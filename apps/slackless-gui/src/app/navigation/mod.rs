@@ -530,11 +530,6 @@ impl App {
             .retain(|p| *p != NavPlace::Channel(channel.clone()));
         self.forward
             .retain(|p| *p != NavPlace::Channel(channel.clone()));
-        self.recent.retain(|c| *c != channel);
-        if let Some(write) = self.bridge.remember_recent_places(&self.recent) {
-            cx.background_executor().spawn(write).detach();
-        }
-        self.update_menus(cx);
         self.reload_live(window, cx);
         if self.channel == channel {
             let next = self
@@ -543,6 +538,13 @@ impl App {
                 .unwrap_or_else(|| NavPlace::Channel(first_conversation(&self.fixtures)));
             self.go_to_place(next, window, cx);
         }
+        // Scrub `recent` after navigating away so `show_conversation` does not re-record the
+        // channel we just left at the top of the history list.
+        self.recent.retain(|c| *c != channel);
+        if let Some(write) = self.bridge.remember_recent_places(&self.recent) {
+            cx.background_executor().spawn(write).detach();
+        }
+        self.update_menus(cx);
     }
 
     /// Open `channel` in the transcript (a no-op when it already is): the sidebar selection,

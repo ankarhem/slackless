@@ -1806,3 +1806,34 @@ impl Render for HuddleDock {
         bar
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::overlay_stroke_fade;
+
+    #[test]
+    fn overlay_stroke_fade_covers_active_hold_smoothstep_and_expired() {
+        // Active (not yet ended) stays fully opaque at full width.
+        assert_eq!(overlay_stroke_fade(None, 10_000), (1.0, 1.0));
+
+        // During 3.8s hold window: still fully opaque.
+        assert_eq!(overlay_stroke_fade(Some(1_000), 1_000), (1.0, 1.0));
+        assert_eq!(overlay_stroke_fade(Some(1_000), 4_799), (1.0, 1.0));
+        // Clock skew (now < ended_at) saturates to 0 elapsed -> full opacity.
+        assert_eq!(overlay_stroke_fade(Some(5_000), 4_000), (1.0, 1.0));
+
+        // Midpoint of 1.6s fade (3800 + 800 = 4600ms elapsed): smoothstep(0.5) = 0.5.
+        let (alpha, width) = overlay_stroke_fade(Some(1_000), 5_600);
+        assert!((alpha - 0.5).abs() < 1e-5, "midpoint alpha={alpha}");
+        assert!((width - 0.86).abs() < 1e-5, "midpoint width={width}");
+
+        // Quarter point (3800 + 400 = 4200ms -> t=0.25, smooth = 1 - 0.0625 * 2.5 = 0.84375).
+        let (q_alpha, q_width) = overlay_stroke_fade(Some(1_000), 5_200);
+        assert!((q_alpha - 0.84375).abs() < 1e-5, "quarter alpha={q_alpha}");
+        assert!(q_width > 0.72 && q_width < 1.0);
+
+        // At and after 3800 + 1600 = 5400ms: expired.
+        assert_eq!(overlay_stroke_fade(Some(1_000), 6_400), (0.0, 0.72));
+        assert_eq!(overlay_stroke_fade(Some(1_000), 99_000), (0.0, 0.72));
+    }
+}

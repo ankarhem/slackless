@@ -6,7 +6,7 @@
 //! goes through `Store`'s public API. Listing is best-effort: a missing or unreadable archive
 //! yields empty results, never an error.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, params};
 use slackless_core::store::types::{ChannelId, Conversation, TeamId, UserId};
@@ -84,7 +84,12 @@ pub fn stored_team_ids() -> Vec<TeamId> {
     let Some(dir) = archive_dir() else {
         return Vec::new();
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    stored_team_ids_in(&dir)
+}
+
+/// Team ids with a `<team_id>.sqlite` archive file in `dir`, sorted.
+pub(crate) fn stored_team_ids_in(dir: &Path) -> Vec<TeamId> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut ids: Vec<TeamId> = entries
@@ -111,12 +116,16 @@ pub struct Archive {
 impl Archive {
     pub fn open(team_id: &TeamId) -> Option<Self> {
         let path = store_path(team_id)?;
+        Self::open_path(&path)
+    }
+
+    pub(crate) fn open_path(path: &Path) -> Option<Self> {
         if !path.is_file() {
             return None;
         }
         // A WAL database without its shm file cannot be opened read-only; fall back.
-        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .or_else(|_| Connection::open(&path))
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .or_else(|_| Connection::open(path))
             .ok()?;
         Some(Self { conn })
     }
@@ -451,4 +460,484 @@ fn name_key(row: &ConversationRow) -> String {
         "{unnamed}{}",
         row.name.as_deref().unwrap_or("").to_lowercase()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use slackless_core::NotifyLevel;
+    use slackless_core::store::Store;
+    use slackless_core::types::{Latest, Message, Profile, TopicPurpose, Ts, User};
+
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let n = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "slackless-cli-archive-test-{}-{}-{n}",
+                label,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn make_user(
+        id: &str,
+        name: &str,
+        display_name: Option<&str>,
+        real_name: Option<&str>,
+        is_bot: bool,
+        deleted: bool,
+    ) -> User {
+        User {
+            id: UserId::from(id),
+            name: name.to_owned(),
+            real_name: real_name.map(str::to_owned),
+            profile: Profile {
+                display_name: display_name.map(str::to_owned),
+                real_name: real_name.map(str::to_owned),
+                ..Profile::default()
+            },
+            is_bot,
+            deleted,
+            ..User::default()
+        }
+    }
+
+    fn make_message(ts: &str, user: Option<&str>, text: &str) -> Message {
+        Message {
+            ts: Ts::from(ts),
+            user: user.map(UserId::from),
+            text: text.to_owned(),
+            ..Message::default()
+        }
+    }
+
+    fn populated_archive(dir: &TempDir) -> (PathBuf, TeamId) {
+        let ws = TeamId::from("T1");
+        let db_path = dir.path().join("T1.sqlite");
+        let mut store = Store::open(&db_path).expect("open store");
+
+        // Users exercising display_name -> real_name -> name fallbacks, empty strings, bot, deleted.
+        let users = vec![
+            make_user(
+                "U1",
+                "alice",
+                Some("Alice Display"),
+                Some("Alice Real"),
+                false,
+                false,
+            ),
+            make_user("U2", "bob", Some(""), Some("Bob Real"), false, false),
+            make_user("U3", "carol", Some(""), Some(""), false, false),
+            make_user("U4", "zbot", Some("Zeta Bot"), None, true, false),
+            make_user("U5", "olduser", Some("Former Member"), None, false, true),
+        ];
+        store.upsert_users(&ws, &users).expect("upsert users");
+
+        // Conversations across all four kinds + unnamed + archived/non-member.
+        let convs = vec![
+            Conversation {
+                id: ChannelId::from("C_ENG"),
+                name: Some("Engineering".into()),
+                is_channel: true,
+                is_member: true,
+                topic: Some(TopicPurpose {
+                    value: "Build things".into(),
+                    ..TopicPurpose::default()
+                }),
+                ..Conversation::default()
+            },
+            Conversation {
+                id: ChannelId::from("C_ALPHA"),
+                name: Some("alpha".into()),
+                is_channel: true,
+                is_private: true,
+                is_archived: true,
+                is_member: false,
+                ..Conversation::default()
+            },
+            Conversation {
+                id: ChannelId::from("C_UNNAMED"),
+                name: None,
+                is_channel: true,
+                is_member: true,
+                ..Conversation::default()
+            },
+            // Public channel whose name matches a user handle to test resolve_channel precedence.
+            Conversation {
+                id: ChannelId::from("C_BOB"),
+                name: Some("bob".into()),
+                is_channel: true,
+                is_member: true,
+                ..Conversation::default()
+            },
+            Conversation {
+                id: ChannelId::from("D_ALICE"),
+                is_im: true,
+                user: Some(UserId::from("U1")),
+                latest: Some(Latest::Ts(Ts::from("1700000300.000000"))),
+                ..Conversation::default()
+            },
+            Conversation {
+                id: ChannelId::from("D_BOB"),
+                is_im: true,
+                user: Some(UserId::from("U2")),
+                latest: None,
+                ..Conversation::default()
+            },
+            Conversation {
+                id: ChannelId::from("G_MPIM"),
+                name: Some("mpdm-alice--bob-1".into()),
+                is_mpim: true,
+                latest: Some(Latest::Ts(Ts::from("1700000500.000000"))),
+                ..Conversation::default()
+            },
+        ];
+        store
+            .upsert_conversations(&ws, &convs)
+            .expect("upsert convs");
+
+        // Messages in C_ENG (including old message, deleted message, and multi-author activity).
+        store
+            .upsert_messages(
+                &ws,
+                &ChannelId::from("C_ENG"),
+                &[
+                    make_message("1700000050.000000", Some("U1"), "before cutoff"),
+                    make_message("1700000100.000000", Some("U1"), "at cutoff"),
+                    make_message("1700000200.000000", Some("U2"), "second author"),
+                    make_message("1700000250.000000", Some("U1"), "newest will be deleted"),
+                ],
+            )
+            .expect("upsert C_ENG");
+        store
+            .record_deletion(
+                &ws,
+                &ChannelId::from("C_ENG"),
+                &Ts::from("1700000250.000000"),
+                Some(&Ts::from("1700000251.000000")),
+                None,
+            )
+            .expect("record deletion");
+
+        // Messages in D_ALICE with same count (2) as C_ENG post-cutoff, but newer max ts (tie-breaker).
+        let long_utf8 = format!("hello\n\tworld   {}", "é".repeat(130));
+        store
+            .upsert_messages(
+                &ws,
+                &ChannelId::from("D_ALICE"),
+                &[
+                    make_message("1700000150.000000", Some("U1"), "dm one"),
+                    make_message("1700000300.000000", Some("U1"), &long_utf8),
+                ],
+            )
+            .expect("upsert D_ALICE");
+
+        // Message in an unknown channel (not in `conversation` table) -> raw ID fallback.
+        store
+            .upsert_message(
+                &ws,
+                &ChannelId::from("C_ORPHAN"),
+                &make_message("1700000120.000000", None, "orphan   msg\nline2"),
+            )
+            .expect("upsert C_ORPHAN");
+
+        // Notification prefs: C_ENG muted, C_ALPHA mentions, C_BOB everything (omitted).
+        let prefs = serde_json::json!({
+            "all_notifications_prefs": serde_json::json!({
+                "channels": {
+                    "C_ENG": { "muted": true, "desktop": "everything" },
+                    "C_ALPHA": { "muted": false, "desktop": "mention" },
+                    "C_BOB": { "muted": false, "desktop": "everything" }
+                }
+            }).to_string()
+        });
+        store.replace_prefs(&ws, &prefs).expect("replace prefs");
+
+        // Another workspace row to verify workspace isolation.
+        let other_ws = TeamId::from("T2");
+        store
+            .upsert_message(
+                &other_ws,
+                &ChannelId::from("C_OTHER"),
+                &make_message("1700000999.000000", Some("U1"), "other ws"),
+            )
+            .expect("upsert T2");
+
+        (db_path, ws)
+    }
+
+    #[test]
+    fn open_path_returns_none_when_missing() {
+        let dir = TempDir::new("missing");
+        assert!(Archive::open_path(&dir.path().join("nope.sqlite")).is_none());
+    }
+
+    #[test]
+    fn channels_filters_and_sorts_case_insensitively_with_unnamed_last() {
+        let dir = TempDir::new("channels");
+        let (db_path, ws) = populated_archive(&dir);
+        let archive = Archive::open_path(&db_path).expect("open archive");
+
+        let channels = archive.channels(&ws);
+        let ids: Vec<&str> = channels.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["C_ALPHA", "C_BOB", "C_ENG", "C_UNNAMED"]);
+
+        assert_eq!(channels[0].label(), "#alpha");
+        assert!(channels[0].is_archived);
+        assert!(!channels[0].is_member);
+        assert_eq!(channels[2].topic.as_deref(), Some("Build things"));
+        assert_eq!(channels[3].label(), "C_UNNAMED");
+    }
+
+    #[test]
+    fn dms_filters_and_sorts_by_latest_secs_desc_with_none_last() {
+        let dir = TempDir::new("dms");
+        let (db_path, ws) = populated_archive(&dir);
+        let archive = Archive::open_path(&db_path).expect("open archive");
+
+        let dms = archive.dms(&ws);
+        let ids: Vec<&str> = dms.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["G_MPIM", "D_ALICE", "D_BOB"]);
+        assert_eq!(dms[0].latest_secs, Some(1_700_000_500));
+        assert_eq!(dms[1].latest_secs, Some(1_700_000_300));
+        assert_eq!(dms[2].latest_secs, None);
+    }
+
+    #[test]
+    fn resolve_channel_respects_precedence_and_prefix_stripping() {
+        let dir = TempDir::new("resolve");
+        let (db_path, ws) = populated_archive(&dir);
+        let archive = Archive::open_path(&db_path).expect("open archive");
+
+        // Exact ID match.
+        assert_eq!(
+            archive.resolve_channel(&ws, "C_ENG").map(|r| r.id),
+            Some(ChannelId::from("C_ENG"))
+        );
+        // Case-insensitive `#name` and bare `name`.
+        assert_eq!(
+            archive.resolve_channel(&ws, "#engineering").map(|r| r.id),
+            Some(ChannelId::from("C_ENG"))
+        );
+        assert_eq!(
+            archive.resolve_channel(&ws, "ENGINEERING").map(|r| r.id),
+            Some(ChannelId::from("C_ENG"))
+        );
+        // Channel name takes precedence over IM by user handle ("bob" is both #bob and @bob).
+        assert_eq!(
+            archive.resolve_channel(&ws, "bob").map(|r| r.id),
+            Some(ChannelId::from("C_BOB"))
+        );
+        // `@handle` and display/real name resolve to IM when no channel shares the name.
+        assert_eq!(
+            archive.resolve_channel(&ws, "@alice").map(|r| r.id),
+            Some(ChannelId::from("D_ALICE"))
+        );
+        assert_eq!(
+            archive.resolve_channel(&ws, "Alice Display").map(|r| r.id),
+            Some(ChannelId::from("D_ALICE"))
+        );
+        assert_eq!(
+            archive.resolve_channel(&ws, "Bob Real").map(|r| r.id),
+            Some(ChannelId::from("D_BOB"))
+        );
+        // Unknown returns None.
+        assert!(archive.resolve_channel(&ws, "#does-not-exist").is_none());
+    }
+
+    #[test]
+    fn user_display_falls_back_skipping_empty_strings() {
+        let dir = TempDir::new("user-display");
+        let (db_path, ws) = populated_archive(&dir);
+        let archive = Archive::open_path(&db_path).expect("open archive");
+
+        assert_eq!(
+            archive.user_display(&ws, &UserId::from("U1")).as_deref(),
+            Some("Alice Display")
+        );
+        assert_eq!(
+            archive.user_display(&ws, &UserId::from("U2")).as_deref(),
+            Some("Bob Real")
+        );
+        assert_eq!(
+            archive.user_display(&ws, &UserId::from("U3")).as_deref(),
+            Some("carol")
+        );
+        assert_eq!(archive.user_display(&ws, &UserId::from("U_MISSING")), None);
+    }
+
+    #[test]
+    fn users_filters_deleted_and_substrings_and_orders_case_insensitively() {
+        let dir = TempDir::new("users");
+        let (db_path, ws) = populated_archive(&dir);
+        let archive = Archive::open_path(&db_path).expect("open archive");
+
+        // Active users only, sorted by effective display name.
+        let active = archive.users(&ws, None, false);
+        let active_ids: Vec<&str> = active.iter().map(|u| u.id.as_str()).collect();
+        assert_eq!(active_ids, vec!["U1", "U2", "U3", "U4"]);
+
+        // Include deleted brings in U5 ("Former Member", between carol and Zeta Bot).
+        let all = archive.users(&ws, None, true);
+        let all_ids: Vec<&str> = all.iter().map(|u| u.id.as_str()).collect();
+        assert_eq!(all_ids, vec!["U1", "U2", "U3", "U5", "U4"]);
+        assert!(all.iter().find(|u| u.id == "U4").is_some_and(|u| u.is_bot));
+        assert!(all.iter().find(|u| u.id == "U5").is_some_and(|u| u.deleted));
+
+        // `@`-stripped case-insensitive substring across handle, display, real_name, id.
+        assert_eq!(
+            archive
+                .users(&ws, Some("  @ALICE "), false)
+                .into_iter()
+                .map(|u| u.id)
+                .collect::<Vec<_>>(),
+            vec!["U1"]
+        );
+        assert_eq!(
+            archive
+                .users(&ws, Some("real"), false)
+                .into_iter()
+                .map(|u| u.id)
+                .collect::<Vec<_>>(),
+            vec!["U1", "U2"]
+        );
+        assert_eq!(
+            archive
+                .users(&ws, Some("u3"), false)
+                .into_iter()
+                .map(|u| u.id)
+                .collect::<Vec<_>>(),
+            vec!["U3"]
+        );
+        assert_eq!(
+            archive
+                .users(&ws, Some("zeta"), false)
+                .into_iter()
+                .map(|u| u.id)
+                .collect::<Vec<_>>(),
+            vec!["U4"]
+        );
+        // Empty/whitespace query matches all active users.
+        assert_eq!(archive.users(&ws, Some("  @  "), false).len(), 4);
+    }
+
+    #[test]
+    fn digest_since_enforces_cutoff_excludes_deleted_breaks_ties_and_truncates_utf8() {
+        let dir = TempDir::new("digest");
+        let (db_path, ws) = populated_archive(&dir);
+        let archive = Archive::open_path(&db_path).expect("open archive");
+
+        let rows = archive.digest_since(&ws, 1_700_000_100, 10);
+        assert_eq!(rows.len(), 3);
+
+        // D_ALICE and C_ENG both have 2 non-deleted messages >= cutoff, but D_ALICE has newer max ts.
+        assert_eq!(rows[0].channel, "D_ALICE");
+        assert_eq!(rows[0].label, "@Alice Display");
+        assert_eq!(rows[0].message_count, 2);
+        assert_eq!(rows[0].author_count, 1);
+        assert_eq!(rows[0].latest_ts, "1700000300.000000");
+        assert_eq!(rows[0].latest_author.as_deref(), Some("Alice Display"));
+        assert!(rows[0].latest_text.starts_with("hello world "));
+        assert!(rows[0].latest_text.ends_with('…'));
+        assert_eq!(rows[0].latest_text.chars().count(), 120);
+
+        assert_eq!(rows[1].channel, "C_ENG");
+        assert_eq!(rows[1].label, "#Engineering");
+        assert_eq!(rows[1].message_count, 2);
+        assert_eq!(rows[1].author_count, 2);
+        assert_eq!(rows[1].latest_ts, "1700000200.000000");
+        assert_eq!(rows[1].latest_author.as_deref(), Some("Bob Real"));
+        assert_eq!(rows[1].latest_text, "second author");
+
+        // Orphan channel falls back to raw ID and collapses whitespace.
+        assert_eq!(rows[2].channel, "C_ORPHAN");
+        assert_eq!(rows[2].label, "C_ORPHAN");
+        assert_eq!(rows[2].message_count, 1);
+        assert_eq!(rows[2].latest_author, None);
+        assert_eq!(rows[2].latest_text, "orphan msg line2");
+
+        // Limit caps returned conversations.
+        let limited = archive.digest_since(&ws, 1_700_000_100, 1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].channel, "D_ALICE");
+    }
+
+    #[test]
+    fn latest_ts_message_count_and_notify_levels() {
+        let dir = TempDir::new("meta");
+        let (db_path, ws) = populated_archive(&dir);
+        let archive = Archive::open_path(&db_path).expect("open archive");
+
+        // Newest in C_ENG (1700000250) was deleted, so latest_ts skips it.
+        assert_eq!(
+            archive.latest_ts(&ws, &ChannelId::from("C_ENG")).as_deref(),
+            Some("1700000200.000000")
+        );
+        assert_eq!(archive.latest_ts(&ws, &ChannelId::from("C_ALPHA")), None);
+
+        // message_count counts message_current rows for T1 only (4 in C_ENG + 2 in D_ALICE + 1 in C_ORPHAN).
+        assert_eq!(archive.message_count(&ws), 7);
+        assert_eq!(archive.message_count(&TeamId::from("T2")), 1);
+        assert_eq!(archive.message_count(&TeamId::from("T_NONE")), 0);
+
+        // Valid notify_levels.
+        let levels = archive.notify_levels(&ws);
+        assert_eq!(
+            levels.get(&ChannelId::from("C_ENG")),
+            Some(&NotifyLevel::Muted)
+        );
+        assert_eq!(
+            levels.get(&ChannelId::from("C_ALPHA")),
+            Some(&NotifyLevel::Mentions)
+        );
+        assert!(!levels.contains_key(&ChannelId::from("C_BOB")));
+        assert!(archive.notify_levels(&TeamId::from("T_NONE")).is_empty());
+
+        // Malformed JSON in prefs falls back to empty map.
+        drop(archive);
+        let conn = Connection::open(&db_path).expect("reopen rw");
+        conn.execute(
+            "INSERT OR REPLACE INTO prefs (workspace_id, json, updated_at) VALUES (?1, ?2, 0)",
+            params!["T_BAD", "{not valid json"],
+        )
+        .expect("insert malformed prefs");
+        drop(conn);
+
+        let archive = Archive::open_path(&db_path).expect("reopen archive");
+        assert!(archive.notify_levels(&TeamId::from("T_BAD")).is_empty());
+    }
+
+    #[test]
+    fn stored_team_ids_in_lists_sorted_sqlite_files_only() {
+        let dir = TempDir::new("team-ids");
+        std::fs::write(dir.path().join("T200.sqlite"), b"").unwrap();
+        std::fs::write(dir.path().join("T100.sqlite"), b"").unwrap();
+        std::fs::write(dir.path().join("T100.sqlite-wal"), b"").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("TDIR.sqlite")).unwrap();
+
+        let ids = stored_team_ids_in(dir.path());
+        assert_eq!(ids, vec![TeamId::from("T100"), TeamId::from("T200")]);
+        assert!(stored_team_ids_in(&dir.path().join("missing")).is_empty());
+    }
 }

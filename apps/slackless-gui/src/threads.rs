@@ -1296,3 +1296,216 @@ fn new_messages_divider(cx: &App) -> Div {
         )
         .child(div().flex_1().h(px(1.)).bg(danger))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+    use gpui_kit::gpui::TestAppContext;
+
+    #[gpui::test]
+    fn thread_panel_open_lru_cache_set_thread_reply_actions_subscribe_and_unread_count(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+
+        let mut fx = crate::fixtures::load();
+        fx.sample = false;
+        let me = fx.self_user.clone();
+        let fx = Arc::new(fx);
+
+        let events: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let subscribed_events: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
+        let reply_broadcasts: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let panel_slot: Rc<RefCell<Option<Entity<ThreadPanel>>>> = Rc::new(RefCell::new(None));
+        let slot = panel_slot.clone();
+        let fx_clone = fx.clone();
+        let ev_log = events.clone();
+        let sub_log = subscribed_events.clone();
+        let bc_log = reply_broadcasts.clone();
+
+        struct PanelHost {
+            panel: Entity<ThreadPanel>,
+            _sub: Subscription,
+        }
+        impl Render for PanelHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(self.panel.clone())
+            }
+        }
+
+        let (_root, cx) = cx.add_window_view(move |window, cx| {
+            let panel = ThreadPanel::new(fx_clone, window, cx);
+            *slot.borrow_mut() = Some(panel.clone());
+            let host = cx.new(|cx| {
+                let sub = cx.subscribe(&panel, move |_, _, ev: &ThreadPanelEvent, _| match ev {
+                    ThreadPanelEvent::Reply { broadcast, .. } => {
+                        ev_log.borrow_mut().push("reply");
+                        bc_log.borrow_mut().push(*broadcast);
+                    }
+                    ThreadPanelEvent::Changed { change, .. } => match change {
+                        MessageChange::React { .. } => ev_log.borrow_mut().push("react"),
+                        MessageChange::Pin { .. } => ev_log.borrow_mut().push("pin"),
+                        MessageChange::Edit { .. } => ev_log.borrow_mut().push("edit"),
+                        MessageChange::Delete { .. } => ev_log.borrow_mut().push("delete"),
+                        _ => ev_log.borrow_mut().push("changed"),
+                    },
+                    ThreadPanelEvent::Later(_) => ev_log.borrow_mut().push("later"),
+                    ThreadPanelEvent::SetSubscribed { subscribed, .. } => {
+                        ev_log.borrow_mut().push("subscribed");
+                        sub_log.borrow_mut().push(*subscribed);
+                    }
+                    ThreadPanelEvent::Close => ev_log.borrow_mut().push("close"),
+                    _ => {}
+                });
+                PanelHost { panel, _sub: sub }
+            });
+            gpui_kit::base::Root::new(host, window, cx)
+        });
+        let panel = panel_slot.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+
+        let ch = ChannelId::from("C0ENG");
+        let root_ts = Ts::from("1700000100.000100");
+        let r1_ts = Ts::from("1700000101.000100");
+        let r2_ts = Ts::from("1700000102.000100");
+
+        let root_msg = Message {
+            ts: root_ts.clone(),
+            user: Some(me.clone()),
+            text: "root post".into(),
+            ..Default::default()
+        };
+        let reply1 = Message {
+            ts: r1_ts.clone(),
+            thread_ts: Some(root_ts.clone()),
+            user: Some(me.clone()),
+            text: "first reply".into(),
+            ..Default::default()
+        };
+        let reply2 = Message {
+            ts: r2_ts.clone(),
+            thread_ts: Some(root_ts.clone()),
+            user: Some(UserId::from("U0OTHER")),
+            text: "second reply".into(),
+            ..Default::default()
+        };
+
+        // 1. Open uncached live thread -> loading = true; set_thread populates & caches; wrong thread ignored.
+        cx.update(|window, cx| {
+            panel.update(cx, |p, cx| {
+                p.open(ch.clone(), root_ts.clone(), Some(root_msg.clone()), cx);
+                assert!(p.loading);
+                assert_eq!(p.open_thread(), Some((ch.clone(), root_ts.clone())));
+
+                // Wrong thread ts is ignored.
+                p.set_thread(
+                    ch.clone(),
+                    Ts::from("9999999999.000000"),
+                    vec![root_msg.clone()],
+                    cx,
+                );
+                assert!(p.loading);
+
+                // Matching thread populates root + replies and clears loading.
+                p.set_thread(
+                    ch.clone(),
+                    root_ts.clone(),
+                    vec![root_msg.clone(), reply1.clone(), reply2.clone()],
+                    cx,
+                );
+                assert!(!p.loading);
+                assert_eq!(p.replies.len(), 2);
+                assert!(p.cache.contains_key(&(ch.clone(), root_ts.clone())));
+
+                // 2. LRU cache eviction past THREAD_CACHE_MAX (16).
+                for i in 0..(THREAD_CACHE_MAX + 3) {
+                    let k = (ch.clone(), Ts::from(format!("1700001{i:03}.000100")));
+                    p.cache_put(k, Some(root_msg.clone()), Vec::new());
+                }
+                assert_eq!(p.cache.len(), THREAD_CACHE_MAX);
+                assert_eq!(p.cache_lru.len(), THREAD_CACHE_MAX);
+                assert!(
+                    !p.cache.contains_key(&(ch.clone(), root_ts.clone())),
+                    "oldest cached thread evicted past THREAD_CACHE_MAX"
+                );
+
+                // Re-seed our thread in cache and reopen -> instant cache hit (`loading == false`).
+                p.cache_put(
+                    (ch.clone(), root_ts.clone()),
+                    Some(root_msg.clone()),
+                    vec![reply1.clone(), reply2.clone()],
+                );
+                p.open(ch.clone(), root_ts.clone(), None, cx);
+                assert!(!p.loading);
+                assert_eq!(p.replies.len(), 2);
+
+                // 3. unread_new_count counts replies >= unread_after.
+                assert_eq!(p.unread_new_count(), 0);
+                p.mark_unread(r2_ts.clone(), cx);
+                assert_eq!(p.unread_new_count(), 1);
+                p.mark_unread(r1_ts.clone(), cx);
+                assert_eq!(p.unread_new_count(), 2);
+
+                // 4. reply appends local echo and emits Reply event.
+                p.reply(MessageContent::plain("third reply"), cx);
+                assert_eq!(p.replies.len(), 3);
+
+                // 5. toggle_subscribed flips root.subscribed and emits SetSubscribed.
+                p.toggle_subscribed(cx);
+                assert_eq!(p.root.as_ref().unwrap().subscribed, Some(true));
+                p.toggle_subscribed(cx);
+                assert_eq!(p.root.as_ref().unwrap().subscribed, Some(false));
+
+                // 6. run_action: reaction, toggle reaction, pin, save for later, edit + save_edit, delete reply & root.
+                p.run_action(&r1_ts, MessageAction::React("thumbsup".into()), window, cx);
+                assert_eq!(p.replies[0].reactions.len(), 1);
+                p.run_action(
+                    &r1_ts,
+                    MessageAction::ToggleReaction("thumbsup".into()),
+                    window,
+                    cx,
+                );
+                assert!(p.replies[0].reactions.is_empty());
+
+                p.run_action(&r1_ts, MessageAction::TogglePin, window, cx);
+                assert!(p.replies[0].pinned_to.contains(&ch));
+
+                p.run_action(&r1_ts, MessageAction::SaveForLater, window, cx);
+                assert!(p.saved.contains(&r1_ts));
+
+                p.run_action(&r1_ts, MessageAction::Edit, window, cx);
+                assert_eq!(p.editing.as_ref(), Some(&r1_ts));
+                p.save_edit(MessageContent::plain("edited reply"), cx);
+                assert_eq!(p.editing, None);
+                assert_eq!(p.replies[0].text, "edited reply");
+
+                // Deleting a reply removes only that reply; deleting root clears panel and emits Close.
+                p.delete_message(&r1_ts, cx);
+                assert_eq!(p.replies.len(), 2);
+                assert!(!p.saved.contains(&r1_ts));
+
+                p.delete_message(&root_ts, cx);
+                assert!(p.open_thread().is_none());
+                assert!(p.root.is_none());
+                assert!(p.replies.is_empty());
+            });
+        });
+
+        assert_eq!(*subscribed_events.borrow(), vec![true, false]);
+        assert_eq!(*reply_broadcasts.borrow(), vec![false]);
+        let evs = events.borrow();
+        assert!(evs.contains(&"reply"));
+        assert!(evs.contains(&"react"));
+        assert!(evs.contains(&"pin"));
+        assert!(evs.contains(&"later"));
+        assert!(evs.contains(&"edit"));
+        assert!(evs.contains(&"delete"));
+        assert!(evs.contains(&"close"));
+    }
+}

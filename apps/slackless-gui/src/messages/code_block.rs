@@ -341,3 +341,109 @@ pub(super) fn code_tooltip(text: &'static str, cx: &App) -> Div {
                 ),
         )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use gpui_kit::gpui::{Font, Hsla, SharedString};
+
+    use super::{cached_highlight, highlighted_code_runs};
+    use crate::messages::render::RunTheme;
+    use crate::syntax::Lang;
+
+    fn dummy_theme() -> RunTheme {
+        let fg = Hsla::default();
+        RunTheme {
+            base_font: Font::default(),
+            mono_font: Font::default(),
+            code_font: Font::default(),
+            foreground: fg,
+            muted: fg,
+            border: fg,
+            link: fg,
+            mention_bg: fg,
+            link_wash: fg,
+            code_bg: fg,
+            code_fg: fg,
+            selection: fg,
+            order: None,
+            links: None,
+            underline_links: false,
+            emoji_text_mode: false,
+            dark: true,
+            verbatim: false,
+            paragraphs: Cell::new(0),
+            key: SharedString::from("test"),
+        }
+    }
+
+    #[test]
+    fn highlighted_code_runs_byte_sum_equals_code_len_across_languages_and_utf8() {
+        let theme = dummy_theme();
+        assert!(highlighted_code_runs("", Lang::Rust, &theme).is_empty());
+
+        let samples = [
+            (
+                Lang::Rust,
+                "fn main() {\n    let s = \"héllo 🚀 世界\";\n    // comment 日本語\n    println!(\"{s}\");\n}",
+            ),
+            (
+                Lang::Json,
+                "{\n  \"key\": \"value — café\",\n  \"nums\": [1, 2.5, true, null]\n}",
+            ),
+            (
+                Lang::Python,
+                "def greet(name: str) -> str:\n    # Ångström\n    return f\"Hi {name} 👋\"\n",
+            ),
+            (
+                Lang::Sql,
+                "SELECT id, name FROM users WHERE bio LIKE '%über%' ORDER BY id DESC;",
+            ),
+            (
+                Lang::Plain,
+                "unknown language\nwith multi-byte UTF-8: åäö € 🦀\nline 3",
+            ),
+        ];
+
+        for (lang, code) in samples {
+            let runs = highlighted_code_runs(code, lang, &theme);
+            let total: usize = runs.iter().map(|r| r.len).sum();
+            assert_eq!(
+                total,
+                code.len(),
+                "run byte lengths must sum exactly to code.len() for {lang:?}"
+            );
+            // Every run boundary must lie on a UTF-8 char boundary.
+            let mut offset = 0;
+            for run in &runs {
+                offset += run.len;
+                assert!(
+                    code.is_char_boundary(offset),
+                    "run ended mid-UTF-8 char at {offset} for {lang:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_highlight_hits_evicts_and_skips_oversized_inputs() {
+        let snippet = "let answer = 42; // cached";
+        let first = cached_highlight(snippet, Lang::Rust);
+        let second = cached_highlight(snippet, Lang::Rust);
+        assert_eq!(first, second);
+
+        // Exceed MAX_ENTRIES (64) to exercise LRU eviction cleanly.
+        for i in 0..70 {
+            let code = format!("let x_{i} = {i};");
+            let tokens = cached_highlight(&code, Lang::Rust);
+            assert_eq!(tokens.iter().map(|(l, _)| *l).sum::<usize>(), code.len());
+        }
+
+        // Oversized input (> 32 KiB) still highlights accurately without entering cache.
+        let huge = "let x = 1;\n".repeat(4_000);
+        assert!(huge.len() > 32 * 1024);
+        let tokens = cached_highlight(&huge, Lang::Rust);
+        assert_eq!(tokens.iter().map(|(l, _)| *l).sum::<usize>(), huge.len());
+    }
+}

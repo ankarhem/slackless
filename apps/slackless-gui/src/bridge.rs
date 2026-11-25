@@ -903,6 +903,264 @@ mod tests {
         assert!(bridge.settings().is_none());
         assert!(bridge.drafts().is_none());
         assert!(bridge.section_prefs().is_none());
+        assert!(bridge.parse_color_mode(&HashMap::new()).is_none());
         bridge.send(Command::MarkAllRead);
+    }
+
+    fn run_ready<F: Future<Output = ()>>(fut: F) {
+        use std::task::{Context, Poll, Waker};
+        let mut pinned = std::pin::pin!(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Ready(())));
+    }
+
+    fn memory_bridge() -> CoreBridge {
+        let store = Arc::new(Mutex::new(
+            Store::open_in_memory().expect("in-memory store"),
+        ));
+        let session = Session {
+            team_id: TeamId::from("T0TEST"),
+            user_id: slackless_core::types::UserId::from("U0ME"),
+            workspace_url: "https://acme.slack.com".into(),
+            xoxc_token: String::new(),
+            d_cookie: String::new(),
+        };
+        CoreBridge {
+            command_sink: None,
+            core_thread: None,
+            store: Some(store),
+            reader: None,
+            session: Some(session),
+            fetcher: None,
+            hub: None,
+        }
+    }
+
+    #[test]
+    fn parse_decoders_handle_valid_boundary_and_malformed_inputs() {
+        let mut local = HashMap::new();
+
+        // parse_last_conversation
+        assert_eq!(CoreBridge::parse_last_conversation(&local), None);
+        local.insert(LAST_CONVERSATION.into(), "C0ENG".into());
+        assert_eq!(
+            CoreBridge::parse_last_conversation(&local),
+            Some(ChannelId::from("C0ENG"))
+        );
+
+        // parse_window_state: valid hex, empty, odd length, non-hex, non-ASCII
+        assert_eq!(CoreBridge::parse_window_state(&local), None);
+        local.insert(WINDOW_STATE.into(), "007fFF".into());
+        assert_eq!(
+            CoreBridge::parse_window_state(&local),
+            Some(vec![0x00, 0x7f, 0xff])
+        );
+        local.insert(WINDOW_STATE.into(), String::new());
+        assert_eq!(CoreBridge::parse_window_state(&local), Some(vec![]));
+        local.insert(WINDOW_STATE.into(), "abc".into());
+        assert_eq!(CoreBridge::parse_window_state(&local), None);
+        local.insert(WINDOW_STATE.into(), "zzzz".into());
+        assert_eq!(CoreBridge::parse_window_state(&local), None);
+        local.insert(WINDOW_STATE.into(), "éé".into());
+        assert_eq!(CoreBridge::parse_window_state(&local), None);
+
+        // parse_font
+        assert_eq!(CoreBridge::parse_font(&local), None);
+        local.insert(FONT.into(), theme::FONT_FAMILIES[2].into());
+        assert_eq!(CoreBridge::parse_font(&local), Some(2));
+        local.insert(FONT.into(), "NonexistentFont".into());
+        assert_eq!(CoreBridge::parse_font(&local), None);
+
+        // parse_zoom bounds
+        assert_eq!(CoreBridge::parse_zoom(&local), None);
+        local.insert(ZOOM.into(), "0".into());
+        assert_eq!(CoreBridge::parse_zoom(&local), Some(0));
+        local.insert(ZOOM.into(), (crate::zoom::FACTORS.len() - 1).to_string());
+        assert_eq!(
+            CoreBridge::parse_zoom(&local),
+            Some(crate::zoom::FACTORS.len() - 1)
+        );
+        local.insert(ZOOM.into(), crate::zoom::FACTORS.len().to_string());
+        assert_eq!(CoreBridge::parse_zoom(&local), None);
+        local.insert(ZOOM.into(), "-1".into());
+        assert_eq!(CoreBridge::parse_zoom(&local), None);
+
+        // parse_channel_counts: merge & malformed JSON
+        assert_eq!(
+            CoreBridge::parse_channel_counts(&local),
+            (HashMap::new(), HashMap::new())
+        );
+        local.insert(
+            "channel_counts_cache".into(),
+            r#"{"C1":[12,3],"C2":[5,null],"C3":[null,2]}"#.into(),
+        );
+        let (members, apps) = CoreBridge::parse_channel_counts(&local);
+        assert_eq!(members.get(&ChannelId::from("C1")), Some(&12));
+        assert_eq!(members.get(&ChannelId::from("C2")), Some(&5));
+        assert!(!members.contains_key(&ChannelId::from("C3")));
+        assert_eq!(apps.get(&ChannelId::from("C1")), Some(&3));
+        assert!(!apps.contains_key(&ChannelId::from("C2")));
+        assert_eq!(apps.get(&ChannelId::from("C3")), Some(&2));
+        local.insert("channel_counts_cache".into(), "{broken".into());
+        assert_eq!(
+            CoreBridge::parse_channel_counts(&local),
+            (HashMap::new(), HashMap::new())
+        );
+
+        // parse_emoji_tone 1..=6 bounds
+        for valid in 1u8..=6 {
+            local.insert(EMOJI_TONE.into(), valid.to_string());
+            assert_eq!(CoreBridge::parse_emoji_tone(&local), Some(valid));
+        }
+        for invalid in ["0", "7", "255", "abc"] {
+            local.insert(EMOJI_TONE.into(), invalid.into());
+            assert_eq!(CoreBridge::parse_emoji_tone(&local), None, "{invalid}");
+        }
+
+        // parse_settings, search_history, toggles, recent_places, drafts, frequent_emoji
+        local.insert(SETTINGS.into(), "{bad".into());
+        assert!(CoreBridge::parse_settings(&local).is_none());
+        local.insert(
+            SETTINGS.into(),
+            serde_json::to_string(&Settings::default()).unwrap(),
+        );
+        assert!(CoreBridge::parse_settings(&local).is_some());
+
+        local.insert(SEARCH_HISTORY.into(), r#"["deploy","incident"]"#.into());
+        assert_eq!(
+            CoreBridge::parse_search_history(&local),
+            Some(vec!["deploy".into(), "incident".into()])
+        );
+        local.insert(SEARCH_HISTORY_SHOWN.into(), "true".into());
+        local.insert(SEARCH_FILTERS_SHOWN.into(), "false".into());
+        assert_eq!(CoreBridge::parse_search_history_shown(&local), Some(true));
+        assert_eq!(CoreBridge::parse_search_filters_shown(&local), Some(false));
+
+        local.insert(RECENT_PLACES.into(), r#"["C0ENG","D0ALICE"]"#.into());
+        assert_eq!(
+            CoreBridge::parse_recent_places(&local),
+            Some(vec![ChannelId::from("C0ENG"), ChannelId::from("D0ALICE")])
+        );
+
+        local.insert(FREQUENT_EMOJI.into(), r#"["tada","rocket"]"#.into());
+        assert_eq!(
+            CoreBridge::parse_frequent_emoji(&local),
+            Some(vec!["tada".into(), "rocket".into()])
+        );
+
+        local.insert(DRAFTS.into(), "not json".into());
+        assert!(CoreBridge::parse_drafts(&local).is_none());
+    }
+
+    #[test]
+    fn in_memory_store_round_trips_all_remember_and_all_local_decoders() {
+        let bridge = memory_bridge();
+        let settings = Settings {
+            keywords: "deploy, urgent".into(),
+            enter_sends: false,
+            ..Default::default()
+        };
+
+        let drafts = vec![SavedDraft {
+            channel: ChannelId::from("C0ENG"),
+            label: "# engineering".into(),
+            text: "draft *body*".into(),
+            at: 1_760_000_123,
+        }];
+        let mut section_prefs = SectionPrefs::default();
+        section_prefs
+            .filters
+            .insert("channels".into(), SectionFilter::Mentions);
+        section_prefs
+            .sorts
+            .insert("dms".into(), SectionSort::Recency);
+
+        let members = HashMap::from([(ChannelId::from("C0ENG"), 42u32)]);
+        let apps = HashMap::from([
+            (ChannelId::from("C0ENG"), 4u32),
+            (ChannelId::from("C0OPS"), 1u32),
+        ]);
+
+        run_ready(
+            bridge
+                .remember_conversation(ChannelId::from("C0ENG"))
+                .unwrap(),
+        );
+        run_ready(
+            bridge
+                .remember_window_state(vec![0xde, 0xad, 0xbe, 0xef])
+                .unwrap(),
+        );
+        run_ready(bridge.remember_color_mode(AppearanceMode::Dark).unwrap());
+        run_ready(
+            bridge
+                .remember_search_history(&["alpha".into(), "beta".into()])
+                .unwrap(),
+        );
+        run_ready(bridge.remember_search_history_shown(false).unwrap());
+        run_ready(bridge.remember_search_filters_shown(true).unwrap());
+        run_ready(
+            bridge
+                .remember_recent_places(&[ChannelId::from("C0ENG"), ChannelId::from("D0ALICE")])
+                .unwrap(),
+        );
+        run_ready(bridge.remember_font(1).unwrap());
+        run_ready(bridge.remember_zoom(4).unwrap());
+        run_ready(bridge.remember_settings(&settings).unwrap());
+        run_ready(bridge.remember_drafts(&drafts).unwrap());
+        run_ready(
+            bridge
+                .remember_frequent_emoji(&["fire".into(), "100".into()])
+                .unwrap(),
+        );
+        run_ready(bridge.remember_emoji_tone(5).unwrap());
+        run_ready(
+            bridge
+                .remember_workspace_order(&["T2".into(), "T1".into()])
+                .unwrap(),
+        );
+        run_ready(bridge.remember_section_prefs(&section_prefs).unwrap());
+        run_ready(bridge.remember_channel_counts(&members, &apps).unwrap());
+
+        let local = bridge.all_local();
+        assert_eq!(
+            CoreBridge::parse_last_conversation(&local),
+            Some(ChannelId::from("C0ENG"))
+        );
+        assert_eq!(bridge.last_conversation(), Some(ChannelId::from("C0ENG")));
+        assert_eq!(
+            CoreBridge::parse_window_state(&local),
+            Some(vec![0xde, 0xad, 0xbe, 0xef])
+        );
+        assert_eq!(bridge.parse_color_mode(&local), Some(AppearanceMode::Dark));
+        assert_eq!(
+            CoreBridge::parse_search_history(&local),
+            Some(vec!["alpha".into(), "beta".into()])
+        );
+        assert_eq!(CoreBridge::parse_search_history_shown(&local), Some(false));
+        assert_eq!(CoreBridge::parse_search_filters_shown(&local), Some(true));
+        assert_eq!(
+            CoreBridge::parse_recent_places(&local),
+            Some(vec![ChannelId::from("C0ENG"), ChannelId::from("D0ALICE")])
+        );
+        assert_eq!(CoreBridge::parse_font(&local), Some(1));
+        assert_eq!(CoreBridge::parse_zoom(&local), Some(4));
+        let decoded_settings = CoreBridge::parse_settings(&local).unwrap();
+        assert_eq!(decoded_settings.keywords, "deploy, urgent");
+        assert!(!decoded_settings.enter_sends);
+        assert_eq!(bridge.settings().unwrap().keywords, "deploy, urgent");
+        assert_eq!(CoreBridge::parse_drafts(&local), Some(drafts.clone()));
+        assert_eq!(bridge.drafts(), Some(drafts));
+        assert_eq!(
+            CoreBridge::parse_frequent_emoji(&local),
+            Some(vec!["fire".into(), "100".into()])
+        );
+        assert_eq!(CoreBridge::parse_emoji_tone(&local), Some(5));
+        assert_eq!(
+            bridge.workspace_order(),
+            Some(vec!["T2".into(), "T1".into()])
+        );
+        assert_eq!(bridge.section_prefs(), Some(section_prefs));
+        assert_eq!(CoreBridge::parse_channel_counts(&local), (members, apps));
     }
 }

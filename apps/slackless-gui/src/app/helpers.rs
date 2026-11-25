@@ -563,7 +563,10 @@ pub(super) fn mentions_me(text: &str, me: &UserId, keywords: &str) -> bool {
 
 #[cfg(test)]
 mod notification_tag_tests {
-    use super::parse_notification_target;
+    use super::{
+        civil_from_days, convert_emoticons, is_suspicious_url, parse_local_schedule,
+        parse_notification_target,
+    };
     use slackless_core::types::{ChannelId, Ts};
 
     #[test]
@@ -593,5 +596,139 @@ mod notification_tag_tests {
             ))
         );
         assert_eq!(parse_notification_target("bg:bad:C0:1.0"), None);
+    }
+
+    #[test]
+    fn is_suspicious_url_flags_insecure_and_deceptive_urls() {
+        // Non-HTTPS & dangerous schemes
+        assert!(is_suspicious_url("http://example.com"));
+        assert!(is_suspicious_url("HTTP://EXAMPLE.COM/path"));
+        assert!(is_suspicious_url("javascript:alert(1)"));
+        assert!(is_suspicious_url("file:///etc/passwd"));
+        assert!(is_suspicious_url("ftp://files.example.com/a"));
+        assert!(is_suspicious_url("data:text/html,<h1>hi</h1>"));
+
+        // Credentialed authority (phishing user@host)
+        assert!(is_suspicious_url("https://slack.com@evil.example/login"));
+        assert!(is_suspicious_url("https://user:pass@example.com"));
+
+        // Punycode IDN homographs
+        assert!(is_suspicious_url("https://xn--80ak6aa92e.com/signin"));
+        assert!(is_suspicious_url("https://sub.XN--p1ai/path"));
+
+        // Raw IPv4 hosts (with or without port/path)
+        assert!(is_suspicious_url("https://127.0.0.1"));
+        assert!(is_suspicious_url("https://192.168.1.10:8443/admin"));
+        assert!(is_suspicious_url("https://10.0.0.1/path?x=1"));
+
+        // Clean HTTPS domains, ports, queries with `@`, and mailto:
+        assert!(!is_suspicious_url("https://example.com"));
+        assert!(!is_suspicious_url(
+            "  https://docs.slack.com:443/reference?email=a@b.com  "
+        ));
+        assert!(!is_suspicious_url(
+            "https://sub.domain.co.uk/path#user@frag"
+        ));
+        assert!(!is_suspicious_url("mailto:alice@example.com"));
+        assert!(!is_suspicious_url("MAILTO:bob@example.com"));
+    }
+
+    #[test]
+    fn convert_emoticons_handles_all_twelve_boundaries_and_code_spans() {
+        let cases = [
+            (":-)", ":slightly_smiling_face:"),
+            (":)", ":slightly_smiling_face:"),
+            (":-D", ":smiley:"),
+            (":D", ":smiley:"),
+            (":-(", ":disappointed:"),
+            (":(", ":disappointed:"),
+            (";-)", ":wink:"),
+            (";)", ":wink:"),
+            (":-P", ":stuck_out_tongue:"),
+            (":P", ":stuck_out_tongue:"),
+            ("<3", ":heart:"),
+            (":/", ":confused:"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(convert_emoticons(raw), expected, "bare {raw}");
+            assert_eq!(
+                convert_emoticons(&format!("hi {raw}!")),
+                format!("hi {expected}!"),
+                "punctuated {raw}"
+            );
+            assert_eq!(
+                convert_emoticons(&format!("({raw}.")),
+                format!("({expected}."),
+                "after paren {raw}"
+            );
+        }
+
+        // Boundary rules: mid-word or URLs must NOT convert.
+        assert_eq!(convert_emoticons("a:)"), "a:)");
+        assert_eq!(convert_emoticons(":)x"), ":)x");
+        assert_eq!(
+            convert_emoticons("https://example.com"),
+            "https://example.com"
+        );
+        assert_eq!(convert_emoticons("foo<3bar"), "foo<3bar");
+        assert_eq!(convert_emoticons("a:/b"), "a:/b");
+
+        // Inline code and fenced code blocks are skipped, and conversion resumes afterward.
+        assert_eq!(
+            convert_emoticons("hi `:)` and :)"),
+            "hi `:)` and :slightly_smiling_face:"
+        );
+        assert_eq!(
+            convert_emoticons("before :)\n```\n:) <3 :D\n```\nafter ;)!"),
+            "before :slightly_smiling_face:\n```\n:) <3 :D\n```\nafter :wink:!"
+        );
+    }
+
+    #[test]
+    fn civil_from_days_handles_epoch_leap_years_and_negative_days() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+        assert_eq!(civil_from_days(19_783), (2024, 3, 1));
+        // 2100 is not a leap year (divisible by 100, not 400): 2099-12-31 -> +59 days = 2100-02-28, +60 = 2100-03-01.
+        assert_eq!(civil_from_days(47_540), (2100, 2, 28));
+        assert_eq!(civil_from_days(47_541), (2100, 3, 1));
+    }
+
+    #[test]
+    fn parse_local_schedule_validates_bounds_and_rejects_past_or_malformed() {
+        // Far-future valid date & time succeeds.
+        let future = parse_local_schedule("2099-06-15", "14:30");
+        assert!(future.is_some());
+        assert!(parse_local_schedule("2099-02-28", "00:00").is_some());
+        assert!(parse_local_schedule("2096-02-29", "23:59").is_some());
+
+        // Invalid times
+        assert_eq!(parse_local_schedule("2099-06-15", "24:00"), None);
+        assert_eq!(parse_local_schedule("2099-06-15", "12:60"), None);
+        assert_eq!(parse_local_schedule("2099-06-15", "-1:00"), None);
+        assert_eq!(parse_local_schedule("2099-06-15", "12:-5"), None);
+        assert_eq!(parse_local_schedule("2099-06-15", "noon"), None);
+        assert_eq!(parse_local_schedule("2099-06-15", "12"), None);
+
+        // Invalid / malformed dates
+        assert_eq!(parse_local_schedule("not-a-date", "12:00"), None);
+        assert_eq!(parse_local_schedule("2099-13-01", "12:00"), None);
+        assert_eq!(parse_local_schedule("2099-02-29", "12:00"), None);
+
+        // Past timestamps (<= now + 30) are rejected.
+        assert_eq!(parse_local_schedule("2020-01-01", "12:00"), None);
+        let now = crate::drafts::now_secs() as i64 + crate::messages::local_offset_now();
+        let (y, m, d) = civil_from_days(now.div_euclid(86_400));
+        let secs = now.rem_euclid(86_400);
+        let date = format!("{y:04}-{m:02}-{d:02}");
+        let time = format!("{:02}:{:02}", secs / 3_600, (secs % 3_600) / 60);
+        assert_eq!(
+            parse_local_schedule(&date, &time),
+            None,
+            "current minute is <= now + 30 and must be rejected"
+        );
     }
 }

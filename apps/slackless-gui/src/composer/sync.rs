@@ -82,7 +82,7 @@ impl Composer {
     /// Slack turns typing three backticks (` ``` `) at the start of a line into a fenced code
     /// block immediately with the caret placed inside it, ready to type code. Only fires when
     /// the third backtick opens an unclosed fence (never when closing an existing block).
-    fn auto_open_code_block(&mut self) -> bool {
+    pub(super) fn auto_open_code_block(&mut self) -> bool {
         let selection = self.editor.selection();
         if !selection.is_empty() {
             return false;
@@ -124,7 +124,7 @@ impl Composer {
     /// Slack turns a typed `:shortcode:` into its emoji as the closing colon is typed (a
     /// glyph, or the workspace's image), as a pick from the emoji menu would. Returns
     /// whether it did. Skipped inside code blocks, inline code, and markdown link URLs.
-    fn convert_typed_emoji(&mut self) -> bool {
+    pub(super) fn convert_typed_emoji(&mut self) -> bool {
         let caret = self.editor.selection().end;
         let doc = self.editor.doc();
         let before = &doc.text()[..caret];
@@ -410,5 +410,56 @@ fn utf16(text: &str, range: Range<usize>) -> Range<usize> {
 fn report(result: Result<(), InlineTokenError>) {
     if let Err(error) = result {
         eprintln!("slackless: composer tokens not applied: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lines_up, utf16};
+    use gpui_kit::component::input::{InputEdit, Point};
+
+    fn edit(start_byte: usize, old_end_byte: usize, new_end_byte: usize) -> InputEdit {
+        let zero = Point::new(0, 0);
+        InputEdit {
+            start_byte,
+            old_end_byte,
+            new_end_byte,
+            start_position: zero,
+            old_end_position: zero,
+            new_end_position: zero,
+        }
+    }
+
+    #[test]
+    fn utf16_maps_ascii_bmp_and_surrogate_pair_byte_ranges() {
+        // 'a' (1B, 1 u16), 'é' (2B, 1 u16), '🚀' (4B, 2 u16 surrogate pair), 'z' (1B, 1 u16)
+        let text = "aé🚀z";
+        assert_eq!(text.len(), 8);
+        assert_eq!(utf16(text, 0..1), 0..1);
+        assert_eq!(utf16(text, 1..3), 1..2);
+        assert_eq!(utf16(text, 3..7), 2..4);
+        assert_eq!(utf16(text, 7..8), 4..5);
+        assert_eq!(utf16(text, 0..8), 0..5);
+    }
+
+    #[test]
+    fn lines_up_validates_char_boundaries_bounds_and_resulting_length() {
+        let text = "aé🚀z"; // len 8
+
+        // Valid replacement of '🚀' (bytes 3..7) with "hi" (2 bytes -> new_end 5, total len 6)
+        let ok = edit(3, 7, 5);
+        assert!(lines_up(text, &ok, 6));
+        // Wrong resulting length rejected
+        assert!(!lines_up(text, &ok, 7));
+
+        // Mid-UTF-8 byte offset rejected
+        let mid_char = edit(4, 7, 4);
+        assert!(!lines_up(text, &mid_char, 5));
+
+        // Out-of-bounds or inverted range rejected
+        let oob = edit(0, 99, 1);
+        assert!(!lines_up(text, &oob, 1));
+        let inverted = edit(7, 3, 7);
+        assert!(!lines_up(text, &inverted, 8));
     }
 }

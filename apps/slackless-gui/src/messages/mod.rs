@@ -1091,6 +1091,16 @@ impl MessageList {
             .map(|m| m.ts.clone())
     }
 
+    #[cfg(test)]
+    pub(crate) fn message_count_for_test(&self, cx: &App) -> usize {
+        self.data.read(cx).messages.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_message_text_for_test(&self, cx: &App) -> Option<String> {
+        self.data.read(cx).messages.last().map(|m| m.text.clone())
+    }
+
     /// A one-key shortcut on the focused message, routed through the row's own
     /// [`MessageAction`] handler — the same one the hover bar and menu run. No-op while no
     /// message is focused (the mouse has not hovered the transcript yet) or the action does

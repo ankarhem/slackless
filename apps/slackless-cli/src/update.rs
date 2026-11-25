@@ -276,20 +276,7 @@ fn download_and_install(
             .status();
 
         // Atomic swap with `.prev` rollback.
-        let prev_app = target_app.with_extension("app.prev");
-        let _ = std::fs::remove_dir_all(&prev_app);
-        let had_existing = target_app.exists();
-        if had_existing {
-            std::fs::rename(&target_app, &prev_app)
-                .with_context(|| format!("moving existing {} aside", target_app.display()))?;
-        }
-        if let Err(err) = move_dir_across_fs(&new_app, &target_app) {
-            if had_existing && prev_app.exists() {
-                let _ = std::fs::rename(&prev_app, &target_app);
-            }
-            return Err(err).with_context(|| format!("installing to {}", target_app.display()));
-        }
-        let _ = std::fs::remove_dir_all(&prev_app);
+        swap_app_bundle(&new_app, &target_app)?;
 
         // Refresh CLI symlink to point at the newly installed bundle.
         let bundled_cli = target_app.join("Contents/MacOS/slackless");
@@ -328,6 +315,25 @@ fn download_and_install(
 
     let _ = std::fs::remove_dir_all(&stage_dir);
     install_result
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn swap_app_bundle(new_app: &Path, target_app: &Path) -> Result<()> {
+    let prev_app = target_app.with_extension("app.prev");
+    let _ = std::fs::remove_dir_all(&prev_app);
+    let had_existing = target_app.exists();
+    if had_existing {
+        std::fs::rename(target_app, &prev_app)
+            .with_context(|| format!("moving existing {} aside", target_app.display()))?;
+    }
+    if let Err(err) = move_dir_across_fs(new_app, target_app) {
+        if had_existing && prev_app.exists() {
+            let _ = std::fs::rename(&prev_app, target_app);
+        }
+        return Err(err).with_context(|| format!("installing to {}", target_app.display()));
+    }
+    let _ = std::fs::remove_dir_all(&prev_app);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -454,15 +460,55 @@ pub fn find_sha256_entry(sums_text: &str, asset_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let n = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "slackless-cli-update-test-{}-{}-{n}",
+                label,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn parses_calver_and_semver_versions() {
         assert_eq!(parse_version("2026.11.24-03"), Some((2026, 11, 24, 3)));
         assert_eq!(parse_version("v0.1.0"), Some((0, 1, 0, 0)));
+        assert_eq!(parse_version("  v1.2.3  "), Some((1, 2, 3, 0)));
+        assert_eq!(parse_version("1.2.3-rc1"), Some((1, 2, 3, 0)));
+        assert_eq!(parse_version("1.2.3.4"), Some((1, 2, 3, 0)));
+        assert_eq!(parse_version("1.2"), None);
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("nightly"), None);
+
         assert!(is_newer_version("2026.11.24-03", "2026.11.24-02"));
         assert!(is_newer_version("2026.11.24-01", "0.1.0"));
         assert!(!is_newer_version("2026.11.24-02", "2026.11.24-02"));
         assert!(!is_newer_version("2026.11.24-01", "2026.11.24-02"));
+        // Malformed version fallback compares inequality.
+        assert!(is_newer_version("nightly-2", "nightly-1"));
+        assert!(!is_newer_version("nightly-1", "nightly-1"));
+        assert!(is_newer_version("2026.11.24-01", "dev"));
     }
 
     #[test]
@@ -470,17 +516,81 @@ mod tests {
         assert!(is_safe_asset_name(
             "Slackless-2026.11.24-03-macos-arm64.app.tar.gz"
         ));
+        assert!(!is_safe_asset_name("."));
+        assert!(!is_safe_asset_name(".."));
         assert!(!is_safe_asset_name("../escape.tar.gz"));
         assert!(!is_safe_asset_name("dir/file.tar.gz"));
+        assert!(!is_safe_asset_name("dir\\file.tar.gz"));
         assert!(!is_safe_asset_name(""));
 
-        let hash = "0123456789abcdef".repeat(4);
-        let sums = format!("{hash} *Slackless-2026.11.24-03-macos-arm64.app.tar.gz\n");
+        let hash_upper = "0123456789ABCDEF".repeat(4);
+        let hash_lower = hash_upper.to_ascii_lowercase();
+        let other_hash = "fedcba9876543210".repeat(4);
+        let non_hex_64 = "g".repeat(64);
+        let sums = format!(
+            "\n{non_hex_64}  badhex.tar.gz\n{other_hash}  other.tar.gz\n{hash_upper} *Slackless-2026.11.24-03-macos-arm64.app.tar.gz\n"
+        );
         assert_eq!(
             find_sha256_entry(&sums, "Slackless-2026.11.24-03-macos-arm64.app.tar.gz"),
-            Some(hash)
+            Some(hash_lower)
         );
+        assert_eq!(find_sha256_entry(&sums, "other.tar.gz"), Some(other_hash));
+        assert_eq!(find_sha256_entry(&sums, "badhex.tar.gz"), None);
         assert_eq!(find_sha256_entry(&sums, "missing.tar.gz"), None);
         assert_eq!(find_sha256_entry("deadbeef  a.tar.gz\n", "a.tar.gz"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dir_is_writable_and_bundle_swap_including_rollback() {
+        let dir = TempDir::new("swap");
+        assert!(dir_is_writable(dir.path()));
+        assert!(!dir_is_writable(&dir.path().join("does-not-exist")));
+        let plain_file = dir.path().join("file.txt");
+        std::fs::write(&plain_file, b"hi").unwrap();
+        assert!(!dir_is_writable(&plain_file));
+
+        // Fresh install via swap_app_bundle.
+        let stage1 = dir.path().join("stage1/Slackless.app");
+        let target = dir.path().join("Apps/Slackless.app");
+        std::fs::create_dir_all(stage1.join("Contents")).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(stage1.join("Contents/version"), b"v1").unwrap();
+
+        swap_app_bundle(&stage1, &target).expect("fresh install");
+        assert_eq!(
+            std::fs::read_to_string(target.join("Contents/version")).unwrap(),
+            "v1"
+        );
+        assert!(!target.with_extension("app.prev").exists());
+
+        // Upgrade replaces v1 with v2 and removes .app.prev.
+        let stage2 = dir.path().join("stage2/Slackless.app");
+        std::fs::create_dir_all(stage2.join("Contents")).unwrap();
+        std::fs::write(stage2.join("Contents/version"), b"v2").unwrap();
+
+        swap_app_bundle(&stage2, &target).expect("upgrade install");
+        assert_eq!(
+            std::fs::read_to_string(target.join("Contents/version")).unwrap(),
+            "v2"
+        );
+        assert!(!target.with_extension("app.prev").exists());
+
+        // Failed swap (missing new_app) rolls back to v2 intact.
+        let missing_stage = dir.path().join("stage3/Missing.app");
+        assert!(swap_app_bundle(&missing_stage, &target).is_err());
+        assert_eq!(
+            std::fs::read_to_string(target.join("Contents/version")).unwrap(),
+            "v2"
+        );
+        assert!(!target.with_extension("app.prev").exists());
+
+        // Direct move_dir_across_fs test.
+        let src = dir.path().join("move-src");
+        let dst = dir.path().join("move-dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("marker"), b"ok").unwrap();
+        move_dir_across_fs(&src, &dst).expect("move dir");
+        assert_eq!(std::fs::read_to_string(dst.join("marker")).unwrap(), "ok");
     }
 }

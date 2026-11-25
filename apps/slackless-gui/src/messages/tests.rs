@@ -4,7 +4,8 @@ use std::cell::RefCell;
 
 use gpui_kit::base::TextSelection;
 use gpui_kit::gpui::{
-    Entity, Modifiers, MouseButton, Render, TestAppContext, VisualTestContext, Window, point, px,
+    Entity, Font, Modifiers, MouseButton, Render, TestAppContext, VisualTestContext, Window, point,
+    px,
 };
 
 use super::*;
@@ -664,4 +665,277 @@ fn snippet_card_lines_are_selectable_without_line_numbers(cx: &mut TestAppContex
 
         drop(harness);
     });
+}
+
+fn test_run_theme(verbatim: bool) -> RunTheme {
+    let fg = Hsla::default();
+    RunTheme {
+        base_font: Font::default(),
+        mono_font: Font::default(),
+        code_font: Font::default(),
+        foreground: fg,
+        muted: fg,
+        border: fg,
+        link: fg,
+        mention_bg: fg,
+        link_wash: fg,
+        code_bg: fg,
+        code_fg: fg,
+        selection: fg,
+        order: None,
+        links: None,
+        underline_links: false,
+        emoji_text_mode: false,
+        dark: true,
+        verbatim,
+        paragraphs: std::cell::Cell::new(0),
+        key: SharedString::from("unit"),
+    }
+}
+
+#[test]
+fn jumbomoji_elements_accepts_one_to_five_standard_and_custom_and_rejects_others() {
+    let mut fixtures = crate::fixtures::load();
+    fixtures.custom_emoji.insert(
+        "partyparrot".into(),
+        crate::fixtures::EmojiImage::Url("https://example.com/parrot.gif".into()),
+    );
+
+    // 1..=5 emojis (including custom and whitespace) succeed.
+    assert_eq!(jumbomoji_elements(":smile:", &fixtures).unwrap().len(), 1);
+    assert_eq!(
+        jumbomoji_elements("  :smile: :partyparrot: :rocket:  ", &fixtures)
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        jumbomoji_elements(":smile::smile::smile::smile::smile:", &fixtures)
+            .unwrap()
+            .len(),
+        5
+    );
+
+    // >5 emojis, empty, mixed text, or unknown shortcodes return None.
+    assert!(
+        jumbomoji_elements(":smile: :smile: :smile: :smile: :smile: :smile:", &fixtures).is_none()
+    );
+    assert!(jumbomoji_elements("", &fixtures).is_none());
+    assert!(jumbomoji_elements("   ", &fixtures).is_none());
+    assert!(jumbomoji_elements("hi :smile:", &fixtures).is_none());
+    assert!(jumbomoji_elements(":smile:!", &fixtures).is_none());
+    assert!(jumbomoji_elements(":definitely_not_a_real_emoji_xyz:", &fixtures).is_none());
+    assert!(jumbomoji_elements("::", &fixtures).is_none());
+}
+
+#[test]
+fn angle_token_parses_users_channels_specials_dates_links_and_mailto() {
+    let fixtures = crate::fixtures::load();
+    let theme = test_run_theme(false);
+
+    // <@U0ME>
+    let mut b = ParagraphBuilder::new();
+    let consumed = angle_token(&mut b, "<@U0ME> rest", &fixtures, &theme, DEFAULT_FLAGS);
+    assert_eq!(consumed, Some(7));
+    assert_eq!(
+        b.text,
+        format!("@{}", fixtures.mention_name(&UserId::from("U0ME")))
+    );
+    assert_eq!(b.links.len(), 1);
+    assert_eq!(b.links[0].1, LinkTarget::Profile(UserId::from("U0ME")));
+
+    // <#C0ENG|eng> and <#C0ENG>
+    let mut b = ParagraphBuilder::new();
+    assert_eq!(
+        angle_token(&mut b, "<#C0ENG|eng>", &fixtures, &theme, DEFAULT_FLAGS),
+        Some(12)
+    );
+    assert_eq!(b.text, "#eng");
+    assert_eq!(b.links[0].1, LinkTarget::Channel(ChannelId::from("C0ENG")));
+
+    let mut b = ParagraphBuilder::new();
+    assert_eq!(
+        angle_token(&mut b, "<#C0ENG>", &fixtures, &theme, DEFAULT_FLAGS),
+        Some(8)
+    );
+    assert!(b.text.contains("engineering"));
+
+    // <!here>, <!subteam^S1|@eng>, <!date^...|fallback>
+    let mut b = ParagraphBuilder::new();
+    assert_eq!(
+        angle_token(&mut b, "<!here>", &fixtures, &theme, DEFAULT_FLAGS),
+        Some(7)
+    );
+    assert_eq!(b.text, "@here");
+
+    let mut b = ParagraphBuilder::new();
+    assert_eq!(
+        angle_token(
+            &mut b,
+            "<!subteam^S1|@eng>",
+            &fixtures,
+            &theme,
+            DEFAULT_FLAGS
+        ),
+        Some(18)
+    );
+    assert_eq!(b.text, "@eng");
+
+    let mut b = ParagraphBuilder::new();
+    assert_eq!(
+        angle_token(
+            &mut b,
+            "<!date^1700000000^{date_short}|Nov 14>",
+            &fixtures,
+            &theme,
+            DEFAULT_FLAGS
+        ),
+        Some(38)
+    );
+    assert_eq!(b.text, "Nov 14");
+
+    // <https://example.com|label> and <mailto:...>
+    let mut b = ParagraphBuilder::new();
+    assert_eq!(
+        angle_token(
+            &mut b,
+            "<https://example.com/a&amp;b|*Docs*>",
+            &fixtures,
+            &theme,
+            DEFAULT_FLAGS
+        ),
+        Some(36)
+    );
+    assert_eq!(b.text, "Docs");
+    assert_eq!(b.runs[0].font.weight, FontWeight::BOLD);
+    assert_eq!(
+        b.links[0].1,
+        LinkTarget::Url(SharedString::from("https://example.com/a&b"))
+    );
+
+    let mut b = ParagraphBuilder::new();
+    assert_eq!(
+        angle_token(
+            &mut b,
+            "<mailto:alice@example.com|Email>",
+            &fixtures,
+            &theme,
+            DEFAULT_FLAGS
+        ),
+        Some(32)
+    );
+    assert_eq!(b.text, "Email");
+    assert_eq!(
+        b.links[0].1,
+        LinkTarget::Url(SharedString::from("mailto:alice@example.com"))
+    );
+
+    // Unclosed or unknown angle brackets return None.
+    let mut b = ParagraphBuilder::new();
+    assert_eq!(
+        angle_token(&mut b, "<unclosed", &fixtures, &theme, DEFAULT_FLAGS),
+        None
+    );
+    assert_eq!(
+        angle_token(&mut b, "<plain>", &fixtures, &theme, DEFAULT_FLAGS),
+        None
+    );
+}
+
+#[test]
+fn push_mrkdwn_text_and_toggle_marker_enforce_verbatim_code_and_word_boundaries() {
+    let normal_theme = test_run_theme(false);
+    let verbatim_theme = test_run_theme(true);
+
+    // Auto-links bare URLs, unescapes entities, and trims trailing punctuation.
+    let mut b = ParagraphBuilder::new();
+    push_mrkdwn_text(
+        &mut b,
+        "See https://example.com/a&amp;b, and http://test.dev).",
+        &normal_theme,
+        DEFAULT_FLAGS,
+    );
+    assert_eq!(b.text, "See https://example.com/a&b, and http://test.dev).");
+    assert_eq!(b.links.len(), 2);
+    assert_eq!(
+        b.links[0].1,
+        LinkTarget::Url(SharedString::from("https://example.com/a&b"))
+    );
+    assert_eq!(
+        b.links[1].1,
+        LinkTarget::Url(SharedString::from("http://test.dev"))
+    );
+
+    // Verbatim mode and inline code skip auto-linking.
+    let mut b_verb = ParagraphBuilder::new();
+    push_mrkdwn_text(
+        &mut b_verb,
+        "visit https://example.com",
+        &verbatim_theme,
+        DEFAULT_FLAGS,
+    );
+    assert!(b_verb.links.is_empty());
+
+    let mut b_code = ParagraphBuilder::new();
+    push_mrkdwn_text(
+        &mut b_code,
+        "https://example.com",
+        &normal_theme,
+        RunFlags {
+            code: true,
+            ..DEFAULT_FLAGS
+        },
+    );
+    assert!(b_code.links.is_empty());
+
+    // toggle_marker word boundaries and code isolation
+    let mut flags = DEFAULT_FLAGS;
+    assert!(toggle_marker(&mut flags, '*', None, "bold*"));
+    assert!(flags.bold);
+    // Mid-word close is rejected, end-of-word close succeeds.
+    assert!(!toggle_marker(&mut flags, '*', Some('d'), "more"));
+    assert!(toggle_marker(&mut flags, '*', Some('d'), " rest"));
+    assert!(!flags.bold);
+    // Mid-word open is rejected.
+    assert!(!toggle_marker(&mut flags, '_', Some('a'), "b_"));
+    // Inside inline code, non-backtick markers do not toggle.
+    flags.code = true;
+    assert!(!toggle_marker(&mut flags, '*', None, "bold*"));
+    assert!(toggle_marker(&mut flags, '`', Some('x'), " "));
+    assert!(!flags.code);
+}
+
+#[test]
+fn strip_quote_prefix_hex_color_huddle_duration_and_ts_just_before() {
+    assert_eq!(strip_quote_prefix("> hello"), Some("hello"));
+    assert_eq!(strip_quote_prefix(">hello"), Some("hello"));
+    assert_eq!(strip_quote_prefix("&gt; hello"), Some("hello"));
+    assert_eq!(strip_quote_prefix("&gt;hello"), Some("hello"));
+    assert_eq!(strip_quote_prefix(">"), Some(""));
+    assert_eq!(strip_quote_prefix("plain"), None);
+
+    assert!(hex_color("#2BAC76").is_some());
+    assert!(hex_color("2BAC76").is_some());
+    assert!(hex_color("#fff").is_none());
+    assert!(hex_color("#zzzzzz").is_none());
+
+    assert_eq!(format_huddle_duration(0), "0s");
+    assert_eq!(format_huddle_duration(16), "16s");
+    assert_eq!(format_huddle_duration(60), "1m");
+    assert_eq!(format_huddle_duration(724), "12m 4s");
+    assert_eq!(format_huddle_duration(3600), "1h");
+    assert_eq!(format_huddle_duration(3900), "1h 5m");
+
+    // ts_just_before: microsecond decrement, second borrow, zero floor, malformed fallback.
+    assert_eq!(
+        ts_just_before(&Ts::from("1700000000.000100")).as_str(),
+        "1700000000.000099"
+    );
+    assert_eq!(
+        ts_just_before(&Ts::from("1700000000.000000")).as_str(),
+        "1699999999.999999"
+    );
+    assert_eq!(ts_just_before(&Ts::from("0.000000")).as_str(), "0.000000");
+    assert_eq!(ts_just_before(&Ts::from("malformed")).as_str(), "0.000000");
+    assert_eq!(ts_just_before(&Ts::from("abc.def")).as_str(), "0.000000");
 }

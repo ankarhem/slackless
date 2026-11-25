@@ -36,7 +36,7 @@ pub fn attachments(message: &Message, kcx: &KitCx, cx: &App) -> Option<Div> {
     Some(v_flex().gap_2().children(cards))
 }
 
-fn is_page_preview_attachment(attachment: &Attachment) -> bool {
+pub(super) fn is_page_preview_attachment(attachment: &Attachment) -> bool {
     !attachment.is_msg_unfurl
         && attachment.from_url.is_some()
         && attachment.service_name.is_some()
@@ -61,7 +61,7 @@ fn bar_color(color: Option<&str>, cx: &App) -> Hsla {
 }
 
 /// The attachment's own timestamp (`ts`, a number or a numeric string), in Unix seconds.
-fn attachment_secs(attachment: &Attachment) -> Option<i64> {
+pub(super) fn attachment_secs(attachment: &Attachment) -> Option<i64> {
     attachment.ts.as_ref().and_then(|ts| {
         ts.as_i64().or_else(|| {
             ts.as_str()
@@ -73,7 +73,7 @@ fn attachment_secs(attachment: &Attachment) -> Option<i64> {
 
 /// `text` with Slack's link markup reduced to what it displays: `<url|label>` to `label`,
 /// `<url>` to `url` (footers show links as plain muted text).
-fn link_labels(text: &str) -> String {
+pub(super) fn link_labels(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find('<') {

@@ -2515,4 +2515,266 @@ mod tests {
             assert!(s.has_any_unreads());
         });
     }
+
+    #[test]
+    fn team_initials_mentions_user_and_hidden_unreads_pure_helpers() {
+        use slackless_core::types::rich_text::{
+            ListStyle, RichTextBlock, RichTextDivider, RichTextHeader, RichTextList,
+            RichTextPreformatted, RichTextQuote, RichTextSection, TextElement, UserElement,
+        };
+
+        assert_eq!(team_initials("Acme Corp"), "AC");
+        assert_eq!(team_initials("slackless"), "S");
+        assert_eq!(team_initials("One Two Three"), "OT");
+        assert_eq!(team_initials("   "), "");
+
+        let me = UserId::from("U0ME");
+        let other = UserId::from("U0OTHER");
+        let mention_el = RichTextElement::User(UserElement {
+            user_id: me.clone(),
+            style: None,
+        });
+        let other_el = RichTextElement::User(UserElement {
+            user_id: other.clone(),
+            style: None,
+        });
+
+        // Raw mrkdwn fallback
+        let raw_hit = Message {
+            text: "hey <@U0ME> check this".into(),
+            ..Default::default()
+        };
+        assert!(mentions_user(&raw_hit, &me));
+        assert!(!mentions_user(&raw_hit, &other));
+
+        // Nested RichText blocks: Section, List, Quote, Preformatted, Header
+        let containers = [
+            RichTextContainer::Section(RichTextSection {
+                elements: vec![mention_el.clone()],
+            }),
+            RichTextContainer::List(RichTextList {
+                style: ListStyle::Bullet,
+                elements: vec![RichTextContainer::Section(RichTextSection {
+                    elements: vec![mention_el.clone()],
+                })],
+                indent: Some(0),
+                offset: None,
+                border: None,
+            }),
+            RichTextContainer::Quote(RichTextQuote {
+                elements: vec![mention_el.clone()],
+                border: None,
+            }),
+            RichTextContainer::Preformatted(RichTextPreformatted {
+                elements: vec![mention_el.clone()],
+                border: None,
+                language: None,
+            }),
+            RichTextContainer::Header(RichTextHeader {
+                level: Some(1),
+                elements: vec![mention_el],
+            }),
+        ];
+        for container in containers {
+            let msg = Message {
+                blocks: vec![Block::RichText(RichTextBlock {
+                    block_id: None,
+                    elements: vec![container],
+                })],
+                ..Default::default()
+            };
+            assert!(mentions_user(&msg, &me));
+            assert!(!mentions_user(&msg, &other));
+        }
+
+        // Divider / plain text / other user do not match
+        let no_hit = Message {
+            blocks: vec![Block::RichText(RichTextBlock {
+                block_id: None,
+                elements: vec![
+                    RichTextContainer::Divider(RichTextDivider::default()),
+                    RichTextContainer::Section(RichTextSection {
+                        elements: vec![
+                            other_el,
+                            RichTextElement::Text(TextElement {
+                                text: "plain".into(),
+                                style: None,
+                            }),
+                        ],
+                    }),
+                ],
+            })],
+            ..Default::default()
+        };
+        assert!(!mentions_user(&no_hit, &me));
+
+        // Unlaid-out ScrollHandle has no item bounds -> (None, None).
+        let scroll = ScrollHandle::new();
+        let (below, above) = hidden_unreads(&scroll, &[(0, false), (2, true)]);
+        assert!(below.is_none() && above.is_none());
+    }
+
+    #[gpui::test]
+    fn sidebar_section_prefs_round_trip_and_hidden_conversations_classify_filters(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use slackless_core::api::ConversationCounts;
+        use slackless_core::types::ConversationProperties;
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+
+        let mut fx = crate::fixtures::load();
+        fx.messages.clear();
+        fx.counts.clear();
+        let selected_ch = fx.channels[0].id.clone();
+        let unread_ch = fx.channels[1].id.clone();
+        let mention_ch = fx.channels[2].id.clone();
+        let mut read_ch = Conversation {
+            id: ChannelId::from("C_READ"),
+            name: Some("quiet".into()),
+            is_channel: true,
+            ..Default::default()
+        };
+        let mut dormant_ch = Conversation {
+            id: ChannelId::from("C_DORMANT"),
+            name: Some("old-stuff".into()),
+            is_channel: true,
+            ..Default::default()
+        };
+        let mut props = ConversationProperties::default();
+        props.extra.insert(
+            "is_dormant".into(),
+            crate::blockkit::serde_json::json!(true),
+        );
+        dormant_ch.properties = Some(props);
+        let muted_ch = Conversation {
+            id: ChannelId::from("C_MUTED"),
+            name: Some("noisy".into()),
+            is_channel: true,
+            ..Default::default()
+        };
+        read_ch.is_general = false;
+        fx.channels.push(read_ch);
+        fx.channels.push(dormant_ch);
+        fx.channels.push(muted_ch);
+
+        fx.notify_levels
+            .insert(ChannelId::from("C_MUTED"), NotifyLevel::Muted);
+        fx.counts.insert(
+            unread_ch.clone(),
+            ConversationCounts {
+                id: unread_ch.clone(),
+                has_unreads: true,
+                mention_count: 0,
+                ..Default::default()
+            },
+        );
+        fx.counts.insert(
+            mention_ch.clone(),
+            ConversationCounts {
+                id: mention_ch.clone(),
+                has_unreads: true,
+                mention_count: 2,
+                ..Default::default()
+            },
+        );
+        fx.counts.insert(
+            ChannelId::from("C_MUTED"),
+            ConversationCounts {
+                id: ChannelId::from("C_MUTED"),
+                has_unreads: true,
+                mention_count: 0,
+                ..Default::default()
+            },
+        );
+
+        let all_ids = vec![
+            selected_ch.clone(),
+            unread_ch.clone(),
+            mention_ch.clone(),
+            ChannelId::from("C_READ"),
+            ChannelId::from("C_DORMANT"),
+            ChannelId::from("C_MUTED"),
+        ];
+
+        let fx = Arc::new(fx);
+        let mounted = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = mounted.clone();
+        let init_fx = fx.clone();
+        let init_sel = selected_ch.clone();
+        let (_root, cx) = cx.add_window_view(move |window, cx| {
+            let entity = Sidebar::new(init_fx.clone(), init_sel.clone(), window, cx);
+            *slot.borrow_mut() = Some(entity.clone());
+            gpui_kit::component::Root::new(entity, window, cx)
+        });
+        let sidebar = mounted.borrow_mut().take().unwrap();
+
+        let key = SharedString::from("channels");
+
+        // 1. Export / restore section prefs round-trip.
+        sidebar.update(cx, |s, cx| {
+            s.set_section_filter(key.clone(), SectionFilter::Unreads, cx);
+            s.set_section_sort(key.clone(), SectionSort::Priority, cx);
+            let exported = s.export_section_prefs();
+            assert_eq!(
+                exported.filters.get("channels"),
+                Some(&SectionFilter::Unreads)
+            );
+            assert_eq!(exported.sorts.get("channels"), Some(&SectionSort::Priority));
+
+            s.restore_section_prefs(crate::bridge::SectionPrefs::default(), cx);
+            assert_eq!(s.section_filter(&key), SectionFilter::ActiveOnly);
+            s.restore_section_prefs(exported, cx);
+            assert_eq!(s.section_filter(&key), SectionFilter::Unreads);
+            assert_eq!(s.section_sort(&key, false), SectionSort::Priority);
+        });
+
+        // 2. SectionFilter::Unreads hides read + muted + dormant (selected stays visible).
+        sidebar.read_with(cx, |s, _| {
+            let h = s.hidden_conversations(&key, &all_ids);
+            assert!(!h.read.contains(&selected_ch));
+            assert!(!h.read.contains(&unread_ch));
+            assert!(!h.read.contains(&mention_ch));
+            assert!(h.read.contains(&ChannelId::from("C_READ")));
+            assert!(h.read.contains(&ChannelId::from("C_DORMANT")));
+            assert!(h.muted.contains(&ChannelId::from("C_MUTED")));
+        });
+
+        // 3. SectionFilter::Mentions also hides unread-without-mention into `hidden.unread`.
+        sidebar.update(cx, |s, cx| {
+            s.set_section_filter(key.clone(), SectionFilter::Mentions, cx);
+        });
+        sidebar.read_with(cx, |s, _| {
+            let h = s.hidden_conversations(&key, &all_ids);
+            assert!(h.unread.contains(&unread_ch));
+            assert!(!h.unread.contains(&mention_ch));
+            assert!(h.read.contains(&ChannelId::from("C_READ")));
+            assert!(h.muted.contains(&ChannelId::from("C_MUTED")));
+        });
+
+        // 4. SectionFilter::ActiveOnly hides dormant into `hidden.dormant` and muted into `hidden.muted`, keeping active read channels visible.
+        sidebar.update(cx, |s, cx| {
+            s.set_section_filter(key.clone(), SectionFilter::ActiveOnly, cx);
+        });
+        sidebar.read_with(cx, |s, _| {
+            let h = s.hidden_conversations(&key, &all_ids);
+            assert!(h.dormant.contains(&ChannelId::from("C_DORMANT")));
+            assert!(h.muted.contains(&ChannelId::from("C_MUTED")));
+            assert!(!h.read.contains(&ChannelId::from("C_READ")));
+        });
+
+        // 5. Collapsed section hides everything except selected & mentions.
+        sidebar.update(cx, |s, _| {
+            s.collapsed.insert(key.clone());
+        });
+        sidebar.read_with(cx, |s, _| {
+            let h = s.hidden_conversations(&key, &all_ids);
+            assert!(h.unread.contains(&unread_ch));
+            assert!(h.read.contains(&ChannelId::from("C_READ")));
+            assert!(!h.unread.contains(&mention_ch));
+        });
+    }
 }

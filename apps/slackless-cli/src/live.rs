@@ -68,6 +68,16 @@ fn resolve_channel(workspace: &TeamId, arg: &str) -> (ChannelId, Option<String>)
     }
 }
 
+/// Selects the read cursor timestamp for `mark-thread`.
+/// Moving the read cursor to `"0"` when marking unread without an explicit `ts` marks all replies unread.
+pub(crate) fn mark_thread_cursor(thread_ts: &str, ts: Option<&str>, unread: bool) -> Ts {
+    if unread && ts.is_none() {
+        Ts::from("0".to_owned())
+    } else {
+        Ts::from(ts.unwrap_or(thread_ts).to_owned())
+    }
+}
+
 /// `mark-thread <channel> <thread_ts> [ts] [--unread]`
 pub async fn run_mark_thread(
     ctx: &Ctx,
@@ -83,12 +93,7 @@ pub async fn run_mark_thread(
     };
     let (channel, label) = resolve_channel(&workspace, channel_arg);
     let root = Ts::from(thread_ts.to_owned());
-    // Moving the read cursor before the latest reply marks newer replies unread.
-    let cursor = if unread && ts.is_none() {
-        Ts::from("0".to_owned())
-    } else {
-        Ts::from(ts.unwrap_or(thread_ts).to_owned())
-    };
+    let cursor = mark_thread_cursor(thread_ts, ts, unread);
     let read = !unread;
     match api
         .subscriptions_thread_mark(&channel, &root, &cursor)
@@ -1153,6 +1158,29 @@ pub async fn run_status_show(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode> 
     }
 }
 
+/// Normalize a status emoji argument into `:shortcode:` (or empty string to clear).
+pub(crate) fn normalize_status_emoji(emoji: Option<&str>) -> Option<String> {
+    emoji.map(|e| {
+        let trimmed = e.trim().trim_matches(':');
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!(":{trimmed}:")
+        }
+    })
+}
+
+/// Convert `--expires-in SECS` into a unix epoch expiration (`0` for non-positive values).
+pub(crate) fn compute_status_expiration(expires_in: Option<i64>, now_secs: i64) -> Option<i64> {
+    expires_in.map(|secs| {
+        if secs <= 0 {
+            0
+        } else {
+            now_secs.saturating_add(secs)
+        }
+    })
+}
+
 /// `status set <TEXT> [--emoji EMOJI] [--expires-in SECS]`
 pub async fn run_status_set(
     ctx: &Ctx,
@@ -1165,25 +1193,12 @@ pub async fn run_status_set(
         Ok(pair) => pair,
         Err(exit) => return Ok(exit),
     };
-    let status_emoji = emoji.map(|e| {
-        let trimmed = e.trim().trim_matches(':');
-        if trimmed.is_empty() {
-            String::new()
-        } else {
-            format!(":{trimmed}:")
-        }
-    });
-    let status_expiration = expires_in.map(|secs| {
-        if secs <= 0 {
-            0
-        } else {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            now.saturating_add(secs)
-        }
-    });
+    let status_emoji = normalize_status_emoji(emoji.as_deref());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let status_expiration = compute_status_expiration(expires_in, now);
     let update = slackless_core::api::ProfileUpdate {
         status_text: Some(text.clone()),
         status_emoji: status_emoji.clone(),
@@ -1236,29 +1251,22 @@ pub async fn run_status_clear(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode>
     }
 }
 
-/// `unread`: live unread channels, DMs, mentions, and threads (`client.counts`).
-pub async fn run_unread(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
-        Err(exit) => return Ok(exit),
-    };
-    let counts = match api.client_counts().await {
-        Ok(c) => c,
-        Err(err) => return Ok(api_fail(ctx, &err)),
-    };
-    let archive = Archive::open(&workspace);
-    let notify_levels = archive
-        .as_ref()
-        .map(|a| a.notify_levels(&workspace))
-        .unwrap_or_default();
-    let label_for = |id: &ChannelId| -> String {
-        archive
-            .as_ref()
-            .and_then(|a| a.resolve_channel(&workspace, id.as_str()))
-            .map(|r| r.label())
-            .unwrap_or_else(|| id.to_string())
-    };
+pub(crate) struct UnreadSummary {
+    pub items: Vec<serde_json::Value>,
+    pub human: String,
+    pub total_mentions: u32,
+    pub threads_unread: bool,
+}
 
+/// Filter and format `client.counts` unread entries, suppressing muted conversations with 0 mentions.
+pub(crate) fn summarize_unread<F>(
+    counts: &slackless_core::api::ClientCounts,
+    notify_levels: &std::collections::HashMap<ChannelId, slackless_core::NotifyLevel>,
+    label_for: F,
+) -> UnreadSummary
+where
+    F: Fn(&ChannelId) -> String,
+{
     let mut items = Vec::new();
     let mut lines = String::new();
     let mut total_mentions: u32 = 0;
@@ -1301,20 +1309,71 @@ pub async fn run_unread(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode> {
             counts.threads.mention_count
         ));
     }
+    UnreadSummary {
+        items,
+        human: lines,
+        total_mentions,
+        threads_unread,
+    }
+}
+
+/// `unread`: live unread channels, DMs, mentions, and threads (`client.counts`).
+pub async fn run_unread(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let counts = match api.client_counts().await {
+        Ok(c) => c,
+        Err(err) => return Ok(api_fail(ctx, &err)),
+    };
+    let archive = Archive::open(&workspace);
+    let notify_levels = archive
+        .as_ref()
+        .map(|a| a.notify_levels(&workspace))
+        .unwrap_or_default();
+    let label_for = |id: &ChannelId| -> String {
+        archive
+            .as_ref()
+            .and_then(|a| a.resolve_channel(&workspace, id.as_str()))
+            .map(|r| r.label())
+            .unwrap_or_else(|| id.to_string())
+    };
+    let summary = summarize_unread(&counts, &notify_levels, label_for);
     output::emit(
         ctx.json,
         &serde_json::json!({
             "ok": true,
             "workspace": workspace.as_str(),
-            "unread_conversations": items.len(),
-            "total_mentions": total_mentions,
-            "threads_unread": threads_unread,
+            "unread_conversations": summary.items.len(),
+            "total_mentions": summary.total_mentions,
+            "threads_unread": summary.threads_unread,
             "threads_mentions": counts.threads.mention_count,
-            "items": items,
+            "items": summary.items,
         }),
-        &lines,
+        &summary.human,
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// Select the preferred authenticated download URL for a Slack file.
+pub(crate) fn select_download_url(file: &slackless_core::types::File) -> Option<&str> {
+    file.url_private_download
+        .as_deref()
+        .or(file.url_private.as_deref())
+}
+
+/// Sanitize a Slack file's display/file name into a single safe filename component.
+pub(crate) fn sanitize_download_name(
+    file_id: &str,
+    name: Option<&str>,
+    title: Option<&str>,
+) -> String {
+    let fallback_name = name.or(title).unwrap_or(file_id);
+    std::path::Path::new(fallback_name)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("{file_id}.bin"))
 }
 
 /// `download <FILE_ID> [--out PATH]`
@@ -1332,11 +1391,7 @@ pub async fn run_download(
         Ok(f) => f,
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
-    let Some(url) = file
-        .url_private_download
-        .as_deref()
-        .or(file.url_private.as_deref())
-    else {
+    let Some(url) = select_download_url(&file) else {
         return Ok(fail(
             ctx,
             "no_download_url",
@@ -1347,15 +1402,7 @@ pub async fn run_download(
         Ok(b) => b,
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
-    let fallback_name = file
-        .name
-        .as_deref()
-        .or(file.title.as_deref())
-        .unwrap_or(file_id);
-    let safe_name = std::path::Path::new(fallback_name)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| format!("{file_id}.bin"));
+    let safe_name = sanitize_download_name(file_id, file.name.as_deref(), file.title.as_deref());
     let dest = out
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(&safe_name));
@@ -1467,7 +1514,14 @@ pub async fn run_backfill(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slackless_core::api::{SlackListColumn, SlackListRow};
+    use slackless_core::NotifyLevel;
+    use slackless_core::api::{
+        ClientCounts, ConversationCounts, SlackListColumn, SlackListRow, ThreadCounts,
+    };
+    use slackless_core::types::event::{
+        Hello, ItemRef, MessageDeleted, ReactionEvent, ThreadMarkedEvent, ThreadSubscription,
+    };
+    use slackless_core::types::{BotId, File, FileId, Message, MessageEvent, UserId};
     use std::collections::HashMap;
 
     #[test]
@@ -1515,5 +1569,350 @@ mod tests {
         let tsv = list_to_tsv(&data);
         assert!(tsv.contains("id\tTask\tDone\n"));
         assert!(tsv.contains("Rec1\tShip, v1\ttrue\n"));
+    }
+
+    #[test]
+    fn cell_to_text_covers_all_variants_and_list_escaping() {
+        assert_eq!(cell_to_text(None), "");
+        assert_eq!(cell_to_text(Some(&SlackListCellValue::Empty)), "");
+        assert_eq!(
+            cell_to_text(Some(&SlackListCellValue::Date("2026-11-25".into()))),
+            "2026-11-25"
+        );
+        assert_eq!(
+            cell_to_text(Some(&SlackListCellValue::Number("42.5".into()))),
+            "42.5"
+        );
+        assert_eq!(
+            cell_to_text(Some(&SlackListCellValue::Users(vec![
+                UserId::from("U1"),
+                UserId::from("U2"),
+            ]))),
+            "U1, U2"
+        );
+        assert_eq!(
+            cell_to_text(Some(&SlackListCellValue::Select(vec![
+                "P0".into(),
+                "Backend".into(),
+            ]))),
+            "P0, Backend"
+        );
+        assert_eq!(
+            cell_to_text(Some(&SlackListCellValue::Checkbox(false))),
+            "false"
+        );
+        assert_eq!(
+            cell_to_text(Some(&SlackListCellValue::Link {
+                label: "Spec".into(),
+                url: "https://example.com".into(),
+            })),
+            "Spec"
+        );
+        assert_eq!(
+            cell_to_text(Some(&SlackListCellValue::Link {
+                label: String::new(),
+                url: "https://example.com".into(),
+            })),
+            "https://example.com"
+        );
+
+        // Key fallback when cell is stored under col.key, plus CSV quoting & TSV sanitization.
+        let mut cells = HashMap::new();
+        cells.insert(
+            "notes_key".into(),
+            SlackListCellValue::Text("Say \"hi\"\tline1\nline2".into()),
+        );
+        let data = SlackListData {
+            file_id: "F2".into(),
+            title: "T".into(),
+            description: "D".into(),
+            columns: vec![SlackListColumn {
+                id: "ColMissing".into(),
+                key: "notes_key".into(),
+                name: "Notes, \"Raw\"".into(),
+                kind: "text".into(),
+                is_primary: true,
+                choices: vec![],
+            }],
+            rows: vec![SlackListRow {
+                id: "R1".into(),
+                cells,
+            }],
+        };
+
+        let json = list_to_json_value(&data);
+        assert_eq!(
+            json["items"][0]["fields"]["Notes, \"Raw\""],
+            "Say \"hi\"\tline1\nline2"
+        );
+
+        let csv = list_to_csv(&data);
+        assert_eq!(
+            csv,
+            "\"Notes, \"\"Raw\"\"\"\n\"Say \"\"hi\"\"\tline1\nline2\"\n"
+        );
+
+        let tsv = list_to_tsv(&data);
+        assert_eq!(tsv, "id\tNotes, \"Raw\"\nR1\tSay \"hi\" line1 line2\n");
+    }
+
+    #[test]
+    fn format_watch_event_handles_messages_reactions_threads_filters_and_ignored() {
+        let ch1 = ChannelId::from("C1");
+        let ch2 = ChannelId::from("C2");
+
+        // User message matching filter.
+        let user_msg = SlackEvent::Message(MessageEvent::Message(Box::new(Message {
+            channel: Some(ch1.clone()),
+            ts: Ts::from("1700000001.000100"),
+            thread_ts: Some(Ts::from("1700000000.000001")),
+            user: Some(UserId::from("U1")),
+            text: "hello".into(),
+            ..Message::default()
+        })));
+        let (json, human) = format_watch_event(&user_msg, Some(&ch1)).expect("matches C1");
+        assert_eq!(json["type"], "message");
+        assert_eq!(json["channel"], "C1");
+        assert_eq!(json["user"], "U1");
+        assert_eq!(json["thread_ts"], "1700000000.000001");
+        assert_eq!(human, "message\tC1\t1700000001.000100\tU1: hello\n");
+        assert!(format_watch_event(&user_msg, Some(&ch2)).is_none());
+
+        // Bot message and unknown author fallback.
+        let bot_msg = SlackEvent::Message(MessageEvent::Message(Box::new(Message {
+            channel: Some(ch1.clone()),
+            ts: Ts::from("1700000002.000100"),
+            bot_id: Some(BotId::from("B9")),
+            text: "deploy ok".into(),
+            ..Message::default()
+        })));
+        let (_, human) = format_watch_event(&bot_msg, None).expect("no filter");
+        assert_eq!(human, "message\tC1\t1700000002.000100\tB9: deploy ok\n");
+
+        let unknown_msg = SlackEvent::Message(MessageEvent::Message(Box::new(Message {
+            ts: Ts::from("1700000003.000100"),
+            text: "ghost".into(),
+            ..Message::default()
+        })));
+        let (_, human) = format_watch_event(&unknown_msg, None).expect("unknown author");
+        assert_eq!(human, "message\t\t1700000003.000100\tunknown: ghost\n");
+
+        // ReactionAdded with channel filter.
+        let rx_ev = SlackEvent::ReactionAdded(ReactionEvent {
+            user: UserId::from("U2"),
+            reaction: "tada".into(),
+            item: ItemRef {
+                r#type: "message".into(),
+                channel: Some(ch1.clone()),
+                ts: Some(Ts::from("1700000001.000100")),
+                ..ItemRef::default()
+            },
+            ..ReactionEvent::default()
+        });
+        let (json, human) = format_watch_event(&rx_ev, Some(&ch1)).expect("rx matches");
+        assert_eq!(json["type"], "reaction_added");
+        assert_eq!(json["reaction"], "tada");
+        assert_eq!(human, "reaction_added\tC1\t1700000001.000100\tU2 :tada: \n");
+        assert!(format_watch_event(&rx_ev, Some(&ch2)).is_none());
+
+        // ThreadMarked with and without last_read.
+        let tm_ev = SlackEvent::ThreadMarked(ThreadMarkedEvent {
+            subscription: ThreadSubscription {
+                channel: ch1.clone(),
+                thread_ts: Ts::from("1700000000.000001"),
+                last_read: Some(Ts::from("1700000005.000000")),
+                active: true,
+            },
+            event_ts: None,
+        });
+        let (json, human) = format_watch_event(&tm_ev, Some(&ch1)).expect("tm matches");
+        assert_eq!(json["type"], "thread_marked");
+        assert_eq!(json["last_read"], "1700000005.000000");
+        assert_eq!(json["active"], true);
+        assert_eq!(
+            human,
+            "thread_marked\tC1\t1700000000.000001\tlast_read=1700000005.000000\n"
+        );
+        assert!(format_watch_event(&tm_ev, Some(&ch2)).is_none());
+
+        let tm_none = SlackEvent::ThreadMarked(ThreadMarkedEvent {
+            subscription: ThreadSubscription {
+                channel: ch1.clone(),
+                thread_ts: Ts::from("1700000000.000001"),
+                last_read: None,
+                active: false,
+            },
+            event_ts: None,
+        });
+        let (_, human) = format_watch_event(&tm_none, None).expect("tm none");
+        assert_eq!(human, "thread_marked\tC1\t1700000000.000001\tlast_read=-\n");
+
+        // Ignored events return None.
+        assert!(format_watch_event(&SlackEvent::Hello(Hello::default()), None).is_none());
+        let deleted_ev = SlackEvent::Message(MessageEvent::Deleted(MessageDeleted {
+            channel: Some(ch1),
+            deleted_ts: Ts::from("1700000001.000100"),
+            previous_message: None,
+            ts: None,
+            event_ts: None,
+        }));
+        assert!(format_watch_event(&deleted_ev, None).is_none());
+    }
+
+    #[test]
+    fn summarize_unread_suppresses_muted_without_mentions_and_handles_caught_up() {
+        let counts = ClientCounts {
+            ims: vec![ConversationCounts {
+                id: ChannelId::from("D1"),
+                dm_count: 2,
+                has_unreads: true,
+                ..ConversationCounts::default()
+            }],
+            mpims: vec![ConversationCounts {
+                id: ChannelId::from("G1"),
+                has_unreads: false,
+                ..ConversationCounts::default()
+            }],
+            channels: vec![
+                // Muted with 0 mentions -> suppressed.
+                ConversationCounts {
+                    id: ChannelId::from("C_MUTED_QUIET"),
+                    has_unreads: true,
+                    mention_count: 0,
+                    ..ConversationCounts::default()
+                },
+                // Muted WITH a mention -> kept!
+                ConversationCounts {
+                    id: ChannelId::from("C_MUTED_PING"),
+                    has_unreads: true,
+                    mention_count: 1,
+                    ..ConversationCounts::default()
+                },
+                // Normal unread channel -> kept.
+                ConversationCounts {
+                    id: ChannelId::from("C_ENG"),
+                    has_unreads: true,
+                    mention_count: 0,
+                    latest: Some(Ts::from("1700000010.000000")),
+                    ..ConversationCounts::default()
+                },
+            ],
+            threads: ThreadCounts {
+                has_unreads: true,
+                mention_count: 3,
+            },
+            ..ClientCounts::default()
+        };
+        let mut levels = HashMap::new();
+        levels.insert(ChannelId::from("C_MUTED_QUIET"), NotifyLevel::Muted);
+        levels.insert(ChannelId::from("C_MUTED_PING"), NotifyLevel::Muted);
+        levels.insert(ChannelId::from("C_ENG"), NotifyLevel::Mentions);
+
+        let summary = summarize_unread(&counts, &levels, |id| format!("label:{id}"));
+        let ids: Vec<&str> = summary
+            .items
+            .iter()
+            .filter_map(|v| v["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["D1", "C_MUTED_PING", "C_ENG"]);
+        assert_eq!(summary.total_mentions, 3);
+        assert!(summary.threads_unread);
+        assert!(summary.human.contains("dm\tD1\tlabel:D1\tmentions=2\n"));
+        assert!(summary.human.contains("threads\t-\tThreads\tmentions=3\n"));
+        assert!(!summary.human.contains("C_MUTED_QUIET"));
+
+        // Caught-up case when all unreads are muted with 0 mentions and threads are clean.
+        let empty = ClientCounts {
+            channels: vec![ConversationCounts {
+                id: ChannelId::from("C_MUTED_QUIET"),
+                has_unreads: true,
+                ..ConversationCounts::default()
+            }],
+            ..ClientCounts::default()
+        };
+        let caught_up = summarize_unread(&empty, &levels, |id| id.to_string());
+        assert!(caught_up.items.is_empty());
+        assert!(!caught_up.threads_unread);
+        assert_eq!(caught_up.human, "all caught up\n");
+    }
+
+    #[test]
+    fn status_normalization_download_sanitization_and_mark_thread_cursor() {
+        // Status emoji normalization.
+        assert_eq!(normalize_status_emoji(None), None);
+        assert_eq!(
+            normalize_status_emoji(Some("calendar")).as_deref(),
+            Some(":calendar:")
+        );
+        assert_eq!(
+            normalize_status_emoji(Some("  ::tada::  ")).as_deref(),
+            Some(":tada:")
+        );
+        assert_eq!(normalize_status_emoji(Some(":::")).as_deref(), Some(""));
+        assert_eq!(normalize_status_emoji(Some("   ")).as_deref(), Some(""));
+
+        // Status expiration.
+        assert_eq!(compute_status_expiration(None, 1000), None);
+        assert_eq!(compute_status_expiration(Some(0), 1000), Some(0));
+        assert_eq!(compute_status_expiration(Some(-60), 1000), Some(0));
+        assert_eq!(compute_status_expiration(Some(300), 1000), Some(1300));
+        assert_eq!(
+            compute_status_expiration(Some(10), i64::MAX - 2),
+            Some(i64::MAX)
+        );
+
+        // Download filename sanitization & URL fallback.
+        assert_eq!(
+            sanitize_download_name("F1", Some("../../etc/passwd"), None),
+            "passwd"
+        );
+        assert_eq!(
+            sanitize_download_name("F1", Some("dir/sub/report.pdf"), Some("Title")),
+            "report.pdf"
+        );
+        assert_eq!(
+            sanitize_download_name("F1", None, Some("../secret.txt")),
+            "secret.txt"
+        );
+        assert_eq!(sanitize_download_name("F1", Some(".."), None), "F1.bin");
+        assert_eq!(sanitize_download_name("F1", Some("/"), None), "F1.bin");
+        assert_eq!(sanitize_download_name("F1", Some(""), None), "F1.bin");
+        assert_eq!(sanitize_download_name("F1", None, None), "F1");
+
+        let both_urls = File {
+            id: FileId::from("F1"),
+            url_private: Some("https://files.slack.com/private".into()),
+            url_private_download: Some("https://files.slack.com/download".into()),
+            ..File::default()
+        };
+        assert_eq!(
+            select_download_url(&both_urls),
+            Some("https://files.slack.com/download")
+        );
+        let private_only = File {
+            id: FileId::from("F2"),
+            url_private: Some("https://files.slack.com/private".into()),
+            ..File::default()
+        };
+        assert_eq!(
+            select_download_url(&private_only),
+            Some("https://files.slack.com/private")
+        );
+        assert_eq!(select_download_url(&File::default()), None);
+
+        // mark-thread cursor selection.
+        assert_eq!(
+            mark_thread_cursor("1700.001", None, false),
+            Ts::from("1700.001")
+        );
+        assert_eq!(
+            mark_thread_cursor("1700.001", Some("1700.005"), false),
+            Ts::from("1700.005")
+        );
+        assert_eq!(mark_thread_cursor("1700.001", None, true), Ts::from("0"));
+        assert_eq!(
+            mark_thread_cursor("1700.001", Some("1700.002"), true),
+            Ts::from("1700.002")
+        );
     }
 }

@@ -853,3 +853,134 @@ pub fn store_huddles(store: &Store, team: &TeamId) -> Vec<RecentHuddle> {
     huddles.sort_by_key(|huddle| std::cmp::Reverse(huddle.ts.clone()));
     huddles
 }
+
+#[cfg(test)]
+mod tests {
+    use super::store_huddles;
+    use crate::blockkit::serde_json::json;
+    use slackless_core::store::Store;
+    use slackless_core::types::{
+        ChannelId, Conversation, Message, MessageSubtype, TeamId, Ts, UserId,
+    };
+
+    #[test]
+    fn store_huddles_filters_huddle_threads_computes_live_duration_and_sorts_newest_first() {
+        let mut store = Store::open_in_memory().expect("in-memory store");
+        let team = TeamId::from("T1");
+        let ch1 = ChannelId::from("C1");
+        let ch2 = ChannelId::from("C2");
+        for id in [&ch1, &ch2] {
+            store
+                .upsert_conversation(
+                    &team,
+                    &Conversation {
+                        id: id.clone(),
+                        name: Some(id.to_string()),
+                        is_channel: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        // Normal message (ignored)
+        let plain = Message {
+            ts: Ts::from("1700000100.000100"),
+            text: "not a huddle".into(),
+            ..Default::default()
+        };
+        store.upsert_message(&team, &ch1, &plain).unwrap();
+
+        // Deleted huddle thread (ignored)
+        let mut deleted = Message {
+            ts: Ts::from("1700000150.000100"),
+            subtype: Some(MessageSubtype::HuddleThread),
+            ..Default::default()
+        };
+        deleted.extra.insert(
+            "room".into(),
+            json!({ "has_ended": false, "participants": ["U1"] }),
+        );
+        store.upsert_message(&team, &ch1, &deleted).unwrap();
+        store
+            .record_deletion(&team, &ch1, &Ts::from("1700000150.000100"), None, None)
+            .unwrap();
+
+        // Ended huddle with participant_history and duration
+        let mut ended = Message {
+            ts: Ts::from("1700000200.000100"),
+            subtype: Some(MessageSubtype::HuddleThread),
+            reply_count: Some(3),
+            ..Default::default()
+        };
+        ended.extra.insert(
+            "room".into(),
+            json!({
+                "has_ended": true,
+                "participants": [],
+                "participant_history": ["U1", "U2"],
+                "date_start": 1000,
+                "date_end": 1600
+            }),
+        );
+        store.upsert_message(&team, &ch1, &ended).unwrap();
+
+        // Live huddle (newer) with active participants
+        let mut live = Message {
+            ts: Ts::from("1700000500.000100"),
+            subtype: Some(MessageSubtype::HuddleThread),
+            ..Default::default()
+        };
+        live.extra.insert(
+            "room".into(),
+            json!({
+                "has_ended": false,
+                "participants": ["U3"],
+                "participant_history": ["U1", "U3"],
+                "date_start": 2000,
+                "date_end": 2000
+            }),
+        );
+        store.upsert_message(&team, &ch2, &live).unwrap();
+
+        // Abandoned huddle (has_ended: false, but empty participants -> not live)
+        let mut abandoned = Message {
+            ts: Ts::from("1700000300.000100"),
+            subtype: Some(MessageSubtype::HuddleThread),
+            ..Default::default()
+        };
+        abandoned.extra.insert(
+            "room".into(),
+            json!({
+                "has_ended": false,
+                "participants": [],
+                "participant_history": ["U9"]
+            }),
+        );
+        store.upsert_message(&team, &ch2, &abandoned).unwrap();
+
+        let huddles = store_huddles(&store, &team);
+        assert_eq!(huddles.len(), 3);
+
+        // Sorted newest first: 500 -> 300 -> 200
+        assert_eq!(huddles[0].channel, ch2);
+        assert_eq!(huddles[0].ts.as_str(), "1700000500.000100");
+        assert!(huddles[0].live);
+        assert_eq!(huddles[0].participants, vec![UserId::from("U3")]);
+        assert_eq!(huddles[0].duration_secs, None);
+
+        assert_eq!(huddles[1].ts.as_str(), "1700000300.000100");
+        assert!(!huddles[1].live);
+        assert_eq!(huddles[1].participants, vec![UserId::from("U9")]);
+
+        assert_eq!(huddles[2].channel, ch1);
+        assert_eq!(huddles[2].ts.as_str(), "1700000200.000100");
+        assert!(!huddles[2].live);
+        assert_eq!(
+            huddles[2].participants,
+            vec![UserId::from("U1"), UserId::from("U2")]
+        );
+        assert_eq!(huddles[2].duration_secs, Some(600));
+        assert_eq!(huddles[2].reply_count, 3);
+    }
+}

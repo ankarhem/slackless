@@ -459,3 +459,56 @@ return "FREE"
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{is_protocol_allowed, is_workflow_trigger_url};
+
+    #[test]
+    fn is_protocol_allowed_parses_separators_colons_case_and_rejects_invalid() {
+        let list = "https:, http; mailto  slack: , zoommtg";
+        assert!(is_protocol_allowed("https://example.com", list));
+        assert!(is_protocol_allowed("HTTPS://EXAMPLE.COM/path", list));
+        assert!(is_protocol_allowed("http://example.com", list));
+        assert!(is_protocol_allowed("mailto:alice@example.com", list));
+        assert!(is_protocol_allowed("slack://channel?id=C1", list));
+        assert!(is_protocol_allowed("zoommtg://zoom.us/join", list));
+
+        // Disallowed schemes
+        assert!(!is_protocol_allowed("javascript:alert(1)", list));
+        assert!(!is_protocol_allowed("file:///etc/passwd", list));
+        assert!(!is_protocol_allowed("ftp://example.com", list));
+
+        // Missing colon, empty scheme, empty allowlist
+        assert!(!is_protocol_allowed("example.com/no-scheme", list));
+        assert!(!is_protocol_allowed(":no-scheme", list));
+        assert!(!is_protocol_allowed("   :leading-space", list));
+        assert!(!is_protocol_allowed("https://example.com", ""));
+        assert!(!is_protocol_allowed("https://example.com", " , ; "));
+    }
+
+    #[test]
+    fn is_workflow_trigger_url_matches_slack_shortcuts_ft_only() {
+        assert!(is_workflow_trigger_url(
+            "https://slack.com/shortcuts/Ft0123ABC"
+        ));
+        assert!(is_workflow_trigger_url(
+            "https://acme.slack.com/shortcuts/Ft999/run"
+        ));
+
+        // Reject insecure scheme, lookalike host, wrong path prefix, or non-Ft ID.
+        assert!(!is_workflow_trigger_url(
+            "http://slack.com/shortcuts/Ft0123ABC"
+        ));
+        assert!(!is_workflow_trigger_url(
+            "https://evilslack.com/shortcuts/Ft0123ABC"
+        ));
+        assert!(!is_workflow_trigger_url(
+            "https://slack.com/shortcuts/Ab0123"
+        ));
+        assert!(!is_workflow_trigger_url(
+            "https://acme.slack.com/archives/C0ENG/p1234567890123456"
+        ));
+        assert!(!is_workflow_trigger_url("https://slack.com"));
+    }
+}

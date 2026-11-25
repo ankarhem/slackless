@@ -328,3 +328,245 @@ fn parses_hex_colors_and_rich_option_descriptions() {
         Some("Skips optional checks")
     );
 }
+
+#[test]
+fn calendar_math_handles_iso_parsing_leap_years_and_weekdays() {
+    assert_eq!(parse_iso_ymd("2026-11-25"), Some((2026, 11, 25)));
+    assert_eq!(parse_iso_ymd("2024-02-29"), Some((2024, 2, 29)));
+    assert_eq!(parse_iso_ymd("2026-00-10"), None);
+    assert_eq!(parse_iso_ymd("2026-13-10"), None);
+    assert_eq!(parse_iso_ymd("2026-01-00"), None);
+    assert_eq!(parse_iso_ymd("2026-01-32"), None);
+    assert_eq!(parse_iso_ymd("bad"), None);
+
+    assert_eq!(days_in_month(2024, 2), 29);
+    assert_eq!(days_in_month(2023, 2), 28);
+    assert_eq!(days_in_month(1900, 2), 28);
+    assert_eq!(days_in_month(2000, 2), 29);
+    assert_eq!(days_in_month(2026, 4), 30);
+    assert_eq!(days_in_month(2026, 12), 31);
+
+    // 1970-01-01 was Thursday (4); 2000-01-01 was Saturday (6); 2024-02-29 was Thursday (4); 2026-11-25 is Wednesday (3).
+    assert_eq!(weekday_sunday0(1970, 1, 1), 4);
+    assert_eq!(weekday_sunday0(2000, 1, 1), 6);
+    assert_eq!(weekday_sunday0(2024, 2, 29), 4);
+    assert_eq!(weekday_sunday0(2026, 11, 25), 3);
+}
+
+#[test]
+fn filtered_conversations_supports_private_im_mpim_and_exclude_bot_users() {
+    use slackless_core::types::{Conversation, User};
+
+    let mut fixtures = crate::fixtures::load();
+    fixtures.users.push(User {
+        id: UserId::from("U_BOT"),
+        name: "bot".into(),
+        is_bot: true,
+        ..Default::default()
+    });
+    fixtures.users.push(User {
+        id: UserId::from("U_HUM"),
+        name: "human".into(),
+        ..Default::default()
+    });
+    fixtures.channels = vec![
+        Conversation {
+            id: ChannelId::from("C_PUB"),
+            name: Some("pub".into()),
+            is_channel: true,
+            ..Default::default()
+        },
+        Conversation {
+            id: ChannelId::from("G_PRIV"),
+            name: Some("priv".into()),
+            is_channel: true,
+            is_private: true,
+            ..Default::default()
+        },
+        Conversation {
+            id: ChannelId::from("D_HUM"),
+            is_im: true,
+            user: Some(UserId::from("U_HUM")),
+            ..Default::default()
+        },
+        Conversation {
+            id: ChannelId::from("D_BOT"),
+            is_im: true,
+            user: Some(UserId::from("U_BOT")),
+            ..Default::default()
+        },
+        Conversation {
+            id: ChannelId::from("G_MPIM"),
+            name: Some("mpdm-a-b".into()),
+            is_mpim: true,
+            ..Default::default()
+        },
+    ];
+
+    let ids = |el: &Json, kind: &str| -> Vec<String> {
+        filtered_conversations(el, kind, &fixtures)
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect()
+    };
+
+    assert_eq!(
+        ids(
+            &json!({ "filter": { "include": ["private"] } }),
+            "conversations_select"
+        ),
+        vec!["G_PRIV"]
+    );
+    assert_eq!(
+        ids(
+            &json!({ "filter": { "include": ["im"], "exclude_bot_users": true } }),
+            "conversations_select"
+        ),
+        vec!["D_HUM"]
+    );
+    assert_eq!(
+        ids(
+            &json!({ "filter": { "include": ["mpim"] } }),
+            "conversations_select"
+        ),
+        vec!["G_MPIM"]
+    );
+    assert_eq!(ids(&json!({}), "channels_select"), vec!["C_PUB"]);
+}
+
+#[test]
+fn attachment_helpers_classify_page_previews_parse_ts_and_strip_link_markup() {
+    let mut preview = Attachment {
+        from_url: Some("https://example.com".into()),
+        service_name: Some("Example".into()),
+        ..Default::default()
+    };
+    assert!(attachments::is_page_preview_attachment(&preview));
+
+    // Color bar disqualifies plain page preview.
+    preview.color = Some("good".into());
+    assert!(!attachments::is_page_preview_attachment(&preview));
+    preview.color = None;
+
+    // Message unfurl or app unfurl disqualifies page preview.
+    preview.is_msg_unfurl = true;
+    assert!(!attachments::is_page_preview_attachment(&preview));
+    preview.is_msg_unfurl = false;
+    preview.extra.insert("is_app_unfurl".into(), json!(true));
+    assert!(!attachments::is_page_preview_attachment(&preview));
+
+    // attachment_secs handles int, float string, and missing/invalid.
+    let mut att = Attachment::default();
+    assert_eq!(attachments::attachment_secs(&att), None);
+    att.ts = Some(json!(1_700_000_000));
+    assert_eq!(attachments::attachment_secs(&att), Some(1_700_000_000));
+    att.ts = Some(json!("1700000123.456000"));
+    assert_eq!(attachments::attachment_secs(&att), Some(1_700_000_123));
+    att.ts = Some(json!("not-a-ts"));
+    assert_eq!(attachments::attachment_secs(&att), None);
+
+    // link_labels strips Slack angle brackets cleanly.
+    assert_eq!(
+        attachments::link_labels("Built by <https://ci.example|Buildkite> · <https://status.dev>"),
+        "Built by Buildkite · https://status.dev"
+    );
+    assert_eq!(attachments::link_labels("unclosed <tag"), "unclosed <tag");
+}
+
+#[gpui::test]
+fn collect_modal_state_covers_all_input_types_required_and_validation_errors(
+    cx: &mut gpui::TestAppContext,
+) {
+    let ts = Ts::from("m1");
+    let blocks = vec![
+        json!({
+            "type": "input",
+            "block_id": "b_date",
+            "label": { "type": "plain_text", "text": "Date" },
+            "element": { "type": "datepicker", "action_id": "a_date", "initial_date": "2026-01-01" }
+        }),
+        json!({
+            "type": "input",
+            "block_id": "b_time",
+            "label": { "type": "plain_text", "text": "Time" },
+            "element": { "type": "timepicker", "action_id": "a_time", "initial_time": "09:30" }
+        }),
+        json!({
+            "type": "input",
+            "block_id": "b_chk",
+            "label": { "type": "plain_text", "text": "Checks" },
+            "element": { "type": "checkboxes", "action_id": "a_chk" }
+        }),
+        json!({
+            "type": "input",
+            "block_id": "b_sel",
+            "label": { "type": "plain_text", "text": "Priority" },
+            "element": {
+                "type": "static_select",
+                "action_id": "a_sel",
+                "initial_option": { "value": "p2" }
+            }
+        }),
+        json!({
+            "type": "input",
+            "block_id": "b_usr",
+            "label": { "type": "plain_text", "text": "Owner" },
+            "element": { "type": "users_select", "action_id": "a_usr", "initial_user": "U0ME" }
+        }),
+        json!({
+            "type": "input",
+            "block_id": "b_conv",
+            "label": { "type": "plain_text", "text": "Channel" },
+            "element": {
+                "type": "conversations_select",
+                "action_id": "a_conv",
+                "initial_conversation": "C0ENG"
+            }
+        }),
+    ];
+
+    // Missing required checkboxes returns an error naming the label.
+    let empty_kit = cx.new(|_| BlockKitState::default());
+    cx.update(|cx| {
+        let err = collect_modal_state(&ts, &blocks, &empty_kit, cx).unwrap_err();
+        assert!(err.contains("Checks"), "unexpected err: {err}");
+    });
+
+    // Populating state overrides initial values and produces Slack's state.values schema.
+    let filled_kit = cx.new(|_| {
+        let mut st = BlockKitState::default();
+        st.choices
+            .insert("m1/b_date/a_date".into(), "2026-12-31".into());
+        st.checked
+            .insert("m1/b_chk/a_chk".into(), HashSet::from(["opt_a".to_owned()]));
+        st
+    });
+    cx.update(|cx| {
+        let state = collect_modal_state(&ts, &blocks, &filled_kit, cx).expect("valid state");
+        assert_eq!(state["b_date"]["a_date"]["selected_date"], "2026-12-31");
+        assert_eq!(state["b_time"]["a_time"]["selected_time"], "09:30");
+        assert_eq!(
+            state["b_chk"]["a_chk"]["selected_options"][0]["value"],
+            "opt_a"
+        );
+        assert_eq!(state["b_sel"]["a_sel"]["selected_option"]["value"], "p2");
+        assert_eq!(state["b_usr"]["a_usr"]["selected_user"], "U0ME");
+        assert_eq!(state["b_conv"]["a_conv"]["selected_conversation"], "C0ENG");
+    });
+
+    // Text input validation error surfaces with field label.
+    let bad_email = vec![json!({
+        "type": "input",
+        "block_id": "b_email",
+        "label": { "type": "plain_text", "text": "Contact" },
+        "element": {
+            "type": "email_text_input",
+            "action_id": "a_email",
+            "initial_value": "not-an-email"
+        }
+    })];
+    cx.update(|cx| {
+        let err = collect_modal_state(&ts, &bad_email, &empty_kit, cx).unwrap_err();
+        assert!(err.contains("Contact"), "unexpected err: {err}");
+    });
+}

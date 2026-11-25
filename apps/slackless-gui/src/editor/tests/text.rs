@@ -300,3 +300,146 @@ fn code_styled_links_adjacent_runs_inline_code_urls_and_consecutive_fences_round
     let two_blocks = typed("```\na\n```\n```\nb\n```");
     assert_eq!(two_blocks.doc().to_mrkdwn(), "```a```\n```b```");
 }
+
+#[test]
+fn rich_text_handles_skin_tone_date_color_usergroup_team_offset_list_header_clamping_and_linkify() {
+    use slackless_core::types::rich_text::{
+        ColorElement, DateElement, RichTextHeader, TeamElement, UsergroupElement,
+    };
+    use slackless_core::types::{RichTextBlock, TeamId, UsergroupId};
+
+    let rich = RichTextBlock {
+        block_id: None,
+        elements: vec![
+            RichTextContainer::Header(RichTextHeader {
+                level: Some(0), // clamps to 1
+                elements: vec![plain("H0")],
+            }),
+            RichTextContainer::Header(RichTextHeader {
+                level: Some(5), // clamps to 3
+                elements: vec![plain("H5")],
+            }),
+            RichTextContainer::Header(RichTextHeader {
+                level: None, // defaults to 2
+                elements: vec![plain("HN")],
+            }),
+            section(vec![
+                RichTextElement::Emoji(EmojiElement {
+                    name: "thumbsup".into(),
+                    unicode: None,
+                    skin_tone: Some(3),
+                    style: None,
+                }),
+                plain(" "),
+                RichTextElement::Date(DateElement {
+                    timestamp: 1_700_000_000,
+                    format: "{date_short}".into(),
+                    url: None,
+                    fallback: Some("Nov 14".into()),
+                }),
+                plain(" "),
+                RichTextElement::Color(ColorElement {
+                    value: "#2BAC76".into(),
+                }),
+                plain(" "),
+                RichTextElement::Usergroup(UsergroupElement {
+                    usergroup_id: UsergroupId::from("S1"),
+                    style: None,
+                }),
+                plain(" "),
+                RichTextElement::Team(TeamElement {
+                    team_id: TeamId::from("T99"),
+                    style: None,
+                }),
+            ]),
+            RichTextContainer::List(RichTextList {
+                style: ListStyle::Ordered,
+                elements: vec![section(vec![plain("fifth")]), section(vec![plain("sixth")])],
+                indent: Some(0),
+                offset: Some(4),
+                border: Some(0),
+            }),
+        ],
+    };
+
+    let doc = from_rich_text(&[rich.into()], &Names).unwrap();
+    assert!(doc.text().starts_with("# H0\n### H5\n## HN\n"));
+    assert!(doc.text().contains("Nov 14 #2BAC76 @S1 T99"));
+    assert!(doc.text().contains("5. fifth\n6. sixth"));
+
+    // Emoji with skin_tone round-trips back to RichTextElement::Emoji with skin_tone = Some(3).
+    let rt = doc.to_rich_text();
+    let has_toned_emoji = rt.elements.iter().any(|c| match c {
+        RichTextContainer::Section(s) => s.elements.iter().any(|el| {
+            matches!(
+                el,
+                RichTextElement::Emoji(e) if e.name == "thumbsup" && e.skin_tone == Some(3)
+            )
+        }),
+        _ => false,
+    });
+    assert!(has_toned_emoji, "emoji skin_tone must round-trip");
+
+    // linkified: balanced parens kept, unbalanced outer parens stripped, trailing punct stripped, bare "https://" rejected.
+    let link_doc = typed(
+        "(https://en.wikipedia.org/wiki/Rust_(lang)) and https://example.com! and bare https:// only",
+    );
+    let rt = link_doc.doc().to_rich_text();
+    let RichTextContainer::Section(sec) = &rt.elements[0] else {
+        panic!("expected section");
+    };
+    let urls: Vec<&str> = sec
+        .elements
+        .iter()
+        .filter_map(|el| match el {
+            RichTextElement::Link(l) => Some(l.url.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        urls,
+        vec![
+            "https://en.wikipedia.org/wiki/Rust_(lang)",
+            "https://example.com",
+        ]
+    );
+}
+
+#[test]
+fn mrkdwn_read_and_write_handle_unclosed_fence_trailing_text_subteam_mailto_underline_and_retarget()
+{
+    // Unclosed fence auto-closes on read.
+    let unclosed = from_mrkdwn("```\nlet x = 1;", &Names);
+    assert_eq!(unclosed.text(), "```\n\nlet x = 1;\n```");
+
+    // Trailing text after closing ``` on the same line becomes a paragraph line.
+    let trailing = from_mrkdwn("```code```after *bold*", &Names);
+    assert_eq!(trailing.to_mrkdwn(), "```code```\nafter *bold*");
+
+    // <!subteam^...> with and without label + <mailto:...>
+    let refs = from_mrkdwn(
+        "ping <!subteam^S1|@eng> and <!subteam^S2|ops> and <!subteam^S3> <mailto:a@b.com> <mailto:c@d.com|Mail>",
+        &Names,
+    );
+    assert!(refs.text().contains("@eng"));
+    assert!(refs.text().contains("@ops"));
+    assert!(refs.text().contains("@S3"));
+    assert_eq!(
+        refs.to_mrkdwn(),
+        "ping <!subteam^S1> and <!subteam^S2> and <!subteam^S3> <mailto:a@b.com> <mailto:c@d.com|Mail>"
+    );
+
+    // Empty <u></u> stays literal; nested <u> stays well-formed without duplicating active underline.
+    let empty_u = from_mrkdwn("<u></u>", &Names);
+    assert_eq!(empty_u.text(), "<u></u>");
+    let nested_u = from_mrkdwn("<u>outer <u>inner</u></u>", &Names);
+    assert!(nested_u.to_draft().contains("<u>"));
+
+    // Overlapping/nested styles close in LIFO order via retarget.
+    let mut ed = typed("ab cd");
+    ed.select(0..5);
+    ed.toggle_style(crate::editor::marks::Style::BOLD);
+    ed.select(1..3); // "ab" inside "*ab cd*"
+    ed.toggle_style(crate::editor::marks::Style::ITALIC);
+    assert_eq!(ed.doc().to_mrkdwn(), "*_ab_ cd*");
+}

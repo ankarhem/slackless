@@ -4,7 +4,6 @@
 //! request per invocation, no websocket session to keep alive. Without a stored session they
 //! print a clear "not signed in" message instead of failing hard.
 
-use std::io::Read as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -23,11 +22,25 @@ pub fn resolve_text_arg(text: String) -> Result<String> {
     if text != "-" {
         return Ok(text);
     }
+    resolve_text_from(&text, std::io::stdin())
+}
+
+/// Pure helper backing [`resolve_text_arg`]: returns `text` verbatim unless `text == "-"`,
+/// in which case it reads all of `reader` and strips trailing `\r`/`\n`.
+pub(crate) fn resolve_text_from(text: &str, mut reader: impl std::io::Read) -> Result<String> {
+    if text != "-" {
+        return Ok(text.to_owned());
+    }
     let mut buf = String::new();
-    std::io::stdin()
+    reader
         .read_to_string(&mut buf)
         .context("reading message text from stdin")?;
     Ok(buf.trim_end_matches(&['\r', '\n'][..]).to_owned())
+}
+
+/// Normalize an emoji shortcode for `reactions.add`/`reactions.remove` by stripping surrounding `:`.
+pub(crate) fn normalize_emoji_shortcode(emoji: &str) -> String {
+    emoji.trim_matches(':').to_owned()
 }
 
 /// `send <channel> <text>`: posts and mirrors the echo into the local archive.
@@ -123,7 +136,7 @@ pub async fn run_react(
     };
     let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
     // reactions.add takes the bare shortcode; accept ":tada:" too.
-    let name = emoji.trim_matches(':').to_owned();
+    let name = normalize_emoji_shortcode(emoji);
     let ts = Ts::from(ts.to_owned());
     match api.reactions_add(&channel, &ts, &name).await {
         Ok(()) => {
@@ -160,7 +173,7 @@ pub async fn run_unreact(
         Err(exit) => return Ok(exit),
     };
     let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
-    let name = emoji.trim_matches(':').to_owned();
+    let name = normalize_emoji_shortcode(emoji);
     let ts = Ts::from(ts.to_owned());
     match api.reactions_remove(&channel, &ts, &name).await {
         Ok(()) => {
@@ -600,21 +613,27 @@ pub fn parse_schedule_at(spec: &str, now_secs: u64) -> Result<u64, String> {
 /// Parse a compact duration string like `30s`, `15m`, `24h`, `7d`, `2w` into seconds.
 pub fn parse_duration_secs(raw: &str) -> Result<u64, String> {
     let s = raw.trim();
-    if s.len() < 2 {
+    let mut chars = s.chars();
+    let Some(unit) = chars.next_back() else {
+        return Err(format!(
+            "invalid duration '{raw}'; expected e.g. 30m, 24h, 7d"
+        ));
+    };
+    let num_part = chars.as_str();
+    if num_part.is_empty() {
         return Err(format!(
             "invalid duration '{raw}'; expected e.g. 30m, 24h, 7d"
         ));
     }
-    let (num_part, unit) = s.split_at(s.len() - 1);
     let value: u64 = num_part
         .parse()
         .map_err(|_| format!("invalid duration '{raw}'; expected e.g. 30m, 24h, 7d"))?;
     let mult: u64 = match unit {
-        "s" | "S" => 1,
-        "m" | "M" => 60,
-        "h" | "H" => 3600,
-        "d" | "D" => 86_400,
-        "w" | "W" => 604_800,
+        's' | 'S' => 1,
+        'm' | 'M' => 60,
+        'h' | 'H' => 3600,
+        'd' | 'D' => 86_400,
+        'w' | 'W' => 604_800,
         _ => {
             return Err(format!(
                 "unknown duration unit '{unit}' in '{raw}'; use s, m, h, d, or w"
@@ -753,18 +772,24 @@ fn api_for(ctx: &Ctx, flag: Option<&str>) -> Result<(SlackApi, TeamId), ExitCode
     Ok((api, session.team_id))
 }
 
-/// API failures become user-actionable messages; a rejected session asks for re-auth.
-fn api_fail(ctx: &Ctx, err: &ApiError) -> ExitCode {
+/// Maps an [`ApiError`] to `(error_code, user_message)`.
+pub(crate) fn api_fail_details(err: &ApiError) -> (&'static str, String) {
     if err.is_auth_expired() {
-        return fail(
-            ctx,
+        (
             "session_rejected",
-            &format!(
+            format!(
                 "slack rejected the stored session ({err}); sign in again with `slackless auth login`"
             ),
-        );
+        )
+    } else {
+        ("request_failed", err.to_string())
     }
-    fail(ctx, "request_failed", &err.to_string())
+}
+
+/// API failures become user-actionable messages; a rejected session asks for re-auth.
+fn api_fail(ctx: &Ctx, err: &ApiError) -> ExitCode {
+    let (code, message) = api_fail_details(err);
+    fail(ctx, code, &message)
 }
 
 /// The channel id + human label for a user-supplied argument (`C…`, `#name`, `@handle`).
@@ -802,4 +827,134 @@ fn store_echo(workspace: &TeamId, channel: &ChannelId, message: &Message) -> Res
     store
         .upsert_message(workspace, channel, message)
         .context("recording the sent message")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_secs_handles_units_bounds_and_multibyte_utf8() {
+        assert_eq!(parse_duration_secs("30s"), Ok(30));
+        assert_eq!(parse_duration_secs("30S"), Ok(30));
+        assert_eq!(parse_duration_secs("15m"), Ok(900));
+        assert_eq!(parse_duration_secs("15M"), Ok(900));
+        assert_eq!(parse_duration_secs("2h"), Ok(7_200));
+        assert_eq!(parse_duration_secs("2H"), Ok(7_200));
+        assert_eq!(parse_duration_secs("3d"), Ok(259_200));
+        assert_eq!(parse_duration_secs("3D"), Ok(259_200));
+        assert_eq!(parse_duration_secs("2w"), Ok(1_209_600));
+        assert_eq!(parse_duration_secs("2W"), Ok(1_209_600));
+        assert_eq!(parse_duration_secs("  10m  "), Ok(600));
+        assert_eq!(parse_duration_secs("0s"), Ok(0));
+
+        // Saturating multiplication prevents overflow panic.
+        assert_eq!(parse_duration_secs(&format!("{}w", u64::MAX)), Ok(u64::MAX));
+
+        // Short / malformed inputs.
+        assert!(parse_duration_secs("").is_err());
+        assert!(parse_duration_secs("   ").is_err());
+        assert!(parse_duration_secs("5").is_err());
+        assert!(parse_duration_secs("m").is_err());
+        assert!(parse_duration_secs("abcm").is_err());
+        assert!(parse_duration_secs("-5m").is_err());
+
+        // Unknown ASCII units.
+        let err = parse_duration_secs("10x").unwrap_err();
+        assert!(err.contains("unknown duration unit 'x'"));
+
+        // Multi-byte UTF-8 trailing characters must return Err cleanly, never panic.
+        for bad in ["10µ", "5€", "µ", "€", "10🎉"] {
+            assert!(
+                parse_duration_secs(bad).is_err(),
+                "expected Err for multi-byte input {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_schedule_at_edge_cases() {
+        let now = 1_700_000_000u64;
+        assert_eq!(parse_schedule_at("+90s", now), Ok(now + 90));
+        assert_eq!(parse_schedule_at("  +15m  ", now), Ok(now + 900));
+        assert_eq!(parse_schedule_at("+1d", now), Ok(now + 86_400));
+        assert_eq!(parse_schedule_at("  1700000001  ", now), Ok(now + 1));
+
+        // Relative zero offset is rejected.
+        assert!(parse_schedule_at("+0s", now).is_err());
+        assert!(parse_schedule_at("+0m", now).is_err());
+
+        // Epoch equal to or before `now` is rejected.
+        assert!(parse_schedule_at("1700000000", now).is_err());
+        assert!(parse_schedule_at("1699999999", now).is_err());
+
+        // Non-numeric / malformed inputs.
+        assert!(parse_schedule_at("tomorrow", now).is_err());
+        assert!(parse_schedule_at("", now).is_err());
+        assert!(parse_schedule_at("+10€", now).is_err());
+
+        // Relative addition saturates at u64::MAX.
+        assert_eq!(parse_schedule_at("+10s", u64::MAX - 5), Ok(u64::MAX));
+    }
+
+    #[test]
+    fn resolve_text_from_passthrough_and_stdin_trimming() {
+        // Literal argument passes through without reading.
+        let mut failing_reader = std::io::empty();
+        assert_eq!(
+            resolve_text_from("hello world\n", &mut failing_reader).unwrap(),
+            "hello world\n"
+        );
+
+        // "-" reads from reader and trims trailing CR/LF only.
+        assert_eq!(
+            resolve_text_from("-", "line 1\nline 2\r\n".as_bytes()).unwrap(),
+            "line 1\nline 2"
+        );
+        assert_eq!(
+            resolve_text_from("-", "hello\n\r\n".as_bytes()).unwrap(),
+            "hello"
+        );
+        assert_eq!(resolve_text_from("-", "".as_bytes()).unwrap(), "");
+
+        // I/O errors propagate cleanly.
+        struct BrokenReader;
+        impl std::io::Read for BrokenReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "stdin closed",
+                ))
+            }
+        }
+        assert!(resolve_text_from("-", BrokenReader).is_err());
+    }
+
+    #[test]
+    fn api_fail_classifies_auth_expired_vs_generic() {
+        let auth_err = ApiError::from_slack_error("token_revoked");
+        let (code, msg) = api_fail_details(&auth_err);
+        assert_eq!(code, "session_rejected");
+        assert!(msg.contains("slackless auth login"));
+        assert!(msg.contains("token_revoked"));
+
+        let generic_err = ApiError::from_slack_error("channel_not_found");
+        let (code, msg) = api_fail_details(&generic_err);
+        assert_eq!(code, "request_failed");
+        assert!(msg.contains("channel_not_found"));
+
+        // Ensure api_fail itself returns FAILURE without panicking.
+        let ctx = Ctx { json: false };
+        assert_eq!(api_fail(&ctx, &auth_err), ExitCode::FAILURE);
+        assert_eq!(api_fail(&ctx, &generic_err), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn normalize_emoji_shortcode_strips_colons() {
+        assert_eq!(normalize_emoji_shortcode(":tada:"), "tada");
+        assert_eq!(normalize_emoji_shortcode("tada"), "tada");
+        assert_eq!(normalize_emoji_shortcode("::fire::"), "fire");
+        assert_eq!(normalize_emoji_shortcode(":+1:"), "+1");
+        assert_eq!(normalize_emoji_shortcode("::"), "");
+    }
 }

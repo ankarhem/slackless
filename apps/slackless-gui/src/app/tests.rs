@@ -1359,3 +1359,626 @@ fn qa_personal_todo_and_major_views_render_cleanly(cx: &mut gpui::TestAppContext
         let _ = window.draw(cx);
     });
 }
+
+fn mount_test_app(
+    fx: Fixtures,
+    cx: &mut gpui::TestAppContext,
+) -> (
+    gpui::Entity<gpui_kit::base::Root>,
+    gpui::Entity<App>,
+    &mut gpui::VisualTestContext,
+) {
+    use gpui_kit::base::Root;
+    use std::cell::RefCell;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let app = App::new(Arc::new(fx), CoreBridge::offline(), window, cx);
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+    (root, app, cx)
+}
+
+#[gpui::test]
+fn should_notify_and_system_notification_dedup_cover_all_rules(cx: &mut gpui::TestAppContext) {
+    let mut fx = fixtures::load();
+    let me = fx.self_user.clone();
+    let peer = fx
+        .users
+        .iter()
+        .find(|u| u.id != me && !u.is_bot)
+        .expect("peer user")
+        .id
+        .clone();
+    let eng = ChannelId::from("C0ENG");
+    let general = ChannelId::from("C0GENERAL");
+    let dm = fx.dms[0].id.clone();
+    fx.notify_levels
+        .insert(eng.clone(), NotifyLevel::Everything);
+    fx.notify_levels.insert(general.clone(), NotifyLevel::Muted);
+
+    let (root, app, cx) = mount_test_app(fx, cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            // Ensure app is viewing a different channel than eng/general/dm.
+            app.select(ChannelId::from("C0DESIGN"), cx);
+
+            let plain_msg = |user: &UserId, text: &str| Message {
+                ts: Ts::from("1700000100.000100"),
+                user: Some(user.clone()),
+                text: text.to_owned(),
+                ..Default::default()
+            };
+
+            // 1. Desktop notifications disabled -> never notifies.
+            app.preferences.update(cx, |p, cx| {
+                let mut s = p.settings().clone();
+                s.desktop_notifications = false;
+                p.load_settings(s, window, cx);
+            });
+            assert!(!app.should_notify(&dm, &plain_msg(&peer, "hi"), window, cx));
+
+            // Re-enable desktop notifications with global notify_level = 1 (Mentions).
+            app.preferences.update(cx, |p, cx| {
+                let mut s = p.settings().clone();
+                s.desktop_notifications = true;
+                s.notify_level = 1;
+                p.load_settings(s, window, cx);
+            });
+
+            // 2. Own message never notifies.
+            assert!(!app.should_notify(&dm, &plain_msg(&me, "my own msg"), window, cx));
+
+            // 3. Per-channel NotifyLevel::Everything overrides global Mentions (1) and Nothing (2).
+            assert!(
+                app.should_notify(&eng, &plain_msg(&peer, "regular update"), window, cx),
+                "per-channel Everything must notify even under global Mentions"
+            );
+            app.preferences.update(cx, |p, cx| {
+                let mut s = p.settings().clone();
+                s.notify_level = 2;
+                p.load_settings(s, window, cx);
+            });
+            assert!(
+                app.should_notify(&eng, &plain_msg(&peer, "regular update"), window, cx),
+                "per-channel Everything must notify even under global Nothing"
+            );
+            assert!(
+                !app.should_notify(
+                    &ChannelId::from("C0RANDOM"),
+                    &plain_msg(&peer, &format!("hi <@{me}>")),
+                    window,
+                    cx
+                ),
+                "global Nothing suppresses channels without override"
+            );
+
+            // 4. Muted channel suppresses normal messages and mentions unless breakthrough.
+            app.preferences.update(cx, |p, cx| {
+                let mut s = p.settings().clone();
+                s.notify_level = 0; // All
+                p.load_settings(s, window, cx);
+            });
+            assert!(!app.should_notify(&general, &plain_msg(&peer, "muted"), window, cx));
+
+            // 5. DND / Focus mode blocks normal DMs, but VIP and urgent DM override break through
+            //    (including muted channels).
+            app.self_state.paused_until = Some(crate::messages::now_secs() + 3600);
+            assert!(!app.should_notify(&dm, &plain_msg(&peer, "normal dm"), window, cx));
+
+            app.preferences.update(cx, |p, cx| {
+                let mut s = p.settings().clone();
+                s.urgent_dm_override = true;
+                p.load_settings(s, window, cx);
+            });
+            assert!(
+                app.should_notify(&dm, &plain_msg(&peer, "[URGENT] prod down"), window, cx),
+                "urgent DM breaks through DND"
+            );
+
+            app.preferences.update(cx, |p, cx| {
+                let mut s = p.settings().clone();
+                s.urgent_dm_override = false;
+                s.vip_users = peer.as_str().to_owned();
+                p.load_settings(s, window, cx);
+            });
+            assert!(
+                app.should_notify(&general, &plain_msg(&peer, "vip ping"), window, cx),
+                "VIP sender breaks through DND and muted channel"
+            );
+
+            // Clear DND + VIP for remaining checks.
+            app.self_state.paused_until = None;
+            app.preferences.update(cx, |p, cx| {
+                let mut s = p.settings().clone();
+                s.vip_users.clear();
+                s.notify_level = 0;
+                s.thread_replies = true;
+                p.load_settings(s, window, cx);
+            });
+
+            // 6. On-screen suppression when window is active.
+            window.activate_window();
+            app.select(eng.clone(), cx);
+            if window.is_window_active() {
+                assert!(
+                    !app.should_notify(&eng, &plain_msg(&peer, "on screen"), window, cx),
+                    "active channel on screen must not notify"
+                );
+            }
+            app.select(ChannelId::from("C0DESIGN"), cx);
+
+            // 7. Thread reply rules: parent_user_id == me notifies when thread_replies=true,
+            //    non-parent reply suppressed unless channel is in follow_all_threads_channels.
+            let mut reply_to_me = plain_msg(&peer, "following up");
+            reply_to_me.thread_ts = Some(Ts::from("1700000001.000100"));
+            reply_to_me.parent_user_id = Some(me.clone());
+            assert!(app.should_notify(&eng, &reply_to_me, window, cx));
+
+            let mut reply_to_other = reply_to_me.clone();
+            reply_to_other.parent_user_id = Some(peer.clone());
+            assert!(!app.should_notify(&eng, &reply_to_other, window, cx));
+
+            app.preferences.update(cx, |p, cx| {
+                let mut s = p.settings().clone();
+                s.follow_all_threads_channels = vec![eng.to_string()];
+                p.load_settings(s, window, cx);
+            });
+            assert!(app.should_notify(&eng, &reply_to_other, window, cx));
+
+            // 8. system_notification_kind 60s duplicate-tag dedup.
+            app.recent_notified_tags.clear();
+            app.system_notification_kind("msg:C0ENG:1.1", "T", "B", false, cx);
+            assert_eq!(app.recent_notified_tags.len(), 1);
+            app.system_notification_kind("msg:C0ENG:1.1", "T", "B", false, cx);
+            assert_eq!(
+                app.recent_notified_tags.len(),
+                1,
+                "duplicate tag within 60s must be ignored"
+            );
+            app.system_notification_kind("msg:C0ENG:1.2", "T", "B", false, cx);
+            assert_eq!(app.recent_notified_tags.len(), 2);
+        });
+    });
+    drop(root);
+}
+
+#[gpui::test]
+fn message_posted_typing_cleanup_thread_reply_rules_and_multi_workspace_sync_badge(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut fx = fixtures::load();
+    fx.sample = false;
+    fx.messages.clear();
+    fx.counts.clear();
+    let peer = fx
+        .users
+        .iter()
+        .find(|u| u.id != fx.self_user && !u.is_bot)
+        .unwrap()
+        .id
+        .clone();
+    let me = fx.self_user.clone();
+    let general = ChannelId::from("C0GENERAL");
+    let eng = ChannelId::from("C0ENG");
+    let dm = fx.dms[0].id.clone();
+
+    let (root, app, cx) = mount_test_app(fx, cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.select(general.clone(), cx);
+            app.sidebar.update(cx, |s, cx| s.set_activity_unread(0, cx));
+
+            // 1. Typing indicator clears when author posts a message in that channel.
+            app.someone_typing(&eng, &peer, None, cx);
+            assert!(app.typing.contains_key(&(eng.clone(), None)));
+            let msg = Message {
+                ts: Ts::from("1700000100.000100"),
+                user: Some(peer.clone()),
+                text: format!("ping <@{me}>"),
+                ..Default::default()
+            };
+            app.message_posted(&eng, &msg, window, cx);
+            assert!(
+                !app.typing.contains_key(&(eng.clone(), None)),
+                "posting clears sender typing indicator"
+            );
+            let eng_counts = app.ws.counts.get(&eng).expect("counts updated");
+            assert!(eng_counts.has_unreads);
+            assert_eq!(eng_counts.mention_count, 1);
+
+            // 2. Non-broadcast thread reply does NOT bump channel unread/mention counts,
+            //    while ThreadBroadcast DOES.
+            let plain_reply = Message {
+                ts: Ts::from("1700000105.000100"),
+                thread_ts: Some(Ts::from("1700000100.000100")),
+                user: Some(peer.clone()),
+                text: format!("quiet reply <@{me}>"),
+                ..Default::default()
+            };
+            app.message_posted(&eng, &plain_reply, window, cx);
+            assert_eq!(app.ws.counts.get(&eng).unwrap().mention_count, 1);
+
+            let broadcast_reply = Message {
+                ts: Ts::from("1700000110.000100"),
+                thread_ts: Some(Ts::from("1700000100.000100")),
+                subtype: Some(slackless_core::types::MessageSubtype::ThreadBroadcast),
+                user: Some(peer.clone()),
+                text: format!("also to channel <@{me}>"),
+                ..Default::default()
+            };
+            app.message_posted(&eng, &broadcast_reply, window, cx);
+            assert_eq!(app.ws.counts.get(&eng).unwrap().mention_count, 2);
+
+            // 3. Incoming DM bumps dm_count and mention_count.
+            let dm_msg = Message {
+                ts: Ts::from("1700000120.000100"),
+                user: Some(peer.clone()),
+                text: "hey".into(),
+                ..Default::default()
+            };
+            app.message_posted(&dm, &dm_msg, window, cx);
+            let dm_counts = app.ws.counts.get(&dm).expect("dm counts");
+            assert_eq!(dm_counts.dm_count, 1);
+            assert_eq!(dm_counts.mention_count, 1);
+
+            // 4. Multi-workspace sync_badge aggregates active + bg_counts + bg_activity_unread.
+            if app.bg_counts.len() < 2 {
+                app.bg_counts.resize_with(2, HashMap::new);
+            }
+            if app.bg_activity_unread.len() < 2 {
+                app.bg_activity_unread.resize(2, 0);
+            }
+            app.bg_counts[1].insert(
+                ChannelId::from("C_BG"),
+                ConversationCounts {
+                    id: ChannelId::from("C_BG"),
+                    has_unreads: true,
+                    mention_count: 3,
+                    ..Default::default()
+                },
+            );
+            app.bg_activity_unread[1] = 2;
+
+            app.sync_badge(cx);
+            // Active sidebar has 1 unread DM (count=1) + bg workspace has 3 mentions + 2 activity = 6.
+            assert_eq!(app.badge, Some(6));
+            assert_eq!(app.badge_label, Some(Some("6".to_owned())));
+
+            // Clearing mentions while leaving channel unread + badge_on_unreads = true shows bullet.
+            app.bg_counts[1].clear();
+            app.bg_activity_unread[1] = 0;
+            app.mark_read(&dm, Ts::from("1700000120.000100"), cx);
+            app.preferences.update(cx, |p, cx| {
+                let mut s = p.settings().clone();
+                s.show_dock_badge = true;
+                s.badge_on_unreads = true;
+                p.load_settings(s, window, cx);
+            });
+            app.sync_badge(cx);
+            assert_eq!(app.badge, Some(0));
+            assert_eq!(app.badge_label, Some(Some("\u{2022}".to_owned())));
+
+            // Disabling show_dock_badge clears label completely.
+            app.preferences.update(cx, |p, cx| {
+                let mut s = p.settings().clone();
+                s.show_dock_badge = false;
+                p.load_settings(s, window, cx);
+            });
+            app.sync_badge(cx);
+            assert_eq!(app.badge, Some(0));
+            assert_eq!(app.badge_label, Some(None));
+        });
+    });
+    drop(root);
+}
+
+#[gpui::test]
+fn run_slash_broadcast_confirmation_and_draft_persistence_across_channels(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut fx = fixtures::load();
+    // Give C0GENERAL >= 6 members and C0RANDOM < 6 members so we test both sides of threshold.
+    for ch in &mut fx.channels {
+        if ch.id.as_str() == "C0GENERAL" {
+            ch.num_members = Some(10);
+        } else if ch.id.as_str() == "C0RANDOM" {
+            ch.num_members = Some(3);
+        }
+    }
+    let dm = fx.dms[0].id.clone();
+
+    let (root, app, cx) = mount_test_app(fx, cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            // 1. Slash commands: /shrug, /away, /status clear, /dnd 30m, /dnd off, invalid /dnd.
+            app.select(ChannelId::from("C0RANDOM"), cx);
+            let before_count = app.messages.read(cx).message_count_for_test(cx);
+            let shrug = crate::slash::parse("/shrug nice").unwrap();
+            app.run_slash(&shrug, None, window, cx);
+            assert_eq!(
+                app.messages.read(cx).message_count_for_test(cx),
+                before_count + 1
+            );
+            assert!(
+                app.messages
+                    .read(cx)
+                    .last_message_text_for_test(cx)
+                    .unwrap()
+                    .ends_with(SHRUG)
+            );
+
+            assert!(!app.self_state.away);
+            app.run_slash(&crate::slash::parse("/away").unwrap(), None, window, cx);
+            assert!(app.self_state.away);
+            app.run_slash(&crate::slash::parse("/away").unwrap(), None, window, cx);
+            assert!(!app.self_state.away);
+
+            app.self_state.set_status(Some(crate::status::UserStatus {
+                emoji: "coffee".into(),
+                text: "Break".into(),
+                clear_after: 0,
+                pause: false,
+                expiration: None,
+            }));
+            app.run_slash(
+                &crate::slash::parse("/status clear").unwrap(),
+                None,
+                window,
+                cx,
+            );
+            assert!(app.self_state.status.is_none());
+
+            app.run_slash(&crate::slash::parse("/dnd 30m").unwrap(), None, window, cx);
+            assert!(app.self_state.paused_until.is_some());
+            let prev_until = app.self_state.paused_until;
+            app.run_slash(
+                &crate::slash::parse("/dnd invalid_arg").unwrap(),
+                None,
+                window,
+                cx,
+            );
+            assert_eq!(
+                app.self_state.paused_until, prev_until,
+                "invalid /dnd usage leaves pause state unchanged"
+            );
+            app.run_slash(&crate::slash::parse("/dnd off").unwrap(), None, window, cx);
+            assert!(app.self_state.paused_until.is_none());
+
+            // 2. Broadcast confirmation threshold: >= 6 members prompts instead of sending immediately;
+            //    < 6 members and DMs send directly.
+            let broadcast = crate::composer::content_of("<!here> attention", &app.fixtures);
+
+            app.select(ChannelId::from("C0GENERAL"), cx);
+            let gen_before = app.messages.read(cx).message_count_for_test(cx);
+            app.send(broadcast.clone(), window, cx);
+            assert_eq!(
+                app.messages.read(cx).message_count_for_test(cx),
+                gen_before,
+                "channel with >= 6 members must open confirmation dialog instead of sending immediately"
+            );
+            window.close_dialog(cx);
+
+            app.select(ChannelId::from("C0RANDOM"), cx);
+            let rand_before = app.messages.read(cx).message_count_for_test(cx);
+            app.send(broadcast.clone(), window, cx);
+            assert_eq!(
+                app.messages.read(cx).message_count_for_test(cx),
+                rand_before + 1,
+                "channel with < 6 members sends directly"
+            );
+
+            app.select(dm.clone(), cx);
+            let dm_before = app.messages.read(cx).message_count_for_test(cx);
+            app.send(broadcast, window, cx);
+            assert_eq!(
+                app.messages.read(cx).message_count_for_test(cx),
+                dm_before + 1,
+                "DM with @here sends directly without threshold prompt"
+            );
+
+            // 3. save_draft / load_draft across channel switches.
+            app.select(ChannelId::from("C0ENG"), cx);
+            app.composer
+                .update(cx, |c, cx| c.load_draft("draft for eng", cx));
+            app.save_draft(cx);
+            assert_eq!(app.drafts.read(cx).draft_count(), 1);
+
+            app.select(ChannelId::from("C0DESIGN"), cx);
+            assert_eq!(app.composer.read(cx).text(), "");
+            app.composer
+                .update(cx, |c, cx| c.load_draft("draft for design", cx));
+            app.select(ChannelId::from("C0ENG"), cx);
+            assert_eq!(app.composer.read(cx).text(), "draft for eng");
+            assert_eq!(app.drafts.read(cx).draft_count(), 2);
+
+            // Clearing draft removes it from DraftsView.
+            app.composer.update(cx, |c, cx| c.load_draft("", cx));
+            app.save_draft(cx);
+            assert_eq!(app.drafts.read(cx).draft_count(), 1);
+        });
+    });
+    drop(root);
+}
+
+#[gpui::test]
+fn deep_links_permalinks_workspace_switch_focus_leave_and_hover_card_lifecycle(
+    cx: &mut gpui::TestAppContext,
+) {
+    let fx = fixtures::load();
+    let team_id = fx.workspaces[0].id.clone();
+    let peer = fx
+        .users
+        .iter()
+        .find(|u| u.id != fx.self_user && !u.is_bot)
+        .unwrap()
+        .id
+        .clone();
+    let eng_thread_ts = fx
+        .messages
+        .get(&ChannelId::from("C0ENG"))
+        .and_then(|msgs| msgs.iter().find(|m| m.reply_count.unwrap_or(0) > 0))
+        .map(|m| m.ts.clone())
+        .expect("C0ENG has thread root");
+
+    let (root, app, cx) = mount_test_app(fx, cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            // 1. handle_deep_link variants
+            assert!(app.handle_deep_link(
+                &format!("slack://channel?team={team_id}&id=C0ENG"),
+                window,
+                cx
+            ));
+            assert_eq!(app.channel, ChannelId::from("C0ENG"));
+
+            assert!(app.handle_deep_link(
+                &format!("slack://user?team={team_id}&id={peer}"),
+                window,
+                cx
+            ));
+            assert!(app.profile_open);
+
+            assert!(app.handle_deep_link(
+                &format!("slack://open?team={team_id}&id=C0DESIGN"),
+                window,
+                cx
+            ));
+            assert_eq!(app.channel, ChannelId::from("C0DESIGN"));
+
+            assert!(app.handle_deep_link(
+                &format!("https://app.slack.com/client/{team_id}/C0ENG/thread/C0ENG-1700000001.000100?thread_ts={eng_thread_ts}"),
+                window,
+                cx
+            ));
+            assert_eq!(app.channel, ChannelId::from("C0ENG"));
+            assert!(app.thread_open);
+            app.close_thread(cx);
+
+            assert!(app.handle_deep_link(
+                &format!("https://app.slack.com/client/{team_id}/C0GENERAL"),
+                window,
+                cx
+            ));
+            assert_eq!(app.channel, ChannelId::from("C0GENERAL"));
+
+            assert!(!app.handle_deep_link("https://example.com/not-slack", window, cx));
+            assert!(!app.handle_deep_link(
+                &format!("slack://channel?team={team_id}&id=C_NONEXISTENT"),
+                window,
+                cx
+            ));
+
+            // 2. open_link routes Slack permalinks in-app (both channel and thread links).
+            app.open_link(
+                LinkTarget::Url(SharedString::from(format!(
+                    "https://acme.slack.com/archives/C0ENG/p17600000000654321?thread_ts={eng_thread_ts}"
+                ))),
+                window,
+                cx,
+            );
+            assert_eq!(app.channel, ChannelId::from("C0ENG"));
+            assert!(app.thread_open);
+            assert_eq!(
+                app.thread.read(cx).open_thread(),
+                Some((ChannelId::from("C0ENG"), eng_thread_ts.clone()))
+            );
+            app.close_thread(cx);
+
+            // 3. switch_workspace preserves active channel & draft on round-trip.
+            app.select(ChannelId::from("C0DESIGN"), cx);
+            app.composer
+                .update(cx, |c, cx| c.load_draft("ws0 draft", cx));
+            assert!(app.parked.len() >= 2, "fixture has multiple workspaces");
+            app.switch_workspace(1, window, cx);
+            assert_eq!(app.workspace, 1);
+            assert_eq!(app.composer.read(cx).text(), "");
+
+            app.switch_workspace(0, window, cx);
+            assert_eq!(app.workspace, 0);
+            assert_eq!(app.channel, ChannelId::from("C0DESIGN"));
+            assert_eq!(app.composer.read(cx).text(), "ws0 draft");
+
+            // 4. toggle_focus toggles focus mode cleanly.
+            assert!(!app.self_state.focused());
+            app.toggle_focus(window, cx);
+            assert!(app.self_state.focused());
+            app.toggle_focus(window, cx);
+            assert!(!app.self_state.focused());
+
+            // 5. leave scrubs channel from back/forward/recent and navigates away when active.
+            app.select(ChannelId::from("C0ENG"), cx);
+            app.select(ChannelId::from("C0RANDOM"), cx);
+            app.leave(ChannelId::from("C0RANDOM"), window, cx);
+            assert_ne!(app.channel, ChannelId::from("C0RANDOM"));
+            assert!(!app.recent.contains(&ChannelId::from("C0RANDOM")));
+            assert!(
+                !app.back
+                    .contains(&NavPlace::Channel(ChannelId::from("C0RANDOM")))
+            );
+
+            // 6. Profile hover-card dwell/grace state machine.
+            let trig1 = hover_card::Trigger {
+                key: SharedString::from("row-1"),
+                user: peer.clone(),
+                anchor: gpui::Bounds::default(),
+            };
+            let trig2 = hover_card::Trigger {
+                key: SharedString::from("row-2"),
+                user: peer.clone(),
+                anchor: gpui::Bounds::default(),
+            };
+            app.profile_hover_entered(trig1.clone(), cx);
+            assert!(app.profile_hover.trigger.is_some());
+            assert!(app.profile_hover.card.is_none());
+
+            // Stale dwell from another key is ignored; matching key opens card.
+            app.hover_dwell_elapsed(&trig2.key, &peer, cx);
+            assert!(app.profile_hover.card.is_none());
+            app.hover_dwell_elapsed(&trig1.key, &peer, cx);
+            assert!(app.profile_hover.card.as_ref() == Some(&trig1));
+
+            // Stale leave from another key is ignored.
+            app.profile_hover_left(&trig2.key, cx);
+            assert!(app.profile_hover.trigger.as_ref() == Some(&trig1));
+
+            // Leaving trigger starts grace; entering card cancels grace.
+            app.profile_hover_left(&trig1.key, cx);
+            assert!(app.profile_hover.trigger.is_none());
+            assert!(app.profile_hover.grace.is_some());
+            app.hover_card_hovered(true, cx);
+            assert!(app.profile_hover.grace.is_none());
+            app.hover_grace_elapsed(cx);
+            assert!(
+                app.profile_hover.card.is_some(),
+                "grace must not close while pointer is inside card"
+            );
+
+            // Leaving card starts grace; grace elapsed closes card.
+            app.hover_card_hovered(false, cx);
+            assert!(app.profile_hover.grace.is_some());
+            app.hover_grace_elapsed(cx);
+            assert!(app.profile_hover.card.is_none());
+
+            // close_hover_card closes immediately even if pointer was inside.
+            app.profile_hover_entered(trig1.clone(), cx);
+            app.hover_dwell_elapsed(&trig1.key, &peer, cx);
+            app.hover_card_hovered(true, cx);
+            app.close_hover_card(cx);
+            assert!(app.profile_hover.card.is_none());
+            assert!(!app.profile_hover.inside);
+            assert!(app.profile_hover.dwell.is_none());
+            assert!(app.profile_hover.grace.is_none());
+        });
+    });
+    drop(root);
+}

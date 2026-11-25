@@ -1776,25 +1776,6 @@ fn expand_shortcodes_in_text(text: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod link_emoji_tests {
-    use super::expand_shortcodes_in_text;
-
-    #[test]
-    fn expands_standard_emoji_shortcodes_inside_link_labels() {
-        assert_eq!(
-            expand_shortcodes_in_text(":chart_with_upwards_trend: Dashboard"),
-            "📈 Dashboard"
-        );
-        assert_eq!(expand_shortcodes_in_text(":bar_chart: Panel"), "📊 Panel");
-        assert_eq!(expand_shortcodes_in_text(":mute: Silence"), "🔇 Silence");
-        assert_eq!(
-            expand_shortcodes_in_text("https://example.com:8080/path"),
-            "https://example.com:8080/path"
-        );
-    }
-}
-
 /// A `:shortcode:` at the start of `rest`: a glyph run, or a custom emoji image.
 pub(super) fn emoji_token(
     builder: &mut ParagraphBuilder,
@@ -1873,4 +1854,23 @@ pub(super) fn jumbomoji_elements(text: &str, fixtures: &Fixtures) -> Option<Vec<
         }
     }
     (!out.is_empty()).then_some(out)
+}
+
+#[cfg(test)]
+mod link_emoji_tests {
+    use super::expand_shortcodes_in_text;
+
+    #[test]
+    fn expands_standard_emoji_shortcodes_inside_link_labels() {
+        assert_eq!(
+            expand_shortcodes_in_text(":chart_with_upwards_trend: Dashboard"),
+            "📈 Dashboard"
+        );
+        assert_eq!(expand_shortcodes_in_text(":bar_chart: Panel"), "📊 Panel");
+        assert_eq!(expand_shortcodes_in_text(":mute: Silence"), "🔇 Silence");
+        assert_eq!(
+            expand_shortcodes_in_text("https://example.com:8080/path"),
+            "https://example.com:8080/path"
+        );
+    }
 }

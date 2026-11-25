@@ -278,3 +278,267 @@ impl Composer {
         self.changed(cx);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slackless_core::api::AppCommand;
+    use slackless_core::types::{Conversation, User, Usergroup};
+
+    fn editor_with(text: &str) -> Editor {
+        let mut ed = Editor::default();
+        ed.replace_all(text);
+        ed
+    }
+
+    #[test]
+    fn menu_at_caret_rejects_selection_and_opens_for_all_triggers() {
+        let fixtures = crate::fixtures::load();
+
+        // Non-empty selection suppresses completion menu.
+        let mut selected = editor_with("@al");
+        selected.select(0..3);
+        assert!(Menu::at_caret(&selected, &fixtures).is_none());
+
+        // Slash trigger
+        let slash_menu = Menu::at_caret(&editor_with("/sh"), &fixtures).expect("slash menu");
+        assert_eq!(slash_menu.range, 0..3);
+        assert!(matches!(slash_menu.entries.first(), Some(Entry::Slash(s)) if s.name == "shrug"));
+
+        // People trigger (`@`)
+        let people_menu = Menu::at_caret(&editor_with("hi @"), &fixtures).expect("people menu");
+        assert_eq!(people_menu.range, 3..4);
+        assert!(!people_menu.entries.is_empty());
+
+        // Channels trigger (`#`)
+        let chan_menu = Menu::at_caret(&editor_with("in #gen"), &fixtures).expect("channel menu");
+        assert_eq!(chan_menu.range, 3..7);
+        assert!(matches!(chan_menu.entries.first(), Some(Entry::Channel(_))));
+
+        // Emoji trigger (`:` + >= 2 chars)
+        let emoji_menu = Menu::at_caret(&editor_with("ok :smi"), &fixtures).expect("emoji menu");
+        assert_eq!(emoji_menu.range, 3..7);
+        assert!(matches!(emoji_menu.entries.first(), Some(Entry::Emoji(_))));
+    }
+
+    #[test]
+    fn menu_step_wraps_forward_and_backward_and_is_typed_command_checks_exact_match() {
+        let fixtures = crate::fixtures::load();
+        let mut menu = Menu::at_caret(&editor_with("/s"), &fixtures).expect("slash menu");
+        let n = menu.entries.len();
+        assert!(n >= 2);
+        assert_eq!(menu.selected, 0);
+
+        menu.step(false);
+        assert_eq!(menu.selected, n - 1, "backward wrap from 0");
+        menu.step(true);
+        assert_eq!(menu.selected, 0, "forward wrap from n-1");
+        menu.step(true);
+        assert_eq!(menu.selected, 1);
+
+        let shrug_menu = Menu::at_caret(&editor_with("/SHRUG"), &fixtures).unwrap();
+        assert!(shrug_menu.is_typed_command("/shrug"));
+        assert!(shrug_menu.is_typed_command("/SHRUG"));
+        assert!(!shrug_menu.is_typed_command("/shr"));
+
+        let chan_menu = Menu::at_caret(&editor_with("#gen"), &fixtures).unwrap();
+        assert!(!chan_menu.is_typed_command("#gen"));
+    }
+
+    #[test]
+    fn slash_commands_prefers_builtins_dedups_and_caps_at_limit() {
+        let mut fixtures = crate::fixtures::load();
+        fixtures.app_commands = vec![
+            AppCommand {
+                name: "shrug".into(),
+                usage: "[custom]".into(),
+                description: "App duplicate of builtin".into(),
+                app_name: Some("DupApp".into()),
+                app_id: None,
+            },
+            AppCommand {
+                name: "deploy".into(),
+                usage: "<env>".into(),
+                description: "Deploy service".into(),
+                app_name: Some("ReleaseBot".into()),
+                app_id: None,
+            },
+            AppCommand {
+                name: "deploy".into(),
+                usage: "<dup>".into(),
+                description: "Duplicate app command".into(),
+                app_name: Some("OtherBot".into()),
+                app_id: None,
+            },
+        ];
+
+        // Builtin `shrug` wins over app command with same name.
+        let shrug = slash_commands(&fixtures, "shrug");
+        assert_eq!(shrug.len(), 1);
+        match &shrug[0] {
+            Entry::Slash(entry) => assert_eq!(entry.app_name, None),
+            _ => panic!("expected Slash entry"),
+        }
+
+        // App commands match by `app_name` and dedup by `name`.
+        let by_app = slash_commands(&fixtures, "releasebot");
+        assert_eq!(by_app.len(), 1);
+        match &by_app[0] {
+            Entry::Slash(entry) => assert_eq!(entry.name, "deploy"),
+            _ => panic!("expected Slash entry"),
+        }
+
+        // Empty query returns at most LIMIT entries.
+        for i in 0..12 {
+            fixtures.app_commands.push(AppCommand {
+                name: format!("cmd{i:02}"),
+                usage: String::new(),
+                description: String::new(),
+                app_name: None,
+                app_id: None,
+            });
+        }
+        assert_eq!(slash_commands(&fixtures, "").len(), LIMIT);
+    }
+
+    #[test]
+    fn people_filters_deleted_orders_users_groups_broadcasts_and_caps_limit() {
+        let mut fixtures = crate::fixtures::load();
+        fixtures.users = vec![
+            User {
+                id: UserId::from("U_DEL"),
+                name: "herbie".into(),
+                deleted: true,
+                ..Default::default()
+            },
+            User {
+                id: UserId::from("U_HER"),
+                name: "herman".into(),
+                ..Default::default()
+            },
+        ];
+        fixtures.usergroups = vec![
+            Usergroup {
+                id: UsergroupId::from("S_DEL"),
+                handle: "her-deleted".into(),
+                name: "Deleted group".into(),
+                date_delete: 1_700_000_000,
+                ..Default::default()
+            },
+            Usergroup {
+                id: UsergroupId::from("S_EMPTY"),
+                handle: String::new(),
+                name: "her-empty".into(),
+                ..Default::default()
+            },
+            Usergroup {
+                id: UsergroupId::from("S_OK"),
+                handle: "heroes".into(),
+                name: "Heroes".into(),
+                ..Default::default()
+            },
+        ];
+
+        // Prefix `"her"` matches user -> usergroup -> broadcast `@here`, excluding deleted/empty.
+        let res = people(&fixtures, "her");
+        assert_eq!(res.len(), 3);
+        assert!(matches!(&res[0], Entry::User(u) if u.as_str() == "U_HER"));
+        assert!(matches!(&res[1], Entry::Usergroup(g) if g.as_str() == "S_OK"));
+        assert!(matches!(&res[2], Entry::Broadcast(BroadcastRange::Here)));
+
+        // Non-prefix substring `"ere"` must NOT match broadcast `@here` (prefix-only `rank == 0`).
+        let sub = people(&fixtures, "ere");
+        assert!(sub.iter().all(|e| !matches!(e, Entry::Broadcast(_))));
+
+        // Respects LIMIT = 8.
+        for i in 0..12 {
+            fixtures.users.push(User {
+                id: UserId::from(format!("U{i:02}")),
+                name: format!("alpha{i:02}"),
+                ..Default::default()
+            });
+        }
+        assert_eq!(people(&fixtures, "alpha").len(), LIMIT);
+    }
+
+    #[test]
+    fn channels_excludes_dms_archived_and_dedups_directory() {
+        let mut fixtures = crate::fixtures::load();
+        let pub_ch = Conversation {
+            id: ChannelId::from("C_ENG"),
+            name: Some("engineering".into()),
+            is_channel: true,
+            ..Default::default()
+        };
+        fixtures.channels = vec![
+            pub_ch.clone(),
+            Conversation {
+                id: ChannelId::from("C_ARCH"),
+                name: Some("engineering-old".into()),
+                is_channel: true,
+                is_archived: true,
+                ..Default::default()
+            },
+            Conversation {
+                id: ChannelId::from("D_IM"),
+                name: Some("engineering-dm".into()),
+                is_im: true,
+                ..Default::default()
+            },
+            Conversation {
+                id: ChannelId::from("G_MPIM"),
+                name: Some("engineering-mpim".into()),
+                is_mpim: true,
+                ..Default::default()
+            },
+        ];
+        fixtures.directory = vec![
+            pub_ch, // Duplicate of joined channel
+            Conversation {
+                id: ChannelId::from("C_DIR"),
+                name: Some("engineering-ops".into()),
+                is_channel: true,
+                ..Default::default()
+            },
+        ];
+
+        let res = channels(&fixtures, "eng");
+        let ids: Vec<&str> = res
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Channel(id) => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["C_ENG", "C_DIR"]);
+    }
+
+    #[test]
+    fn emoji_names_merges_custom_and_standard_with_dedup() {
+        let mut fixtures = crate::fixtures::load();
+        fixtures.custom_emoji.insert(
+            "smile".into(),
+            crate::fixtures::EmojiImage::Url("https://example.com/smile.png".into()),
+        );
+        fixtures.custom_emoji.insert(
+            "smile_custom_xyz".into(),
+            crate::fixtures::EmojiImage::Url("https://example.com/custom.png".into()),
+        );
+
+        let res = emoji_names(&fixtures, "smile");
+        assert!(res.len() <= LIMIT);
+        let names: Vec<&str> = res
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Emoji(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names.iter().filter(|&&n| n == "smile").count(),
+            1,
+            "duplicate custom+standard shortcode must appear once"
+        );
+        assert!(names.contains(&"smile_custom_xyz"));
+    }
+}

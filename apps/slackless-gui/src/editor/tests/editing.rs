@@ -209,3 +209,154 @@ fn toggle_style_handles_multiline_whitespace_double_pairs_and_atoms() {
     linked.set_link("https://two.dev");
     assert_eq!(linked.doc().text(), "hi [@Alice](https://two.dev) ");
 }
+
+#[test]
+fn history_enforces_depth_cap_coalesces_typing_and_erasing_and_clears_redo() {
+    use crate::editor::doc::Doc;
+    use crate::editor::history::{Change, History, Snapshot};
+
+    let snap = |s: &str| Snapshot {
+        doc: Doc::from(s),
+        selection: s.len()..s.len(),
+    };
+
+    // DEPTH = 100 eviction: 105 checkpoints retain the most recent 100.
+    let mut hist = History::default();
+    for i in 0..105 {
+        hist.checkpoint(&snap(&format!("v{i}")));
+    }
+    let mut now = snap("latest");
+    let mut undone = 0;
+    while hist.undo(&mut now) {
+        undone += 1;
+    }
+    assert_eq!(undone, 100);
+    assert_eq!(now.doc.text(), "v5", "oldest 5 snapshots should be evicted");
+
+    // Change::Type coalesces contiguous non-word-start edits; word_start or break_run splits.
+    let mut hist = History::default();
+    hist.record(
+        &snap(""),
+        Change::Type {
+            at: 0,
+            len: 1,
+            word_start: true,
+        },
+    );
+    hist.record(
+        &snap("a"),
+        Change::Type {
+            at: 1,
+            len: 1,
+            word_start: false,
+        },
+    );
+    hist.record(
+        &snap("ab"),
+        Change::Type {
+            at: 2,
+            len: 1,
+            word_start: true,
+        },
+    );
+    hist.break_run();
+    hist.record(
+        &snap("abc"),
+        Change::Type {
+            at: 3,
+            len: 1,
+            word_start: false,
+        },
+    );
+    let mut cur = snap("abcd");
+    assert!(hist.undo(&mut cur));
+    assert_eq!(cur.doc.text(), "abc");
+    assert!(hist.undo(&mut cur));
+    assert_eq!(cur.doc.text(), "ab");
+    assert!(hist.undo(&mut cur));
+    assert_eq!(cur.doc.text(), "");
+    assert!(!hist.undo(&mut cur));
+
+    // Redo works, then a new edit clears redo stack.
+    assert!(hist.redo(&mut cur));
+    assert_eq!(cur.doc.text(), "ab");
+    hist.checkpoint(&cur);
+    assert!(!hist.redo(&mut cur));
+
+    // Change::Erase coalesces contiguous backspaces (range.end == *at) and forward deletes (range.start == *at).
+    let mut hist = History::default();
+    hist.record(&snap("abcd"), Change::Erase { range: 3..4 }); // backspace 'd' -> at = 3
+    hist.record(&snap("abc"), Change::Erase { range: 2..3 }); // backspace 'c' (end 3 == at 3) -> coalesced, at = 2
+    let mut cur = snap("ab");
+    assert!(hist.undo(&mut cur));
+    assert_eq!(cur.doc.text(), "abcd");
+    assert!(!hist.undo(&mut cur));
+
+    let mut hist = History::default();
+    hist.record(&snap("abcd"), Change::Erase { range: 1..2 }); // forward-del 'b' -> at = 1
+    hist.record(&snap("acd"), Change::Erase { range: 1..2 }); // forward-del 'c' (start 1 == at 1) -> coalesced
+    let mut cur = snap("ad");
+    assert!(hist.undo(&mut cur));
+    assert_eq!(cur.doc.text(), "abcd");
+    assert!(!hist.undo(&mut cur));
+}
+
+#[test]
+fn format_edge_cases_non_formatted_lines_mid_span_unwrap_mid_word_promotion_and_set_link() {
+    // No-op on Code, Fence, and Divider lines.
+    for (doc_text, caret) in [
+        ("```\nlet x = 1;\n```", 6), // Code line
+        ("```\nlet x = 1;\n```", 1), // Fence line
+        ("---", 1),                  // Divider line
+    ] {
+        let mut ed = typed(doc_text);
+        ed.select(caret..caret);
+        ed.toggle_style(Style::BOLD);
+        assert_eq!(ed.doc().text(), doc_text, "no-op on {doc_text:?}");
+        ed.set_link("https://example.com");
+        assert_eq!(ed.doc().text(), doc_text, "set_link no-op on {doc_text:?}");
+    }
+
+    // Collapsed caret mid-span unwraps vs caret at inner_end steps out past closing marker.
+    let mut mid = typed("*hello*");
+    mid.select(3..3); // inside "he|llo"
+    mid.toggle_style(Style::BOLD);
+    assert_eq!(mid.doc().text(), "hello", "mid-span toggle unwraps");
+
+    let mut end = typed("*hello*");
+    end.select(6..6); // at inner_end "hello|*"
+    end.toggle_style(Style::BOLD);
+    assert_eq!(end.doc().text(), "*hello*", "inner_end toggle steps out");
+    assert_eq!(end.selection(), 7..7);
+
+    // Mid-word bold promotes `*` -> `**` and strike promotes `~` -> `~~`.
+    let mut word = typed("foobar");
+    word.select(3..6); // "bar" abuts 'o'
+    word.toggle_style(Style::BOLD);
+    assert_eq!(word.doc().text(), "foo**bar**");
+
+    let mut word_s = typed("foobar");
+    word_s.select(0..3); // "foo" abuts 'b'
+    word_s.toggle_style(Style::STRIKE);
+    assert_eq!(word_s.doc().text(), "~~foo~~bar");
+
+    // Mixed multi-line selection: one wrapped, one plain -> wraps only the plain line;
+    // toggling again unwraps both.
+    let mut mixed = typed("*one*\ntwo");
+    mixed.select(0..9);
+    mixed.toggle_style(Style::BOLD);
+    assert_eq!(mixed.doc().text(), "*one*\n*two*");
+    mixed.select(0..11);
+    mixed.toggle_style(Style::BOLD);
+    assert_eq!(mixed.doc().text(), "one\ntwo");
+
+    // set_link edge cases: collapsed caret inserts URL, whitespace-only selection is no-op.
+    let mut bare = typed("go ");
+    bare.set_link("https://slack.com");
+    assert_eq!(bare.doc().text(), "go https://slack.com");
+
+    let mut ws = typed("a   b");
+    ws.select(1..4);
+    ws.set_link("https://slack.com");
+    assert_eq!(ws.doc().text(), "a   b");
+}

@@ -1192,8 +1192,8 @@ mod tests {
 
     use super::*;
     use gpui_kit::gpui::{
-        IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Render, TestAppContext,
-        VisualTestContext,
+        ClipboardItem, IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Render,
+        TestAppContext, VisualTestContext,
     };
 
     struct ComposerHarness {
@@ -1320,6 +1320,274 @@ mod tests {
         cx.dispatch_action(gpui_kit::component::input::SelectAll);
         cx.run_until_parked();
         assert_eq!(selected_slice(&composer, cx), expected_text);
+        drop(root);
+    }
+
+    #[gpui::test]
+    fn composer_keys_paste_escape_up_auto_fence_and_typed_emoji_state_machines(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::component::input::{Enter, Escape, MoveUp};
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+
+        let submitted: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let slash_cmds: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let edit_last_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+        let cancel_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+
+        struct SpyHost {
+            composer: Entity<Composer>,
+            _sub: Subscription,
+        }
+        impl Render for SpyHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(self.composer.clone())
+            }
+        }
+
+        let slot = Rc::new(RefCell::new(None));
+        let slot_c = slot.clone();
+        let sub_c = submitted.clone();
+        let slash_c = slash_cmds.clone();
+        let edit_c = edit_last_count.clone();
+        let cancel_c = cancel_count.clone();
+
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let fixtures = Arc::new(crate::fixtures::load());
+            let composer = Composer::new("Message".into(), fixtures, window, cx);
+            *slot_c.borrow_mut() = Some(composer.clone());
+            let view = cx.new(|cx| {
+                let sub = cx.subscribe(&composer, move |_, _, ev: &ComposerEvent, _| match ev {
+                    ComposerEvent::Submit(c) => sub_c.borrow_mut().push(c.text.clone()),
+                    ComposerEvent::SlashCommand(inv) => slash_c.borrow_mut().push(inv.name.clone()),
+                    ComposerEvent::EditLast => *edit_c.borrow_mut() += 1,
+                    ComposerEvent::Cancel => *cancel_c.borrow_mut() += 1,
+                    _ => {}
+                });
+                SpyHost {
+                    composer,
+                    _sub: sub,
+                }
+            });
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let composer = slot.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+
+        // 1. on_up on empty composer emits EditLast; non-empty draft does not.
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| c.on_up(&MoveUp, window, cx));
+        });
+        assert_eq!(*edit_last_count.borrow(), 1);
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.editor.replace_all("draft text");
+                c.on_up(&MoveUp, window, cx);
+            });
+        });
+        assert_eq!(*edit_last_count.borrow(), 1);
+
+        // 2. on_enter: enter_sends = true submits; Shift+Enter does not; enter_sends = false does not; Cmd+Enter submits.
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.editor.replace_all("hello");
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: true,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert!(submitted.borrow().is_empty(), "Shift+Enter must not submit");
+
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.set_enter_sends(false, cx);
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert!(
+            submitted.borrow().is_empty(),
+            "Enter must not submit when enter_sends = false"
+        );
+
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.on_enter(
+                    &Enter {
+                        secondary: true,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(submitted.borrow().as_slice(), ["hello"]);
+
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.set_enter_sends(true, cx);
+                c.editor.replace_all("second");
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(submitted.borrow().as_slice(), ["hello", "second"]);
+
+        // 3. Menu pick on partial slash command vs submitting a full typed slash command.
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.editor.replace_all("/sh");
+                c.changed(cx);
+                assert!(c.menu.is_some());
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(c.editor.doc().text(), "/shrug ");
+            });
+        });
+        assert!(slash_cmds.borrow().is_empty());
+
+        // Full typed command submits SlashCommand instead of re-completing.
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.editor.replace_all("/away");
+                c.changed(cx);
+                assert!(c.menu.is_some());
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(slash_cmds.borrow().as_slice(), ["away"]);
+
+        // 4. on_escape sticky menu dismiss: stays dismissed while typing same trigger.
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.editor.replace_all("hi @");
+                c.changed(cx);
+                assert!(c.menu.is_some());
+                c.on_escape(&Escape, window, cx);
+                assert!(c.menu.is_none());
+                assert_eq!(c.dismissed, Some(3));
+
+                // Continuing the same `@` trigger keeps menu dismissed.
+                c.editor.insert_text("a");
+                c.changed(cx);
+                assert!(c.menu.is_none());
+
+                // Moving past space clears dismissal.
+                c.editor.insert_text(" ");
+                c.changed(cx);
+                assert_eq!(c.dismissed, None);
+            });
+        });
+
+        // 5. on_paste: URL over selection wraps as [text](url); empty selection or non-URL returns false.
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.editor.replace_all("read docs now");
+                c.editor.select(5..9);
+                let url_clip = ClipboardItem::new_string("https://example.com".into());
+                assert!(c.on_paste(&url_clip, window, cx));
+                assert_eq!(
+                    c.editor.doc().text(),
+                    "read [docs](https://example.com) now"
+                );
+
+                // Empty selection -> false
+                assert!(!c.on_paste(&url_clip, window, cx));
+
+                // Non-URL over selection -> false
+                c.editor.select(0..4);
+                let plain_clip = ClipboardItem::new_string("not a url".into());
+                assert!(!c.on_paste(&plain_clip, window, cx));
+            });
+        });
+
+        // 6. auto_open_code_block opens on opening fence and does NOT open on closing fence.
+        cx.update(|_, cx| {
+            composer.update(cx, |c, _| {
+                c.editor.replace_all("```");
+                assert!(c.auto_open_code_block());
+                assert_eq!(c.editor.doc().text(), "```\n\n```");
+                assert_eq!(c.editor.selection(), 4..4);
+
+                // Closing an already-opened fence must not auto-open again.
+                c.editor.replace_all("```\ncode\n```");
+                assert!(!c.auto_open_code_block());
+                assert_eq!(c.editor.doc().text(), "```\ncode\n```");
+            });
+        });
+
+        // 7. convert_typed_emoji converts `:smile:` in prose, skips inline code, fenced code, and link URLs.
+        cx.update(|_, cx| {
+            composer.update(cx, |c, _| {
+                c.editor.replace_all("hi :smile:");
+                assert!(c.convert_typed_emoji());
+                assert_eq!(c.editor.doc().atoms().len(), 1);
+                assert_eq!(c.editor.doc().to_mrkdwn(), "hi :smile:");
+
+                // Skipped inside inline code
+                c.editor.replace_all("`:smile:`");
+                c.editor.select(8..8);
+                assert!(!c.convert_typed_emoji());
+                assert!(c.editor.doc().atoms().is_empty());
+
+                // Skipped inside fenced code block
+                c.editor.replace_all("```\n:smile:\n```");
+                c.editor.select(11..11);
+                assert!(!c.convert_typed_emoji());
+                assert!(c.editor.doc().atoms().is_empty());
+
+                // Skipped inside link URL
+                c.editor.replace_all("[lbl](https://x.dev/:smile:)");
+                c.editor.select(27..27);
+                assert!(!c.convert_typed_emoji());
+                assert!(c.editor.doc().atoms().is_empty());
+            });
+        });
+
+        // 8. Edit mode Escape emits Cancel.
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.edit_mode = true;
+                c.on_escape(&Escape, window, cx);
+            });
+        });
+        assert_eq!(*cancel_count.borrow(), 1);
+
         drop(root);
     }
 }

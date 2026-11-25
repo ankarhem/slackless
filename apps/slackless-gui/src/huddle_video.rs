@@ -325,3 +325,45 @@ pub fn make_catmull_rom_segment(
         d: [p2.0, p2.1],
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{format_elapsed, make_catmull_rom_segment};
+
+    #[test]
+    fn format_elapsed_renders_mm_ss_and_h_mm_ss() {
+        assert_eq!(format_elapsed(0), "00:00");
+        assert_eq!(format_elapsed(9), "00:09");
+        assert_eq!(format_elapsed(59), "00:59");
+        assert_eq!(format_elapsed(60), "01:00");
+        assert_eq!(format_elapsed(3599), "59:59");
+        assert_eq!(format_elapsed(3600), "1:00:00");
+        assert_eq!(format_elapsed(3661), "1:01:01");
+    }
+
+    #[test]
+    fn make_catmull_rom_segment_handles_zero_chord_endpoints_and_sharp_bend_clamping() {
+        // Zero chord returns degenerate segment with endpoints intact.
+        let deg = make_catmull_rom_segment((0.0, 0.0), (0.5, 0.5), (0.5, 0.5), (1.0, 1.0));
+        assert_eq!(deg.a, [0.5, 0.5]);
+        assert_eq!(deg.b, [0.5, 0.5]);
+        assert_eq!(deg.c, [0.5, 0.5]);
+        assert_eq!(deg.d, [0.5, 0.5]);
+
+        // Collinear points preserve endpoints and produce smooth interior handles.
+        let seg = make_catmull_rom_segment((0.0, 0.0), (0.25, 0.0), (0.5, 0.0), (0.75, 0.0));
+        assert_eq!(seg.a, [0.25, 0.0]);
+        assert_eq!(seg.d, [0.5, 0.0]);
+        assert!((seg.b[0] - (0.25 + 0.5 / 6.0)).abs() < 1e-9);
+        assert!((seg.c[0] - (0.5 - 0.5 / 6.0)).abs() < 1e-9);
+
+        // Extreme outlier neighbors clamp control handles to <= 0.45 * chord_len.
+        let p1 = (0.4, 0.4);
+        let p2 = (0.5, 0.4); // chord_len = 0.1, max_handle = 0.045
+        let sharp = make_catmull_rom_segment((-10.0, 10.0), p1, p2, (10.0, -10.0));
+        let h1 = ((sharp.b[0] - sharp.a[0]).powi(2) + (sharp.b[1] - sharp.a[1]).powi(2)).sqrt();
+        let h2 = ((sharp.d[0] - sharp.c[0]).powi(2) + (sharp.d[1] - sharp.c[1]).powi(2)).sqrt();
+        assert!((h1 - 0.045).abs() < 1e-9, "h1 clamped to 0.45*chord: {h1}");
+        assert!((h2 - 0.045).abs() < 1e-9, "h2 clamped to 0.45*chord: {h2}");
+    }
+}

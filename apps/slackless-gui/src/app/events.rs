@@ -625,9 +625,12 @@ impl App {
                 }
                 let mentioned = mentions_me(&message.text, &bg_ctx.self_user, &settings.keywords);
                 let wanted = match (level, settings.notify_level) {
-                    (Some(NotifyLevel::Mentions), _) | (_, 1) => dm || mentioned,
-                    (_, 0) => true,
-                    _ => false,
+                    (Some(NotifyLevel::Everything), _) => true,
+                    (Some(NotifyLevel::Mentions), _) => dm || mentioned,
+                    (Some(NotifyLevel::Muted), _) => false,
+                    (None, 0) => true,
+                    (None, 1) => dm || mentioned,
+                    (None, _) => false,
                 };
                 if !wanted {
                     return;
@@ -2211,9 +2214,12 @@ impl App {
         }
         let mentioned = mentions_me(&message.text, me, &settings.keywords);
         let wanted = match (level, settings.notify_level) {
-            (Some(NotifyLevel::Mentions), _) | (_, 1) => dm || mentioned,
-            (_, 0) => true,
-            _ => false,
+            (Some(NotifyLevel::Everything), _) => true,
+            (Some(NotifyLevel::Mentions), _) => dm || mentioned,
+            (Some(NotifyLevel::Muted), _) => false,
+            (None, 0) => true,
+            (None, 1) => dm || mentioned,
+            (None, _) => false,
         };
         if reply && !dm && !mentioned {
             let channel_followed = settings

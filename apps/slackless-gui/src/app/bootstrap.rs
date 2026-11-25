@@ -1459,6 +1459,9 @@ impl App {
                 list_sort: None,
                 app_home_kit,
                 fixture_bookmarks: HashMap::new(),
+                #[cfg(test)]
+                os: Rc::new(platform::noop()),
+                #[cfg(not(test))]
                 os: Rc::new(platform::current()),
                 badge: None,
                 badge_label: None,
