@@ -15,8 +15,7 @@ impl SlackApi {
             ("channel", channel.to_string()),
             ("timestamp", ts.to_string()),
         ];
-        self.call::<Empty>(method::PINS_ADD, params).await?;
-        Ok(())
+        self.call_ok(method::PINS_ADD, params).await
     }
 
     /// `pins.remove`: unpin the message `ts` in `channel`.
@@ -25,8 +24,7 @@ impl SlackApi {
             ("channel", channel.to_string()),
             ("timestamp", ts.to_string()),
         ];
-        self.call::<Empty>(method::PINS_REMOVE, params).await?;
-        Ok(())
+        self.call_ok(method::PINS_REMOVE, params).await
     }
 
     /// `bookmarks.list`: the conversation's bookmarks, folders included. Fetched lazily by
@@ -67,8 +65,7 @@ impl SlackApi {
         if let Some(parent) = parent_id.filter(|s| !s.is_empty()) {
             params.push(("parent_id", parent.to_owned()));
         }
-        self.call::<Empty>(method::BOOKMARKS_ADD, params).await?;
-        Ok(())
+        self.call_ok(method::BOOKMARKS_ADD, params).await
     }
 
     /// `bookmarks.remove`: delete a bookmark from `channel` (`F-CORE-062`).
@@ -77,8 +74,7 @@ impl SlackApi {
             ("channel_id", channel.to_string()),
             ("bookmark_id", bookmark_id.to_owned()),
         ];
-        self.call::<Empty>(method::BOOKMARKS_REMOVE, params).await?;
-        Ok(())
+        self.call_ok(method::BOOKMARKS_REMOVE, params).await
     }
 
     /// Raw `drafts.list` response (`is_active=true`, `limit=100`).
@@ -165,16 +161,11 @@ impl SlackApi {
 
     /// `drafts.create`: create a cloud-synced draft for `channel` and return its draft id.
     pub async fn drafts_create(&self, channel: &ChannelId, text: &str) -> Result<Option<String>> {
-        let blocks = serde_json::json!([{
-            "type": "rich_text",
-            "elements": [{
-                "type": "rich_text_section",
-                "elements": [{ "type": "text", "text": text }]
-            }]
-        }]);
+        let blocks =
+            serde_json::to_string(&[Block::from(RichTextBlock::plain_text(text.to_owned()))])?;
         let destinations = serde_json::json!([{ "channel_id": channel.as_str() }]);
         let params = vec![
-            ("blocks", blocks.to_string()),
+            ("blocks", blocks),
             ("destinations", destinations.to_string()),
             ("file_ids", "[]".to_owned()),
             ("client_msg_id", uuid::Uuid::new_v4().to_string()),
@@ -196,17 +187,12 @@ impl SlackApi {
         channel: &ChannelId,
         text: &str,
     ) -> Result<()> {
-        let blocks = serde_json::json!([{
-            "type": "rich_text",
-            "elements": [{
-                "type": "rich_text_section",
-                "elements": [{ "type": "text", "text": text }]
-            }]
-        }]);
+        let blocks =
+            serde_json::to_string(&[Block::from(RichTextBlock::plain_text(text.to_owned()))])?;
         let destinations = serde_json::json!([{ "channel_id": channel.as_str() }]);
         let mut params = vec![
             ("draft_id", draft_id.to_owned()),
-            ("blocks", blocks.to_string()),
+            ("blocks", blocks),
             ("destinations", destinations.to_string()),
             ("file_ids", "[]".to_owned()),
             ("client_msg_id", uuid::Uuid::new_v4().to_string()),
@@ -217,8 +203,7 @@ impl SlackApi {
         {
             params.push(("client_last_updated_ts", ts));
         }
-        self.call::<Empty>(method::DRAFTS_UPDATE, params).await?;
-        Ok(())
+        self.call_ok(method::DRAFTS_UPDATE, params).await
     }
 
     /// `drafts.delete`: remove a cloud draft (or cancel a scheduled draft), attaching the
@@ -233,8 +218,7 @@ impl SlackApi {
         {
             params.push(("client_last_updated_ts", ts));
         }
-        self.call::<Empty>(method::DRAFTS_DELETE, params).await?;
-        Ok(())
+        self.call_ok(method::DRAFTS_DELETE, params).await
     }
 
     /// One page of `files.list`: the files matching `filter`, newest first. A `channel`
@@ -439,8 +423,7 @@ impl SlackApi {
             ("entries", serde_json::to_string(entries)?),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        self.call::<Empty>(method, params).await?;
-        Ok(())
+        self.call_ok(method, params).await
     }
     /// Featured/trending GIFs for Slack's emoji/GIF picker (`gif.featured`).
     pub async fn gif_featured(&self, limit: u32) -> Result<Vec<GifItem>> {
@@ -495,8 +478,7 @@ impl SlackApi {
         if let Some(due) = date_due {
             params.push(("date_due", due.to_string()));
         }
-        self.call::<Empty>(method::SAVED_ADD, params).await?;
-        Ok(())
+        self.call_ok(method::SAVED_ADD, params).await
     }
 
     /// `saved.add`: save a file for Later (`item_type=file`, `F-CORE-157`).
@@ -510,8 +492,7 @@ impl SlackApi {
         if let Some(due) = date_due {
             params.push(("date_due", due.to_string()));
         }
-        self.call::<Empty>(method::SAVED_ADD, params).await?;
-        Ok(())
+        self.call_ok(method::SAVED_ADD, params).await
     }
 
     /// `files.info`: fetch metadata for one file or canvas (`F-COLLAB-125`).
@@ -531,8 +512,7 @@ impl SlackApi {
     /// `files.delete`: permanently delete a file/clip uploaded by the user (`F-CORE-130`).
     pub async fn files_delete(&self, file_id: &str) -> Result<()> {
         let params = vec![("file", file_id.to_owned())];
-        self.call::<Empty>(method::FILES_DELETE, params).await?;
-        Ok(())
+        self.call_ok(method::FILES_DELETE, params).await
     }
 
     /// Fetch a live Slack canvas's parsed metadata and HTML body (`files.info` -> `url_private`
@@ -586,8 +566,7 @@ impl SlackApi {
         if let Some(due) = date_due {
             params.push(("date_due", due.unwrap_or(0).to_string()));
         }
-        self.call::<Empty>(method::SAVED_UPDATE, params).await?;
-        Ok(())
+        self.call_ok(method::SAVED_UPDATE, params).await
     }
 
     /// `saved.delete`: remove a message from Later.
@@ -599,8 +578,7 @@ impl SlackApi {
             ("_x_reason", "saved-api/deleteSavedMessage".to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        self.call::<Empty>(method::SAVED_DELETE, params).await?;
-        Ok(())
+        self.call_ok(method::SAVED_DELETE, params).await
     }
 
     /// `saved.clearCompleted`: clear all completed Later items.
@@ -609,9 +587,7 @@ impl SlackApi {
             ("_x_reason", "manually_marked_all_completed".to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        self.call::<Empty>(method::SAVED_CLEAR_COMPLETED, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::SAVED_CLEAR_COMPLETED, params).await
     }
 
     /// `client.appCommands`: workspace slash command catalog (`core`, `app`, `service`).
@@ -678,6 +654,45 @@ impl SlackApi {
         Ok(results)
     }
 
+    fn search_module_params(
+        module: &str,
+        query: &str,
+        sort: SearchSort,
+        page: usize,
+        search_context: &str,
+        reason: &str,
+        extra: &[(&'static str, &'static str)],
+    ) -> crate::client::Params {
+        let sort_key = match sort {
+            SearchSort::Score => "score",
+            SearchSort::Timestamp => "timestamp",
+        };
+        let mut params = vec![
+            ("module", module.to_owned()),
+            ("query", query.to_owned()),
+            ("page", page.max(1).to_string()),
+            ("count", "20".to_owned()),
+            ("extracts", "1".to_owned()),
+            ("highlight", "0".to_owned()),
+            ("extra_message_data", "1".to_owned()),
+            ("file_title_only", "false".to_owned()),
+            ("query_rewrite_disabled", "false".to_owned()),
+            ("include_files_shares", "1".to_owned()),
+            ("search_context", search_context.to_owned()),
+            ("sort", sort_key.to_owned()),
+            ("sort_dir", "desc".to_owned()),
+            ("search_tab_filter", module.to_owned()),
+            ("search_tab_sort", sort_key.to_owned()),
+            ("_x_reason", reason.to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+            ("_x_app_name", "client".to_owned()),
+        ];
+        for &(k, v) in extra {
+            params.push((k, v.to_owned()));
+        }
+        params
+    }
+
     /// `search.modules.messages`: private web-client message search (`docs/research/api-search.md`).
     pub async fn search_modules_messages(
         &self,
@@ -685,34 +700,19 @@ impl SlackApi {
         sort: SearchSort,
         page: usize,
     ) -> Result<RemoteMessagePage> {
-        let sort_key = match sort {
-            SearchSort::Score => "score",
-            SearchSort::Timestamp => "timestamp",
-        };
-        let params = vec![
-            ("module", "messages".to_owned()),
-            ("query", query.to_owned()),
-            ("page", page.max(1).to_string()),
-            ("count", "20".to_owned()),
-            ("extracts", "1".to_owned()),
-            ("highlight", "0".to_owned()),
-            ("max_extract_len", "200".to_owned()),
-            ("extra_message_data", "1".to_owned()),
-            ("no_user_profile", "1".to_owned()),
-            ("file_title_only", "false".to_owned()),
-            ("query_rewrite_disabled", "false".to_owned()),
-            ("include_files_shares", "1".to_owned()),
-            ("search_context", "desktop_messages_tab".to_owned()),
-            ("sort", sort_key.to_owned()),
-            ("sort_dir", "desc".to_owned()),
-            ("search_tab_filter", "messages".to_owned()),
-            ("search_tab_sort", sort_key.to_owned()),
-            ("_x_reason", "search-modules-messages".to_owned()),
-            ("_x_mode", MODE_ONLINE.to_owned()),
-            ("_x_app_name", "client".to_owned()),
-        ];
-        let wire: SearchModulesMessagesWire =
-            self.call("search.modules.messages", params).await?.data;
+        let params = Self::search_module_params(
+            "messages",
+            query,
+            sort,
+            page,
+            "desktop_messages_tab",
+            "search-modules-messages",
+            &[("max_extract_len", "200"), ("no_user_profile", "1")],
+        );
+        let wire: SearchModulesMessagesWire = self
+            .call(method::SEARCH_MODULES_MESSAGES, params)
+            .await?
+            .data;
         Ok(parse_search_modules_messages(wire))
     }
 
@@ -723,31 +723,17 @@ impl SlackApi {
         sort: SearchSort,
         page: usize,
     ) -> Result<RemoteFilePage> {
-        let sort_key = match sort {
-            SearchSort::Score => "score",
-            SearchSort::Timestamp => "timestamp",
-        };
-        let params = vec![
-            ("module", "files".to_owned()),
-            ("query", query.to_owned()),
-            ("page", page.max(1).to_string()),
-            ("count", "20".to_owned()),
-            ("extracts", "1".to_owned()),
-            ("highlight", "0".to_owned()),
-            ("extra_message_data", "1".to_owned()),
-            ("file_title_only", "false".to_owned()),
-            ("query_rewrite_disabled", "false".to_owned()),
-            ("include_files_shares", "1".to_owned()),
-            ("search_context", "desktop_files_tab".to_owned()),
-            ("sort", sort_key.to_owned()),
-            ("sort_dir", "desc".to_owned()),
-            ("search_tab_filter", "messages".to_owned()),
-            ("search_tab_sort", sort_key.to_owned()),
-            ("_x_reason", "search-modules-files".to_owned()),
-            ("_x_mode", MODE_ONLINE.to_owned()),
-            ("_x_app_name", "client".to_owned()),
-        ];
-        let wire: SearchModulesFilesWire = self.call("search.modules.files", params).await?.data;
+        let params = Self::search_module_params(
+            "files",
+            query,
+            sort,
+            page,
+            "desktop_files_tab",
+            "search-modules-files",
+            &[],
+        );
+        let wire: SearchModulesFilesWire =
+            self.call(method::SEARCH_MODULES_FILES, params).await?.data;
         Ok(parse_search_modules_files(wire))
     }
 
@@ -756,14 +742,13 @@ impl SlackApi {
         &self,
         update: &ProfileUpdate,
     ) -> Result<slackless_types::Profile> {
-        let profile_json = serde_json::to_string(update)
-            .map_err(|e| crate::ApiError::Slack(format!("invalid profile update payload: {e}")))?;
+        let profile_json = serde_json::to_string(update)?;
         let params = vec![
             ("profile", profile_json),
             ("_x_reason", "profile-edit".to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        let resp: ProfileSetWire = self.call("users.profile.set", params).await?.data;
+        let resp: ProfileSetWire = self.call(method::USERS_PROFILE_SET, params).await?.data;
         Ok(resp.profile)
     }
 
@@ -775,8 +760,7 @@ impl SlackApi {
             ("_x_reason", "manual-presence".to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        self.call::<Empty>("presence.set", params).await?;
-        Ok(())
+        self.call_ok(method::PRESENCE_SET, params).await
     }
 
     /// `users.prefs.set`: write a single user preference key/value pair back to Slack.
@@ -786,8 +770,7 @@ impl SlackApi {
             ("value", value.to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        self.call::<Empty>("users.prefs.set", params).await?;
-        Ok(())
+        self.call_ok(method::USERS_PREFS_SET, params).await
     }
 
     /// `users.prefs.setNotifications` (`global=true`): write one global notification pref
@@ -806,8 +789,7 @@ impl SlackApi {
             ("sync", sync.to_string()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        self.call::<Empty>(method::USERS_PREFS_SET_NOTIFICATIONS, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::USERS_PREFS_SET_NOTIFICATIONS, params)
+            .await
     }
 }

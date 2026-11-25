@@ -24,7 +24,7 @@ use crate::pagination::{Page, paginate};
 use crate::types::endpoints::method;
 use crate::types::{
     ApiResponse, Block, BotId, BotProfile, ChannelId, ChannelSection, Conversation, DndStatus,
-    Empty, File, Message, RichTextBlock, Team, TeamId, Ts, User, UserId, UserPresence, Usergroup,
+    File, Message, RichTextBlock, Team, TeamId, Ts, User, UserId, UserPresence, Usergroup,
 };
 use crate::{ApiError, Result, SlackApi};
 
@@ -40,8 +40,7 @@ impl SlackApi {
 
     /// `auth.revoke`: revokes the current token server-side on sign-out (`F-CORE-009`).
     pub async fn auth_revoke(&self) -> Result<()> {
-        let _: serde_json::Value = self.call(method::AUTH_REVOKE, Vec::new()).await?.data;
-        Ok(())
+        self.call_ok(method::AUTH_REVOKE, Vec::new()).await
     }
 
     /// `conversations.addTab`: add a tab (`files`, `bookmarks`, `folder`, `canvas`, etc.) to `channel` (`F-CORE-061`).
@@ -59,8 +58,7 @@ impl SlackApi {
         if let Some(label) = label.filter(|s| !s.is_empty()) {
             params.push(("label", label.to_owned()));
         }
-        let _: serde_json::Value = self.call(method::CONVERSATIONS_ADD_TAB, params).await?.data;
-        Ok(())
+        self.call_ok(method::CONVERSATIONS_ADD_TAB, params).await
     }
 
     /// `conversations.removeTab`: remove a tab from `channel` while keeping shared files (`F-CORE-061`).
@@ -71,11 +69,7 @@ impl SlackApi {
             ("keep_file_share", "true".to_owned()),
             ("reason", "remove-channel-tab".to_owned()),
         ];
-        let _: serde_json::Value = self
-            .call(method::CONVERSATIONS_REMOVE_TAB, params)
-            .await?
-            .data;
-        Ok(())
+        self.call_ok(method::CONVERSATIONS_REMOVE_TAB, params).await
     }
 
     /// `conversations.moveTab`: reorder a tab inside `channel` (`F-CORE-061`).
@@ -92,11 +86,7 @@ impl SlackApi {
         if let Some(after) = after.filter(|s| !s.is_empty()) {
             params.push(("after", after.to_owned()));
         }
-        let _: serde_json::Value = self
-            .call(method::CONVERSATIONS_MOVE_TAB, params)
-            .await?
-            .data;
-        Ok(())
+        self.call_ok(method::CONVERSATIONS_MOVE_TAB, params).await
     }
 
     /// `client.userBoot` (cold boot): self, team, channels, IMs, priorities, prefs.
@@ -223,9 +213,8 @@ impl SlackApi {
             ("type", "home".to_owned()),
             ("_x_reason", "app-home-logging".to_owned()),
         ];
-        self.call::<Empty>(method::APPS_HOME_DISPATCH_OPEN_EVENT, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::APPS_HOME_DISPATCH_OPEN_EVENT, params)
+            .await
     }
 
     /// `apps.home.open`: resolve an app's DM conversation id from `(app_id, team_id)` (`F-COLLAB-481`, `F-COLLAB-523`).
@@ -253,17 +242,13 @@ impl SlackApi {
     /// `workflows.triggers.trip`: trigger a Slack Workflow Builder link trigger (`https://slack.com/shortcuts/Ft...`,
     /// `F-COLLAB-319`, `F-COLLAB-376`). Any resulting modal arrives over the websocket as `view_opened`.
     pub async fn workflows_triggers_trip(&self, url: &str, context: &Value) -> Result<()> {
-        if !url.starts_with("https://") {
+        let parsed =
+            url::Url::parse(url).map_err(|_| crate::ApiError::UntrustedUrl(url.to_owned()))?;
+        if !crate::client::is_trusted_slack_https_url(&parsed) {
             return Err(crate::ApiError::UntrustedUrl(url.to_owned()));
         }
-        let client_token = format!(
-            "web-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis())
-        );
         let params = vec![
-            ("client_token", client_token),
+            ("client_token", client_token()),
             ("url", url.to_owned()),
             ("context", context.to_string()),
             (
@@ -272,9 +257,7 @@ impl SlackApi {
             ),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        self.call::<Empty>(method::WORKFLOWS_TRIGGERS_TRIP, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::WORKFLOWS_TRIGGERS_TRIP, params).await
     }
 
     /// One page of `conversations.list`.
@@ -388,27 +371,21 @@ impl SlackApi {
             .await
     }
 
-    /// `conversations.mark`: moves the read cursor to `ts` (an earlier ts marks unread).
     /// `conversations.leave`: the signed-in user leaves `channel`.
     pub async fn conversations_leave(&self, channel: &ChannelId) -> Result<()> {
         let params = vec![("channel", channel.to_string())];
-        self.call::<Empty>(method::CONVERSATIONS_LEAVE, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::CONVERSATIONS_LEAVE, params).await
     }
 
+    /// `conversations.mark`: moves the read cursor to `ts` (an earlier ts marks unread).
     pub async fn conversations_mark(&self, channel: &ChannelId, ts: &Ts) -> Result<()> {
         let params = vec![("channel", channel.to_string()), ("ts", ts.to_string())];
-        self.call::<Empty>(method::CONVERSATIONS_MARK, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::CONVERSATIONS_MARK, params).await
     }
 
     /// `users.markAllRead`: every conversation and thread read (Slack's Shift+Esc).
     pub async fn users_mark_all_read(&self) -> Result<()> {
-        self.call::<Empty>(method::USERS_MARK_ALL_READ, Vec::new())
-            .await?;
-        Ok(())
+        self.call_ok(method::USERS_MARK_ALL_READ, Vec::new()).await
     }
 
     /// `subscriptions.thread.add` / `subscriptions.thread.remove`: follow or unfollow a
@@ -431,8 +408,7 @@ impl SlackApi {
         } else {
             method::SUBSCRIPTIONS_THREAD_REMOVE
         };
-        self.call::<Empty>(method, params).await?;
-        Ok(())
+        self.call_ok(method, params).await
     }
 
     /// `subscriptions.thread.mark`: update the read cursor of a single thread (`read=1` marks
@@ -449,9 +425,8 @@ impl SlackApi {
             ("ts", ts.to_string()),
             ("read", "1".to_owned()),
         ];
-        self.call::<Empty>(method::SUBSCRIPTIONS_THREAD_MARK, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::SUBSCRIPTIONS_THREAD_MARK, params)
+            .await
     }
 
     /// `conversations.open`: opens (or finds) the DM with `users`, a comma-separated id list.
@@ -467,8 +442,6 @@ impl SlackApi {
         Ok(resp.data.channel)
     }
 
-    /// `conversations.setTopic`: replace `channel`'s topic; the answer carries the updated
-    /// channel object.
     /// `conversations.join`: the signed-in user joins public `channel`; the answer carries
     /// the joined channel.
     pub async fn conversations_join(&self, channel: &ChannelId) -> Result<Conversation> {
@@ -480,6 +453,8 @@ impl SlackApi {
             .channel)
     }
 
+    /// `conversations.setTopic`: replace `channel`'s topic; the answer carries the updated
+    /// channel object.
     pub async fn conversations_set_topic(
         &self,
         channel: &ChannelId,
@@ -547,26 +522,21 @@ impl SlackApi {
     /// `conversations.archive`: archive an active channel.
     pub async fn conversations_archive(&self, channel: &ChannelId) -> Result<()> {
         let params = vec![("channel", channel.to_string())];
-        self.call::<Empty>(method::CONVERSATIONS_ARCHIVE, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::CONVERSATIONS_ARCHIVE, params).await
     }
 
     /// `conversations.unarchive`: restore an archived channel.
     pub async fn conversations_unarchive(&self, channel: &ChannelId) -> Result<()> {
         let params = vec![("channel", channel.to_string())];
-        self.call::<Empty>(method::CONVERSATIONS_UNARCHIVE, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::CONVERSATIONS_UNARCHIVE, params).await
     }
 
     /// `admin.conversations.delete`: permanently delete a channel (`F-CORE-053`; requires
     /// workspace admin privileges).
     pub async fn admin_conversations_delete(&self, channel: &ChannelId) -> Result<()> {
         let params = vec![("channel_id", channel.to_string())];
-        self.call::<Empty>(method::ADMIN_CONVERSATIONS_DELETE, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::ADMIN_CONVERSATIONS_DELETE, params)
+            .await
     }
 
     /// `conversations.convertToPrivate`: convert a public channel or group DM into a private

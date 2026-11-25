@@ -67,9 +67,7 @@ impl SlackApi {
             ("channel_id", channel_id.to_string()),
             ("user_id", user_id.to_string()),
         ];
-        self.call::<Empty>(method::ROOMS_NOTIFY_MEMBER, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::ROOMS_NOTIFY_MEMBER, params).await
     }
 
     /// `rooms.getLink`: fetch a shareable huddle link (falling back to the canonical web URL).
@@ -89,9 +87,7 @@ impl SlackApi {
             ("room", room_id.to_owned()),
             ("room_name", room_name.to_owned()),
         ];
-        self.call::<Empty>(method::SCREENHERO_ROOMS_RENAME, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::SCREENHERO_ROOMS_RENAME, params).await
     }
 
     /// `rooms.startTranscription`: enable server-side AWS Transcribe live captions (`F-COLLAB-037`).
@@ -100,9 +96,8 @@ impl SlackApi {
             ("call_id", call_id.to_owned()),
             ("reason", "start-event-log".to_owned()),
         ];
-        self.call::<Empty>(method::ROOMS_START_TRANSCRIPTION, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::ROOMS_START_TRANSCRIPTION, params)
+            .await
     }
 
     /// `rooms.stopTranscription`: disable server-side AWS Transcribe live captions.
@@ -111,9 +106,7 @@ impl SlackApi {
             ("call_id", call_id.to_owned()),
             ("reason", "stop-event-log".to_owned()),
         ];
-        self.call::<Empty>(method::ROOMS_STOP_TRANSCRIPTION, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::ROOMS_STOP_TRANSCRIPTION, params).await
     }
 
     /// `rooms.inviteResponse`: decline or respond (`"decline"`, `"joining_soon"`) to a DM huddle invite.
@@ -129,9 +122,7 @@ impl SlackApi {
             ("response", response.to_owned()),
             ("reason", "respond-to-huddle-invite".to_owned()),
         ];
-        self.call::<Empty>(method::ROOMS_INVITE_RESPONSE, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::ROOMS_INVITE_RESPONSE, params).await
     }
 
     /// `huddles.update`: update the huddle's theme/background id (`F-COLLAB-035`).
@@ -145,7 +136,6 @@ impl SlackApi {
             ("background_id", background_id.to_owned()),
             ("reason", "canvas-background-update".to_owned()),
         ];
-        self.call::<Empty>(method::HUDDLES_UPDATE, params).await?;
-        Ok(())
+        self.call_ok(method::HUDDLES_UPDATE, params).await
     }
 }

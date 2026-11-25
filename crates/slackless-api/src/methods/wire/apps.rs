@@ -4,7 +4,19 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::de::lenient_vec;
-use crate::types::{ChannelId, Ts};
+use crate::types::{BotId, ChannelId, TeamId, Ts};
+
+/// Request parameters for `blocks.suggestions` (`external_select` / `multi_external_select`).
+#[derive(Debug, Clone)]
+pub struct BlockSuggestionsRequest<'a> {
+    pub bot: &'a BotId,
+    pub app_id: &'a str,
+    pub team: &'a TeamId,
+    pub action_id: &'a str,
+    pub block_id: &'a str,
+    pub value: &'a str,
+    pub container: &'a ActionContainer,
+}
 
 /// Where a Block Kit action happened, as `blocks.actions`'s `container` names it.
 #[derive(Debug, Clone, PartialEq)]

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::de::or_default;
+use crate::de::{or_default, value_as_lenient_bool};
 use crate::types::{ChannelId, File, Message, MessageSubtype, Ts, UserId};
 
 /// Access level for `canvases.access.set`.
@@ -95,19 +95,6 @@ pub fn canvas_comment_channel_id(file_id: &str) -> ChannelId {
         ChannelId::from(format!("C{rest}"))
     } else {
         ChannelId::from(file_id)
-    }
-}
-
-fn value_as_lenient_bool(val: &Value) -> Option<bool> {
-    match val {
-        Value::Bool(b) => Some(*b),
-        Value::Number(n) => n.as_i64().map(|i| i != 0),
-        Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" => Some(true),
-            "false" | "0" | "no" => Some(false),
-            _ => None,
-        },
-        _ => None,
     }
 }
 

@@ -43,7 +43,7 @@ where
             let page = fetch(cursor.clone()).await?;
             let next = page
                 .next_cursor
-                .filter(|c| Some(c) != cursor.as_ref())
+                .filter(|c| !c.is_empty() && Some(c) != cursor.as_ref())
                 .map(Some);
             Ok(Some((page.items, (fetch, next))))
         },

@@ -1606,12 +1606,13 @@ async fn users_set_photo_multipart_framing_sanitization_mime_and_errors() {
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), cases.len());
+    let mut boundaries = std::collections::HashSet::new();
     for (req, (_, safe_name, expected_mime)) in requests.iter().zip(cases.iter()) {
         let ct = req.headers.get("content-type").unwrap().to_str().unwrap();
-        assert!(
-            ct.starts_with("multipart/form-data; boundary="),
-            "unexpected content-type: {ct}"
-        );
+        let boundary = ct
+            .strip_prefix("multipart/form-data; boundary=")
+            .unwrap_or_else(|| panic!("unexpected content-type: {ct}"));
+        boundaries.insert(boundary.to_owned());
         let body = String::from_utf8_lossy(&req.body);
         assert!(body.contains("name=\"token\"\r\n\r\nxoxc-1-2-3-deadbeef\r\n"));
         assert!(
@@ -1629,6 +1630,10 @@ async fn users_set_photo_multipart_framing_sanitization_mime_and_errors() {
             "raw binary payload must be preserved verbatim"
         );
     }
+    assert!(
+        boundaries.len() > 1,
+        "multipart uploads must use random per-request boundaries, got: {boundaries:?}"
+    );
 
     // Error decoding on users.setPhoto (Slack error, non-2xx status, 200 bad JSON)
     {
@@ -1986,14 +1991,24 @@ async fn blocks_suggestions_upload_errors_canvas_html_workflows_and_asset_client
         );
     }
 
-    // 4. workflows_triggers_trip rejects non-HTTPS and sends HTTPS
+    // 4. workflows_triggers_trip rejects non-HTTPS and non-Slack hosts, accepts Slack HTTPS
     {
         let (server, api) = setup().await;
-        let err = api
-            .workflows_triggers_trip("http://slack.com/shortcuts/Ft1", &json!({}))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ApiError::UntrustedUrl(_)), "{err:?}");
+        for untrusted in [
+            "http://slack.com/shortcuts/Ft1",
+            "https://evil.example/shortcuts/Ft1",
+            "https://slack.com.evil.example/shortcuts/Ft1",
+            "https://evilslack.com/shortcuts/Ft1",
+        ] {
+            let err = api
+                .workflows_triggers_trip(untrusted, &json!({}))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ApiError::UntrustedUrl(_)),
+                "expected UntrustedUrl for {untrusted}, got {err:?}"
+            );
+        }
 
         Mock::given(method("POST"))
             .and(path("/api/workflows.triggers.trip"))
@@ -2031,6 +2046,14 @@ async fn blocks_suggestions_upload_errors_canvas_html_workflows_and_asset_client
         assert_eq!(bytes, b"PNG!");
         let reqs = server.received_requests().await.unwrap();
         assert!(reqs[0].headers.get("cookie").is_none());
+        assert!(
+            reqs[0]
+                .headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ua| ua.contains("Mozilla/5.0")),
+            "AssetClient should send browser User-Agent"
+        );
 
         let err = client
             .get(&format!("{}/404.png", server.uri()))
@@ -2395,4 +2418,130 @@ async fn canvas_create_and_delete_fall_back_on_not_allowed_token_type() {
     api.canvases_delete("F0PRIVCANVAS")
         .await
         .expect("files.delete fallback should succeed");
+}
+
+#[tokio::test]
+async fn lists_do_not_swallow_auth_expired_and_search_modules_files_uses_files_filter() {
+    use slackless_api::types::{BotId, TeamId};
+    use slackless_api::{
+        ActionContainer, BlockSuggestionsRequest, ListCellInput, ListCellInputValue, SearchSort,
+    };
+
+    // 1. lists endpoints propagate AuthExpired instead of falling back.
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/files.info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "file": { "id": "F_LIST" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/lists.records.list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": false,
+                "error": "invalid_auth"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/slackLists.items.list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let err = api.fetch_list("F_LIST").await.unwrap_err();
+        assert!(err.is_auth_expired(), "expected AuthExpired, got {err:?}");
+
+        Mock::given(method("POST"))
+            .and(path("/api/lists.cells.update"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": false,
+                "error": "token_revoked"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/slackLists.items.update"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let err = api
+            .lists_cells_update(
+                "F_LIST",
+                "R1",
+                &[ListCellInput {
+                    column_id: "C1".into(),
+                    value: ListCellInputValue::Checkbox(true),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.is_auth_expired(), "expected AuthExpired, got {err:?}");
+    }
+
+    // 2. search_modules_files sends search_tab_filter=files (not messages).
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/search.modules.files"))
+            .and(body_string_contains("search_tab_filter=files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "pagination": { "total_count": 0, "page": 1, "page_count": 0 },
+                "items": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let page = api
+            .search_modules_files("quarterly", SearchSort::Score, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.total, 0);
+    }
+
+    // 3. blocks_suggestions_for works with BlockSuggestionsRequest.
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/blocks.suggestions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "options": [{ "text": "Item 1", "value": "v1" }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let container = ActionContainer {
+            channel: ChannelId::from("C1"),
+            message_ts: Ts::from("1.0"),
+            attachment_id: None,
+            is_ephemeral: false,
+            view_id: None,
+        };
+        let bot = BotId::from("B1");
+        let team = TeamId::from("T1");
+        let opts = api
+            .blocks_suggestions_for(&BlockSuggestionsRequest {
+                bot: &bot,
+                app_id: "A1",
+                team: &team,
+                action_id: "act",
+                block_id: "blk",
+                value: "q",
+                container: &container,
+            })
+            .await
+            .unwrap();
+        assert_eq!(opts, vec![("Item 1".to_owned(), "v1".to_owned())]);
+    }
 }

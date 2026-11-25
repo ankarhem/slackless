@@ -4,6 +4,8 @@
 //! so a renamed flag or moved host is a one-line edit. Observed values: docs/research/api-realtime.md
 //! ("URL, full parameter set").
 
+use std::fmt;
+
 use slackless_types::TeamId;
 use slackless_types::endpoints::WSS_PRIMARY;
 use url::Url;
@@ -31,7 +33,7 @@ pub mod param {
 }
 
 /// Inputs to [`connect_url`]. [`ConnectParams::new`] fills in the web client's observed defaults.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConnectParams {
     pub token: String,
     /// `gateway_server`; omitted when `None`. Use [`ConnectParams::with_team`] to derive it.
@@ -46,6 +48,23 @@ pub struct ConnectParams {
     pub start_args: Vec<(String, String)>,
     /// Extra params appended verbatim, for flags Slack adds later.
     pub extra: Vec<(String, String)>,
+}
+
+impl fmt::Debug for ConnectParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectParams")
+            .field("token", &"<redacted>")
+            .field("gateway_server", &self.gateway_server)
+            .field("slack_client", &self.slack_client)
+            .field("sync_desync", &self.sync_desync)
+            .field("no_query_on_subscribe", &self.no_query_on_subscribe)
+            .field("flannel", &self.flannel)
+            .field("lazy_channels", &self.lazy_channels)
+            .field("batch_presence_aware", &self.batch_presence_aware)
+            .field("start_args", &self.start_args)
+            .field("extra", &self.extra)
+            .finish()
+    }
 }
 
 /// `start_args` observed from the web client (slackdump FlannelURL, slackgo).

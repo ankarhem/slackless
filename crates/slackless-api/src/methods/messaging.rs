@@ -66,8 +66,7 @@ impl SlackApi {
             ("_x_reason", REASON_COMMAND.to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ]);
-        self.call::<Empty>(method::CHAT_COMMAND, params).await?;
-        Ok(())
+        self.call_ok(method::CHAT_COMMAND, params).await
     }
 
     /// `blocks.actions`: a Block Kit interaction dispatched to the app (`bot`, `app_id`) that
@@ -93,31 +92,23 @@ impl SlackApi {
             ("_x_reason", REASON_BLOCK_ACTION.to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        self.call::<Empty>(method::BLOCKS_ACTIONS, params).await?;
-        Ok(())
+        self.call_ok(method::BLOCKS_ACTIONS, params).await
     }
 
     /// `blocks.suggestions`: fetch dynamic option suggestions for `external_select` /
     /// `multi_external_select` elements (`F-COLLAB-786`).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn blocks_suggestions(
+    pub async fn blocks_suggestions_for(
         &self,
-        bot: &BotId,
-        app_id: &str,
-        team: &TeamId,
-        action_id: &str,
-        block_id: &str,
-        value: &str,
-        container: &ActionContainer,
+        req: &BlockSuggestionsRequest<'_>,
     ) -> Result<Vec<(String, String)>> {
         let params = vec![
-            ("service_id", bot.to_string()),
-            ("app_id", app_id.to_owned()),
-            ("service_team_id", team.to_string()),
-            ("action_id", action_id.to_owned()),
-            ("block_id", block_id.to_owned()),
-            ("value", value.to_owned()),
-            ("container", container.json().to_string()),
+            ("service_id", req.bot.to_string()),
+            ("app_id", req.app_id.to_owned()),
+            ("service_team_id", req.team.to_string()),
+            ("action_id", req.action_id.to_owned()),
+            ("block_id", req.block_id.to_owned()),
+            ("value", req.value.to_owned()),
+            ("container", req.container.json().to_string()),
             ("client_token", client_token()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
@@ -145,6 +136,30 @@ impl SlackApi {
         Ok(options)
     }
 
+    /// Backwards-compatible wrapper around [`SlackApi::blocks_suggestions_for`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn blocks_suggestions(
+        &self,
+        bot: &BotId,
+        app_id: &str,
+        team: &TeamId,
+        action_id: &str,
+        block_id: &str,
+        value: &str,
+        container: &ActionContainer,
+    ) -> Result<Vec<(String, String)>> {
+        self.blocks_suggestions_for(&BlockSuggestionsRequest {
+            bot,
+            app_id,
+            team,
+            action_id,
+            block_id,
+            value,
+            container,
+        })
+        .await
+    }
+
     /// `views.submit`: submit a Block Kit modal view's `state.values` back to the app (`F-COLLAB-725`).
     pub async fn views_submit(
         &self,
@@ -164,8 +179,7 @@ impl SlackApi {
         if let Some(hash) = hash {
             params.push(("hash", hash.to_owned()));
         }
-        self.call::<Empty>(method::VIEWS_SUBMIT, params).await?;
-        Ok(())
+        self.call_ok(method::VIEWS_SUBMIT, params).await
     }
 
     /// `views.close`: notify Slack that the user dismissed a Block Kit modal (`notify_on_close`).
@@ -178,8 +192,7 @@ impl SlackApi {
         if let Some(hash) = hash {
             params.push(("hash", hash.to_owned()));
         }
-        self.call::<Empty>(method::VIEWS_CLOSE, params).await?;
-        Ok(())
+        self.call_ok(method::VIEWS_CLOSE, params).await
     }
 
     /// `bots.info`: a bot's profile (name, icons, app) for messages that carry only its id.
@@ -219,8 +232,7 @@ impl SlackApi {
             ("ts", ts.to_string()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        self.call::<Empty>(method::CHAT_DELETE, params).await?;
-        Ok(())
+        self.call_ok(method::CHAT_DELETE, params).await
     }
 
     /// `chat.scheduleMessage`: queue a message for delivery at unix timestamp `post_at`.
@@ -300,10 +312,10 @@ impl SlackApi {
             ("scheduled_message_id", scheduled_message_id.to_owned()),
         ];
         match self
-            .call::<Empty>(method::CHAT_DELETE_SCHEDULED_MESSAGE, params)
+            .call_ok(method::CHAT_DELETE_SCHEDULED_MESSAGE, params)
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(()) => Ok(()),
             Err(ApiError::Slack(ref code)) if code == "not_allowed_token_type" => {
                 self.mark_drafts_schedule();
                 self.drafts_delete(scheduled_message_id).await
@@ -331,11 +343,10 @@ impl SlackApi {
             ("name", name.trim_matches(':').to_owned()),
             ("_x_reason", REASON_REACTION.to_owned()),
         ];
-        self.call::<Empty>(method, params).await?;
-        Ok(())
+        self.call_ok(method, params).await
     }
 
-    /// `users.info`.
+    /// `users.prefs.setNotifications`: write a per-channel notification preference override.
     pub async fn users_prefs_set_notifications(
         &self,
         channel: &ChannelId,
@@ -350,11 +361,11 @@ impl SlackApi {
             ("global", "false".to_owned()),
             ("sync", "false".to_owned()),
         ];
-        self.call::<Empty>(method::USERS_PREFS_SET_NOTIFICATIONS, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::USERS_PREFS_SET_NOTIFICATIONS, params)
+            .await
     }
 
+    /// `users.info`.
     pub async fn users_info(&self, user: &UserId) -> Result<User> {
         let params = vec![("user", user.to_string())];
         Ok(self
@@ -430,8 +441,7 @@ impl SlackApi {
 
     /// `dnd.endDnd`: end the signed-in user's active do-not-disturb session (`F-SHELL-034`).
     pub async fn dnd_end_dnd(&self) -> Result<()> {
-        self.call::<Empty>(method::DND_END_DND, Vec::new()).await?;
-        Ok(())
+        self.call_ok(method::DND_END_DND, Vec::new()).await
     }
 
     /// `dnd.teamInfo`: batch DND status lookup for up to 50 users per request (`F-SHELL-035`).
@@ -515,22 +525,8 @@ impl SlackApi {
         handle: &str,
         description: &str,
     ) -> Result<Usergroup> {
-        #[derive(Deserialize)]
-        struct Wire {
-            usergroup: Usergroup,
-        }
-        let mut params = vec![("name", name.to_owned())];
-        if !handle.trim().is_empty() {
-            params.push(("handle", handle.trim().trim_start_matches('@').to_owned()));
-        }
-        if !description.trim().is_empty() {
-            params.push(("description", description.trim().to_owned()));
-        }
-        Ok(self
-            .call::<Wire>(method::USERGROUPS_CREATE, params)
-            .await?
-            .data
-            .usergroup)
+        self.usergroups_mutate(method::USERGROUPS_CREATE, None, name, handle, description)
+            .await
     }
 
     /// `usergroups.update`: update an existing `@handle` user group's name/handle/description.
@@ -541,25 +537,40 @@ impl SlackApi {
         handle: &str,
         description: &str,
     ) -> Result<Usergroup> {
+        self.usergroups_mutate(
+            method::USERGROUPS_UPDATE,
+            Some(usergroup),
+            name,
+            handle,
+            description,
+        )
+        .await
+    }
+
+    async fn usergroups_mutate(
+        &self,
+        endpoint: &str,
+        usergroup: Option<&str>,
+        name: &str,
+        handle: &str,
+        description: &str,
+    ) -> Result<Usergroup> {
         #[derive(Deserialize)]
         struct Wire {
             usergroup: Usergroup,
         }
-        let mut params = vec![
-            ("usergroup", usergroup.to_owned()),
-            ("name", name.to_owned()),
-        ];
+        let mut params = Vec::new();
+        if let Some(id) = usergroup {
+            params.push(("usergroup", id.to_owned()));
+        }
+        params.push(("name", name.to_owned()));
         if !handle.trim().is_empty() {
             params.push(("handle", handle.trim().trim_start_matches('@').to_owned()));
         }
         if !description.trim().is_empty() {
             params.push(("description", description.trim().to_owned()));
         }
-        Ok(self
-            .call::<Wire>(method::USERGROUPS_UPDATE, params)
-            .await?
-            .data
-            .usergroup)
+        Ok(self.call::<Wire>(endpoint, params).await?.data.usergroup)
     }
 
     /// Every page of `users.channelSections.list`: the user's sidebar sections, in the order
@@ -567,28 +578,26 @@ impl SlackApi {
     /// uses the top-level `cursor`, not `response_metadata.next_cursor`.
     pub async fn users_channel_sections_list(&self) -> Result<Vec<ChannelSection>> {
         let mut sections = Vec::new();
-        let mut cursor: Option<String> = None;
-        loop {
+        let mut stream = std::pin::pin!(paginate(|cursor| async move {
             let mut params = Vec::new();
-            if let Some(cursor) = &cursor {
-                params.push(("cursor", cursor.clone()));
+            if let Some(cursor) = cursor {
+                params.push(("cursor", cursor));
             }
             let data = self
                 .call::<ChannelSectionsWire>(method::USERS_CHANNEL_SECTIONS_LIST, params)
                 .await?
                 .data;
-            for section in data.channel_sections.into_iter().map(ChannelSection::from) {
-                merge_section(&mut sections, section);
-            }
-            let previous = cursor;
-            // Stop on an empty cursor, or when Slack hands back the cursor it was just given
-            // (the same loop guard `paginate` applies to `response_metadata` cursors).
-            cursor = data
-                .cursor
-                .filter(|c| !c.is_empty() && Some(c) != previous.as_ref());
-            if cursor.is_none() {
-                break;
-            }
+            Ok(Page {
+                items: data
+                    .channel_sections
+                    .into_iter()
+                    .map(ChannelSection::from)
+                    .collect(),
+                next_cursor: data.cursor,
+            })
+        }));
+        while let Some(section) = stream.try_next().await? {
+            merge_section(&mut sections, section);
         }
         Ok(sections)
     }
@@ -623,18 +632,16 @@ impl SlackApi {
             ("name", name.to_owned()),
             ("emoji", emoji.to_owned()),
         ];
-        self.call::<Empty>(method::USERS_CHANNEL_SECTIONS_SET, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::USERS_CHANNEL_SECTIONS_SET, params)
+            .await
     }
 
     /// `users.channelSections.delete`: deletes a section; its conversations fall back to
     /// their default buckets.
     pub async fn users_channel_sections_delete(&self, channel_section_id: &str) -> Result<()> {
         let params = vec![("channel_section_id", channel_section_id.to_owned())];
-        self.call::<Empty>(method::USERS_CHANNEL_SECTIONS_DELETE, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::USERS_CHANNEL_SECTIONS_DELETE, params)
+            .await
     }
 
     /// `users.channelSections.channels.bulkUpdate`: moves channels between sections in one
@@ -647,23 +654,21 @@ impl SlackApi {
         insert: Option<(&str, ChannelId)>,
         remove: Option<(&str, ChannelId)>,
     ) -> Result<()> {
-        let side = |(section, channel): (&str, ChannelId)| {
-            serde_json::to_string(&serde_json::json!([{
+        let side = |(section, channel): (&str, ChannelId)| -> Result<String> {
+            Ok(serde_json::to_string(&serde_json::json!([{
                 "channel_section_id": section,
                 "channel_ids": [channel.as_str()],
-            }]))
-            .unwrap_or_default()
+            }]))?)
         };
         let mut params = Vec::new();
         if let Some(insert) = insert {
-            params.push(("insert", side(insert)));
+            params.push(("insert", side(insert)?));
         }
         if let Some(remove) = remove {
-            params.push(("remove", side(remove)));
+            params.push(("remove", side(remove)?));
         }
-        self.call::<Empty>(method::USERS_CHANNEL_SECTIONS_CHANNELS_BULK_UPDATE, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::USERS_CHANNEL_SECTIONS_CHANNELS_BULK_UPDATE, params)
+            .await
     }
 
     /// `search.messages` with Slack's query modifier syntax (`in:`, `from:`, `before:`, ...).

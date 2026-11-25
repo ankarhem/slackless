@@ -50,6 +50,15 @@ pub struct SlackListRow {
     pub cells: HashMap<String, SlackListCellValue>,
 }
 
+impl SlackListRow {
+    /// Looks up the cell for `column` by its `id`, falling back to its `key`.
+    pub fn cell(&self, column: &SlackListColumn) -> Option<&SlackListCellValue> {
+        self.cells
+            .get(&column.id)
+            .or_else(|| self.cells.get(&column.key))
+    }
+}
+
 /// A parsed Slack List ready for native read-only table rendering.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SlackListData {
@@ -209,13 +218,7 @@ pub(in crate::methods) fn parse_list_records(records: &[Value]) -> Vec<SlackList
                 }
                 let cell = parse_list_cell(field);
                 if cell != SlackListCellValue::Empty {
-                    cells.insert(col_key.to_owned(), cell.clone());
-                    if let Some(key) = field.get("key").and_then(Value::as_str)
-                        && !key.is_empty()
-                        && key != col_key
-                    {
-                        cells.insert(key.to_owned(), cell);
-                    }
+                    cells.insert(col_key.to_owned(), cell);
                 }
             }
         }
@@ -288,13 +291,17 @@ pub(in crate::methods) fn parse_list_cell(field: &Value) -> SlackListCellValue {
         && let Some(n) = arr.first()
     {
         let s = n
-            .as_f64()
-            .map(|v| {
-                if v.fract() == 0.0 {
-                    format!("{}", v as i64)
-                } else {
-                    v.to_string()
-                }
+            .as_i64()
+            .map(|i| i.to_string())
+            .or_else(|| n.as_u64().map(|u| u.to_string()))
+            .or_else(|| {
+                n.as_f64().filter(|v| v.is_finite()).map(|v| {
+                    if v.fract() == 0.0 && v >= (i64::MIN as f64) && v < (i64::MAX as f64) {
+                        format!("{}", v as i64)
+                    } else {
+                        v.to_string()
+                    }
+                })
             })
             .or_else(|| n.as_str().map(str::to_owned));
         if let Some(s) = s {

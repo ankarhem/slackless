@@ -11,10 +11,17 @@ pub use slackless_types as types;
 
 mod backoff;
 mod client;
+mod config;
+mod driver;
 mod frame;
+#[cfg(test)]
+mod tests;
+pub mod tls;
 mod url;
 
 pub use backoff::Backoff;
-pub use client::{ConnectionState, RtmClient, RtmConfig, RtmError, RtmEvent};
+pub use client::RtmClient;
+pub use config::{ConnectionState, RtmConfig, RtmError, RtmEvent};
 pub use frame::{Outgoing, TickleReason, frame_type, parse_frame};
+pub use tls::tls_connector;
 pub use url::{ConnectParams, DEFAULT_START_ARGS, connect_url, connect_url_on, param};
