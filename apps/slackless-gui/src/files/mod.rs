@@ -69,9 +69,9 @@ pub fn attachments(
     }
     for (ix, file) in message.files.iter().enumerate() {
         column = column.child(if is_audio(file) {
-            audio_card(file, cx)
+            audio_card(fixtures, file, cx)
         } else if is_video(file) {
-            video_card(file, ix, on_open, cx)
+            video_card(fixtures, file, ix, on_open, cx)
         } else if is_snippet(file) {
             // Reserve a disjoint selection document-order slice per file after the message body.
             let order_base =

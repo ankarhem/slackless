@@ -324,6 +324,43 @@ impl App {
             | Event::FilesExtrasLoaded { .. }
             | Event::FileRestored { .. }
             | Event::FileDeleted { .. } => self.on_files_event(event, window, cx),
+            Event::FileTranscriptReady { file_id, text } => {
+                let was_manual = crate::media::finish_transcription(file_id, cx);
+                if !text.trim().is_empty() {
+                    let updated = Arc::new(
+                        self.fixtures
+                            .with_file_transcript(file_id.clone(), text.clone()),
+                    );
+                    self.fixtures = updated.clone();
+                    self.sync_all_views_fixtures(updated, cx);
+                    if self.page == MainPage::Search {
+                        self.results.update(cx, |view, cx| view.refresh_local(cx));
+                    }
+                    if was_manual {
+                        notify(
+                            "Transcript saved",
+                            "Transcript saved \u{2014} video is now searchable in Messages",
+                            window,
+                            cx,
+                        );
+                    }
+                } else if was_manual {
+                    notify(
+                        "No speech detected",
+                        "No spoken audio was found in this media clip.",
+                        window,
+                        cx,
+                    );
+                }
+                window.refresh();
+                cx.notify();
+            }
+            Event::FileTranscriptFailed { file_id, error } => {
+                crate::media::finish_transcription(file_id, cx);
+                tracing::warn!(file_id = %file_id, error = %error, "file transcription failed");
+                notify("Transcription failed", error.clone(), window, cx);
+                window.refresh();
+            }
             Event::AppHomeLoaded { .. } | Event::AppHomeUpdated(_) => {
                 self.on_app_home_event(event, cx)
             }

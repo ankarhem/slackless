@@ -285,6 +285,7 @@ pub fn live(
     );
     let status_presets = status_presets_from_prefs(&workspace.extra, &prefs);
     let cached_bots = store.bot_profiles(team).unwrap_or_default();
+    let file_transcripts = store.all_file_transcripts(team).unwrap_or_default();
     Fixtures::from_parts(
         WorkspaceData {
             workspaces: vec![workspace],
@@ -307,6 +308,7 @@ pub fn live(
             frequent_emoji,
             skin_tone: crate::emoji::skin_tone_from_prefs(&prefs),
             thumbnails: HashMap::new(),
+            file_transcripts,
             profile_extras: HashMap::new(),
             custom_emoji,
             block_images: HashMap::new(),
@@ -378,5 +380,25 @@ mod tests {
                 .map(|c| c.mention_count),
             Some(2)
         );
+    }
+
+    #[test]
+    fn with_file_transcript_stores_trims_and_clears_empty() {
+        let fixtures = load();
+        let fid = slackless_core::types::FileId::from("F_CLIP_1");
+        assert_eq!(fixtures.file_transcript(&fid), None);
+
+        let with_tr =
+            fixtures.with_file_transcript(fid.clone(), "  hello from the demo clip \n".into());
+        assert_eq!(
+            with_tr.file_transcript(&fid),
+            Some("hello from the demo clip")
+        );
+        // Original snapshot remains immutable.
+        assert_eq!(fixtures.file_transcript(&fid), None);
+
+        // Blank transcript clears the entry cleanly.
+        let cleared = with_tr.with_file_transcript(fid.clone(), "   ".into());
+        assert_eq!(cleared.file_transcript(&fid), None);
     }
 }

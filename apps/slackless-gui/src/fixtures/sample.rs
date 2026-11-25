@@ -785,6 +785,7 @@ pub fn load() -> Fixtures {
             frequent_emoji: Vec::new(),
             skin_tone: 1,
             thumbnails,
+            file_transcripts: HashMap::new(),
             profile_extras,
             custom_emoji,
             block_images,

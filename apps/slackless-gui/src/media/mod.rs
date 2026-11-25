@@ -10,7 +10,9 @@ mod picture;
 mod video_player;
 
 pub(crate) use audio_player::fetch_cached_media;
-pub use audio_player::{audio_state, stop_audio, toggle_audio};
+pub use audio_player::{
+    audio_state, cycle_audio_rate, seek_audio, stop_audio, toggle_audio, toggle_audio_mute,
+};
 pub(crate) use downloads::active_fetcher;
 pub use downloads::{
     DownloadStatus, clear_finished_downloads, download, download_as, downloads, enable_downloads,
@@ -22,8 +24,9 @@ pub(crate) use video_player::{
     VIDEO_FRAME_INTERVAL, copy_player_surface, take_inline_handoff_for_viewer,
 };
 pub use video_player::{
-    VideoSurface, format_video_time, inline_video_snapshot, play_inline_video, progress_fraction,
-    render_video_surface, sanitize_secs, seek_inline_video, stop_inline_video,
-    stop_inline_video_for_expand, toggle_inline_video_mute, toggle_inline_video_pause,
-    video_scrub_bar,
+    VideoSurface, cycle_inline_video_rate, finish_transcription, format_playback_rate,
+    format_video_time, inline_video_snapshot, install_transcription_dispatcher, is_hls_url,
+    is_transcribing, play_inline_video, progress_fraction, render_video_surface, sanitize_secs,
+    seek_inline_video, stop_inline_video, stop_inline_video_for_expand, toggle_inline_video_mute,
+    toggle_inline_video_pause, transcribe_media, video_scrub_bar,
 };

@@ -150,11 +150,17 @@ fn file_classification_naming_urls_and_icon_kinds() {
     };
     assert_eq!(video_poster_url(&video_only_mp4_thumb), None);
 
-    // Video playback URL precedence: extra["mp4"] -> url_private -> url_private_download.
-    let mut vid_urls = File {
-        url_private_download: Some("https://files.slack.com/dl/v.mp4".into()),
-        ..Default::default()
-    };
+    // Video playback URL precedence: extra["mp4"] -> url_private -> url_private_download -> extra["vjs_hls"].
+    let mut vid_urls = File::default();
+    vid_urls.extra.insert(
+        "vjs_hls".into(),
+        json!("https://files.slack.com/hls/v/master.m3u8"),
+    );
+    assert_eq!(
+        video_playback_url(&vid_urls).as_deref(),
+        Some("https://files.slack.com/hls/v/master.m3u8")
+    );
+    vid_urls.url_private_download = Some("https://files.slack.com/dl/v.mp4".into());
     assert_eq!(
         video_playback_url(&vid_urls).as_deref(),
         Some("https://files.slack.com/dl/v.mp4")

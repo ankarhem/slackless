@@ -503,20 +503,26 @@ impl ImageViewer {
             return;
         };
         let generation = self.video_gen;
-        let carry_pos = crate::media::take_inline_handoff_for_viewer(&video.file_id, window, cx);
+        let carry = crate::media::take_inline_handoff_for_viewer(&video.file_id, window, cx);
         let fallback_duration_secs = video.duration_ms.map_or(0.0, |ms| ms as f64 / 1000.0);
+        let hls = crate::media::is_hls_url(&video.url);
 
-        let Some(fetcher) = crate::media::active_fetcher(cx) else {
-            self.video_playback = Some(ViewerVideoPlayback {
-                generation,
-                loading: false,
-                player: None,
-                last_frame: None,
-                error: Some("Playback needs a signed-in workspace.".to_owned()),
-                fallback_duration_secs,
-            });
-            cx.notify();
-            return;
+        let fetcher = if hls {
+            crate::media::active_fetcher(cx)
+        } else {
+            let Some(fetcher) = crate::media::active_fetcher(cx) else {
+                self.video_playback = Some(ViewerVideoPlayback {
+                    generation,
+                    loading: false,
+                    player: None,
+                    last_frame: None,
+                    error: Some("Playback needs a signed-in workspace.".to_owned()),
+                    fallback_duration_secs,
+                });
+                cx.notify();
+                return;
+            };
+            Some(fetcher)
         };
 
         self.video_playback = Some(ViewerVideoPlayback {
@@ -532,16 +538,32 @@ impl ImageViewer {
         let file_id = video.file_id;
         let url = video.url;
         let ext = video.ext;
+        let fetch_url = url.clone();
+        let fetch_ext = ext.clone();
+        let cache_id = file_id.clone();
         self.video_load_task = Some(cx.spawn_in(window, async move |weak, cx| {
             let bg = cx.background_executor().clone();
-            let path =
-                crate::media::fetch_cached_media(fetcher, file_id, url, ext, bg.clone()).await;
-            let open_res = match path {
-                Ok(path) => bg
-                    .spawn(async move { NativeVideoPlayer::open(&path) })
+            let open_res = if hls {
+                bg.spawn(async move { NativeVideoPlayer::open_url(&fetch_url, None) })
                     .await
-                    .map_err(|e| e.to_string()),
-                Err(err) => Err(err),
+                    .map_err(|e| e.to_string())
+            } else {
+                let fetcher = fetcher.expect("fetcher validated for non-HLS media");
+                let path = crate::media::fetch_cached_media(
+                    fetcher,
+                    cache_id,
+                    fetch_url,
+                    fetch_ext,
+                    bg.clone(),
+                )
+                .await;
+                match path {
+                    Ok(path) => bg
+                        .spawn(async move { NativeVideoPlayer::open(&path) })
+                        .await
+                        .map_err(|e| e.to_string()),
+                    Err(err) => Err(err),
+                }
             };
             let _ = weak.update_in(cx, |viewer, window, cx| {
                 if viewer.video_gen != generation {
@@ -550,11 +572,13 @@ impl ImageViewer {
                 }
                 match open_res {
                     Ok(player) => {
-                        if let Some(pos) = carry_pos
-                            && pos.is_finite()
-                            && pos > 0.05
-                        {
-                            player.seek(pos);
+                        if let Some(handoff) = carry {
+                            if (handoff.rate - 1.0).abs() > 0.01 {
+                                player.set_rate(handoff.rate);
+                            }
+                            if handoff.position_secs.is_finite() && handoff.position_secs > 0.05 {
+                                player.seek(handoff.position_secs);
+                            }
                         }
                         player.play();
                         let initial_frame = crate::media::copy_player_surface(&player);
@@ -563,6 +587,16 @@ impl ImageViewer {
                             pb.error = None;
                             pb.last_frame = initial_frame;
                             pb.player = Some(player);
+                        }
+                        if !hls && !file_id.starts_with("bk-video-") {
+                            crate::media::transcribe_media(
+                                slackless_core::types::FileId::from(file_id.clone()),
+                                url,
+                                ext,
+                                true,
+                                window,
+                                cx,
+                            );
                         }
                         viewer.spawn_video_tick_loop(generation, window, cx);
                         cx.notify();
@@ -660,6 +694,37 @@ impl ImageViewer {
         let muted = !player.state().muted;
         player.set_muted(muted);
         cx.notify();
+    }
+
+    /// Cycle playback speed (`1x -> 1.5x -> 2x -> 1x`) on the viewer's currently open video.
+    pub fn cycle_video_rate(&mut self, cx: &mut Context<Self>) {
+        let Some(player) = self
+            .video_playback
+            .as_ref()
+            .and_then(|pb| pb.player.as_ref())
+        else {
+            return;
+        };
+        player.cycle_rate();
+        cx.notify();
+    }
+
+    /// Seek the viewer's currently open video relative to its current position by `delta_secs`.
+    pub fn seek_video_relative(
+        &mut self,
+        delta_secs: f64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cur) = self
+            .video_playback
+            .as_ref()
+            .and_then(|pb| pb.player.as_ref())
+            .map(|p| crate::media::sanitize_secs(p.state().position_secs))
+        else {
+            return;
+        };
+        self.seek_video((cur + delta_secs).max(0.0), window, cx);
     }
 
     /// Seek the viewer's currently open video to `secs`.
@@ -872,6 +937,7 @@ impl Render for ImageViewer {
             vid_ended,
             vid_pos,
             vid_dur,
+            vid_rate,
             vid_surface,
             vid_err,
         ) = if is_video {
@@ -886,6 +952,11 @@ impl Render for ImageViewer {
                     } else {
                         pb.fallback_duration_secs
                     };
+                    let rate = if st.rate.is_finite() && st.rate > 0.0 {
+                        st.rate
+                    } else {
+                        1.0
+                    };
                     (
                         pb.loading,
                         st.playing,
@@ -893,6 +964,7 @@ impl Render for ImageViewer {
                         st.ended,
                         crate::media::sanitize_secs(st.position_secs),
                         effective_dur,
+                        rate,
                         surface,
                         pb.error.clone(),
                     )
@@ -904,15 +976,16 @@ impl Render for ImageViewer {
                         false,
                         0.0,
                         pb.fallback_duration_secs,
+                        1.0,
                         pb.last_frame.clone(),
                         pb.error.clone(),
                     )
                 }
             } else {
-                (false, false, false, false, 0.0, 0.0, None, None)
+                (false, false, false, false, 0.0, 0.0, 1.0, None, None)
             }
         } else {
-            (false, false, false, false, 0.0, 0.0, None, None)
+            (false, false, false, false, 0.0, 0.0, 1.0, None, None)
         };
 
         let stage_content = if is_video {
@@ -1045,7 +1118,7 @@ impl Render for ImageViewer {
                 .gap_2()
                 .px_2p5()
                 .h(px(CONTROL_BUTTON))
-                .w(px(420.))
+                .w(px(460.))
                 .rounded_lg()
                 .bg(chrome.glass)
                 .border_1()
@@ -1082,6 +1155,26 @@ impl Render for ImageViewer {
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(chrome.text_muted)
                         .child(time_readout),
+                )
+                .child(
+                    div()
+                        .id("viewer-video-rate")
+                        .flex_none()
+                        .px_1p5()
+                        .h(px(24.))
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(chrome.text)
+                        .cursor_pointer()
+                        .hover(move |b| b.bg(chrome.button_hover))
+                        .child(crate::media::format_playback_rate(vid_rate))
+                        .on_click(cx.listener(|viewer, _, _, cx| {
+                            viewer.cycle_video_rate(cx);
+                        })),
                 )
                 .child(
                     div()

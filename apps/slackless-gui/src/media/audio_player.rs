@@ -1,19 +1,26 @@
-//! Inline audio playback and bounded LRU cache eviction for `$TMPDIR/slackless-media/`.
+//! Native in-app inline audio playback (`AVPlayer` via [`NativeVideoPlayer`]) and bounded LRU
+//! cache eviction for `$TMPDIR/slackless-media/`.
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command as ProcessCommand};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use gpui_kit::gpui::{App, BackgroundExecutor, Global, Window};
 use slackless_core::Fetcher;
+use slackless_core::huddle::NativeVideoPlayer;
+use slackless_core::types::FileId;
 
 use super::downloads::active_fetcher;
+use super::video_player::{sanitize_secs, transcribe_media};
 
 /// Maximum cumulative bytes kept in `$TMPDIR/slackless-media/` before evicting oldest files.
 const MAX_MEDIA_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 /// Maximum number of cached media files kept in `$TMPDIR/slackless-media/`.
 const MAX_MEDIA_CACHE_FILES: usize = 200;
+/// Lightweight ~10 Hz progress refresh cadence while audio is actively playing.
+const AUDIO_TICK_INTERVAL: Duration = Duration::from_millis(100);
+/// Brief startup grace ticks while `AVPlayer` finishes preparing the audio item.
+const AUDIO_STARTUP_GRACE_TICKS: u32 = 4;
 
 /// Snapshot of an audio file's inline playback state.
 #[derive(Clone, Debug)]
@@ -21,135 +28,245 @@ pub struct AudioSnapshot {
     pub loading: bool,
     pub playing: bool,
     pub paused: bool,
+    pub position_secs: f64,
+    pub duration_secs: f64,
+    pub rate: f32,
+    pub muted: bool,
+    #[allow(dead_code)]
     pub elapsed_ms: u64,
     pub duration_ms: Option<u64>,
 }
 
 struct ActiveAudio {
+    generation: u64,
+    tick_gen: u64,
     file_id: String,
-    child: Option<Child>,
-    started: Option<Instant>,
-    paused_at: Option<Instant>,
-    accumulated_ms: u64,
-    duration_ms: Option<u64>,
+    player: Option<NativeVideoPlayer>,
+    fallback_duration_ms: Option<u64>,
     loading: bool,
 }
 
 #[derive(Default)]
 struct MediaPlayer {
+    next_generation: u64,
     audio: Option<ActiveAudio>,
 }
 
-impl Drop for MediaPlayer {
-    fn drop(&mut self) {
-        if let Some(active) = self.audio.as_mut()
-            && let Some(child) = active.child.as_mut()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
+impl MediaPlayer {
+    fn next_gen(&mut self) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.next_generation
+    }
+
+    fn stop_all(&mut self) {
+        self.next_gen();
+        self.audio = None;
+    }
+
+    fn snapshot(&self, file_id: &str) -> Option<AudioSnapshot> {
+        let active = self.audio.as_ref()?;
+        if active.file_id != file_id {
+            return None;
         }
+        let fallback_secs = active
+            .fallback_duration_ms
+            .map_or(0.0, |ms| ms as f64 / 1000.0);
+        if active.loading {
+            return Some(AudioSnapshot {
+                loading: true,
+                playing: false,
+                paused: false,
+                position_secs: 0.0,
+                duration_secs: fallback_secs,
+                rate: 1.0,
+                muted: false,
+                elapsed_ms: 0,
+                duration_ms: active.fallback_duration_ms,
+            });
+        }
+        let player = active.player.as_ref()?;
+        let st = player.state();
+        let position_secs = sanitize_secs(st.position_secs);
+        let player_dur = sanitize_secs(st.duration_secs);
+        let duration_secs = if player_dur > 0.0 {
+            player_dur
+        } else {
+            fallback_secs
+        };
+        let duration_ms = if duration_secs > 0.0 {
+            Some((duration_secs * 1000.0).round() as u64)
+        } else {
+            active.fallback_duration_ms
+        };
+        let elapsed_ms = (position_secs * 1000.0).round() as u64;
+        let playing = st.playing && !st.ended;
+        let paused = !playing && !st.ended;
+        let rate = if st.rate.is_finite() && st.rate > 0.0 {
+            st.rate
+        } else {
+            1.0
+        };
+        Some(AudioSnapshot {
+            loading: false,
+            playing,
+            paused,
+            position_secs,
+            duration_secs,
+            rate,
+            muted: st.muted,
+            elapsed_ms,
+            duration_ms,
+        })
+    }
+
+    fn cycle_rate_for(&mut self, file_id: &str) -> Option<f32> {
+        let active = self.audio.as_mut().filter(|a| a.file_id == file_id)?;
+        let player = active.player.as_ref()?;
+        Some(player.cycle_rate())
+    }
+
+    fn toggle_mute_for(&mut self, file_id: &str) -> Option<bool> {
+        let active = self.audio.as_mut().filter(|a| a.file_id == file_id)?;
+        let player = active.player.as_ref()?;
+        let next = !player.state().muted;
+        player.set_muted(next);
+        Some(next)
+    }
+
+    fn seek_for(&mut self, file_id: &str, secs: f64) -> Option<f64> {
+        let active = self.audio.as_mut().filter(|a| a.file_id == file_id)?;
+        let player = active.player.as_ref()?;
+        let duration = sanitize_secs(player.state().duration_secs);
+        let target = if duration > 0.0 {
+            sanitize_secs(secs).min(duration)
+        } else {
+            sanitize_secs(secs)
+        };
+        player.seek(target);
+        Some(target)
     }
 }
 
 impl Global for MediaPlayer {}
 
-/// Current inline playback state for `file_id`, if it is loading or playing.
+/// Current inline playback state for `file_id`, if it is loading, playing, or paused.
 pub fn audio_state(file_id: &str, cx: &App) -> Option<AudioSnapshot> {
-    let active = cx.try_global::<MediaPlayer>()?.audio.as_ref()?;
-    if active.file_id != file_id {
-        return None;
-    }
-    let elapsed_ms = active.accumulated_ms
-        + if active.paused_at.is_some() {
-            0
-        } else {
-            active
-                .started
-                .map(|s| s.elapsed().as_millis() as u64)
-                .unwrap_or(0)
-        };
-    Some(AudioSnapshot {
-        loading: active.loading,
-        playing: active.child.is_some() && active.paused_at.is_none(),
-        paused: active.child.is_some() && active.paused_at.is_some(),
-        elapsed_ms,
-        duration_ms: active.duration_ms,
-    })
-}
-
-#[cfg(unix)]
-fn send_child_signal(child: &Child, sig: libc::c_int) -> std::io::Result<()> {
-    let pid = libc::pid_t::try_from(child.id())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pid out of range"))?;
-    if pid <= 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "refusing to signal non-positive pid",
-        ));
-    }
-    // SAFETY: `pid` is a validated positive PID belonging to our own spawned audio child process,
-    // and `sig` is a standard POSIX signal constant from `libc` (`SIGSTOP` / `SIGCONT`).
-    let rc = unsafe { libc::kill(pid, sig) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    cx.try_global::<MediaPlayer>()?.snapshot(file_id)
 }
 
 /// Pause or resume the currently active audio clip without restarting (`F-CORE-126`).
 pub fn toggle_pause_audio(file_id: &str, window: &mut Window, cx: &mut App) {
-    let player = cx.default_global::<MediaPlayer>();
-    let Some(active) = player.audio.as_mut() else {
-        return;
-    };
-    if active.file_id != file_id {
-        return;
-    }
-    let Some(child) = active.child.as_ref() else {
-        return;
-    };
-    #[cfg(unix)]
-    {
-        if active.paused_at.is_some() {
-            if let Err(err) = send_child_signal(child, libc::SIGCONT) {
-                tracing::warn!("failed to resume audio child process: {err}");
-                return;
-            }
-            active.paused_at = None;
-            active.started = Some(Instant::now());
+    let kick = {
+        let player = cx.default_global::<MediaPlayer>();
+        let Some(active) = player.audio.as_mut().filter(|a| a.file_id == file_id) else {
+            return;
+        };
+        let Some(native) = active.player.as_ref() else {
+            return;
+        };
+        let was_playing = native.state().playing;
+        native.toggle_play();
+        active.tick_gen = active.tick_gen.wrapping_add(1);
+        if !was_playing {
+            Some((active.generation, active.tick_gen))
         } else {
-            if let Err(err) = send_child_signal(child, libc::SIGSTOP) {
-                tracing::warn!("failed to pause audio child process: {err}");
-                return;
-            }
-            if let Some(started) = active.started.take() {
-                active.accumulated_ms = active
-                    .accumulated_ms
-                    .saturating_add(started.elapsed().as_millis() as u64);
-            }
-            active.paused_at = Some(Instant::now());
+            // Bumping `tick_gen` immediately terminates any active progress timer loop.
+            None
         }
+    };
+    window.refresh();
+    if let Some((generation, tick_gen)) = kick {
+        spawn_audio_progress_loop(generation, tick_gen, window, cx);
+    }
+}
+
+/// Seek the currently active audio clip matching `file_id` to `secs`.
+pub fn seek_audio(file_id: &str, secs: f64, window: &mut Window, cx: &mut App) {
+    if cx
+        .default_global::<MediaPlayer>()
+        .seek_for(file_id, secs)
+        .is_some()
+    {
         window.refresh();
     }
-    #[cfg(not(unix))]
+}
+
+/// Cycle playback speed (`1x -> 1.5x -> 2x -> 1x`) on the currently active audio clip.
+pub fn cycle_audio_rate(file_id: &str, window: &mut Window, cx: &mut App) -> Option<f32> {
+    let rate = cx.default_global::<MediaPlayer>().cycle_rate_for(file_id)?;
+    window.refresh();
+    Some(rate)
+}
+
+/// Toggle mute/unmute on the currently active audio clip.
+pub fn toggle_audio_mute(file_id: &str, window: &mut Window, cx: &mut App) {
+    if cx
+        .default_global::<MediaPlayer>()
+        .toggle_mute_for(file_id)
+        .is_some()
     {
-        let _ = (child, window);
+        window.refresh();
     }
 }
 
 /// Stop any active audio playback immediately.
 pub fn stop_audio(window: &mut Window, cx: &mut App) {
-    stop_active_audio(cx.default_global::<MediaPlayer>());
+    cx.default_global::<MediaPlayer>().stop_all();
     window.refresh();
 }
 
-fn stop_active_audio(player: &mut MediaPlayer) {
-    if let Some(mut active) = player.audio.take()
-        && let Some(mut child) = active.child.take()
-    {
-        let _ = child.kill();
-        let _ = child.wait();
+fn spawn_audio_progress_loop(generation: u64, tick_gen: u64, window: &mut Window, cx: &mut App) {
+    window
+        .spawn(cx, async move |cx| {
+            run_audio_progress_loop(generation, tick_gen, cx).await;
+        })
+        .detach();
+}
+
+async fn run_audio_progress_loop(
+    generation: u64,
+    tick_gen: u64,
+    cx: &mut gpui_kit::gpui::AsyncWindowContext,
+) {
+    let mut startup_ticks = 0u32;
+    let mut ever_playing = false;
+    loop {
+        cx.background_executor().timer(AUDIO_TICK_INTERVAL).await;
+        let keep_going = cx
+            .update(|window, cx| {
+                let mgr = cx.default_global::<MediaPlayer>();
+                let Some(active) = mgr.audio.as_ref() else {
+                    return false;
+                };
+                if active.generation != generation || active.tick_gen != tick_gen {
+                    return false;
+                }
+                let Some(player) = active.player.as_ref() else {
+                    return false;
+                };
+                let st = player.state();
+                if st.failed || st.ended {
+                    mgr.audio = None;
+                    window.refresh();
+                    return false;
+                }
+                window.refresh();
+                if st.playing {
+                    ever_playing = true;
+                    startup_ticks = 0;
+                    true
+                } else if !ever_playing && startup_ticks < AUDIO_STARTUP_GRACE_TICKS {
+                    startup_ticks += 1;
+                    true
+                } else {
+                    // Paused or stopped: exit immediately for 0% idle CPU.
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if !keep_going {
+            break;
+        }
     }
 }
 
@@ -261,7 +378,7 @@ pub(crate) async fn fetch_cached_media(
 }
 
 /// Toggle inline playback of a Slack-hosted audio clip or file. Downloads authenticated bytes
-/// into `$TMPDIR/slackless-media/` once and plays via macOS `afplay` with live progress ticks.
+/// into `$TMPDIR/slackless-media/` once and plays natively in-app via [`NativeVideoPlayer`].
 pub fn toggle_audio(
     file_id: String,
     url: String,
@@ -270,15 +387,19 @@ pub fn toggle_audio(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let already_active = cx
+    let existing = cx
         .try_global::<MediaPlayer>()
         .and_then(|p| p.audio.as_ref())
-        .is_some_and(|active| active.file_id == file_id && active.child.is_some());
-    if already_active {
-        toggle_pause_audio(&file_id, window, cx);
-        return;
+        .filter(|active| active.file_id == file_id)
+        .map(|active| (active.loading, active.player.is_some()));
+    match existing {
+        Some((_, true)) => {
+            toggle_pause_audio(&file_id, window, cx);
+            return;
+        }
+        Some((true, false)) => return,
+        _ => {}
     }
-    stop_active_audio(cx.default_global::<MediaPlayer>());
     let Some(fetcher) = active_fetcher(cx) else {
         crate::actions::notify(
             "Audio playback",
@@ -288,112 +409,77 @@ pub fn toggle_audio(
         );
         return;
     };
-    cx.default_global::<MediaPlayer>().audio = Some(ActiveAudio {
+    let mgr = cx.default_global::<MediaPlayer>();
+    let generation = mgr.next_gen();
+    mgr.audio = Some(ActiveAudio {
+        generation,
+        tick_gen: 0,
         file_id: file_id.clone(),
-        child: None,
-        started: None,
-        paused_at: None,
-        accumulated_ms: 0,
-        duration_ms,
+        player: None,
+        fallback_duration_ms: duration_ms,
         loading: true,
     });
     window.refresh();
+
     let cache_id = file_id.clone();
+    let fetch_url = url.clone();
+    let fetch_ext = ext.clone();
     window
         .spawn(cx, async move |cx| {
             let bg = cx.background_executor().clone();
-            let path = fetch_cached_media(fetcher, cache_id, url, ext, bg).await;
-            let launched = cx
+            let path =
+                fetch_cached_media(fetcher, cache_id, fetch_url, fetch_ext, bg.clone()).await;
+            let open_res = match path {
+                Ok(path) => bg
+                    .spawn(async move { NativeVideoPlayer::open(&path) })
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(err) => Err(err),
+            };
+            let tick = cx
                 .update(|window, cx| {
-                    let player = cx.default_global::<MediaPlayer>();
-                    if player
+                    let mgr = cx.default_global::<MediaPlayer>();
+                    let matches = mgr
                         .audio
                         .as_ref()
-                        .is_none_or(|active| active.file_id != file_id)
-                    {
-                        return false;
+                        .is_some_and(|a| a.generation == generation);
+                    if !matches {
+                        drop(open_res);
+                        return None;
                     }
-                    match path {
-                        Ok(path) => {
-                            let spawn_res = {
-                                #[cfg(target_os = "macos")]
-                                {
-                                    ProcessCommand::new("/usr/bin/afplay").arg(&path).spawn()
-                                }
-                                #[cfg(not(target_os = "macos"))]
-                                {
-                                    ProcessCommand::new("ffplay")
-                                        .args(["-nodisp", "-autoexit"])
-                                        .arg(&path)
-                                        .spawn()
-                                }
-                            };
-                            match spawn_res {
-                                Ok(child) => {
-                                    if let Some(active) = player.audio.as_mut() {
-                                        active.loading = false;
-                                        active.child = Some(child);
-                                        active.started = Some(Instant::now());
-                                    }
-                                    window.refresh();
-                                    true
-                                }
-                                Err(e) => {
-                                    player.audio = None;
-                                    crate::actions::notify(
-                                        "Audio playback failed",
-                                        e.to_string(),
-                                        window,
-                                        cx,
-                                    );
-                                    window.refresh();
-                                    false
-                                }
+                    match open_res {
+                        Ok(player) => {
+                            player.play();
+                            let mut tick_gen = 0;
+                            if let Some(active) = mgr.audio.as_mut() {
+                                active.loading = false;
+                                active.player = Some(player);
+                                active.tick_gen = active.tick_gen.wrapping_add(1);
+                                tick_gen = active.tick_gen;
                             }
+                            transcribe_media(
+                                FileId::from(file_id.clone()),
+                                url,
+                                ext,
+                                true,
+                                window,
+                                cx,
+                            );
+                            window.refresh();
+                            Some(tick_gen)
                         }
                         Err(e) => {
-                            player.audio = None;
+                            mgr.audio = None;
                             crate::actions::notify("Audio playback failed", e, window, cx);
                             window.refresh();
-                            false
+                            None
                         }
                     }
                 })
-                .unwrap_or(false);
-            if !launched {
-                return;
-            }
-            // Poll playback progress at 4 Hz while audio plays and clean up once finished.
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(250))
-                    .await;
-                let keep_going = cx
-                    .update(|window, cx| {
-                        let player = cx.default_global::<MediaPlayer>();
-                        let Some(active) = player.audio.as_mut() else {
-                            return false;
-                        };
-                        if active.file_id != file_id {
-                            return false;
-                        }
-                        let done = active
-                            .child
-                            .as_mut()
-                            .is_none_or(|c| matches!(c.try_wait(), Ok(Some(_)) | Err(_)));
-                        if done {
-                            player.audio = None;
-                            window.refresh();
-                            false
-                        } else {
-                            window.refresh();
-                            true
-                        }
-                    })
-                    .unwrap_or(false);
-                if !keep_going {
-                    break;
-                }
+                .ok()
+                .flatten();
+            if let Some(tick_gen) = tick {
+                run_audio_progress_loop(generation, tick_gen, cx).await;
             }
         })
         .detach();
@@ -441,5 +527,112 @@ mod tests {
         assert!(f4.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn media_player_loading_snapshot_and_stop_lifecycle() {
+        let mut mgr = MediaPlayer::default();
+        assert!(mgr.snapshot("F_AUD1").is_none());
+
+        let g1 = mgr.next_gen();
+        mgr.audio = Some(ActiveAudio {
+            generation: g1,
+            tick_gen: 0,
+            file_id: "F_AUD1".into(),
+            player: None,
+            fallback_duration_ms: Some(12_500),
+            loading: true,
+        });
+        assert!(mgr.snapshot("F_OTHER").is_none());
+        let snap = mgr.snapshot("F_AUD1").expect("loading snapshot");
+        assert!(snap.loading);
+        assert!(!snap.playing);
+        assert!(!snap.paused);
+        assert_eq!(snap.rate, 1.0);
+        assert!(!snap.muted);
+        assert_eq!(snap.duration_ms, Some(12_500));
+        assert!((snap.duration_secs - 12.5).abs() < 1e-6);
+
+        mgr.stop_all();
+        assert!(mgr.snapshot("F_AUD1").is_none());
+        assert!(mgr.next_generation > g1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_audio_player_speed_cycle_mute_and_seek() {
+        // Synthesize a 1-second 16 kHz mono PCM WAV file for AVPlayer audio-only playback.
+        let sample_rate = 16_000u32;
+        let num_samples = sample_rate as usize;
+        let data_bytes = (num_samples * 2) as u32;
+        let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        for i in 0..num_samples {
+            let t = i as f32 / sample_rate as f32;
+            let sample = ((t * 440.0 * std::f32::consts::TAU).sin() * 4000.0) as i16;
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "slackless-audio-player-test-{}.wav",
+            std::process::id()
+        ));
+        std::fs::write(&path, &wav).expect("write synthetic wav");
+
+        let player = NativeVideoPlayer::open(&path).expect("open audio-only wav");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while player.state().duration_secs <= 0.0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut mgr = MediaPlayer::default();
+        let g = mgr.next_gen();
+        mgr.audio = Some(ActiveAudio {
+            generation: g,
+            tick_gen: 0,
+            file_id: "F_WAV".into(),
+            player: Some(player),
+            fallback_duration_ms: None,
+            loading: false,
+        });
+
+        let snap0 = mgr.snapshot("F_WAV").expect("initial snapshot");
+        assert!(!snap0.loading);
+        assert_eq!(snap0.rate, 1.0);
+        assert!(!snap0.muted);
+
+        // Speed cycling: 1.0 -> 1.5 -> 2.0 -> 1.0
+        assert_eq!(mgr.cycle_rate_for("F_WAV"), Some(1.5));
+        assert_eq!(mgr.snapshot("F_WAV").unwrap().rate, 1.5);
+        assert_eq!(mgr.cycle_rate_for("F_WAV"), Some(2.0));
+        assert_eq!(mgr.snapshot("F_WAV").unwrap().rate, 2.0);
+        assert_eq!(mgr.cycle_rate_for("F_WAV"), Some(1.0));
+        assert_eq!(mgr.snapshot("F_WAV").unwrap().rate, 1.0);
+
+        // Mute toggle
+        assert_eq!(mgr.toggle_mute_for("F_WAV"), Some(true));
+        assert!(mgr.snapshot("F_WAV").unwrap().muted);
+        assert_eq!(mgr.toggle_mute_for("F_WAV"), Some(false));
+        assert!(!mgr.snapshot("F_WAV").unwrap().muted);
+
+        // Seek clamped within duration
+        let sought = mgr.seek_for("F_WAV", 0.5).expect("seek succeeded");
+        assert!(sought <= 1.1);
+
+        mgr.stop_all();
+        assert!(mgr.snapshot("F_WAV").is_none());
+        let _ = std::fs::remove_file(&path);
     }
 }
