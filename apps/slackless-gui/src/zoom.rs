@@ -71,11 +71,16 @@ impl Zoom {
     }
 }
 
+/// Resolve Preferences' zoom level into its scale factor, falling back to `1.0` if out of bounds.
+pub fn factor_for_level(level: usize) -> f32 {
+    FACTORS.get(level).copied().unwrap_or(1.0)
+}
+
 /// Zoom every window to Preferences' level `level`; whether that changed the zoom. The
 /// windows re-read their size and scale once the current update is done: a window cannot
 /// re-lay out (and run its bounds observers) inside an update of its own views.
 pub fn set_level(level: usize, cx: &mut App) -> bool {
-    let factor = FACTORS[level];
+    let factor = factor_for_level(level);
     let zoom = cx.global::<Zoom>().0.clone();
     if zoom.get() == factor {
         return false;
@@ -367,7 +372,7 @@ impl Platform for ZoomPlatform {
     fn graphical_environment(&self) -> Option<GraphicalEnvironment> {
         self.inner.graphical_environment()
     }
-    fn debug_state(&self) -> crate::blockkit::serde_json::Value {
+    fn debug_state(&self) -> serde_json::Value {
         self.inner.debug_state()
     }
     fn app_path(&self) -> Result<PathBuf> {
@@ -766,7 +771,7 @@ impl PlatformWindow for ZoomWindow {
     fn a11y_update_window_bounds(&self) {
         self.inner.a11y_update_window_bounds()
     }
-    fn debug_state(&self) -> crate::blockkit::serde_json::Value {
+    fn debug_state(&self) -> serde_json::Value {
         self.inner.debug_state()
     }
     unsafe fn attach_native_view(
@@ -794,5 +799,19 @@ impl PlatformWindow for ZoomWindow {
     }
     fn set_native_titlebar_visibility(&self, visible: bool) {
         self.inner.set_native_titlebar_visibility(visible)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ACTUAL_SIZE, FACTORS, factor_for_level};
+
+    #[test]
+    fn factor_for_level_bounds_checks_corrupted_indices() {
+        assert_eq!(factor_for_level(0), 0.8);
+        assert_eq!(factor_for_level(ACTUAL_SIZE), 1.0);
+        assert_eq!(factor_for_level(FACTORS.len() - 1), 1.5);
+        assert_eq!(factor_for_level(FACTORS.len()), 1.0);
+        assert_eq!(factor_for_level(usize::MAX), 1.0);
     }
 }

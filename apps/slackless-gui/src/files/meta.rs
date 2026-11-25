@@ -147,12 +147,7 @@ pub(super) fn media_duration_ms(file: &File) -> Option<u64> {
         .filter(|&ms| ms > 0)
 }
 
-pub(super) fn format_duration(ms: u64) -> String {
-    let total_secs = ms / 1000;
-    let mins = total_secs / 60;
-    let secs = total_secs % 60;
-    format!("{mins}:{secs:02}")
-}
+pub(super) use slackless_core::types::time::format_duration;
 
 pub(super) fn file_ext(file: &File, default: &str) -> String {
     if let Some(ft) = file.filetype.as_deref().filter(|s| !s.is_empty()) {
@@ -413,15 +408,7 @@ pub(crate) fn fit(width: Option<i64>, height: Option<i64>) -> (f32, f32) {
     (w * scale, h * scale)
 }
 
-/// Bytes as Slack labels them: `512 B`, `52 KB`, `2.3 MB`.
+/// Bytes formatted in binary IEC units (`0 B`, `512 B`, `1.0 KiB`, `2.3 MiB`).
 pub(crate) fn human_size(bytes: i64) -> String {
-    const KB: f64 = 1024.;
-    let bytes = bytes.max(0) as f64;
-    if bytes < KB {
-        format!("{bytes} B")
-    } else if bytes < KB * KB {
-        format!("{:.0} KB", bytes / KB)
-    } else {
-        format!("{:.1} MB", bytes / (KB * KB))
-    }
+    slackless_core::types::time::format_bytes(bytes.max(0) as u64)
 }

@@ -11,8 +11,6 @@
 //! emits `DraftsEvent::Open { workspace, channel }` / `DraftsEvent::SendNow(Entry)` /
 //! `DraftsEvent::Close`
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
@@ -22,17 +20,14 @@ use gpui_kit::gpui::{
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
     Styled as _, Window, div, px,
 };
-use slackless_core::types::ChannelId;
+use slackless_core::types::{ChannelId, time};
 
 const DAY: u64 = 86_400;
 const HOUR: u64 = 3_600;
 
 /// Unix seconds now.
 pub fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0)
+    time::now_epoch_secs().max(0) as u64
 }
 
 /// The composer's "Schedule for later" presets (times are UTC in fixture mode).
@@ -91,7 +86,7 @@ pub fn when_label(at: u64, now: u64) -> String {
 
 /// Pure local-timezone label formatter with an explicit UTC offset in seconds.
 pub fn when_label_with_offset(at: u64, now: u64, offset_secs: i64) -> String {
-    const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     let local_at = at as i64 + offset_secs;
     let local_now = now as i64 + offset_secs;
     let day = local_at.div_euclid(DAY as i64);
@@ -102,7 +97,10 @@ pub fn when_label_with_offset(at: u64, now: u64, offset_secs: i64) -> String {
         0 => "Today".to_owned(),
         1 => "Tomorrow".to_owned(),
         -1 => "Yesterday".to_owned(),
-        _ => WEEKDAYS[(day + 3).rem_euclid(7) as usize].to_owned(),
+        _ => {
+            let (year, month, dom) = time::civil_from_days(day);
+            WEEKDAYS[time::weekday_sunday0(year, month, dom) as usize].to_owned()
+        }
     };
     format!("{date} {clock}")
 }

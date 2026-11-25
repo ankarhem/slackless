@@ -1,6 +1,6 @@
 //! Preferences > Appearance & Themes section view.
 
-use super::super::*;
+use super::*;
 
 impl Preferences {
     pub(super) fn appearance(&mut self, cx: &mut Context<Self>) -> Div {

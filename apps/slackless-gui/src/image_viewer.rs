@@ -16,56 +16,21 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState, SliderValue};
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, Hsla, ImageSource,
+    App, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, ImageSource,
     InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, relative, rgb,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, relative,
 };
-use slackless_core::types::{Block, Message, UserId};
+use slackless_core::types::{Block, Message, UserId, time};
 
 use crate::avatars;
 use crate::fixtures::Fixtures;
-
-// Slack's image viewer chrome (measured on the 4.5x viewer, identical in both modes): an
-// opaque medium-gray backdrop swallows the window behind it, and the chip and controls sit
-// on dark glass with hairline white borders and dim white text.
-fn chrome_panel() -> Hsla {
-    Hsla::from(rgb(0x5b_5b_5b))
-}
-
-fn chrome_glass() -> Hsla {
-    Hsla::from(rgb(0x33_35_38)).opacity(0.92)
-}
-
-fn chrome_button() -> Hsla {
-    Hsla::from(rgb(0x3a_3d_42)).opacity(0.85)
-}
-
-fn chrome_button_hover() -> Hsla {
-    Hsla::from(rgb(0x4a_4d_52)).opacity(0.9)
-}
-
-fn chrome_border() -> Hsla {
-    Hsla::from(rgb(0xff_ff_ff)).opacity(0.16)
-}
-
-fn chrome_text() -> Hsla {
-    Hsla::from(rgb(0xd9_da_db)).opacity(0.95)
-}
-
-fn chrome_text_muted() -> Hsla {
-    Hsla::from(rgb(0xd9_da_db)).opacity(0.65)
-}
-
-fn chrome_text_dim() -> Hsla {
-    Hsla::from(rgb(0xd9_da_db)).opacity(0.45)
-}
+use crate::theme::{self, ViewerChrome};
 
 /// Zoom steps as multiples of the fitted size; the viewer opens at [`FIT_INDEX`].
 const ZOOM_STEPS: [f32; 10] = [0.1, 0.15, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0];
@@ -307,10 +272,7 @@ pub(crate) fn relative_stamp(secs: i64) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_secs() as i64)
-        .unwrap_or(secs);
+    let now = time::now_epoch_secs();
     let ago = (now - secs).max(0);
     match ago {
         0..=59 => "just now".to_owned(),
@@ -319,33 +281,14 @@ pub(crate) fn relative_stamp(secs: i64) -> String {
         86_400..=172_799 => "yesterday".to_owned(),
         172_800..=604_799 => plural(ago / 86_400, "day"),
         _ => {
-            let mut days = secs.div_euclid(86_400);
-            let mut year = 1970;
-            loop {
-                let year_days = if leap_year(year) { 366 } else { 365 };
-                if days < year_days {
-                    break;
-                }
-                days -= year_days;
-                year += 1;
-            }
-            let month_lengths: [i64; 12] = if leap_year(year) {
-                [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-            } else {
-                [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-            };
-            let mut month = 0;
-            while days >= month_lengths[month] {
-                days -= month_lengths[month];
-                month += 1;
-            }
-            format!("{} {}", MONTHS[month], days + 1)
+            let (_year, month, day) = time::civil_from_days(secs.div_euclid(86_400));
+            let month_name = MONTHS
+                .get(month.saturating_sub(1) as usize)
+                .copied()
+                .unwrap_or("Jan");
+            format!("{month_name} {day}")
         }
     }
-}
-
-fn leap_year(year: i64) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 fn plural(count: i64, unit: &str) -> String {
@@ -488,7 +431,11 @@ impl ImageViewer {
     }
 
     /// A round chrome arrow button: dark glass, hairline border, hover lift.
-    fn arrow_button(id: &'static str, icon: IconName) -> gpui_kit::gpui::Stateful<Div> {
+    fn arrow_button(
+        id: &'static str,
+        icon: IconName,
+        chrome: ViewerChrome,
+    ) -> gpui_kit::gpui::Stateful<Div> {
         div()
             .id(id)
             .flex_none()
@@ -497,16 +444,20 @@ impl ImageViewer {
             .items_center()
             .justify_center()
             .rounded_full()
-            .bg(chrome_button())
+            .bg(chrome.button)
             .border_1()
-            .border_color(chrome_border())
+            .border_color(chrome.border)
             .cursor_pointer()
-            .hover(|button| button.bg(chrome_button_hover()))
-            .child(Icon::new(icon).text_color(chrome_text()).size(px(18.)))
+            .hover(move |button| button.bg(chrome.button_hover))
+            .child(Icon::new(icon).text_color(chrome.text).size(px(18.)))
     }
 
     /// A square glass button (the download control, Slack's bottom-right tiles).
-    fn tile_button(id: &'static str, icon: IconName) -> gpui_kit::gpui::Stateful<Div> {
+    fn tile_button(
+        id: &'static str,
+        icon: IconName,
+        chrome: ViewerChrome,
+    ) -> gpui_kit::gpui::Stateful<Div> {
         div()
             .id(id)
             .flex_none()
@@ -515,17 +466,18 @@ impl ImageViewer {
             .items_center()
             .justify_center()
             .rounded_lg()
-            .bg(chrome_button())
+            .bg(chrome.button)
             .border_1()
-            .border_color(chrome_border())
+            .border_color(chrome.border)
             .cursor_pointer()
-            .hover(|button| button.bg(chrome_button_hover()))
-            .child(Icon::new(icon).text_color(chrome_text()).size(px(16.)))
+            .hover(move |button| button.bg(chrome.button_hover))
+            .child(Icon::new(icon).text_color(chrome.text).size(px(16.)))
     }
 }
 
 impl Render for ImageViewer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let chrome = theme::viewer_chrome();
         let image = self.current();
         let zoom = ZOOM_STEPS[self.zoom_ix];
         let multiple = self.images.len() > 1;
@@ -549,7 +501,7 @@ impl Render for ImageViewer {
             .pr(px(14.))
             .py(px(8.))
             .rounded_lg()
-            .bg(chrome_glass())
+            .bg(chrome.glass)
             .when_some(image.user.clone(), |chip, user| {
                 chip.child(avatars::user_chip(&self.fixtures, &user, 36.))
             })
@@ -561,7 +513,7 @@ impl Render for ImageViewer {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(chrome_text())
+                            .text_color(chrome.text)
                             .truncate()
                             .child(self.uploader_name()),
                     )
@@ -573,13 +525,13 @@ impl Render for ImageViewer {
                             .child(
                                 div()
                                     .flex_none()
-                                    .text_color(chrome_text_muted())
+                                    .text_color(chrome.text_muted)
                                     .child(SharedString::from(format!("{stamp} in"))),
                             )
                             .child(
                                 div()
                                     .flex_none()
-                                    .text_color(chrome_text_muted())
+                                    .text_color(chrome.text_muted)
                                     .child(SharedString::from(self.channel.clone())),
                             )
                             .child(
@@ -587,7 +539,7 @@ impl Render for ImageViewer {
                                     .min_w_0()
                                     .truncate()
                                     .max_w(px(280.))
-                                    .text_color(chrome_text_dim())
+                                    .text_color(chrome.text_dim)
                                     .child(SharedString::from(format!("- {name}"))),
                             ),
                     ),
@@ -612,7 +564,7 @@ impl Render for ImageViewer {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(chrome_panel())
+            .bg(chrome.panel)
             // Header: chip top-left, close X top-right.
             .child(
                 h_flex()
@@ -632,16 +584,12 @@ impl Render for ImageViewer {
                             .items_center()
                             .justify_center()
                             .rounded_full()
-                            .bg(chrome_button())
+                            .bg(chrome.button)
                             .border_1()
-                            .border_color(chrome_border())
+                            .border_color(chrome.border)
                             .cursor_pointer()
-                            .hover(|button| button.bg(chrome_button_hover()))
-                            .child(
-                                Icon::new(IconName::X)
-                                    .text_color(chrome_text())
-                                    .size(px(16.)),
-                            )
+                            .hover(move |button| button.bg(chrome.button_hover))
+                            .child(Icon::new(IconName::X).text_color(chrome.text).size(px(16.)))
                             .on_click(cx.listener(|_, _, _, cx| {
                                 cx.emit(ViewerEvent::Close);
                             })),
@@ -684,7 +632,7 @@ impl Render for ImageViewer {
                                 .flex()
                                 .items_center()
                                 .child(
-                                    Self::arrow_button("viewer-prev", IconName::ArrowLeft)
+                                    Self::arrow_button("viewer-prev", IconName::ArrowLeft, chrome)
                                         .on_click(cx.listener(|viewer, _, window, cx| {
                                             viewer.step(-1, window, cx);
                                         }))
@@ -703,7 +651,7 @@ impl Render for ImageViewer {
                                 .items_center()
                                 .justify_end()
                                 .child(
-                                    Self::arrow_button("viewer-next", IconName::ArrowRight)
+                                    Self::arrow_button("viewer-next", IconName::ArrowRight, chrome)
                                         .on_click(cx.listener(|viewer, _, window, cx| {
                                             viewer.step(1, window, cx);
                                         }))
@@ -735,14 +683,14 @@ impl Render for ImageViewer {
                                     .rounded_full()
                                     .cursor_pointer()
                                     .when(zoom_out_enabled, |button| {
-                                        button.hover(|button| button.bg(chrome_button()))
+                                        button.hover(move |button| button.bg(chrome.button))
                                     })
                                     .child(
                                         Icon::new(IconName::Minus)
                                             .text_color(if zoom_out_enabled {
-                                                chrome_text_muted()
+                                                chrome.text_muted
                                             } else {
-                                                chrome_text_dim()
+                                                chrome.text_dim
                                             })
                                             .size(px(16.)),
                                     )
@@ -767,14 +715,14 @@ impl Render for ImageViewer {
                                     .rounded_full()
                                     .cursor_pointer()
                                     .when(zoom_in_enabled, |button| {
-                                        button.hover(|button| button.bg(chrome_button()))
+                                        button.hover(move |button| button.bg(chrome.button))
                                     })
                                     .child(
                                         Icon::new(IconName::Plus)
                                             .text_color(if zoom_in_enabled {
-                                                chrome_text_muted()
+                                                chrome.text_muted
                                             } else {
-                                                chrome_text_dim()
+                                                chrome.text_dim
                                             })
                                             .size(px(16.)),
                                     )
@@ -785,7 +733,7 @@ impl Render for ImageViewer {
                     )
                     .child(match image.download.clone() {
                         Some((url, name)) => {
-                            Self::tile_button("viewer-download", IconName::Download)
+                            Self::tile_button("viewer-download", IconName::Download, chrome)
                                 .on_click(move |_, window, cx| {
                                     crate::media::download(url.clone(), name.clone(), window, cx)
                                 })
@@ -799,13 +747,13 @@ impl Render for ImageViewer {
                                 .items_center()
                                 .justify_center()
                                 .rounded_lg()
-                                .bg(chrome_button())
+                                .bg(chrome.button)
                                 .border_1()
-                                .border_color(chrome_border())
+                                .border_color(chrome.border)
                                 .opacity(0.35)
                                 .child(
                                     Icon::new(IconName::Download)
-                                        .text_color(chrome_text_dim())
+                                        .text_color(chrome.text_dim)
                                         .size(px(16.)),
                                 );
                             button.into_any_element()

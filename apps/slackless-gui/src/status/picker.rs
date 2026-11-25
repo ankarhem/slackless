@@ -430,7 +430,12 @@ impl Render for StatusPicker {
                     .border_color(border)
                     .cursor_pointer()
                     .text_sm()
-                    .child(CLEAR_AFTER[self.clear_after])
+                    .child(
+                        CLEAR_AFTER
+                            .get(self.clear_after)
+                            .copied()
+                            .unwrap_or(CLEAR_AFTER[0]),
+                    )
                     .child(
                         Icon::new(IconName::ChevronDown)
                             .text_color(muted)

@@ -1,6 +1,6 @@
 //! Preferences > Navigation, Home, Messages & media, Language & region, Accessibility, and Mark as read section views.
 
-use super::super::*;
+use super::*;
 
 impl Preferences {
     pub(super) fn navigation(&mut self, cx: &mut Context<Self>) -> Div {

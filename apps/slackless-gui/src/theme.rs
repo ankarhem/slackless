@@ -13,8 +13,8 @@ use std::borrow::Cow;
 
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
 use gpui_kit::gpui::{
-    App, Background, Global, Hsla, Pixels, SharedString, linear_color_stop, linear_gradient, px,
-    rgb,
+    App, Background, Global, Hsla, Pixels, SharedString, hsla, linear_color_stop, linear_gradient,
+    px, rgb,
 };
 
 /// Slack's Font choices slackless can show (Preferences > Appearance > Font): Lato, Slack's
@@ -125,7 +125,7 @@ pub fn init(cx: &mut App) {
         include_bytes!("../fonts/Lato-BoldItalic.ttf"),
     ];
     if let Err(e) = cx.text_system().add_fonts(lato.map(Cow::Borrowed).to_vec()) {
-        eprintln!("slackless: could not load Lato ({e})");
+        tracing::warn!("could not load Lato ({e})");
     }
     let inline_code = std::fs::read(MONACO)
         .ok()
@@ -133,7 +133,7 @@ pub fn init(cx: &mut App) {
     let loaded = inline_code.is_some_and(|font| {
         cx.text_system()
             .add_fonts(vec![Cow::Owned(font)])
-            .inspect_err(|e| eprintln!("slackless: could not load the inline code face ({e})"))
+            .inspect_err(|e| tracing::warn!("could not load the inline code face ({e})"))
             .is_ok()
     });
     cx.set_global(InlineCode(loaded));
@@ -146,13 +146,27 @@ pub fn font(cx: &App) -> usize {
         .map_or(DEFAULT_FONT, |font| font.0)
 }
 
-/// Switch the UI font to [`FONT_LABELS`]`[font]` (a valid index); a no-op when it is in effect.
+/// Resolve a font index safely into [`FONT_FAMILIES`], falling back to [`DEFAULT_FONT`].
+pub fn font_family_for(index: usize) -> &'static str {
+    FONT_FAMILIES
+        .get(index)
+        .copied()
+        .unwrap_or(FONT_FAMILIES[DEFAULT_FONT])
+}
+
+/// Switch the UI font to [`FONT_LABELS`]`[font]` (out-of-range falls back to [`DEFAULT_FONT`]);
+/// a no-op when it is already in effect.
 pub fn set_font(font: usize, cx: &mut App) {
+    let font = if font < FONT_FAMILIES.len() {
+        font
+    } else {
+        DEFAULT_FONT
+    };
     if self::font(cx) == font {
         return;
     }
     cx.set_global(UiFont(font));
-    Theme::update(cx, |theme| theme.font_family = FONT_FAMILIES[font].into());
+    Theme::update(cx, |theme| theme.font_family = font_family_for(font).into());
 }
 
 /// Switch the whole app to `theme` with the default color theme and repaint every window.
@@ -175,7 +189,7 @@ pub fn activate_with(
     cx: &mut App,
 ) {
     let mode = theme.mode();
-    let family = FONT_FAMILIES[font(cx)];
+    let family = font_family_for(font(cx));
     cx.set_global(Focus(focus));
     cx.set_global(ThemeChrome {
         palette,
@@ -325,7 +339,7 @@ impl Palette {
 /// The color theme Slack stores for the signed-in user (`sidebar_theme`), so slackless opens
 /// tinted like Slack itself; `None` when the pref is absent. Light, dark or system is not a
 /// workspace pref: Slack keeps its Color Mode on the client, and so does slackless.
-pub fn palette_from_prefs(prefs: &crate::blockkit::serde_json::Value) -> Option<Palette> {
+pub fn palette_from_prefs(prefs: &serde_json::Value) -> Option<Palette> {
     prefs
         .get("sidebar_theme")
         .and_then(|value| value.as_str())
@@ -802,10 +816,86 @@ pub fn avatar_foreground() -> Hsla {
     color(0xFF_FF_FF)
 }
 
+/// Fixed dark-glass chrome palette for the full-screen image viewer overlay (Slack renders its
+/// lightbox dark in both Light and Dark modes).
+#[derive(Clone, Copy)]
+pub struct ViewerChrome {
+    pub panel: Hsla,
+    pub glass: Hsla,
+    pub button: Hsla,
+    pub button_hover: Hsla,
+    pub border: Hsla,
+    pub text: Hsla,
+    pub text_muted: Hsla,
+    pub text_dim: Hsla,
+}
+
+/// Semantic dark-chrome tokens for [`crate::image_viewer::ImageViewer`].
+pub fn viewer_chrome() -> ViewerChrome {
+    ViewerChrome {
+        panel: color(0x5B_5B_5B),
+        glass: color(0x33_35_38).opacity(0.92),
+        button: color(0x3A_3D_42).opacity(0.85),
+        button_hover: color(0x4A_4D_52).opacity(0.9),
+        border: color(0xFF_FF_FF).opacity(0.16),
+        text: color(0xD9_DA_DB).opacity(0.95),
+        text_muted: color(0xD9_DA_DB).opacity(0.65),
+        text_dim: color(0xD9_DA_DB).opacity(0.45),
+    }
+}
+
+/// Translucent dark scrim used behind play buttons on video thumbnails and link unfurls.
+pub fn media_overlay_scrim() -> Hsla {
+    hsla(0., 0., 0., 0.62)
+}
+
+/// Slightly denser dark scrim for video duration badges and Block Kit video tiles.
+pub fn media_overlay_scrim_strong() -> Hsla {
+    hsla(0., 0., 0., 0.68)
+}
+
+/// Hairline white border over dark media scrims.
+pub fn media_overlay_border() -> Hsla {
+    hsla(0., 0., 1., 0.25)
+}
+
+/// High-contrast white icon/label foreground over dark media scrims.
+pub fn media_overlay_foreground() -> Hsla {
+    hsla(0., 0., 1., 0.95)
+}
+
+/// Theme-aware syntax-highlighting foreground color for a [`crate::syntax::TokenKind`].
+pub fn syntax_token_color(kind: crate::syntax::TokenKind, dark: bool, fg: Hsla) -> Hsla {
+    use crate::syntax::TokenKind;
+    match (kind, dark) {
+        (TokenKind::Plain, _) => fg,
+        (TokenKind::Keyword, true) => color(0xFF_7B_72),
+        (TokenKind::String, true) => color(0xA5_D6_FF),
+        (TokenKind::Number, true) => color(0x79_C0_FF),
+        (TokenKind::Comment, true) => color(0x8B_94_9E),
+        (TokenKind::Tag, true) => color(0x7E_E7_87),
+        (TokenKind::Attr, true) => color(0x79_C0_FF),
+        (TokenKind::Type, true) => color(0xFF_A6_57),
+        (TokenKind::DiffAdd, true) => color(0x7E_E7_87),
+        (TokenKind::DiffDel, true) => color(0xFF_A1_98),
+        (TokenKind::DiffHunk, true) => color(0xD2_A8_FF),
+        (TokenKind::Keyword, false) => color(0xCF_22_2E),
+        (TokenKind::String, false) => color(0x0A_30_69),
+        (TokenKind::Number, false) => color(0x05_50_AE),
+        (TokenKind::Comment, false) => color(0x6E_77_81),
+        (TokenKind::Tag, false) => color(0x11_63_29),
+        (TokenKind::Attr, false) => color(0x05_50_AE),
+        (TokenKind::Type, false) => color(0x95_38_00),
+        (TokenKind::DiffAdd, false) => color(0x11_63_29),
+        (TokenKind::DiffDel, false) => color(0xCF_22_2E),
+        (TokenKind::DiffHunk, false) => color(0x82_50_DF),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blockkit::serde_json::json;
+    use serde_json::json;
 
     #[test]
     fn palette_follows_the_workspace_sidebar_theme() {

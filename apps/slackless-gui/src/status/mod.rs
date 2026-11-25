@@ -258,18 +258,17 @@ impl SelfState {
         self.focus_until.is_some_and(|until| until > now_secs())
     }
 
-    /// Turn focus mode on with the Duration [`FOCUS_DURATIONS`]`[preset]`, or re-time it. Like
-    /// Slack it sets the telescope's "In focus mode" status unless a status is already set.
-    #[allow(dead_code)]
-    pub fn start_focus(&mut self, preset: usize) {
-        self.start_focus_with_status(preset, true);
-    }
-
-    /// Turn focus mode on with `preset`, optionally setting the automatic `"In focus mode"`
-    /// status when `auto_status` is true (`F-SHELL-037`, `F-SHELL-039`).
+    /// Turn focus mode on with `preset` (out-of-range falls back to [`FOCUS_UNTIL_OFF`]),
+    /// optionally setting the automatic `"In focus mode"` status when `auto_status` is true
+    /// (`F-SHELL-037`, `F-SHELL-039`).
     pub fn start_focus_with_status(&mut self, preset: usize, auto_status: bool) {
-        let duration = FOCUS_DURATIONS[preset].1;
-        self.focus_preset = preset;
+        let clamped = if preset < FOCUS_DURATIONS.len() {
+            preset
+        } else {
+            FOCUS_UNTIL_OFF
+        };
+        let duration = FOCUS_DURATIONS.get(clamped).and_then(|(_, secs)| *secs);
+        self.focus_preset = clamped;
         self.focus_until = Some(duration.map_or(i64::MAX, |secs| now_secs() + secs));
         if auto_status && self.status.is_none() {
             self.status = Some(focus_status());

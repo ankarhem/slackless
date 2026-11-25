@@ -112,6 +112,106 @@ impl ProfilePanel {
     }
 }
 
+/// Custom status shortcode (colons trimmed) + text derived for a user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DerivedStatus {
+    pub emoji: String,
+    pub text: String,
+}
+
+/// Shared user-profile summary derived from workspace [`Fixtures`], [`SelfState`], and optional
+/// live-hydrated pronouns; consumed by both [`ProfilePanel`] and [`crate::hover_card`].
+pub(crate) struct DerivedUserProfile {
+    pub name: String,
+    pub pronouns: Option<String>,
+    pub title: Option<String>,
+    pub away: bool,
+    /// `Some(active)` for an undeleted resolved user; `None` when unresolved or deactivated.
+    pub active: Option<bool>,
+    pub status: Option<DerivedStatus>,
+    /// `("4:12 PM local time", Some("2 hours ahead"))` when the user's timezone offset is known.
+    pub local_time: Option<(String, Option<String>)>,
+    pub is_self: bool,
+    pub can_message: bool,
+}
+
+/// Derive a user's display name, pronouns, title, presence, unexpired status, and local time.
+pub(crate) fn derive_user_profile(
+    fixtures: &Fixtures,
+    self_state: &SelfState,
+    user_id: &UserId,
+    loaded_pronouns: Option<&str>,
+) -> DerivedUserProfile {
+    let is_self = *user_id == fixtures.self_user;
+    let user = fixtures.user(user_id);
+    let name = user
+        .map(|user| fixtures.name_of(user).to_owned())
+        .unwrap_or_else(|| user_id.as_str().to_owned());
+    let pronouns = loaded_pronouns
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            user.and_then(|u| u.profile.pronouns.as_deref())
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            fixtures
+                .profile_extras
+                .get(user_id)
+                .and_then(|extras| extras.pronouns.clone())
+        });
+    let title = user
+        .and_then(|user| user.profile.title.clone())
+        .filter(|title| !title.is_empty());
+    let away = if is_self {
+        self_state.away
+    } else {
+        matches!(fixtures.presence(user_id), Some(Presence::Away) | None)
+    };
+    let active = user.filter(|user| !user.deleted).map(|_| !away);
+    let status = if is_self {
+        self_state.status.as_ref().map(|status| DerivedStatus {
+            emoji: status.emoji.trim_matches(':').to_owned(),
+            text: status.text.clone(),
+        })
+    } else {
+        user.and_then(|user| {
+            let profile = &user.profile;
+            let unexpired = profile
+                .status_expiration
+                .is_none_or(|end| end == 0 || end > now_secs());
+            let text = profile
+                .status_text
+                .clone()
+                .filter(|text| !text.is_empty())?;
+            unexpired.then(|| DerivedStatus {
+                emoji: profile
+                    .status_emoji
+                    .clone()
+                    .unwrap_or_default()
+                    .trim_matches(':')
+                    .to_owned(),
+                text,
+            })
+        })
+    };
+    let local_time = user.and_then(|user| user.tz_offset).map(local_time);
+    DerivedUserProfile {
+        name,
+        pronouns,
+        title,
+        away,
+        active,
+        status,
+        local_time,
+        is_self,
+        can_message: !is_self && user.is_some_and(|user| !user.deleted),
+    }
+}
+
 /// `4:12 PM local time`, plus how far it is from this machine's clock.
 fn local_time(offset: i64) -> (String, Option<String>) {
     let now = now_secs();
@@ -264,24 +364,22 @@ impl Render for ProfilePanel {
         else {
             return v_flex().size_full().bg(background).child(header);
         };
-        let is_self = user.id == self.fixtures.self_user;
         let extras = self.fixtures.profile_extras.get(&user.id);
         let loaded = self.loaded_profiles.get(&user.id);
-        let pronouns = loaded
-            .and_then(|p| p.pronouns.clone())
-            .or_else(|| {
-                user.profile
-                    .pronouns
-                    .clone()
-                    .filter(|p| !p.trim().is_empty())
-            })
-            .or_else(|| extras.and_then(|e| e.pronouns.clone()));
+        let derived = derive_user_profile(
+            &self.fixtures,
+            &self.self_state,
+            &user.id,
+            loaded.and_then(|p| p.pronouns.as_deref()),
+        );
+        let is_self = derived.is_self;
+        let pronouns = derived.pronouns;
         let custom_fields: Vec<(String, String)> = match loaded {
             Some(p) if !p.fields.is_empty() => p.fields.clone(),
             _ => extras.map(|e| e.fields.clone()).unwrap_or_default(),
         };
         // The name messages show the person by (full or display name, per the workspace).
-        let name = self.fixtures.name_of(&user).to_owned();
+        let name = derived.name;
         let real_name = user
             .profile
             .real_name
@@ -292,32 +390,19 @@ impl Render for ProfilePanel {
         // Slack's big profile photo (an initials tile for someone without one).
         let photo = crate::avatars::user_chip(&self.fixtures, &user.id, 240.);
 
-        let status = if is_self {
-            self.self_state
-                .status
-                .as_ref()
-                .map(|s| (s.glyph().to_owned(), s.text.clone()))
-        } else {
-            user.profile
-                .status_text
-                .clone()
-                .filter(|t| !t.is_empty())
-                .map(|text| {
-                    let code = user.profile.status_emoji.clone().unwrap_or_default();
-                    let glyph = emoji_glyph(code.trim_matches(':'))
-                        .map(str::to_owned)
-                        .unwrap_or(code);
-                    (glyph, text)
-                })
-        };
-        let away = if is_self {
-            self.self_state.away
-        } else {
-            matches!(
-                self.fixtures.presence(&user.id),
-                Some(Presence::Away) | None
-            )
-        };
+        let status = derived.status.map(|s| {
+            let glyph = if is_self {
+                emoji_glyph(s.emoji.as_str())
+                    .unwrap_or("\u{1F4AC}")
+                    .to_owned()
+            } else {
+                emoji_glyph(s.emoji.as_str())
+                    .map(str::to_owned)
+                    .unwrap_or(s.emoji)
+            };
+            (glyph, s.text)
+        });
+        let away = derived.away;
         let presence = h_flex()
             .items_center()
             .gap_2()
@@ -354,8 +439,7 @@ impl Render for ProfilePanel {
                 }))
             });
 
-        let time = user.tz_offset.map(|offset| {
-            let (time, relative) = local_time(offset);
+        let time = derived.local_time.map(|(time, relative)| {
             let text = match relative {
                 Some(relative) => format!("{time} \u{b7} {relative}"),
                 None => time,

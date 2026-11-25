@@ -1,6 +1,6 @@
 //! Preferences > Advanced: software updates and CLI installation groups.
 
-use super::super::*;
+use super::*;
 
 impl Preferences {
     pub(super) fn software_updates_group(&mut self, cx: &mut Context<Self>) -> Div {

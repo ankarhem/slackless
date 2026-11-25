@@ -972,64 +972,128 @@ impl FilesPage {
     }
 }
 
-fn open_new_canvas_dialog(
+struct SingleInputDialog {
+    title: &'static str,
+    placeholder: &'static str,
+    width: f32,
+    cancel_id: &'static str,
+    create_id: &'static str,
+    empty_fallback: Option<&'static str>,
+    templates: &'static [(&'static str, &'static str)],
+}
+
+fn open_single_input_dialog(
     page: gpui_kit::gpui::WeakEntity<FilesPage>,
+    spec: SingleInputDialog,
+    make_event: impl Fn(String) -> FilesPageEvent + 'static,
     window: &mut Window,
     cx: &mut App,
 ) {
     use gpui_kit::component::WindowExt as _;
     use gpui_kit::gpui::Focusable as _;
-    let title_state = cx.new(|cx| {
+    let input_state = cx.new(|cx| {
         TextareaState::new(window, cx)
-            .placeholder("Canvas title (e.g. Launch runbook)")
+            .placeholder(spec.placeholder)
             .auto_grow(1, 1)
     });
-    title_state.read(cx).focus_handle(cx).focus(window, cx);
+    input_state.read(cx).focus_handle(cx).focus(window, cx);
+    let make_event = std::rc::Rc::new(make_event);
     window.open_dialog(cx, move |dialog, _, cx| {
-        let bg = cx.theme().background;
-        let title_c = title_state.clone();
+        let theme = cx.theme();
+        let (bg, muted) = (theme.background, theme.muted_foreground);
+        let input_c = input_state.clone();
         let page_c = page.clone();
-        dialog.title("Create standalone canvas").w(px(380.)).child(
+        let make_event = make_event.clone();
+        let template_strip = (!spec.templates.is_empty()).then(|| {
+            v_flex()
+                .gap_1p5()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Start from a template"),
+                )
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_1p5()
+                        .children(spec.templates.iter().map(|&(label, preset)| {
+                            let ns = input_state.clone();
+                            Button::new(SharedString::from(format!("files-list-tpl-{label}")))
+                                .outline()
+                                .with_size(Size::XSmall)
+                                .label(label)
+                                .on_click(move |_, window, cx| {
+                                    ns.update(cx, |st, cx| {
+                                        st.set_value(preset.to_owned(), window, cx);
+                                    });
+                                })
+                        })),
+                )
+        });
+        dialog.title(spec.title).w(px(spec.width)).child(
             v_flex()
                 .gap_3()
                 .p_4()
-                .child(crate::preferences::text_input_box(&title_state, false, cx).bg(bg))
+                .children(template_strip)
+                .child(crate::ui::forms::text_input_box(&input_state, false, cx).bg(bg))
                 .child(
                     h_flex()
                         .justify_end()
                         .gap_2()
                         .child(
-                            crate::preferences::form_button(
-                                Button::new("files-new-canvas-cancel")
-                                    .outline()
-                                    .label("Cancel"),
+                            crate::ui::forms::form_button(
+                                Button::new(spec.cancel_id).outline().label("Cancel"),
                                 cx,
                             )
                             .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(
-                            crate::preferences::form_button(
-                                Button::new("files-new-canvas-create")
-                                    .primary()
-                                    .label("Create"),
+                            crate::ui::forms::form_button(
+                                Button::new(spec.create_id).primary().label("Create"),
                                 cx,
                             )
                             .on_click(move |_, window, cx| {
-                                let title = title_c.read(cx).value().trim().to_owned();
-                                let title = if title.is_empty() {
-                                    "Untitled canvas".to_owned()
+                                let raw = input_c.read(cx).value().trim().to_owned();
+                                let value = if raw.is_empty() {
+                                    match spec.empty_fallback {
+                                        Some(default) => default.to_owned(),
+                                        None => return,
+                                    }
                                 } else {
-                                    title
+                                    raw
                                 };
                                 window.close_dialog(cx);
                                 let _ = page_c.update(cx, |_, cx| {
-                                    cx.emit(FilesPageEvent::CreateCanvas { title });
+                                    cx.emit(make_event(value));
                                 });
                             }),
                         ),
                 ),
         )
     });
+}
+
+fn open_new_canvas_dialog(
+    page: gpui_kit::gpui::WeakEntity<FilesPage>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    open_single_input_dialog(
+        page,
+        SingleInputDialog {
+            title: "Create standalone canvas",
+            placeholder: "Canvas title (e.g. Launch runbook)",
+            width: 380.,
+            cancel_id: "files-new-canvas-cancel",
+            create_id: "files-new-canvas-create",
+            empty_fallback: Some("Untitled canvas"),
+            templates: &[],
+        },
+        |title| FilesPageEvent::CreateCanvas { title },
+        window,
+        cx,
+    );
 }
 
 fn open_new_list_dialog(
@@ -1037,95 +1101,27 @@ fn open_new_list_dialog(
     window: &mut Window,
     cx: &mut App,
 ) {
-    use gpui_kit::component::WindowExt as _;
-    use gpui_kit::gpui::Focusable as _;
-    let name_state = cx.new(|cx| {
-        TextareaState::new(window, cx)
-            .placeholder("List name (e.g. Q4 release checklist)")
-            .auto_grow(1, 1)
-    });
-    name_state.read(cx).focus_handle(cx).focus(window, cx);
-    window.open_dialog(cx, move |dialog, _, cx| {
-        let theme = cx.theme();
-        let (bg, muted) = (theme.background, theme.muted_foreground);
-        let name_c = name_state.clone();
-        let page_c = page.clone();
-        let templates = [
-            ("Project tracker", "Project tracker"),
-            ("Bug triage", "Bug triage"),
-            ("Launch checklist", "Launch checklist"),
-            ("Feedback tracker", "Customer feedback"),
-        ];
-        dialog.title("Create list").w(px(420.)).child(
-            v_flex()
-                .gap_3()
-                .p_4()
-                .child(
-                    v_flex()
-                        .gap_1p5()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child("Start from a template"),
-                        )
-                        .child(
-                            h_flex()
-                                .flex_wrap()
-                                .gap_1p5()
-                                .children(templates.into_iter().map(|(label, preset)| {
-                                    let ns = name_state.clone();
-                                    Button::new(SharedString::from(format!(
-                                        "files-list-tpl-{label}"
-                                    )))
-                                    .outline()
-                                    .with_size(Size::XSmall)
-                                    .label(label)
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            ns.update(cx, |st, cx| {
-                                                st.set_value(preset.to_owned(), window, cx);
-                                            });
-                                        },
-                                    )
-                                })),
-                        ),
-                )
-                .child(crate::preferences::text_input_box(&name_state, false, cx).bg(bg))
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            crate::preferences::form_button(
-                                Button::new("files-new-list-cancel")
-                                    .outline()
-                                    .label("Cancel"),
-                                cx,
-                            )
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                        )
-                        .child(
-                            crate::preferences::form_button(
-                                Button::new("files-new-list-create")
-                                    .primary()
-                                    .label("Create"),
-                                cx,
-                            )
-                            .on_click(move |_, window, cx| {
-                                let name = name_c.read(cx).value().trim().to_owned();
-                                if name.is_empty() {
-                                    return;
-                                }
-                                window.close_dialog(cx);
-                                let _ = page_c.update(cx, |_, cx| {
-                                    cx.emit(FilesPageEvent::CreateList { name });
-                                });
-                            }),
-                        ),
-                ),
-        )
-    });
+    const TEMPLATES: [(&str, &str); 4] = [
+        ("Project tracker", "Project tracker"),
+        ("Bug triage", "Bug triage"),
+        ("Launch checklist", "Launch checklist"),
+        ("Feedback tracker", "Customer feedback"),
+    ];
+    open_single_input_dialog(
+        page,
+        SingleInputDialog {
+            title: "Create list",
+            placeholder: "List name (e.g. Q4 release checklist)",
+            width: 420.,
+            cancel_id: "files-new-list-cancel",
+            create_id: "files-new-list-create",
+            empty_fallback: None,
+            templates: &TEMPLATES,
+        },
+        |name| FilesPageEvent::CreateList { name },
+        window,
+        cx,
+    );
 }
 
 fn open_new_collection_dialog(
@@ -1133,53 +1129,21 @@ fn open_new_collection_dialog(
     window: &mut Window,
     cx: &mut App,
 ) {
-    use gpui_kit::component::WindowExt as _;
-    use gpui_kit::gpui::Focusable as _;
-    let name_state = cx.new(|cx| {
-        TextareaState::new(window, cx)
-            .placeholder("Collection name (e.g. Design specs)")
-            .auto_grow(1, 1)
-    });
-    name_state.read(cx).focus_handle(cx).focus(window, cx);
-    window.open_dialog(cx, move |dialog, _, cx| {
-        let bg = cx.theme().background;
-        let name_c = name_state.clone();
-        let page_c = page.clone();
-        dialog.title("Create file collection").w(px(380.)).child(
-            v_flex()
-                .gap_3()
-                .p_4()
-                .child(crate::preferences::text_input_box(&name_state, false, cx).bg(bg))
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            crate::preferences::form_button(
-                                Button::new("files-col-cancel").outline().label("Cancel"),
-                                cx,
-                            )
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                        )
-                        .child(
-                            crate::preferences::form_button(
-                                Button::new("files-col-create").primary().label("Create"),
-                                cx,
-                            )
-                            .on_click(move |_, window, cx| {
-                                let name = name_c.read(cx).value().trim().to_owned();
-                                if name.is_empty() {
-                                    return;
-                                }
-                                window.close_dialog(cx);
-                                let _ = page_c.update(cx, |_, cx| {
-                                    cx.emit(FilesPageEvent::CreateCollection { name });
-                                });
-                            }),
-                        ),
-                ),
-        )
-    });
+    open_single_input_dialog(
+        page,
+        SingleInputDialog {
+            title: "Create file collection",
+            placeholder: "Collection name (e.g. Design specs)",
+            width: 380.,
+            cancel_id: "files-col-cancel",
+            create_id: "files-col-create",
+            empty_fallback: None,
+            templates: &[],
+        },
+        |name| FilesPageEvent::CreateCollection { name },
+        window,
+        cx,
+    );
 }
 
 /// One file: type tile, bold name, and the "<owner> · Created <when>" line; opens canvases and
@@ -1211,7 +1175,7 @@ fn file_row(
         .with_size(Size::XSmall)
         .icon(IconName::Star)
         .tooltip(if starred { "Unstar file" } else { "Star file" })
-        .when(starred, |b| b.text_color(gpui_kit::gpui::rgb(0xeab308)))
+        .when(starred, |b| b.text_color(theme.warning))
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
             let _ = page_star.update(cx, |p, cx| {

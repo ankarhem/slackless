@@ -50,9 +50,8 @@ use crate::fixtures::Fixtures;
 use crate::image_viewer::ImageOrigin;
 use crate::messages::{self, LinkHandler, LinkTarget, THEME_ORDER_STRIDE};
 
-/// `serde_json` through gpui's re-export (the single 1.x version the core crates use): the
-/// GUI crate has no direct dependency, and `Block::Unknown` hands out its `Value`.
-pub(crate) use gpui_kit::gpui::private::serde_json;
+/// Re-export workspace `serde_json` for Block Kit modules and callers that import it from here.
+pub(crate) use ::serde_json;
 pub(crate) type Json = serde_json::Value;
 
 /// Local state of interactive Block Kit controls, keyed by [`control_key`].

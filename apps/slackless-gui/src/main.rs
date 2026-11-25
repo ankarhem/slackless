@@ -71,6 +71,7 @@ mod threads_cards;
 mod threads_view;
 mod thumbnail;
 mod tools_page;
+mod ui;
 mod unreads;
 mod updater;
 mod zoom;
