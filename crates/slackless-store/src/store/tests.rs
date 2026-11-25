@@ -89,12 +89,22 @@ fn migrate_is_idempotent() {
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE name IN
              ('message_revision','message_current','message_fts','conversation','user',
-              'reaction','team','channel_section','custom_emoji','prefs')",
+              'team','channel_section','custom_emoji','prefs','local_state','offline_queue',
+              'bot_profile','huddle_transcript','huddle_transcript_fts')",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 10);
+    assert_eq!(tables, 14);
+    let legacy_reaction: i64 = store
+        .conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'reaction'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_reaction, 0);
 }
 
 #[test]
@@ -1678,7 +1688,14 @@ fn ts_key_handles_malformed_and_utf8_fractional_parts() {
     );
     assert_eq!(ts_key(&Ts::from("1700000000.-1")), 1_700_000_000_000_000);
     assert_eq!(ts_key(&Ts::from("not-a-ts.abc")), 0);
+    assert_eq!(ts_key(&Ts::from("not-a-ts.123456")), 0);
     assert_eq!(ts_key(&Ts::from("")), 0);
+    assert_eq!(parse_ts_key(&Ts::from("not-a-ts.123456")), None);
+    assert_eq!(parse_ts_key(&Ts::from("-1700000000.000100")), None);
+    assert_eq!(
+        parse_ts_key(&Ts::from("1700000000.000100")),
+        Some(1_700_000_000_000_100)
+    );
 }
 
 #[test]
@@ -1849,23 +1866,53 @@ fn open_read_only_rejects_writes_and_open_rejects_future_schema() {
 
     let mut writer = Store::open(&path).unwrap();
     writer.set_local(&ws(), "theme", "dark").unwrap();
+    writer
+        .upsert_message(&ws(), &general(), &msg("1700000000.000100", "U1", "hello"))
+        .unwrap();
 
     let mut reader = Store::open_read_only(&path).unwrap();
     assert_eq!(
         reader.local(&ws(), "theme").unwrap().as_deref(),
         Some("dark")
     );
-    assert!(reader.set_local(&ws(), "theme", "light").is_err());
-    assert!(
+    // Multi-query read transactions must work cleanly on read-only handles.
+    assert_eq!(reader.stats(&ws()).unwrap().messages, 1);
+    assert_eq!(
         reader
-            .upsert_message(&ws(), &general(), &msg("1700000001.000100", "U1", "nope"))
-            .is_err()
+            .storage_breakdown(&ws(), 5)
+            .unwrap()
+            .top_channels
+            .len(),
+        1
     );
-    assert!(reader.enqueue_offline(&ws(), "{}").is_err());
+    assert_eq!(
+        reader.latest_messages(&ws(), &[general()]).unwrap().len(),
+        1
+    );
+    assert_eq!(reader.digest_since(&ws(), 0, 10).unwrap().len(), 1);
+
+    assert!(matches!(
+        reader.set_local(&ws(), "theme", "light"),
+        Err(StoreError::ReadOnly)
+    ));
+    assert!(matches!(
+        reader.upsert_message(&ws(), &general(), &msg("1700000001.000100", "U1", "nope")),
+        Err(StoreError::ReadOnly)
+    ));
+    assert!(matches!(
+        reader.enqueue_offline(&ws(), "{}"),
+        Err(StoreError::ReadOnly)
+    ));
+    assert!(matches!(reader.vacuum(), Err(StoreError::ReadOnly)));
+    assert!(matches!(
+        reader.delete_huddle_transcript(&ws(), "R0CALL"),
+        Err(StoreError::ReadOnly)
+    ));
 
     drop(reader);
 
-    // Bump user_version past SCHEMA_VERSION and verify Store::open returns FutureSchema.
+    // Bump user_version past SCHEMA_VERSION and verify both Store::open and Store::open_read_only
+    // return FutureSchema.
     let future = schema::SCHEMA_VERSION + 2;
     writer
         .conn
@@ -1873,20 +1920,22 @@ fn open_read_only_rejects_writes_and_open_rejects_future_schema() {
         .unwrap();
     drop(writer);
 
-    let err = match Store::open(&path) {
-        Ok(_) => panic!("expected FutureSchema error"),
-        Err(err) => err,
-    };
-    assert!(
-        matches!(
-            err,
-            StoreError::FutureSchema {
-                found,
-                supported,
-            } if found == future && supported == schema::SCHEMA_VERSION
-        ),
-        "expected FutureSchema, got {err:?}"
-    );
+    for res in [Store::open(&path), Store::open_read_only(&path)] {
+        let err = match res {
+            Ok(_) => panic!("expected FutureSchema error"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err,
+                StoreError::FutureSchema {
+                    found,
+                    supported,
+                } if found == future && supported == schema::SCHEMA_VERSION
+            ),
+            "expected FutureSchema, got {err:?}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2665,7 +2714,7 @@ fn search_include_deleted_opt_in_returns_tombstones() {
 
 #[test]
 fn huddle_transcripts_fts5_multilingual_en_sv_and_sessions() {
-    let store = Store::open_in_memory().unwrap();
+    let mut store = Store::open_in_memory().unwrap();
     let ch = ChannelId::from("C0HUDDLE");
     let thread_ts = Ts::from("1700001000.000100");
     let u_alice = UserId::from("U0ALICE");
@@ -2733,13 +2782,120 @@ fn huddle_transcripts_fts5_multilingual_en_sv_and_sessions() {
         .search_huddle_transcripts(&ws(), "", Some(&ch), Some("en"), 20)
         .unwrap();
     assert_eq!(en_only.len(), 1);
-    assert_eq!(en_only[0].speaker_id, Some(u_bob));
+    assert_eq!(en_only[0].speaker_id, Some(u_bob.clone()));
 
+    // Quotes, trailing wildcards, and punctuation-only inputs must not fail FTS5 parsing.
+    let quoted_hits = store
+        .search_huddle_transcripts(&ws(), r#"deploy* "checkout""#, None, None, 20)
+        .unwrap();
+    assert_eq!(quoted_hits.len(), 1);
+    assert_eq!(quoted_hits[0].speaker_id, Some(u_bob));
+    let punct_only = store
+        .search_huddle_transcripts(&ws(), r#"""" ***"#, None, None, 20)
+        .unwrap();
+    assert_eq!(punct_only.len(), 2);
+
+    let rev_before_del = Store::message_revision();
     assert_eq!(store.delete_huddle_transcript(&ws(), "R0CALL1").unwrap(), 2);
+    assert!(Store::message_revision() > rev_before_del);
     assert!(
         store
             .search_huddle_transcripts(&ws(), "mote", None, None, 20)
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn recent_threads_uses_partial_index_and_filters_correctly() {
+    let mut store = Store::open_in_memory().unwrap();
+    let plan: Vec<String> = {
+        let explain_sql = format!("EXPLAIN QUERY PLAN {RECENT_THREADS_WORKSPACE_SQL}");
+        let mut stmt = store.conn.prepare(&explain_sql).unwrap();
+        let rows: Vec<String> = stmt
+            .query_map(params![ws().as_str(), 10i64], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        drop(stmt);
+        rows
+    };
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("USING INDEX message_current_threads")),
+        "expected recent_threads to use partial index message_current_threads, got plan: {plan:?}"
+    );
+
+    let mut root1 = msg("1700000001.000100", "U1", "thread one");
+    root1.reply_count = Some(2);
+    let mut root2 = msg("1700000003.000100", "U2", "thread two");
+    root2.reply_count = Some(5);
+    let mut zero_replies = msg("1700000004.000100", "U1", "zero replies");
+    zero_replies.reply_count = Some(0);
+    let plain = msg("1700000005.000100", "U1", "plain message");
+    let mut deleted_root = msg("1700000006.000100", "U1", "deleted thread");
+    deleted_root.reply_count = Some(4);
+
+    store
+        .upsert_messages(&ws(), &general(), &[root1, zero_replies, plain])
+        .unwrap();
+    store
+        .upsert_message(&ws(), &ChannelId::from("C2"), &root2)
+        .unwrap();
+    store
+        .upsert_message(&ws(), &general(), &deleted_root)
+        .unwrap();
+    store
+        .record_deletion(
+            &ws(),
+            &general(),
+            &deleted_root.ts,
+            None,
+            Some(&deleted_root),
+        )
+        .unwrap();
+
+    let all = store.recent_threads(&ws(), None, 10).unwrap();
+    let all_texts: Vec<&str> = all.iter().map(|m| m.message.text.as_str()).collect();
+    assert_eq!(all_texts, ["thread two", "thread one"]);
+
+    let c1_only = store.recent_threads(&ws(), Some(&general()), 10).unwrap();
+    let c1_texts: Vec<&str> = c1_only.iter().map(|m| m.message.text.as_str()).collect();
+    assert_eq!(c1_texts, ["thread one"]);
+}
+
+#[test]
+fn empty_upsert_does_not_bump_revision_while_transcript_insert_does() {
+    let mut store = Store::open_in_memory().unwrap();
+    let rev = Store::message_revision();
+    store.upsert_messages(&ws(), &general(), &[]).unwrap();
+    assert_eq!(Store::message_revision(), rev);
+
+    let seg = crate::NewHuddleTranscriptSegment {
+        channel: &general(),
+        call_id: "R0REV",
+        thread_root_ts: None,
+        speaker_id: None,
+        lang: Some("en"),
+        source: "chime",
+        text: "   ",
+        at_ms: 1_700_000_000_000,
+    };
+    assert_eq!(
+        store.insert_huddle_transcript_segment(&ws(), &seg).unwrap(),
+        0
+    );
+    assert_eq!(Store::message_revision(), rev);
+
+    let seg_non_empty = crate::NewHuddleTranscriptSegment {
+        text: "hello huddle",
+        ..seg
+    };
+    assert!(
+        store
+            .insert_huddle_transcript_segment(&ws(), &seg_non_empty)
+            .unwrap()
+            > 0
+    );
+    assert!(Store::message_revision() > rev);
 }

@@ -1,7 +1,11 @@
 //! The blocking [`Store`]. Drive it from a dedicated thread or `spawn_blocking`.
 
 mod archive;
+mod bots;
+mod maintenance;
+mod memberships;
 mod messages;
+mod offline;
 mod search;
 #[cfg(test)]
 mod tests;
@@ -15,21 +19,24 @@ pub use transcripts::{
 use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use rusqlite::types::{Value as SqlValue, ValueRef};
-use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    params_from_iter,
+};
 
-use crate::Result;
 use crate::query::{Has, SearchQuery};
-use crate::schema;
 use crate::types::{
     BotId, BotProfile, ChannelId, ChannelSection, Conversation, ConversationKind, Message,
     MessageSubtype, Team, TeamId, Ts, User, UserId,
 };
+use crate::{Result, StoreError, schema};
 
 /// A message as the store currently renders it.
 #[derive(Debug, Clone, PartialEq)]
@@ -88,34 +95,64 @@ pub struct StorageBreakdown {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        let _ = self.conn.execute_batch("PRAGMA optimize;");
+        if !self.read_only {
+            let _ = self.conn.execute_batch("PRAGMA optimize;");
+        }
     }
 }
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Monotonic revision bumped whenever message rows are mutated in any [`Store`] instance.
-/// Lets secondary windows skip idle SQLite polling with a single atomic load.
+/// Monotonic revision bumped whenever message, transcript, or conversation rows are mutated in
+/// any [`Store`] instance. Lets secondary windows skip idle SQLite polling with a single atomic
+/// load.
 static MESSAGE_REVISION: AtomicU64 = AtomicU64::new(1);
 
 /// Durable local-first message store; the rendering source of truth.
 pub struct Store {
     pub(crate) conn: Connection,
+    read_only: bool,
 }
 
 impl Store {
-    /// Current monotonic message-mutation revision (O(1) atomic read, zero SQLite I/O).
+    /// Current monotonic mutation revision (O(1) atomic read, zero SQLite I/O).
     pub fn message_revision() -> u64 {
         MESSAGE_REVISION.load(Ordering::Acquire)
     }
 
     #[inline]
-    fn bump_message_revision() {
+    pub(super) fn bump_message_revision() {
         MESSAGE_REVISION.fetch_add(1, Ordering::Release);
     }
+
+    /// Rejects mutations on handles opened via [`Store::open_read_only`].
+    #[inline]
+    pub(super) fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(StoreError::ReadOnly);
+        }
+        Ok(())
+    }
+
+    /// Runs `f` inside a `DEFERRED` read transaction so multi-query reads observe a single
+    /// consistent WAL snapshot.
+    pub(super) fn with_read_tx<T>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
     /// Opens (creating if needed) the database at `path` and migrates it.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        // `Store` is `!Sync` and always externally synchronized, so disable SQLite's internal
+        // per-statement mutex to avoid double locking.
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags)?;
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
         let _ = conn.execute_batch(
             "PRAGMA synchronous = NORMAL;
@@ -129,8 +166,7 @@ impl Store {
     /// Opens a read-only WAL connection to an existing database at `path`, allowing UI reads to
     /// run concurrently with background write transactions without waiting on the writer mutex.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
-        let flags =
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(path, flags)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         let _ = conn.execute_batch(
@@ -140,27 +176,43 @@ impl Store {
              PRAGMA mmap_size = 8388608;",
         );
         // Probe header/schema readability eagerly so WAL-without-shm databases fail here instead
-        // of returning a broken handle whose later queries silently fail.
-        let _ = schema::schema_version(&conn)?;
-        Ok(Self { conn })
+        // of returning a broken handle, and refuse databases written by a newer schema version.
+        let found = schema::schema_version(&conn)?;
+        if found > schema::SCHEMA_VERSION {
+            return Err(StoreError::FutureSchema {
+                found,
+                supported: schema::SCHEMA_VERSION,
+            });
+        }
+        Ok(Self {
+            conn,
+            read_only: true,
+        })
     }
 
     /// A fresh in-memory store (tests, ephemeral sessions).
     pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_in_memory_with_flags(flags)?;
         let _ = conn.execute_batch("PRAGMA temp_store = MEMORY; PRAGMA cache_size = -8000;");
         Self::init(conn)
     }
 
     fn init(conn: Connection) -> Result<Self> {
         conn.busy_timeout(Duration::from_secs(5))?;
-        let mut store = Self { conn };
+        let mut store = Self {
+            conn,
+            read_only: false,
+        };
         store.migrate()?;
         Ok(store)
     }
 
     /// Applies pending schema migrations. Idempotent; `open*` already calls it.
     pub fn migrate(&mut self) -> Result<()> {
+        self.ensure_writable()?;
         schema::migrate(&mut self.conn)
     }
 
@@ -179,6 +231,7 @@ impl Store {
         workspace: &TeamId,
         conversations: &[Conversation],
     ) -> Result<()> {
+        self.ensure_writable()?;
         if conversations.is_empty() {
             return Ok(());
         }
@@ -214,6 +267,7 @@ impl Store {
             }
         }
         tx.commit()?;
+        Self::bump_message_revision();
         Ok(())
     }
 
@@ -223,6 +277,7 @@ impl Store {
 
     /// Upsert a batch of users in a single SQLite transaction.
     pub fn upsert_users(&mut self, workspace: &TeamId, users: &[User]) -> Result<()> {
+        self.ensure_writable()?;
         if users.is_empty() {
             return Ok(());
         }
@@ -277,6 +332,7 @@ impl Store {
     /// clobbering richer stored fields ([`Conversation::merge`]). A conversation not yet
     /// stored is inserted as-is.
     pub fn merge_conversation(&mut self, workspace: &TeamId, fresh: &Conversation) -> Result<()> {
+        self.ensure_writable()?;
         let merged = match self.conversation(workspace, &fresh.id)? {
             Some(mut stored) => {
                 stored.merge(fresh);
@@ -328,7 +384,7 @@ impl Store {
                 raw_row,
             )
             .optional()?;
-        Ok(collect(row.into_iter().map(Ok))?.into_iter().next())
+        row.map(decode_stored_message).transpose()
     }
 
     /// Every stored user of `workspace`, as last upserted.
@@ -344,6 +400,7 @@ impl Store {
 
     /// Stores the workspace's team record (`client.userBoot.team`).
     pub fn upsert_team(&mut self, workspace: &TeamId, team: &Team) -> Result<()> {
+        self.ensure_writable()?;
         self.conn.execute(
             "INSERT INTO team (workspace_id, id, json, updated_at)
              VALUES (?1, ?2, ?3, ?4)
@@ -402,25 +459,17 @@ impl Store {
         }
         // `team_id` lives in the stored JSON blob, not a column, so the rows parse here;
         // unreadable profiles read as own-team (a missing profile never invents an org).
-        // Chunk IN lists to stay well below SQLITE_MAX_VARIABLE_NUMBER on large workspaces.
         let mut teams: Vec<TeamId> = Vec::new();
-        for chunk in ask.chunks(SQL_IN_CHUNK) {
-            let sql = format!(
-                r#"SELECT json FROM "user" WHERE workspace_id = ?1 AND id IN ({})"#,
-                vec!["?"; chunk.len()].join(", ")
-            );
-            let mut args = Vec::with_capacity(chunk.len() + 1);
-            args.push(SqlValue::Text(workspace.as_str().to_owned()));
-            args.extend(
-                chunk
-                    .iter()
-                    .map(|id| SqlValue::Text(id.as_str().to_owned())),
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(0))?;
-            for row in rows {
-                let Ok(user) = serde_json::from_str::<User>(&row?) else {
-                    continue;
+        query_in_chunks(
+            &self.conn,
+            workspace,
+            &ask,
+            |id| id.as_str(),
+            r#"SELECT json FROM "user" WHERE workspace_id = ?1 AND id"#,
+            |r| r.get::<_, String>(0),
+            |raw| {
+                let Ok(user) = serde_json::from_str::<User>(&raw) else {
+                    return;
                 };
                 if let Some(team) = user.team_id
                     && team != *workspace
@@ -428,8 +477,8 @@ impl Store {
                 {
                     teams.push(team);
                 }
-            }
-        }
+            },
+        )?;
         Ok(teams)
     }
 
@@ -440,23 +489,26 @@ impl Store {
         workspace: &TeamId,
         sections: &[ChannelSection],
     ) -> Result<()> {
+        self.ensure_writable()?;
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM channel_section WHERE workspace_id = ?1",
-            params![workspace.as_str()],
-        )?;
-        for (seq, section) in sections.iter().enumerate() {
-            tx.execute(
+        let ts = now_secs();
+        {
+            let mut del =
+                tx.prepare_cached("DELETE FROM channel_section WHERE workspace_id = ?1")?;
+            del.execute(params![workspace.as_str()])?;
+            let mut ins = tx.prepare_cached(
                 "INSERT INTO channel_section (workspace_id, id, seq, json, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
+            )?;
+            for (seq, section) in sections.iter().enumerate() {
+                ins.execute(params![
                     workspace.as_str(),
                     section.id,
                     seq as i64,
                     serde_json::to_string(section)?,
-                    now_secs(),
-                ],
-            )?;
+                    ts,
+                ])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -483,16 +535,17 @@ impl Store {
         workspace: &TeamId,
         emoji: &[(String, String)],
     ) -> Result<()> {
+        self.ensure_writable()?;
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM custom_emoji WHERE workspace_id = ?1",
-            params![workspace.as_str()],
-        )?;
-        for (name, url) in emoji {
-            tx.execute(
+        {
+            let mut del = tx.prepare_cached("DELETE FROM custom_emoji WHERE workspace_id = ?1")?;
+            del.execute(params![workspace.as_str()])?;
+            let mut ins = tx.prepare_cached(
                 "INSERT INTO custom_emoji (workspace_id, name, url) VALUES (?1, ?2, ?3)",
-                params![workspace.as_str(), name, url],
             )?;
+            for (name, url) in emoji {
+                ins.execute(params![workspace.as_str(), name, url])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -522,6 +575,7 @@ impl Store {
 
     /// Stores the signed-in user's prefs blob (`client.userBoot.prefs`).
     pub fn replace_prefs(&mut self, workspace: &TeamId, prefs: &serde_json::Value) -> Result<()> {
+        self.ensure_writable()?;
         self.conn.execute(
             "INSERT INTO prefs (workspace_id, json, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT (workspace_id) DO UPDATE SET
@@ -566,6 +620,7 @@ impl Store {
 
     /// Sets a slackless-local value for `workspace`, replacing any previous one.
     pub fn set_local(&mut self, workspace: &TeamId, key: &str, value: &str) -> Result<()> {
+        self.ensure_writable()?;
         self.conn.execute(
             "INSERT INTO local_state (workspace_id, key, value) VALUES (?1, ?2, ?3)
              ON CONFLICT (workspace_id, key) DO UPDATE SET value = excluded.value",
@@ -596,6 +651,48 @@ impl Store {
 }
 
 use self::messages::*;
+
+/// Builds `?, ?, ...` with `n` positional SQL placeholders.
+pub(super) fn placeholders(n: usize) -> String {
+    let mut out = String::with_capacity(n.saturating_mul(3));
+    for i in 0..n {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push('?');
+    }
+    out
+}
+
+/// Runs a workspace-scoped `... IN (?, ...)` query across chunks of at most [`SQL_IN_CHUNK`]
+/// values, passing each mapped row to `on_row`. `sql_before_in` must bind `?1` to `workspace_id`
+/// and end immediately before `IN (...)`.
+pub(super) fn query_in_chunks<T, R>(
+    conn: &Connection,
+    workspace: &TeamId,
+    items: &[T],
+    as_str: impl Fn(&T) -> &str,
+    sql_before_in: &str,
+    mut map_row: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<R>,
+    mut on_row: impl FnMut(R),
+) -> Result<()> {
+    for chunk in items.chunks(SQL_IN_CHUNK) {
+        let sql = format!("{sql_before_in} IN ({})", placeholders(chunk.len()));
+        let mut args = Vec::with_capacity(chunk.len() + 1);
+        args.push(SqlValue::Text(workspace.as_str().to_owned()));
+        args.extend(
+            chunk
+                .iter()
+                .map(|item| SqlValue::Text(as_str(item).to_owned())),
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), &mut map_row)?;
+        for row in rows {
+            on_row(row?);
+        }
+    }
+    Ok(())
+}
 
 /// Orders sections for display: the `next_id` chain starting at the section no other section
 /// points to, then every remaining section in stored order.

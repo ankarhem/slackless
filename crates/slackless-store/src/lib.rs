@@ -3,8 +3,9 @@
 //! - `message_revision`: immutable, append-only log of every message revision observed, keyed
 //!   `(workspace_id, channel_id, ts, edit_ts)`. Edits and deletions are new revisions; triggers
 //!   reject UPDATE/DELETE, so retention never removes history (extra-features X-1).
-//! - `message_current`: latest revision per message, which the UI reads; `reaction`,
-//!   `conversation`, `user` hold current state.
+//! - `message_current`: latest revision per message, which the UI reads (including indexed
+//!   flags such as `has_link`, `has_file`, `has_reaction`, `is_pinned`); `conversation`, `user`
+//!   hold current state.
 //! - `message_fts`: FTS5 over current message text + file names, synced by triggers; queried
 //!   with Slack-style modifiers parsed by [`query`] (X-2).
 //! - `team`, `channel_section`, `custom_emoji`, `prefs`: sidebar data (team record, channel
@@ -38,6 +39,8 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("database schema version {found} is newer than this build supports ({supported})")]
     FutureSchema { found: u32, supported: u32 },
+    #[error("store was opened read-only")]
+    ReadOnly,
 }
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;

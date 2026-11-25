@@ -192,13 +192,41 @@ impl SearchQuery {
     }
 }
 
+/// Escape double quotes for an FTS5 double-quoted string literal (`"` -> `""`).
+pub(crate) fn escape_fts_phrase(s: &str) -> String {
+    s.replace('"', "\"\"")
+}
+
 /// Format a single search term for FTS5 `MATCH`, supporting Slack's trailing `*` prefix wildcard
 /// (`deploy*` -> `"deploy"*`) while quoting all other characters literally.
-fn fts_term(term: &str) -> String {
+pub(crate) fn fts_term(term: &str) -> String {
     if let Some(stem) = term.strip_suffix('*').filter(|s| !s.is_empty()) {
-        format!("\"{}\"*", stem.replace('"', "\"\""))
+        format!("\"{}\"*", escape_fts_phrase(stem))
     } else {
-        format!("\"{}\"", term.replace('"', "\"\""))
+        format!("\"{}\"", escape_fts_phrase(term))
+    }
+}
+
+/// Format a free-text query as an FTS5 prefix-AND `MATCH` expression using the same quote
+/// escaping as [`fts_term`]. Every whitespace-delimited token becomes a prefix match
+/// (`"term"*`); returns `None` when no searchable tokens remain.
+pub(crate) fn fts_prefix_match(raw: &str) -> Option<String> {
+    let terms: Vec<String> = raw
+        .split_whitespace()
+        .filter_map(|token| {
+            let stem = token.trim_end_matches('*');
+            // Skip tokens that contain no Unicode alphanumeric chars (e.g. standalone quotes or
+            // punctuation) so FTS5 never rejects `"..."*` on an empty token stream.
+            if !stem.chars().any(char::is_alphanumeric) {
+                return None;
+            }
+            Some(format!("\"{}\"*", escape_fts_phrase(stem)))
+        })
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
     }
 }
 

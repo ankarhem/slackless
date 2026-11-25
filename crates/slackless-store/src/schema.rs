@@ -306,7 +306,27 @@ CREATE TRIGGER huddle_transcript_au AFTER UPDATE OF text ON huddle_transcript BE
 END;
 "#;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9];
+/// Version 10: replace the write-amplifying `reaction` table with a `has_reaction` flag on
+/// `message_current` (the only query ever run against `reaction` was `EXISTS(...)` for
+/// `has:reaction`), and drop redundant prefix indexes (`message_revision_lookup` is a strict
+/// prefix of `UNIQUE (workspace_id, channel_id, ts, edit_ts)`; `message_current_user` is a
+/// strict prefix of V8's `message_current_user_ts`).
+const V10: &str = r#"
+ALTER TABLE message_current ADD COLUMN has_reaction INTEGER NOT NULL DEFAULT 0;
+UPDATE message_current
+SET has_reaction = 1
+WHERE EXISTS (
+    SELECT 1 FROM reaction r
+    WHERE r.workspace_id = message_current.workspace_id
+      AND r.channel_id = message_current.channel_id
+      AND r.ts = message_current.ts
+);
+DROP TABLE IF EXISTS reaction;
+DROP INDEX IF EXISTS message_revision_lookup;
+DROP INDEX IF EXISTS message_current_user;
+"#;
+
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
 
 /// The schema version this build migrates to.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -591,5 +611,81 @@ mod tests {
         assert_eq!(fts_count(&conn, "design"), 1);
         assert_eq!(fts_count(&conn, "beta"), 1);
         check_integrity(&conn);
+    }
+
+    #[test]
+    fn v10_backfills_has_reaction_and_drops_reaction_table_and_redundant_indexes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // Bootstrap strictly through V9 so we exercise V10 migration cleanly.
+        for (i, sql) in MIGRATIONS[..9].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", i as u32 + 1)
+                .unwrap();
+        }
+        assert_eq!(schema_version(&conn).unwrap(), 9);
+
+        conn.execute(
+            "INSERT INTO message_current
+             (workspace_id, channel_id, ts, ts_key, edit_ts, user_id, text, file_names, deleted,
+              has_link, has_file, is_pinned, reply_count, json, updated_at)
+             VALUES
+             ('T1','C1','1700000001.000100',1700000001000100,'','U1','reacted msg','',0,0,0,0,NULL,'{\"ts\":\"1700000001.000100\"}',100),
+             ('T1','C1','1700000002.000100',1700000002000100,'','U1','plain msg','',0,0,0,0,NULL,'{\"ts\":\"1700000002.000100\"}',101)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO reaction (workspace_id, channel_id, ts, name, count, users)
+             VALUES ('T1', 'C1', '1700000001.000100', 'rocket', 2, '[\"U1\",\"U2\"]')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let reacted_flag: i64 = conn
+            .query_row(
+                "SELECT has_reaction FROM message_current WHERE ts = '1700000001.000100'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let plain_flag: i64 = conn
+            .query_row(
+                "SELECT has_reaction FROM message_current WHERE ts = '1700000002.000100'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reacted_flag, 1);
+        assert_eq!(plain_flag, 0);
+
+        let reaction_table: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'reaction'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reaction_table, 0);
+
+        for dropped_idx in ["message_revision_lookup", "message_current_user"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [dropped_idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 0, "redundant index {dropped_idx} should be dropped");
+        }
+
+        // FTS5 stays intact after V10 backfill UPDATE (V6 trigger scopes to text, file_names).
+        conn.execute(
+            "INSERT INTO message_fts(message_fts) VALUES('integrity-check')",
+            [],
+        )
+        .unwrap();
     }
 }

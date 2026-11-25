@@ -78,19 +78,18 @@ impl Store {
         if kinds.is_empty() {
             return Ok(Vec::new());
         }
-        let mut stmt = self.conn.prepare_cached(
+        let mut out = Vec::new();
+        query_in_chunks(
+            &self.conn,
+            workspace,
+            kinds,
+            |k| k,
             "SELECT id, name, kind, is_archived, is_member, json
              FROM conversation
-             WHERE workspace_id = ?1",
+             WHERE workspace_id = ?1 AND kind",
+            parse_conversation_summary,
+            |summary| out.push(summary),
         )?;
-        let rows = stmt.query_map(params![workspace.as_str()], parse_conversation_summary)?;
-        let mut out = Vec::new();
-        for row in rows {
-            let summary = row?;
-            if kinds.contains(&summary.kind.as_str()) {
-                out.push(summary);
-            }
-        }
         Ok(out)
     }
 
@@ -202,13 +201,7 @@ impl Store {
         )?;
         let row = stmt
             .query_row(params![workspace.as_str(), user.as_str()], |row| {
-                let display: Option<String> = row.get(0)?;
-                let real: Option<String> = row.get(1)?;
-                let name: Option<String> = row.get(2)?;
-                Ok(display
-                    .filter(|v| !v.is_empty())
-                    .or_else(|| real.filter(|v| !v.is_empty()))
-                    .or_else(|| name.filter(|v| !v.is_empty())))
+                Ok(pick_user_display(row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .optional()?;
         Ok(row.flatten())
@@ -301,91 +294,155 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<DigestChannel>> {
         let cutoff_key = cutoff_secs.saturating_mul(1_000_000);
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT channel_id, COUNT(*), COUNT(DISTINCT COALESCE(user_id, '')), MAX(ts_key)
-             FROM message_current
-             WHERE workspace_id = ?1 AND ts_key >= ?2 AND deleted = 0
-             GROUP BY channel_id
-             ORDER BY COUNT(*) DESC, MAX(ts_key) DESC
-             LIMIT ?3",
-        )?;
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let grouped: Vec<(String, i64, i64, i64)> = stmt
-            .query_map(params![workspace.as_str(), cutoff_key, limit_i64], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        if grouped.is_empty() {
-            return Ok(Vec::new());
-        }
+        self.with_read_tx(|tx| {
+            let mut stmt = tx.prepare_cached(
+                "SELECT channel_id, COUNT(*), COUNT(DISTINCT COALESCE(user_id, '')), MAX(ts_key)
+                 FROM message_current
+                 WHERE workspace_id = ?1 AND ts_key >= ?2 AND deleted = 0
+                 GROUP BY channel_id
+                 ORDER BY COUNT(*) DESC, MAX(ts_key) DESC
+                 LIMIT ?3",
+            )?;
+            let grouped: Vec<(String, i64, i64, i64)> = stmt
+                .query_map(params![workspace.as_str(), cutoff_key, limit_i64], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            if grouped.is_empty() {
+                return Ok(Vec::new());
+            }
 
-        let names = self.channel_names(workspace)?;
-        let dm_labels: HashMap<String, String> = self
-            .list_dms(workspace)?
-            .into_iter()
-            .filter_map(|dm| {
-                let label = dm
-                    .user
-                    .as_ref()
-                    .and_then(|u| self.user_display(workspace, u).ok().flatten())
-                    .map(|n| format!("@{n}"))
-                    .or_else(|| dm.name.map(|n| format!("#{n}")))?;
-                Some((dm.id.as_str().to_owned(), label))
-            })
-            .collect();
+            // Fetch metadata ONLY for the conversations actually present in `grouped`
+            // (eliminating full-workspace channel/DM scans).
+            let channel_ids: Vec<&str> = grouped.iter().map(|(id, ..)| id.as_str()).collect();
+            let mut convs: HashMap<String, ConversationSummary> =
+                HashMap::with_capacity(channel_ids.len());
+            query_in_chunks(
+                tx,
+                workspace,
+                &channel_ids,
+                |id| id,
+                "SELECT id, name, kind, is_archived, is_member, json
+                 FROM conversation
+                 WHERE workspace_id = ?1 AND id",
+                parse_conversation_summary,
+                |summary| {
+                    convs.insert(summary.id.as_str().to_owned(), summary);
+                },
+            )?;
 
-        let mut latest_stmt = self.conn.prepare_cached(
-            "SELECT ts, user_id, text FROM message_current
-             WHERE workspace_id = ?1 AND channel_id = ?2 AND ts_key = ?3 AND deleted = 0
-             LIMIT 1",
-        )?;
-
-        let mut out = Vec::with_capacity(grouped.len());
-        for (channel_id, msg_count, author_count, max_ts_key) in grouped {
-            let latest = latest_stmt
-                .query_row(
-                    params![workspace.as_str(), &channel_id, max_ts_key],
-                    |row| {
+            let mut latest_stmt = tx.prepare_cached(
+                "SELECT ts, user_id, text FROM message_current
+                 WHERE workspace_id = ?1 AND channel_id = ?2 AND ts_key = ?3 AND deleted = 0
+                 LIMIT 1",
+            )?;
+            let mut latest_rows: Vec<(String, Option<String>, String)> =
+                Vec::with_capacity(grouped.len());
+            let mut user_ids_seen: HashSet<String> = HashSet::new();
+            for (channel_id, _, _, max_ts_key) in &grouped {
+                let latest = latest_stmt
+                    .query_row(params![workspace.as_str(), channel_id, max_ts_key], |row| {
                         Ok((
                             row.get::<_, String>(0)?,
                             row.get::<_, Option<String>>(1)?,
                             row.get::<_, String>(2)?,
                         ))
+                    })
+                    .optional()?
+                    .unwrap_or_default();
+                if let Some(uid) = &latest.1 {
+                    user_ids_seen.insert(uid.clone());
+                }
+                if let Some(conv) = convs.get(channel_id)
+                    && (conv.kind == "im" || conv.kind == "mpim")
+                    && let Some(peer) = &conv.user
+                {
+                    user_ids_seen.insert(peer.as_str().to_owned());
+                }
+                latest_rows.push(latest);
+            }
+
+            // Batch-fetch display names for all referenced DM peers and latest authors at once.
+            let mut user_displays: HashMap<String, String> =
+                HashMap::with_capacity(user_ids_seen.len());
+            if !user_ids_seen.is_empty() {
+                let ask: Vec<String> = user_ids_seen.into_iter().collect();
+                query_in_chunks(
+                    tx,
+                    workspace,
+                    &ask,
+                    String::as_str,
+                    r#"SELECT id, display_name, real_name, name FROM "user"
+                       WHERE workspace_id = ?1 AND id"#,
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            pick_user_display(row.get(1)?, row.get(2)?, row.get(3)?),
+                        ))
                     },
-                )
-                .optional()?;
-            let (latest_ts, latest_user, latest_text) = latest.unwrap_or_default();
-            let latest_author = latest_user.as_deref().map(|uid| {
-                self.user_display(workspace, &UserId::from(uid))
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| uid.to_owned())
-            });
-            let label = names
-                .get(&channel_id)
-                .map(|n| format!("#{n}"))
-                .or_else(|| dm_labels.get(&channel_id).cloned())
-                .unwrap_or_else(|| channel_id.clone());
-            let snippet = latest_text.split_whitespace().collect::<Vec<_>>().join(" ");
-            let truncated = if snippet.chars().count() > 120 {
-                let mut s: String = snippet.chars().take(119).collect();
-                s.push('…');
-                s
-            } else {
-                snippet
-            };
-            out.push(DigestChannel {
-                channel: ChannelId::from(channel_id),
-                label,
-                message_count: u64::try_from(msg_count.max(0)).unwrap_or(0),
-                author_count: u64::try_from(author_count.max(0)).unwrap_or(0),
-                latest_ts: Ts::from(latest_ts),
-                latest_author,
-                latest_text: truncated,
-            });
-        }
-        Ok(out)
+                    |(id, display)| {
+                        if let Some(name) = display {
+                            user_displays.insert(id, name);
+                        }
+                    },
+                )?;
+            }
+
+            let mut out = Vec::with_capacity(grouped.len());
+            for ((channel_id, msg_count, author_count, _), (latest_ts, latest_user, latest_text)) in
+                grouped.into_iter().zip(latest_rows)
+            {
+                let latest_author = latest_user.as_deref().map(|uid| {
+                    user_displays
+                        .get(uid)
+                        .cloned()
+                        .unwrap_or_else(|| uid.to_owned())
+                });
+                let label = match convs.get(&channel_id) {
+                    Some(conv) if conv.name.is_some() => {
+                        format!("#{}", conv.name.as_deref().unwrap_or_default())
+                    }
+                    Some(conv) if conv.kind == "im" || conv.kind == "mpim" => conv
+                        .user
+                        .as_ref()
+                        .and_then(|u| user_displays.get(u.as_str()))
+                        .map(|n| format!("@{n}"))
+                        .unwrap_or_else(|| channel_id.clone()),
+                    _ => channel_id.clone(),
+                };
+                let snippet = latest_text.split_whitespace().collect::<Vec<_>>().join(" ");
+                let truncated = if snippet.chars().count() > 120 {
+                    let mut s: String = snippet.chars().take(119).collect();
+                    s.push('…');
+                    s
+                } else {
+                    snippet
+                };
+                out.push(DigestChannel {
+                    channel: ChannelId::from(channel_id),
+                    label,
+                    message_count: u64::try_from(msg_count.max(0)).unwrap_or(0),
+                    author_count: u64::try_from(author_count.max(0)).unwrap_or(0),
+                    latest_ts: Ts::from(latest_ts),
+                    latest_author,
+                    latest_text: truncated,
+                });
+            }
+            Ok(out)
+        })
     }
+}
+
+fn pick_user_display(
+    display: Option<String>,
+    real: Option<String>,
+    name: Option<String>,
+) -> Option<String> {
+    display
+        .filter(|v| !v.is_empty())
+        .or_else(|| real.filter(|v| !v.is_empty()))
+        .or_else(|| name.filter(|v| !v.is_empty()))
 }
 
 fn parse_conversation_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationSummary> {

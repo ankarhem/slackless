@@ -47,16 +47,21 @@ pub struct NewHuddleTranscriptSegment<'a> {
     pub at_ms: i64,
 }
 
-fn sanitize_fts_query(raw: &str) -> String {
-    let mut terms = Vec::new();
-    for token in raw.split_whitespace() {
-        let cleaned = token.replace('"', "");
-        if !cleaned.is_empty() {
-            terms.push(format!("\"{cleaned}\"*"));
-        }
-    }
-    terms.join(" AND ")
-}
+const SESSION_SELECT_PREFIX: &str = "SELECT call_id,
+        channel_id,
+        MAX(thread_root_ts),
+        MIN(at_ms),
+        MAX(at_ms),
+        COUNT(*),
+        COALESCE(GROUP_CONCAT(DISTINCT LOWER(SUBSTR(lang, 1, 2))), ''),
+        (SELECT t2.text FROM huddle_transcript t2
+         WHERE t2.workspace_id = t.workspace_id AND t2.call_id = t.call_id
+         ORDER BY t2.at_ms ASC, t2.id ASC LIMIT 1)
+ FROM huddle_transcript t
+ WHERE workspace_id = ?1";
+
+const SESSION_GROUP_SUFFIX: &str = " GROUP BY call_id, channel_id
+ ORDER BY MAX(at_ms) DESC";
 
 fn row_to_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<HuddleTranscriptSegment> {
     let channel_s: String = row.get(1)?;
@@ -75,34 +80,66 @@ fn row_to_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<HuddleTranscriptS
     })
 }
 
+fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<HuddleTranscriptSession> {
+    let call_id: String = row.get(0)?;
+    let ch: String = row.get(1)?;
+    let thread_s: Option<String> = row.get(2)?;
+    let started_at_ms: i64 = row.get(3)?;
+    let ended_at_ms: i64 = row.get(4)?;
+    let segment_count: i64 = row.get(5)?;
+    let langs_csv: String = row.get(6)?;
+    let preview: Option<String> = row.get(7)?;
+    let mut languages: Vec<String> = langs_csv
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    languages.sort();
+    languages.dedup();
+    Ok(HuddleTranscriptSession {
+        call_id,
+        channel: ChannelId::from(ch),
+        thread_root_ts: thread_s.filter(|s| !s.is_empty()).map(Ts::from),
+        started_at_ms,
+        ended_at_ms,
+        segment_count: segment_count.max(0) as u64,
+        languages,
+        preview: preview.unwrap_or_default(),
+    })
+}
+
 impl Store {
     /// Persist one finalized spoken huddle transcript segment (text-only; zero audio on disk).
     pub fn insert_huddle_transcript_segment(
-        &self,
+        &mut self,
         workspace: &TeamId,
         seg: &NewHuddleTranscriptSegment<'_>,
     ) -> Result<i64> {
+        self.ensure_writable()?;
         let trimmed = seg.text.trim();
         if trimmed.is_empty() {
             return Ok(0);
         }
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO huddle_transcript
                 (workspace_id, channel_id, call_id, thread_root_ts, speaker_id, lang, source, text, at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                workspace.as_str(),
-                seg.channel.as_str(),
-                seg.call_id,
-                seg.thread_root_ts.map(Ts::as_str),
-                seg.speaker_id.map(UserId::as_str),
-                seg.lang,
-                seg.source,
-                trimmed,
-                seg.at_ms,
-            ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        stmt.execute(params![
+            workspace.as_str(),
+            seg.channel.as_str(),
+            seg.call_id,
+            seg.thread_root_ts.map(Ts::as_str),
+            seg.speaker_id.map(UserId::as_str),
+            seg.lang,
+            seg.source,
+            trimmed,
+            seg.at_ms,
+        ])?;
+        let id = self.conn.last_insert_rowid();
+        Self::bump_message_revision();
+        Ok(id)
     }
 
     /// Every persisted transcript segment for `call_id`, oldest first.
@@ -188,81 +225,20 @@ impl Store {
         channel: Option<&ChannelId>,
         limit: usize,
     ) -> Result<Vec<HuddleTranscriptSession>> {
-        let mut stmt = if channel.is_some() {
-            self.conn.prepare_cached(
-                "SELECT call_id,
-                        channel_id,
-                        MAX(thread_root_ts),
-                        MIN(at_ms),
-                        MAX(at_ms),
-                        COUNT(*),
-                        COALESCE(GROUP_CONCAT(DISTINCT LOWER(SUBSTR(lang, 1, 2))), ''),
-                        (SELECT t2.text FROM huddle_transcript t2
-                         WHERE t2.workspace_id = t.workspace_id AND t2.call_id = t.call_id
-                         ORDER BY t2.at_ms ASC, t2.id ASC LIMIT 1)
-                 FROM huddle_transcript t
-                 WHERE workspace_id = ?1 AND channel_id = ?2
-                 GROUP BY call_id, channel_id
-                 ORDER BY MAX(at_ms) DESC
-                 LIMIT ?3",
-            )?
-        } else {
-            self.conn.prepare_cached(
-                "SELECT call_id,
-                        channel_id,
-                        MAX(thread_root_ts),
-                        MIN(at_ms),
-                        MAX(at_ms),
-                        COUNT(*),
-                        COALESCE(GROUP_CONCAT(DISTINCT LOWER(SUBSTR(lang, 1, 2))), ''),
-                        (SELECT t2.text FROM huddle_transcript t2
-                         WHERE t2.workspace_id = t.workspace_id AND t2.call_id = t.call_id
-                         ORDER BY t2.at_ms ASC, t2.id ASC LIMIT 1)
-                 FROM huddle_transcript t
-                 WHERE workspace_id = ?1
-                 GROUP BY call_id, channel_id
-                 ORDER BY MAX(at_ms) DESC
-                 LIMIT ?2",
-            )?
-        };
+        let mut sql = String::from(SESSION_SELECT_PREFIX);
+        let mut bind: Vec<SqlValue> = vec![SqlValue::Text(workspace.as_str().to_owned())];
+        if let Some(ch) = channel {
+            bind.push(SqlValue::Text(ch.as_str().to_owned()));
+            sql.push_str(&format!(" AND channel_id = ?{}", bind.len()));
+        }
+        sql.push_str(SESSION_GROUP_SUFFIX);
+        bind.push(SqlValue::Integer(limit as i64));
+        sql.push_str(&format!(" LIMIT ?{}", bind.len()));
 
-        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<HuddleTranscriptSession> {
-            let call_id: String = row.get(0)?;
-            let ch: String = row.get(1)?;
-            let thread_s: Option<String> = row.get(2)?;
-            let started_at_ms: i64 = row.get(3)?;
-            let ended_at_ms: i64 = row.get(4)?;
-            let segment_count: i64 = row.get(5)?;
-            let langs_csv: String = row.get(6)?;
-            let preview: Option<String> = row.get(7)?;
-            let mut languages: Vec<String> = langs_csv
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect();
-            languages.sort();
-            languages.dedup();
-            Ok(HuddleTranscriptSession {
-                call_id,
-                channel: ChannelId::from(ch),
-                thread_root_ts: thread_s.filter(|s| !s.is_empty()).map(Ts::from),
-                started_at_ms,
-                ended_at_ms,
-                segment_count: segment_count.max(0) as u64,
-                languages,
-                preview: preview.unwrap_or_default(),
-            })
-        };
-
-        let limit_i64 = limit as i64;
-        let rows = if let Some(ch) = channel {
-            stmt.query_map(params![workspace.as_str(), ch.as_str(), limit_i64], map_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        } else {
-            stmt.query_map(params![workspace.as_str(), limit_i64], map_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(bind), row_to_session)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -276,52 +252,36 @@ impl Store {
         lang: Option<&str>,
         limit: usize,
     ) -> Result<Vec<HuddleTranscriptSegment>> {
-        let fts = sanitize_fts_query(query);
+        let fts = crate::query::fts_prefix_match(query);
         let lang_prefix = lang
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| format!("{}%", s.to_ascii_lowercase()));
 
-        if fts.is_empty() {
-            let mut sql = String::from(
-                "SELECT id, channel_id, call_id, thread_root_ts, speaker_id, lang, source, text, at_ms
-                 FROM huddle_transcript
-                 WHERE workspace_id = ?1",
-            );
-            let mut bind: Vec<SqlValue> = vec![SqlValue::Text(workspace.as_str().to_owned())];
-            if let Some(ch) = channel {
-                bind.push(SqlValue::Text(ch.as_str().to_owned()));
-                sql.push_str(&format!(" AND channel_id = ?{}", bind.len()));
-            }
-            if let Some(lp) = lang_prefix {
-                bind.push(SqlValue::Text(lp));
-                sql.push_str(&format!(
-                    " AND LOWER(COALESCE(lang, '')) LIKE ?{}",
-                    bind.len()
-                ));
-            }
-            bind.push(SqlValue::Integer(limit as i64));
-            sql.push_str(&format!(
-                " ORDER BY at_ms DESC, id DESC LIMIT ?{}",
-                bind.len()
-            ));
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt
-                .query_map(params_from_iter(bind), row_to_segment)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            return Ok(rows);
-        }
+        let (mut sql, mut bind) = if let Some(fts) = fts {
+            (
+                String::from(
+                    "SELECT t.id, t.channel_id, t.call_id, t.thread_root_ts, t.speaker_id, t.lang, t.source, t.text, t.at_ms
+                     FROM huddle_transcript_fts f
+                     JOIN huddle_transcript t ON t.id = f.rowid
+                     WHERE huddle_transcript_fts MATCH ?1 AND t.workspace_id = ?2",
+                ),
+                vec![
+                    SqlValue::Text(fts),
+                    SqlValue::Text(workspace.as_str().to_owned()),
+                ],
+            )
+        } else {
+            (
+                String::from(
+                    "SELECT t.id, t.channel_id, t.call_id, t.thread_root_ts, t.speaker_id, t.lang, t.source, t.text, t.at_ms
+                     FROM huddle_transcript t
+                     WHERE t.workspace_id = ?1",
+                ),
+                vec![SqlValue::Text(workspace.as_str().to_owned())],
+            )
+        };
 
-        let mut sql = String::from(
-            "SELECT t.id, t.channel_id, t.call_id, t.thread_root_ts, t.speaker_id, t.lang, t.source, t.text, t.at_ms
-             FROM huddle_transcript_fts f
-             JOIN huddle_transcript t ON t.id = f.rowid
-             WHERE huddle_transcript_fts MATCH ?1 AND t.workspace_id = ?2",
-        );
-        let mut bind: Vec<SqlValue> = vec![
-            SqlValue::Text(fts),
-            SqlValue::Text(workspace.as_str().to_owned()),
-        ];
         if let Some(ch) = channel {
             bind.push(SqlValue::Text(ch.as_str().to_owned()));
             sql.push_str(&format!(" AND t.channel_id = ?{}", bind.len()));
@@ -338,6 +298,7 @@ impl Store {
             " ORDER BY t.at_ms DESC, t.id DESC LIMIT ?{}",
             bind.len()
         ));
+
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(bind), row_to_segment)?
@@ -346,11 +307,15 @@ impl Store {
     }
 
     /// Delete every stored transcript segment for `call_id` (returns number of deleted rows).
-    pub fn delete_huddle_transcript(&self, workspace: &TeamId, call_id: &str) -> Result<usize> {
-        let deleted = self.conn.execute(
+    pub fn delete_huddle_transcript(&mut self, workspace: &TeamId, call_id: &str) -> Result<usize> {
+        self.ensure_writable()?;
+        let mut stmt = self.conn.prepare_cached(
             "DELETE FROM huddle_transcript WHERE workspace_id = ?1 AND call_id = ?2",
-            params![workspace.as_str(), call_id],
         )?;
+        let deleted = stmt.execute(params![workspace.as_str(), call_id])?;
+        if deleted > 0 {
+            Self::bump_message_revision();
+        }
         Ok(deleted)
     }
 }
