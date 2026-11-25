@@ -1,18 +1,77 @@
+use std::collections::HashMap;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use slackless_core::auth::SessionStore;
-use slackless_core::store::SearchQuery;
-use slackless_core::types::{TeamId, Ts};
+use slackless_core::store::{SearchQuery, Store, StoredMessage};
+use slackless_core::types::time::now_epoch_secs;
+use slackless_core::types::{ChannelId, TeamId, Ts};
 
 use super::{
-    archive_hint, empty_local, now_epoch_secs, open_archive_store, parse_since_cutoff,
-    raw_channel_id,
+    all_workspace_ids, empty_local, open_archive_with_hint, parse_since_cutoff, raw_channel_id,
+    write_or_print_export,
 };
-use crate::archive::{self, Archive};
+use crate::archive::Archive;
 use crate::cli::ExportFormat;
 use crate::output::{self, MessageRow};
 use crate::{Ctx, fail};
+
+/// Read up to `limit` newest matching messages from `channel`, ordered oldest first.
+///
+/// Paginates backwards via `before` when filtering deleted rows or applying `--since` so
+/// deleted tombstones or cutoff filters never starve `--limit`.
+pub(crate) fn read_channel_messages(
+    store: &Store,
+    workspace: &TeamId,
+    channel: &ChannelId,
+    limit: usize,
+    cutoff_secs: Option<i64>,
+    include_deleted: bool,
+) -> slackless_core::store::Result<Vec<StoredMessage>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    if include_deleted && cutoff_secs.is_none() {
+        return store.channel_history(workspace, channel, None, limit);
+    }
+
+    let page_size = limit.clamp(64, 500);
+    let mut collected: Vec<StoredMessage> = Vec::with_capacity(limit.min(512));
+    let mut before: Option<Ts> = None;
+
+    'pages: loop {
+        let page = store.channel_history(workspace, channel, before.as_ref(), page_size)?;
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
+        let oldest_ts = page[0].message.ts.clone();
+
+        for msg in page.into_iter().rev() {
+            if let Some(cutoff) = cutoff_secs {
+                match msg.message.ts.secs() {
+                    Some(secs) if secs < cutoff => break 'pages,
+                    Some(_) => {}
+                    None => continue,
+                }
+            }
+            if !include_deleted && msg.deleted {
+                continue;
+            }
+            collected.push(msg);
+            if collected.len() >= limit {
+                break 'pages;
+            }
+        }
+
+        if page_len < page_size || before.as_ref() == Some(&oldest_ts) {
+            break;
+        }
+        before = Some(oldest_ts);
+    }
+
+    collected.reverse();
+    Ok(collected)
+}
 
 pub(crate) fn cmd_search_all_workspaces(
     ctx: &Ctx,
@@ -20,19 +79,7 @@ pub(crate) fn cmd_search_all_workspaces(
     limit: usize,
     include_deleted: bool,
 ) -> Result<ExitCode> {
-    let mut team_ids: Vec<TeamId> = Vec::new();
-    if let Ok(sessions) = SessionStore::new().and_then(|s| s.load()) {
-        for s in sessions {
-            if !team_ids.contains(&s.team_id) {
-                team_ids.push(s.team_id);
-            }
-        }
-    }
-    for tid in archive::stored_team_ids() {
-        if !team_ids.contains(&tid) {
-            team_ids.push(tid);
-        }
-    }
+    let team_ids = all_workspace_ids();
     if team_ids.is_empty() {
         return Ok(empty_local(
             ctx,
@@ -51,21 +98,26 @@ pub(crate) fn cmd_search_all_workspaces(
     parsed.filters.include_deleted = include_deleted;
     let mut hits: Vec<(String, Option<String>, MessageRow)> = Vec::new();
     for ws in &team_ids {
-        let Some(store) = open_archive_store(ws) else {
+        let Some(archive) =
+            Archive::open(ws).with_context(|| format!("opening local archive for {ws}"))?
+        else {
             continue;
         };
-        let messages = store
+        let messages = archive
+            .store()
             .search(ws, &parsed, limit)
             .with_context(|| format!("searching the local archive of {ws}"))?;
         if messages.is_empty() {
             continue;
         }
-        let archive = Archive::open(ws);
         let names = archive
-            .as_ref()
-            .map_or_else(Default::default, |a| a.channel_names(ws));
+            .channel_names(ws)
+            .with_context(|| format!("reading channel names for {ws}"))?;
+        let user_names = archive
+            .user_display_map(ws)
+            .with_context(|| format!("reading user names for {ws}"))?;
         for message in &messages {
-            let row = MessageRow::from_stored(message, archive.as_ref(), ws);
+            let row = MessageRow::from_stored(message, &user_names);
             let label = names.get(row.channel.as_str()).cloned();
             hits.push((ws.as_str().to_owned(), label, row));
         }
@@ -118,19 +170,26 @@ pub(crate) fn cmd_search(
     };
     let mut parsed = SearchQuery::parse(query);
     parsed.filters.include_deleted = include_deleted;
-    let messages = match open_archive_store(workspace) {
-        Some(store) => store
-            .search(workspace, &parsed, limit)
-            .with_context(|| format!("searching the local archive of {workspace}"))?,
-        None => Vec::new(),
+    let archive = open_archive_with_hint(ctx, workspace)?;
+    let (messages, names, user_names) = match archive.as_ref() {
+        Some(archive) => {
+            let messages = archive
+                .store()
+                .search(workspace, &parsed, limit)
+                .with_context(|| format!("searching the local archive of {workspace}"))?;
+            let names = archive
+                .channel_names(workspace)
+                .with_context(|| format!("reading channel names for {workspace}"))?;
+            let user_names = archive
+                .user_display_map(workspace)
+                .with_context(|| format!("reading user names for {workspace}"))?;
+            (messages, names, user_names)
+        }
+        None => (Vec::new(), HashMap::new(), HashMap::new()),
     };
-    let archive = Archive::open(workspace);
-    let names = archive
-        .as_ref()
-        .map_or_else(Default::default, |archive| archive.channel_names(workspace));
     let rows: Vec<MessageRow> = messages
         .iter()
-        .map(|message| MessageRow::from_stored(message, archive.as_ref(), workspace))
+        .map(|message| MessageRow::from_stored(message, &user_names))
         .collect();
     if format.is_some() || out.is_some() {
         let effective = if ctx.json {
@@ -146,28 +205,7 @@ pub(crate) fn cmd_search(
             }))?,
             ExportFormat::Md => format_markdown_export(&format!("Search: {query}"), &rows),
         };
-        if let Some(path) = out {
-            std::fs::write(path, &rendered)
-                .with_context(|| format!("writing search results to {}", path.display()))?;
-            if ctx.json {
-                output::emit_json(&serde_json::json!({
-                    "ok": true,
-                    "path": path.display().to_string(),
-                    "count": rows.len(),
-                }));
-            } else {
-                eprintln!(
-                    "Exported {} search matches to {}",
-                    rows.len(),
-                    path.display()
-                );
-            }
-        } else {
-            print!("{rendered}");
-            if !rendered.ends_with('\n') {
-                println!();
-            }
-        }
+        write_or_print_export(ctx, &rendered, out, rows.len(), "search matches")?;
         return Ok(ExitCode::SUCCESS);
     }
     let mut human = String::new();
@@ -205,41 +243,55 @@ pub(crate) fn cmd_read(
             "reading",
         ));
     };
-    let archive = Archive::open(workspace);
-    if archive.is_none() {
-        archive_hint(workspace);
-    }
-    let resolved = archive
-        .as_ref()
-        .and_then(|a| a.resolve_channel(workspace, channel_arg));
-    let channel_id = resolved
-        .as_ref()
-        .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
-    let label = resolved.as_ref().map(|row| row.label());
-    let mut messages = match open_archive_store(workspace) {
-        Some(store) => store
-            .channel_history(workspace, &channel_id, None, limit)
-            .with_context(|| format!("reading the history of {channel_id}"))?,
-        None => Vec::new(),
+    let archive = open_archive_with_hint(ctx, workspace)?;
+    let (resolved, channel_id, messages, user_names) = match archive.as_ref() {
+        Some(archive) => {
+            let resolved = archive
+                .resolve_channel(workspace, channel_arg)
+                .with_context(|| format!("resolving channel {channel_arg}"))?;
+            let channel_id = resolved
+                .as_ref()
+                .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
+            let messages = read_channel_messages(
+                archive.store(),
+                workspace,
+                &channel_id,
+                limit,
+                cutoff_secs,
+                include_deleted,
+            )
+            .with_context(|| format!("reading the history of {channel_id}"))?;
+            let user_names = archive
+                .user_display_map(workspace)
+                .with_context(|| format!("reading user names for {workspace}"))?;
+            (resolved, channel_id, messages, user_names)
+        }
+        None => (
+            None,
+            raw_channel_id(channel_arg),
+            Vec::new(),
+            HashMap::new(),
+        ),
     };
-    if !include_deleted {
-        messages.retain(|m| !m.deleted);
-    }
-    if let Some(cutoff) = cutoff_secs {
-        messages.retain(|m| m.message.ts.secs().is_some_and(|s| s >= cutoff));
-    }
+    let label = resolved.as_ref().map(|row| row.label());
     let rows: Vec<MessageRow> = messages
         .iter()
-        .map(|message| MessageRow::from_stored(message, archive.as_ref(), workspace))
+        .map(|message| MessageRow::from_stored(message, &user_names))
         .collect();
     let mut human = String::new();
     for row in &rows {
         human.push_str(&row.human_line(label.as_deref()));
     }
-    let channel = match archive
-        .as_ref()
-        .and_then(|a| a.conversation_by_id(workspace, &channel_id))
-    {
+    let channel_row = match resolved {
+        Some(row) => Some(row),
+        None => match archive.as_ref() {
+            Some(archive) => archive
+                .conversation_by_id(workspace, &channel_id)
+                .with_context(|| format!("looking up conversation {channel_id}"))?,
+            None => None,
+        },
+    };
+    let channel = match channel_row {
         Some(row) => serde_json::json!({
             "id": channel_id.as_str(),
             "name": row.name,
@@ -275,27 +327,36 @@ pub(crate) fn cmd_thread(
             "reading thread",
         ));
     };
-    let archive = Archive::open(workspace);
-    if archive.is_none() {
-        archive_hint(workspace);
-    }
-    let resolved = archive
-        .as_ref()
-        .and_then(|a| a.resolve_channel(workspace, channel_arg));
-    let channel_id = resolved
-        .as_ref()
-        .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
-    let label = resolved.as_ref().map(|row| row.label());
+    let archive = open_archive_with_hint(ctx, workspace)?;
     let thread_ts = Ts::from(thread_ts_arg.to_owned());
-    let messages = match open_archive_store(workspace) {
-        Some(store) => store
-            .thread_replies(workspace, &channel_id, &thread_ts)
-            .with_context(|| format!("reading thread {thread_ts} in {channel_id}"))?,
-        None => Vec::new(),
+    let (resolved, channel_id, messages, user_names) = match archive.as_ref() {
+        Some(archive) => {
+            let resolved = archive
+                .resolve_channel(workspace, channel_arg)
+                .with_context(|| format!("resolving channel {channel_arg}"))?;
+            let channel_id = resolved
+                .as_ref()
+                .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
+            let messages = archive
+                .store()
+                .thread_replies(workspace, &channel_id, &thread_ts)
+                .with_context(|| format!("reading thread {thread_ts} in {channel_id}"))?;
+            let user_names = archive
+                .user_display_map(workspace)
+                .with_context(|| format!("reading user names for {workspace}"))?;
+            (resolved, channel_id, messages, user_names)
+        }
+        None => (
+            None,
+            raw_channel_id(channel_arg),
+            Vec::new(),
+            HashMap::new(),
+        ),
     };
+    let label = resolved.as_ref().map(|row| row.label());
     let rows: Vec<MessageRow> = messages
         .iter()
-        .map(|message| MessageRow::from_stored(message, archive.as_ref(), workspace))
+        .map(|message| MessageRow::from_stored(message, &user_names))
         .collect();
     let mut human = String::new();
     for row in &rows {
@@ -330,29 +391,38 @@ pub(crate) fn cmd_export(
             "exporting",
         ));
     };
-    let archive = Archive::open(workspace);
-    if archive.is_none() {
-        archive_hint(workspace);
-    }
-    let resolved = archive
-        .as_ref()
-        .and_then(|a| a.resolve_channel(workspace, channel_arg));
-    let channel_id = resolved
-        .as_ref()
-        .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
+    let archive = open_archive_with_hint(ctx, workspace)?;
+    let (resolved, channel_id, messages, user_names) = match archive.as_ref() {
+        Some(archive) => {
+            let resolved = archive
+                .resolve_channel(workspace, channel_arg)
+                .with_context(|| format!("resolving channel {channel_arg}"))?;
+            let channel_id = resolved
+                .as_ref()
+                .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
+            let messages = archive
+                .store()
+                .channel_history(workspace, &channel_id, None, limit)
+                .with_context(|| format!("exporting the history of {channel_id}"))?;
+            let user_names = archive
+                .user_display_map(workspace)
+                .with_context(|| format!("reading user names for {workspace}"))?;
+            (resolved, channel_id, messages, user_names)
+        }
+        None => (
+            None,
+            raw_channel_id(channel_arg),
+            Vec::new(),
+            HashMap::new(),
+        ),
+    };
     let label = resolved
         .as_ref()
         .map(|row| row.label())
         .unwrap_or_else(|| channel_id.as_str().to_owned());
-    let messages = match open_archive_store(workspace) {
-        Some(store) => store
-            .channel_history(workspace, &channel_id, None, limit)
-            .with_context(|| format!("exporting the history of {channel_id}"))?,
-        None => Vec::new(),
-    };
     let rows: Vec<MessageRow> = messages
         .iter()
-        .map(|message| MessageRow::from_stored(message, archive.as_ref(), workspace))
+        .map(|message| MessageRow::from_stored(message, &user_names))
         .collect();
     let effective = if ctx.json { ExportFormat::Json } else { format };
     let rendered = match effective {
@@ -367,24 +437,7 @@ pub(crate) fn cmd_export(
         }))?,
         ExportFormat::Md => format_markdown_export(&label, &rows),
     };
-    if let Some(path) = out {
-        std::fs::write(path, &rendered)
-            .with_context(|| format!("writing export to {}", path.display()))?;
-        if ctx.json {
-            output::emit_json(&serde_json::json!({
-                "ok": true,
-                "path": path.display().to_string(),
-                "count": rows.len(),
-            }));
-        } else {
-            eprintln!("Exported {} messages to {}", rows.len(), path.display());
-        }
-    } else {
-        print!("{rendered}");
-        if !rendered.ends_with('\n') {
-            println!();
-        }
-    }
+    write_or_print_export(ctx, &rendered, out, rows.len(), "messages")?;
     Ok(ExitCode::SUCCESS)
 }
 

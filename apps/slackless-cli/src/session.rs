@@ -92,9 +92,10 @@ pub fn status_entries() -> Vec<StatusEntry> {
             let path = archive::store_path(&session.team_id);
             let archive_exists = path.as_ref().is_some_and(|path| path.is_file());
             let messages = archive_exists
-                .then(|| Archive::open(&session.team_id))
+                .then(|| Archive::open(&session.team_id).ok().flatten())
                 .flatten()
-                .map_or(0, |archive| archive.message_count(&session.team_id));
+                .and_then(|archive| archive.message_count(&session.team_id).ok())
+                .unwrap_or(0);
             StatusEntry {
                 team_id: session.team_id.clone(),
                 workspace_url: session.workspace_url.clone(),

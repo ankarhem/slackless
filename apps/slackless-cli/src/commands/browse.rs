@@ -1,14 +1,14 @@
+use std::collections::HashMap;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use slackless_core::auth::SessionStore;
-use slackless_core::types::TeamId;
+use slackless_core::types::time::now_epoch_secs;
+use slackless_core::types::{TeamId, Ts};
 
 use super::{
-    archive_hint, empty_local, now_epoch_secs, open_archive_store, parse_since_cutoff,
-    raw_channel_id,
+    all_workspace_ids, empty_local, open_archive_with_hint, parse_since_cutoff, raw_channel_id,
 };
-use crate::archive::{self, Archive};
+use crate::archive::Archive;
 use crate::output::{self, ChannelView, DmView, MessageRow};
 use crate::{Ctx, fail};
 
@@ -20,13 +20,11 @@ pub(crate) fn cmd_channels(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<Exit
             "listing channels",
         ));
     };
-    let archive = Archive::open(workspace);
-    if archive.is_none() {
-        archive_hint(workspace);
-    }
+    let archive = open_archive_with_hint(ctx, workspace)?;
     let rows: Vec<ChannelView> = match archive.as_ref() {
         Some(archive) => archive
             .channels(workspace)
+            .with_context(|| format!("listing channels for {workspace}"))?
             .iter()
             .map(ChannelView::from_row)
             .collect(),
@@ -48,16 +46,19 @@ pub(crate) fn cmd_dms(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode>
             "listing DMs",
         ));
     };
-    let archive = Archive::open(workspace);
-    if archive.is_none() {
-        archive_hint(workspace);
-    }
+    let archive = open_archive_with_hint(ctx, workspace)?;
     let rows: Vec<DmView> = match archive.as_ref() {
-        Some(archive) => archive
-            .dms(workspace)
-            .iter()
-            .map(|row| DmView::from_row(row, archive, workspace))
-            .collect(),
+        Some(archive) => {
+            let user_names = archive
+                .user_display_map(workspace)
+                .with_context(|| format!("loading users for {workspace}"))?;
+            archive
+                .dms(workspace)
+                .with_context(|| format!("listing DMs for {workspace}"))?
+                .iter()
+                .map(|row| DmView::from_row(row, &user_names))
+                .collect()
+        }
         None => Vec::new(),
     };
     output::emit(
@@ -81,13 +82,13 @@ pub(crate) fn cmd_users(
             "listing users",
         ));
     };
-    let archive = Archive::open(workspace);
-    if archive.is_none() {
-        archive_hint(workspace);
-    }
-    let users = archive
-        .as_ref()
-        .map_or_else(Vec::new, |a| a.users(workspace, query, include_deleted));
+    let archive = open_archive_with_hint(ctx, workspace)?;
+    let users = match archive.as_ref() {
+        Some(archive) => archive
+            .users(workspace, query, include_deleted)
+            .with_context(|| format!("listing users for {workspace}"))?,
+        None => Vec::new(),
+    };
     let mut human = String::new();
     for u in &users {
         let display = u
@@ -130,28 +131,35 @@ pub(crate) fn cmd_threads(
             "listing threads",
         ));
     };
-    let archive = Archive::open(workspace);
-    if archive.is_none() {
-        archive_hint(workspace);
-    }
-    let resolved_ch = channel_arg.map(|arg| {
-        archive
-            .as_ref()
-            .and_then(|a| a.resolve_channel(workspace, arg))
-            .map_or_else(|| raw_channel_id(arg), |row| row.id)
-    });
-    let messages = match open_archive_store(workspace) {
-        Some(store) => store
-            .recent_threads(workspace, resolved_ch.as_ref(), limit)
-            .with_context(|| format!("listing archived threads for {workspace}"))?,
-        None => Vec::new(),
+    let archive = open_archive_with_hint(ctx, workspace)?;
+    let (messages, names, user_names) = match archive.as_ref() {
+        Some(archive) => {
+            let resolved_ch = match channel_arg {
+                Some(arg) => Some(
+                    archive
+                        .resolve_channel(workspace, arg)
+                        .with_context(|| format!("resolving channel {arg}"))?
+                        .map_or_else(|| raw_channel_id(arg), |row| row.id),
+                ),
+                None => None,
+            };
+            let messages = archive
+                .store()
+                .recent_threads(workspace, resolved_ch.as_ref(), limit)
+                .with_context(|| format!("listing archived threads for {workspace}"))?;
+            let names = archive
+                .channel_names(workspace)
+                .with_context(|| format!("reading channel names for {workspace}"))?;
+            let user_names = archive
+                .user_display_map(workspace)
+                .with_context(|| format!("reading user names for {workspace}"))?;
+            (messages, names, user_names)
+        }
+        None => (Vec::new(), HashMap::new(), HashMap::new()),
     };
-    let names = archive
-        .as_ref()
-        .map_or_else(Default::default, |a| a.channel_names(workspace));
     let rows: Vec<MessageRow> = messages
         .iter()
-        .map(|m| MessageRow::from_stored(m, archive.as_ref(), workspace))
+        .map(|m| MessageRow::from_stored(m, &user_names))
         .collect();
     let mut human = String::new();
     for row in &rows {
@@ -192,16 +200,20 @@ pub(crate) fn cmd_revisions(
             "reading revisions",
         ));
     };
-    let archive = Archive::open(workspace);
-    let channel_id = archive
-        .as_ref()
-        .and_then(|a| a.resolve_channel(workspace, channel_arg))
-        .map_or_else(|| raw_channel_id(channel_arg), |row| row.id);
-    let revisions = match open_archive_store(workspace) {
-        Some(store) => store
-            .revisions(workspace, &channel_id, &slackless_core::types::Ts::from(ts))
-            .with_context(|| format!("reading revisions of {channel_id} {ts}"))?,
-        None => Vec::new(),
+    let archive = open_archive_with_hint(ctx, workspace)?;
+    let (channel_id, revisions) = match archive.as_ref() {
+        Some(archive) => {
+            let channel_id = archive
+                .resolve_channel(workspace, channel_arg)
+                .with_context(|| format!("resolving channel {channel_arg}"))?
+                .map_or_else(|| raw_channel_id(channel_arg), |row| row.id);
+            let revisions = archive
+                .store()
+                .revisions(workspace, &channel_id, &Ts::from(ts))
+                .with_context(|| format!("reading revisions of {channel_id} {ts}"))?;
+            (channel_id, revisions)
+        }
+        None => (raw_channel_id(channel_arg), Vec::new()),
     };
     let json_rows: Vec<_> = revisions
         .iter()
@@ -258,20 +270,7 @@ pub(crate) fn cmd_digest(
         Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
     };
     let team_ids: Vec<TeamId> = if all_workspaces {
-        let mut ids = Vec::new();
-        if let Ok(sessions) = SessionStore::new().and_then(|s| s.load()) {
-            for s in sessions {
-                if !ids.contains(&s.team_id) {
-                    ids.push(s.team_id);
-                }
-            }
-        }
-        for tid in archive::stored_team_ids() {
-            if !ids.contains(&tid) {
-                ids.push(tid);
-            }
-        }
-        ids
+        all_workspace_ids()
     } else {
         workspace.into_iter().cloned().collect()
     };
@@ -291,10 +290,14 @@ pub(crate) fn cmd_digest(
     let mut rows_json = Vec::new();
     let mut human = String::new();
     for ws in &team_ids {
-        let Some(archive) = Archive::open(ws) else {
+        let Some(archive) =
+            Archive::open(ws).with_context(|| format!("opening local archive for {ws}"))?
+        else {
             continue;
         };
-        let rows = archive.digest_since(ws, cutoff_secs, limit);
+        let rows = archive
+            .digest_since(ws, cutoff_secs, limit)
+            .with_context(|| format!("building digest for {ws}"))?;
         for row in rows {
             total_messages = total_messages.saturating_add(row.message_count);
             let who = row.latest_author.as_deref().unwrap_or("unknown");

@@ -3,14 +3,23 @@
 use std::process::ExitCode;
 
 use anyhow::Result;
-use slackless_core::api::{ProfileUpdate, SlackApi};
+use slackless_core::api::ProfileUpdate;
+use slackless_core::types::time::now_epoch_secs;
 use slackless_core::types::{Profile, UserId};
 
+use crate::Ctx;
 use crate::output;
-use crate::session::resolve_session;
-use crate::{Ctx, fail};
 
 use super::session::{api_fail, api_for};
+
+fn format_status_pair(emoji: &str, text: &str) -> String {
+    match (emoji.is_empty(), text.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => text.to_owned(),
+        (false, true) => emoji.to_owned(),
+        (false, false) => format!("{emoji} {text}"),
+    }
+}
 
 pub(crate) fn format_status_show(
     user_id: &UserId,
@@ -19,10 +28,11 @@ pub(crate) fn format_status_show(
     let text = profile.status_text.as_deref().unwrap_or_default();
     let emoji = profile.status_emoji.as_deref().unwrap_or_default();
     let expiration = profile.status_expiration.unwrap_or(0);
-    let human = if text.is_empty() && emoji.is_empty() {
+    let rendered = format_status_pair(emoji, text);
+    let human = if rendered.is_empty() {
         "(no status set)\n".to_owned()
     } else {
-        format!("{emoji} {text}\n").trim_start().to_owned()
+        format!("{rendered}\n")
     };
     let json = serde_json::json!({
         "ok": true,
@@ -36,25 +46,11 @@ pub(crate) fn format_status_show(
 
 /// `status show`
 pub async fn run_status_show(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode> {
-    let session = match resolve_session(flag) {
-        Ok(session) => session,
-        Err(not_signed_in) => return Ok(fail(ctx, "not_signed_in", &not_signed_in.to_string())),
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
+        Err(exit) => return Ok(exit),
     };
-    let api = match SlackApi::new(
-        &session.api_base(),
-        session.xoxc_token.clone(),
-        &session.d_cookie,
-    ) {
-        Ok(api) => api,
-        Err(err) => {
-            return Ok(fail(
-                ctx,
-                "client_error",
-                &format!("building the Slack client: {err}"),
-            ));
-        }
-    };
-    match api.users_profile_get(&session.user_id).await {
+    match session.api.users_profile_get(&session.user_id).await {
         Ok(profile) => {
             let (json, human) = format_status_show(&session.user_id, &profile);
             output::emit(ctx.json, &json, &human);
@@ -100,7 +96,12 @@ pub(crate) fn format_status_set(
         "status_emoji": em,
         "status_expiration": exp,
     });
-    let human = format!("status set: {em} {txt}\n");
+    let rendered = format_status_pair(&em, &txt);
+    let human = if rendered.is_empty() {
+        "status set: (empty)\n".to_owned()
+    } else {
+        format!("status set: {rendered}\n")
+    };
     (json, human)
 }
 
@@ -112,23 +113,19 @@ pub async fn run_status_set(
     emoji: Option<String>,
     expires_in: Option<i64>,
 ) -> Result<ExitCode> {
-    let (api, _) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
     let status_emoji = normalize_status_emoji(emoji.as_deref());
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let status_expiration = compute_status_expiration(expires_in, now);
+    let status_expiration = compute_status_expiration(expires_in, now_epoch_secs());
     let update = ProfileUpdate {
         status_text: Some(text.clone()),
         status_emoji,
         status_expiration,
         ..Default::default()
     };
-    match api.users_profile_set(&update).await {
+    match session.api.users_profile_set(&update).await {
         Ok(profile) => {
             let (json, human) = format_status_set(text, profile);
             output::emit(ctx.json, &json, &human);
@@ -140,8 +137,8 @@ pub async fn run_status_set(
 
 /// `status clear`
 pub async fn run_status_clear(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode> {
-    let (api, _) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
     let update = ProfileUpdate {
@@ -150,7 +147,7 @@ pub async fn run_status_clear(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode>
         status_expiration: Some(0),
         ..Default::default()
     };
-    match api.users_profile_set(&update).await {
+    match session.api.users_profile_set(&update).await {
         Ok(_) => {
             output::emit(
                 ctx.json,

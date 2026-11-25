@@ -3,33 +3,77 @@ pub(crate) mod browse;
 pub(crate) mod maintenance;
 pub(crate) mod messages;
 
+use std::collections::HashSet;
+use std::path::Path;
 use std::process::ExitCode;
 
-use slackless_core::store::Store;
+use anyhow::{Context, Result};
+use slackless_core::auth::SessionStore;
+use slackless_core::types::time::{days_from_civil, days_in_month};
 use slackless_core::types::{ChannelId, TeamId};
 
+use crate::archive::{self, Archive};
 use crate::write::parse_duration_secs;
-use crate::{Ctx, archive, output};
+use crate::{Ctx, output};
 
-/// The workspace's durable store opened read-only; `None` when no archive exists yet (creating
-/// one as a side effect of a read would be surprising).
-pub(crate) fn open_archive_store(workspace: &TeamId) -> Option<Store> {
-    let path = archive::store_path(workspace)?;
-    if !path.is_file() {
-        return None;
+/// Opens a workspace archive read-only, propagating genuine SQLite errors while printing a
+/// stderr hint in human mode when no archive file exists yet.
+pub(crate) fn open_archive_with_hint(ctx: &Ctx, workspace: &TeamId) -> Result<Option<Archive>> {
+    let archive = Archive::open(workspace)
+        .with_context(|| format!("opening local archive for {workspace}"))?;
+    if archive.is_none() && !ctx.json {
+        archive_hint(workspace);
     }
-    Store::open_read_only(&path)
-        .or_else(|_| Store::open(&path))
-        .ok()
+    Ok(archive)
 }
 
-/// The workspace's durable store opened read-write (for `vacuum`); `None` when no archive exists.
-pub(crate) fn open_archive_store_rw(workspace: &TeamId) -> Option<Store> {
-    let path = archive::store_path(workspace)?;
-    if !path.is_file() {
-        return None;
+/// Every workspace known from stored sessions or local archive files, deduplicated in O(n)
+/// while preserving session-first order.
+pub(crate) fn all_workspace_ids() -> Vec<TeamId> {
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    if let Ok(sessions) = SessionStore::new().and_then(|s| s.load()) {
+        for s in sessions {
+            if seen.insert(s.team_id.clone()) {
+                ids.push(s.team_id);
+            }
+        }
     }
-    Store::open(&path).ok()
+    for tid in archive::stored_team_ids() {
+        if seen.insert(tid.clone()) {
+            ids.push(tid);
+        }
+    }
+    ids
+}
+
+/// Write rendered export output to `out` (emitting a JSON or human confirmation) or print to stdout.
+pub(crate) fn write_or_print_export(
+    ctx: &Ctx,
+    rendered: &str,
+    out: Option<&Path>,
+    count: usize,
+    item_noun: &str,
+) -> Result<()> {
+    if let Some(path) = out {
+        std::fs::write(path, rendered)
+            .with_context(|| format!("writing export to {}", path.display()))?;
+        if ctx.json {
+            output::emit_json(&serde_json::json!({
+                "ok": true,
+                "path": path.display().to_string(),
+                "count": count,
+            }));
+        } else {
+            eprintln!("Exported {count} {item_noun} to {}", path.display());
+        }
+    } else {
+        print!("{rendered}");
+        if !rendered.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
 }
 
 /// The channel id when the archive cannot resolve the argument.
@@ -55,12 +99,6 @@ pub(crate) fn archive_hint(workspace: &TeamId) {
     eprintln!(
         "slackless: no local archive for workspace {workspace} yet; it fills up once the desktop app syncs"
     );
-}
-
-pub(crate) fn now_epoch_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Parse a `--since` cutoff (`30m`, `24h`, `7d`, `2w`, `YYYY-MM-DD`, or unix seconds) into
@@ -97,28 +135,4 @@ pub(crate) fn parse_since_cutoff(spec: &str, now_secs: i64) -> Result<i64, Strin
     let delta = parse_duration_secs(trimmed)?;
     let delta_i64 = i64::try_from(delta).unwrap_or(i64::MAX);
     Ok(now_secs.saturating_sub(delta_i64))
-}
-
-fn is_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
-}
-
-fn days_in_month(year: i64, month: u32) -> Option<u32> {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
-        4 | 6 | 9 | 11 => Some(30),
-        2 => Some(if is_leap_year(year) { 29 } else { 28 }),
-        _ => None,
-    }
-}
-
-/// Howard Hinnant's civil-from-days inverse: UTC `YYYY-MM-DD` -> days since `1970-01-01`.
-pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let y = year - i64::from(month <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let m = i64::from(month);
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }

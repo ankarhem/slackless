@@ -1,8 +1,6 @@
-#![allow(unknown_lints, clippy::large_unopt_stack_frames)]
-
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// Default page size of `read`.
 pub(crate) const READ_LIMIT: usize = 50;
@@ -32,83 +30,211 @@ pub(crate) struct Cli {
     pub(crate) workspace: Option<String>,
 }
 
+#[derive(Args)]
+pub(crate) struct SearchArgs {
+    /// Query text plus modifiers, e.g. "launch in:#eng from:@ana has:file".
+    pub(crate) query: String,
+    /// Maximum number of results.
+    #[arg(long, value_name = "N", default_value_t = SEARCH_LIMIT)]
+    pub(crate) limit: usize,
+    /// Search across every locally archived workspace at once (merges hits newest first).
+    #[arg(long)]
+    pub(crate) all_workspaces: bool,
+    /// Optional export format (`md` or `json`) for search results.
+    #[arg(long, value_enum)]
+    pub(crate) format: Option<ExportFormat>,
+    /// Write search results to a file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) out: Option<PathBuf>,
+    /// Include locally archived deleted messages in results.
+    #[arg(long)]
+    pub(crate) include_deleted: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct ReadArgs {
+    pub(crate) channel: String,
+    /// Maximum number of messages (newest page, printed oldest first).
+    #[arg(long, value_name = "N", default_value_t = READ_LIMIT)]
+    pub(crate) limit: usize,
+    /// Only include messages at or after this cutoff (`30m`, `24h`, `7d`, `YYYY-MM-DD`, or unix secs).
+    #[arg(long, value_name = "WHEN")]
+    pub(crate) since: Option<String>,
+    /// Include locally archived deleted messages (marked as deleted).
+    #[arg(long)]
+    pub(crate) include_deleted: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct ThreadArgs {
+    /// Channel id, #name, or @handle.
+    pub(crate) channel: String,
+    /// The ts of the thread root (first column of `slackless read` or `slackless threads`).
+    pub(crate) thread_ts: String,
+    /// Fetch fresh replies live via `conversations.replies` and mirror them locally.
+    #[arg(long)]
+    pub(crate) live: bool,
+    /// Maximum number of messages when using `--live` (Slack max 999).
+    #[arg(long, value_name = "N", default_value_t = 200)]
+    pub(crate) limit: u32,
+}
+
+#[derive(Args)]
+pub(crate) struct SendArgs {
+    pub(crate) channel: String,
+    pub(crate) text: String,
+    /// Allow sending text that triggers the pre-send secret-leak detector.
+    #[arg(long)]
+    pub(crate) allow_secrets: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct ReplyArgs {
+    pub(crate) channel: String,
+    /// The ts of the thread root (first column of `slackless read`).
+    pub(crate) thread_ts: String,
+    pub(crate) text: String,
+    /// Allow sending text that triggers the pre-send secret-leak detector.
+    #[arg(long)]
+    pub(crate) allow_secrets: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct EditArgs {
+    pub(crate) channel: String,
+    /// The ts of the message to edit.
+    pub(crate) ts: String,
+    /// New message text.
+    pub(crate) text: String,
+    /// Allow sending text that triggers the pre-send secret-leak detector.
+    #[arg(long)]
+    pub(crate) allow_secrets: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct ReactionArgs {
+    pub(crate) channel: String,
+    /// The ts of the message.
+    pub(crate) ts: String,
+    /// Emoji shortcode, with or without colons ("tada" or ":tada:").
+    pub(crate) emoji: String,
+}
+
+#[derive(Args)]
+pub(crate) struct UploadArgs {
+    /// Channel id, #name, or @handle.
+    pub(crate) channel: String,
+    /// File path(s) to upload.
+    #[arg(required = true)]
+    pub(crate) files: Vec<PathBuf>,
+    /// Optional initial message accompanying the uploaded file(s).
+    #[arg(short, long)]
+    pub(crate) comment: Option<String>,
+    /// Optional thread root ts to upload into a thread.
+    #[arg(long, value_name = "TS")]
+    pub(crate) thread_ts: Option<String>,
+    /// Allow uploading a `--comment` that triggers the pre-send secret-leak detector.
+    #[arg(long)]
+    pub(crate) allow_secrets: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct ScheduleArgs {
+    /// Channel id, #name, or @handle.
+    pub(crate) channel: String,
+    /// Message text (pass `-` to read from stdin).
+    pub(crate) text: String,
+    /// When to deliver: relative (`+15m`, `+2h`, `+1d`) or unix epoch seconds.
+    #[arg(long, value_name = "WHEN")]
+    pub(crate) at: String,
+    /// Optional thread root ts.
+    #[arg(long, value_name = "TS")]
+    pub(crate) thread_ts: Option<String>,
+    /// Allow scheduling text that triggers the pre-send secret-leak detector.
+    #[arg(long)]
+    pub(crate) allow_secrets: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct ExportArgs {
+    /// Channel id, #name, or @handle.
+    pub(crate) channel: String,
+    /// Output format (`md` or `json`).
+    #[arg(long, value_enum, default_value_t = ExportFormat::Md)]
+    pub(crate) format: ExportFormat,
+    /// Maximum number of messages to export (newest window, ordered oldest first).
+    #[arg(long, value_name = "N", default_value_t = 10_000)]
+    pub(crate) limit: usize,
+    /// Write export to a file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub(crate) struct MarkThreadArgs {
+    /// Channel id, #name, or @handle.
+    pub(crate) channel: String,
+    /// Thread root ts.
+    pub(crate) thread_ts: String,
+    /// Read cursor ts (defaults to `thread_ts`).
+    pub(crate) ts: Option<String>,
+    /// Mark the thread unread instead of read.
+    #[arg(long)]
+    pub(crate) unread: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct DigestArgs {
+    /// Time window (`30m`, `24h`, `7d`, `YYYY-MM-DD`, or unix timestamp).
+    #[arg(long, value_name = "WHEN", default_value = "24h")]
+    pub(crate) since: String,
+    /// Summarize across every locally archived workspace at once.
+    #[arg(long)]
+    pub(crate) all_workspaces: bool,
+    /// Maximum conversations to show per workspace.
+    #[arg(long, value_name = "N", default_value_t = 25)]
+    pub(crate) limit: usize,
+}
+
+#[derive(Args)]
+pub(crate) struct FilesArgs {
+    /// Optional channel id, #name, or @handle to filter by.
+    #[arg(long, value_name = "CHANNEL")]
+    pub(crate) channel: Option<String>,
+    /// Optional Slack file types filter (e.g. `canvas`, `images`, `pdfs`).
+    #[arg(long, value_name = "TYPES")]
+    pub(crate) types: Option<String>,
+    /// Maximum number of files (1..=200).
+    #[arg(long, value_name = "N", default_value_t = 50)]
+    pub(crate) limit: u32,
+}
+
+#[derive(Args)]
+pub(crate) struct BackfillArgs {
+    /// Channel id, #name, or @handle.
+    pub(crate) channel: String,
+    /// Maximum number of history pages to walk (0 = walk all history to the beginning).
+    #[arg(long, value_name = "N", default_value_t = 10)]
+    pub(crate) pages: usize,
+    /// Messages per page (Slack max 200).
+    #[arg(long, value_name = "N", default_value_t = 200)]
+    pub(crate) page_size: u32,
+}
+
 #[derive(Subcommand)]
 pub(crate) enum Commands {
     /// Full-text search the local archive (modifiers: in: from: has: before: after:).
-    Search {
-        /// Query text plus modifiers, e.g. "launch in:#eng from:@ana has:file".
-        query: String,
-        /// Maximum number of results.
-        #[arg(long, value_name = "N", default_value_t = SEARCH_LIMIT)]
-        limit: usize,
-        /// Search across every locally archived workspace at once (merges hits newest first).
-        #[arg(long)]
-        all_workspaces: bool,
-        /// Optional export format (`md` or `json`) for search results.
-        #[arg(long, value_enum)]
-        format: Option<ExportFormat>,
-        /// Write search results to a file instead of stdout.
-        #[arg(long, value_name = "PATH")]
-        out: Option<PathBuf>,
-        /// Include locally archived deleted messages in results.
-        #[arg(long)]
-        include_deleted: bool,
-    },
+    Search(Box<SearchArgs>),
     /// Print recent messages from a conversation (channel id, #name or @handle).
-    Read {
-        channel: String,
-        /// Maximum number of messages (newest page, printed oldest first).
-        #[arg(long, value_name = "N", default_value_t = READ_LIMIT)]
-        limit: usize,
-        /// Only include messages at or after this cutoff (`30m`, `24h`, `7d`, `YYYY-MM-DD`, or unix secs).
-        #[arg(long, value_name = "WHEN")]
-        since: Option<String>,
-        /// Include locally archived deleted messages (marked as deleted).
-        #[arg(long)]
-        include_deleted: bool,
-    },
+    Read(Box<ReadArgs>),
     /// Read a thread's root message and replies (offline archive by default, or `--live` from Slack).
-    Thread {
-        /// Channel id, #name, or @handle.
-        channel: String,
-        /// The ts of the thread root (first column of `slackless read` or `slackless threads`).
-        thread_ts: String,
-        /// Fetch fresh replies live via `conversations.replies` and mirror them locally.
-        #[arg(long)]
-        live: bool,
-        /// Maximum number of messages when using `--live` (Slack max 999).
-        #[arg(long, value_name = "N", default_value_t = 200)]
-        limit: u32,
-    },
+    Thread(Box<ThreadArgs>),
     /// Post a message to a conversation (needs a stored session).
-    Send {
-        channel: String,
-        text: String,
-        /// Allow sending text that triggers the pre-send secret-leak detector.
-        #[arg(long)]
-        allow_secrets: bool,
-    },
+    Send(Box<SendArgs>),
     /// Reply in a thread (needs a stored session).
-    Reply {
-        channel: String,
-        /// The ts of the thread root (first column of `slackless read`).
-        thread_ts: String,
-        text: String,
-        /// Allow sending text that triggers the pre-send secret-leak detector.
-        #[arg(long)]
-        allow_secrets: bool,
-    },
+    Reply(Box<ReplyArgs>),
     /// Edit an existing message (`chat.update`, needs a stored session).
-    Edit {
-        channel: String,
-        /// The ts of the message to edit.
-        ts: String,
-        /// New message text.
-        text: String,
-        /// Allow sending text that triggers the pre-send secret-leak detector.
-        #[arg(long)]
-        allow_secrets: bool,
-    },
+    Edit(Box<EditArgs>),
     /// Delete a message (`chat.delete`, needs a stored session).
     Delete {
         channel: String,
@@ -116,35 +242,11 @@ pub(crate) enum Commands {
         ts: String,
     },
     /// Add an emoji reaction to a message (needs a stored session).
-    React {
-        channel: String,
-        /// The ts of the message (first column of `slackless read`).
-        ts: String,
-        /// Emoji shortcode, with or without colons ("tada" or ":tada:").
-        emoji: String,
-    },
+    React(Box<ReactionArgs>),
     /// Remove an emoji reaction from a message (`reactions.remove`, needs a stored session).
-    Unreact {
-        channel: String,
-        /// The ts of the message.
-        ts: String,
-        /// Emoji shortcode, with or without colons ("tada" or ":tada:").
-        emoji: String,
-    },
+    Unreact(Box<ReactionArgs>),
     /// Upload one or more local files to a conversation or thread (needs a stored session).
-    Upload {
-        /// Channel id, #name, or @handle.
-        channel: String,
-        /// File path(s) to upload.
-        #[arg(required = true)]
-        files: Vec<PathBuf>,
-        /// Optional initial message accompanying the uploaded file(s).
-        #[arg(short, long)]
-        comment: Option<String>,
-        /// Optional thread root ts to upload into a thread.
-        #[arg(long, value_name = "TS")]
-        thread_ts: Option<String>,
-    },
+    Upload(Box<UploadArgs>),
     /// List channels and private groups known to the local archive.
     Channels,
     /// List direct messages and group DMs known to the local archive.
@@ -158,17 +260,7 @@ pub(crate) enum Commands {
         include_deleted: bool,
     },
     /// Summarize recent archived activity per conversation (offline).
-    Digest {
-        /// Time window (`30m`, `24h`, `7d`, `YYYY-MM-DD`, or unix timestamp).
-        #[arg(long, value_name = "WHEN", default_value = "24h")]
-        since: String,
-        /// Summarize across every locally archived workspace at once.
-        #[arg(long)]
-        all_workspaces: bool,
-        /// Maximum conversations to show per workspace.
-        #[arg(long, value_name = "N", default_value_t = 25)]
-        limit: usize,
-    },
+    Digest(Box<DigestArgs>),
     /// Mark a conversation read (`conversations.mark`; defaults to newest archived message ts).
     MarkRead {
         /// Channel id, #name, or @handle.
@@ -196,21 +288,7 @@ pub(crate) enum Commands {
         ts: String,
     },
     /// Schedule a message for future delivery (`chat.scheduleMessage`, needs a stored session).
-    Schedule {
-        /// Channel id, #name, or @handle.
-        channel: String,
-        /// Message text (pass `-` to read from stdin).
-        text: String,
-        /// When to deliver: relative (`+15m`, `+2h`, `+1d`) or unix epoch seconds.
-        #[arg(long, value_name = "WHEN")]
-        at: String,
-        /// Optional thread root ts.
-        #[arg(long, value_name = "TS")]
-        thread_ts: Option<String>,
-        /// Allow scheduling text that triggers the pre-send secret-leak detector.
-        #[arg(long)]
-        allow_secrets: bool,
-    },
+    Schedule(Box<ScheduleArgs>),
     /// List pending scheduled messages (`chat.scheduledMessages.list`, needs a stored session).
     Scheduled {
         /// Optional channel id, #name, or @handle to filter by.
@@ -249,57 +327,25 @@ pub(crate) enum Commands {
         ts: String,
     },
     /// Export a conversation's locally archived messages to JSON or Markdown (offline).
-    Export {
-        /// Channel id, #name, or @handle.
-        channel: String,
-        /// Output format (`md` or `json`).
-        #[arg(long, value_enum, default_value_t = ExportFormat::Md)]
-        format: ExportFormat,
-        /// Maximum number of messages to export (newest window, ordered oldest first).
-        #[arg(long, value_name = "N", default_value_t = 10_000)]
-        limit: usize,
-        /// Write export to a file instead of stdout.
-        #[arg(long, value_name = "PATH")]
-        out: Option<PathBuf>,
-    },
+    Export(Box<ExportArgs>),
     /// Mark a followed thread read or unread (`subscriptions.thread.mark`, needs a stored session).
-    MarkThread {
-        /// Channel id, #name, or @handle.
-        channel: String,
-        /// Thread root ts.
-        thread_ts: String,
-        /// Read cursor ts (defaults to `thread_ts`).
-        ts: Option<String>,
-        /// Mark the thread unread instead of read.
-        #[arg(long)]
-        unread: bool,
-    },
+    MarkThread(Box<MarkThreadArgs>),
     /// Manage Later / Saved items (needs a stored session).
     Saved {
         #[command(subcommand)]
-        command: SavedCommand,
+        command: Box<SavedCommand>,
     },
     /// List workspace or channel files (`files.list`, needs a stored session).
-    Files {
-        /// Optional channel id, #name, or @handle to filter by.
-        #[arg(long, value_name = "CHANNEL")]
-        channel: Option<String>,
-        /// Optional Slack file types filter (e.g. `canvas`, `images`, `pdfs`).
-        #[arg(long, value_name = "TYPES")]
-        types: Option<String>,
-        /// Maximum number of files (1..=200).
-        #[arg(long, value_name = "N", default_value_t = 50)]
-        limit: u32,
-    },
+    Files(Box<FilesArgs>),
     /// Read, create, edit, share, inspect, delete, or comment on Slack Canvases (needs a stored session).
     Canvas {
         #[command(subcommand)]
-        command: CanvasCommand,
+        command: Box<CanvasCommand>,
     },
     /// Read, create, or mutate Slack Lists (needs a stored session).
     List {
         #[command(subcommand)]
-        command: ListCommand,
+        command: Box<ListCommand>,
     },
     /// Stream live Slack messages and events over the realtime websocket (needs a stored session).
     Watch {
@@ -313,12 +359,12 @@ pub(crate) enum Commands {
     /// Native Slack Huddles (audio join/smoke-test, shareable link, invite, local audio devices).
     Huddle {
         #[command(subcommand)]
-        command: HuddleCommand,
+        command: Box<HuddleCommand>,
     },
     /// Show, set, or clear your Slack custom status (`users.profile.get` / `users.profile.set`).
     Status {
         #[command(subcommand)]
-        command: StatusCommand,
+        command: Box<StatusCommand>,
     },
     /// Show live unread channels, DMs, mentions, and threads (`client.counts`, needs a stored session).
     Unread,
@@ -331,16 +377,7 @@ pub(crate) enum Commands {
         out: Option<std::path::PathBuf>,
     },
     /// Backfill a conversation's historical messages into the local SQLite archive (needs a stored session).
-    Backfill {
-        /// Channel id, #name, or @handle.
-        channel: String,
-        /// Maximum number of history pages to walk (0 = walk all history to the beginning).
-        #[arg(long, value_name = "N", default_value_t = 10)]
-        pages: usize,
-        /// Messages per page (Slack max 200).
-        #[arg(long, value_name = "N", default_value_t = 200)]
-        page_size: u32,
-    },
+    Backfill(Box<BackfillArgs>),
     /// Check for and install Slackless updates from GitHub Releases (updates Slackless.app + CLI).
     Update {
         /// Only check whether a newer release is available without installing.
@@ -356,7 +393,7 @@ pub(crate) enum Commands {
     /// Account and session management.
     Auth {
         #[command(subcommand)]
-        command: AuthCommand,
+        command: Box<AuthCommand>,
     },
 }
 
@@ -401,6 +438,7 @@ pub(crate) enum CanvasCommand {
     /// Create a standalone or channel-tabbed canvas (`canvases.create`).
     Create {
         title: String,
+        /// Optional markdown body (pass `-` to read from stdin).
         #[arg(long)]
         markdown: Option<String>,
         #[arg(long)]
@@ -409,6 +447,7 @@ pub(crate) enum CanvasCommand {
     /// Edit a canvas via `canvases.edit` (replace whole canvas or one section, or `--append`).
     Edit {
         file_id: String,
+        /// Markdown body (pass `-` to read from stdin).
         markdown: String,
         #[arg(long)]
         section: Option<String>,
@@ -473,6 +512,9 @@ pub(crate) enum CanvasCommand {
         /// Optional root comment thread ts to reply to.
         #[arg(long, value_name = "TS")]
         thread: Option<String>,
+        /// Allow posting a comment that triggers the pre-send secret-leak detector.
+        #[arg(long)]
+        allow_secrets: bool,
     },
     /// Resolve or reopen canvas comment threads (`quip.thread.archive` / `unarchive` / `archiveAll`).
     Resolve {

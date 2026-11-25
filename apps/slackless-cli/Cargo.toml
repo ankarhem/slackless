@@ -11,7 +11,6 @@ path = "src/main.rs"
 [dependencies]
 slackless-core.workspace = true
 slackless-auth = { workspace = true, features = ["webview"] }
-slackless-store.workspace = true
 clap = { version = "4", features = ["derive"] }
 anyhow.workspace = true
 serde.workspace = true

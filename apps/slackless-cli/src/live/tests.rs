@@ -12,10 +12,13 @@ use slackless_core::api::{
     ConversationCounts, HuddleCanvasRef, RoomJoinResponse, SavedItem, SavedItemState,
     SlackListCellValue, SlackListColumn, SlackListData, SlackListRow, ThreadCounts,
 };
+use slackless_core::domain::canvas::CanvasCommentFilter;
+use slackless_core::domain::lists::{cell_to_text, list_to_csv, list_to_json_value, list_to_tsv};
 use slackless_core::huddle::{
     AudioDeviceInfo, AudioDevices, CameraDeviceInfo, HuddlePhase, HuddleSessionSnapshot,
     ScreenSource,
 };
+use slackless_core::store::Store;
 use slackless_core::types::event::{
     Hello, ItemRef, MessageDeleted, ReactionEvent, ThreadMarkedEvent, ThreadSubscription,
 };
@@ -23,7 +26,6 @@ use slackless_core::types::{
     BotId, ChannelId, Conversation, File, FileId, HuddleRoom, Message, MessageEvent, Profile,
     SlackEvent, TeamId, Ts, User, UserId,
 };
-use slackless_store::Store;
 
 use crate::ListReadFormat;
 use crate::archive::Archive;
@@ -91,70 +93,112 @@ fn formats_list_as_json_csv_and_tsv() {
         }],
     };
 
-    let json = list_to_json_value(&data);
+    let id_user = |u: &UserId| u.to_string();
+    let json = list_to_json_value(&data, id_user);
     assert_eq!(json["count"], 1);
-    assert_eq!(json["items"][0]["fields"]["Task"], "Ship, v1");
-    assert_eq!(json["items"][0]["fields"]["Done"], "true");
+    assert_eq!(json["items"][0]["Task"], "Ship, v1");
+    assert_eq!(json["items"][0]["Done"], true);
 
-    let csv = list_to_csv(&data);
+    let csv = list_to_csv(&data, id_user);
     assert!(csv.contains("Task,Done\n"));
     assert!(csv.contains("\"Ship, v1\",true\n"));
 
-    let tsv = list_to_tsv(&data);
+    let tsv = list_to_tsv(&data, id_user);
     assert!(tsv.contains("id\tTask\tDone\n"));
     assert!(tsv.contains("Rec1\tShip, v1\ttrue\n"));
 }
 
 #[test]
 fn cell_to_text_covers_all_variants_and_list_escaping() {
-    assert_eq!(cell_to_text(None), "");
-    assert_eq!(cell_to_text(Some(&SlackListCellValue::Empty)), "");
+    let col = SlackListColumn {
+        id: "C1".into(),
+        key: "k".into(),
+        name: "Col".into(),
+        kind: "text".into(),
+        is_primary: false,
+        choices: vec![],
+    };
+    let resolve_user = |u: &UserId| u.to_string();
+
+    assert_eq!(cell_to_text(None, &col, &resolve_user), "");
     assert_eq!(
-        cell_to_text(Some(&SlackListCellValue::Date("2026-11-25".into()))),
+        cell_to_text(Some(&SlackListCellValue::Empty), &col, &resolve_user),
+        ""
+    );
+    assert_eq!(
+        cell_to_text(
+            Some(&SlackListCellValue::Date("2026-11-25".into())),
+            &col,
+            &resolve_user
+        ),
         "2026-11-25"
     );
     assert_eq!(
-        cell_to_text(Some(&SlackListCellValue::Number("42.5".into()))),
+        cell_to_text(
+            Some(&SlackListCellValue::Number("42.5".into())),
+            &col,
+            &resolve_user
+        ),
         "42.5"
     );
     assert_eq!(
-        cell_to_text(Some(&SlackListCellValue::Users(vec![
-            UserId::from("U1"),
-            UserId::from("U2"),
-        ]))),
-        "U1, U2"
+        cell_to_text(
+            Some(&SlackListCellValue::Users(vec![
+                UserId::from("U1"),
+                UserId::from("U2"),
+            ])),
+            &col,
+            &resolve_user
+        ),
+        "U1; U2"
     );
     assert_eq!(
-        cell_to_text(Some(&SlackListCellValue::Select(vec![
-            "P0".into(),
-            "Backend".into(),
-        ]))),
-        "P0, Backend"
+        cell_to_text(
+            Some(&SlackListCellValue::Select(vec![
+                "P0".into(),
+                "Backend".into(),
+            ])),
+            &col,
+            &resolve_user
+        ),
+        "P0; Backend"
     );
     assert_eq!(
-        cell_to_text(Some(&SlackListCellValue::Checkbox(false))),
+        cell_to_text(
+            Some(&SlackListCellValue::Checkbox(false)),
+            &col,
+            &resolve_user
+        ),
         "false"
     );
     assert_eq!(
-        cell_to_text(Some(&SlackListCellValue::Link {
-            label: "Spec".into(),
-            url: "https://example.com".into(),
-        })),
-        "Spec"
+        cell_to_text(
+            Some(&SlackListCellValue::Link {
+                label: "Spec".into(),
+                url: "https://example.com".into(),
+            }),
+            &col,
+            &resolve_user
+        ),
+        "Spec (https://example.com)"
     );
     assert_eq!(
-        cell_to_text(Some(&SlackListCellValue::Link {
-            label: String::new(),
-            url: "https://example.com".into(),
-        })),
+        cell_to_text(
+            Some(&SlackListCellValue::Link {
+                label: String::new(),
+                url: "https://example.com".into(),
+            }),
+            &col,
+            &resolve_user
+        ),
         "https://example.com"
     );
 
-    // Key fallback when cell is stored under col.key, plus CSV quoting & TSV sanitization.
+    // Key fallback when cell is stored under col.key, plus RFC-4180 CR/LF CSV quoting & TSV sanitization.
     let mut cells = HashMap::new();
     cells.insert(
         "notes_key".into(),
-        SlackListCellValue::Text("Say \"hi\"\tline1\nline2".into()),
+        SlackListCellValue::Text("Say \"hi\"\tline1\r\nline2".into()),
     );
     let data = SlackListData {
         file_id: "F2".into(),
@@ -174,20 +218,20 @@ fn cell_to_text_covers_all_variants_and_list_escaping() {
         }],
     };
 
-    let json = list_to_json_value(&data);
+    let json = list_to_json_value(&data, resolve_user);
     assert_eq!(
-        json["items"][0]["fields"]["Notes, \"Raw\""],
-        "Say \"hi\"\tline1\nline2"
+        json["items"][0]["Notes, \"Raw\""],
+        "Say \"hi\"\tline1\r\nline2"
     );
 
-    let csv = list_to_csv(&data);
+    let csv = list_to_csv(&data, resolve_user);
     assert_eq!(
         csv,
-        "\"Notes, \"\"Raw\"\"\"\n\"Say \"\"hi\"\"\tline1\nline2\"\n"
+        "\"Notes, \"\"Raw\"\"\"\n\"Say \"\"hi\"\"\tline1\r\nline2\"\n"
     );
 
-    let tsv = list_to_tsv(&data);
-    assert_eq!(tsv, "id\tNotes, \"Raw\"\nR1\tSay \"hi\" line1 line2\n");
+    let tsv = list_to_tsv(&data, resolve_user);
+    assert_eq!(tsv, "id\tNotes, \"Raw\"\nR1\tSay \"hi\" line1  line2\n");
 }
 
 #[test]
@@ -248,7 +292,7 @@ fn format_watch_event_handles_messages_reactions_threads_filters_and_ignored() {
     let (json, human) = format_watch_event(&rx_ev, Some(&ch1)).expect("rx matches");
     assert_eq!(json["type"], "reaction_added");
     assert_eq!(json["reaction"], "tada");
-    assert_eq!(human, "reaction_added\tC1\t1700000001.000100\tU2 :tada: \n");
+    assert_eq!(human, "reaction_added\tC1\t1700000001.000100\tU2 :tada:\n");
     assert!(format_watch_event(&rx_ev, Some(&ch2)).is_none());
 
     let rx_missing_meta = SlackEvent::ReactionAdded(ReactionEvent {
@@ -260,7 +304,7 @@ fn format_watch_event_handles_messages_reactions_threads_filters_and_ignored() {
     let (json, human) = format_watch_event(&rx_missing_meta, None).expect("unfiltered rx");
     assert_eq!(json["channel"], "");
     assert_eq!(json["ts"], "");
-    assert_eq!(human, "reaction_added\t\t\tU3 :eyes: \n");
+    assert_eq!(human, "reaction_added\t\t\tU3 :eyes:\n");
     assert!(format_watch_event(&rx_missing_meta, Some(&ch1)).is_none());
 
     // ThreadMarked with and without last_read.
@@ -593,7 +637,9 @@ fn resolve_channel_with_handles_missing_archive_and_isolated_sqlite_archive() {
         .expect("upsert convs");
     drop(store);
 
-    let archive = Archive::open_path(&db).expect("open archive");
+    let archive = Archive::open_path(&db)
+        .expect("open result")
+        .expect("open archive");
     assert_eq!(
         resolve_channel_with(Some(&archive), &ws, "#engineering"),
         (ChannelId::from("C_ENG"), Some("#engineering".into()))
@@ -1205,15 +1251,15 @@ fn canvas_comments_filtering_formatting_posting_and_resolve_seams() {
 
     // Filter mode selection & filtering.
     assert_eq!(
-        CanvasCommentFilter::from_flags(false, false),
+        comment_filter_from_flags(false, false),
         CanvasCommentFilter::Open
     );
     assert_eq!(
-        CanvasCommentFilter::from_flags(true, false),
+        comment_filter_from_flags(true, false),
         CanvasCommentFilter::Resolved
     );
     assert_eq!(
-        CanvasCommentFilter::from_flags(false, true),
+        comment_filter_from_flags(false, true),
         CanvasCommentFilter::All
     );
 
@@ -1348,4 +1394,96 @@ fn classify_canvas_api_error_translates_canvas_codes_and_preserves_auth_expiry()
     let (code, msg) = classify_canvas_api_error(&unknown);
     assert_eq!(code, "request_failed");
     assert_eq!(msg, "some_other_error");
+}
+
+#[test]
+fn canvas_html_fallback_never_swallows_auth_or_transport_errors() {
+    assert!(should_fallback_canvas_html(&ApiError::from_slack_error(
+        "not_allowed_token_type"
+    )));
+    assert!(should_fallback_canvas_html(&ApiError::from_slack_error(
+        "unknown_method"
+    )));
+    assert!(!should_fallback_canvas_html(&ApiError::from_slack_error(
+        "invalid_auth"
+    )));
+    assert!(!should_fallback_canvas_html(&ApiError::from_slack_error(
+        "token_revoked"
+    )));
+    assert!(!should_fallback_canvas_html(&ApiError::RateLimited {
+        retry_after: Duration::from_secs(5),
+    }));
+    assert!(!should_fallback_canvas_html(&ApiError::UntrustedUrl(
+        "http://evil.example".into()
+    )));
+}
+
+#[test]
+fn backfill_stuck_cursor_guard_status_spacing_and_huddle_helpers() {
+    // Stuck-cursor guard rejects empty and repeated cursors.
+    assert_eq!(next_backfill_cursor(None, None), None);
+    assert_eq!(next_backfill_cursor(None, Some(String::new())), None);
+    assert_eq!(
+        next_backfill_cursor(None, Some("cur1".into())),
+        Some("cur1".into())
+    );
+    assert_eq!(
+        next_backfill_cursor(Some("cur1"), Some("cur1".into())),
+        None
+    );
+    assert_eq!(
+        next_backfill_cursor(Some("cur1"), Some("cur2".into())),
+        Some("cur2".into())
+    );
+
+    // Status set with empty emoji must not emit a double space.
+    let (_, human) = format_status_set(
+        "Heads down".into(),
+        Profile {
+            status_emoji: None,
+            status_text: None,
+            status_expiration: None,
+            ..Profile::default()
+        },
+    );
+    assert_eq!(human, "status set: Heads down\n");
+
+    // Status show with emoji-only must not emit a trailing space.
+    let (_, human) = format_status_show(
+        &UserId::from("U1"),
+        &Profile {
+            status_emoji: Some(":coffee:".into()),
+            status_text: None,
+            ..Profile::default()
+        },
+    );
+    assert_eq!(human, ":coffee:\n");
+
+    // Whitespace-only huddle thread_root_ts falls back to canvas root_thread_ts or None.
+    let ws = TeamId::from("T1");
+    let ch = ChannelId::from("C1");
+    let joined = RoomJoinResponse {
+        call_id: "R2".into(),
+        chime: ChimeJoinData::default(),
+        huddle: HuddleRoom {
+            thread_root_ts: Some(Ts::from("   ")),
+            huddle_link: Some("   ".into()),
+            ..HuddleRoom::default()
+        },
+        canvas: Some(HuddleCanvasRef {
+            root_thread_ts: Some(Ts::from("  \t ")),
+            thread_channel_id: Some(ch.clone()),
+            file_id: None,
+        }),
+    };
+    let creds = build_huddle_credentials(&ws, &ch, joined);
+    assert_eq!(creds.thread_root_ts, None);
+    assert_eq!(
+        creds.huddle_link.as_deref(),
+        Some("https://app.slack.com/huddle/T1/C1")
+    );
+
+    // format_ms_utc uses shared civil_from_days accurately.
+    assert_eq!(format_ms_utc(0), "1970-01-01 00:00:00");
+    assert_eq!(format_ms_utc(1_709_208_000_000), "2024-02-29 12:00:00");
 }

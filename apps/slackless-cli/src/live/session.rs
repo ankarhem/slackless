@@ -1,15 +1,23 @@
-//! Session bootstrap, channel resolution, and API error mapping shared by live commands.
+//! Session bootstrap, channel resolution, and API error mapping shared by all live & write commands.
 
 use std::process::ExitCode;
 
 use slackless_core::api::{ApiError, SlackApi};
-use slackless_core::types::{ChannelId, TeamId};
+use slackless_core::types::{ChannelId, TeamId, UserId};
 
 use crate::archive::Archive;
 use crate::session::resolve_session;
 use crate::{Ctx, fail};
 
-pub(super) fn api_for(ctx: &Ctx, flag: Option<&str>) -> Result<(SlackApi, TeamId), ExitCode> {
+/// Authenticated live session client plus workspace and signed-in user identity.
+pub(crate) struct LiveSession {
+    pub(crate) api: SlackApi,
+    pub(crate) workspace: TeamId,
+    pub(crate) user_id: UserId,
+}
+
+/// Resolve credentials and construct a [`LiveSession`]; `Err` is the already-emitted CLI failure.
+pub(crate) fn api_for(ctx: &Ctx, flag: Option<&str>) -> Result<LiveSession, ExitCode> {
     let session = match resolve_session(flag) {
         Ok(session) => session,
         Err(not_signed_in) => return Err(fail(ctx, "not_signed_in", &not_signed_in.to_string())),
@@ -26,7 +34,11 @@ pub(super) fn api_for(ctx: &Ctx, flag: Option<&str>) -> Result<(SlackApi, TeamId
             &format!("building the Slack client: {err}"),
         )
     })?;
-    Ok((api, session.team_id))
+    Ok(LiveSession {
+        api,
+        workspace: session.team_id,
+        user_id: session.user_id,
+    })
 }
 
 /// Map an [`ApiError`] to its machine-readable CLI error code and human-facing message.
@@ -43,7 +55,7 @@ pub(crate) fn classify_api_error(err: &ApiError) -> (&'static str, String) {
     }
 }
 
-pub(super) fn api_fail(ctx: &Ctx, err: &ApiError) -> ExitCode {
+pub(crate) fn api_fail(ctx: &Ctx, err: &ApiError) -> ExitCode {
     let (code, message) = classify_api_error(err);
     fail(ctx, code, &message)
 }
@@ -54,7 +66,7 @@ pub(crate) fn resolve_channel_with(
     workspace: &TeamId,
     arg: &str,
 ) -> (ChannelId, Option<String>) {
-    match archive.and_then(|a| a.resolve_channel(workspace, arg)) {
+    match archive.and_then(|a| a.resolve_channel(workspace, arg).ok().flatten()) {
         Some(row) => {
             let label = row.label();
             (row.id, Some(label))
@@ -63,8 +75,8 @@ pub(crate) fn resolve_channel_with(
     }
 }
 
-pub(super) fn resolve_channel(workspace: &TeamId, arg: &str) -> (ChannelId, Option<String>) {
-    let archive = Archive::open(workspace);
+pub(crate) fn resolve_channel(workspace: &TeamId, arg: &str) -> (ChannelId, Option<String>) {
+    let archive = Archive::open(workspace).ok().flatten();
     resolve_channel_with(archive.as_ref(), workspace, arg)
 }
 

@@ -5,50 +5,53 @@
 //! - `canvas` (`read` / `create` / `edit` / `info` / `delete` / `share` / `unshare` / `comments` / `comment` / `resolve`)
 //! - `list` (`fetch_list` / `lists.create` / `lists.records.create` / `lists.records.delete` / `lists.addToList`)
 //! - `watch` (live RTM event stream over `wss-primary`)
-//! - `huddle` (devices, cameras, screens, link, invite, join)
+//! - `huddle` (devices, cameras, screens, link, invite, join, transcripts)
 //! - `status` (show, set, clear), `unread`, and `backfill`
 
-mod canvas_list;
+mod canvas;
 mod channels;
 mod files;
 mod huddle;
+mod list;
 mod saved;
-mod session;
+pub(crate) mod session;
 mod status;
 mod watch;
 
 #[cfg(test)]
 mod tests;
 
-pub use canvas_list::{
+pub use canvas::{
     run_canvas_comment, run_canvas_comments, run_canvas_create, run_canvas_delete, run_canvas_edit,
     run_canvas_info, run_canvas_read, run_canvas_resolve, run_canvas_share, run_canvas_unshare,
-    run_list_add_item, run_list_add_message, run_list_create, run_list_delete_item, run_list_read,
 };
 pub use channels::{run_backfill, run_unread};
 pub use files::{run_download, run_files};
 pub use huddle::{
-    run_huddle_cameras, run_huddle_devices, run_huddle_invite, run_huddle_join, run_huddle_link,
-    run_huddle_screens, run_huddle_transcripts,
+    HuddleJoinArgs, HuddleTranscriptsArgs, run_huddle_cameras, run_huddle_devices,
+    run_huddle_invite, run_huddle_join, run_huddle_link, run_huddle_screens,
+    run_huddle_transcripts,
+};
+pub use list::{
+    run_list_add_item, run_list_add_message, run_list_create, run_list_delete_item, run_list_read,
 };
 pub use saved::{run_mark_thread, run_saved_add, run_saved_delete, run_saved_done, run_saved_list};
 pub use status::{run_status_clear, run_status_set, run_status_show};
 pub use watch::run_watch;
 
 #[cfg(test)]
-pub(crate) use canvas_list::{
-    CanvasCommentFilter, CanvasResolveAction, CanvasShareTarget, build_canvas_edit_op,
-    cell_to_text, classify_canvas_api_error, effective_list_format, filter_canvas_comments,
-    format_canvas_comment_posted, format_canvas_comments, format_canvas_delete_result,
-    format_canvas_meta, format_canvas_read, format_canvas_resolve_result,
-    format_canvas_share_result, format_canvas_unshare_result, list_to_csv, list_to_json_value,
-    list_to_tsv, parse_canvas_resolve_action, parse_canvas_share_target,
-    select_list_primary_column, validate_canvas_comment_args, validate_canvas_share_post,
+pub(crate) use canvas::{
+    CanvasResolveAction, CanvasShareTarget, build_canvas_edit_op, classify_canvas_api_error,
+    comment_filter_from_flags, filter_canvas_comments, format_canvas_comment_posted,
+    format_canvas_comments, format_canvas_delete_result, format_canvas_meta, format_canvas_read,
+    format_canvas_resolve_result, format_canvas_share_result, format_canvas_unshare_result,
+    parse_canvas_resolve_action, parse_canvas_share_target, should_fallback_canvas_html,
+    validate_canvas_comment_args, validate_canvas_share_post,
 };
 #[cfg(test)]
 pub(crate) use channels::{
     backfill_should_stop, clamp_backfill_page_size, format_backfill_output, format_unread_json,
-    summarize_unread,
+    next_backfill_cursor, summarize_unread,
 };
 #[cfg(test)]
 pub(crate) use files::{
@@ -58,8 +61,10 @@ pub(crate) use files::{
 #[cfg(test)]
 pub(crate) use huddle::{
     build_huddle_credentials, fallback_huddle_link, format_huddle_cameras, format_huddle_devices,
-    format_huddle_screens, format_huddle_state,
+    format_huddle_screens, format_huddle_state, format_ms_utc,
 };
+#[cfg(test)]
+pub(crate) use list::{effective_list_format, select_list_primary_column};
 #[cfg(test)]
 pub(crate) use saved::{
     format_mark_thread_output, format_saved_list, mark_thread_cursor, normalize_saved_filter,

@@ -1,13 +1,15 @@
-//! Read-only access to the local message archive via [`slackless_store::Store`].
+//! Access to the local message archive via [`slackless_core::store::Store`].
 //!
-//! Listing and lookup helpers are best-effort: a missing or unreadable archive yields empty
-//! results rather than failing offline commands.
+//! Missing archive files return `Ok(None)` so offline commands can report empty results cleanly,
+//! while genuine SQLite/corruption errors propagate explicitly.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
+pub use slackless_core::store::ConversationSummary as ConversationRow;
+use slackless_core::store::{self, DigestChannel, Store, UserSummary};
 use slackless_core::types::{ChannelId, TeamId, UserId};
-pub use slackless_store::ConversationSummary as ConversationRow;
-use slackless_store::{DigestChannel, Store, UserSummary};
 
 /// One workspace user row from the local archive.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -59,27 +61,14 @@ impl From<DigestChannel> for DigestChannelRow {
     }
 }
 
-/// The platform application-data directory holding one `<team_id>.sqlite` per workspace — the
-/// same location the desktop app uses (`bridge.rs`'s `default_store_path`; the store location
-/// stays a front-end decision).
-fn archive_dir() -> Option<PathBuf> {
-    let mut path = PathBuf::from(std::env::var_os("HOME")?);
-    if cfg!(target_os = "macos") {
-        path.push("Library/Application Support/slackless");
-    } else {
-        path.push(".local/share/slackless");
-    }
-    Some(path)
-}
-
 /// The archive database path for one workspace.
 pub fn store_path(team_id: &TeamId) -> Option<PathBuf> {
-    archive_dir().map(|dir| dir.join(format!("{}.sqlite", team_id.as_str())))
+    slackless_core::platform::archive_store_path(team_id.as_str())
 }
 
 /// Team ids with an archive on disk, sorted.
 pub fn stored_team_ids() -> Vec<TeamId> {
-    let Some(dir) = archive_dir() else {
+    let Some(dir) = slackless_core::platform::app_data_dir() else {
         return Vec::new();
     };
     stored_team_ids_in(&dir)
@@ -106,46 +95,107 @@ pub(crate) fn stored_team_ids_in(dir: &Path) -> Vec<TeamId> {
     ids
 }
 
-/// A read-only view of one workspace's archive; `None` when it does not exist on disk.
+/// Format a raw channel name consistently with a single leading `#`.
+pub(crate) fn format_channel_name(name: &str) -> String {
+    if name.starts_with('#') {
+        name.to_owned()
+    } else {
+        format!("#{name}")
+    }
+}
+
+/// One opened SQLite archive handle (`Store`), avoiding repeated opens per CLI invocation.
 pub struct Archive {
     store: Store,
 }
 
 impl Archive {
-    pub fn open(team_id: &TeamId) -> Option<Self> {
-        let path = store_path(team_id)?;
+    /// Opens an existing workspace archive read-only; returns `Ok(None)` when no file exists yet
+    /// and propagates genuine SQLite/corruption errors.
+    pub fn open(team_id: &TeamId) -> store::Result<Option<Self>> {
+        let Some(path) = store_path(team_id) else {
+            return Ok(None);
+        };
         Self::open_path(&path)
     }
 
-    pub(crate) fn open_path(path: &Path) -> Option<Self> {
+    pub(crate) fn open_path(path: &Path) -> store::Result<Option<Self>> {
         if !path.is_file() {
-            return None;
+            return Ok(None);
         }
-        // A WAL database without its shm file cannot be opened read-only; fall back.
-        let store = Store::open_read_only(path)
-            .or_else(|_| Store::open(path))
-            .ok()?;
-        Some(Self { store })
+        // A WAL database without its shm file cannot be opened read-only; fall back once.
+        let store = match Store::open_read_only(path) {
+            Ok(store) => store,
+            Err(_) => Store::open(path)?,
+        };
+        Ok(Some(Self { store }))
+    }
+
+    /// Opens an existing workspace archive read-write; returns `Ok(None)` when no file exists yet.
+    pub fn open_rw(team_id: &TeamId) -> store::Result<Option<Self>> {
+        let Some(path) = store_path(team_id) else {
+            return Ok(None);
+        };
+        Self::open_rw_path(&path)
+    }
+
+    pub(crate) fn open_rw_path(path: &Path) -> store::Result<Option<Self>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            store: Store::open(path)?,
+        }))
+    }
+
+    /// Opens a workspace archive read-write, creating its parent directory and database if needed.
+    pub fn open_or_create_rw(team_id: &TeamId) -> Result<Self> {
+        let path = store_path(team_id).context("resolving the local archive path")?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating archive directory {}", parent.display()))?;
+        }
+        let store = Store::open(&path)
+            .with_context(|| format!("opening local archive {}", path.display()))?;
+        Ok(Self { store })
+    }
+
+    /// Direct read access to the underlying [`Store`].
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// Direct mutable access to the underlying [`Store`].
+    pub fn store_mut(&mut self) -> &mut Store {
+        &mut self.store
     }
 
     /// Public and private channels, alphabetical by name.
-    pub fn channels(&self, workspace: &TeamId) -> Vec<ConversationRow> {
-        self.store.list_channels(workspace).unwrap_or_default()
+    pub fn channels(&self, workspace: &TeamId) -> store::Result<Vec<ConversationRow>> {
+        self.store.list_channels(workspace)
     }
 
     /// Direct messages and multi-person DMs, most recently active first.
-    pub fn dms(&self, workspace: &TeamId) -> Vec<ConversationRow> {
-        self.store.list_dms(workspace).unwrap_or_default()
+    pub fn dms(&self, workspace: &TeamId) -> store::Result<Vec<ConversationRow>> {
+        self.store.list_dms(workspace)
     }
 
     /// Channel-id to `#name` map for human result lines.
-    pub fn channel_names(&self, workspace: &TeamId) -> std::collections::HashMap<String, String> {
-        self.store.channel_names(workspace).unwrap_or_default()
+    pub fn channel_names(&self, workspace: &TeamId) -> store::Result<HashMap<String, String>> {
+        let raw = self.store.channel_names(workspace)?;
+        Ok(raw
+            .into_iter()
+            .map(|(id, name)| (id, format_channel_name(&name)))
+            .collect())
     }
 
     /// Resolves `#name`, `name`, `@handle`, or an exact `C…`/`D…`/`G…` id to a conversation.
-    pub fn resolve_channel(&self, workspace: &TeamId, arg: &str) -> Option<ConversationRow> {
-        self.store.resolve_channel(workspace, arg).ok().flatten()
+    pub fn resolve_channel(
+        &self,
+        workspace: &TeamId,
+        arg: &str,
+    ) -> store::Result<Option<ConversationRow>> {
+        self.store.resolve_channel(workspace, arg)
     }
 
     /// The conversation with this exact id, if the archive knows it.
@@ -153,34 +203,48 @@ impl Archive {
         &self,
         workspace: &TeamId,
         id: &ChannelId,
-    ) -> Option<ConversationRow> {
-        self.store
-            .conversation_summary(workspace, id)
-            .ok()
-            .flatten()
+    ) -> store::Result<Option<ConversationRow>> {
+        self.store.conversation_summary(workspace, id)
     }
 
     /// The best display name for a user id, from the archive's user table.
-    pub fn user_display(&self, workspace: &TeamId, user: &UserId) -> Option<String> {
-        self.store.user_display(workspace, user).ok().flatten()
+    #[cfg(test)]
+    pub fn user_display(&self, workspace: &TeamId, user: &UserId) -> store::Result<Option<String>> {
+        self.store.user_display(workspace, user)
     }
 
-    /// Number of stored current-state messages; 0 when the archive is empty or unreadable.
-    pub fn message_count(&self, workspace: &TeamId) -> u64 {
-        self.store.message_count(workspace).unwrap_or(0)
+    /// Batch-loads every user's best display name (`display_name` -> `real_name` -> `name`)
+    /// for `workspace` in one query, preventing N+1 lookups across message/DM/pin/transcript rows.
+    pub fn user_display_map(&self, workspace: &TeamId) -> store::Result<HashMap<UserId, String>> {
+        let users = self.store.list_users(workspace, None, true)?;
+        let mut map = HashMap::with_capacity(users.len());
+        for user in users {
+            let best = user
+                .display_name
+                .or(user.real_name)
+                .or_else(|| (!user.name.is_empty()).then_some(user.name));
+            if let Some(name) = best {
+                map.insert(user.id, name);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Number of stored current-state messages.
+    pub fn message_count(&self, workspace: &TeamId) -> store::Result<u64> {
+        self.store.message_count(workspace)
     }
 
     /// Per-channel notification overrides (e.g. muted channels) parsed from cached Slack `prefs`.
     pub fn notify_levels(
         &self,
         workspace: &TeamId,
-    ) -> std::collections::HashMap<ChannelId, slackless_core::NotifyLevel> {
-        self.store
-            .prefs(workspace)
-            .ok()
-            .flatten()
+    ) -> store::Result<HashMap<ChannelId, slackless_core::NotifyLevel>> {
+        Ok(self
+            .store
+            .prefs(workspace)?
             .map(|prefs| slackless_core::notify_levels(&prefs))
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     /// List archived workspace users, optionally filtered by a case-insensitive substring on
@@ -190,22 +254,25 @@ impl Archive {
         workspace: &TeamId,
         query: Option<&str>,
         include_deleted: bool,
-    ) -> Vec<UserRow> {
-        self.store
-            .list_users(workspace, query, include_deleted)
-            .unwrap_or_default()
+    ) -> store::Result<Vec<UserRow>> {
+        Ok(self
+            .store
+            .list_users(workspace, query, include_deleted)?
             .into_iter()
             .map(UserRow::from)
-            .collect()
+            .collect())
     }
 
     /// Newest stored non-deleted message `ts` in `channel`, if any.
-    pub fn latest_ts(&self, workspace: &TeamId, channel: &ChannelId) -> Option<String> {
-        self.store
-            .latest_ts(workspace, channel)
-            .ok()
-            .flatten()
-            .map(|ts| ts.as_str().to_owned())
+    pub fn latest_ts(
+        &self,
+        workspace: &TeamId,
+        channel: &ChannelId,
+    ) -> store::Result<Option<String>> {
+        Ok(self
+            .store
+            .latest_ts(workspace, channel)?
+            .map(|ts| ts.as_str().to_owned()))
     }
 
     /// Activity digest grouped by channel for messages at or after `cutoff_secs` (unix seconds).
@@ -214,13 +281,13 @@ impl Archive {
         workspace: &TeamId,
         cutoff_secs: i64,
         limit: usize,
-    ) -> Vec<DigestChannelRow> {
-        self.store
-            .digest_since(workspace, cutoff_secs, limit)
-            .unwrap_or_default()
+    ) -> store::Result<Vec<DigestChannelRow>> {
+        Ok(self
+            .store
+            .digest_since(workspace, cutoff_secs, limit)?
             .into_iter()
             .map(DigestChannelRow::from)
-            .collect()
+            .collect())
     }
 }
 
@@ -448,18 +515,31 @@ mod tests {
     }
 
     #[test]
-    fn open_path_returns_none_when_missing() {
-        let dir = TempDir::new("missing");
-        assert!(Archive::open_path(&dir.path().join("nope.sqlite")).is_none());
+    fn open_path_returns_none_when_missing_and_err_when_corrupt() {
+        let dir = TempDir::new("missing-or-corrupt");
+        assert!(
+            Archive::open_path(&dir.path().join("nope.sqlite"))
+                .expect("missing file is Ok(None)")
+                .is_none()
+        );
+
+        let corrupt = dir.path().join("corrupt.sqlite");
+        std::fs::write(&corrupt, b"not a valid sqlite database file!").unwrap();
+        assert!(
+            Archive::open_path(&corrupt).is_err(),
+            "corrupt database must propagate an error instead of returning None"
+        );
     }
 
     #[test]
     fn channels_filters_and_sorts_case_insensitively_with_unnamed_last() {
         let dir = TempDir::new("channels");
         let (db_path, ws) = populated_archive(&dir);
-        let archive = Archive::open_path(&db_path).expect("open archive");
+        let archive = Archive::open_path(&db_path)
+            .expect("open result")
+            .expect("open archive");
 
-        let channels = archive.channels(&ws);
+        let channels = archive.channels(&ws).expect("channels");
         let ids: Vec<&str> = channels.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["C_ALPHA", "C_BOB", "C_ENG", "C_UNNAMED"]);
 
@@ -468,15 +548,22 @@ mod tests {
         assert!(!channels[0].is_member);
         assert_eq!(channels[2].topic.as_deref(), Some("Build things"));
         assert_eq!(channels[3].label(), "C_UNNAMED");
+
+        let names = archive.channel_names(&ws).expect("channel_names");
+        assert_eq!(names.get("C_ENG").map(String::as_str), Some("#Engineering"));
+        assert_eq!(names.get("C_ALPHA").map(String::as_str), Some("#alpha"));
+        assert!(!names.contains_key("C_UNNAMED"));
     }
 
     #[test]
     fn dms_filters_and_sorts_by_latest_secs_desc_with_none_last() {
         let dir = TempDir::new("dms");
         let (db_path, ws) = populated_archive(&dir);
-        let archive = Archive::open_path(&db_path).expect("open archive");
+        let archive = Archive::open_path(&db_path)
+            .expect("open result")
+            .expect("open archive");
 
-        let dms = archive.dms(&ws);
+        let dms = archive.dms(&ws).expect("dms");
         let ids: Vec<&str> = dms.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(ids, vec!["G_MPIM", "D_ALICE", "D_BOB"]);
         assert_eq!(dms[0].latest_secs, Some(1_700_000_500));
@@ -488,78 +575,143 @@ mod tests {
     fn resolve_channel_respects_precedence_and_prefix_stripping() {
         let dir = TempDir::new("resolve");
         let (db_path, ws) = populated_archive(&dir);
-        let archive = Archive::open_path(&db_path).expect("open archive");
+        let archive = Archive::open_path(&db_path)
+            .expect("open result")
+            .expect("open archive");
 
         // Exact ID match.
         assert_eq!(
-            archive.resolve_channel(&ws, "C_ENG").map(|r| r.id),
+            archive
+                .resolve_channel(&ws, "C_ENG")
+                .expect("resolve")
+                .map(|r| r.id),
             Some(ChannelId::from("C_ENG"))
         );
         // Case-insensitive `#name` and bare `name`.
         assert_eq!(
-            archive.resolve_channel(&ws, "#engineering").map(|r| r.id),
+            archive
+                .resolve_channel(&ws, "#engineering")
+                .expect("resolve")
+                .map(|r| r.id),
             Some(ChannelId::from("C_ENG"))
         );
         assert_eq!(
-            archive.resolve_channel(&ws, "ENGINEERING").map(|r| r.id),
+            archive
+                .resolve_channel(&ws, "ENGINEERING")
+                .expect("resolve")
+                .map(|r| r.id),
             Some(ChannelId::from("C_ENG"))
         );
         // Channel name takes precedence over IM by user handle ("bob" is both #bob and @bob).
         assert_eq!(
-            archive.resolve_channel(&ws, "bob").map(|r| r.id),
+            archive
+                .resolve_channel(&ws, "bob")
+                .expect("resolve")
+                .map(|r| r.id),
             Some(ChannelId::from("C_BOB"))
         );
         // `@handle` and display/real name resolve to IM when no channel shares the name.
         assert_eq!(
-            archive.resolve_channel(&ws, "@alice").map(|r| r.id),
+            archive
+                .resolve_channel(&ws, "@alice")
+                .expect("resolve")
+                .map(|r| r.id),
             Some(ChannelId::from("D_ALICE"))
         );
         assert_eq!(
-            archive.resolve_channel(&ws, "Alice Display").map(|r| r.id),
+            archive
+                .resolve_channel(&ws, "Alice Display")
+                .expect("resolve")
+                .map(|r| r.id),
             Some(ChannelId::from("D_ALICE"))
         );
         assert_eq!(
-            archive.resolve_channel(&ws, "Bob Real").map(|r| r.id),
+            archive
+                .resolve_channel(&ws, "Bob Real")
+                .expect("resolve")
+                .map(|r| r.id),
             Some(ChannelId::from("D_BOB"))
         );
         // Unknown returns None.
-        assert!(archive.resolve_channel(&ws, "#does-not-exist").is_none());
+        assert!(
+            archive
+                .resolve_channel(&ws, "#does-not-exist")
+                .expect("resolve")
+                .is_none()
+        );
     }
 
     #[test]
-    fn user_display_falls_back_skipping_empty_strings() {
+    fn user_display_and_user_display_map_fall_back_skipping_empty_strings() {
         let dir = TempDir::new("user-display");
         let (db_path, ws) = populated_archive(&dir);
-        let archive = Archive::open_path(&db_path).expect("open archive");
+        let archive = Archive::open_path(&db_path)
+            .expect("open result")
+            .expect("open archive");
 
         assert_eq!(
-            archive.user_display(&ws, &UserId::from("U1")).as_deref(),
+            archive
+                .user_display(&ws, &UserId::from("U1"))
+                .expect("u1")
+                .as_deref(),
             Some("Alice Display")
         );
         assert_eq!(
-            archive.user_display(&ws, &UserId::from("U2")).as_deref(),
+            archive
+                .user_display(&ws, &UserId::from("U2"))
+                .expect("u2")
+                .as_deref(),
             Some("Bob Real")
         );
         assert_eq!(
-            archive.user_display(&ws, &UserId::from("U3")).as_deref(),
+            archive
+                .user_display(&ws, &UserId::from("U3"))
+                .expect("u3")
+                .as_deref(),
             Some("carol")
         );
-        assert_eq!(archive.user_display(&ws, &UserId::from("U_MISSING")), None);
+        assert_eq!(
+            archive
+                .user_display(&ws, &UserId::from("U_MISSING"))
+                .expect("missing"),
+            None
+        );
+
+        let map = archive.user_display_map(&ws).expect("user_display_map");
+        assert_eq!(
+            map.get(&UserId::from("U1")).map(String::as_str),
+            Some("Alice Display")
+        );
+        assert_eq!(
+            map.get(&UserId::from("U2")).map(String::as_str),
+            Some("Bob Real")
+        );
+        assert_eq!(
+            map.get(&UserId::from("U3")).map(String::as_str),
+            Some("carol")
+        );
+        assert_eq!(
+            map.get(&UserId::from("U5")).map(String::as_str),
+            Some("Former Member")
+        );
+        assert!(!map.contains_key(&UserId::from("U_MISSING")));
     }
 
     #[test]
     fn users_filters_deleted_and_substrings_and_orders_case_insensitively() {
         let dir = TempDir::new("users");
         let (db_path, ws) = populated_archive(&dir);
-        let archive = Archive::open_path(&db_path).expect("open archive");
+        let archive = Archive::open_path(&db_path)
+            .expect("open result")
+            .expect("open archive");
 
         // Active users only, sorted by effective display name.
-        let active = archive.users(&ws, None, false);
+        let active = archive.users(&ws, None, false).expect("active");
         let active_ids: Vec<&str> = active.iter().map(|u| u.id.as_str()).collect();
         assert_eq!(active_ids, vec!["U1", "U2", "U3", "U4"]);
 
         // Include deleted brings in U5 ("Former Member", between carol and Zeta Bot).
-        let all = archive.users(&ws, None, true);
+        let all = archive.users(&ws, None, true).expect("all");
         let all_ids: Vec<&str> = all.iter().map(|u| u.id.as_str()).collect();
         assert_eq!(all_ids, vec!["U1", "U2", "U3", "U5", "U4"]);
         assert!(all.iter().find(|u| u.id == "U4").is_some_and(|u| u.is_bot));
@@ -569,6 +721,7 @@ mod tests {
         assert_eq!(
             archive
                 .users(&ws, Some("  @ALICE "), false)
+                .expect("alice")
                 .into_iter()
                 .map(|u| u.id)
                 .collect::<Vec<_>>(),
@@ -577,6 +730,7 @@ mod tests {
         assert_eq!(
             archive
                 .users(&ws, Some("real"), false)
+                .expect("real")
                 .into_iter()
                 .map(|u| u.id)
                 .collect::<Vec<_>>(),
@@ -585,6 +739,7 @@ mod tests {
         assert_eq!(
             archive
                 .users(&ws, Some("u3"), false)
+                .expect("u3")
                 .into_iter()
                 .map(|u| u.id)
                 .collect::<Vec<_>>(),
@@ -593,22 +748,33 @@ mod tests {
         assert_eq!(
             archive
                 .users(&ws, Some("zeta"), false)
+                .expect("zeta")
                 .into_iter()
                 .map(|u| u.id)
                 .collect::<Vec<_>>(),
             vec!["U4"]
         );
         // Empty/whitespace query matches all active users.
-        assert_eq!(archive.users(&ws, Some("  @  "), false).len(), 4);
+        assert_eq!(
+            archive
+                .users(&ws, Some("  @  "), false)
+                .expect("blank")
+                .len(),
+            4
+        );
     }
 
     #[test]
     fn digest_since_enforces_cutoff_excludes_deleted_breaks_ties_and_truncates_utf8() {
         let dir = TempDir::new("digest");
         let (db_path, ws) = populated_archive(&dir);
-        let archive = Archive::open_path(&db_path).expect("open archive");
+        let archive = Archive::open_path(&db_path)
+            .expect("open result")
+            .expect("open archive");
 
-        let rows = archive.digest_since(&ws, 1_700_000_100, 10);
+        let rows = archive
+            .digest_since(&ws, 1_700_000_100, 10)
+            .expect("digest");
         assert_eq!(rows.len(), 3);
 
         // D_ALICE and C_ENG both have 2 non-deleted messages >= cutoff, but D_ALICE has newer max ts.
@@ -638,7 +804,9 @@ mod tests {
         assert_eq!(rows[2].latest_text, "orphan msg line2");
 
         // Limit caps returned conversations.
-        let limited = archive.digest_since(&ws, 1_700_000_100, 1);
+        let limited = archive
+            .digest_since(&ws, 1_700_000_100, 1)
+            .expect("limited");
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].channel, "D_ALICE");
     }
@@ -647,22 +815,40 @@ mod tests {
     fn latest_ts_message_count_and_notify_levels() {
         let dir = TempDir::new("meta");
         let (db_path, ws) = populated_archive(&dir);
-        let archive = Archive::open_path(&db_path).expect("open archive");
+        let archive = Archive::open_path(&db_path)
+            .expect("open result")
+            .expect("open archive");
 
         // Newest in C_ENG (1700000250) was deleted, so latest_ts skips it.
         assert_eq!(
-            archive.latest_ts(&ws, &ChannelId::from("C_ENG")).as_deref(),
+            archive
+                .latest_ts(&ws, &ChannelId::from("C_ENG"))
+                .expect("latest")
+                .as_deref(),
             Some("1700000200.000000")
         );
-        assert_eq!(archive.latest_ts(&ws, &ChannelId::from("C_ALPHA")), None);
+        assert_eq!(
+            archive
+                .latest_ts(&ws, &ChannelId::from("C_ALPHA"))
+                .expect("latest"),
+            None
+        );
 
         // message_count counts message_current rows for T1 only (4 in C_ENG + 2 in D_ALICE + 1 in C_ORPHAN).
-        assert_eq!(archive.message_count(&ws), 7);
-        assert_eq!(archive.message_count(&TeamId::from("T2")), 1);
-        assert_eq!(archive.message_count(&TeamId::from("T_NONE")), 0);
+        assert_eq!(archive.message_count(&ws).expect("count"), 7);
+        assert_eq!(
+            archive.message_count(&TeamId::from("T2")).expect("count"),
+            1
+        );
+        assert_eq!(
+            archive
+                .message_count(&TeamId::from("T_NONE"))
+                .expect("count"),
+            0
+        );
 
         // Valid notify_levels.
-        let levels = archive.notify_levels(&ws);
+        let levels = archive.notify_levels(&ws).expect("notify_levels");
         assert_eq!(
             levels.get(&ChannelId::from("C_ENG")),
             Some(&NotifyLevel::Muted)
@@ -672,7 +858,12 @@ mod tests {
             Some(&NotifyLevel::Mentions)
         );
         assert!(!levels.contains_key(&ChannelId::from("C_BOB")));
-        assert!(archive.notify_levels(&TeamId::from("T_NONE")).is_empty());
+        assert!(
+            archive
+                .notify_levels(&TeamId::from("T_NONE"))
+                .expect("notify")
+                .is_empty()
+        );
 
         // Malformed inner notification prefs JSON falls back to empty map.
         drop(archive);
@@ -685,8 +876,15 @@ mod tests {
             .expect("replace malformed prefs");
         drop(store);
 
-        let archive = Archive::open_path(&db_path).expect("reopen archive");
-        assert!(archive.notify_levels(&TeamId::from("T_BAD")).is_empty());
+        let archive = Archive::open_path(&db_path)
+            .expect("open result")
+            .expect("reopen archive");
+        assert!(
+            archive
+                .notify_levels(&TeamId::from("T_BAD"))
+                .expect("notify")
+                .is_empty()
+        );
     }
 
     #[test]

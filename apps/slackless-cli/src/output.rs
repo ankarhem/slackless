@@ -1,18 +1,20 @@
 //! Machine (`--json`) and human output shaping for every command.
 
+use std::collections::HashMap;
+
 use serde::Serialize;
 use slackless_core::store::StoredMessage;
-use slackless_core::types::TeamId;
+use slackless_core::types::UserId;
 
-use crate::archive::{Archive, ConversationRow};
+use crate::archive::ConversationRow;
 use crate::session::StatusEntry;
 
-/// Prints `value` as one JSON line.
+/// Prints `value` as one JSON line without panicking on serialization errors.
 pub fn emit_json(value: &impl Serialize) {
-    println!(
-        "{}",
-        serde_json::to_string(value).expect("view structs are plain data")
-    );
+    match serde_json::to_string(value) {
+        Ok(json) => println!("{json}"),
+        Err(err) => eprintln!("slackless: failed to serialize JSON output: {err}"),
+    }
 }
 
 /// Prints `value` as JSON for `--json`, otherwise the assembled human text.
@@ -52,12 +54,9 @@ pub struct MessageRow {
 }
 
 impl MessageRow {
-    /// One message as the archive renders it, with the author's name resolved when stored.
-    pub fn from_stored(
-        message: &StoredMessage,
-        archive: Option<&Archive>,
-        workspace: &TeamId,
-    ) -> Self {
+    /// One message as the archive renders it, resolving the author's display name from a
+    /// preloaded `user_names` map (avoiding per-row SQLite lookups).
+    pub fn from_stored(message: &StoredMessage, user_names: &HashMap<UserId, String>) -> Self {
         let inner = &message.message;
         Self {
             channel: message.channel.as_str().to_owned(),
@@ -66,7 +65,7 @@ impl MessageRow {
             user_name: inner
                 .user
                 .as_ref()
-                .and_then(|user| archive.and_then(|archive| archive.user_display(workspace, user))),
+                .and_then(|user| user_names.get(user).cloned()),
             bot_id: inner.bot_id.as_ref().map(|bot| bot.as_str().to_owned()),
             text: inner.text.clone(),
             thread_ts: inner.thread_ts.as_ref().map(|ts| ts.as_str().to_owned()),
@@ -139,7 +138,7 @@ pub fn channels_human(rows: &[ChannelView]) -> String {
         let name = row
             .name
             .as_deref()
-            .map_or_else(|| row.id.clone(), |name| format!("#{name}"));
+            .map_or_else(|| row.id.clone(), crate::archive::format_channel_name);
         let mut flags = String::new();
         if row.is_archived {
             flags.push_str(" (archived)");
@@ -169,11 +168,11 @@ pub struct DmView {
 }
 
 impl DmView {
-    pub fn from_row(row: &ConversationRow, archive: &Archive, workspace: &TeamId) -> Self {
+    pub fn from_row(row: &ConversationRow, user_names: &HashMap<UserId, String>) -> Self {
         let user_name = row
             .user
             .as_ref()
-            .and_then(|user| archive.user_display(workspace, user));
+            .and_then(|user| user_names.get(user).cloned());
         Self {
             id: row.id.as_str().to_owned(),
             user: row.user.as_ref().map(|user| user.as_str().to_owned()),
@@ -276,9 +275,11 @@ mod tests {
 
     use slackless_core::store::Store;
     use slackless_core::types::{
-        BotId, ChannelId, Edited, File, FileId, Message, MessageSubtype, Profile, Reaction, Ts,
-        User, UserId,
+        BotId, ChannelId, Edited, File, FileId, Message, MessageSubtype, Profile, Reaction, TeamId,
+        Ts, User,
     };
+
+    use crate::archive::Archive;
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -312,7 +313,10 @@ mod tests {
             .expect("upsert user");
         drop(store);
 
-        let archive = Archive::open_path(&path).expect("open archive");
+        let archive = Archive::open_path(&path)
+            .expect("open result")
+            .expect("open archive");
+        let user_names = archive.user_display_map(&ws).expect("user_display_map");
         let stored = StoredMessage {
             channel: ChannelId::from("C1"),
             deleted: true,
@@ -365,7 +369,7 @@ mod tests {
             },
         };
 
-        let row = MessageRow::from_stored(&stored, Some(&archive), &ws);
+        let row = MessageRow::from_stored(&stored, &user_names);
         assert_eq!(row.channel, "C1");
         assert_eq!(row.ts, "1700000001.000100");
         assert_eq!(row.user.as_deref(), Some("U1"));
@@ -385,8 +389,9 @@ mod tests {
             Some("https://acme.slack.com/archives/C1/p1")
         );
 
-        // Without archive, user_name stays None.
-        let row_no_archive = MessageRow::from_stored(&stored, None, &ws);
+        // Without user names, user_name stays None.
+        let empty = HashMap::new();
+        let row_no_archive = MessageRow::from_stored(&stored, &empty);
         assert_eq!(row_no_archive.user_name, None);
 
         drop(archive);

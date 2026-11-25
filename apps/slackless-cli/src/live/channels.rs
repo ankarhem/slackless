@@ -2,17 +2,23 @@
 
 use std::collections::HashMap;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Result;
 use slackless_core::NotifyLevel;
 use slackless_core::api::{ApiError, ClientCounts, ConversationCounts, HistoryOpts};
 use slackless_core::types::{ChannelId, TeamId};
 
+use crate::Ctx;
 use crate::archive::Archive;
 use crate::output;
-use crate::{Ctx, fail};
 
-use super::session::{api_fail, api_for, display_channel, resolve_channel};
+use super::session::{api_fail, api_for, display_channel, resolve_channel_with};
+
+/// Maximum 429 rate-limit waits per history page (aligned with `slackless_core::backfill`).
+pub(crate) const MAX_RATE_LIMIT_WAITS: u32 = 5;
+/// Polite Tier-3 delay between `conversations.history` pages.
+const BACKFILL_PAGE_DELAY: Duration = Duration::from_millis(1200);
 
 pub(crate) struct UnreadSummary {
     pub items: Vec<serde_json::Value>,
@@ -96,28 +102,32 @@ pub(crate) fn format_unread_json(
 
 /// `unread`: live unread channels, DMs, mentions, and threads (`client.counts`).
 pub async fn run_unread(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let counts = match api.client_counts().await {
+    let counts = match session.api.client_counts().await {
         Ok(c) => c,
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
-    let archive = Archive::open(&workspace);
+    let archive = Archive::open(&session.workspace).ok().flatten();
     let notify_levels = archive
         .as_ref()
-        .map(|a| a.notify_levels(&workspace))
+        .and_then(|a| a.notify_levels(&session.workspace).ok())
+        .unwrap_or_default();
+    // Batch-load all conversation labels in one query instead of N+1 `resolve_channel` calls.
+    let channel_names = archive
+        .as_ref()
+        .and_then(|a| a.channel_names(&session.workspace).ok())
         .unwrap_or_default();
     let label_for = |id: &ChannelId| -> String {
-        archive
-            .as_ref()
-            .and_then(|a| a.resolve_channel(&workspace, id.as_str()))
-            .map(|r| r.label())
+        channel_names
+            .get(id.as_str())
+            .cloned()
             .unwrap_or_else(|| id.to_string())
     };
     let summary = summarize_unread(&counts, &notify_levels, label_for);
-    let json = format_unread_json(&workspace, &summary, counts.threads.mention_count);
+    let json = format_unread_json(&session.workspace, &summary, counts.threads.mention_count);
     output::emit(ctx.json, &json, &summary.human);
     Ok(ExitCode::SUCCESS)
 }
@@ -128,6 +138,12 @@ pub(crate) fn clamp_backfill_page_size(page_size: u32) -> u32 {
 
 pub(crate) fn backfill_should_stop(max_pages: usize, pages_fetched: usize) -> bool {
     max_pages > 0 && pages_fetched >= max_pages
+}
+
+/// Returns the next pagination cursor if non-empty and strictly different from `current`
+/// (stuck-cursor guard matching `slackless_core::backfill`).
+pub(crate) fn next_backfill_cursor(current: Option<&str>, next: Option<String>) -> Option<String> {
+    next.filter(|c| !c.is_empty() && current != Some(c.as_str()))
 }
 
 pub(crate) fn format_backfill_output(
@@ -155,8 +171,8 @@ pub(crate) fn format_backfill_output(
 }
 
 /// `backfill <CHANNEL> [--pages N] [--page-size N]`
-/// Walks `conversations.history` pages politely (Tier-3 pacing + 429 retry) and upserts every
-/// fetched message into the local SQLite archive (`X-1`).
+/// Walks `conversations.history` pages politely (Tier-3 pacing, bounded 429 waits, stuck-cursor
+/// guard) and batch-upserts each page into the local SQLite archive in one transaction (`X-1`).
 pub async fn run_backfill(
     ctx: &Ctx,
     flag: Option<&str>,
@@ -164,19 +180,12 @@ pub async fn run_backfill(
     max_pages: usize,
     page_size: u32,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel(&workspace, channel_arg);
-    let Some(path) = crate::archive::store_path(&workspace) else {
-        return Ok(fail(
-            ctx,
-            "no_store_path",
-            "could not resolve local archive path",
-        ));
-    };
-    let mut store = slackless_store::Store::open(&path)?;
+    let mut archive = Archive::open_or_create_rw(&session.workspace)?;
+    let (channel, label) = resolve_channel_with(Some(&archive), &session.workspace, channel_arg);
     let opts = HistoryOpts {
         limit: Some(clamp_backfill_page_size(page_size)),
         ..Default::default()
@@ -190,29 +199,32 @@ pub async fn run_backfill(
         if backfill_should_stop(max_pages, pages_fetched) {
             break;
         }
+        let mut waits = 0u32;
         let page = loop {
-            match api
+            match session
+                .api
                 .conversations_history(&channel, &opts, cursor.clone())
                 .await
             {
                 Ok(page) => break page,
-                Err(ApiError::RateLimited { retry_after }) => {
-                    tokio::time::sleep(retry_after.max(std::time::Duration::from_secs(1))).await;
+                Err(ApiError::RateLimited { retry_after }) if waits < MAX_RATE_LIMIT_WAITS => {
+                    waits += 1;
+                    tokio::time::sleep(retry_after.max(Duration::from_secs(1))).await;
                 }
                 Err(err) => return Ok(api_fail(ctx, &err)),
             }
         };
         pages_fetched += 1;
-        for msg in &page.items {
-            store.upsert_message(&workspace, &channel, msg)?;
-            messages_stored += 1;
-        }
-        match page.next_cursor {
-            Some(next) if !next.is_empty() => {
+        archive
+            .store_mut()
+            .upsert_messages(&session.workspace, &channel, &page.items)?;
+        messages_stored += page.items.len();
+        match next_backfill_cursor(cursor.as_deref(), page.next_cursor) {
+            Some(next) => {
                 cursor = Some(next);
-                tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+                tokio::time::sleep(BACKFILL_PAGE_DELAY).await;
             }
-            _ => {
+            None => {
                 reached_end = true;
                 break;
             }
@@ -220,7 +232,7 @@ pub async fn run_backfill(
     }
 
     let (json, human) = format_backfill_output(
-        &workspace,
+        &session.workspace,
         &channel,
         label.as_deref(),
         pages_fetched,
