@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::input::TextareaState;
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
@@ -1084,30 +1084,30 @@ fn card_view(
                 .border_t_1()
                 .border_color(border)
                 .child(
-                    div()
+                    crate::preferences::text_input_box(&input, true, cx)
                         .flex_1()
-                        .min_w_0()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(border)
-                        .child(Textarea::new(&input).appearance(false).bordered(false)),
+                        .min_w_0(),
                 )
                 .child(
-                    Button::new(("unreads-reply-cancel", ix))
-                        .ghost()
-                        .with_size(Size::Small)
-                        .label("Cancel")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.replying = None;
-                            cx.notify();
-                        })),
+                    crate::preferences::form_button(
+                        Button::new(("unreads-reply-cancel", ix))
+                            .ghost()
+                            .label("Cancel"),
+                        cx,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.replying = None;
+                        cx.notify();
+                    })),
                 )
                 .child(
-                    Button::new(("unreads-reply-send", ix))
-                        .primary()
-                        .with_size(Size::Small)
-                        .label("Send")
-                        .on_click(cx.listener(move |this, _, _, cx| this.submit_reply(ix, cx))),
+                    crate::preferences::form_button(
+                        Button::new(("unreads-reply-send", ix))
+                            .primary()
+                            .label("Send"),
+                        cx,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.submit_reply(ix, cx))),
                 )
         })
     } else {

@@ -23,9 +23,10 @@ impl App {
         let is_private = cx.new(|_| false);
         name_state.read(cx).focus_handle(cx).focus(window, cx);
         window.open_dialog(cx, move |dialog, _, cx| {
+            let m = preferences::control_metrics(cx);
             let theme = cx.theme();
-            let (border, muted, bg, fg, accent) = (
-                theme.border,
+            let (input_border, muted, bg, fg, accent) = (
+                theme.input,
                 theme.muted_foreground,
                 theme.background,
                 theme.foreground,
@@ -63,18 +64,7 @@ impl App {
                                     .text_color(muted)
                                     .child("Name"),
                             )
-                            .child(
-                                div()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(border)
-                                    .bg(bg)
-                                    .child(
-                                        Textarea::new(&name_state)
-                                            .appearance(false)
-                                            .bordered(false),
-                                    ),
-                            )
+                            .child(preferences::text_input_box(&name_state, false, cx).bg(bg))
                             .when(!preview.is_empty(), |col| {
                                 col.child(div().text_xs().text_color(muted).child(preview))
                             }),
@@ -96,13 +86,17 @@ impl App {
                                         h_flex()
                                             .id("create-ch-public")
                                             .flex_1()
+                                            .h(m.height)
                                             .items_center()
                                             .gap_2()
                                             .px_3()
-                                            .py_2()
                                             .rounded_md()
                                             .border_1()
-                                            .border_color(if !private_now { accent } else { border })
+                                            .border_color(if !private_now {
+                                                accent
+                                            } else {
+                                                input_border
+                                            })
                                             .cursor_pointer()
                                             .text_sm()
                                             .text_color(fg)
@@ -119,13 +113,17 @@ impl App {
                                         h_flex()
                                             .id("create-ch-private")
                                             .flex_1()
+                                            .h(m.height)
                                             .items_center()
                                             .gap_2()
                                             .px_3()
-                                            .py_2()
                                             .rounded_md()
                                             .border_1()
-                                            .border_color(if private_now { accent } else { border })
+                                            .border_color(if private_now {
+                                                accent
+                                            } else {
+                                                input_border
+                                            })
                                             .cursor_pointer()
                                             .text_sm()
                                             .text_color(fg)
@@ -150,36 +148,25 @@ impl App {
                                     .text_color(muted)
                                     .child("Description"),
                             )
-                            .child(
-                                div()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(border)
-                                    .bg(bg)
-                                    .child(
-                                        Textarea::new(&purpose_state)
-                                            .appearance(false)
-                                            .bordered(false),
-                                    ),
-                            ),
+                            .child(preferences::text_input_box(&purpose_state, true, cx).bg(bg)),
                     )
                     .child(
                         h_flex()
                             .justify_end()
                             .gap_2()
                             .child(
-                                Button::new("create-ch-cancel")
-                                    .outline()
-                                    .with_size(Size::Small)
-                                    .label("Cancel")
-                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                                preferences::form_button(
+                                    Button::new("create-ch-cancel").outline().label("Cancel"),
+                                    cx,
+                                )
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
                             )
                             .child(
-                                Button::new("create-ch-submit")
-                                    .primary()
-                                    .with_size(Size::Small)
-                                    .label("Create")
-                                    .on_click(move |_, window, cx| {
+                                preferences::form_button(
+                                    Button::new("create-ch-submit").primary().label("Create"),
+                                    cx,
+                                )
+                                .on_click(move |_, window, cx| {
                                         let slug = channel_details::normalize_channel_slug(
                                             name_s.read(cx).value().as_ref(),
                                         );
@@ -275,8 +262,7 @@ impl App {
         };
         window.open_dialog(cx, move |dialog, _, cx| {
             let theme = cx.theme();
-            let (border, muted, bg, fg, hover, accent) = (
-                theme.border,
+            let (muted, bg, fg, hover, accent) = (
                 theme.muted_foreground,
                 theme.background,
                 theme.foreground,
@@ -331,18 +317,7 @@ impl App {
                 v_flex()
                     .gap_3()
                     .p_4()
-                    .child(
-                        div()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(border)
-                            .bg(bg)
-                            .child(
-                                Textarea::new(&filter_state)
-                                    .appearance(false)
-                                    .bordered(false),
-                            ),
-                    )
+                    .child(preferences::search_input_box(&filter_state, cx).bg(bg))
                     .child(
                         v_flex()
                             .id("add-people-list")
@@ -374,18 +349,23 @@ impl App {
                                 h_flex()
                                     .gap_2()
                                     .child(
-                                        Button::new("add-people-cancel")
-                                            .outline()
-                                            .with_size(Size::Small)
-                                            .label("Cancel")
-                                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                                        preferences::form_button(
+                                            Button::new("add-people-cancel")
+                                                .outline()
+                                                .label("Cancel"),
+                                            cx,
+                                        )
+                                        .on_click(|_, window, cx| window.close_dialog(cx)),
                                     )
                                     .child(
-                                        Button::new("add-people-confirm")
-                                            .primary()
-                                            .with_size(Size::Small)
-                                            .label(if is_dm { "Open group DM" } else { "Add" })
-                                            .on_click(move |_, window, cx| {
+                                        preferences::form_button(
+                                            Button::new("add-people-confirm")
+                                                .primary()
+                                                .label(if is_dm { "Open group DM" } else { "Add" }),
+                                            cx,
+                                        )
+                                        .on_click(
+                                            move |_, window, cx| {
                                                 let chosen = sel_submit.read(cx).clone();
                                                 if chosen.is_empty() {
                                                     return;
@@ -428,7 +408,8 @@ impl App {
                                                         );
                                                     }
                                                 });
-                                            }),
+                                            },
+                                        ),
                                     ),
                             ),
                     ),
@@ -580,18 +561,20 @@ impl App {
                                     .justify_end()
                                     .gap_2()
                                     .child(
-                                        Button::new("archive-cancel")
-                                            .outline()
-                                            .with_size(Size::Small)
-                                            .label("Cancel")
-                                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                                        preferences::form_button(
+                                            Button::new("archive-cancel").outline().label("Cancel"),
+                                            cx,
+                                        )
+                                        .on_click(|_, window, cx| window.close_dialog(cx)),
                                     )
                                     .child(
-                                        Button::new("archive-confirm")
-                                            .danger()
-                                            .with_size(Size::Small)
-                                            .label("Archive channel")
-                                            .on_click(move |_, window, cx| {
+                                        preferences::form_button(
+                                            Button::new("archive-confirm")
+                                                .danger()
+                                                .label("Archive channel"),
+                                            cx,
+                                        )
+                                        .on_click(move |_, window, cx| {
                                                 window.close_dialog(cx);
                                                 let _ = this.update(cx, |app, cx| {
                                                     app.bridge
@@ -667,18 +650,22 @@ impl App {
                                         .justify_end()
                                         .gap_2()
                                         .child(
-                                            Button::new("delete-ch-cancel")
-                                                .outline()
-                                                .with_size(Size::Small)
-                                                .label("Cancel")
-                                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                                            preferences::form_button(
+                                                Button::new("delete-ch-cancel")
+                                                    .outline()
+                                                    .label("Cancel"),
+                                                cx,
+                                            )
+                                            .on_click(|_, window, cx| window.close_dialog(cx)),
                                         )
                                         .child(
-                                            Button::new("delete-ch-confirm")
-                                                .danger()
-                                                .with_size(Size::Small)
-                                                .label("Delete permanently")
-                                                .on_click(move |_, window, cx| {
+                                            preferences::form_button(
+                                                Button::new("delete-ch-confirm")
+                                                    .danger()
+                                                    .label("Delete permanently"),
+                                                cx,
+                                            )
+                                            .on_click(move |_, window, cx| {
                                                     window.close_dialog(cx);
                                                     let _ = this.update(cx, |app, cx| {
                                                         if !app.fixtures.sample {
@@ -722,18 +709,22 @@ impl App {
                                         .justify_end()
                                         .gap_2()
                                         .child(
-                                            Button::new("convert-priv-cancel")
-                                                .outline()
-                                                .with_size(Size::Small)
-                                                .label("Cancel")
-                                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                                            preferences::form_button(
+                                                Button::new("convert-priv-cancel")
+                                                    .outline()
+                                                    .label("Cancel"),
+                                                cx,
+                                            )
+                                            .on_click(|_, window, cx| window.close_dialog(cx)),
                                         )
                                         .child(
-                                            Button::new("convert-priv-confirm")
-                                                .primary()
-                                                .with_size(Size::Small)
-                                                .label("Convert to private")
-                                                .on_click(move |_, window, cx| {
+                                            preferences::form_button(
+                                                Button::new("convert-priv-confirm")
+                                                    .primary()
+                                                    .label("Convert to private"),
+                                                cx,
+                                            )
+                                            .on_click(move |_, window, cx| {
                                                     window.close_dialog(cx);
                                                     let _ = this.update(cx, |app, cx| {
                                                         if !app.fixtures.sample {
@@ -955,19 +946,23 @@ impl App {
                                     h_flex()
                                         .gap_2()
                                         .child(
-                                            Button::new("cleanup-cancel")
-                                                .outline()
-                                                .with_size(Size::Small)
-                                                .label("Cancel")
-                                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                                            preferences::form_button(
+                                                Button::new("cleanup-cancel")
+                                                    .outline()
+                                                    .label("Cancel"),
+                                                cx,
+                                            )
+                                            .on_click(|_, window, cx| window.close_dialog(cx)),
                                         )
                                         .child(
-                                            Button::new("cleanup-leave")
-                                                .danger()
-                                                .with_size(Size::Small)
-                                                .disabled(sel_count == 0)
-                                                .label(format!("Leave selected ({sel_count})"))
-                                                .on_click(move |_, window, cx| {
+                                            preferences::form_button(
+                                                Button::new("cleanup-leave")
+                                                    .danger()
+                                                    .disabled(sel_count == 0)
+                                                    .label(format!("Leave selected ({sel_count})")),
+                                                cx,
+                                            )
+                                            .on_click(move |_, window, cx| {
                                                     let targets: Vec<ChannelId> = sel_for_leave
                                                         .read(cx)
                                                         .iter()

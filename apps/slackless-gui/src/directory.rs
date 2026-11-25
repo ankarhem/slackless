@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{InputEvent, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
@@ -266,25 +266,10 @@ impl Render for DirectoryView {
                     .children(tab_row),
             )
             .child(
-                h_flex()
+                crate::preferences::search_input_box(&self.filter, cx)
                     .flex_none()
                     .mx_4()
-                    .my_2()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .child(Icon::new(IconName::Search).text_color(muted).size(px(14.)))
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Textarea::new(&self.filter)
-                                .appearance(false)
-                                .bordered(false),
-                        ),
-                    ),
+                    .my_2(),
             )
             .child(
                 div()
@@ -339,14 +324,14 @@ fn open_new_usergroup_dialog(
     name_in.read(cx).focus_handle(cx).focus(window, cx);
     window.open_dialog(cx, move |dialog, _, cx| {
         let theme = cx.theme();
-        let (border, muted, bg) = (theme.border, theme.muted_foreground, theme.background);
+        let (muted, bg) = (theme.muted_foreground, theme.background);
         let (n_c, h_c, d_c, v_c) = (
             name_in.clone(),
             handle_in.clone(),
             desc_in.clone(),
             view.clone(),
         );
-        let field = |label: &'static str, st: &Entity<TextareaState>| {
+        let field = |label: &'static str, st: &Entity<TextareaState>, multi_line: bool| {
             v_flex()
                 .gap_1()
                 .child(
@@ -356,61 +341,54 @@ fn open_new_usergroup_dialog(
                         .text_color(muted)
                         .child(label),
                 )
-                .child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(border)
-                        .bg(bg)
-                        .child(Textarea::new(st).appearance(false).bordered(false)),
-                )
+                .child(crate::preferences::text_input_box(st, multi_line, cx).bg(bg))
         };
         dialog.title("Create user group").w(px(420.)).child(
             v_flex()
                 .gap_3()
                 .p_4()
-                .child(field("Name", &name_in))
-                .child(field("Handle (@handle)", &handle_in))
-                .child(field("Description", &desc_in))
+                .child(field("Name", &name_in, false))
+                .child(field("Handle (@handle)", &handle_in, false))
+                .child(field("Description", &desc_in, true))
                 .child(
                     h_flex()
                         .justify_end()
                         .gap_2()
                         .child(
-                            Button::new("ug-create-cancel")
-                                .outline()
-                                .with_size(Size::Small)
-                                .label("Cancel")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                            crate::preferences::form_button(
+                                Button::new("ug-create-cancel").outline().label("Cancel"),
+                                cx,
+                            )
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(
-                            Button::new("ug-create-submit")
-                                .primary()
-                                .with_size(Size::Small)
-                                .label("Create group")
-                                .on_click(move |_, window, cx| {
-                                    let name = n_c.read(cx).value().trim().to_owned();
-                                    let handle = h_c
-                                        .read(cx)
-                                        .value()
-                                        .trim()
-                                        .trim_start_matches('@')
-                                        .to_owned();
-                                    let description = d_c.read(cx).value().trim().to_owned();
-                                    if name.is_empty() {
-                                        return;
-                                    }
-                                    window.close_dialog(cx);
-                                    let _ = v_c.update(cx, |_, cx| {
-                                        cx.emit(DirectoryEvent::CreateUsergroup {
-                                            name,
-                                            handle,
-                                            description,
-                                        });
+                            crate::preferences::form_button(
+                                Button::new("ug-create-submit")
+                                    .primary()
+                                    .label("Create group"),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                let name = n_c.read(cx).value().trim().to_owned();
+                                let handle = h_c
+                                    .read(cx)
+                                    .value()
+                                    .trim()
+                                    .trim_start_matches('@')
+                                    .to_owned();
+                                let description = d_c.read(cx).value().trim().to_owned();
+                                if name.is_empty() {
+                                    return;
+                                }
+                                window.close_dialog(cx);
+                                let _ = v_c.update(cx, |_, cx| {
+                                    cx.emit(DirectoryEvent::CreateUsergroup {
+                                        name,
+                                        handle,
+                                        description,
                                     });
-                                }),
+                                });
+                            }),
                         ),
                 ),
         )

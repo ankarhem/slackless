@@ -13,10 +13,8 @@ use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Textarea, TextareaState};
-use gpui_kit::component::{
-    ActiveTheme as _, Icon, Sizable as _, Size, WindowExt as _, h_flex, v_flex,
-};
+use gpui_kit::component::input::TextareaState;
+use gpui_kit::component::{ActiveTheme as _, Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     App, AppContext as _, Div, Entity, FontWeight, InteractiveElement as _, ParentElement as _,
@@ -204,7 +202,7 @@ pub fn bar(
 }
 
 /// One labelled input of the add-link dialog.
-fn field(label: &'static str, input: &Entity<TextareaState>) -> Div {
+fn field(label: &'static str, input: &Entity<TextareaState>, cx: &App) -> Div {
     v_flex()
         .gap_1()
         .child(
@@ -213,7 +211,7 @@ fn field(label: &'static str, input: &Entity<TextareaState>) -> Div {
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(label),
         )
-        .child(Textarea::new(input))
+        .child(crate::preferences::text_input_box(input, false, cx))
 }
 
 /// The add-link dialog: link and title fields. Add calls `on_add(title, url, cx)` for a
@@ -234,40 +232,40 @@ pub fn open_add_dialog(
             .placeholder("Title")
             .auto_grow(1, 1)
     });
-    window.open_dialog(cx, move |dialog, _, _| {
+    window.open_dialog(cx, move |dialog, _, cx| {
         let (link, title, on_add) = (link.clone(), title.clone(), on_add.clone());
         dialog.title("Add a bookmark").w(px(460.)).child(
             v_flex()
                 .gap_3()
                 .p_4()
-                .child(field("Link", &link))
-                .child(field("Title", &title))
+                .child(field("Link", &link, cx))
+                .child(field("Title", &title, cx))
                 .child(
                     h_flex()
                         .justify_end()
                         .gap_2()
                         .child(
-                            Button::new("link-cancel")
-                                .ghost()
-                                .with_size(Size::Small)
-                                .label("Cancel")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                            crate::preferences::form_button(
+                                Button::new("link-cancel").outline().label("Cancel"),
+                                cx,
+                            )
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(
-                            Button::new("link-add")
-                                .primary()
-                                .with_size(Size::Small)
-                                .label("Add")
-                                .on_click(move |_, window, cx| {
-                                    let url = link.read(cx).value().trim().to_string();
-                                    if url.is_empty() {
-                                        return;
-                                    }
-                                    let title = title.read(cx).value().trim().to_string();
-                                    let title = if title.is_empty() { url.clone() } else { title };
-                                    on_add(title, url, cx);
-                                    window.close_dialog(cx);
-                                }),
+                            crate::preferences::form_button(
+                                Button::new("link-add").primary().label("Add"),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                let url = link.read(cx).value().trim().to_string();
+                                if url.is_empty() {
+                                    return;
+                                }
+                                let title = title.read(cx).value().trim().to_string();
+                                let title = if title.is_empty() { url.clone() } else { title };
+                                on_add(title, url, cx);
+                                window.close_dialog(cx);
+                            }),
                         ),
                 ),
         )

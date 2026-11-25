@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{InputEvent, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
@@ -565,25 +565,10 @@ impl Render for ToolsPage {
                     .children(tabs),
             )
             .child(
-                h_flex()
+                crate::preferences::search_input_box(&self.filter, cx)
                     .flex_none()
                     .mx_4()
-                    .mt_3()
-                    .items_center()
-                    .gap_2()
-                    .px_2p5()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .child(Icon::new(IconName::Search).size(px(14.)).text_color(muted))
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Textarea::new(&self.filter)
-                                .appearance(false)
-                                .bordered(false),
-                        ),
-                    ),
+                    .mt_3(),
             )
             .child(
                 v_flex()

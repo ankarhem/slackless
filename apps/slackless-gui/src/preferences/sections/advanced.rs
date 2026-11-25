@@ -46,7 +46,7 @@ impl Preferences {
             |s| &mut s.debug_logging,
             cx,
         );
-        let links = self.select("adv-links", &OPEN_LINKS, |s| &mut s.open_links, cx);
+        let links = self.select_w("adv-links", 220., &OPEN_LINKS, |s| &mut s.open_links, cx);
         let remote_search = self.checkbox(
             "adv-remote-search",
             "Also search Slack remotely by default (slower; local FTS5 stays instant otherwise)",
@@ -83,34 +83,30 @@ impl Preferences {
             |s| &mut s.search_in_channel,
             cx,
         );
-        let excluded_border = cx.theme().input;
-        let excluded_input = div()
-            .w(px(420.))
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(excluded_border)
-            .text_sm()
-            .child(
-                Textarea::new(&self.excluded_channels)
-                    .appearance(false)
-                    .bordered(false),
-            );
-        let compact_db = Button::new("adv-compact-db")
-            .outline()
-            .with_size(Size::Small)
-            .label("Compact database")
+        let m = self.metrics();
+        let excluded_input = text_input_box_for(&self.excluded_channels, true, false, m, cx)
+            .w_full()
+            .max_w(px(420.));
+        let compact_db = self
+            .btn(
+                Button::new("adv-compact-db")
+                    .outline()
+                    .label("Compact database"),
+            )
             .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::CompactStorage)));
-        let prune_media = Button::new("adv-prune-media")
-            .outline()
-            .with_size(Size::Small)
-            .label("Prune media cache")
+        let prune_media = self
+            .btn(
+                Button::new("adv-prune-media")
+                    .outline()
+                    .label("Prune media cache"),
+            )
             .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::PruneMediaCache)));
-        let reset_cache = Button::new("adv-reset-cache")
-            .danger()
-            .with_size(Size::Small)
-            .label("Clear local cache & reload")
+        let reset_cache = self
+            .btn(
+                Button::new("adv-reset-cache")
+                    .danger()
+                    .label("Clear local cache & reload"),
+            )
             .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::ResetCache)));
         let storage_summary = {
             let theme = cx.theme();
@@ -191,19 +187,19 @@ impl Preferences {
         let has_custom_dl = !self.settings.download_dir.is_empty();
         let dl_muted = cx.theme().muted_foreground;
         let dl_fg = cx.theme().foreground;
-        let dl_border = cx.theme().border;
+        let dl_border = cx.theme().input;
         let dl_bg = cx.theme().secondary.opacity(0.35);
         let dl_mono = cx.theme().mono_font_family.clone();
         let download_row = h_flex()
             .items_center()
             .gap_2()
             .child(
-                div()
+                h_flex()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
+                    .h(m.height)
+                    .items_center()
                     .px_3()
-                    .py_1p5()
                     .rounded_md()
                     .border_1()
                     .border_color(dl_border)
@@ -211,40 +207,37 @@ impl Preferences {
                     .font_family(dl_mono)
                     .text_xs()
                     .text_color(if has_custom_dl { dl_fg } else { dl_muted })
-                    .child(dl_label),
+                    .child(div().flex_1().min_w_0().truncate().child(dl_label)),
             )
             .child(
-                Button::new("adv-dl-choose")
-                    .outline()
-                    .with_size(Size::Small)
-                    .label("Choose folder\u{2026}")
-                    .on_click(cx.listener(|_, _, _, cx| {
-                        let rx = cx.prompt_for_paths(PathPromptOptions {
-                            files: false,
-                            directories: true,
-                            multiple: false,
-                            prompt: Some("Choose download folder".into()),
-                        });
-                        cx.spawn(async move |this, cx| {
-                            if let Ok(Ok(Some(paths))) = rx.await
-                                && let Some(path) = paths.into_iter().next()
-                            {
-                                let _ = this.update(cx, |prefs, cx| {
-                                    prefs.settings.download_dir =
-                                        path.to_string_lossy().into_owned();
-                                    prefs.changed(cx);
-                                });
-                            }
-                        })
-                        .detach();
-                    })),
+                self.btn(
+                    Button::new("adv-dl-choose")
+                        .outline()
+                        .label("Choose folder\u{2026}"),
+                )
+                .on_click(cx.listener(|_, _, _, cx| {
+                    let rx = cx.prompt_for_paths(PathPromptOptions {
+                        files: false,
+                        directories: true,
+                        multiple: false,
+                        prompt: Some("Choose download folder".into()),
+                    });
+                    cx.spawn(async move |this, cx| {
+                        if let Ok(Ok(Some(paths))) = rx.await
+                            && let Some(path) = paths.into_iter().next()
+                        {
+                            let _ = this.update(cx, |prefs, cx| {
+                                prefs.settings.download_dir = path.to_string_lossy().into_owned();
+                                prefs.changed(cx);
+                            });
+                        }
+                    })
+                    .detach();
+                })),
             )
             .when(has_custom_dl, |row| {
                 row.child(
-                    Button::new("adv-dl-reset")
-                        .ghost()
-                        .with_size(Size::Small)
-                        .label("Reset")
+                    self.btn(Button::new("adv-dl-reset").ghost().label("Reset"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.settings.download_dir.clear();
                             this.changed(cx);
@@ -257,19 +250,10 @@ impl Preferences {
             |s| &mut s.ask_download_location,
             cx,
         );
-        let protocol_input = div()
-            .w(px(420.))
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(excluded_border)
-            .text_sm()
-            .child(
-                Textarea::new(&self.protocol_allowlist_input)
-                    .appearance(false)
-                    .bordered(false),
-            );
+        let protocol_input =
+            text_input_box_for(&self.protocol_allowlist_input, false, false, m, cx)
+                .w_full()
+                .max_w(px(420.));
         let network_group = self.network_diagnostics_group(cx);
         v_flex()
             .child(self.group(
@@ -334,28 +318,16 @@ impl Preferences {
     }
 
     fn network_diagnostics_group(&mut self, cx: &mut Context<Self>) -> Div {
+        let m = self.metrics();
         let theme = cx.theme();
-        let dl_border = theme.input;
-        let mono = theme.mono_font_family.clone();
         let dot_color = if self.settings.net_log_enabled {
             theme.success
         } else {
             theme.muted_foreground
         };
-        let proxy_field = div()
-            .w(px(420.))
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(dl_border)
-            .font_family(mono)
-            .text_xs()
-            .child(
-                Textarea::new(&self.proxy_input)
-                    .appearance(false)
-                    .bordered(false),
-            );
+        let proxy_field = text_input_box_for(&self.proxy_input, false, true, m, cx)
+            .w_full()
+            .max_w(px(420.));
         let net_log_toggle = self.checkbox(
             "adv-net-log",
             "Capture HTTP net-log diagnostics (credentials redacted; last 500 requests)",
@@ -384,26 +356,26 @@ impl Preferences {
                 .items_center()
                 .gap_1p5()
                 .child(
-                    Button::new("adv-net-log-clear")
-                        .ghost()
-                        .with_size(Size::Small)
-                        .disabled(net_log_count == 0)
-                        .label("Clear")
-                        .on_click(cx.listener(|_, _, _, cx| {
-                            slackless_core::api::clear_net_log();
-                            cx.notify();
-                        })),
+                    self.btn(
+                        Button::new("adv-net-log-clear")
+                            .ghost()
+                            .disabled(net_log_count == 0)
+                            .label("Clear"),
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        slackless_core::api::clear_net_log();
+                        cx.notify();
+                    })),
                 )
                 .child(
-                    Button::new("adv-net-log-export")
-                        .outline()
-                        .with_size(Size::Small)
-                        .disabled(net_log_count == 0)
-                        .icon(IconName::Download)
-                        .label("Export")
-                        .on_click(
-                            cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::ExportNetLog)),
-                        ),
+                    self.btn(
+                        Button::new("adv-net-log-export")
+                            .outline()
+                            .disabled(net_log_count == 0)
+                            .icon(IconName::Download)
+                            .label("Export"),
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::ExportNetLog))),
                 ),
             cx,
         );

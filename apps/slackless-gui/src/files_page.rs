@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{InputEvent, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
@@ -525,27 +525,7 @@ impl FilesPage {
 
     /// Slack's search box: a full-width field led by the magnifier.
     fn search_field(&self, cx: &Context<Self>) -> Div {
-        let theme = cx.theme();
-        h_flex()
-            .h(px(34.))
-            .px_2p5()
-            .gap_2()
-            .items_center()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .child(
-                Icon::new(IconName::Search)
-                    .text_color(theme.muted_foreground)
-                    .size(px(16.)),
-            )
-            .child(
-                div().flex_1().min_w_0().child(
-                    Textarea::new(&self.search)
-                        .appearance(false)
-                        .bordered(false),
-                ),
-            )
+        crate::preferences::search_input_box(&self.search, cx)
     }
 
     /// Slack's ownership chips; the chosen one is filled.
@@ -1006,54 +986,46 @@ fn open_new_canvas_dialog(
     });
     title_state.read(cx).focus_handle(cx).focus(window, cx);
     window.open_dialog(cx, move |dialog, _, cx| {
-        let theme = cx.theme();
-        let (border, bg) = (theme.border, theme.background);
+        let bg = cx.theme().background;
         let title_c = title_state.clone();
         let page_c = page.clone();
         dialog.title("Create standalone canvas").w(px(380.)).child(
             v_flex()
                 .gap_3()
                 .p_4()
-                .child(
-                    div()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(border)
-                        .bg(bg)
-                        .child(
-                            Textarea::new(&title_state)
-                                .appearance(false)
-                                .bordered(false),
-                        ),
-                )
+                .child(crate::preferences::text_input_box(&title_state, false, cx).bg(bg))
                 .child(
                     h_flex()
                         .justify_end()
                         .gap_2()
                         .child(
-                            Button::new("files-new-canvas-cancel")
-                                .outline()
-                                .with_size(Size::Small)
-                                .label("Cancel")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                            crate::preferences::form_button(
+                                Button::new("files-new-canvas-cancel")
+                                    .outline()
+                                    .label("Cancel"),
+                                cx,
+                            )
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(
-                            Button::new("files-new-canvas-create")
-                                .primary()
-                                .with_size(Size::Small)
-                                .label("Create")
-                                .on_click(move |_, window, cx| {
-                                    let title = title_c.read(cx).value().trim().to_owned();
-                                    let title = if title.is_empty() {
-                                        "Untitled canvas".to_owned()
-                                    } else {
-                                        title
-                                    };
-                                    window.close_dialog(cx);
-                                    let _ = page_c.update(cx, |_, cx| {
-                                        cx.emit(FilesPageEvent::CreateCanvas { title });
-                                    });
-                                }),
+                            crate::preferences::form_button(
+                                Button::new("files-new-canvas-create")
+                                    .primary()
+                                    .label("Create"),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                let title = title_c.read(cx).value().trim().to_owned();
+                                let title = if title.is_empty() {
+                                    "Untitled canvas".to_owned()
+                                } else {
+                                    title
+                                };
+                                window.close_dialog(cx);
+                                let _ = page_c.update(cx, |_, cx| {
+                                    cx.emit(FilesPageEvent::CreateCanvas { title });
+                                });
+                            }),
                         ),
                 ),
         )
@@ -1075,7 +1047,7 @@ fn open_new_list_dialog(
     name_state.read(cx).focus_handle(cx).focus(window, cx);
     window.open_dialog(cx, move |dialog, _, cx| {
         let theme = cx.theme();
-        let (border, bg, muted) = (theme.border, theme.background, theme.muted_foreground);
+        let (bg, muted) = (theme.background, theme.muted_foreground);
         let name_c = name_state.clone();
         let page_c = page.clone();
         let templates = [
@@ -1119,40 +1091,37 @@ fn open_new_list_dialog(
                                 })),
                         ),
                 )
-                .child(
-                    div()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(border)
-                        .bg(bg)
-                        .child(Textarea::new(&name_state).appearance(false).bordered(false)),
-                )
+                .child(crate::preferences::text_input_box(&name_state, false, cx).bg(bg))
                 .child(
                     h_flex()
                         .justify_end()
                         .gap_2()
                         .child(
-                            Button::new("files-new-list-cancel")
-                                .outline()
-                                .with_size(Size::Small)
-                                .label("Cancel")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                            crate::preferences::form_button(
+                                Button::new("files-new-list-cancel")
+                                    .outline()
+                                    .label("Cancel"),
+                                cx,
+                            )
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(
-                            Button::new("files-new-list-create")
-                                .primary()
-                                .with_size(Size::Small)
-                                .label("Create")
-                                .on_click(move |_, window, cx| {
-                                    let name = name_c.read(cx).value().trim().to_owned();
-                                    if name.is_empty() {
-                                        return;
-                                    }
-                                    window.close_dialog(cx);
-                                    let _ = page_c.update(cx, |_, cx| {
-                                        cx.emit(FilesPageEvent::CreateList { name });
-                                    });
-                                }),
+                            crate::preferences::form_button(
+                                Button::new("files-new-list-create")
+                                    .primary()
+                                    .label("Create"),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                let name = name_c.read(cx).value().trim().to_owned();
+                                if name.is_empty() {
+                                    return;
+                                }
+                                window.close_dialog(cx);
+                                let _ = page_c.update(cx, |_, cx| {
+                                    cx.emit(FilesPageEvent::CreateList { name });
+                                });
+                            }),
                         ),
                 ),
         )
@@ -1173,48 +1142,40 @@ fn open_new_collection_dialog(
     });
     name_state.read(cx).focus_handle(cx).focus(window, cx);
     window.open_dialog(cx, move |dialog, _, cx| {
-        let theme = cx.theme();
-        let (border, bg) = (theme.border, theme.background);
+        let bg = cx.theme().background;
         let name_c = name_state.clone();
         let page_c = page.clone();
         dialog.title("Create file collection").w(px(380.)).child(
             v_flex()
                 .gap_3()
                 .p_4()
-                .child(
-                    div()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(border)
-                        .bg(bg)
-                        .child(Textarea::new(&name_state).appearance(false).bordered(false)),
-                )
+                .child(crate::preferences::text_input_box(&name_state, false, cx).bg(bg))
                 .child(
                     h_flex()
                         .justify_end()
                         .gap_2()
                         .child(
-                            Button::new("files-col-cancel")
-                                .outline()
-                                .with_size(Size::Small)
-                                .label("Cancel")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                            crate::preferences::form_button(
+                                Button::new("files-col-cancel").outline().label("Cancel"),
+                                cx,
+                            )
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(
-                            Button::new("files-col-create")
-                                .primary()
-                                .with_size(Size::Small)
-                                .label("Create")
-                                .on_click(move |_, window, cx| {
-                                    let name = name_c.read(cx).value().trim().to_owned();
-                                    if name.is_empty() {
-                                        return;
-                                    }
-                                    window.close_dialog(cx);
-                                    let _ = page_c.update(cx, |_, cx| {
-                                        cx.emit(FilesPageEvent::CreateCollection { name });
-                                    });
-                                }),
+                            crate::preferences::form_button(
+                                Button::new("files-col-create").primary().label("Create"),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                let name = name_c.read(cx).value().trim().to_owned();
+                                if name.is_empty() {
+                                    return;
+                                }
+                                window.close_dialog(cx);
+                                let _ = page_c.update(cx, |_, cx| {
+                                    cx.emit(FilesPageEvent::CreateCollection { name });
+                                });
+                            }),
                         ),
                 ),
         )

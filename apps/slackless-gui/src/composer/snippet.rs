@@ -1,8 +1,8 @@
 //! `"Create a text snippet"` dialog for staging code/text snippets as attachments.
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Textarea, TextareaState};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::input::TextareaState;
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::gpui::{
     AppContext as _, Context, Focusable as _, FontWeight, InteractiveElement as _,
     ParentElement as _, StatefulInteractiveElement as _, Styled as _, Window, div, px,
@@ -121,16 +121,7 @@ impl Composer {
                                         .child("Filename"),
                                 )
                                 .child(
-                                    div()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(border)
-                                        .bg(bg)
-                                        .child(
-                                            Textarea::new(&filename)
-                                                .appearance(false)
-                                                .bordered(false),
-                                        ),
+                                    crate::preferences::text_input_box(&filename, false, cx).bg(bg),
                                 )
                                 .child(lang_pills),
                         )
@@ -144,34 +135,28 @@ impl Composer {
                                         .text_color(muted)
                                         .child("Content"),
                                 )
-                                .child(
-                                    div()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(border)
-                                        .bg(bg)
-                                        .child(
-                                            Textarea::new(&body).appearance(false).bordered(false),
-                                        ),
-                                ),
+                                .child(crate::preferences::text_input_box(&body, true, cx).bg(bg)),
                         )
                         .child(
                             h_flex()
                                 .justify_end()
                                 .gap_2()
                                 .child(
-                                    Button::new("snippet-cancel")
-                                        .outline()
-                                        .with_size(Size::Small)
-                                        .label("Cancel")
-                                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                                    crate::preferences::form_button(
+                                        Button::new("snippet-cancel").outline().label("Cancel"),
+                                        cx,
+                                    )
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
                                 )
                                 .child(
-                                    Button::new("snippet-create")
-                                        .primary()
-                                        .with_size(Size::Small)
-                                        .label("Create snippet")
-                                        .on_click(move |_, window, cx| {
+                                    crate::preferences::form_button(
+                                        Button::new("snippet-create")
+                                            .primary()
+                                            .label("Create snippet"),
+                                        cx,
+                                    )
+                                    .on_click(
+                                        move |_, window, cx| {
                                             let content = body.read(cx).value().to_string();
                                             if content.trim().is_empty() {
                                                 return;
@@ -190,7 +175,8 @@ impl Composer {
                                                 });
                                             }
                                             window.close_dialog(cx);
-                                        }),
+                                        },
+                                    ),
                                 ),
                         ),
                 )

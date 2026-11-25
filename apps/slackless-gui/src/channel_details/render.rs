@@ -23,8 +23,9 @@ use super::{ChannelDetails, ChannelDetailsEvent, DetailsTab, EditField, MAX_ROWS
 impl Render for ChannelDetails {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, muted_foreground, foreground, ring, background) = (
+        let (border, input_border, muted_foreground, foreground, ring, background) = (
             theme.border,
+            theme.input,
             theme.muted_foreground,
             theme.foreground,
             theme.ring,
@@ -108,18 +109,20 @@ impl Render for ChannelDetails {
                         .filter(|row| member_filter.keeps(row))
                         .filter(|row| needle.is_empty() || row.key.contains(&needle))
                         .collect();
+                    let m = crate::preferences::control_metrics(cx);
                     let find_people = h_flex()
                         .flex_1()
                         .min_w_0()
                         .items_center()
-                        .gap_2()
-                        .px_3()
-                        .h(px(36.))
-                        .rounded(px(8.))
+                        .gap_0p5()
+                        .pl_2p5()
+                        .pr_1()
+                        .h(m.height)
+                        .rounded_md()
                         // Opaque, so the focus ring's spread shows only outside the field.
                         .bg(background)
                         .border_1()
-                        .border_color(if find_focused { ring } else { border })
+                        .border_color(if find_focused { ring } else { input_border })
                         .when(find_focused, |field| {
                             field.shadow(vec![BoxShadow {
                                 color: ring.opacity(0.3),
@@ -131,28 +134,31 @@ impl Render for ChannelDetails {
                         })
                         .child(
                             Icon::new(IconName::Search)
+                                .flex_none()
                                 .text_color(muted_foreground)
-                                .size(px(16.)),
+                                .size(px(14.)),
                         )
                         .child(
                             div().flex_1().min_w_0().child(
                                 Textarea::new(&self.filter)
+                                    .with_size(m.input_size)
                                     .appearance(false)
                                     .bordered(false),
                             ),
                         );
                     let filter_select = self.filter_select(cx);
                     let add_channel = self.channel.clone();
-                    let add_people = Button::new("details-add-people")
-                        .outline()
-                        .flex_none()
-                        .h(px(36.))
-                        .rounded(px(8.))
-                        .icon(IconName::UserPlus)
-                        .label("Add people")
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(ChannelDetailsEvent::AddPeople(add_channel.clone()));
-                        }));
+                    let add_people = crate::preferences::form_button(
+                        Button::new("details-add-people")
+                            .outline()
+                            .flex_none()
+                            .icon(IconName::UserPlus)
+                            .label("Add people"),
+                        cx,
+                    )
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(ChannelDetailsEvent::AddPeople(add_channel.clone()));
+                    }));
                     v_flex()
                         .flex_1()
                         .min_h_0()
@@ -232,33 +238,35 @@ impl ChannelDetails {
             NotifyLevel::Mentions => "Just mentions",
             NotifyLevel::Muted => "Mute and hide",
         };
-        let notify = Button::new("details-notify")
-            .outline()
-            .with_size(Size::Small)
-            .icon(IconName::Bell)
-            .label(level_label)
-            .dropdown_caret(true)
-            .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
-                menu = menu.label("Notify you about…");
-                for (choice, label) in [
-                    (NotifyLevel::Everything, "All new posts"),
-                    (NotifyLevel::Mentions, "Just mentions"),
-                    (NotifyLevel::Muted, "Mute and hide"),
-                ] {
-                    let (this, channel) = (this.clone(), channel.clone());
-                    menu = menu.item(PopupMenuItem::new(label).checked(choice == level).on_click(
-                        move |_, _, cx| {
-                            let _ = this.update(cx, |_, cx| {
-                                cx.emit(ChannelDetailsEvent::SetNotifyLevel {
-                                    channel: channel.clone(),
-                                    level: choice,
-                                })
-                            });
-                        },
-                    ));
-                }
-                menu
-            });
+        let notify = crate::preferences::form_button(
+            Button::new("details-notify")
+                .outline()
+                .icon(IconName::Bell)
+                .label(level_label)
+                .dropdown_caret(true),
+            cx,
+        )
+        .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
+            menu = menu.label("Notify you about…");
+            for (choice, label) in [
+                (NotifyLevel::Everything, "All new posts"),
+                (NotifyLevel::Mentions, "Just mentions"),
+                (NotifyLevel::Muted, "Mute and hide"),
+            ] {
+                let (this, channel) = (this.clone(), channel.clone());
+                menu = menu.item(PopupMenuItem::new(label).checked(choice == level).on_click(
+                    move |_, _, cx| {
+                        let _ = this.update(cx, |_, cx| {
+                            cx.emit(ChannelDetailsEvent::SetNotifyLevel {
+                                channel: channel.clone(),
+                                level: choice,
+                            })
+                        });
+                    },
+                ));
+            }
+            menu
+        });
         h_flex()
             .flex_none()
             .items_center()
@@ -267,12 +275,14 @@ impl ChannelDetails {
             .pb_2()
             .child(notify)
             .child(
-                Button::new("details-huddle")
-                    .outline()
-                    .with_size(Size::Small)
-                    .icon(IconName::Headphones)
-                    .label("Huddle")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ChannelDetailsEvent::StartHuddle))),
+                crate::preferences::form_button(
+                    Button::new("details-huddle")
+                        .outline()
+                        .icon(IconName::Headphones)
+                        .label("Huddle"),
+                    cx,
+                )
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(ChannelDetailsEvent::StartHuddle))),
             )
     }
 
@@ -303,27 +313,27 @@ impl ChannelDetails {
             .map(|e| e.draft.clone());
         let name_card = if let Some(draft) = editing_name {
             card("Channel name", None, border)
-                .child(Textarea::new(&draft))
+                .child(crate::preferences::text_input_box(&draft, false, cx))
                 .child(
                     h_flex()
                         .flex_none()
                         .gap_2()
                         .child(
-                            Button::new("details-save-Name")
-                                .primary()
-                                .with_size(Size::Small)
-                                .label("Save")
-                                .on_click(cx.listener(|this, _, _, cx| this.save_edit(cx))),
+                            crate::preferences::form_button(
+                                Button::new("details-save-Name").primary().label("Save"),
+                                cx,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.save_edit(cx))),
                         )
                         .child(
-                            Button::new("details-cancel-Name")
-                                .ghost()
-                                .with_size(Size::Small)
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.editing = None;
-                                    cx.notify();
-                                })),
+                            crate::preferences::form_button(
+                                Button::new("details-cancel-Name").ghost().label("Cancel"),
+                                cx,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.editing = None;
+                                cx.notify();
+                            })),
                         ),
                 )
         } else {
@@ -677,27 +687,33 @@ impl ChannelDetails {
             .map(|editing| editing.draft.clone());
         if let Some(draft) = draft {
             return card(label, None, border)
-                .child(Textarea::new(&draft))
+                .child(crate::preferences::text_input_box(&draft, true, cx))
                 .child(
                     h_flex()
                         .flex_none()
                         .gap_2()
                         .child(
-                            Button::new(SharedString::from(format!("details-save-{field:?}")))
-                                .primary()
-                                .with_size(Size::Small)
-                                .label("Save")
-                                .on_click(cx.listener(|this, _, _, cx| this.save_edit(cx))),
+                            crate::preferences::form_button(
+                                Button::new(SharedString::from(format!("details-save-{field:?}")))
+                                    .primary()
+                                    .label("Save"),
+                                cx,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.save_edit(cx))),
                         )
                         .child(
-                            Button::new(SharedString::from(format!("details-cancel-{field:?}")))
+                            crate::preferences::form_button(
+                                Button::new(SharedString::from(format!(
+                                    "details-cancel-{field:?}"
+                                )))
                                 .ghost()
-                                .with_size(Size::Small)
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.editing = None;
-                                    cx.notify();
-                                })),
+                                .label("Cancel"),
+                                cx,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.editing = None;
+                                cx.notify();
+                            })),
                         ),
                 );
         }
@@ -755,46 +771,47 @@ impl ChannelDetails {
             .find(|choice| choice.filter == current)
             .map_or_else(|| SharedString::from("All"), |choice| choice.label.clone());
         let muted = cx.theme().muted_foreground;
-        Button::new("details-member-filter")
-            .outline()
-            .flex_none()
-            .w(px(200.))
-            .h(px(36.))
-            .rounded(px(8.))
-            .label(label)
-            .dropdown_caret(true)
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
-                menu = menu.min_w(px(320.));
-                let mut people_from = false;
-                for choice in choices.iter() {
-                    if matches!(choice.filter, MemberFilter::Team(_)) && !people_from {
-                        people_from = true;
-                        menu = menu.separator().label("People from");
-                    }
-                    let (this, filter) = (this.clone(), choice.filter.clone());
-                    let (label, count) = (choice.label.clone(), choice.count.to_string());
-                    let checked = filter == current;
-                    menu = menu.item(
-                        PopupMenuItem::element(move |_, _| {
-                            h_flex()
-                                .w_full()
-                                .gap_6()
-                                .justify_between()
-                                .child(label.clone())
-                                .child(div().text_color(muted).child(count.clone()))
-                        })
-                        .checked(checked)
-                        .on_click(move |_, _, cx| {
-                            let filter = filter.clone();
-                            let _ = this.update(cx, |this, cx| {
-                                this.member_filter = filter;
-                                cx.notify();
-                            });
-                        }),
-                    );
+        crate::preferences::form_button(
+            Button::new("details-member-filter")
+                .outline()
+                .flex_none()
+                .w(px(200.))
+                .label(label)
+                .dropdown_caret(true),
+            cx,
+        )
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+            menu = menu.min_w(px(320.));
+            let mut people_from = false;
+            for choice in choices.iter() {
+                if matches!(choice.filter, MemberFilter::Team(_)) && !people_from {
+                    people_from = true;
+                    menu = menu.separator().label("People from");
                 }
-                menu
-            })
+                let (this, filter) = (this.clone(), choice.filter.clone());
+                let (label, count) = (choice.label.clone(), choice.count.to_string());
+                let checked = filter == current;
+                menu = menu.item(
+                    PopupMenuItem::element(move |_, _| {
+                        h_flex()
+                            .w_full()
+                            .gap_6()
+                            .justify_between()
+                            .child(label.clone())
+                            .child(div().text_color(muted).child(count.clone()))
+                    })
+                    .checked(checked)
+                    .on_click(move |_, _, cx| {
+                        let filter = filter.clone();
+                        let _ = this.update(cx, |this, cx| {
+                            this.member_filter = filter;
+                            cx.notify();
+                        });
+                    }),
+                );
+            }
+            menu
+        })
     }
 
     /// One member row, Slack's member list: the 36px avatar (its organization's badge when

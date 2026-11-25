@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::input::TextareaState;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _, Size, WindowExt as _, h_flex, v_flex,
@@ -63,7 +63,7 @@ pub fn open_custom_remind_dialog(
     time_state.read(cx).focus_handle(cx).focus(window, cx);
     window.open_dialog(cx, move |dialog, _, cx| {
         let theme = cx.theme();
-        let (border, muted, bg) = (theme.border, theme.muted_foreground, theme.background);
+        let (muted, bg) = (theme.muted_foreground, theme.background);
         let (date_state, time_state, on_confirm) =
             (date_state.clone(), time_state.clone(), on_confirm.clone());
         dialog.title("Set a custom reminder").w(px(400.)).child(
@@ -91,16 +91,8 @@ pub fn open_custom_remind_dialog(
                                         .child("Date"),
                                 )
                                 .child(
-                                    div()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(border)
-                                        .bg(bg)
-                                        .child(
-                                            Textarea::new(&date_state)
-                                                .appearance(false)
-                                                .bordered(false),
-                                        ),
+                                    crate::preferences::text_input_box(&date_state, false, cx)
+                                        .bg(bg),
                                 ),
                         )
                         .child(
@@ -115,16 +107,8 @@ pub fn open_custom_remind_dialog(
                                         .child("Time"),
                                 )
                                 .child(
-                                    div()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(border)
-                                        .bg(bg)
-                                        .child(
-                                            Textarea::new(&time_state)
-                                                .appearance(false)
-                                                .bordered(false),
-                                        ),
+                                    crate::preferences::text_input_box(&time_state, false, cx)
+                                        .bg(bg),
                                 ),
                         ),
                 )
@@ -133,32 +117,36 @@ pub fn open_custom_remind_dialog(
                         .justify_end()
                         .gap_2()
                         .child(
-                            Button::new("remind-custom-cancel")
-                                .outline()
-                                .with_size(Size::Small)
-                                .label("Cancel")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                            crate::preferences::form_button(
+                                Button::new("remind-custom-cancel")
+                                    .outline()
+                                    .label("Cancel"),
+                                cx,
+                            )
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(
-                            Button::new("remind-custom-save")
-                                .primary()
-                                .with_size(Size::Small)
-                                .label("Set reminder")
-                                .on_click(move |_, window, cx| {
-                                    let d = date_state.read(cx).value().to_string();
-                                    let t = time_state.read(cx).value().to_string();
-                                    let Some(at) = crate::app::parse_local_schedule(&d, &t) else {
-                                        crate::actions::notify(
-                                            "Invalid date or time",
-                                            "Use YYYY-MM-DD and HH:MM in the future.",
-                                            window,
-                                            cx,
-                                        );
-                                        return;
-                                    };
-                                    window.close_dialog(cx);
-                                    on_confirm(at, window, cx);
-                                }),
+                            crate::preferences::form_button(
+                                Button::new("remind-custom-save")
+                                    .primary()
+                                    .label("Set reminder"),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                let d = date_state.read(cx).value().to_string();
+                                let t = time_state.read(cx).value().to_string();
+                                let Some(at) = crate::app::parse_local_schedule(&d, &t) else {
+                                    crate::actions::notify(
+                                        "Invalid date or time",
+                                        "Use YYYY-MM-DD and HH:MM in the future.",
+                                        window,
+                                        cx,
+                                    );
+                                    return;
+                                };
+                                window.close_dialog(cx);
+                                on_confirm(at, window, cx);
+                            }),
                         ),
                 ),
         )
@@ -981,22 +969,17 @@ impl Render for LaterView {
                     .border_b_1()
                     .border_color(border)
                     .child(
-                        div()
+                        crate::preferences::text_input_box(&input, true, cx)
                             .flex_1()
-                            .min_w_0()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(border)
-                            .child(Textarea::new(&input).appearance(false).bordered(false)),
+                            .min_w_0(),
                     )
                     .child(
-                        Button::new("later-todo-add")
-                            .primary()
-                            .with_size(Size::Small)
-                            .label("Add")
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                        crate::preferences::form_button(
+                            Button::new("later-todo-add").primary().label("Add"),
+                            cx,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
                                 let text = input_add.read(cx).value().to_string();
                                 if !text.trim().is_empty() {
                                     this.add_todo(text, cx);
@@ -1005,17 +988,18 @@ impl Render for LaterView {
                                     });
                                     this.creating_todo = false;
                                 }
-                            })),
+                            },
+                        )),
                     )
                     .child(
-                        Button::new("later-todo-cancel")
-                            .ghost()
-                            .with_size(Size::Small)
-                            .label("Cancel")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.creating_todo = false;
-                                cx.notify();
-                            })),
+                        crate::preferences::form_button(
+                            Button::new("later-todo-cancel").ghost().label("Cancel"),
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.creating_todo = false;
+                            cx.notify();
+                        })),
                     )
             });
 

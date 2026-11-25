@@ -1565,6 +1565,8 @@ pub(super) fn text_input(
             || element["dispatch_action_config"]["trigger_actions_on"]
                 .as_array()
                 .is_some_and(|a| !a.is_empty());
+        let multi_line = element["multiline"].as_bool().unwrap_or(false)
+            || element["type"].as_str() == Some("rich_text_input");
         let apply_btn = dispatch_enabled.then(|| {
             let input_c = input.clone();
             let base = action_base(element, block);
@@ -1575,28 +1577,30 @@ pub(super) fn text_input(
             let on_action = kcx.on_action.clone();
             let attachment = kcx.attachment;
             let key_c = key.to_owned();
-            Button::new(SharedString::from(format!("bk-dispatch-{key}")))
-                .outline()
-                .with_size(Size::Small)
-                .label("Apply")
-                .on_click(move |_, window, cx| {
-                    let val = input_c.read(cx).value().to_string();
-                    let mut payload = base.clone();
-                    if kind == "rich_text_input" {
-                        payload["rich_text_value"] = rich_text_input_value(&val);
-                    } else {
-                        payload["value"] = val.clone().into();
-                    }
-                    dispatch_action(
-                        payload,
-                        on_action.as_ref(),
-                        attachment,
-                        &key_c,
-                        &format!("submitted \u{201C}{val}\u{201D}"),
-                        window,
-                        cx,
-                    );
-                })
+            crate::preferences::form_button(
+                Button::new(SharedString::from(format!("bk-dispatch-{key}")))
+                    .outline()
+                    .label("Apply"),
+                cx,
+            )
+            .on_click(move |_, window, cx| {
+                let val = input_c.read(cx).value().to_string();
+                let mut payload = base.clone();
+                if kind == "rich_text_input" {
+                    payload["rich_text_value"] = rich_text_input_value(&val);
+                } else {
+                    payload["value"] = val.clone().into();
+                }
+                dispatch_action(
+                    payload,
+                    on_action.as_ref(),
+                    attachment,
+                    &key_c,
+                    &format!("submitted \u{201C}{val}\u{201D}"),
+                    window,
+                    cx,
+                );
+            })
         });
         return v_flex()
             .w_full()
@@ -1607,13 +1611,10 @@ pub(super) fn text_input(
                     .items_start()
                     .gap_1p5()
                     .child(
-                        div()
+                        crate::preferences::text_input_box(&input, multi_line, cx)
                             .flex_1()
                             .min_w_0()
-                            .when(error.is_some(), |el| {
-                                el.rounded_md().border_1().border_color(danger)
-                            })
-                            .child(Textarea::new(&input)),
+                            .when(error.is_some(), |el| el.border_color(danger)),
                     )
                     .children(apply_btn),
             )

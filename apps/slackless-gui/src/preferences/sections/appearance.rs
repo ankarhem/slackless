@@ -101,6 +101,7 @@ impl Preferences {
                         }))
                 }))
         };
+        let m = self.metrics();
         let custom_hex_row = {
             let input_border = cx.theme().input;
             let mono = cx.theme().mono_font_family.clone();
@@ -115,12 +116,10 @@ impl Preferences {
                     .pl_2p5()
                     .pr_1()
                     .w(px(148.))
-                    .h(px(32.))
+                    .h(m.height)
                     .rounded_md()
                     .border_1()
                     .border_color(input_border)
-                    .font_family(mono.clone())
-                    .text_xs()
                     .when_some(preview, |row, col| {
                         row.child(
                             div()
@@ -135,7 +134,9 @@ impl Preferences {
                     .child(
                         div().flex_1().min_w_0().child(
                             Textarea::new(state)
-                                .with_size(Size::Small)
+                                .with_size(m.input_size)
+                                .font_family(mono.clone())
+                                .text_xs()
                                 .appearance(false)
                                 .bordered(false),
                         ),
@@ -147,10 +148,7 @@ impl Preferences {
                 .child(hex_box(&self.custom_sidebar_hex, sb_preview))
                 .child(hex_box(&self.custom_accent_hex, ac_preview))
                 .child(
-                    Button::new("custom-hex-apply")
-                        .outline()
-                        .with_size(Size::Small)
-                        .label("Apply hex")
+                    self.btn(Button::new("custom-hex-apply").outline().label("Apply hex"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             let sb =
                                 theme::parse_hex_rgb(&this.custom_sidebar_hex.read(cx).value());
@@ -163,35 +161,18 @@ impl Preferences {
                 )
         };
         let slack_theme_row = {
-            let input_border = cx.theme().input;
-            let mono = cx.theme().mono_font_family.clone();
             v_flex().gap_2().child(
                 h_flex()
                     .items_center()
                     .gap_2()
                     .child(
-                        div()
+                        text_input_box_for(&self.slack_theme_import, true, true, m, cx)
                             .flex_1()
                             .min_w_0()
-                            .max_w(px(360.))
-                            .px_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(input_border)
-                            .font_family(mono)
-                            .text_xs()
-                            .child(
-                                Textarea::new(&self.slack_theme_import)
-                                    .with_size(Size::Small)
-                                    .appearance(false)
-                                    .bordered(false),
-                            ),
+                            .max_w(px(420.)),
                     )
                     .child(
-                        Button::new("slack-theme-import")
-                            .outline()
-                            .with_size(Size::Small)
-                            .label("Import")
+                        self.btn(Button::new("slack-theme-import").outline().label("Import"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let raw = this.slack_theme_import.read(cx).value().to_string();
                                 if let Some((sidebar, accent)) =
@@ -222,13 +203,15 @@ impl Preferences {
                             })),
                     )
                     .child(
-                        Button::new("slack-theme-copy")
-                            .outline()
-                            .with_size(Size::Small)
-                            .icon(IconName::Copy)
-                            .label("Copy theme")
-                            .tooltip("Copy Slack-compatible comma-separated hex theme string")
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                        self.btn(
+                            Button::new("slack-theme-copy")
+                                .outline()
+                                .icon(IconName::Copy)
+                                .label("Copy theme")
+                                .tooltip("Copy Slack-compatible comma-separated hex theme string"),
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
                                 let exported = theme::format_slack_theme_string(
                                     this.settings.palette,
                                     is_dark,
@@ -237,7 +220,8 @@ impl Preferences {
                                     exported.clone(),
                                 ));
                                 crate::actions::notify("Slack theme copied", exported, window, cx);
-                            })),
+                            },
+                        )),
                     ),
             )
         };

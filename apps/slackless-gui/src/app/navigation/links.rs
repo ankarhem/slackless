@@ -112,18 +112,21 @@ impl App {
                             .gap_2()
                             .justify_end()
                             .child(
-                                Button::new("ext-url-cancel")
-                                    .label("Cancel")
-                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                                preferences::form_button(
+                                    Button::new("ext-url-cancel").outline().label("Cancel"),
+                                    cx,
+                                )
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
                             )
                             .child(
-                                Button::new("ext-url-open")
-                                    .primary()
-                                    .label("Open link")
-                                    .on_click(move |_, window, cx| {
-                                        window.close_dialog(cx);
-                                        launch_external_url(&open_target, browser_choice, cx);
-                                    }),
+                                preferences::form_button(
+                                    Button::new("ext-url-open").primary().label("Open link"),
+                                    cx,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    launch_external_url(&open_target, browser_choice, cx);
+                                }),
                             ),
                     ),
             )

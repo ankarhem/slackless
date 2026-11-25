@@ -5,7 +5,6 @@ use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::Textarea;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
@@ -256,16 +255,7 @@ pub(super) fn render_share_panel(
                     .child("Share with people or channels"),
             )
             .when_some(target_input.clone(), |col, input| {
-                col.child(
-                    div()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.background)
-                        .px_2()
-                        .py_1()
-                        .child(Textarea::new(&input).appearance(false).bordered(false)),
-                )
+                col.child(crate::preferences::text_input_box(&input, true, cx).bg(theme.background))
             })
             .child(
                 h_flex()

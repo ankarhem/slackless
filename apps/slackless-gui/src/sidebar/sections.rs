@@ -646,26 +646,33 @@ impl Sidebar {
                         )))
                         .child(
                             h_flex().gap_2().justify_end().child(
-                                Button::new("section-delete-cancel")
-                                    .label("Cancel")
-                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                                crate::preferences::form_button(
+                                    Button::new("section-delete-cancel")
+                                        .outline()
+                                        .label("Cancel"),
+                                    cx,
+                                )
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
                             ),
                         ),
                 )
                 // The confirm rides as the dialog's footer action so it reads as one.
                 .child(
                     h_flex().justify_end().child(
-                        Button::new("section-delete-confirm")
-                            .danger()
-                            .label("Delete section")
-                            .on_click(move |_, window, cx| {
-                                window.close_dialog(cx);
-                                let _ = this.update(cx, |_, cx| {
-                                    cx.emit(SidebarEvent::DeleteSection {
-                                        section: section_id.clone(),
-                                    })
-                                });
-                            }),
+                        crate::preferences::form_button(
+                            Button::new("section-delete-confirm")
+                                .danger()
+                                .label("Delete section"),
+                            cx,
+                        )
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let _ = this.update(cx, |_, cx| {
+                                cx.emit(SidebarEvent::DeleteSection {
+                                    section: section_id.clone(),
+                                })
+                            });
+                        }),
                     ),
                 )
         });

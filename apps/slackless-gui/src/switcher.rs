@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{InputEvent, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
@@ -372,8 +372,7 @@ impl QuickSwitcher {
 impl Render for QuickSwitcher {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, muted, hover, active, active_fg, popover) = (
-            theme.border,
+        let (muted, hover, active, active_fg, popover) = (
             theme.muted_foreground,
             theme.accent,
             theme.sidebar_accent,
@@ -523,23 +522,7 @@ impl Render for QuickSwitcher {
             .w_full()
             .gap_2()
             .capture_key_down(cx.listener(Self::on_key))
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .child(Icon::new(IconName::Search).text_color(muted).size(px(16.)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Textarea::new(&self.input).appearance(false).bordered(false)),
-                    ),
-            )
+            .child(crate::preferences::search_input_box(&self.input, cx))
             .child(v_flex().gap_0p5().children(rows).children(empty))
             .child(div().pt_1().text_xs().text_color(muted).child(
                 "\u{2191}\u{2193} to navigate \u{b7} \u{21B5} to open \u{b7} esc to dismiss",

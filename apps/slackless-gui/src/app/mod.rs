@@ -223,7 +223,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Escape as InputEscape, InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{Escape as InputEscape, InputEvent, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, TitleBar, WindowExt as _, h_flex,
@@ -281,7 +281,7 @@ use crate::menu_bar::{self, MenuBar};
 use crate::messages::{LinkTarget, MessageList, MessageListEvent};
 use crate::new_message::{NewMessageEvent, NewMessageView};
 use crate::pins;
-use crate::preferences::{AppearanceMode, Preferences, PreferencesEvent, Section};
+use crate::preferences::{self, AppearanceMode, Preferences, PreferencesEvent, Section};
 use crate::profile::{ProfileEvent, ProfilePanel};
 use crate::search::{SearchEvent, SearchView, fixture_archive};
 use crate::search_menu::{SEARCH_PLACEHOLDER, SearchMenu, SearchMenuEvent, Snapshot};

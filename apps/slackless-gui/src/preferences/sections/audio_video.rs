@@ -4,11 +4,12 @@ use super::super::*;
 
 impl Preferences {
     fn device_choice_button(
+        &self,
         id: impl Into<ElementId>,
         label: impl Into<SharedString>,
         selected: bool,
     ) -> Button {
-        let btn = Button::new(id).with_size(Size::Small).label(label);
+        let btn = self.btn(Button::new(id).label(label));
         if selected {
             btn.primary().icon(IconName::Check)
         } else {
@@ -36,7 +37,7 @@ impl Preferences {
                     .flex_wrap()
                     .gap_1p5()
                     .child(
-                        Self::device_choice_button(
+                        self.device_choice_button(
                             "prefs-mic-default",
                             "System default",
                             active_in.is_none(),
@@ -55,7 +56,7 @@ impl Preferences {
                             .map(|(ix, dev)| {
                                 let selected = active_in.as_deref() == Some(dev.name.as_str());
                                 let name = dev.name.clone();
-                                Self::device_choice_button(
+                                self.device_choice_button(
                                     ("prefs-mic", ix),
                                     dev.name.clone(),
                                     selected,
@@ -126,7 +127,7 @@ impl Preferences {
                         .flex_wrap()
                         .gap_1p5()
                         .child(
-                            Self::device_choice_button(
+                            self.device_choice_button(
                                 "prefs-spk-default",
                                 "System default",
                                 active_out.is_none(),
@@ -140,7 +141,7 @@ impl Preferences {
                             |(ix, dev)| {
                                 let selected = active_out.as_deref() == Some(dev.name.as_str());
                                 let name = dev.name.clone();
-                                Self::device_choice_button(
+                                self.device_choice_button(
                                     ("prefs-spk", ix),
                                     dev.name.clone(),
                                     selected,
@@ -158,27 +159,29 @@ impl Preferences {
                     h_flex()
                         .gap_2()
                         .child(
-                            Button::new("prefs-test-speaker")
-                                .outline()
-                                .with_size(Size::Small)
-                                .icon(IconName::Play)
-                                .label("Test speaker")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    cx.emit(PreferencesEvent::TestSpeaker(
-                                        this.settings.huddle_output_device.clone(),
-                                    ));
-                                })),
+                            self.btn(
+                                Button::new("prefs-test-speaker")
+                                    .outline()
+                                    .icon(IconName::Play)
+                                    .label("Test speaker"),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.emit(PreferencesEvent::TestSpeaker(
+                                    this.settings.huddle_output_device.clone(),
+                                ));
+                            })),
                         )
                         .child(
-                            Button::new("prefs-refresh-audio")
-                                .ghost()
-                                .with_size(Size::Small)
-                                .icon(IconName::RefreshCw)
-                                .label("Refresh devices")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.refresh_audio_devices_and_probe(cx);
-                                    cx.notify();
-                                })),
+                            self.btn(
+                                Button::new("prefs-refresh-audio")
+                                    .ghost()
+                                    .icon(IconName::RefreshCw)
+                                    .label("Refresh devices"),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.refresh_audio_devices_and_probe(cx);
+                                cx.notify();
+                            })),
                         ),
                 );
 
@@ -350,43 +353,45 @@ impl Preferences {
                 .gap_1p5()
                 .when(!setup.model_ready, |row| {
                     row.child(
-                        Button::new("prefs-stt-download")
-                            .primary()
-                            .with_size(Size::Small)
-                            .icon(IconName::Download)
-                            .disabled(self.stt_downloading.is_some())
-                            .label(if downloading {
-                                "Downloading…".to_owned()
-                            } else {
-                                format!("Download ({})", setup.download_size_hint)
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.start_stt_model_download(provider, cx);
-                            })),
+                        self.btn(
+                            Button::new("prefs-stt-download")
+                                .primary()
+                                .icon(IconName::Download)
+                                .disabled(self.stt_downloading.is_some())
+                                .label(if downloading {
+                                    "Downloading…".to_owned()
+                                } else {
+                                    format!("Download ({})", setup.download_size_hint)
+                                }),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.start_stt_model_download(provider, cx);
+                        })),
                     )
                 })
                 .when(setup.model_ready && !downloading, |row| {
                     row.child(
-                        Button::new("prefs-stt-delete")
-                            .ghost()
-                            .with_size(Size::Small)
-                            .icon(IconName::Trash)
-                            .label("Remove model")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                match slackless_core::huddle::delete_provider_model(provider) {
-                                    Ok(freed) => {
-                                        this.stt_download_status = Some(format!(
-                                            "Removed local model (reclaimed {}).",
-                                            format_bytes(freed)
-                                        ));
-                                    }
-                                    Err(err) => {
-                                        this.stt_download_status =
-                                            Some(format!("Could not remove model: {err}"));
-                                    }
+                        self.btn(
+                            Button::new("prefs-stt-delete")
+                                .ghost()
+                                .icon(IconName::Trash)
+                                .label("Remove model"),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            match slackless_core::huddle::delete_provider_model(provider) {
+                                Ok(freed) => {
+                                    this.stt_download_status = Some(format!(
+                                        "Removed local model (reclaimed {}).",
+                                        format_bytes(freed)
+                                    ));
                                 }
-                                cx.notify();
-                            })),
+                                Err(err) => {
+                                    this.stt_download_status =
+                                        Some(format!("Could not remove model: {err}"));
+                                }
+                            }
+                            cx.notify();
+                        })),
                     )
                 });
 
@@ -512,7 +517,7 @@ impl Preferences {
                     .flex_wrap()
                     .gap_1p5()
                     .child(
-                        Self::device_choice_button(
+                        self.device_choice_button(
                             "prefs-cam-default",
                             "System default",
                             active_cam.is_none(),
@@ -528,7 +533,7 @@ impl Preferences {
                     .children(self.cameras.iter().enumerate().map(|(ix, cam)| {
                         let selected = active_cam == Some(cam.index);
                         let cam_idx = cam.index;
-                        Self::device_choice_button(("prefs-cam", ix), cam.name.clone(), selected)
+                        self.device_choice_button(("prefs-cam", ix), cam.name.clone(), selected)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.settings.huddle_camera_device = Some(cam_idx);
                                 if this.camera_preview_on {
@@ -546,27 +551,28 @@ impl Preferences {
             ))
             .child(
                 h_flex().gap_2().child(
-                    Button::new("prefs-cam-preview-toggle")
-                        .outline()
-                        .with_size(Size::Small)
-                        .icon(if preview_on {
-                            IconName::VideoOff
-                        } else {
-                            IconName::Video
-                        })
-                        .label(if preview_on {
-                            "Stop camera preview"
-                        } else {
-                            "Preview camera"
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if this.camera_preview_on {
-                                this.stop_camera_preview(cx);
-                                cx.notify();
+                    self.btn(
+                        Button::new("prefs-cam-preview-toggle")
+                            .outline()
+                            .icon(if preview_on {
+                                IconName::VideoOff
                             } else {
-                                this.start_camera_preview(cx);
-                            }
-                        })),
+                                IconName::Video
+                            })
+                            .label(if preview_on {
+                                "Stop camera preview"
+                            } else {
+                                "Preview camera"
+                            }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.camera_preview_on {
+                            this.stop_camera_preview(cx);
+                            cx.notify();
+                        } else {
+                            this.start_camera_preview(cx);
+                        }
+                    })),
                 ),
             )
             .when(preview_on, |el| {

@@ -286,24 +286,29 @@ impl Render for NewMessageView {
                     .min_h_0()
                     .px_4()
                     .pt_2()
-                    .child(
+                    .child({
+                        let m = crate::preferences::control_metrics(cx);
                         h_flex()
                             .flex_wrap()
                             .items_center()
                             .gap_1p5()
+                            .min_h(m.height)
                             .px_2()
-                            .py_1()
+                            .py(px(if m.compact { 1. } else { 2. }))
                             .rounded_md()
                             .border_1()
-                            .border_color(border)
+                            .border_color(cx.theme().input)
                             .child(div().flex_none().text_sm().text_color(muted).child("To:"))
                             .children(chips)
                             .child(
                                 div().flex_1().min_w(px(140.)).child(
-                                    Textarea::new(&self.to).appearance(false).bordered(false),
+                                    Textarea::new(&self.to)
+                                        .with_size(m.input_size)
+                                        .appearance(false)
+                                        .bordered(false),
                                 ),
-                            ),
-                    )
+                            )
+                    })
                     .when(picking && !suggestions.is_empty(), |column| {
                         column.child(
                             v_flex()

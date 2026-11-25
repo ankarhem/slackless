@@ -2,7 +2,7 @@
 
 use gpui_kit::base::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{InputEvent, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, IntoElement, ParentElement as _, Render,
@@ -71,7 +71,7 @@ impl PausePicker {
 impl Render for PausePicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, muted, foreground) = (theme.input, theme.muted_foreground, theme.foreground);
+        let (muted, foreground) = (theme.muted_foreground, theme.foreground);
         let hint = match (self.until, self.invalid) {
             (Some(until), _) => {
                 format!("Notifications will stay off until {}.", clock(until, None))
@@ -93,16 +93,7 @@ impl Render for PausePicker {
                     .text_color(foreground)
                     .child("Pause notifications until a time you pick."),
             )
-            .child(
-                h_flex()
-                    .items_center()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .child(Textarea::new(&self.text).appearance(false).bordered(false)),
-            )
+            .child(crate::preferences::text_input_box(&self.text, false, cx))
             .child(div().text_xs().text_color(hint_color).child(hint))
             .child(
                 h_flex()
@@ -110,17 +101,21 @@ impl Render for PausePicker {
                     .gap_2()
                     .pt_2()
                     .child(
-                        Button::new("pause-cancel")
-                            .outline()
-                            .label("Cancel")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(PauseEvent::Cancel))),
+                        crate::preferences::form_button(
+                            Button::new("pause-cancel").outline().label("Cancel"),
+                            cx,
+                        )
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(PauseEvent::Cancel))),
                     )
                     .child(
-                        Button::new("pause-save")
-                            .primary()
-                            .label("Pause")
-                            .disabled(self.until.is_none())
-                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                        crate::preferences::form_button(
+                            Button::new("pause-save")
+                                .primary()
+                                .label("Pause")
+                                .disabled(self.until.is_none()),
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
                     ),
             )
     }

@@ -312,11 +312,13 @@ impl PopoutWindow {
                 .border_color(pal.drawer_border)
                 .bg(pal.drawer_bg)
                 .child(
-                    div()
-                        .w(px(180.))
-                        .text_xs()
-                        .text_color(pal.drawer_fg)
-                        .child(Textarea::new(input).appearance(false).bordered(false)),
+                    div().w(px(180.)).text_color(pal.drawer_fg).child(
+                        Textarea::new(input)
+                            .with_size(gpui_kit::component::Size::Small)
+                            .text_xs()
+                            .appearance(false)
+                            .bordered(false),
+                    ),
                 )
                 .child(
                     div()

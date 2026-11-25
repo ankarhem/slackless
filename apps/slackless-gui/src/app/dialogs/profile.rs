@@ -111,15 +111,7 @@ impl App {
                             .text_color(muted)
                             .child(label),
                     )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(border)
-                            .child(Textarea::new(state).appearance(false).bordered(false)),
-                    )
+                    .child(preferences::text_input_box(state, false, cx))
             };
             let this_save = this.clone();
             let (d_save, t_save, p_save, pr_save, tz_save, fields_save) = (
@@ -159,77 +151,77 @@ impl App {
                                     ),
                             )
                             .child(
-                                Button::new("profile-upload-photo")
-                                    .outline()
-                                    .with_size(Size::Small)
-                                    .icon(IconName::Image)
-                                    .label("Upload photo\u{2026}")
-                                    .on_click(move |_, window, cx| {
-                                        let this_u = this_photo.clone();
-                                        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
-                                            files: true,
-                                            directories: false,
-                                            multiple: false,
-                                            prompt: Some("Choose profile photo".into()),
-                                        });
-                                        window
-                                            .spawn(cx, async move |cx| {
-                                                let Ok(Ok(Some(paths))) = rx.await else {
-                                                    return;
-                                                };
-                                                let Some(path) = paths.into_iter().next() else {
-                                                    return;
-                                                };
-                                                let filename = path
-                                                    .file_name()
-                                                    .map(|n| n.to_string_lossy().into_owned())
-                                                    .unwrap_or_else(|| "avatar.png".to_owned());
-                                                let bytes = match std::fs::read(&path) {
-                                                    Ok(b) if b.len() <= 10 * 1024 * 1024 => b,
-                                                    Ok(_) => {
-                                                        let _ = cx.update(|window, cx| {
-                                                            notify(
-                                                                "Photo too large",
-                                                                "Choose an image smaller than 10 MB.",
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        });
-                                                        return;
-                                                    }
-                                                    Err(err) => {
-                                                        let _ = cx.update(|window, cx| {
-                                                            notify(
-                                                                "Could not read photo",
-                                                                err.to_string(),
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        });
-                                                        return;
-                                                    }
-                                                };
-                                                let _ = cx.update(|window, cx| {
-                                                    let _ = this_u.update(cx, |app, _| {
-                                                        if !app.fixtures.sample {
-                                                            app.bridge.send(
-                                                                Command::SetUserPhoto {
-                                                                    filename: filename.clone(),
-                                                                    bytes,
-                                                                },
-                                                            );
-                                                        }
+                                preferences::form_button(
+                                    Button::new("profile-upload-photo")
+                                        .outline()
+                                        .icon(IconName::Image)
+                                        .label("Upload photo\u{2026}"),
+                                    cx,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    let this_u = this_photo.clone();
+                                    let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+                                        files: true,
+                                        directories: false,
+                                        multiple: false,
+                                        prompt: Some("Choose profile photo".into()),
+                                    });
+                                    window
+                                        .spawn(cx, async move |cx| {
+                                            let Ok(Ok(Some(paths))) = rx.await else {
+                                                return;
+                                            };
+                                            let Some(path) = paths.into_iter().next() else {
+                                                return;
+                                            };
+                                            let filename = path
+                                                .file_name()
+                                                .map(|n| n.to_string_lossy().into_owned())
+                                                .unwrap_or_else(|| "avatar.png".to_owned());
+                                            let bytes = match std::fs::read(&path) {
+                                                Ok(b) if b.len() <= 10 * 1024 * 1024 => b,
+                                                Ok(_) => {
+                                                    let _ = cx.update(|window, cx| {
+                                                        notify(
+                                                            "Photo too large",
+                                                            "Choose an image smaller than 10 MB.",
+                                                            window,
+                                                            cx,
+                                                        );
                                                     });
-                                                    notify(
-                                                        "Profile photo",
-                                                        format!("Uploading {filename}\u{2026}"),
-                                                        window,
-                                                        cx,
-                                                    );
+                                                    return;
+                                                }
+                                                Err(err) => {
+                                                    let _ = cx.update(|window, cx| {
+                                                        notify(
+                                                            "Could not read photo",
+                                                            err.to_string(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    });
+                                                    return;
+                                                }
+                                            };
+                                            let _ = cx.update(|window, cx| {
+                                                let _ = this_u.update(cx, |app, _| {
+                                                    if !app.fixtures.sample {
+                                                        app.bridge.send(Command::SetUserPhoto {
+                                                            filename: filename.clone(),
+                                                            bytes,
+                                                        });
+                                                    }
                                                 });
-                                            })
-                                            .detach();
-                                    }),
+                                                notify(
+                                                    "Profile photo",
+                                                    format!("Uploading {filename}\u{2026}"),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        })
+                                        .detach();
+                                }),
                             ),
                     )
                     .child(field("Display name", &display_in))
@@ -243,55 +235,57 @@ impl App {
                             .gap_2()
                             .pt_2()
                             .child(
-                                Button::new("profile-edit-cancel")
-                                    .outline()
-                                    .label("Cancel")
-                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                                preferences::form_button(
+                                    Button::new("profile-edit-cancel").outline().label("Cancel"),
+                                    cx,
+                                )
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
                             )
                             .child(
-                                Button::new("profile-edit-save")
-                                    .primary()
-                                    .label("Save Changes")
-                                    .on_click(move |_, window, cx| {
-                                        let pronouns_val =
-                                            pr_save.read(cx).value().trim().to_owned();
-                                        let tz_val = tz_save.read(cx).value().trim().to_owned();
-                                        let update = slackless_core::api::ProfileUpdate {
-                                            display_name: Some(
-                                                d_save.read(cx).value().trim().to_owned(),
-                                            ),
-                                            title: Some(t_save.read(cx).value().trim().to_owned()),
-                                            phone: Some(p_save.read(cx).value().trim().to_owned()),
-                                            pronouns: Some(pronouns_val.clone()),
-                                            tz: (!tz_val.is_empty()).then_some(tz_val),
-                                            ..Default::default()
-                                        };
-                                        if let Some(app) = this_save.upgrade() {
-                                            app.update(cx, |app, cx| {
-                                                let me_id = app.fixtures.self_user.clone();
-                                                app.profile.update(cx, |profile, cx| {
-                                                    profile.set_user_profile(
-                                                        me_id,
-                                                        (!pronouns_val.is_empty())
-                                                            .then_some(pronouns_val),
-                                                        fields_save.clone(),
-                                                        cx,
-                                                    );
-                                                });
-                                                if !app.fixtures.sample {
-                                                    app.bridge
-                                                        .send(Command::UpdateProfile { update });
-                                                }
-                                                notify(
-                                                    "Profile updated",
-                                                    "Your profile changes were saved.",
-                                                    window,
+                                preferences::form_button(
+                                    Button::new("profile-edit-save")
+                                        .primary()
+                                        .label("Save Changes"),
+                                    cx,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    let pronouns_val = pr_save.read(cx).value().trim().to_owned();
+                                    let tz_val = tz_save.read(cx).value().trim().to_owned();
+                                    let update = slackless_core::api::ProfileUpdate {
+                                        display_name: Some(
+                                            d_save.read(cx).value().trim().to_owned(),
+                                        ),
+                                        title: Some(t_save.read(cx).value().trim().to_owned()),
+                                        phone: Some(p_save.read(cx).value().trim().to_owned()),
+                                        pronouns: Some(pronouns_val.clone()),
+                                        tz: (!tz_val.is_empty()).then_some(tz_val),
+                                        ..Default::default()
+                                    };
+                                    if let Some(app) = this_save.upgrade() {
+                                        app.update(cx, |app, cx| {
+                                            let me_id = app.fixtures.self_user.clone();
+                                            app.profile.update(cx, |profile, cx| {
+                                                profile.set_user_profile(
+                                                    me_id,
+                                                    (!pronouns_val.is_empty())
+                                                        .then_some(pronouns_val),
+                                                    fields_save.clone(),
                                                     cx,
                                                 );
                                             });
-                                        }
-                                        window.close_dialog(cx);
-                                    }),
+                                            if !app.fixtures.sample {
+                                                app.bridge.send(Command::UpdateProfile { update });
+                                            }
+                                            notify(
+                                                "Profile updated",
+                                                "Your profile changes were saved.",
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                    window.close_dialog(cx);
+                                }),
                             ),
                     ),
             )

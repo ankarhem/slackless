@@ -546,21 +546,26 @@ pub fn list_view(cx: &App) -> Stateful<Div> {
 
     let add_bar = state.adding.then(|| {
         state.new_item_input.clone().map(|input| {
+            let m = crate::preferences::control_metrics(cx);
             let input_submit = input.clone();
             let rows_seed = default_rows.clone();
             h_flex()
                 .items_center()
                 .gap_2()
-                .p_2()
+                .px_2()
+                .py_1()
+                .min_h(m.height)
                 .rounded_md()
                 .border_1()
                 .border_color(theme.border)
                 .bg(theme.secondary.opacity(0.3))
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(Textarea::new(&input).appearance(false).bordered(false)),
+                    div().flex_1().min_w_0().child(
+                        Textarea::new(&input)
+                            .with_size(m.input_size)
+                            .appearance(false)
+                            .bordered(false),
+                    ),
                 )
                 .child(
                     Button::new("list-fix-add-save")

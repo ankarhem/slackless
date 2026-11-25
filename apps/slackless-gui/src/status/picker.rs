@@ -198,6 +198,7 @@ impl StatusPicker {
 
 impl Render for StatusPicker {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let m = crate::preferences::control_metrics(cx);
         let focused = self.text.read(cx).focus_handle(cx).is_focused(window);
         let theme = cx.theme();
         let (border, muted, hover, popover, ring, accent_fg, accent) = (
@@ -215,16 +216,16 @@ impl Render for StatusPicker {
 
         let field = h_flex()
             .items_center()
-            .gap_2()
-            .px_2()
-            .py_1()
+            .gap_1()
+            .px_1p5()
+            .h(m.height)
             .rounded_md()
             .border_1()
             .border_color(if focused { ring } else { border })
             .child(
                 div()
                     .id("status-emoji")
-                    .size(px(28.))
+                    .size(px(if m.compact { 22. } else { 24. }))
                     .flex_none()
                     .rounded_sm()
                     .flex()
@@ -237,7 +238,7 @@ impl Render for StatusPicker {
                         button.child(
                             Icon::new(IconName::FaceSlightlySmiling)
                                 .text_color(muted)
-                                .size(px(18.)),
+                                .size(px(16.)),
                         )
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -246,16 +247,18 @@ impl Render for StatusPicker {
                     })),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Textarea::new(&self.text).appearance(false).bordered(false)),
+                div().flex_1().min_w_0().child(
+                    Textarea::new(&self.text)
+                        .with_size(m.input_size)
+                        .appearance(false)
+                        .bordered(false),
+                ),
             )
             .when(self.has_text, |row| {
                 row.child(
                     div()
                         .id("status-clear")
-                        .size(px(24.))
+                        .size(px(if m.compact { 22. } else { 24. }))
                         .flex_none()
                         .rounded_sm()
                         .flex()
@@ -266,7 +269,7 @@ impl Render for StatusPicker {
                         .child(
                             Icon::new(IconName::CircleX)
                                 .text_color(foreground)
-                                .size(px(16.)),
+                                .size(px(15.)),
                         )
                         .on_click(cx.listener(|this, _, window, cx| this.load(None, window, cx))),
                 )
@@ -418,10 +421,10 @@ impl Render for StatusPicker {
                 h_flex()
                     .id("status-clear-after")
                     .w_full()
+                    .h(m.height)
                     .items_center()
                     .justify_between()
                     .px_3()
-                    .py_1p5()
                     .rounded_md()
                     .border_1()
                     .border_color(border)
@@ -473,17 +476,21 @@ impl Render for StatusPicker {
             .gap_2()
             .pt_2()
             .child(
-                Button::new("status-cancel")
-                    .outline()
-                    .label("Cancel")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(StatusEvent::Cancel))),
+                crate::preferences::form_button(
+                    Button::new("status-cancel").outline().label("Cancel"),
+                    cx,
+                )
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(StatusEvent::Cancel))),
             )
             .child(
-                Button::new("status-save")
-                    .primary()
-                    .label("Save")
-                    .disabled(!self.has_text)
-                    .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                crate::preferences::form_button(
+                    Button::new("status-save")
+                        .primary()
+                        .label("Save")
+                        .disabled(!self.has_text),
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
             );
         let schedule_row = v_flex()
             .gap_1p5()

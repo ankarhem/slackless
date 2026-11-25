@@ -19,20 +19,25 @@ pub(super) fn render_live_add_bar(
             let input_submit = input.clone();
             let key_save = list_key.clone();
             let key_cancel = list_key.clone();
+            let m = crate::preferences::control_metrics(cx);
             Some(
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .p_2()
+                    .px_2()
+                    .py_1()
+                    .min_h(m.height)
                     .rounded_md()
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.secondary.opacity(0.3))
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Textarea::new(&input).appearance(false).bordered(false)),
+                        div().flex_1().min_w_0().child(
+                            Textarea::new(&input)
+                                .with_size(m.input_size)
+                                .appearance(false)
+                                .bordered(false),
+                        ),
                     )
                     .child(
                         Button::new("list-live-add-save")
@@ -90,27 +95,32 @@ pub(super) fn render_live_find_bar(
     search: Option<&Entity<TextareaState>>,
     cx: &App,
 ) -> Option<Div> {
+    let m = crate::preferences::control_metrics(cx);
     let theme = cx.theme();
     search.map(|input| {
         h_flex()
             .w(px(280.))
-            .h(px(30.))
-            .px_2p5()
-            .gap_2()
+            .h(m.height)
+            .pl_2p5()
+            .pr_1()
+            .gap_0p5()
             .items_center()
             .rounded_md()
             .border_1()
-            .border_color(theme.border)
+            .border_color(theme.input)
             .child(
                 Icon::new(IconName::Search)
+                    .flex_none()
                     .size(px(14.))
                     .text_color(theme.muted_foreground),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Textarea::new(input).appearance(false).bordered(false)),
+                div().flex_1().min_w_0().child(
+                    Textarea::new(input)
+                        .with_size(m.input_size)
+                        .appearance(false)
+                        .bordered(false),
+                ),
             )
             .when(!query.trim().is_empty(), |row| {
                 let clear_input = input.clone();

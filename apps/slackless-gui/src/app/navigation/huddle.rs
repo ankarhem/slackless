@@ -94,19 +94,28 @@ impl App {
                                 h_flex()
                                     .gap_2()
                                     .justify_end()
-                                    .child(Button::new("huddle-warn-cancel").label("Cancel").on_click(
-                                        |_, window, cx| window.close_dialog(cx),
-                                    ))
                                     .child(
-                                        Button::new("huddle-warn-go")
-                                            .primary()
-                                            .label("Start huddle")
-                                            .on_click(move |_, window, cx| {
-                                                window.close_dialog(cx);
-                                                let _ = this.update(cx, |app, cx| {
-                                                    app.join_huddle_in(ch.clone(), window, cx);
-                                                });
-                                            }),
+                                        preferences::form_button(
+                                            Button::new("huddle-warn-cancel")
+                                                .outline()
+                                                .label("Cancel"),
+                                            cx,
+                                        )
+                                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                                    )
+                                    .child(
+                                        preferences::form_button(
+                                            Button::new("huddle-warn-go")
+                                                .primary()
+                                                .label("Start huddle"),
+                                            cx,
+                                        )
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            let _ = this.update(cx, |app, cx| {
+                                                app.join_huddle_in(ch.clone(), window, cx);
+                                            });
+                                        }),
                                     ),
                             ),
                     )

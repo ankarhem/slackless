@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, AppContext as _, BoxShadow, Context, Entity, EventEmitter, Focusable as _,
@@ -591,13 +591,15 @@ impl Render for EmojiPicker {
         });
 
         // The search field in Slack's focus ring: the accent border inside a soft halo.
+        let m = crate::preferences::control_metrics(cx);
         let focused = self.search.read(cx).focus_handle(cx).is_focused(window);
         let search = h_flex()
             .mx_4()
             .mt_3()
-            .h(px(36.))
+            .px_1()
+            .h(m.height)
             .items_center()
-            .rounded_lg()
+            .rounded_md()
             .border_1()
             .border_color(if focused { ring } else { input_border })
             .when(focused, |field| {
@@ -611,8 +613,9 @@ impl Render for EmojiPicker {
             })
             .bg(background)
             .child(
-                div().flex_1().min_w_0().text_sm().child(
+                div().flex_1().min_w_0().child(
                     Textarea::new(&self.search)
+                        .with_size(m.input_size)
                         .appearance(false)
                         .bordered(false),
                 ),

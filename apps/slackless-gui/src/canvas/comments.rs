@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::input::TextareaState;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
@@ -433,18 +433,8 @@ pub(super) fn render_comments_drawer(
                         .gap_1()
                         .pt_1()
                         .child(
-                            div()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.background)
-                                .px_2()
-                                .py_1()
-                                .child(
-                                    Textarea::new(&reply_input)
-                                        .appearance(false)
-                                        .bordered(false),
-                                ),
+                            crate::preferences::text_input_box(&reply_input, true, cx)
+                                .bg(theme.background),
                         )
                         .child(
                             h_flex()
@@ -538,16 +528,7 @@ pub(super) fn render_comments_drawer(
             .pt_2()
             .border_t_1()
             .border_color(theme.border)
-            .child(
-                div()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.background)
-                    .px_2()
-                    .py_1()
-                    .child(Textarea::new(&input).appearance(false).bordered(false)),
-            )
+            .child(crate::preferences::text_input_box(&input, true, cx).bg(theme.background))
             .child(
                 h_flex().justify_end().child(
                     Button::new(SharedString::from(format!("canvas-comment-post-{key}")))

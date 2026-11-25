@@ -27,7 +27,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     App, AppContext as _, Context, Div, Entity, EventEmitter, Focusable as _, FontWeight,
@@ -194,29 +194,39 @@ impl SectionNameForm {
 
 impl Render for SectionNameForm {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (border, muted) = (cx.theme().border, cx.theme().muted_foreground);
+        let m = crate::preferences::control_metrics(cx);
+        let (border, muted) = (cx.theme().input, cx.theme().muted_foreground);
         v_flex()
             .id("section-form")
             .gap_3()
             .child(
                 h_flex()
                     .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
+                    .gap_0p5()
+                    .pl_2p5()
+                    .pr_1()
+                    .h(m.height)
                     .rounded_md()
                     .border_1()
                     .border_color(border)
-                    .child(Icon::new(IconName::Tag).text_color(muted).size(px(14.)))
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Textarea::new(&self.name).appearance(false).bordered(false)),
+                        Icon::new(IconName::Tag)
+                            .flex_none()
+                            .text_color(muted)
+                            .size(px(14.)),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Textarea::new(&self.name)
+                                .with_size(m.input_size)
+                                .appearance(false)
+                                .bordered(false),
+                        ),
                     ),
             )
             .child(
                 h_flex()
+                    .items_center()
                     .gap_2()
                     .justify_end()
                     .child(
@@ -226,10 +236,11 @@ impl Render for SectionNameForm {
                             .child("Sections created here appear in Slack on every client."),
                     )
                     .child(
-                        Button::new("section-create")
-                            .primary()
-                            .label("Create")
-                            .on_click(cx.listener(|this, _, _, cx| this.create(cx))),
+                        crate::preferences::form_button(
+                            Button::new("section-create").primary().label("Create"),
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.create(cx))),
                     ),
             )
     }

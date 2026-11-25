@@ -181,6 +181,14 @@ impl Preferences {
             }))
     }
 
+    pub(super) fn metrics(&self) -> ControlMetrics {
+        ControlMetrics::for_compact(self.settings.density == 1)
+    }
+
+    pub(super) fn btn(&self, btn: Button) -> Button {
+        form_button_for(btn, self.metrics())
+    }
+
     /// A select: the current option in a bordered box; clicking opens a floating dropdown menu
     /// anchored directly below the trigger without shifting content beneath it.
     fn select(
@@ -190,8 +198,20 @@ impl Preferences {
         choice: Choice,
         cx: &mut Context<Self>,
     ) -> Div {
+        self.select_w(id, 300., options, choice, cx)
+    }
+
+    fn select_w(
+        &mut self,
+        id: &'static str,
+        width: f32,
+        options: &'static [&'static str],
+        choice: Choice,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let selected = (*choice(&mut self.settings)).min(options.len().saturating_sub(1));
         let open = self.open_select == Some(id);
+        let m = self.metrics();
         let theme = cx.theme();
         let (border, focus_border, muted, popover, hover, active, active_fg, fg) = (
             theme.input,
@@ -205,12 +225,12 @@ impl Preferences {
         );
         let trigger = h_flex()
             .id(id)
-            .w(px(300.))
+            .w(px(width))
+            .h(m.height)
             .items_center()
             .justify_between()
             .gap_2()
             .px_3()
-            .py_1p5()
             .rounded_md()
             .border_1()
             .border_color(if open { focus_border } else { border })
@@ -245,7 +265,7 @@ impl Preferences {
         let menu_overlay = open.then(|| {
             let menu = v_flex()
                 .id(SharedString::from(format!("{id}-menu")))
-                .w(px(300.))
+                .w(px(width))
                 .p_1()
                 .gap_0p5()
                 .rounded_md()
@@ -270,7 +290,7 @@ impl Preferences {
                         .justify_between()
                         .gap_2()
                         .px_2p5()
-                        .py_1p5()
+                        .py(px(if m.compact { 4. } else { 6. }))
                         .rounded_sm()
                         .cursor_pointer()
                         .text_sm()
@@ -302,7 +322,7 @@ impl Preferences {
         });
         div()
             .relative()
-            .w(px(300.))
+            .w(px(width))
             .child(trigger)
             .children(menu_overlay)
     }

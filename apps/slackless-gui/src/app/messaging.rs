@@ -930,24 +930,31 @@ impl App {
                                 .gap_2()
                                 .justify_end()
                                 .child(
-                                    Button::new("secret-guard-cancel")
-                                        .label("Cancel")
-                                        .on_click(move |_, window, cx| {
-                                            window.close_dialog(cx);
-                                            if restore_main_composer {
-                                                let _ = this_cancel.update(cx, |app, cx| {
-                                                    app.composer.update(cx, |composer, cx| {
-                                                        composer.load_draft(&cancel_text, cx);
-                                                    });
+                                    preferences::form_button(
+                                        Button::new("secret-guard-cancel")
+                                            .outline()
+                                            .label("Cancel"),
+                                        cx,
+                                    )
+                                    .on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        if restore_main_composer {
+                                            let _ = this_cancel.update(cx, |app, cx| {
+                                                app.composer.update(cx, |composer, cx| {
+                                                    composer.load_draft(&cancel_text, cx);
                                                 });
-                                            }
-                                        }),
+                                            });
+                                        }
+                                    }),
                                 )
                                 .child(
-                                    Button::new("secret-guard-send")
-                                        .danger()
-                                        .label("Send anyway")
-                                        .on_click(move |_, window, cx| {
+                                    preferences::form_button(
+                                        Button::new("secret-guard-send")
+                                            .danger()
+                                            .label("Send anyway"),
+                                        cx,
+                                    )
+                                    .on_click(move |_, window, cx| {
                                             window.close_dialog(cx);
                                             let _ = this_send.update(cx, |app, cx| {
                                                 proceed(app, window, cx);
@@ -1011,7 +1018,13 @@ impl App {
                                     .gap_2()
                                     .justify_end()
                                     .child(
-                                        Button::new("broadcast-cancel").label("Cancel").on_click(
+                                        preferences::form_button(
+                                            Button::new("broadcast-cancel")
+                                                .outline()
+                                                .label("Cancel"),
+                                            cx,
+                                        )
+                                        .on_click(
                                             move |_, window, cx| {
                                                 window.close_dialog(cx);
                                                 let _ = this_cancel.update(cx, |app, cx| {
@@ -1023,15 +1036,18 @@ impl App {
                                         ),
                                     )
                                     .child(
-                                        Button::new("broadcast-send")
-                                            .primary()
-                                            .label("Send")
-                                            .on_click(move |_, window, cx| {
+                                        preferences::form_button(
+                                            Button::new("broadcast-send").primary().label("Send"),
+                                            cx,
+                                        )
+                                        .on_click(
+                                            move |_, window, cx| {
                                                 window.close_dialog(cx);
                                                 let _ = this_send.update(cx, |app, cx| {
                                                     app.deliver_send(send_content.clone(), cx);
                                                 });
-                                            }),
+                                            },
+                                        ),
                                     ),
                             ),
                     )
@@ -1833,47 +1849,40 @@ impl App {
                                     .text_color(muted)
                                     .child("Or enter a list ID"),
                             )
-                            .child(
-                                div()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(border)
-                                    .bg(bg)
-                                    .child(
-                                        Textarea::new(&id_input).appearance(false).bordered(false),
-                                    ),
-                            ),
+                            .child(preferences::text_input_mono(&id_input, false, cx).bg(bg)),
                     )
                     .child(
                         h_flex()
                             .justify_end()
                             .gap_2()
                             .child(
-                                Button::new("add-to-list-cancel")
-                                    .outline()
-                                    .with_size(Size::Small)
-                                    .label("Cancel")
-                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                                preferences::form_button(
+                                    Button::new("add-to-list-cancel").outline().label("Cancel"),
+                                    cx,
+                                )
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
                             )
                             .child(
-                                Button::new("add-to-list-submit")
-                                    .primary()
-                                    .with_size(Size::Small)
-                                    .label("Add to list")
-                                    .on_click(move |_, window, cx| {
-                                        let list_id = input_c.read(cx).value().trim().to_owned();
-                                        if list_id.is_empty() {
-                                            return;
-                                        }
-                                        window.close_dialog(cx);
-                                        let _ = this_ok.update(cx, |app, _| {
-                                            app.bridge.send(Command::AddMessageToList {
-                                                list_id,
-                                                channel: ch_ok.clone(),
-                                                ts: ts_ok.clone(),
-                                            });
+                                preferences::form_button(
+                                    Button::new("add-to-list-submit")
+                                        .primary()
+                                        .label("Add to list"),
+                                    cx,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    let list_id = input_c.read(cx).value().trim().to_owned();
+                                    if list_id.is_empty() {
+                                        return;
+                                    }
+                                    window.close_dialog(cx);
+                                    let _ = this_ok.update(cx, |app, _| {
+                                        app.bridge.send(Command::AddMessageToList {
+                                            list_id,
+                                            channel: ch_ok.clone(),
+                                            ts: ts_ok.clone(),
                                         });
-                                    }),
+                                    });
+                                }),
                             ),
                     ),
             )

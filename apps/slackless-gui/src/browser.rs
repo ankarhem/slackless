@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{InputEvent, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
@@ -204,25 +204,7 @@ impl Render for ChannelBrowser {
             .w_full()
             .gap_2()
             .text_sm()
-            .child(
-                h_flex()
-                    .mx_4()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .child(Icon::new(IconName::Search).text_color(muted).size(px(14.)))
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Textarea::new(&self.filter)
-                                .appearance(false)
-                                .bordered(false),
-                        ),
-                    ),
-            )
+            .child(crate::preferences::search_input_box(&self.filter, cx).mx_4())
             .child(
                 div()
                     .px_4()

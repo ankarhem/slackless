@@ -166,3 +166,18 @@ fn accessible_message_verbosity_and_cross_workspace_summary_format_cleanly() {
         "3 workspaces: Acme: 3 mentions; Labs: unread messages; Ops: all read"
     );
 }
+
+#[test]
+fn control_metrics_switches_between_clean_and_compact() {
+    let clean = ControlMetrics::for_compact(false);
+    assert!(!clean.compact);
+    assert_eq!(clean.height, px(32.));
+    assert_eq!(clean.button_size, Size::Medium);
+    assert_eq!(clean.input_size, Size::Small);
+
+    let compact = ControlMetrics::for_compact(true);
+    assert!(compact.compact);
+    assert_eq!(compact.height, px(28.));
+    assert_eq!(compact.button_size, Size::Small);
+    assert_eq!(compact.input_size, Size::Small);
+}

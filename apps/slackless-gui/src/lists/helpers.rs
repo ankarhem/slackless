@@ -635,15 +635,7 @@ pub(super) fn render_record_comments_section(
             })
             .unwrap_or_default();
         section = section
-            .child(
-                div()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme.border)
-                    .px_2()
-                    .py_1()
-                    .child(Textarea::new(&input).appearance(false).bordered(false)),
-            )
+            .child(crate::preferences::text_input_box(&input, true, cx))
             .when(!mention_matches.is_empty(), |col| {
                 let mut picks = v_flex()
                     .gap_0p5()

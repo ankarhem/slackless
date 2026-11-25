@@ -834,25 +834,30 @@ fn render_canvas_doc(
                 .child(format_canvas_error(msg))
         });
 
+    let m = crate::preferences::control_metrics(cx);
     let find_bar = search.map(|input| {
         h_flex()
-            .h(px(32.))
-            .px_2p5()
-            .gap_2()
+            .h(m.height)
+            .pl_2p5()
+            .pr_1()
+            .gap_0p5()
             .items_center()
             .rounded_md()
             .border_1()
-            .border_color(theme.border)
+            .border_color(theme.input)
             .child(
                 Icon::new(IconName::Search)
+                    .flex_none()
                     .size(px(14.))
                     .text_color(theme.muted_foreground),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Textarea::new(input).appearance(false).bordered(false)),
+                div().flex_1().min_w_0().child(
+                    Textarea::new(input)
+                        .with_size(m.input_size)
+                        .appearance(false)
+                        .bordered(false),
+                ),
             )
             .children(match_note.map(|note| {
                 div()

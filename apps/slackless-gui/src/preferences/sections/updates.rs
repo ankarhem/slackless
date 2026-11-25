@@ -21,11 +21,12 @@ impl Preferences {
                 "Contacting GitHub Releases.".to_owned(),
                 false,
                 h_flex().gap_1p5().child(
-                    Button::new("adv-upd-checking")
-                        .outline()
-                        .with_size(Size::Small)
-                        .disabled(true)
-                        .label("Checking\u{2026}"),
+                    self.btn(
+                        Button::new("adv-upd-checking")
+                            .outline()
+                            .disabled(true)
+                            .label("Checking\u{2026}"),
+                    ),
                 ),
             ),
             UpdateState::Downloading(ver) => (
@@ -35,11 +36,12 @@ impl Preferences {
                 "Verifying package and preparing restart.".to_owned(),
                 false,
                 h_flex().gap_1p5().child(
-                    Button::new("adv-upd-downloading")
-                        .primary()
-                        .with_size(Size::Small)
-                        .disabled(true)
-                        .label("Downloading\u{2026}"),
+                    self.btn(
+                        Button::new("adv-upd-downloading")
+                            .primary()
+                            .disabled(true)
+                            .label("Downloading\u{2026}"),
+                    ),
                 ),
             ),
             UpdateState::Available(rel) => {
@@ -55,20 +57,18 @@ impl Preferences {
                         .items_center()
                         .gap_1p5()
                         .child(
-                            Button::new("adv-upd-notes")
-                                .ghost()
-                                .with_size(Size::Small)
-                                .label("Release notes")
+                            self.btn(Button::new("adv-upd-notes").ghost().label("Release notes"))
                                 .on_click(move |_, _, cx| cx.open_url(&notes_url)),
                         )
                         .child(
-                            Button::new("adv-upd-download")
-                                .primary()
-                                .with_size(Size::Small)
-                                .label("Download & restart")
-                                .on_click(cx.listener(|_, _, _, cx| {
-                                    cx.emit(PreferencesEvent::InstallUpdate);
-                                })),
+                            self.btn(
+                                Button::new("adv-upd-download")
+                                    .primary()
+                                    .label("Download & restart"),
+                            )
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(PreferencesEvent::InstallUpdate);
+                            })),
                         ),
                 )
             }
@@ -79,13 +79,14 @@ impl Preferences {
                 "You have the latest release of Slackless.".to_owned(),
                 false,
                 h_flex().gap_1p5().child(
-                    Button::new("adv-upd-check-again")
-                        .outline()
-                        .with_size(Size::Small)
-                        .label("Check for updates")
-                        .on_click(cx.listener(|_, _, _, cx| {
-                            cx.emit(PreferencesEvent::CheckForUpdates);
-                        })),
+                    self.btn(
+                        Button::new("adv-upd-check-again")
+                            .outline()
+                            .label("Check for updates"),
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(PreferencesEvent::CheckForUpdates);
+                    })),
                 ),
             ),
             UpdateState::Error(err) => (
@@ -95,10 +96,7 @@ impl Preferences {
                 err.clone(),
                 true,
                 h_flex().gap_1p5().child(
-                    Button::new("adv-upd-retry")
-                        .outline()
-                        .with_size(Size::Small)
-                        .label("Try again")
+                    self.btn(Button::new("adv-upd-retry").outline().label("Try again"))
                         .on_click(cx.listener(|_, _, _, cx| {
                             cx.emit(PreferencesEvent::CheckForUpdates);
                         })),
@@ -118,20 +116,24 @@ impl Preferences {
                             .items_center()
                             .gap_1p5()
                             .child(
-                                Button::new("adv-upd-notes-cached")
-                                    .ghost()
-                                    .with_size(Size::Small)
-                                    .label("Release notes")
-                                    .on_click(move |_, _, cx| cx.open_url(&notes_url)),
+                                self.btn(
+                                    Button::new("adv-upd-notes-cached")
+                                        .ghost()
+                                        .label("Release notes"),
+                                )
+                                .on_click(move |_, _, cx| cx.open_url(&notes_url)),
                             )
                             .child(
-                                Button::new("adv-upd-download-cached")
-                                    .primary()
-                                    .with_size(Size::Small)
-                                    .label("Download & restart")
-                                    .on_click(cx.listener(|_, _, _, cx| {
+                                self.btn(
+                                    Button::new("adv-upd-download-cached")
+                                        .primary()
+                                        .label("Download & restart"),
+                                )
+                                .on_click(cx.listener(
+                                    |_, _, _, cx| {
                                         cx.emit(PreferencesEvent::InstallUpdate);
-                                    })),
+                                    },
+                                )),
                             ),
                     )
                 }
@@ -152,13 +154,14 @@ impl Preferences {
                     .to_owned(),
                     false,
                     h_flex().gap_1p5().child(
-                        Button::new("adv-upd-check")
-                            .outline()
-                            .with_size(Size::Small)
-                            .label("Check for updates")
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                cx.emit(PreferencesEvent::CheckForUpdates);
-                            })),
+                        self.btn(
+                            Button::new("adv-upd-check")
+                                .outline()
+                                .label("Check for updates"),
+                        )
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.emit(PreferencesEvent::CheckForUpdates);
+                        })),
                     ),
                 ),
             },
@@ -248,22 +251,23 @@ impl Preferences {
                 Some(SharedString::from(path.display().to_string())),
                 format!("Version {ver} · stays in sync with app updates"),
                 h_flex().gap_1p5().child(
-                    Button::new("adv-cli-uninstall")
-                        .outline()
-                        .with_size(Size::Small)
-                        .label("Uninstall")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            match crate::updater::uninstall_cli_symlink() {
-                                Ok(()) => {
-                                    this.cli_status_note =
-                                        Some("Removed slackless CLI link.".to_owned());
-                                }
-                                Err(err) => {
-                                    this.cli_status_note = Some(format!("Error: {err}"));
-                                }
+                    self.btn(
+                        Button::new("adv-cli-uninstall")
+                            .outline()
+                            .label("Uninstall"),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        match crate::updater::uninstall_cli_symlink() {
+                            Ok(()) => {
+                                this.cli_status_note =
+                                    Some("Removed slackless CLI link.".to_owned());
                             }
-                            cx.notify();
-                        })),
+                            Err(err) => {
+                                this.cli_status_note = Some(format!("Error: {err}"));
+                            }
+                        }
+                        cx.notify();
+                    })),
                 ),
             ),
             CliInstallStatus::OutOfSync(path) => (
@@ -272,10 +276,7 @@ impl Preferences {
                 Some(SharedString::from(path.display().to_string())),
                 format!("Points to a different build. Re-link to match Slackless {ver}."),
                 h_flex().gap_1p5().child(
-                    Button::new("adv-cli-relink")
-                        .primary()
-                        .with_size(Size::Small)
-                        .label("Update link")
+                    self.btn(Button::new("adv-cli-relink").primary().label("Update link"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             match crate::updater::install_cli_symlink() {
                                 Ok(p) => {
@@ -298,22 +299,23 @@ impl Preferences {
                     "Links the bundled CLI (version {ver}) so it stays in sync with app updates."
                 ),
                 h_flex().gap_1p5().child(
-                    Button::new("adv-cli-install")
-                        .primary()
-                        .with_size(Size::Small)
-                        .label("Install CLI")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            match crate::updater::install_cli_symlink() {
-                                Ok(p) => {
-                                    this.cli_status_note =
-                                        Some(format!("Installed CLI at {}.", p.display()));
-                                }
-                                Err(err) => {
-                                    this.cli_status_note = Some(format!("Error: {err}"));
-                                }
+                    self.btn(
+                        Button::new("adv-cli-install")
+                            .primary()
+                            .label("Install CLI"),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        match crate::updater::install_cli_symlink() {
+                            Ok(p) => {
+                                this.cli_status_note =
+                                    Some(format!("Installed CLI at {}.", p.display()));
                             }
-                            cx.notify();
-                        })),
+                            Err(err) => {
+                                this.cli_status_note = Some(format!("Error: {err}"));
+                            }
+                        }
+                        cx.notify();
+                    })),
                 ),
             ),
             CliInstallStatus::Unavailable => (
@@ -359,19 +361,19 @@ impl Preferences {
                             .child(self.mono_chip(export_cmd, cx)),
                     )
                     .child(
-                        Button::new("adv-cli-copy-path")
-                            .ghost()
-                            .with_size(Size::Small)
-                            .icon(IconName::Copy)
-                            .label("Copy")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(
-                                    copy_cmd.clone(),
-                                ));
-                                this.cli_status_note =
-                                    Some("Copied PATH export command.".to_owned());
-                                cx.notify();
-                            })),
+                        self.btn(
+                            Button::new("adv-cli-copy-path")
+                                .ghost()
+                                .icon(IconName::Copy)
+                                .label("Copy"),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(
+                                copy_cmd.clone(),
+                            ));
+                            this.cli_status_note = Some("Copied PATH export command.".to_owned());
+                            cx.notify();
+                        })),
                     ),
             );
         }

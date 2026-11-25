@@ -758,20 +758,23 @@ impl App {
             let this_close = this.clone();
             let (close_id, close_hash) = (view_id.clone(), hash.clone());
             let mut footer = h_flex().justify_end().gap_2().pt_3().child(
-                Button::new("modal-close")
-                    .outline()
-                    .label(close_label.clone())
-                    .on_click(move |_, window, cx| {
-                        if notify_on_close && let Some(app) = this_close.upgrade() {
-                            app.update(cx, |app, _| {
-                                app.bridge.send(Command::CloseModal {
-                                    view_id: close_id.clone(),
-                                    hash: close_hash.clone(),
-                                });
+                preferences::form_button(
+                    Button::new("modal-close")
+                        .outline()
+                        .label(close_label.clone()),
+                    cx,
+                )
+                .on_click(move |_, window, cx| {
+                    if notify_on_close && let Some(app) = this_close.upgrade() {
+                        app.update(cx, |app, _| {
+                            app.bridge.send(Command::CloseModal {
+                                view_id: close_id.clone(),
+                                hash: close_hash.clone(),
                             });
-                        }
-                        window.close_dialog(cx);
-                    }),
+                        });
+                    }
+                    window.close_dialog(cx);
+                }),
             );
             if let Some(submit_text) = &submit_label {
                 let (this_submit, kit_submit, ts_submit, blocks_submit, sub_id, sub_hash) = (
@@ -783,33 +786,36 @@ impl App {
                     hash.clone(),
                 );
                 footer = footer.child(
-                    Button::new("modal-submit")
-                        .primary()
-                        .label(submit_text.clone())
-                        .on_click(
-                            move |_, window, cx| match crate::blockkit::collect_modal_state(
-                                &ts_submit,
-                                &blocks_submit,
-                                &kit_submit,
-                                cx,
-                            ) {
-                                Ok(state_values) => {
-                                    if let Some(app) = this_submit.upgrade() {
-                                        app.update(cx, |app, _| {
-                                            app.bridge.send(Command::SubmitModal {
-                                                view_id: sub_id.clone(),
-                                                hash: sub_hash.clone(),
-                                                state_values,
-                                            });
+                    preferences::form_button(
+                        Button::new("modal-submit")
+                            .primary()
+                            .label(submit_text.clone()),
+                        cx,
+                    )
+                    .on_click(move |_, window, cx| {
+                        match crate::blockkit::collect_modal_state(
+                            &ts_submit,
+                            &blocks_submit,
+                            &kit_submit,
+                            cx,
+                        ) {
+                            Ok(state_values) => {
+                                if let Some(app) = this_submit.upgrade() {
+                                    app.update(cx, |app, _| {
+                                        app.bridge.send(Command::SubmitModal {
+                                            view_id: sub_id.clone(),
+                                            hash: sub_hash.clone(),
+                                            state_values,
                                         });
-                                    }
-                                    window.close_dialog(cx);
+                                    });
                                 }
-                                Err(err) => {
-                                    notify("Missing or invalid field", err, window, cx);
-                                }
-                            },
-                        ),
+                                window.close_dialog(cx);
+                            }
+                            Err(err) => {
+                                notify("Missing or invalid field", err, window, cx);
+                            }
+                        }
+                    }),
                 );
             }
             dialog.title(title.clone()).w(px(540.)).child(
@@ -851,19 +857,26 @@ impl App {
                                 .gap_2()
                                 .justify_end()
                                 .child(
-                                    Button::new("mark-all-cancel")
-                                        .label("Cancel")
-                                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                                    preferences::form_button(
+                                        Button::new("mark-all-cancel").outline().label("Cancel"),
+                                        cx,
+                                    )
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
                                 )
                                 .child(
-                                    Button::new("mark-all-confirm")
-                                        .primary()
-                                        .label("Mark all as read")
-                                        .on_click(move |_, window, cx| {
+                                    preferences::form_button(
+                                        Button::new("mark-all-confirm")
+                                            .primary()
+                                            .label("Mark all as read"),
+                                        cx,
+                                    )
+                                    .on_click(
+                                        move |_, window, cx| {
                                             window.close_dialog(cx);
                                             let _ =
                                                 this.update(cx, |app, cx| app.mark_all_read(cx));
-                                        }),
+                                        },
+                                    ),
                                 ),
                         ),
                 )
@@ -907,8 +920,7 @@ impl App {
         });
         let this = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
-            let theme = cx.theme();
-            let (muted, border) = (theme.muted_foreground, theme.border);
+            let muted = cx.theme().muted_foreground;
             let field = |label: &'static str, state: &Entity<TextareaState>| {
                 v_flex()
                     .gap_1()
@@ -919,15 +931,7 @@ impl App {
                             .text_color(muted)
                             .child(label),
                     )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(border)
-                            .child(Textarea::new(state).appearance(false).bordered(false)),
-                    )
+                    .child(preferences::text_input_box(state, false, cx))
             };
             let this_save = this.clone();
             let (d_in, t_in) = (date_in.clone(), time_in.clone());
@@ -949,51 +953,55 @@ impl App {
                             .gap_2()
                             .pt_2()
                             .child(
-                                Button::new("sched-custom-cancel")
-                                    .outline()
-                                    .label("Cancel")
-                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                                preferences::form_button(
+                                    Button::new("sched-custom-cancel").outline().label("Cancel"),
+                                    cx,
+                                )
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
                             )
                             .child(
-                                Button::new("sched-custom-ok")
-                                    .primary()
-                                    .label("Schedule message")
-                                    .on_click(move |_, window, cx| {
-                                        let ds = d_in.read(cx).value().trim().to_owned();
-                                        let ts = t_in.read(cx).value().trim().to_owned();
-                                        let Some(post_at) = parse_local_schedule(&ds, &ts) else {
-                                            notify(
-                                                "Invalid date or time",
-                                                "Use YYYY-MM-DD and HH:MM in the future.",
+                                preferences::form_button(
+                                    Button::new("sched-custom-ok")
+                                        .primary()
+                                        .label("Schedule message"),
+                                    cx,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    let ds = d_in.read(cx).value().trim().to_owned();
+                                    let ts = t_in.read(cx).value().trim().to_owned();
+                                    let Some(post_at) = parse_local_schedule(&ds, &ts) else {
+                                        notify(
+                                            "Invalid date or time",
+                                            "Use YYYY-MM-DD and HH:MM in the future.",
+                                            window,
+                                            cx,
+                                        );
+                                        return;
+                                    };
+                                    if let Some(app) = this_save.upgrade() {
+                                        app.update(cx, |app, cx| {
+                                            if th.is_some() {
+                                                app.thread.update(cx, |panel, cx| {
+                                                    panel.clear_composer(window, cx);
+                                                });
+                                            } else {
+                                                app.composer.update(cx, |c, cx| {
+                                                    c.load_draft("", cx);
+                                                });
+                                            }
+                                            app.schedule_at(
+                                                ch.clone(),
+                                                th.clone(),
+                                                body.clone(),
+                                                post_at,
+                                                format!("on {ds} at {ts}"),
                                                 window,
                                                 cx,
                                             );
-                                            return;
-                                        };
-                                        if let Some(app) = this_save.upgrade() {
-                                            app.update(cx, |app, cx| {
-                                                if th.is_some() {
-                                                    app.thread.update(cx, |panel, cx| {
-                                                        panel.clear_composer(window, cx);
-                                                    });
-                                                } else {
-                                                    app.composer.update(cx, |c, cx| {
-                                                        c.load_draft("", cx);
-                                                    });
-                                                }
-                                                app.schedule_at(
-                                                    ch.clone(),
-                                                    th.clone(),
-                                                    body.clone(),
-                                                    post_at,
-                                                    format!("on {ds} at {ts}"),
-                                                    window,
-                                                    cx,
-                                                );
-                                            });
-                                        }
-                                        window.close_dialog(cx);
-                                    }),
+                                        });
+                                    }
+                                    window.close_dialog(cx);
+                                }),
                             ),
                     ),
             )

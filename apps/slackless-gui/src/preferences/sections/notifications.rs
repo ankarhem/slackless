@@ -68,28 +68,19 @@ impl Preferences {
             |s| &mut s.notify_reminders,
             cx,
         );
-        let border = cx.theme().input;
-        let keywords = div()
-            .w(px(420.))
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .text_sm()
-            .child(
-                Textarea::new(&self.keywords)
-                    .appearance(false)
-                    .bordered(false),
-            );
+        let m = self.metrics();
+        let keywords = text_input_box_for(&self.keywords, true, false, m, cx)
+            .w_full()
+            .max_w(px(420.));
         let schedule_on = self.checkbox(
             "schedule-on",
             "Only send notifications during these hours",
             |s| &mut s.schedule_enabled,
             cx,
         );
-        let days = self.select(
+        let days = self.select_w(
             "schedule-days",
+            220.,
             &SCHEDULE_DAYS,
             |s| &mut s.schedule_days,
             cx,
@@ -131,10 +122,16 @@ impl Preferences {
                         .child(*label)
                 }))
         });
-        let start = self.select("schedule-start", &HOURS, |s| &mut s.schedule_start, cx);
-        let end = self.select("schedule-end", &HOURS, |s| &mut s.schedule_end, cx);
-        let sound = self.select("notify-sound", &SOUNDS, |s| &mut s.sound, cx);
-        let dm_sound = self.select("notify-dm-sound", &SOUNDS, |s| &mut s.dm_sound, cx);
+        let start = self.select_w(
+            "schedule-start",
+            148.,
+            &HOURS,
+            |s| &mut s.schedule_start,
+            cx,
+        );
+        let end = self.select_w("schedule-end", 148., &HOURS, |s| &mut s.schedule_end, cx);
+        let sound = self.select_w("notify-sound", 220., &SOUNDS, |s| &mut s.sound, cx);
+        let dm_sound = self.select_w("notify-dm-sound", 220., &SOUNDS, |s| &mut s.dm_sound, cx);
         let preview = self.checkbox(
             "notify-preview",
             "Include a preview of the message in each notification",
@@ -165,26 +162,17 @@ impl Preferences {
             |s| &mut s.bounce_dock,
             cx,
         );
-        let vip_box = div()
-            .w(px(420.))
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .text_sm()
-            .child(
-                Textarea::new(&self.vip_input)
-                    .appearance(false)
-                    .bordered(false),
-            );
+        let vip_box = text_input_box_for(&self.vip_input, true, false, m, cx)
+            .w_full()
+            .max_w(px(420.));
         let urgent_override = self.checkbox(
             "notify-urgent-dm-override",
             "Allow urgent direct messages to break through Do Not Disturb & Focus mode",
             |s| &mut s.urgent_dm_override,
             cx,
         );
-        let vip_sound_sel = self.select("notify-vip-sound", &SOUNDS, |s| &mut s.vip_sound, cx);
+        let vip_sound_sel =
+            self.select_w("notify-vip-sound", 220., &SOUNDS, |s| &mut s.vip_sound, cx);
         let focus_status = self.checkbox(
             "notify-focus-auto-status",
             "Automatically set 'In focus mode' status during Focus mode",

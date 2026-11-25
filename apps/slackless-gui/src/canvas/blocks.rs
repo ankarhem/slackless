@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::input::TextareaState;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
@@ -784,16 +784,10 @@ pub(super) fn render_block(
                         .items_center()
                         .pt_0p5()
                         .child(
-                            div()
+                            crate::preferences::text_input_box(&input, false, cx)
                                 .flex_1()
                                 .min_w_0()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.background)
-                                .px_2()
-                                .py_0p5()
-                                .child(Textarea::new(&input).appearance(false).bordered(false)),
+                                .bg(theme.background),
                         )
                         .child(
                             Button::new(SharedString::from(format!(
@@ -1317,16 +1311,10 @@ fn render_checklist_block(
                     .items_center()
                     .pt_1()
                     .child(
-                        div()
+                        crate::preferences::text_input_box(&input, false, cx)
                             .flex_1()
                             .min_w_0()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.background)
-                            .px_2()
-                            .py_0p5()
-                            .child(Textarea::new(&input).appearance(false).bordered(false)),
+                            .bg(theme.background),
                     )
                     .child(
                         Button::new(SharedString::from(format!(

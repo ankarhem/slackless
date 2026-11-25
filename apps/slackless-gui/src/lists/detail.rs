@@ -263,19 +263,7 @@ pub(super) fn render_live_detail_drawer(
                                 v_flex()
                                     .w_full()
                                     .gap_1p5()
-                                    .child(
-                                        div()
-                                            .rounded_md()
-                                            .border_1()
-                                            .border_color(theme.border)
-                                            .px_2()
-                                            .py_1()
-                                            .child(
-                                                Textarea::new(&input)
-                                                    .appearance(false)
-                                                    .bordered(false),
-                                            ),
-                                    )
+                                    .child(crate::preferences::text_input_box(&input, true, cx))
                                     .child(
                                         h_flex()
                                             .justify_end()

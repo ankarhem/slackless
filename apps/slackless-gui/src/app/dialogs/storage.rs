@@ -43,26 +43,28 @@ impl App {
                 .gap_2()
                 .when_some(folder, |row, path| {
                     row.child(
-                        Button::new("downloads-open-folder")
-                            .outline()
-                            .with_size(Size::Small)
-                            .icon(IconName::Folder)
-                            .label("Open folder")
-                            .on_click(move |_, _, cx| {
-                                cx.open_url(&Self::file_url(&path));
-                            }),
+                        preferences::form_button(
+                            Button::new("downloads-open-folder")
+                                .outline()
+                                .icon(IconName::Folder)
+                                .label("Open folder"),
+                            cx,
+                        )
+                        .on_click(move |_, _, cx| {
+                            cx.open_url(&Self::file_url(&path));
+                        }),
                     )
                 })
                 .when(has_finished, |row| {
                     row.child(
-                        Button::new("downloads-clear")
-                            .ghost()
-                            .with_size(Size::Small)
-                            .label("Clear list")
-                            .on_click(|_, window, cx| {
-                                crate::media::clear_finished_downloads(cx);
-                                window.refresh();
-                            }),
+                        preferences::form_button(
+                            Button::new("downloads-clear").ghost().label("Clear list"),
+                            cx,
+                        )
+                        .on_click(|_, window, cx| {
+                            crate::media::clear_finished_downloads(cx);
+                            window.refresh();
+                        }),
                     )
                 });
             let rows: Vec<_> = items
@@ -221,22 +223,25 @@ impl App {
                             .gap_2()
                             .justify_end()
                             .child(
-                                Button::new("delete-file-cancel")
-                                    .label("Cancel")
-                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                                preferences::form_button(
+                                    Button::new("delete-file-cancel").outline().label("Cancel"),
+                                    cx,
+                                )
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
                             )
                             .child(
-                                Button::new("delete-file-confirm")
-                                    .danger()
-                                    .label("Delete")
-                                    .on_click(move |_, window, cx| {
-                                        window.close_dialog(cx);
-                                        let _ = this.update(cx, |app, _| {
-                                            app.bridge.send(Command::DeleteFile {
-                                                file_id: file_id.clone(),
-                                            });
+                                preferences::form_button(
+                                    Button::new("delete-file-confirm").danger().label("Delete"),
+                                    cx,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let _ = this.update(cx, |app, _| {
+                                        app.bridge.send(Command::DeleteFile {
+                                            file_id: file_id.clone(),
                                         });
-                                    }),
+                                    });
+                                }),
                             ),
                     ),
             )
@@ -264,14 +269,23 @@ impl App {
                             h_flex()
                                 .gap_2()
                                 .justify_end()
-                                .child(Button::new("reset-cache-cancel").label("Cancel").on_click(
-                                    |_, window, cx| window.close_dialog(cx),
-                                ))
                                 .child(
-                                    Button::new("reset-cache-confirm")
-                                        .danger()
-                                        .label("Clear cache")
-                                        .on_click(|_, window, cx| {
+                                    preferences::form_button(
+                                        Button::new("reset-cache-cancel")
+                                            .outline()
+                                            .label("Cancel"),
+                                        cx,
+                                    )
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                                )
+                                .child(
+                                    preferences::form_button(
+                                        Button::new("reset-cache-confirm")
+                                            .danger()
+                                            .label("Clear cache"),
+                                        cx,
+                                    )
+                                    .on_click(|_, window, cx| {
                                             window.close_dialog(cx);
                                             if let Some(dir) = crate::bridge::store_dir()
                                                 && let Ok(entries) = std::fs::read_dir(&dir) {
@@ -913,36 +927,38 @@ impl App {
                         .items_center()
                         .gap_1p5()
                         .child(
-                            Button::new("transcript-go-channel")
-                                .outline()
-                                .with_size(Size::Small)
-                                .icon(IconName::Hash)
-                                .label("Channel")
-                                .on_click(move |_, window, cx| {
-                                    window.close_dialog(cx);
-                                    let _ = jump_this.update(cx, |app, cx| {
-                                        app.select(jump_ch.clone(), cx);
-                                    });
-                                }),
+                            preferences::form_button(
+                                Button::new("transcript-go-channel")
+                                    .outline()
+                                    .icon(IconName::Hash)
+                                    .label("Channel"),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                let _ = jump_this.update(cx, |app, cx| {
+                                    app.select(jump_ch.clone(), cx);
+                                });
+                            }),
                         )
                         .child(
-                            Button::new("transcript-copy-md")
-                                .outline()
-                                .with_size(Size::Small)
-                                .icon(IconName::Copy)
-                                .label("Copy Markdown")
-                                .disabled(segments.is_empty())
-                                .on_click(move |_, window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        copy_md.clone(),
-                                    ));
-                                    notify(
-                                        "Transcript copied",
-                                        "Copied Markdown transcript to clipboard.",
-                                        window,
-                                        cx,
-                                    );
-                                }),
+                            preferences::form_button(
+                                Button::new("transcript-copy-md")
+                                    .outline()
+                                    .icon(IconName::Copy)
+                                    .label("Copy Markdown")
+                                    .disabled(segments.is_empty()),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_md.clone()));
+                                notify(
+                                    "Transcript copied",
+                                    "Copied Markdown transcript to clipboard.",
+                                    window,
+                                    cx,
+                                );
+                            }),
                         )
                         .when(!segments.is_empty(), |row| {
                             row.child(

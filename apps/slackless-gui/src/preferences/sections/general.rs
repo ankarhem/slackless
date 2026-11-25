@@ -178,7 +178,8 @@ impl Preferences {
             |s| &mut s.show_quick_reactions,
             cx,
         );
-        let border = cx.theme().border;
+        let m = self.metrics();
+        let border = cx.theme().input;
         let muted = cx.theme().muted_foreground;
         let bg_card = cx.theme().secondary;
         let quick_editors = self.settings.show_quick_reactions.then(|| {
@@ -191,17 +192,19 @@ impl Preferences {
                 row = row.child(
                     h_flex()
                         .items_center()
-                        .gap_1p5()
-                        .px_2()
-                        .py_1()
+                        .gap_0p5()
+                        .pl_2p5()
+                        .pr_1()
+                        .h(m.height)
                         .rounded_md()
                         .bg(bg_card)
                         .border_1()
                         .border_color(border)
-                        .child(div().text_sm().child(glyph))
+                        .child(div().flex_none().text_sm().child(glyph))
                         .child(
-                            div().w(px(124.)).child(
+                            div().w(px(130.)).child(
                                 Textarea::new(&self.quick_reaction_inputs[ix])
+                                    .with_size(m.input_size)
                                     .appearance(false)
                                     .bordered(false),
                             ),
@@ -302,7 +305,8 @@ impl Preferences {
     }
 
     pub(super) fn accessibility(&mut self, cx: &mut Context<Self>) -> Div {
-        let zoom = self.select("zoom", &ZOOM, |s| &mut s.zoom, cx);
+        let m = self.metrics();
+        let zoom = self.select_w("zoom", 148., &ZOOM, |s| &mut s.zoom, cx);
         let animate = self.checkbox(
             "a11y-animate",
             "Allow animated images and emoji",
@@ -330,7 +334,7 @@ impl Preferences {
         );
         let verbosity_current = self.settings.message_verbosity;
         let theme = cx.theme();
-        let (border, ring) = (theme.border, theme.ring);
+        let (border, ring) = (theme.input, theme.ring);
         let verbosity = h_flex()
             .gap_2()
             .children(MESSAGE_VERBOSITY.iter().enumerate().map(|(ix, &label)| {
@@ -338,8 +342,9 @@ impl Preferences {
                 let on = verbosity_current == level;
                 h_flex()
                     .id(("a11y-verbosity", ix))
+                    .items_center()
+                    .h(m.height)
                     .px_3()
-                    .py_1()
                     .rounded_md()
                     .cursor_pointer()
                     .border_1()
