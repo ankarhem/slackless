@@ -62,6 +62,7 @@
                 minicom
                 usbutils
                 cmake
+                just
                 pkg-config
               ]
               ++ config.pre-commit.settings.enabledPackages;
