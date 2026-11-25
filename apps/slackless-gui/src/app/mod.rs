@@ -490,6 +490,14 @@ pub(super) struct WorkspaceState {
     pub(super) files: HashMap<ChannelId, Loaded<File>>,
     /// Live mode: parsed read-only canvases keyed by file id (`files.info` -> `url_private`, `F-COLLAB-125`).
     pub(super) canvases: HashMap<String, Result<crate::canvas::CanvasDoc, String>>,
+    /// Live mode: parsed `CanvasMeta` keyed by file id (`Event::CanvasMetaLoaded`).
+    pub(super) canvas_metas: HashMap<String, slackless_core::api::CanvasMeta>,
+    /// Live mode: threaded comments keyed by canvas file id (`Event::CanvasCommentsLoaded`).
+    pub(super) canvas_comments: HashMap<String, Vec<slackless_core::api::CanvasCommentThread>>,
+    /// Live mode: inline status or error banner per canvas id (`(is_error, message)`).
+    pub(super) canvas_status: HashMap<String, (bool, String)>,
+    /// Live mode: "Canvas updated" notice per canvas id (`F-COLLAB-185`).
+    pub(super) canvas_updated_notes: HashMap<String, String>,
     /// File id of the live canvas currently displayed in `ConversationTab::Canvas`.
     pub(super) active_canvas: Option<String>,
     /// Live mode: parsed read-only Slack Lists keyed by file id (`files.info` + `lists.records.list`).

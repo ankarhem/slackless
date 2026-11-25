@@ -354,7 +354,10 @@ impl App {
                 });
             }
             Event::ChannelCanvasCreated { channel, canvas_id } if *channel == self.channel => {
-                cx.open_url(&self.canvas_link(canvas_id));
+                if !canvas_id.is_empty() {
+                    self.open_live_canvas(canvas_id.clone(), cx);
+                }
+                notify("Canvas created", "Channel canvas is ready.", window, cx);
             }
             Event::Usergroups(groups) => {
                 self.ws.usergroups = groups.clone();
@@ -459,13 +462,130 @@ impl App {
                 title,
                 html,
             } => {
+                let was_loaded = self.ws.canvases.get(file_id).is_some_and(Result::is_ok);
                 let parsed = match html {
                     Ok(raw) => Ok(crate::canvas::CanvasDoc::from_html(title.clone(), raw)),
                     Err(err) => Err(err.clone()),
                 };
+                if was_loaded && parsed.is_ok() {
+                    self.ws
+                        .canvas_updated_notes
+                        .insert(file_id.clone(), format!("Canvas updated: “{title}”"));
+                }
                 self.ws.canvases.insert(file_id.clone(), parsed);
                 cx.notify();
             }
+            Event::CanvasMetaLoaded { file_id, meta } => {
+                self.ws.canvas_metas.insert(file_id.clone(), meta.clone());
+                cx.notify();
+            }
+            Event::CanvasDeleted { canvas_id, result } => match result {
+                Ok(()) => {
+                    self.ws.canvases.remove(canvas_id);
+                    self.ws.canvas_metas.remove(canvas_id);
+                    self.ws.canvas_comments.remove(canvas_id);
+                    self.ws.canvas_status.remove(canvas_id);
+                    self.ws.canvas_updated_notes.remove(canvas_id);
+                    if self.ws.active_canvas.as_deref() == Some(canvas_id.as_str()) {
+                        self.ws.active_canvas = None;
+                        self.tab = ConversationTab::Messages;
+                    }
+                    notify("Canvas deleted", "Canvas permanently deleted.", window, cx);
+                    cx.notify();
+                }
+                Err(err) => {
+                    let msg = slackless_core::api::format_canvas_error(err);
+                    self.ws
+                        .canvas_status
+                        .insert(canvas_id.clone(), (true, msg.clone()));
+                    notify("Could not delete canvas", msg, window, cx);
+                    cx.notify();
+                }
+            },
+            Event::CanvasAccessUpdated {
+                canvas_id,
+                summary,
+                result,
+            } => match result {
+                Ok(()) => {
+                    self.ws
+                        .canvas_status
+                        .insert(canvas_id.clone(), (false, summary.clone()));
+                    self.bridge.send(Command::LoadCanvas {
+                        file_id: canvas_id.clone(),
+                    });
+                    notify("Canvas access updated", summary.clone(), window, cx);
+                    cx.notify();
+                }
+                Err(err) => {
+                    let msg = slackless_core::api::format_canvas_error(err);
+                    self.ws
+                        .canvas_status
+                        .insert(canvas_id.clone(), (true, msg.clone()));
+                    notify("Access update failed", msg, window, cx);
+                    cx.notify();
+                }
+            },
+            Event::CanvasCommentsLoaded { canvas_id, result } => match result {
+                Ok(threads) => {
+                    self.ws
+                        .canvas_comments
+                        .insert(canvas_id.clone(), threads.clone());
+                    cx.notify();
+                }
+                Err(err) => {
+                    let msg = slackless_core::api::format_canvas_error(err);
+                    self.ws.canvas_status.insert(canvas_id.clone(), (true, msg));
+                    cx.notify();
+                }
+            },
+            Event::CanvasCommentPosted { canvas_id, result } => match result {
+                Ok(()) => {
+                    self.bridge.send(Command::LoadCanvasComments {
+                        canvas_id: canvas_id.clone(),
+                    });
+                    cx.notify();
+                }
+                Err(err) => {
+                    let msg = slackless_core::api::format_canvas_error(err);
+                    self.ws
+                        .canvas_status
+                        .insert(canvas_id.clone(), (true, msg.clone()));
+                    notify("Comment failed", msg, window, cx);
+                    cx.notify();
+                }
+            },
+            Event::CanvasCommentResolved {
+                canvas_id,
+                thread_ts,
+                resolved,
+                result,
+            } => match result {
+                Ok(()) => {
+                    if let Some(threads) = self.ws.canvas_comments.get_mut(canvas_id) {
+                        if thread_ts.as_str().is_empty() {
+                            for t in threads.iter_mut() {
+                                t.resolved = *resolved;
+                            }
+                        } else if let Some(t) = threads.iter_mut().find(|t| t.root_ts == *thread_ts)
+                        {
+                            t.resolved = *resolved;
+                        }
+                    }
+                    self.bridge.send(Command::LoadCanvasComments {
+                        canvas_id: canvas_id.clone(),
+                    });
+                    cx.notify();
+                }
+                Err(err) => {
+                    let msg = slackless_core::api::format_canvas_error(err);
+                    self.ws
+                        .canvas_status
+                        .insert(canvas_id.clone(), (true, msg.clone()));
+                    notify("Could not update comment thread", msg, window, cx);
+                    cx.notify();
+                }
+            },
             Event::CanvasCreated {
                 file_id,
                 title,

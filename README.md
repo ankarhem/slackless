@@ -96,7 +96,7 @@ See [`skill/SKILL.md`](skill/SKILL.md) for the full command reference and `--jso
 | `crates/slackless-api` / `rtm`       | Slack private web-client REST & realtime WebSocket clients                                  |
 | `crates/slackless-auth` / `platform` | Embedded WebKit sign-in, Keychain storage, macOS notifications/dock/menu bar                |
 
-Feature tracking lives in [`docs/feature-parity.md`](docs/feature-parity.md) (`530` shipped / `0` partial).
+Feature tracking lives in [`docs/feature-parity.md`](docs/feature-parity.md) (`564` shipped / `0` partial).
 
 ## Data & Privacy
 

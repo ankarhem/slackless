@@ -4,7 +4,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui_kit::gpui::{self, IntoElement, Render, Window};
-use slackless_core::api::CanvasEditOp;
+use slackless_core::api::{
+    CanvasAccessLevel, CanvasCommentReply, CanvasCommentThread, CanvasEditOp, CanvasMeta,
+};
+use slackless_core::types::{ChannelId, Ts, UserId};
 
 use crate::canvas::format::{
     BlockFormat, InlineFormat, SlashCommand, add_table_column_at, add_table_row_at,
@@ -17,11 +20,20 @@ use crate::canvas::parse::{
     parse_slack_profile_url, resolve_canvas_emoji,
 };
 use crate::canvas::{
-    CanvasActions, CanvasBlock, CanvasDoc, CanvasEditFn, CanvasEmbedKind, CanvasOpenEmbedFn,
-    CanvasOpenMediaFn, CanvasOpenProfileFn, CanvasUploadCompleteFn, CanvasUploadFileFn,
-    CanvasUserLookupFn, CanvasUserProfile, MediaKind, OpenBrowserFn, UploadedCanvasFile,
-    canvas_view, live_canvas_view, parse_canvas_html, parse_canvas_markdown, resolve_profile_card,
-    section_delete_op, section_insert_after_op, section_replace_op,
+    CanvasAccessDeleteFn, CanvasAccessSetFn, CanvasActions, CanvasActivation, CanvasBlock,
+    CanvasChannelLookupFn, CanvasCommentFilter, CanvasCommentPostFn, CanvasCommentResolveAllFn,
+    CanvasCommentResolveFn, CanvasCommentsLoadFn, CanvasDeleteFn, CanvasDoc, CanvasEditFn,
+    CanvasEmbedKind, CanvasExportFn, CanvasFocusRegion, CanvasInlineSegment, CanvasKeyboardState,
+    CanvasOpenChannelFn, CanvasOpenEmbedFn, CanvasOpenMediaFn, CanvasOpenProfileFn,
+    CanvasUploadCompleteFn, CanvasUploadFileFn, CanvasUserLookupFn, CanvasUserProfile, MediaKind,
+    OpenBrowserFn, ShareAccessRequest, UploadedCanvasFile, activate_focused_block,
+    build_share_access_request, canvas_export_stem, canvas_print_allowed,
+    canvas_server_rule_notice, canvas_to_printable_html, canvas_view, comment_thread_counts,
+    cycle_canvas_focus_region, cycle_region, filter_comment_threads, general_access_summary,
+    live_canvas_view, parse_canvas_html, parse_canvas_markdown, parse_inline_canvas_segments,
+    parse_share_targets, resolve_profile_card, save_canvas_pdf_to_path, section_delete_op,
+    section_insert_after_op, section_replace_op, step_block, toggle_section_actions_shortcut,
+    trigger_canvas_print, write_printable_html,
 };
 
 #[test]
@@ -796,8 +808,9 @@ fn parses_resolves_and_roundtrips_user_profile_cards() {
                 title: None,
                 handle: None,
             },
-            // Inline mention inside prose must NOT become a standalone profile card.
-            CanvasBlock::Paragraph("Ask @U02BOB before shipping.".into()),
+            // Inline mention inside prose must NOT become a standalone profile card;
+            // it is preserved as a canonical `<@U...>` inline mention token (`F-COLLAB-150`).
+            CanvasBlock::Paragraph("Ask <@U02BOB> before shipping.".into()),
         ]
     );
     assert_eq!(doc.section_ids[0].as_deref(), Some("temp:C:u1"));
@@ -1053,4 +1066,555 @@ fn canvas_renders_drag_reorder_media_profile_and_doc_embeds_with_mock_callbacks(
         assert!(!embed_opened.get());
         assert!(!edited.get());
     }
+}
+
+#[test]
+fn inline_mentions_tokenizer_handles_user_channel_usergroup_broadcast_and_quip_controls() {
+    let text = "Ping <@U01ALICE> and <control><a>@U02BOB</a></control> in <#C01ENG|eng> \
+                or <control><a>#C02OPS</a></control> with <!subteam^S01DES|@design> \
+                (@here, @channel, not dev@here.com)";
+    let segments = parse_inline_canvas_segments(text);
+    assert!(segments.contains(&CanvasInlineSegment::UserMention {
+        user_id: "U01ALICE".into(),
+        label: None,
+    }));
+    assert!(segments.contains(&CanvasInlineSegment::UserMention {
+        user_id: "U02BOB".into(),
+        label: None,
+    }));
+    assert!(segments.contains(&CanvasInlineSegment::ChannelMention {
+        channel_id: "C01ENG".into(),
+        name: Some("eng".into()),
+    }));
+    assert!(segments.contains(&CanvasInlineSegment::ChannelMention {
+        channel_id: "C02OPS".into(),
+        name: None,
+    }));
+    assert!(segments.contains(&CanvasInlineSegment::UsergroupMention {
+        group_id: "S01DES".into(),
+        handle: "design".into(),
+    }));
+    assert_eq!(
+        segments
+            .iter()
+            .filter(|s| matches!(s, CanvasInlineSegment::BroadcastMention(_)))
+            .count(),
+        2
+    );
+    // Email address must stay plain text.
+    assert!(segments.iter().any(|s| matches!(
+        s,
+        CanvasInlineSegment::Text(t) if t.contains("dev@here.com")
+    )));
+
+    // HTML export preserves inline Quip `<control>` mentions and mrkdwn mentions inside text blocks.
+    let html = r#"<html><body>
+        <h2>Review with <control><a href="https://acme.slack.com/team/U01ALICE">@U01ALICE</a></control></h2>
+        <p>Discuss in <control><a href="https://acme.slack.com/archives/C01ENG">#eng</a></control> with <!subteam^S01DES|@design> and @here.</p>
+        <table><tr><th>Owner</th><th>Channel</th></tr><tr><td><@U01ALICE></td><td><#C01ENG|eng></td></tr></table>
+    </body></html>"#;
+    let blocks = parse_canvas_html(html);
+    assert_eq!(blocks.len(), 3);
+    match &blocks[0] {
+        CanvasBlock::Heading { text, .. } => {
+            assert!(parse_inline_canvas_segments(text).contains(
+                &CanvasInlineSegment::UserMention {
+                    user_id: "U01ALICE".into(),
+                    label: None,
+                }
+            ));
+        }
+        other => panic!("expected heading, got {other:?}"),
+    }
+    match &blocks[1] {
+        CanvasBlock::Paragraph(text) => {
+            let segs = parse_inline_canvas_segments(text);
+            assert!(segs.contains(&CanvasInlineSegment::ChannelMention {
+                channel_id: "C01ENG".into(),
+                name: Some("eng".into()),
+            }));
+            assert!(segs.contains(&CanvasInlineSegment::UsergroupMention {
+                group_id: "S01DES".into(),
+                handle: "design".into(),
+            }));
+            assert!(segs.contains(&CanvasInlineSegment::BroadcastMention("here".into())));
+        }
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+    match &blocks[2] {
+        CanvasBlock::Table { rows, .. } => {
+            assert_eq!(rows[0][0], "<@U01ALICE>");
+            assert_eq!(rows[0][1], "<#C01ENG|eng>");
+        }
+        other => panic!("expected table, got {other:?}"),
+    }
+}
+
+#[test]
+fn threaded_comments_filtering_and_counts() {
+    let threads = vec![
+        CanvasCommentThread {
+            root_ts: Ts::from("1700000100.000100"),
+            author: Some(UserId::from("U01ALICE")),
+            text: "Open thread".into(),
+            reply_count: 1,
+            replies: vec![CanvasCommentReply {
+                ts: Ts::from("1700000101.000200"),
+                author: Some(UserId::from("U02BOB")),
+                text: "Looks good".into(),
+            }],
+            resolved: false,
+        },
+        CanvasCommentThread {
+            root_ts: Ts::from("1700000050.000100"),
+            author: Some(UserId::from("U03SAM")),
+            text: "Already resolved".into(),
+            reply_count: 0,
+            replies: Vec::new(),
+            resolved: true,
+        },
+    ];
+
+    assert_eq!(comment_thread_counts(&threads), (2, 1, 1));
+    assert_eq!(
+        filter_comment_threads(&threads, CanvasCommentFilter::All).len(),
+        2
+    );
+    let open = filter_comment_threads(&threads, CanvasCommentFilter::Open);
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].text, "Open thread");
+    assert_eq!(open[0].replies.len(), 1);
+
+    let resolved = filter_comment_threads(&threads, CanvasCommentFilter::Resolved);
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].text, "Already resolved");
+}
+
+#[test]
+fn share_access_request_builder_general_access_and_server_rule_notices() {
+    let (channels, users) = parse_share_targets("#C01ENG, @U01ALICE C01ENG invalid W02ENT");
+    assert_eq!(channels, vec![ChannelId::from("C01ENG")]);
+    assert_eq!(
+        users,
+        vec![UserId::from("U01ALICE"), UserId::from("W02ENT")]
+    );
+
+    let with_post = build_share_access_request(
+        "C01ENG, U01ALICE",
+        CanvasAccessLevel::Write,
+        false,
+        Some("https://acme.slack.com/docs/T01/F01"),
+    )
+    .expect("valid request");
+    assert_eq!(with_post.access_level, CanvasAccessLevel::Write);
+    assert_eq!(
+        with_post.post_permalink.as_deref(),
+        Some("https://acme.slack.com/docs/T01/F01")
+    );
+
+    let silent = build_share_access_request(
+        "C01ENG",
+        CanvasAccessLevel::Read,
+        true,
+        Some("https://acme.slack.com/docs/T01/F01"),
+    )
+    .expect("valid silent request");
+    assert_eq!(silent.post_permalink, None);
+
+    let owner = build_share_access_request("U01ALICE", CanvasAccessLevel::Owner, false, None)
+        .expect("valid owner request");
+    assert_eq!(owner.access_level, CanvasAccessLevel::Owner);
+    assert_eq!(owner.post_permalink, None);
+
+    assert!(build_share_access_request("   ", CanvasAccessLevel::Read, false, None).is_err());
+
+    let meta_private = CanvasMeta {
+        org_or_workspace_access: Some("private".into()),
+        ..Default::default()
+    };
+    let (badge, desc) = general_access_summary(Some(&meta_private), None, true);
+    assert_eq!(badge, "Invite only");
+    assert!(desc.contains("limited to canvas owners"));
+
+    let meta_write = CanvasMeta {
+        org_or_workspace_access: Some("write".into()),
+        ..Default::default()
+    };
+    let (badge_w, _) = general_access_summary(Some(&meta_write), None, false);
+    assert_eq!(badge_w, "Workspace can edit");
+
+    assert!(
+        canvas_server_rule_notice("free_teams_cannot_create_standalone_canvases")
+            .contains("Free Slack workspaces")
+    );
+    assert!(canvas_server_rule_notice("canvas_printing_disabled").contains("Printing"));
+    assert!(canvas_server_rule_notice("cant_delete_file").contains("deleted"));
+    assert!(canvas_server_rule_notice("restricted_action").contains("permission"));
+}
+
+#[test]
+fn printable_html_export_escapes_content_and_respects_print_policy() {
+    let mut doc = CanvasDoc::from_markdown(
+        "Q4 <script>alert(1)</script> Plan".into(),
+        "Live canvas".into(),
+        "# Overview\n\nPing <@U01ALICE|Alice> in <#C01ENG|eng> @here\n\n- [x] Done\n- [ ] Todo\n\n> Quoted line\n\n```\nlet x = a < b;\n```\n\n| Col |\n| --- |\n| Val |\n\n![Arch diagram](https://files.slack.com/arch.png)",
+    );
+    doc.push_block(CanvasBlock::MediaEmbed {
+        kind: MediaKind::Video,
+        title: "walkthrough.mp4".into(),
+        url: "https://files.slack.com/walkthrough.mp4".into(),
+        file_id: Some("F01VID".into()),
+        duration: Some("1:30".into()),
+        mime: Some("video/mp4".into()),
+    });
+
+    let html = canvas_to_printable_html(&doc);
+    assert!(html.contains("@media print"));
+    assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!html.contains("<script>alert(1)</script>"));
+    assert!(html.contains("class=\"mention\">@Alice</span>"));
+    assert!(html.contains("class=\"mention\">#eng</span>"));
+    assert!(html.contains("class=\"mention broadcast\">@here</span>"));
+    assert!(html.contains("<figcaption>Arch diagram</figcaption>"));
+    assert!(html.contains("walkthrough.mp4"));
+    assert!(html.contains("let x = a &lt; b;"));
+
+    assert!(canvas_print_allowed(None));
+    assert!(canvas_print_allowed(Some(&CanvasMeta {
+        canvas_printing_enabled: true,
+        ..Default::default()
+    })));
+    assert!(!canvas_print_allowed(Some(&CanvasMeta {
+        canvas_printing_enabled: false,
+        ..Default::default()
+    })));
+    assert_eq!(canvas_export_stem("Q4 Launch / Plan!"), "q4-launch-plan");
+
+    let tmp_path = std::env::temp_dir().join("slackless-canvas-export-test.html");
+    write_printable_html(&doc, &tmp_path).expect("write printable html");
+    let written = std::fs::read_to_string(&tmp_path).expect("read printable html");
+    assert!(written.contains("<!DOCTYPE html>"));
+    let _ = std::fs::remove_file(&tmp_path);
+
+    // OS subprocess helpers are safely disabled in `#[cfg(test)]`.
+    assert!(trigger_canvas_print(&doc).is_err());
+    assert!(save_canvas_pdf_to_path(&doc, &tmp_path).is_err());
+}
+
+#[test]
+fn image_description_alt_text_edit_and_embedded_files_extraction() {
+    let mut doc = CanvasDoc::from_markdown(
+        "Media Doc".into(),
+        "Live".into(),
+        "# Intro\n\n![Old caption](https://files.slack.com/pic.png)",
+    );
+    doc.push_block(CanvasBlock::MediaEmbed {
+        kind: MediaKind::Audio,
+        title: "standup.mp3".into(),
+        url: "https://files.slack.com/standup.mp3".into(),
+        file_id: Some("F01AUD".into()),
+        duration: Some("0:45".into()),
+        mime: Some("audio/mpeg".into()),
+    });
+    doc.push_block(CanvasBlock::DocEmbed {
+        kind: CanvasEmbedKind::Canvas,
+        file_id: "F02CAN".into(),
+        title: "Sub-spec".into(),
+        url: "https://acme.slack.com/docs/T01/F02CAN".into(),
+    });
+
+    let updated_md = doc
+        .set_image_alt(1, "  System topology diagram  ".into())
+        .expect("image block updated");
+    assert_eq!(
+        updated_md,
+        "![System topology diagram](https://files.slack.com/pic.png)"
+    );
+    assert!(doc.set_image_alt(0, "Not an image".into()).is_none());
+
+    let files = doc.embedded_files();
+    assert_eq!(files.len(), 3);
+    assert_eq!(files[0].block_ix, 1);
+    assert_eq!(files[0].kind_label, "Image");
+    assert_eq!(files[0].title, "System topology diagram");
+    assert_eq!(files[1].block_ix, 2);
+    assert_eq!(files[1].kind_label, "Audio");
+    assert_eq!(files[2].block_ix, 3);
+    assert_eq!(files[2].kind_label, "Canvas");
+    assert_eq!(files[2].file_id.as_deref(), Some("F02CAN"));
+}
+
+#[test]
+fn keyboard_focus_regions_block_activation_and_section_actions_shortcut() {
+    assert_eq!(
+        cycle_region(CanvasFocusRegion::Header, true, true, true),
+        CanvasFocusRegion::Outline
+    );
+    assert_eq!(
+        cycle_region(CanvasFocusRegion::Outline, true, true, true),
+        CanvasFocusRegion::Document
+    );
+    assert_eq!(
+        cycle_region(CanvasFocusRegion::Document, true, true, true),
+        CanvasFocusRegion::Comments
+    );
+    assert_eq!(
+        cycle_region(CanvasFocusRegion::Comments, true, true, true),
+        CanvasFocusRegion::Header
+    );
+    assert_eq!(
+        cycle_region(CanvasFocusRegion::Header, false, false, false),
+        CanvasFocusRegion::Document
+    );
+
+    assert_eq!(step_block(None, 1, 4), Some(0));
+    assert_eq!(step_block(None, -1, 4), Some(3));
+    assert_eq!(step_block(Some(0), -1, 4), Some(0));
+    assert_eq!(step_block(Some(3), 1, 4), Some(3));
+    assert_eq!(step_block(Some(1), 1, 4), Some(2));
+    assert_eq!(step_block(None, 1, 0), None);
+
+    let doc = CanvasDoc {
+        title: "KB".into(),
+        meta: "Live".into(),
+        blocks: vec![
+            CanvasBlock::Paragraph("Plain".into()),
+            CanvasBlock::Checklist(vec![(true, "Done".into()), (false, "Next".into())]),
+            CanvasBlock::MediaEmbed {
+                kind: MediaKind::Video,
+                title: "demo.mp4".into(),
+                url: "https://files.slack.com/demo.mp4".into(),
+                file_id: None,
+                duration: None,
+                mime: None,
+            },
+            CanvasBlock::DocEmbed {
+                kind: CanvasEmbedKind::List,
+                file_id: "F09LIST".into(),
+                title: "Tasks".into(),
+                url: "https://acme.slack.com/lists/T01/F09LIST".into(),
+            },
+            CanvasBlock::ProfileCard {
+                user_id: "U01ALICE".into(),
+                display_name: Some("Alice".into()),
+                title: None,
+                handle: None,
+            },
+        ],
+        section_ids: vec![None; 5],
+    };
+
+    assert_eq!(activate_focused_block(&doc, Some(0)), None);
+    assert_eq!(
+        activate_focused_block(&doc, Some(1)),
+        Some(CanvasActivation::ToggleChecklist {
+            block_ix: 1,
+            item_ix: 1,
+        })
+    );
+    assert_eq!(
+        activate_focused_block(&doc, Some(2)),
+        Some(CanvasActivation::OpenMedia {
+            block_ix: 2,
+            kind: MediaKind::Video,
+            url: "https://files.slack.com/demo.mp4".into(),
+        })
+    );
+    assert_eq!(
+        activate_focused_block(&doc, Some(3)),
+        Some(CanvasActivation::OpenDocEmbed {
+            block_ix: 3,
+            kind: CanvasEmbedKind::List,
+            file_id: "F09LIST".into(),
+            url: "https://acme.slack.com/lists/T01/F09LIST".into(),
+        })
+    );
+    assert_eq!(
+        activate_focused_block(&doc, Some(4)),
+        Some(CanvasActivation::OpenProfile {
+            block_ix: 4,
+            user_id: "U01ALICE".into(),
+        })
+    );
+
+    let mut kb = CanvasKeyboardState::default();
+    assert_eq!(toggle_section_actions_shortcut(&mut kb, 5), Some(0));
+    assert_eq!(kb.region, CanvasFocusRegion::Document);
+    assert_eq!(kb.focused_block, Some(0));
+    assert_eq!(toggle_section_actions_shortcut(&mut kb, 5), None);
+    assert_eq!(toggle_section_actions_shortcut(&mut kb, 0), None);
+}
+
+#[gpui::test]
+fn gpui_canvas_renders_mentions_comments_share_export_updated_banner_and_keyboard_focus(
+    cx: &mut gpui::TestAppContext,
+) {
+    struct FullCanvasHost {
+        doc: CanvasDoc,
+        meta: CanvasMeta,
+        threads: Vec<CanvasCommentThread>,
+        print_called: Rc<Cell<bool>>,
+        pdf_called: Rc<Cell<bool>>,
+        delete_called: Rc<Cell<bool>>,
+        channel_opened: Rc<Cell<bool>>,
+    }
+    impl Render for FullCanvasHost {
+        fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+            let p_flag = self.print_called.clone();
+            let on_print: CanvasExportFn = Rc::new(move |_, _, _| p_flag.set(true));
+            let pdf_flag = self.pdf_called.clone();
+            let on_pdf: CanvasExportFn = Rc::new(move |_, _, _| pdf_flag.set(true));
+            let del_flag = self.delete_called.clone();
+            let on_del: CanvasDeleteFn = Rc::new(move |_, _| del_flag.set(true));
+            let ch_flag = self.channel_opened.clone();
+            let on_open_channel: CanvasOpenChannelFn = Rc::new(move |_, _, _| ch_flag.set(true));
+            let channel_lookup: CanvasChannelLookupFn =
+                Rc::new(|cid: &str| (cid == "C01ENG").then(|| "eng".to_owned()));
+            let user_lookup: CanvasUserLookupFn = Rc::new(|uid: &str| {
+                (uid == "U01ALICE").then(|| CanvasUserProfile {
+                    user_id: "U01ALICE".into(),
+                    display_name: "Alice Rivera".into(),
+                    title: Some("Lead".into()),
+                    handle: Some("alice".into()),
+                })
+            });
+            let on_load_comments: CanvasCommentsLoadFn = Rc::new(|_, _| {});
+            let on_post_comment: CanvasCommentPostFn = Rc::new(|_, _, _, _| {});
+            let on_resolve_comment: CanvasCommentResolveFn = Rc::new(|_, _, _, _| {});
+            let on_resolve_all: CanvasCommentResolveAllFn = Rc::new(|_, _| {});
+            let on_set_access: CanvasAccessSetFn = Rc::new(|_: ShareAccessRequest, _, _| {});
+            let on_delete_access: CanvasAccessDeleteFn = Rc::new(|_, _, _, _| {});
+            let on_refresh: OpenBrowserFn = Rc::new(|_, _| {});
+            let on_dismiss: OpenBrowserFn = Rc::new(|_, _| {});
+            let on_edit: CanvasEditFn = Rc::new(|_, _, _| {});
+            let loaded = Ok(self.doc.clone());
+
+            live_canvas_view(
+                "F01FULL",
+                Some(&loaded),
+                "",
+                None,
+                CanvasActions {
+                    on_edit: Some(on_edit),
+                    canvas_url: Some("https://acme.slack.com/docs/T01/F01FULL".into()),
+                    user_lookup: Some(user_lookup),
+                    channel_lookup: Some(channel_lookup),
+                    on_open_channel: Some(on_open_channel),
+                    meta: Some(self.meta.clone()),
+                    comment_threads: Some(self.threads.clone()),
+                    on_load_comments: Some(on_load_comments),
+                    on_post_comment: Some(on_post_comment),
+                    on_resolve_comment: Some(on_resolve_comment),
+                    on_resolve_all_comments: Some(on_resolve_all),
+                    on_set_access: Some(on_set_access),
+                    on_delete_access: Some(on_delete_access),
+                    on_delete_canvas: Some(on_del),
+                    on_print_canvas: Some(on_print),
+                    on_save_pdf: Some(on_pdf),
+                    on_refresh_canvas: Some(on_refresh),
+                    status_banner: Some((true, "restricted_action".into())),
+                    updated_note: Some("Canvas updated with latest changes".into()),
+                    on_dismiss_updated: Some(on_dismiss),
+                    ..Default::default()
+                },
+                cx,
+            )
+        }
+    }
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::init(cx);
+    });
+
+    let doc = CanvasDoc::from_markdown(
+        "Full Canvas".into(),
+        "Live canvas".into(),
+        "# Intro\n\nAsk <@U01ALICE> in <#C01ENG|eng> @here\n\n## Architecture\n\n![System diagram](https://files.slack.com/diag.png)",
+    );
+    let meta = CanvasMeta {
+        file_id: "F01FULL".into(),
+        title: "Full Canvas".into(),
+        permalink: Some("https://acme.slack.com/docs/T01/F01FULL".into()),
+        editable: true,
+        access: Some("write".into()),
+        org_or_workspace_access: Some("private".into()),
+        canvas_printing_enabled: false,
+        canvas_creator_id: Some(UserId::from("U01ALICE")),
+        editors: vec![UserId::from("U02BOB")],
+        quip_thread_id: Some("Q01".into()),
+        comment_channel_id: ChannelId::from("C01FULL"),
+    };
+    let threads = vec![CanvasCommentThread {
+        root_ts: Ts::from("1700000100.000100"),
+        author: Some(UserId::from("U01ALICE")),
+        text: "Please review section 2".into(),
+        reply_count: 1,
+        replies: vec![CanvasCommentReply {
+            ts: Ts::from("1700000105.000200"),
+            author: Some(UserId::from("U02BOB")),
+            text: "Looks good!".into(),
+        }],
+        resolved: false,
+    }];
+
+    let print_called = Rc::new(Cell::new(false));
+    let pdf_called = Rc::new(Cell::new(false));
+    let delete_called = Rc::new(Cell::new(false));
+    let channel_opened = Rc::new(Cell::new(false));
+
+    let (p, pdf, del, ch) = (
+        print_called.clone(),
+        pdf_called.clone(),
+        delete_called.clone(),
+        channel_opened.clone(),
+    );
+    let (_root, cx) = cx.add_window_view(move |_, _| FullCanvasHost {
+        doc: doc.clone(),
+        meta: meta.clone(),
+        threads: threads.clone(),
+        print_called: p,
+        pdf_called: pdf,
+        delete_called: del,
+        channel_opened: ch,
+    });
+
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        // Exercise focus region cycling (`F-COLLAB-194`).
+        let next = cycle_canvas_focus_region("F01FULL", true, true, window, cx);
+        assert_eq!(next, CanvasFocusRegion::Outline);
+        let next2 = cycle_canvas_focus_region("F01FULL", true, true, window, cx);
+        assert_eq!(next2, CanvasFocusRegion::Document);
+        // Open Comments drawer & draw.
+        crate::canvas::mutate_ui(
+            "F01FULL",
+            |s| {
+                s.comments_open = true;
+                s.files_strip_open = true;
+                s.keyboard.section_menu_block = Some(0);
+            },
+            window,
+            cx,
+        );
+        let _ = window.draw(cx);
+        // Switch to Share & Access panel & confirm delete bar & draw.
+        crate::canvas::mutate_ui(
+            "F01FULL",
+            |s| {
+                s.comments_open = false;
+                s.share_open = true;
+                s.confirm_delete = true;
+            },
+            window,
+            cx,
+        );
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    assert!(!print_called.get());
+    assert!(!pdf_called.get());
+    assert!(!delete_called.get());
+    assert!(!channel_opened.get());
 }

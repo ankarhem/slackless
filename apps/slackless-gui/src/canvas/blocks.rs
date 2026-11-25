@@ -19,14 +19,15 @@ use gpui_kit::gpui::{
 };
 use slackless_core::types::UserId;
 
+use crate::canvas::mentions::render_inline_canvas_text;
 use crate::canvas::model::{
     CanvasBlock, CanvasDoc, CanvasEmbedKind, MediaKind, resolve_profile_card,
 };
 use crate::canvas::parse::{media_format_pill, resolve_canvas_emoji};
 use crate::canvas::{
-    CanvasActions, CanvasEditFn, CanvasOpenEmbedFn, CanvasOpenMediaFn, CanvasOpenProfileFn,
-    CanvasUiState, CanvasUserLookupFn, commit_block_edit, mutate_ui, section_delete_op,
-    section_insert_after_op, section_replace_op,
+    CanvasActions, CanvasChannelLookupFn, CanvasEditFn, CanvasOpenChannelFn, CanvasOpenEmbedFn,
+    CanvasOpenMediaFn, CanvasOpenProfileFn, CanvasUiState, CanvasUserLookupFn, commit_block_edit,
+    mutate_ui, section_delete_op, section_insert_after_op, section_replace_op,
 };
 
 /// Drag payload and floating preview chip for drag-to-reorder canvas blocks (`F-COLLAB-144`).
@@ -109,6 +110,7 @@ pub(super) fn render_drag_handle(
 type ChecklistItemFn = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 type ChecklistAddFn = Rc<dyn Fn(String, &mut Window, &mut App)>;
 type TableMutateFn = Rc<dyn Fn(&mut Window, &mut App)>;
+type ImageAltSetFn = Rc<dyn Fn(String, &mut Window, &mut App)>;
 
 #[derive(Clone, Default)]
 pub(super) struct BlockCallbacks {
@@ -117,9 +119,12 @@ pub(super) struct BlockCallbacks {
     pub(super) on_add_check_submit: Option<ChecklistAddFn>,
     pub(super) on_table_add_row: Option<TableMutateFn>,
     pub(super) on_table_add_col: Option<TableMutateFn>,
+    pub(super) on_set_image_alt: Option<ImageAltSetFn>,
     pub(super) on_open_media: Option<CanvasOpenMediaFn>,
     pub(super) user_lookup: Option<CanvasUserLookupFn>,
+    pub(super) channel_lookup: Option<CanvasChannelLookupFn>,
     pub(super) on_open_profile: Option<CanvasOpenProfileFn>,
+    pub(super) on_open_channel: Option<CanvasOpenChannelFn>,
     pub(super) on_open_embed: Option<CanvasOpenEmbedFn>,
 }
 
@@ -136,7 +141,9 @@ pub(super) fn build_block_callbacks(
     let mut cbs = BlockCallbacks {
         on_open_media: actions.on_open_media.clone(),
         user_lookup: actions.user_lookup.clone(),
+        channel_lookup: actions.channel_lookup.clone(),
         on_open_profile: actions.on_open_profile.clone(),
+        on_open_channel: actions.on_open_channel.clone(),
         on_open_embed: actions.on_open_embed.clone(),
         ..Default::default()
     };
@@ -218,8 +225,8 @@ pub(super) fn build_block_callbacks(
     cbs.on_table_add_col = {
         let k = key.to_owned();
         let doc = canvas.clone();
-        let sid = section_id;
-        let cb = on_edit;
+        let sid = section_id.clone();
+        let cb = on_edit.clone();
         Some(Rc::new(move |window: &mut Window, cx: &mut App| {
             let mut updated = doc.clone();
             if let Some(section_md) = updated.table_add_column(block_ix) {
@@ -228,6 +235,23 @@ pub(super) fn build_block_callbacks(
                 commit_block_edit(&k, updated, op, is_fixture, cb.as_ref(), window, cx);
             }
         }) as Rc<dyn Fn(&mut Window, &mut App)>)
+    };
+
+    cbs.on_set_image_alt = {
+        let k = key.to_owned();
+        let doc = canvas.clone();
+        let sid = section_id;
+        let cb = on_edit;
+        Some(
+            Rc::new(move |alt: String, window: &mut Window, cx: &mut App| {
+                let mut updated = doc.clone();
+                if let Some(section_md) = updated.set_image_alt(block_ix, alt) {
+                    let full_md = updated.to_markdown();
+                    let op = section_replace_op(sid.clone(), section_md, full_md);
+                    commit_block_edit(&k, updated, op, is_fixture, cb.as_ref(), window, cx);
+                }
+            }) as Rc<dyn Fn(String, &mut Window, &mut App)>,
+        )
     };
 
     cbs
@@ -383,6 +407,194 @@ pub(super) fn append_section_edit_menu_items(
     menu
 }
 
+/// Inline keyboard-accessible Section Actions bar opened by `Cmd+Shift+.` or `.` (`F-COLLAB-196`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_inline_section_actions_bar(
+    key: &str,
+    block_ix: usize,
+    block_count: usize,
+    can_edit: bool,
+    is_fixture: bool,
+    canvas: &CanvasDoc,
+    section_id: Option<String>,
+    block_md: String,
+    on_edit: Option<CanvasEditFn>,
+    cx: &App,
+) -> Div {
+    let theme = cx.theme();
+    let k_close = key.to_owned();
+    let copy_md = block_md;
+
+    let mut bar = h_flex()
+        .flex_wrap()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .py_1()
+        .mt_1()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.ring)
+        .bg(theme.secondary.opacity(0.45))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.muted_foreground)
+                .child("Section actions:"),
+        )
+        .child(
+            Button::new(SharedString::from(format!(
+                "canvas-kb-sec-copy-{key}-{block_ix}"
+            )))
+            .ghost()
+            .with_size(Size::XSmall)
+            .icon(IconName::Copy)
+            .label("Copy")
+            .on_click(move |_, window, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_md.clone()));
+                crate::actions::notify(
+                    "Copied section",
+                    "Copied canvas section markdown to clipboard.",
+                    window,
+                    cx,
+                );
+            }),
+        );
+
+    if can_edit {
+        let (c_up, k_up, e_up) = (canvas.clone(), key.to_owned(), on_edit.clone());
+        let (c_dn, k_dn, e_dn) = (canvas.clone(), key.to_owned(), on_edit.clone());
+        let (c_dup, k_dup, e_dup, sid_dup) = (
+            canvas.clone(),
+            key.to_owned(),
+            on_edit.clone(),
+            section_id.clone(),
+        );
+        let (c_del, k_del, e_del, sid_del) = (canvas.clone(), key.to_owned(), on_edit, section_id);
+
+        bar = bar
+            .when(block_ix > 0, |row| {
+                row.child(
+                    Button::new(SharedString::from(format!(
+                        "canvas-kb-sec-up-{key}-{block_ix}"
+                    )))
+                    .ghost()
+                    .with_size(Size::XSmall)
+                    .icon(IconName::ArrowUp)
+                    .label("Move up")
+                    .on_click(move |_, window, cx| {
+                        let mut updated = c_up.clone();
+                        if let Some(op) = updated.reorder_block_op(block_ix, block_ix - 1) {
+                            commit_block_edit(
+                                &k_up,
+                                updated,
+                                op,
+                                is_fixture,
+                                e_up.as_ref(),
+                                window,
+                                cx,
+                            );
+                        }
+                    }),
+                )
+            })
+            .when(block_ix + 1 < block_count, |row| {
+                row.child(
+                    Button::new(SharedString::from(format!(
+                        "canvas-kb-sec-dn-{key}-{block_ix}"
+                    )))
+                    .ghost()
+                    .with_size(Size::XSmall)
+                    .icon(IconName::ArrowDown)
+                    .label("Move down")
+                    .on_click(move |_, window, cx| {
+                        let mut updated = c_dn.clone();
+                        if let Some(op) = updated.reorder_block_op(block_ix, block_ix + 1) {
+                            commit_block_edit(
+                                &k_dn,
+                                updated,
+                                op,
+                                is_fixture,
+                                e_dn.as_ref(),
+                                window,
+                                cx,
+                            );
+                        }
+                    }),
+                )
+            })
+            .child(
+                Button::new(SharedString::from(format!(
+                    "canvas-kb-sec-dup-{key}-{block_ix}"
+                )))
+                .ghost()
+                .with_size(Size::XSmall)
+                .label("Duplicate")
+                .on_click(move |_, window, cx| {
+                    let mut updated = c_dup.clone();
+                    let duplicated_md = updated.block_plain_text(block_ix).unwrap_or_default();
+                    if updated.duplicate_block(block_ix) {
+                        let full_md = updated.to_markdown();
+                        let op = section_insert_after_op(sid_dup.clone(), duplicated_md, full_md);
+                        commit_block_edit(
+                            &k_dup,
+                            updated,
+                            op,
+                            is_fixture,
+                            e_dup.as_ref(),
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+            )
+            .child(
+                Button::new(SharedString::from(format!(
+                    "canvas-kb-sec-del-{key}-{block_ix}"
+                )))
+                .ghost()
+                .with_size(Size::XSmall)
+                .icon(IconName::Trash)
+                .label("Delete")
+                .on_click(move |_, window, cx| {
+                    let mut updated = c_del.clone();
+                    if updated.delete_block(block_ix) {
+                        let full_md = updated.to_markdown();
+                        let op = section_delete_op(sid_del.clone(), full_md);
+                        commit_block_edit(
+                            &k_del,
+                            updated,
+                            op,
+                            is_fixture,
+                            e_del.as_ref(),
+                            window,
+                            cx,
+                        );
+                        mutate_ui(&k_del, |s| s.keyboard.section_menu_block = None, window, cx);
+                    }
+                }),
+            );
+    }
+
+    bar.child(
+        Button::new(SharedString::from(format!(
+            "canvas-kb-sec-close-{key}-{block_ix}"
+        )))
+        .ghost()
+        .with_size(Size::XSmall)
+        .icon(IconName::X)
+        .on_click(move |_, window, cx| {
+            mutate_ui(
+                &k_close,
+                |s| s.keyboard.section_menu_block = None,
+                window,
+                cx,
+            );
+        }),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_block(
     key: &str,
@@ -397,7 +609,6 @@ pub(super) fn render_block(
     let theme = cx.theme();
     match block {
         CanvasBlock::Heading { level, text } => {
-            let display_text = resolve_canvas_emoji(text);
             let slug = section_id.map(str::to_owned).unwrap_or_else(|| {
                 text.to_ascii_lowercase()
                     .chars()
@@ -420,7 +631,12 @@ pub(super) fn render_block(
                 .items_center()
                 .gap_1p5()
                 .when(*level == 2, |row| row.pt_2())
-                .child(heading.child(display_text))
+                .child(heading.child(render_inline_canvas_text(
+                    &format!("canvas-h-{key}-{block_ix}"),
+                    text,
+                    cbs,
+                    cx,
+                )))
                 .child(
                     Button::new(SharedString::from(format!("canvas-anchor-{block_ix}")))
                         .ghost()
@@ -438,10 +654,17 @@ pub(super) fn render_block(
                         }),
                 )
         }
-        CanvasBlock::Paragraph(text) => div()
-            .text_sm()
-            .line_height(px(22.))
-            .child(resolve_canvas_emoji(text)),
+        CanvasBlock::Paragraph(text) => {
+            div()
+                .text_sm()
+                .line_height(px(22.))
+                .child(render_inline_canvas_text(
+                    &format!("canvas-p-{key}-{block_ix}"),
+                    text,
+                    cbs,
+                    cx,
+                ))
+        }
         CanvasBlock::CodeBlock(code) => div()
             .w_full()
             .p_3()
@@ -452,33 +675,47 @@ pub(super) fn render_block(
             .font_family(theme.mono_font_family.clone())
             .text_xs()
             .child(code.clone()),
-        CanvasBlock::Quote(text) => {
-            let lines: Vec<String> = text.lines().map(resolve_canvas_emoji).collect();
+        CanvasBlock::Quote(text) => v_flex()
+            .gap_1()
+            .pl_3()
+            .py_1()
+            .border_l_2()
+            .border_color(theme.link)
+            .bg(theme.secondary.opacity(0.18))
+            .rounded_r_sm()
+            .text_sm()
+            .text_color(theme.muted_foreground)
+            .children(text.lines().enumerate().map(|(line_ix, line)| {
+                render_inline_canvas_text(
+                    &format!("canvas-q-{key}-{block_ix}-{line_ix}"),
+                    line,
+                    cbs,
+                    cx,
+                )
+            })),
+        CanvasBlock::Bullets(items) => {
             v_flex()
                 .gap_1()
-                .pl_3()
-                .py_1()
-                .border_l_2()
-                .border_color(theme.link)
-                .bg(theme.secondary.opacity(0.18))
-                .rounded_r_sm()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .children(lines.into_iter().map(|line| div().child(line)))
+                .pl_2()
+                .children(items.iter().enumerate().map(|(ix, item)| {
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .text_sm()
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(theme.muted_foreground)
+                                .child("•"),
+                        )
+                        .child(div().flex_1().child(render_inline_canvas_text(
+                            &format!("canvas-b-{key}-{block_ix}-{ix}"),
+                            item,
+                            cbs,
+                            cx,
+                        )))
+                }))
         }
-        CanvasBlock::Bullets(items) => v_flex().gap_1().pl_2().children(items.iter().map(|item| {
-            h_flex()
-                .gap_2()
-                .items_start()
-                .text_sm()
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(theme.muted_foreground)
-                        .child("•"),
-                )
-                .child(div().flex_1().child(resolve_canvas_emoji(item)))
-        })),
         CanvasBlock::NumberedList(items) => {
             v_flex()
                 .gap_1()
@@ -496,7 +733,12 @@ pub(super) fn render_block(
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(format!("{}.", ix + 1)),
                         )
-                        .child(div().flex_1().child(resolve_canvas_emoji(item)))
+                        .child(div().flex_1().child(render_inline_canvas_text(
+                            &format!("canvas-n-{key}-{block_ix}-{ix}"),
+                            item,
+                            cbs,
+                            cx,
+                        )))
                 }))
         }
         CanvasBlock::Checklist(items) => render_checklist_block(key, block_ix, items, ui, cbs, cx),
@@ -516,27 +758,137 @@ pub(super) fn render_block(
                 }
                 _ => (480., 270.),
             };
-            v_flex()
-                .gap_1()
-                .child(
-                    div()
-                        .w(px(box_w))
-                        .h(px(box_h))
-                        .rounded_md()
-                        .bg(theme.muted.opacity(0.3))
-                        .border_1()
-                        .border_color(theme.border)
-                        .overflow_hidden()
-                        .child(img(url.clone()).size_full().object_fit(ObjectFit::Contain)),
-                )
-                .when(!alt.is_empty(), |col| {
-                    col.child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(resolve_canvas_emoji(alt)),
-                    )
-                })
+            let is_editing_alt = ui.editing_image_block == Some(block_ix);
+            let mut col = v_flex().gap_1().child(
+                div()
+                    .w(px(box_w))
+                    .h(px(box_h))
+                    .rounded_md()
+                    .bg(theme.muted.opacity(0.3))
+                    .border_1()
+                    .border_color(theme.border)
+                    .overflow_hidden()
+                    .child(img(url.clone()).size_full().object_fit(ObjectFit::Contain)),
+            );
+
+            if is_editing_alt
+                && let Some(input) = ui.image_alt_input.clone()
+                && let Some(on_set_alt) = cbs.on_set_image_alt.clone()
+            {
+                let input_save = input.clone();
+                let k_save = key.to_owned();
+                let k_cancel = key.to_owned();
+                col = col.child(
+                    h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .pt_0p5()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.background)
+                                .px_2()
+                                .py_0p5()
+                                .child(Textarea::new(&input).appearance(false).bordered(false)),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "canvas-img-alt-save-{key}-{block_ix}"
+                            )))
+                            .primary()
+                            .with_size(Size::XSmall)
+                            .label("Save")
+                            .on_click(move |_, window, cx| {
+                                let val = input_save.read(cx).value().trim().to_owned();
+                                on_set_alt(val, window, cx);
+                                mutate_ui(
+                                    &k_save,
+                                    |s| {
+                                        s.editing_image_block = None;
+                                        s.image_alt_input = None;
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "canvas-img-alt-cancel-{key}-{block_ix}"
+                            )))
+                            .ghost()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::X)
+                            .on_click(move |_, window, cx| {
+                                mutate_ui(
+                                    &k_cancel,
+                                    |s| {
+                                        s.editing_image_block = None;
+                                        s.image_alt_input = None;
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        ),
+                );
+            } else {
+                let edit_alt_btn = cbs.on_set_image_alt.as_ref().map(|_| {
+                    let k_open = key.to_owned();
+                    let cur_alt = alt.clone();
+                    Button::new(SharedString::from(format!(
+                        "canvas-img-alt-edit-{key}-{block_ix}"
+                    )))
+                    .ghost()
+                    .with_size(Size::XSmall)
+                    .icon(IconName::Pencil)
+                    .label(if alt.is_empty() {
+                        "Add description"
+                    } else {
+                        "Edit description"
+                    })
+                    .tooltip("Edit accessible image description (alt text)")
+                    .on_click(move |_, window, cx| {
+                        let initial = cur_alt.clone();
+                        let input = cx.new(|cx| {
+                            TextareaState::new(window, cx)
+                                .default_value(initial)
+                                .placeholder("Describe this image for screen readers…")
+                                .auto_grow(1, 3)
+                        });
+                        mutate_ui(
+                            &k_open,
+                            |s| {
+                                s.editing_image_block = Some(block_ix);
+                                s.image_alt_input = Some(input);
+                            },
+                            window,
+                            cx,
+                        );
+                    })
+                });
+                if !alt.is_empty() || edit_alt_btn.is_some() {
+                    col = col.child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .when(!alt.is_empty(), |row| {
+                                row.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(resolve_canvas_emoji(alt)),
+                                )
+                            })
+                            .children(edit_alt_btn),
+                    );
+                }
+            }
+            col
         }
         CanvasBlock::MediaEmbed {
             kind,
@@ -932,7 +1284,12 @@ fn render_checklist_block(
                                 .when(*done, |text| {
                                     text.line_through().text_color(theme.muted_foreground)
                                 })
-                                .child(resolve_canvas_emoji(item)),
+                                .child(render_inline_canvas_text(
+                                    &format!("canvas-c-{key}-{block_ix}-{item_ix}"),
+                                    item,
+                                    cbs,
+                                    cx,
+                                )),
                         ),
                 )
                 .when_some(del, |row, del_cb| {
@@ -1091,7 +1448,12 @@ fn render_table_block(
                     cx,
                 );
             })
-            .child(display)
+            .child(render_inline_canvas_text(
+                &format!("canvas-t-{key}-{block_ix}-{row_id}-{col_ix}"),
+                text,
+                cbs,
+                cx,
+            ))
     };
 
     let action_strip = h_flex()

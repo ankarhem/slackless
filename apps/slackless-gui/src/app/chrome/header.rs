@@ -345,6 +345,13 @@ impl App {
             .conversation(&self.channel)
             .unwrap_or(&fallback);
         let specs = self.conversation_tab_specs(conversation);
+        let at_tab_limit = !tabs::can_add_tab(&specs);
+        let canvas_item_label = if tabs::has_canvas_tab(&specs) {
+            "Canvas"
+        } else {
+            "Add canvas"
+        };
+        let tab_limit_tip = tabs::tab_limit_message(&specs).unwrap_or_else(|| "New tab".to_owned());
         let this = cx.entity().downgrade();
         let sample = self.fixtures.sample;
         let ch_for_add = self.channel.clone();
@@ -352,13 +359,15 @@ impl App {
             .ghost()
             .with_size(Size::XSmall)
             .icon(IconName::Plus)
-            .tooltip("New tab")
+            .disabled(at_tab_limit)
+            .tooltip(tab_limit_tip)
             .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
                 if !sample {
                     let this_canvas = this.clone();
                     menu = menu.item(
-                        PopupMenuItem::new("Canvas")
+                        PopupMenuItem::new(canvas_item_label)
                             .icon(IconName::LayoutTemplate)
+                            .disabled(at_tab_limit)
                             .on_click(move |_, _, cx| {
                                 let _ =
                                     this_canvas.update(cx, |app, cx| app.open_or_add_canvas(cx));
@@ -369,6 +378,7 @@ impl App {
                     menu = menu.item(
                         PopupMenuItem::new("Files & links")
                             .icon(IconName::Files)
+                            .disabled(at_tab_limit)
                             .on_click(move |_, _, cx| {
                                 let _ = this_files.update(cx, |app, _| {
                                     app.bridge.send(Command::AddConversationTab {
@@ -384,6 +394,7 @@ impl App {
                     menu = menu.item(
                         PopupMenuItem::new("Pins & bookmarks")
                             .icon(IconName::Pin)
+                            .disabled(at_tab_limit)
                             .on_click(move |_, _, cx| {
                                 let _ = this_pins.update(cx, |app, _| {
                                     app.bridge.send(Command::AddConversationTab {
@@ -396,11 +407,14 @@ impl App {
                     );
                 }
                 let this = this.clone();
-                menu.item(PopupMenuItem::new("Link").icon(IconName::Link).on_click(
-                    move |_, window, cx| {
-                        let _ = this.update(cx, |app, cx| app.open_link_dialog(window, cx));
-                    },
-                ))
+                menu.item(
+                    PopupMenuItem::new("Link")
+                        .icon(IconName::Link)
+                        .disabled(at_tab_limit)
+                        .on_click(move |_, window, cx| {
+                            let _ = this.update(cx, |app, cx| app.open_link_dialog(window, cx));
+                        }),
+                )
             });
         let tab_ids: Vec<Option<String>> = specs.iter().map(|s| s.tab_id.clone()).collect();
         let ch_for_tabs = self.channel.clone();

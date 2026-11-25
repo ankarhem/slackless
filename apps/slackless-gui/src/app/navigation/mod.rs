@@ -400,13 +400,48 @@ impl App {
         self.search.read(cx).focus_handle(cx).focus(window, cx);
     }
 
-    /// Cycle keyboard focus between app panes (`F6` / `Shift+F6`).
+    /// Cycle keyboard focus between app panes (`F6` / `Shift+F6`), or between canvas regions
+    /// when a Canvas tab is active (`F-COLLAB-194`).
     pub(super) fn cycle_pane_focus(
         &mut self,
         forward: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let showing_canvas = self.tab == ConversationTab::Canvas
+            && !self.searching
+            && !self.drafts_open
+            && !self.later_open
+            && !self.threads_open
+            && !self.unreads_open
+            && !self.huddles_open
+            && !self.directory_open
+            && !self.tools_open
+            && !self.compose_open
+            && !self.activity_open
+            && self.sidebar.read(cx).active_nav() != NavItem::Files;
+        if showing_canvas {
+            let key = if self.fixtures.sample {
+                "fixture".to_owned()
+            } else {
+                self.ws
+                    .active_canvas
+                    .clone()
+                    .unwrap_or_else(|| "live-canvas".to_owned())
+            };
+            let has_outline = if self.fixtures.sample {
+                true
+            } else {
+                self.ws
+                    .canvases
+                    .get(&key)
+                    .and_then(|r| r.as_ref().ok())
+                    .is_some_and(|doc| doc.outline_headings().len() >= 2)
+            };
+            let _ =
+                crate::canvas::cycle_canvas_focus_region(&key, forward, has_outline, window, cx);
+            return;
+        }
         let has_right = self.thread_open || self.profile_open || self.pins_open;
         let count = if has_right { 4 } else { 3 };
         self.pane_focus = if forward {

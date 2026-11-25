@@ -168,9 +168,9 @@ impl App {
         }
     }
 
-    /// The "+" menu's Canvas item: open the conversation's canvas, creating it first when
-    /// it has none (the created canvas arrives as `Event::ChannelCanvasCreated` and opens
-    /// then).
+    /// The "+" menu's Canvas item: open the conversation's canvas natively, creating it first
+    /// when it has none (the created canvas arrives as `Event::ChannelCanvasCreated` and opens
+    /// natively then; `F-COLLAB-123`, `F-COLLAB-124`).
     pub(in crate::app) fn open_or_add_canvas(&mut self, cx: &mut Context<Self>) {
         let canvas = self
             .fixtures
@@ -180,7 +180,7 @@ impl App {
             .and_then(|canvas| canvas.file_id.as_ref())
             .map(|file| file.to_string());
         match canvas {
-            Some(file) => cx.open_url(&self.canvas_link(&file)),
+            Some(file) => self.open_live_canvas(file, cx),
             None => {
                 self.bridge
                     .send(Command::CreateChannelCanvas(self.channel.clone()));

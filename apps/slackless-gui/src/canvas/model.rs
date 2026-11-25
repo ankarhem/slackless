@@ -421,6 +421,19 @@ pub(crate) fn serialize_markdown_table(header: &[String], rows: &[Vec<String>]) 
     lines.join("\n")
 }
 
+/// One embedded file, image, media clip, or document extracted for the "Files in this canvas"
+/// section strip (`F-COLLAB-126`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanvasEmbeddedFile {
+    pub block_ix: usize,
+    pub kind_label: &'static str,
+    pub title: String,
+    pub url: String,
+    pub file_id: Option<String>,
+    pub embed_kind: Option<CanvasEmbedKind>,
+    pub media_kind: Option<MediaKind>,
+}
+
 /// A parsed canvas document ready to render in the native reader/editor.
 #[derive(Clone, Debug)]
 pub struct CanvasDoc {
@@ -639,6 +652,86 @@ impl CanvasDoc {
             row.resize(cols, String::new());
         }
         Some(serialize_markdown_table(header, rows))
+    }
+
+    /// Update the accessible description (`alt` text) of an image block and return its updated
+    /// markdown `![alt](url)` (`F-COLLAB-200`).
+    pub fn set_image_alt(&mut self, block_ix: usize, new_alt: String) -> Option<String> {
+        let block = self.blocks.get_mut(block_ix)?;
+        let CanvasBlock::Image { alt, .. } = block else {
+            return None;
+        };
+        *alt = new_alt.trim().to_owned();
+        Some(block.to_markdown())
+    }
+
+    /// Extract all embedded images, audio/video media clips, and embedded canvases/lists for the
+    /// collapsible "Files in this canvas" section strip (`F-COLLAB-126`).
+    pub fn embedded_files(&self) -> Vec<CanvasEmbeddedFile> {
+        let mut out = Vec::new();
+        for (block_ix, block) in self.blocks.iter().enumerate() {
+            match block {
+                CanvasBlock::Image { url, alt, .. } => {
+                    let fallback_name = url
+                        .split('?')
+                        .next()
+                        .unwrap_or(url)
+                        .rsplit('/')
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("Image");
+                    let title = if alt.trim().is_empty() {
+                        fallback_name.to_owned()
+                    } else {
+                        alt.trim().to_owned()
+                    };
+                    out.push(CanvasEmbeddedFile {
+                        block_ix,
+                        kind_label: "Image",
+                        title,
+                        url: url.clone(),
+                        file_id: None,
+                        embed_kind: None,
+                        media_kind: None,
+                    });
+                }
+                CanvasBlock::MediaEmbed {
+                    kind,
+                    title,
+                    url,
+                    file_id,
+                    ..
+                } => {
+                    out.push(CanvasEmbeddedFile {
+                        block_ix,
+                        kind_label: kind.label(),
+                        title: title.clone(),
+                        url: url.clone(),
+                        file_id: file_id.clone(),
+                        embed_kind: None,
+                        media_kind: Some(*kind),
+                    });
+                }
+                CanvasBlock::DocEmbed {
+                    kind,
+                    file_id,
+                    title,
+                    url,
+                } => {
+                    out.push(CanvasEmbeddedFile {
+                        block_ix,
+                        kind_label: kind.label(),
+                        title: title.clone(),
+                        url: url.clone(),
+                        file_id: Some(file_id.clone()),
+                        embed_kind: Some(*kind),
+                        media_kind: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+        out
     }
 }
 

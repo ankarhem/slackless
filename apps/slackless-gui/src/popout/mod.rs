@@ -1602,7 +1602,7 @@ impl Render for PopoutWindow {
                 doc,
                 file_id,
                 open_browser_url,
-                ..
+                on_jump,
             } => {
                 let open_browser = open_browser_url.clone().map(|url| {
                     Rc::new(move |_: &mut Window, cx: &mut App| cx.open_url(&url))
@@ -1616,6 +1616,108 @@ impl Render for PopoutWindow {
                             op,
                         });
                     }) as crate::canvas::CanvasEditFn
+                });
+                let on_load_comments = file_id.clone().map(|fid| {
+                    let send = self.send.clone();
+                    Rc::new(move |_: &mut Window, _: &mut App| {
+                        (send)(Command::LoadCanvasComments {
+                            canvas_id: fid.clone(),
+                        });
+                    }) as crate::canvas::CanvasCommentsLoadFn
+                });
+                let on_post_comment = file_id.clone().map(|fid| {
+                    let send = self.send.clone();
+                    Rc::new(move |text, thread_ts, _: &mut Window, _: &mut App| {
+                        (send)(Command::PostCanvasComment {
+                            canvas_id: fid.clone(),
+                            text,
+                            thread_ts,
+                        });
+                    }) as crate::canvas::CanvasCommentPostFn
+                });
+                let on_resolve_comment = file_id.clone().map(|fid| {
+                    let send = self.send.clone();
+                    Rc::new(move |thread_ts, resolved, _: &mut Window, _: &mut App| {
+                        (send)(Command::ResolveCanvasComment {
+                            canvas_id: fid.clone(),
+                            thread_ts,
+                            resolved,
+                        });
+                    }) as crate::canvas::CanvasCommentResolveFn
+                });
+                let on_resolve_all_comments = file_id.clone().map(|fid| {
+                    let send = self.send.clone();
+                    Rc::new(move |_: &mut Window, _: &mut App| {
+                        (send)(Command::ResolveAllCanvasComments {
+                            canvas_id: fid.clone(),
+                        });
+                    }) as crate::canvas::CanvasCommentResolveAllFn
+                });
+                let on_set_access = file_id.clone().map(|fid| {
+                    let send = self.send.clone();
+                    Rc::new(
+                        move |req: crate::canvas::ShareAccessRequest,
+                              _: &mut Window,
+                              _: &mut App| {
+                            (send)(Command::SetCanvasAccess {
+                                canvas_id: fid.clone(),
+                                access_level: req.access_level,
+                                channel_ids: req.channel_ids,
+                                user_ids: req.user_ids,
+                                post_permalink: req.post_permalink,
+                            });
+                        },
+                    ) as crate::canvas::CanvasAccessSetFn
+                });
+                let on_delete_access = file_id.clone().map(|fid| {
+                    let send = self.send.clone();
+                    Rc::new(move |channel_ids, user_ids, _: &mut Window, _: &mut App| {
+                        (send)(Command::DeleteCanvasAccess {
+                            canvas_id: fid.clone(),
+                            channel_ids,
+                            user_ids,
+                        });
+                    }) as crate::canvas::CanvasAccessDeleteFn
+                });
+                let on_delete_canvas = file_id.clone().map(|fid| {
+                    let send = self.send.clone();
+                    Rc::new(move |_: &mut Window, _: &mut App| {
+                        (send)(Command::DeleteCanvas {
+                            canvas_id: fid.clone(),
+                        });
+                    }) as crate::canvas::CanvasDeleteFn
+                });
+                let channel_lookup =
+                    crate::canvas::channel_lookup_from_fixtures(self.fixtures.clone());
+                let jump_ch = on_jump.clone();
+                let on_open_channel: crate::canvas::CanvasOpenChannelFn =
+                    Rc::new(move |channel_id, _window, cx| {
+                        jump_ch(channel_id, None, false, cx);
+                    });
+                let on_print_canvas: crate::canvas::CanvasExportFn =
+                    Rc::new(move |doc, window, cx| {
+                        match crate::canvas::trigger_canvas_print(&doc) {
+                            Ok(_) => actions::notify(
+                                "Print canvas",
+                                "Opened printable canvas preview.",
+                                window,
+                                cx,
+                            ),
+                            Err(err) => actions::notify("Print canvas", err, window, cx),
+                        }
+                    });
+                let on_save_pdf: crate::canvas::CanvasExportFn = Rc::new(move |doc, window, cx| {
+                    let stem = crate::canvas::canvas_export_stem(&doc.title);
+                    let target = std::env::temp_dir().join(format!("{stem}.pdf"));
+                    match crate::canvas::save_canvas_pdf_to_path(&doc, &target) {
+                        Ok(saved) => actions::notify(
+                            "Saved PDF",
+                            format!("Exported to {}", saved.display()),
+                            window,
+                            cx,
+                        ),
+                        Err(err) => actions::notify("Save as PDF", err, window, cx),
+                    }
                 });
                 let on_upload_file: crate::canvas::CanvasUploadFileFn = {
                     let send = self.send.clone();
@@ -1752,10 +1854,22 @@ impl Render for PopoutWindow {
                         open_browser,
                         on_edit,
                         on_upload_file: Some(on_upload_file),
+                        canvas_url: open_browser_url.clone(),
                         on_open_media: Some(on_open_media),
                         user_lookup: Some(user_lookup),
+                        channel_lookup: Some(channel_lookup),
                         on_open_profile: Some(on_open_profile),
+                        on_open_channel: Some(on_open_channel),
                         on_open_embed: Some(on_open_embed),
+                        on_load_comments,
+                        on_post_comment,
+                        on_resolve_comment,
+                        on_resolve_all_comments,
+                        on_set_access,
+                        on_delete_access,
+                        on_delete_canvas,
+                        on_print_canvas: Some(on_print_canvas),
+                        on_save_pdf: Some(on_save_pdf),
                         ..Default::default()
                     },
                     file_id.is_none(),

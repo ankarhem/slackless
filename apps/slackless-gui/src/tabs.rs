@@ -123,6 +123,43 @@ fn default_tabs() -> Vec<ConversationTabSpec> {
     Vec::new()
 }
 
+/// Slack's conversation header tab cap (Messages + up to 9 additional tabs = 10 total;
+/// `F-COLLAB-201`).
+pub const MAX_CONVERSATION_TABS: usize = 10;
+
+/// Whether the derived conversation tab row currently exposes a Canvas or Add canvas tab
+/// (`F-COLLAB-123`, `F-COLLAB-124`).
+pub fn has_canvas_tab(specs: &[TabSpec]) -> bool {
+    specs.iter().any(|s| {
+        matches!(
+            s.action,
+            TabAction::OpenCanvas(_)
+                | TabAction::AddCanvas
+                | TabAction::Switch(ConversationTab::Canvas)
+        )
+    })
+}
+
+/// Whether another tab can be added to the conversation header under Slack's tab limit
+/// (`F-COLLAB-201`).
+pub fn can_add_tab(specs: &[TabSpec]) -> bool {
+    specs.len() < MAX_CONVERSATION_TABS
+}
+
+/// Human-readable tab limit guard message when at or above [`MAX_CONVERSATION_TABS`]
+/// (`F-COLLAB-201`).
+pub fn tab_limit_message(specs: &[TabSpec]) -> Option<String> {
+    if can_add_tab(specs) {
+        None
+    } else {
+        Some(format!(
+            "Tab limit reached ({}/{}). Remove a tab before adding another.",
+            specs.len(),
+            MAX_CONVERSATION_TABS
+        ))
+    }
+}
+
 /// Prepend the `Home` tab to `specs` for app/bot DMs (`F-COLLAB-480`).
 pub fn with_app_home(mut specs: Vec<TabSpec>) -> Vec<TabSpec> {
     specs.insert(
@@ -171,9 +208,10 @@ pub fn derive(conversation: &Conversation, sample: bool) -> Vec<TabSpec> {
         (Some(tab), Some(file)) if !tab.is_disabled => {
             Some(("Canvas", TabAction::OpenCanvas(file)))
         }
+        (Some(tab), None) if !tab.is_disabled => Some(("Add canvas", TabAction::AddCanvas)),
         (None, Some(file)) => Some(("Canvas", TabAction::OpenCanvas(file))),
         (None, None) => Some(("Add canvas", TabAction::AddCanvas)),
-        // A disabled canvas tab (or one without its file id) shows nothing.
+        // A disabled canvas tab hides the canvas without offering to add another.
         (Some(_), _) => None,
     };
     if let Some((label, action)) = canvas {
@@ -423,6 +461,50 @@ mod tests {
                 "List -> Switch(List)",
                 "Files & links -> Switch(Files)",
             ]
+        );
+    }
+
+    #[test]
+    fn exposes_canvas_tab_by_default_and_enforces_tab_limit() {
+        // New conversation with no stored tabs gets Add canvas by default (`F-COLLAB-123`).
+        let fresh = derive(&Conversation::default(), false);
+        assert!(has_canvas_tab(&fresh));
+        assert!(can_add_tab(&fresh));
+        assert_eq!(tab_limit_message(&fresh), None);
+
+        // Enabled ChannelCanvas tab without a file id yet still offers Add canvas (`F-COLLAB-123`).
+        let uninit = derive(
+            &conversation(vec![tab_spec(ConversationTabKind::ChannelCanvas)], None),
+            false,
+        );
+        assert!(has_canvas_tab(&uninit));
+
+        // Disabled canvas tab hides canvas (`F-COLLAB-124`).
+        let mut disabled = tab_spec(ConversationTabKind::ChannelCanvas);
+        disabled.is_disabled = true;
+        let hidden = derive(&conversation(vec![disabled], Some("F1")), false);
+        assert!(!has_canvas_tab(&hidden));
+
+        // At MAX_CONVERSATION_TABS, adding more tabs is blocked with a clear message (`F-COLLAB-201`).
+        let mut many_tabs = Vec::new();
+        for i in 0..MAX_CONVERSATION_TABS {
+            many_tabs.push(ConversationTabSpec {
+                kind: Some(ConversationTabKind::Folder),
+                label: Some(format!("Folder {i}")),
+                data: Some(TabData {
+                    folder_bookmark_id: Some(format!("Bk{i}")),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        let full = derive(&conversation(many_tabs, Some("F1")), false);
+        assert!(full.len() >= MAX_CONVERSATION_TABS);
+        assert!(!can_add_tab(&full));
+        assert!(
+            tab_limit_message(&full)
+                .expect("limit message")
+                .contains("Tab limit reached")
         );
     }
 }

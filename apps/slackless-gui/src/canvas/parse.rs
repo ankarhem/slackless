@@ -1343,6 +1343,11 @@ fn expand_inline_emoji_tags(html: &str) -> String {
                     rest = &after_open[end + "</control>".len()..];
                     continue;
                 }
+                if let Some(mention_token) = extract_control_inline_mention(inner) {
+                    out.push_str(&mention_token);
+                    rest = &after_open[end + "</control>".len()..];
+                    continue;
+                }
             }
         }
         if tag_name == "img"
@@ -1510,17 +1515,115 @@ fn parse_html_table(inner: &str) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     Some((header, rows))
 }
 
-fn strip_tags(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
+/// Extract an inline Slack `@user` or `#channel` mention token from a Quip `<control>` element
+/// (`F-COLLAB-150`) so `strip_tags` preserves it as `<@U...>` / `<#C...|name>`.
+fn extract_control_inline_mention(inner: &str) -> Option<String> {
+    let a_pos = find_case_insensitive(inner, "<a")?;
+    let a_rest = &inner[a_pos..];
+    let gt = a_rest.find('>')?;
+    let raw_a = &a_rest[1..gt];
+    let after_a = &a_rest[gt + 1..];
+    let a_end = find_case_insensitive(after_a, "</a>")?;
+    let anchor_text = clean_text(&strip_tags(&after_a[..a_end]));
+
+    if let Some(uid) = anchor_text.strip_prefix('@')
+        && is_slack_user_id(uid.trim())
+    {
+        return Some(format!("<@{}>", uid.trim()));
+    }
+    if let Some(cid) = anchor_text.strip_prefix('#') {
+        let candidate = cid.trim();
+        let bytes = candidate.as_bytes();
+        if bytes.len() >= 3
+            && matches!(bytes[0], b'C' | b'G')
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            return Some(format!("<#{candidate}>"));
         }
     }
+    if let Some(href) = extract_attr(raw_a, "href") {
+        let decoded = decode_entities(&href);
+        if let Some(uid) = parse_slack_profile_url(&decoded) {
+            let label = anchor_text.trim_start_matches('@').trim();
+            if !label.is_empty() && label != uid {
+                return Some(format!("<@{uid}|{label}>"));
+            }
+            return Some(format!("<@{uid}>"));
+        }
+        if let Some(pos) = decoded.find("/archives/") {
+            let tail = &decoded[pos + "/archives/".len()..];
+            let cid: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            let bytes = cid.as_bytes();
+            if bytes.len() >= 3
+                && matches!(bytes[0], b'C' | b'G')
+                && bytes
+                    .iter()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            {
+                let name = anchor_text.trim_start_matches('#').trim();
+                if !name.is_empty() && name != cid {
+                    return Some(format!("<#{cid}|{name}>"));
+                }
+                return Some(format!("<#{cid}>"));
+            }
+        }
+    }
+    None
+}
+
+fn is_preserved_slack_mention_token(inner: &str) -> bool {
+    if let Some(body) = inner.strip_prefix('@') {
+        let uid = body.split('|').next().unwrap_or(body).trim();
+        return is_slack_user_id(uid);
+    }
+    if let Some(body) = inner.strip_prefix('#') {
+        let cid = body.split('|').next().unwrap_or(body).trim();
+        let bytes = cid.as_bytes();
+        return bytes.len() >= 3
+            && matches!(bytes[0], b'C' | b'G')
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    }
+    if let Some(body) = inner.strip_prefix("!subteam^") {
+        let gid = body.split('|').next().unwrap_or(body).trim();
+        let bytes = gid.as_bytes();
+        return bytes.len() >= 3
+            && bytes[0] == b'S'
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    }
+    if let Some(body) = inner.strip_prefix('!') {
+        let kw = body.split('|').next().unwrap_or(body).trim();
+        return matches!(kw, "here" | "channel" | "everyone");
+    }
+    false
+}
+
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let after = &rest[lt + 1..];
+        let Some(gt) = after.find('>') else {
+            break;
+        };
+        let inside = &after[..gt];
+        if is_preserved_slack_mention_token(inside) {
+            out.push('<');
+            out.push_str(inside);
+            out.push('>');
+        }
+        rest = &after[gt + 1..];
+    }
+    out.push_str(rest);
     out
 }
 

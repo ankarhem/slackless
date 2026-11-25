@@ -186,11 +186,20 @@ impl Render for App {
                             });
                         let user_lookup =
                             crate::canvas::user_lookup_from_fixtures(self.fixtures.clone());
+                        let channel_lookup =
+                            crate::canvas::channel_lookup_from_fixtures(self.fixtures.clone());
                         let this_prof = cx.weak_entity();
                         let on_open_profile: crate::canvas::CanvasOpenProfileFn =
                             Rc::new(move |user_id, _window, cx| {
                                 let _ = this_prof.update(cx, |app, cx| {
                                     app.open_profile(user_id, cx);
+                                });
+                            });
+                        let this_ch = cx.weak_entity();
+                        let on_open_channel: crate::canvas::CanvasOpenChannelFn =
+                            Rc::new(move |channel_id, _window, cx| {
+                                let _ = this_ch.update(cx, |app, cx| {
+                                    app.select(channel_id, cx);
                                 });
                             });
                         let this_emb = cx.weak_entity();
@@ -218,6 +227,31 @@ impl Render for App {
                                     );
                                 }
                             });
+                        let on_print_canvas: crate::canvas::CanvasExportFn = Rc::new(
+                            move |doc, window, cx| match crate::canvas::trigger_canvas_print(&doc) {
+                                Ok(_) => notify(
+                                    "Print canvas",
+                                    "Opened printable canvas preview.",
+                                    window,
+                                    cx,
+                                ),
+                                Err(err) => notify("Print canvas", err, window, cx),
+                            },
+                        );
+                        let on_save_pdf: crate::canvas::CanvasExportFn =
+                            Rc::new(move |doc, window, cx| {
+                                let stem = crate::canvas::canvas_export_stem(&doc.title);
+                                let target = std::env::temp_dir().join(format!("{stem}.pdf"));
+                                match crate::canvas::save_canvas_pdf_to_path(&doc, &target) {
+                                    Ok(saved) => notify(
+                                        "Saved PDF",
+                                        format!("Exported to {}", saved.display()),
+                                        window,
+                                        cx,
+                                    ),
+                                    Err(err) => notify("Save as PDF", err, window, cx),
+                                }
+                            });
                         canvas_view(
                             &self.canvas_query,
                             Some(&self.canvas_search),
@@ -227,8 +261,12 @@ impl Render for App {
                                 on_upload_file: Some(on_upload_file),
                                 on_open_media: Some(on_open_media),
                                 user_lookup: Some(user_lookup),
+                                channel_lookup: Some(channel_lookup),
                                 on_open_profile: Some(on_open_profile),
+                                on_open_channel: Some(on_open_channel),
                                 on_open_embed: Some(on_open_embed),
+                                on_print_canvas: Some(on_print_canvas),
+                                on_save_pdf: Some(on_save_pdf),
                                 ..Default::default()
                             },
                             cx,
@@ -283,13 +321,22 @@ impl Render for App {
                             }) as crate::canvas::CanvasPopOutFn
                         });
                         let canvas_url = file_id.as_ref().map(|id| self.canvas_link(id));
+                        let tab_limit_msg = conversation.as_ref().and_then(|conv| {
+                            let specs = self.conversation_tab_specs(conv);
+                            tabs::tab_limit_message(&specs)
+                        });
                         let on_pin_tab = file_id.as_ref().map(|_| {
                             let ch = self.channel.clone();
                             let label = loaded
                                 .and_then(|res| res.as_ref().ok())
                                 .map(|doc| doc.title.clone());
+                            let limit_err = tab_limit_msg.clone();
                             let this = cx.weak_entity();
                             Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
+                                if let Some(msg) = &limit_err {
+                                    notify("Tab limit reached", msg.clone(), window, cx);
+                                    return;
+                                }
                                 let _ = this.update(cx, |app, _| {
                                     app.bridge.send(Command::AddConversationTab {
                                         channel: ch.clone(),
@@ -376,11 +423,20 @@ impl Render for App {
                         });
                         let user_lookup =
                             crate::canvas::user_lookup_from_fixtures(self.fixtures.clone());
+                        let channel_lookup =
+                            crate::canvas::channel_lookup_from_fixtures(self.fixtures.clone());
                         let this_prof = cx.weak_entity();
                         let on_open_profile: crate::canvas::CanvasOpenProfileFn =
                             Rc::new(move |user_id, _window, cx| {
                                 let _ = this_prof.update(cx, |app, cx| {
                                     app.open_profile(user_id, cx);
+                                });
+                            });
+                        let this_ch = cx.weak_entity();
+                        let on_open_channel: crate::canvas::CanvasOpenChannelFn =
+                            Rc::new(move |channel_id, _window, cx| {
+                                let _ = this_ch.update(cx, |app, cx| {
+                                    app.select(channel_id, cx);
                                 });
                             });
                         let this_emb = cx.weak_entity();
@@ -413,6 +469,162 @@ impl Render for App {
                                     );
                                 }
                             });
+                        let meta = file_id
+                            .as_deref()
+                            .and_then(|id| self.ws.canvas_metas.get(id).cloned());
+                        let comment_threads = file_id
+                            .as_deref()
+                            .and_then(|id| self.ws.canvas_comments.get(id).cloned());
+                        let status_banner = file_id
+                            .as_deref()
+                            .and_then(|id| self.ws.canvas_status.get(id).cloned());
+                        let updated_note = file_id
+                            .as_deref()
+                            .and_then(|id| self.ws.canvas_updated_notes.get(id).cloned());
+                        let on_load_comments = file_id.as_ref().map(|id| {
+                            let cid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::LoadCanvasComments {
+                                        canvas_id: cid.clone(),
+                                    });
+                                });
+                            }) as crate::canvas::CanvasCommentsLoadFn
+                        });
+                        let on_post_comment = file_id.as_ref().map(|id| {
+                            let cid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |text, thread_ts, _: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::PostCanvasComment {
+                                        canvas_id: cid.clone(),
+                                        text,
+                                        thread_ts,
+                                    });
+                                });
+                            }) as crate::canvas::CanvasCommentPostFn
+                        });
+                        let on_resolve_comment = file_id.as_ref().map(|id| {
+                            let cid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(
+                                move |thread_ts, resolved, _: &mut Window, cx: &mut gpui::App| {
+                                    let _ = this.update(cx, |app, _| {
+                                        app.bridge.send(Command::ResolveCanvasComment {
+                                            canvas_id: cid.clone(),
+                                            thread_ts,
+                                            resolved,
+                                        });
+                                    });
+                                },
+                            ) as crate::canvas::CanvasCommentResolveFn
+                        });
+                        let on_resolve_all_comments = file_id.as_ref().map(|id| {
+                            let cid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::ResolveAllCanvasComments {
+                                        canvas_id: cid.clone(),
+                                    });
+                                });
+                            })
+                                as crate::canvas::CanvasCommentResolveAllFn
+                        });
+                        let on_set_access = file_id.as_ref().map(|id| {
+                            let cid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(
+                                move |req: crate::canvas::ShareAccessRequest,
+                                      _: &mut Window,
+                                      cx: &mut gpui::App| {
+                                    let _ = this.update(cx, |app, _| {
+                                        app.bridge.send(Command::SetCanvasAccess {
+                                            canvas_id: cid.clone(),
+                                            access_level: req.access_level,
+                                            channel_ids: req.channel_ids,
+                                            user_ids: req.user_ids,
+                                            post_permalink: req.post_permalink,
+                                        });
+                                    });
+                                },
+                            ) as crate::canvas::CanvasAccessSetFn
+                        });
+                        let on_delete_access = file_id.as_ref().map(|id| {
+                            let cid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(
+                                move |channel_ids, user_ids, _: &mut Window, cx: &mut gpui::App| {
+                                    let _ = this.update(cx, |app, _| {
+                                        app.bridge.send(Command::DeleteCanvasAccess {
+                                            canvas_id: cid.clone(),
+                                            channel_ids,
+                                            user_ids,
+                                        });
+                                    });
+                                },
+                            ) as crate::canvas::CanvasAccessDeleteFn
+                        });
+                        let on_delete_canvas = file_id.as_ref().map(|id| {
+                            let cid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::DeleteCanvas {
+                                        canvas_id: cid.clone(),
+                                    });
+                                });
+                            }) as crate::canvas::CanvasDeleteFn
+                        });
+                        let on_refresh_canvas = file_id.as_ref().map(|id| {
+                            let fid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, cx| {
+                                    app.ws.canvas_updated_notes.remove(&fid);
+                                    app.bridge.send(Command::LoadCanvas {
+                                        file_id: fid.clone(),
+                                    });
+                                    cx.notify();
+                                });
+                            }) as crate::canvas::OpenBrowserFn
+                        });
+                        let on_dismiss_updated = file_id.as_ref().map(|id| {
+                            let fid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, cx| {
+                                    app.ws.canvas_updated_notes.remove(&fid);
+                                    cx.notify();
+                                });
+                            }) as crate::canvas::OpenBrowserFn
+                        });
+                        let on_print_canvas: crate::canvas::CanvasExportFn = Rc::new(
+                            move |doc, window, cx| match crate::canvas::trigger_canvas_print(&doc) {
+                                Ok(_) => notify(
+                                    "Print canvas",
+                                    "Opened printable canvas preview.",
+                                    window,
+                                    cx,
+                                ),
+                                Err(err) => notify("Print canvas", err, window, cx),
+                            },
+                        );
+                        let on_save_pdf: crate::canvas::CanvasExportFn =
+                            Rc::new(move |doc, window, cx| {
+                                let stem = crate::canvas::canvas_export_stem(&doc.title);
+                                let target = std::env::temp_dir().join(format!("{stem}.pdf"));
+                                match crate::canvas::save_canvas_pdf_to_path(&doc, &target) {
+                                    Ok(saved) => notify(
+                                        "Saved PDF",
+                                        format!("Exported to {}", saved.display()),
+                                        window,
+                                        cx,
+                                    ),
+                                    Err(err) => notify("Save as PDF", err, window, cx),
+                                }
+                            });
                         crate::canvas::live_canvas_view(
                             file_id.as_deref().unwrap_or("live-canvas"),
                             loaded,
@@ -428,8 +640,25 @@ impl Render for App {
                                 canvas_url,
                                 on_open_media: Some(on_open_media),
                                 user_lookup: Some(user_lookup),
+                                channel_lookup: Some(channel_lookup),
                                 on_open_profile: Some(on_open_profile),
+                                on_open_channel: Some(on_open_channel),
                                 on_open_embed: Some(on_open_embed),
+                                meta,
+                                comment_threads,
+                                on_load_comments,
+                                on_post_comment,
+                                on_resolve_comment,
+                                on_resolve_all_comments,
+                                on_set_access,
+                                on_delete_access,
+                                on_delete_canvas,
+                                on_print_canvas: Some(on_print_canvas),
+                                on_save_pdf: Some(on_save_pdf),
+                                on_refresh_canvas,
+                                status_banner,
+                                updated_note,
+                                on_dismiss_updated,
                             },
                             cx,
                         )
