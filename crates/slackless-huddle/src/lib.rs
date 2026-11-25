@@ -55,9 +55,10 @@ pub use screen::{ScreenCapture, ScreenSource, capture_screen_thumbnails, list_sc
 pub use session::spawn_huddle_session;
 pub use signaling::install_default_crypto_provider;
 pub use transcribe::{
-    ModelDownloadProgress, ProviderSetupStatus, TranscriptionProvider, default_parakeet_model_dir,
-    default_whisper_model_dir, delete_provider_model, detect_provider_setup, detect_spoken_lang,
-    download_provider_model,
+    ModelDownloadProgress, ProviderSetupStatus, TranscriptionProvider,
+    chunk_audio_for_transcription, default_parakeet_model_dir, default_whisper_model_dir,
+    delete_provider_model, detect_provider_setup, detect_spoken_lang, download_provider_model,
+    extract_audio_16k_mono, resolve_local_file_provider, transcribe_media_file,
 };
 pub use video::{
     CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoFrameData, VideoTileKey, list_cameras,

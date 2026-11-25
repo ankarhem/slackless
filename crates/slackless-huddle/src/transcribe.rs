@@ -699,7 +699,6 @@ enum ActiveSttBackend {
     WhisperServer {
         child: Arc<Mutex<Option<Child>>>,
         url: String,
-        handle: tokio::runtime::Handle,
         http: reqwest::Client,
     },
     WhisperCli {
@@ -741,13 +740,11 @@ impl ActiveSttBackend {
                 let lang = detect_spoken_lang(&text).map(str::to_owned);
                 Some((lang, text))
             }
-            ActiveSttBackend::WhisperServer {
-                url, handle, http, ..
-            } => {
+            ActiveSttBackend::WhisperServer { url, http, .. } => {
                 let wav_bytes = encode_wav_16khz_mono(pcm_16k);
                 let url = url.clone();
                 let http = http.clone();
-                handle.block_on(async move {
+                block_on_http(async move {
                     let part = reqwest::multipart::Part::bytes(wav_bytes)
                         .file_name("utterance.wav")
                         .mime_str("audio/wav")
@@ -801,17 +798,13 @@ impl LocalTranscriber {
             );
             return None;
         }
-        let runtime_handle = tokio::runtime::Handle::try_current()
-            .ok()
-            .unwrap_or_else(shared_http_runtime_handle);
         let server_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         let worker_server_child = Arc::clone(&server_child);
         let (tx, rx) = mpsc::sync_channel::<TranscribeChunk>(64);
         let worker = std::thread::Builder::new()
             .name(format!("slackless-stt-{}", provider.source_tag()))
             .spawn(move || {
-                let Some(mut backend) =
-                    init_stt_backend(provider, &setup, runtime_handle, worker_server_child)
+                let Some(mut backend) = init_stt_backend(provider, &setup, worker_server_child)
                 else {
                     return;
                 };
@@ -889,7 +882,6 @@ impl Drop for LocalTranscriber {
 fn init_stt_backend(
     provider: TranscriptionProvider,
     setup: &ProviderSetupStatus,
-    runtime_handle: tokio::runtime::Handle,
     server_child: Arc<Mutex<Option<Child>>>,
 ) -> Option<ActiveSttBackend> {
     match provider {
@@ -905,12 +897,8 @@ fn init_stt_backend(
         }
         TranscriptionProvider::WhisperTurbo => {
             if let Some(server_bin) = find_whisper_binary(&["whisper-server"])
-                && let Some(srv) = spawn_whisper_server(
-                    &server_bin,
-                    &setup.model_path,
-                    runtime_handle,
-                    server_child,
-                )
+                && let Some(srv) =
+                    spawn_whisper_server(&server_bin, &setup.model_path, server_child)
             {
                 return Some(srv);
             }
@@ -926,7 +914,6 @@ fn init_stt_backend(
 fn spawn_whisper_server(
     bin: &Path,
     model: &Path,
-    handle: tokio::runtime::Handle,
     server_child: Arc<Mutex<Option<Child>>>,
 ) -> Option<ActiveSttBackend> {
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
@@ -951,15 +938,16 @@ fn spawn_whisper_server(
     }
 
     let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(120))
         .build()
         .ok()?;
 
     // Wait up to 8s for `whisper-server` to finish loading the model onto Metal/CPU.
     let health_url = format!("http://127.0.0.1:{port}/");
-    let ready = handle.block_on(async {
+    let http_probe = http.clone();
+    let ready = block_on_http(async move {
         for _ in 0..80 {
-            if http.get(&health_url).send().await.is_ok() {
+            if http_probe.get(&health_url).send().await.is_ok() {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -974,7 +962,6 @@ fn spawn_whisper_server(
     Some(ActiveSttBackend::WhisperServer {
         child: server_child,
         url: format!("http://127.0.0.1:{port}/inference"),
-        handle,
         http,
     })
 }
@@ -1045,6 +1032,354 @@ fn run_whisper_cli_utterance(
 
     let raw_json = std::fs::read_to_string(&json_path).ok()?;
     parse_whisper_json(&raw_json)
+}
+
+// ---------------------------------------------------------------------------
+// Offline Media File Audio Extraction & Local Transcription
+// ---------------------------------------------------------------------------
+
+/// Cap extracted offline audio at 120 minutes @ 16 kHz mono (115.2M samples).
+const MAX_OFFLINE_AUDIO_SAMPLES: usize = TARGET_RATE * 60 * 120;
+/// Maximum chunk duration fed to local STT models (~28s keeps Whisper & Parakeet fast & accurate).
+const MAX_CHUNK_SAMPLES: usize = TARGET_RATE * 28;
+/// Start searching for a low-energy silence boundary after 20s so words aren't cut mid-syllable.
+const MIN_SPLIT_SEARCH_SAMPLES: usize = TARGET_RATE * 20;
+/// Analysis window for silence boundary detection (100 ms @ 16 kHz).
+const SPLIT_WINDOW_SAMPLES: usize = TARGET_RATE / 10;
+/// Hop size for silence boundary scan (50 ms @ 16 kHz).
+const SPLIT_HOP_SAMPLES: usize = TARGET_RATE / 20;
+
+/// Decode a RIFF WAVE byte buffer (16-bit signed PCM or 32-bit IEEE float, any channel count and
+/// sample rate) into 16 kHz mono `f32` samples in `[-1.0, 1.0]`.
+fn decode_wav_bytes_to_16k_mono(bytes: &[u8]) -> std::result::Result<Vec<f32>, String> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("not a RIFF WAVE file".to_owned());
+    }
+
+    let mut audio_format: Option<u16> = None;
+    let mut channels: u16 = 0;
+    let mut sample_rate: u32 = 0;
+    let mut bits_per_sample: u16 = 0;
+    let mut data_slice: Option<&[u8]> = None;
+
+    let mut pos = 12usize;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let chunk_size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        pos += 8;
+        let payload_end = pos.saturating_add(chunk_size).min(bytes.len());
+        let payload = &bytes[pos..payload_end];
+
+        if id == b"fmt " && payload.len() >= 16 {
+            audio_format = Some(u16::from_le_bytes([payload[0], payload[1]]));
+            channels = u16::from_le_bytes([payload[2], payload[3]]);
+            sample_rate = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            bits_per_sample = u16::from_le_bytes([payload[14], payload[15]]);
+        } else if id == b"data" {
+            data_slice = Some(payload);
+        }
+
+        // RIFF chunks are word-aligned (padded by 1 byte if odd).
+        let padded = chunk_size.saturating_add(chunk_size & 1);
+        pos = pos.saturating_add(padded);
+    }
+
+    let fmt = audio_format.ok_or_else(|| "WAV missing fmt chunk".to_owned())?;
+    let data = data_slice.ok_or_else(|| "WAV missing data chunk".to_owned())?;
+    if channels == 0 || sample_rate == 0 {
+        return Err("WAV has invalid channel count or sample rate".to_owned());
+    }
+
+    let ch = channels as usize;
+    let mono: Vec<f32> = match (fmt, bits_per_sample) {
+        (1, 16) => {
+            let frame_bytes = ch * 2;
+            let frame_count = data.len() / frame_bytes;
+            let mut out = Vec::with_capacity(frame_count);
+            for frame in data.chunks_exact(frame_bytes) {
+                let mut sum = 0.0f32;
+                for c in 0..ch {
+                    let s = i16::from_le_bytes([frame[c * 2], frame[c * 2 + 1]]);
+                    sum += f32::from(s) / 32_768.0;
+                }
+                out.push((sum / ch as f32).clamp(-1.0, 1.0));
+            }
+            out
+        }
+        (3, 32) => {
+            let frame_bytes = ch * 4;
+            let frame_count = data.len() / frame_bytes;
+            let mut out = Vec::with_capacity(frame_count);
+            for frame in data.chunks_exact(frame_bytes) {
+                let mut sum = 0.0f32;
+                for c in 0..ch {
+                    let s = f32::from_le_bytes([
+                        frame[c * 4],
+                        frame[c * 4 + 1],
+                        frame[c * 4 + 2],
+                        frame[c * 4 + 3],
+                    ]);
+                    sum += if s.is_finite() { s } else { 0.0 };
+                }
+                out.push((sum / ch as f32).clamp(-1.0, 1.0));
+            }
+            out
+        }
+        _ => {
+            return Err(format!(
+                "unsupported WAV encoding (format={fmt}, bits={bits_per_sample})"
+            ));
+        }
+    };
+
+    let mut resampled = if sample_rate == TARGET_RATE as u32 {
+        mono
+    } else {
+        crate::audio::resample_linear(&mono, sample_rate, TARGET_RATE as u32)
+    };
+    if resampled.len() > MAX_OFFLINE_AUDIO_SAMPLES {
+        resampled.truncate(MAX_OFFLINE_AUDIO_SAMPLES);
+    }
+    Ok(resampled)
+}
+
+#[cfg(target_os = "macos")]
+fn extract_audio_16k_mono_macos(path: &Path) -> Option<Vec<f32>> {
+    use std::ffi::CString;
+
+    let path_str = path.to_str()?;
+    let c_path = CString::new(path_str).ok()?;
+    let mut ptr: *mut f32 = std::ptr::null_mut();
+    let mut len: usize = 0;
+
+    // SAFETY: `c_path` is a valid NUL-terminated UTF-8 string; `ptr` and `len` are stack locals.
+    let ok = unsafe {
+        crate::macos::ffi::slackless_extract_audio_16k_mono(c_path.as_ptr(), &mut ptr, &mut len)
+    };
+    if !ok {
+        return None;
+    }
+    if ptr.is_null() || len == 0 {
+        if !ptr.is_null() {
+            // SAFETY: `ptr` was allocated by `slackless_extract_audio_16k_mono`.
+            unsafe { crate::macos::ffi::slackless_free_f32_buf(ptr) };
+        }
+        return Some(Vec::new());
+    }
+    // SAFETY: `ptr` is valid for `len` initialized `f32` samples until freed below.
+    let samples = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+    // SAFETY: `ptr` was allocated with `malloc`/`realloc` inside `slackless_extract_audio_16k_mono`.
+    unsafe { crate::macos::ffi::slackless_free_f32_buf(ptr) };
+    Some(samples)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn extract_audio_16k_mono_ffmpeg(path: &Path) -> std::result::Result<Vec<f32>, String> {
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("ffmpeg unavailable for decoding {}: {e}", path.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "ffmpeg failed to extract audio from {}: {}",
+            path.display(),
+            stderr.trim()
+        ));
+    }
+    let mut samples = Vec::with_capacity((output.stdout.len() / 4).min(MAX_OFFLINE_AUDIO_SAMPLES));
+    for chunk in output
+        .stdout
+        .chunks_exact(4)
+        .take(MAX_OFFLINE_AUDIO_SAMPLES)
+    {
+        let s = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        samples.push(if s.is_finite() {
+            s.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        });
+    }
+    Ok(samples)
+}
+
+/// Extract audio from any supported media file (MP4, MOV, M4A, MP3, WAV, AAC, etc.) as 16 kHz mono
+/// `f32` PCM samples suitable for local transcription.
+///
+/// On macOS this uses native `AVAssetReader` (falling back to a pure-Rust WAV decoder if needed).
+/// On non-macOS platforms this decodes PCM/float WAV files directly and falls back to `ffmpeg`.
+pub fn extract_audio_16k_mono(path: &Path) -> std::result::Result<Vec<f32>, String> {
+    if !path.is_file() {
+        return Err(format!("media file not found: {}", path.display()));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(samples) = extract_audio_16k_mono_macos(path) {
+            return Ok(samples);
+        }
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+            return decode_wav_bytes_to_16k_mono(&bytes);
+        }
+        Err(format!("no readable audio track in {}", path.display()))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+            return decode_wav_bytes_to_16k_mono(&bytes);
+        }
+        extract_audio_16k_mono_ffmpeg(path)
+    }
+}
+
+/// Resolve which ready local transcription provider to use for offline media file transcription.
+///
+/// Prefers `preferred` when it is a local provider that is ready on disk; otherwise falls back to
+/// [`TranscriptionProvider::ParakeetV3`] and then [`TranscriptionProvider::WhisperTurbo`]. Returns
+/// `None` if no local model is downloaded and ready yet.
+pub fn resolve_local_file_provider(
+    preferred: TranscriptionProvider,
+) -> Option<TranscriptionProvider> {
+    if preferred.is_local() && detect_provider_setup(preferred).is_ready() {
+        return Some(preferred);
+    }
+    [
+        TranscriptionProvider::ParakeetV3,
+        TranscriptionProvider::WhisperTurbo,
+    ]
+    .into_iter()
+    .find(|&candidate| candidate != preferred && detect_provider_setup(candidate).is_ready())
+}
+
+/// Split 16 kHz mono audio into chunks of at most 28 seconds, preferring the lowest-energy
+/// silence boundary between 20s and 28s so words are not cut in half.
+pub fn chunk_audio_for_transcription(samples: &[f32]) -> Vec<&[f32]> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+
+    while start < samples.len() {
+        let remaining = samples.len() - start;
+        if remaining <= MAX_CHUNK_SAMPLES {
+            chunks.push(&samples[start..]);
+            break;
+        }
+
+        let search_start = start + MIN_SPLIT_SEARCH_SAMPLES;
+        let search_end = start + MAX_CHUNK_SAMPLES;
+        let mut best_split = search_end;
+        let mut best_energy = f32::INFINITY;
+
+        let mut win_start = search_start;
+        while win_start + SPLIT_WINDOW_SAMPLES <= search_end {
+            let window = &samples[win_start..win_start + SPLIT_WINDOW_SAMPLES];
+            let energy: f32 = window.iter().map(|&s| s * s).sum::<f32>() / window.len() as f32;
+            if energy < best_energy {
+                best_energy = energy;
+                best_split = win_start + SPLIT_WINDOW_SAMPLES / 2;
+            }
+            win_start += SPLIT_HOP_SAMPLES;
+        }
+
+        chunks.push(&samples[start..best_split]);
+        start = best_split;
+    }
+
+    chunks
+}
+
+fn is_effectively_silent(samples: &[f32]) -> bool {
+    samples.iter().all(|&s| s.abs() < 1e-4)
+}
+
+/// Transcribe an offline audio or video file using a locally downloaded STT model (`ParakeetV3`
+/// or `WhisperTurbo`). Loads model weights only for the duration of this call (0 MB idle RAM) and
+/// tears down any spawned `whisper-server` cleanly before returning.
+pub fn transcribe_media_file(
+    path: &Path,
+    preferred: TranscriptionProvider,
+) -> std::result::Result<(TranscriptionProvider, String), String> {
+    let Some(provider) = resolve_local_file_provider(preferred) else {
+        return Err(
+            "No local transcription model is downloaded yet. Download Parakeet v3 or Whisper Turbo in Preferences → Audio & Video."
+                .to_owned(),
+        );
+    };
+
+    let samples = extract_audio_16k_mono(path)?;
+    if samples.is_empty() || is_effectively_silent(&samples) {
+        return Ok((provider, String::new()));
+    }
+
+    let chunks = chunk_audio_for_transcription(&samples);
+    let setup = detect_provider_setup(provider);
+    let mut parts: Vec<String> = Vec::with_capacity(chunks.len());
+
+    match provider {
+        TranscriptionProvider::ParakeetV3 => {
+            let mut model = ParakeetModel::load(&setup.model_path, &Quantization::Int8)
+                .map_err(|e| format!("failed to load Parakeet v3 model: {e}"))?;
+            let params = ParakeetParams::default();
+            for chunk in chunks {
+                if is_effectively_silent(chunk) {
+                    continue;
+                }
+                let res = model
+                    .transcribe_with(chunk, &params)
+                    .map_err(|e| format!("Parakeet transcription failed: {e}"))?;
+                let text = res.text.trim();
+                if !text.is_empty() && !is_stt_artifact(text) {
+                    parts.push(text.to_owned());
+                }
+            }
+            drop(model);
+        }
+        TranscriptionProvider::WhisperTurbo => {
+            let server_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+            let mut backend =
+                init_stt_backend(provider, &setup, server_child).ok_or_else(|| {
+                    "failed to initialize local Whisper transcription backend".to_owned()
+                })?;
+            for (idx, chunk) in chunks.into_iter().enumerate() {
+                if is_effectively_silent(chunk) {
+                    continue;
+                }
+                let pcm_16k: Vec<i16> = chunk
+                    .iter()
+                    .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                    .collect();
+                if let Some((_, text)) = backend.transcribe(idx as u64 + 1, &pcm_16k)
+                    && !text.is_empty()
+                {
+                    parts.push(text);
+                }
+            }
+            drop(backend);
+        }
+        TranscriptionProvider::SlackBuiltIn => {
+            return Err(
+                "Slack built-in provider does not support offline file transcription.".to_owned(),
+            );
+        }
+    }
+
+    Ok((provider, parts.join(" ")))
 }
 
 #[cfg(test)]
@@ -1144,5 +1479,182 @@ mod tests {
         let blank_only =
             r#"{ "result": { "language": "en" }, "transcription": [{ "text": "[BLANK_AUDIO]" }] }"#;
         assert_eq!(parse_whisper_json(blank_only), None);
+    }
+
+    #[test]
+    fn extract_audio_16k_mono_decodes_16khz_and_44100hz_wav() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+
+        // 1) 1.0s 16 kHz mono 440 Hz sine wave WAV.
+        let pcm_16k: Vec<i16> = (0..16_000)
+            .map(|i| {
+                ((i as f32 * 440.0 * std::f32::consts::TAU / 16_000.0).sin() * 16_000.0) as i16
+            })
+            .collect();
+        let wav_16k = crate::clips::encode_wav_pcm16(&pcm_16k, 16_000, 1);
+        let path_16k = dir.join(format!("slackless-extract-16k-{pid}.wav"));
+        std::fs::write(&path_16k, &wav_16k).expect("write 16k WAV");
+
+        let extracted_16k = extract_audio_16k_mono(&path_16k).expect("extract 16k WAV");
+        let _ = std::fs::remove_file(&path_16k);
+        assert!(
+            (extracted_16k.len() as isize - 16_000).abs() <= 256,
+            "expected ~16000 samples, got {}",
+            extracted_16k.len()
+        );
+        let rms_16k =
+            (extracted_16k.iter().map(|&s| s * s).sum::<f32>() / extracted_16k.len() as f32).sqrt();
+        assert!(
+            rms_16k > 0.2 && rms_16k < 0.6,
+            "expected ~0.35 RMS for 16k sine, got {rms_16k}"
+        );
+
+        // 2) 1.0s 44.1 kHz stereo 440 Hz sine wave WAV -> downmixed & resampled to 16 kHz mono.
+        let mut pcm_44k_stereo = Vec::with_capacity(44_100 * 2);
+        for i in 0..44_100 {
+            let s = ((i as f32 * 440.0 * std::f32::consts::TAU / 44_100.0).sin() * 16_000.0) as i16;
+            pcm_44k_stereo.push(s);
+            pcm_44k_stereo.push(s);
+        }
+        let wav_44k = crate::clips::encode_wav_pcm16(&pcm_44k_stereo, 44_100, 2);
+        let path_44k = dir.join(format!("slackless-extract-44k-{pid}.wav"));
+        std::fs::write(&path_44k, &wav_44k).expect("write 44.1k stereo WAV");
+
+        let extracted_44k = extract_audio_16k_mono(&path_44k).expect("extract 44.1k stereo WAV");
+        let _ = std::fs::remove_file(&path_44k);
+        assert!(
+            (extracted_44k.len() as isize - 16_000).abs() <= 512,
+            "expected ~16000 resampled samples, got {}",
+            extracted_44k.len()
+        );
+        let rms_44k =
+            (extracted_44k.iter().map(|&s| s * s).sum::<f32>() / extracted_44k.len() as f32).sqrt();
+        assert!(
+            rms_44k > 0.2 && rms_44k < 0.6,
+            "expected ~0.35 RMS for 44.1k stereo sine, got {rms_44k}"
+        );
+
+        // 3) Pure-Rust WAV fallback decoder matches on 44.1 kHz stereo directly.
+        let fallback_44k = decode_wav_bytes_to_16k_mono(&wav_44k).expect("pure-Rust WAV decode");
+        assert_eq!(fallback_44k.len(), 16_000);
+        let missing = dir.join(format!("slackless-extract-missing-{pid}.wav"));
+        assert!(extract_audio_16k_mono(&missing).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn extract_audio_16k_mono_decodes_aac_h264_mp4_and_rejects_silent_video() {
+        use crate::clips::{encode_wav_pcm16, mux_h264_aac_mp4, mux_h264_mp4, parse_adts_frames};
+        use crate::video::H264VideoEncoder;
+
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+
+        // Build 1.0s of H.264 video frames.
+        let w = 160usize;
+        let h = 96usize;
+        let fps = 12u32;
+        let mut enc = H264VideoEncoder::new_screen().expect("openh264 encoder");
+        let rgb = vec![128u8; w * h * 3];
+        let frames: Vec<Vec<u8>> = (0..12)
+            .map(|_| enc.encode_rgb(&rgb, w, h).expect("encode H.264"))
+            .collect();
+
+        // 1) Silent H.264-only MP4 has no audio track -> returns Err cleanly.
+        let silent_mp4 = mux_h264_mp4(w as u32, h as u32, fps, &frames).expect("mux silent MP4");
+        let silent_path = dir.join(format!("slackless-extract-silent-{pid}.mp4"));
+        std::fs::write(&silent_path, &silent_mp4).expect("write silent MP4");
+        assert!(
+            extract_audio_16k_mono(&silent_path).is_err(),
+            "video without audio track should fail cleanly"
+        );
+        let _ = std::fs::remove_file(&silent_path);
+
+        // 2) H.264 + AAC MP4 decoded natively via macOS AVAssetReader.
+        let tone_pcm: Vec<i16> = (0..48_000)
+            .map(|i| {
+                ((i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 14_000.0) as i16
+            })
+            .collect();
+        let wav_path = dir.join(format!("slackless-extract-src-{pid}.wav"));
+        let adts_path = dir.join(format!("slackless-extract-src-{pid}.aac"));
+        std::fs::write(&wav_path, encode_wav_pcm16(&tone_pcm, 48_000, 1)).expect("write tone WAV");
+        let status = Command::new("/usr/bin/afconvert")
+            .args(["-f", "adts", "-d", "aac", "-b", "96000"])
+            .arg(&wav_path)
+            .arg(&adts_path)
+            .status()
+            .expect("invoke afconvert");
+        let _ = std::fs::remove_file(&wav_path);
+        assert!(status.success(), "afconvert to ADTS AAC failed");
+        let adts_bytes = std::fs::read(&adts_path).expect("read ADTS AAC");
+        let _ = std::fs::remove_file(&adts_path);
+        let aac_track = parse_adts_frames(&adts_bytes).expect("parse ADTS AAC frames");
+
+        let av_mp4 = mux_h264_aac_mp4(w as u32, h as u32, fps, &frames, Some(&aac_track))
+            .expect("mux A/V MP4");
+        let av_path = dir.join(format!("slackless-extract-av-{pid}.mp4"));
+        std::fs::write(&av_path, &av_mp4).expect("write A/V MP4");
+
+        let samples = extract_audio_16k_mono(&av_path).expect("extract audio from H.264+AAC MP4");
+        let _ = std::fs::remove_file(&av_path);
+        assert!(
+            samples.len() >= 14_000 && samples.len() <= 18_500,
+            "expected ~16000 samples (~1.0s), got {}",
+            samples.len()
+        );
+        let rms = (samples.iter().map(|&s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+        assert!(
+            rms > 0.15 && rms < 0.6,
+            "expected audible 440 Hz tone from AAC track, got rms={rms}"
+        );
+    }
+
+    #[test]
+    fn chunk_audio_for_transcription_respects_max_len_and_prefers_silence() {
+        assert!(chunk_audio_for_transcription(&[]).is_empty());
+
+        // Short audio (<= 28s) stays a single chunk.
+        let short = vec![0.25f32; TARGET_RATE * 10];
+        let short_chunks = chunk_audio_for_transcription(&short);
+        assert_eq!(short_chunks.len(), 1);
+        assert_eq!(short_chunks[0].len(), short.len());
+
+        // 50s audio with a clear 1s silence gap at 23s..24s: split must land inside 23s..24s.
+        let mut with_gap = vec![0.3f32; TARGET_RATE * 50];
+        let gap_start = TARGET_RATE * 23;
+        let gap_end = TARGET_RATE * 24;
+        with_gap[gap_start..gap_end].fill(0.0);
+
+        let gap_chunks = chunk_audio_for_transcription(&with_gap);
+        assert_eq!(gap_chunks.len(), 2);
+        assert!(
+            gap_chunks[0].len() >= gap_start && gap_chunks[0].len() <= gap_end,
+            "expected first split inside 23s..24s silence ({gap_start}..{gap_end}), got {}",
+            gap_chunks[0].len()
+        );
+        assert_eq!(
+            gap_chunks.iter().map(|c| c.len()).sum::<usize>(),
+            with_gap.len()
+        );
+        for chunk in &gap_chunks {
+            assert!(!chunk.is_empty());
+            assert!(chunk.len() <= MAX_CHUNK_SAMPLES);
+        }
+
+        // 75s continuous speech -> lossless partitioning, every chunk <= 28s.
+        let continuous: Vec<f32> = (0..TARGET_RATE * 75)
+            .map(|i| (i as f32 * 0.01).sin() * 0.4)
+            .collect();
+        let cont_chunks = chunk_audio_for_transcription(&continuous);
+        assert!(cont_chunks.len() >= 3);
+        let mut rebuilt = Vec::with_capacity(continuous.len());
+        for chunk in &cont_chunks {
+            assert!(!chunk.is_empty());
+            assert!(chunk.len() <= MAX_CHUNK_SAMPLES);
+            rebuilt.extend_from_slice(chunk);
+        }
+        assert_eq!(rebuilt, continuous);
     }
 }
