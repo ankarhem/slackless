@@ -237,16 +237,30 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
                         app.preferences.update(cx, |p, cx| p.set_stealth_mode(true, cx));
                         app.apply_preferences(window, cx);
                         let ch = app.channel.clone();
-                        let mut ghost = app.fixtures.local_message(
+                        let mut ghost_collapsed = app.fixtures.local_message(
+                            &ch,
+                            "Det här meddelandet raderades och visas hopfällt som standard.".into(),
+                            None,
+                        );
+                        ghost_collapsed.extra.insert(
+                            crate::bridge::DELETED_EXTRA_KEY.to_owned(),
+                            crate::blockkit::serde_json::Value::Bool(true),
+                        );
+                        let mut ghost_expanded = app.fixtures.local_message(
                             &ch,
                             "Vi sköt upp releasen till imorgon kl 10 (raderat av avsändaren)".into(),
                             None,
                         );
-                        ghost.extra.insert(
+                        ghost_expanded.extra.insert(
                             crate::bridge::DELETED_EXTRA_KEY.to_owned(),
                             crate::blockkit::serde_json::Value::Bool(true),
                         );
-                        app.messages.update(cx, |list, cx| list.append(ch, ghost, cx));
+                        let expand_ts = ghost_expanded.ts.clone();
+                        app.messages.update(cx, |list, cx| {
+                            list.append(ch.clone(), ghost_collapsed, cx);
+                            list.append(ch, ghost_expanded, cx);
+                            list.toggle_deleted(&expand_ts, cx);
+                        });
                     }
                     "secret-guard" => {
                         let leaked = format!(

@@ -55,6 +55,7 @@ mod render;
 mod rows;
 mod selectable;
 mod time;
+pub(crate) use render::is_deleted_ghost;
 use render::{
     CivilTime, card_stamp, date_label, day_index, format_clock, format_clock_with, message_body,
 };
@@ -260,6 +261,9 @@ struct MessageData {
     kit: Entity<BlockKitState>,
     /// Messages saved for later (fixture mode: in memory).
     saved: HashSet<Ts>,
+    /// Per-message expand/collapse overrides for locally preserved deleted messages (XORed with
+    /// `DisplayPrefs::show_deleted_messages`).
+    toggled_deleted: HashSet<Ts>,
     /// The hovered message (Slack's one-key target while no field holds focus).
     active: Option<Ts>,
     /// Root of the thread open beside the list, tinted while it shows.
@@ -410,6 +414,7 @@ impl MessageList {
                     first_unread_ix: None,
                     kit,
                     saved: HashSet::new(),
+                    toggled_deleted: HashSet::new(),
                     active: None,
                     open_thread: None,
                     highlighted: None,
@@ -529,11 +534,29 @@ impl MessageList {
             if !old_urls.is_empty() {
                 self.pending_evict_urls.extend(old_urls);
             }
+            self.data.update(cx, |data, _| data.toggled_deleted.clear());
         }
         self.channel = channel.clone();
         self.touch_cache(&channel);
         self.pending_initial_unread_jump = true;
         self.sync(cx);
+    }
+
+    /// Toggle whether a single locally preserved deleted message is expanded or collapsed.
+    pub fn toggle_deleted(&mut self, ts: &Ts, cx: &mut Context<Self>) {
+        self.data.update(cx, |data, _| {
+            if !data.toggled_deleted.remove(ts) {
+                data.toggled_deleted.insert(ts.clone());
+            }
+        });
+        self.refresh(cx);
+    }
+
+    /// Clear per-message deleted overrides when the global preference changes so every deleted
+    /// message follows the newly chosen default immediately.
+    pub fn reset_deleted_overrides(&mut self, cx: &mut Context<Self>) {
+        self.data.update(cx, |data, _| data.toggled_deleted.clear());
+        self.refresh(cx);
     }
 
     /// Move the visible transcript's `"New"` divider cursor (e.g. pressing Esc clears it).

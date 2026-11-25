@@ -336,7 +336,9 @@ impl CoreBridge {
 
     /// Synchronous single-page read of `channel`'s newest stored messages for cold-launch
     /// frame-0 seeding (bounded to `INITIAL_HISTORY_LIMIT` so cold launch stays sub-millisecond).
-    pub fn history_sync(&self, channel: &ChannelId, include_deleted: bool) -> Vec<Message> {
+    /// Locally preserved deleted messages are always included (tagged with [`DELETED_EXTRA_KEY`])
+    /// so the UI can render either a minimal clickable row or the expanded message.
+    pub fn history_sync(&self, channel: &ChannelId, _include_deleted: bool) -> Vec<Message> {
         let Some(session) = self.session.as_ref() else {
             return Vec::new();
         };
@@ -344,24 +346,21 @@ impl CoreBridge {
             return Vec::new();
         };
         match store.channel_history(&session.team_id, channel, None, INITIAL_HISTORY_LIMIT) {
-            Ok(rows) => rows
-                .into_iter()
-                .filter(|row| include_deleted || !row.deleted)
-                .map(row_to_message)
-                .collect(),
+            Ok(rows) => rows.into_iter().map(row_to_message).collect(),
             Err(_) => Vec::new(),
         }
     }
 
     /// Live mode: a read of `channel`'s stored history (oldest first) to run off the UI thread:
     /// the newest `HISTORY_LIMIT` messages, or the `HISTORY_LIMIT` before `before` when paging
-    /// older on scroll-back. When `include_deleted` is true, locally preserved deleted messages
-    /// are tagged with [`DELETED_EXTRA_KEY`] and retained as ghost tombstones. `None` offline.
+    /// older on scroll-back. Locally preserved deleted messages are tagged with
+    /// [`DELETED_EXTRA_KEY`] so the UI can show a minimal toggle row or expand them inline.
+    /// `None` offline.
     pub fn history(
         &self,
         channel: ChannelId,
         before: Option<Ts>,
-        include_deleted: bool,
+        _include_deleted: bool,
     ) -> Option<impl Future<Output = Vec<Message>> + Send + 'static + use<>> {
         let team = self.session.as_ref()?.team_id.clone();
         let store = self.read_store()?.clone();
@@ -370,11 +369,7 @@ impl CoreBridge {
                 return Vec::new();
             };
             match store.channel_history(&team, &channel, before.as_ref(), HISTORY_LIMIT) {
-                Ok(rows) => rows
-                    .into_iter()
-                    .filter(|row| include_deleted || !row.deleted)
-                    .map(row_to_message)
-                    .collect(),
+                Ok(rows) => rows.into_iter().map(row_to_message).collect(),
                 Err(e) => {
                     eprintln!("slackless: could not read {channel} from the local store ({e})");
                     Vec::new()
@@ -424,13 +419,14 @@ impl CoreBridge {
     }
 
     /// Live mode: a read of one thread's stored history (root + replies, oldest first)
-    /// to run off the UI thread. When `include_deleted` is true, locally preserved deleted
-    /// messages are tagged with [`DELETED_EXTRA_KEY`] and retained. `None` offline.
+    /// to run off the UI thread. Locally preserved deleted messages are tagged with
+    /// [`DELETED_EXTRA_KEY`] so the thread panel can show a minimal toggle row or expand them.
+    /// `None` offline.
     pub fn thread(
         &self,
         channel: ChannelId,
         thread_ts: Ts,
-        include_deleted: bool,
+        _include_deleted: bool,
     ) -> Option<impl Future<Output = Vec<Message>> + Send + 'static> {
         let team = self.session.as_ref()?.team_id.clone();
         let store = self.read_store()?.clone();
@@ -439,11 +435,7 @@ impl CoreBridge {
                 return Vec::new();
             };
             match store.thread_replies(&team, &channel, &thread_ts) {
-                Ok(rows) => rows
-                    .into_iter()
-                    .filter(|row| include_deleted || !row.deleted)
-                    .map(row_to_message)
-                    .collect(),
+                Ok(rows) => rows.into_iter().map(row_to_message).collect(),
                 Err(e) => {
                     eprintln!(
                         "slackless: could not read the thread {thread_ts} of {channel} from the local store ({e})"

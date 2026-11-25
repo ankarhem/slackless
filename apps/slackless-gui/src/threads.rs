@@ -182,6 +182,8 @@ pub struct ThreadPanel {
     unread_after: Option<Ts>,
     /// Messages saved for later (fixture mode: in memory).
     saved: HashSet<Ts>,
+    /// Per-message expand/collapse overrides for deleted thread replies.
+    toggled_deleted: HashSet<Ts>,
     composer: Entity<Composer>,
     /// The thread body's scroll, so a linked reply can be scrolled into view.
     scroll: ScrollHandle,
@@ -291,12 +293,26 @@ impl ThreadPanel {
                 edit_composer,
                 unread_after: None,
                 saved: HashSet::new(),
+                toggled_deleted: HashSet::new(),
                 composer,
                 scroll: ScrollHandle::new(),
                 reveal: None,
                 _subscriptions: subscriptions,
             }
         })
+    }
+
+    /// Clear per-message deleted overrides when the global setting changes.
+    pub fn reset_deleted_overrides(&mut self, cx: &mut Context<Self>) {
+        self.toggled_deleted.clear();
+        cx.notify();
+    }
+
+    fn toggle_deleted(&mut self, ts: &Ts, cx: &mut Context<Self>) {
+        if !self.toggled_deleted.remove(ts) {
+            self.toggled_deleted.insert(ts.clone());
+        }
+        cx.notify();
     }
 
     /// Live refresh: the open thread stays open, drawn from `fixtures`.
@@ -976,6 +992,78 @@ impl ThreadPanel {
                 .into_any_element();
         }
 
+        let prefs = crate::preferences::display_prefs(cx);
+        let deleted_ghost = crate::messages::is_deleted_ghost(message);
+        let deleted_expanded =
+            !deleted_ghost || (prefs.show_deleted_messages ^ self.toggled_deleted.contains(&ts));
+        if deleted_ghost && !deleted_expanded {
+            let (muted, fg, hover_bg) = (
+                cx.theme().muted_foreground,
+                cx.theme().foreground,
+                cx.theme().secondary.opacity(0.38),
+            );
+            let author = message
+                .user
+                .as_ref()
+                .map(|u| self.fixtures.user_name(u).to_owned())
+                .unwrap_or_else(|| "Unknown".to_owned());
+            let stamp = crate::messages::list_stamp(&ts);
+            let toggle_ts = ts.clone();
+            return h_flex()
+                .id(SharedString::from(format!(
+                    "thread-deleted-collapsed-{}",
+                    ts.as_str()
+                )))
+                .group("thread-deleted-row")
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_3()
+                .px_2()
+                .py_1()
+                .cursor_pointer()
+                .hover(move |el| el.bg(hover_bg))
+                .child(
+                    div()
+                        .w(px(36.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            Icon::new(IconName::Trash)
+                                .size(px(12.))
+                                .text_color(muted.opacity(0.55)),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .child(
+                            div()
+                                .italic()
+                                .text_color(muted.opacity(0.8))
+                                .child(format!("Deleted message \u{b7} {author} \u{b7} {stamp}")),
+                        )
+                        .child(
+                            div()
+                                .text_color(muted)
+                                .group_hover("thread-deleted-row", move |el| {
+                                    el.text_color(fg).underline()
+                                })
+                                .child("Show"),
+                        ),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_deleted(&toggle_ts, cx);
+                }))
+                .into_any_element();
+        }
+
         let handler: ActionHandler = {
             let (this, ts) = (this.clone(), ts.clone());
             Rc::new(move |action, window, cx| {
@@ -1018,6 +1106,39 @@ impl ThreadPanel {
             grouped.then(|| row_group.clone()),
             cx,
         );
+        let card = if deleted_ghost {
+            let (muted, fg) = (cx.theme().muted_foreground, cx.theme().foreground);
+            let toggle_ts = ts.clone();
+            v_flex()
+                .min_w_0()
+                .child(div().opacity(0.65).child(card))
+                .child(
+                    h_flex()
+                        .pl(px(TEXT_INSET))
+                        .pt_0p5()
+                        .items_center()
+                        .gap_1p5()
+                        .text_xs()
+                        .child(div().italic().text_color(muted).child("deleted"))
+                        .child(div().text_color(muted).child("\u{b7}"))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "thread-deleted-hide-{}",
+                                    ts.as_str()
+                                )))
+                                .text_color(muted)
+                                .cursor_pointer()
+                                .hover(move |el| el.text_color(fg).underline())
+                                .child("Hide")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_deleted(&toggle_ts, cx);
+                                })),
+                        ),
+                )
+        } else {
+            card
+        };
         let chips = actions::reaction_chips(&key, &reactions, &self.fixtures, Some(&handler), cx)
             .map(|chips| chips.pl(px(TEXT_INSET)));
 

@@ -390,13 +390,10 @@ impl App {
                 cx.background_executor().spawn(write).detach();
             }
             if reload_deleted {
-                let open_channel = self.channel.clone();
-                self.load_history(&open_channel, cx);
-                if self.thread_open
-                    && let Some((thread_channel, thread_ts)) = self.thread.read(cx).open_thread()
-                {
-                    self.load_thread(&thread_channel, &thread_ts, cx);
-                }
+                self.messages
+                    .update(cx, |list, cx| list.reset_deleted_overrides(cx));
+                self.thread
+                    .update(cx, |panel, cx| panel.reset_deleted_overrides(cx));
             }
         }
         window.refresh();

@@ -61,7 +61,7 @@ impl Preferences {
         );
         let show_deleted = self.checkbox(
             "adv-show-deleted",
-            "Show deleted messages inline as ghost tombstones (preserved locally)",
+            "Expand deleted messages by default (otherwise show a minimal toggle row)",
             |s| &mut s.show_deleted_messages,
             cx,
         );

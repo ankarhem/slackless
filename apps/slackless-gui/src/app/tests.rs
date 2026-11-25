@@ -1429,10 +1429,12 @@ fn should_notify_and_system_notification_dedup_cover_all_rules(cx: &mut gpui::Te
             });
             assert!(!app.should_notify(&dm, &plain_msg(&peer, "hi"), window, cx));
 
-            // Re-enable desktop notifications with global notify_level = 1 (Mentions).
+            // Re-enable desktop notifications with global notify_level = 1 (Mentions) and disable
+            // the 9-18 quiet-hours schedule so the test is deterministic at any hour of day.
             app.preferences.update(cx, |p, cx| {
                 let mut s = p.settings().clone();
                 s.desktop_notifications = true;
+                s.schedule_enabled = false;
                 s.notify_level = 1;
                 p.load_settings(s, window, cx);
             });

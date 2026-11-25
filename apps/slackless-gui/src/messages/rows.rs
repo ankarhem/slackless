@@ -87,16 +87,115 @@ pub(super) fn transcript_row(
     let prefs = crate::preferences::display_prefs(cx);
     let author = author_name_with(message, fixtures, prefs.display_names_only);
     let stamp = format_clock_with(&message.ts, prefs.clock_24h);
+    let deleted_ghost = is_deleted_ghost(message);
+    let deleted_expanded = !deleted_ghost
+        || (prefs.show_deleted_messages ^ store.toggled_deleted.contains(&message.ts));
+
+    // Minimal clickable placeholder row when a deleted message is collapsed (either because
+    // "Expand deleted messages by default" is off, or because the user clicked Hide on it).
+    if deleted_ghost && !deleted_expanded && !editing {
+        let theme = cx.theme();
+        let (muted, fg, hover_bg) = (
+            theme.muted_foreground,
+            theme.foreground,
+            theme.secondary.opacity(0.38),
+        );
+        let toggle_list = this.clone();
+        let toggle_ts = message.ts.clone();
+        let gutter_w = if prefs.compact { 52. } else { AVATAR_SIZE };
+        let collapsed = h_flex()
+            .id(SharedString::from(format!(
+                "deleted-collapsed-{}",
+                message.ts.as_str()
+            )))
+            .group("deleted-row")
+            .min_w_0()
+            .items_center()
+            .gap_3()
+            .ml(px(-GUTTER))
+            .mr(px(-GUTTER))
+            .px(px(GUTTER))
+            .py_1()
+            .cursor_pointer()
+            .hover(move |el| el.bg(hover_bg))
+            .child(
+                div()
+                    .w(px(gutter_w))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::Trash)
+                            .size(px(12.))
+                            .text_color(muted.opacity(0.55)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .child(
+                        div()
+                            .italic()
+                            .text_color(muted.opacity(0.8))
+                            .child(format!("Deleted message \u{b7} {author} \u{b7} {stamp}")),
+                    )
+                    .child(
+                        div()
+                            .text_color(muted)
+                            .group_hover("deleted-row", move |el| el.text_color(fg).underline())
+                            .child("Show"),
+                    ),
+            )
+            .on_click(move |_, _window, cx| {
+                toggle_list.update(cx, |list, cx| list.toggle_deleted(&toggle_ts, cx));
+            });
+        return row.child(collapsed);
+    }
+
     let mut body = v_flex().flex_1().min_w_0().gap_0p5().text_sm();
     if !grouped && !editing {
-        body = body.child(message_header(
+        let mut header = message_header(
             message,
             &author,
             stamp.clone(),
             fixtures,
             Some(&handler),
             cx,
-        ));
+        );
+        if deleted_ghost {
+            let (muted, fg) = (cx.theme().muted_foreground, cx.theme().foreground);
+            let toggle_list = this.clone();
+            let toggle_ts = message.ts.clone();
+            header = header
+                .child(
+                    div()
+                        .text_xs()
+                        .italic()
+                        .text_color(muted)
+                        .child("\u{b7} deleted"),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "deleted-hide-{}",
+                            message.ts.as_str()
+                        )))
+                        .text_xs()
+                        .text_color(muted)
+                        .cursor_pointer()
+                        .hover(move |el| el.text_color(fg).underline())
+                        .child("Hide")
+                        .on_click(move |_, _window, cx| {
+                            toggle_list.update(cx, |list, cx| list.toggle_deleted(&toggle_ts, cx));
+                        }),
+                );
+        }
+        body = body.child(header);
     }
     if editing {
         body = body.child(store.edit_composer.clone());
@@ -154,32 +253,10 @@ pub(super) fn transcript_row(
                     }),
             );
         }
-        let deleted_ghost = is_deleted_ghost(message);
-        if deleted_ghost {
-            let danger = cx.theme().danger;
-            body = body.child(
-                h_flex().items_center().gap_1().mb_0p5().child(
-                    h_flex()
-                        .items_center()
-                        .gap_1()
-                        .px_1p5()
-                        .py_0p5()
-                        .rounded(px(4.))
-                        .bg(danger.opacity(0.12))
-                        .border_1()
-                        .border_color(danger.opacity(0.35))
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(danger)
-                        .child(Icon::new(IconName::Trash).size(px(11.)).text_color(danger))
-                        .child("Deleted \u{b7} preserved locally"),
-                ),
-            );
-        }
         body = body.child(
             div()
                 .min_w_0()
-                .when(deleted_ghost, |el| el.opacity(0.68))
+                .when(deleted_ghost, |el| el.opacity(0.65))
                 .child(message_body(message, &kcx, cx)),
         );
         if prefs.inline_media {
@@ -240,7 +317,7 @@ pub(super) fn transcript_row(
     } else if grouped && !editing {
         None
     } else {
-        Some(avatar_gutter(
+        let av = avatar_gutter(
             fixtures,
             message,
             &author_key,
@@ -248,7 +325,12 @@ pub(super) fn transcript_row(
             &key,
             Some(&handler),
             cx,
-        ))
+        );
+        Some(if deleted_ghost {
+            div().flex_none().opacity(0.65).child(av).into_any_element()
+        } else {
+            av
+        })
     };
 
     let set = ActionSet {
@@ -264,9 +346,6 @@ pub(super) fn transcript_row(
     let saved_bg = theme.warning.opacity(0.08);
     let keyword_bg = theme.warning.opacity(0.11);
     let keyword_bar = theme.warning;
-    let deleted_ghost = is_deleted_ghost(message);
-    let deleted_bg = theme.danger.opacity(0.05);
-    let deleted_bar = theme.danger.opacity(0.5);
     let thread_open = !saved && store.open_thread.as_ref() == Some(&message.ts);
     let highlighted = store.highlighted.as_ref() == Some(&message.ts);
     let active_row = store.active.as_ref() == Some(&message.ts);
@@ -308,9 +387,6 @@ pub(super) fn transcript_row(
             .when(editing, |card| card.py_2().bg(editing_bg))
             .when(!editing, |card| {
                 card.py_0p5()
-                    .when(deleted_ghost, |card| {
-                        card.bg(deleted_bg).border_l_2().border_color(deleted_bar)
-                    })
                     .when(saved, |card| {
                         card.bg(saved_bg).child(actions::saved_banner(cx))
                     })
@@ -493,6 +569,9 @@ pub(crate) fn reply_bar(
 /// Two consecutive messages group into one card when they share an author, land on the same
 /// day within [`GROUP_WINDOW_SECS`], and carry the same thread-ness.
 pub(crate) fn same_group(prev: &Message, message: &Message) -> bool {
+    if is_deleted_ghost(prev) || is_deleted_ghost(message) {
+        return false;
+    }
     let same_author = match (&prev.user, &message.user) {
         (Some(a), Some(b)) => a == b,
         (None, None) => prev.username == message.username,
