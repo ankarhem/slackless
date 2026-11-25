@@ -223,7 +223,7 @@ impl App {
         }
         let channel = self.channel.clone();
         if self.bridge.store().is_some() {
-            let Some(read) = self.bridge.history(channel.clone(), None) else {
+            let Some(read) = self.bridge.history(channel.clone(), None, false) else {
                 return;
             };
             cx.spawn(async move |this, cx| {

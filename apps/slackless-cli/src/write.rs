@@ -43,14 +43,41 @@ pub(crate) fn normalize_emoji_shortcode(emoji: &str) -> String {
     emoji.trim_matches(':').to_owned()
 }
 
+/// Pre-send secret-leak guard shared across `send`, `reply`, `edit`, and `schedule`.
+pub(crate) fn check_secrets(ctx: &Ctx, text: &str, allow_secrets: bool) -> Option<ExitCode> {
+    if allow_secrets {
+        return None;
+    }
+    let hits = slackless_core::detect_secrets(text);
+    if hits.is_empty() {
+        return None;
+    }
+    let summary: Vec<String> = hits
+        .iter()
+        .map(|h| format!("{} ({})", h.kind, h.preview))
+        .collect();
+    Some(fail(
+        ctx,
+        "secret_detected",
+        &format!(
+            "refused to send possible secret(s): {}; pass --allow-secrets to override",
+            summary.join(", ")
+        ),
+    ))
+}
+
 /// `send <channel> <text>`: posts and mirrors the echo into the local archive.
 pub async fn run_send(
     ctx: &Ctx,
     flag: Option<&str>,
     channel_arg: &str,
     text: String,
+    allow_secrets: bool,
 ) -> Result<ExitCode> {
     let text = resolve_text_arg(text)?;
+    if let Some(exit) = check_secrets(ctx, &text, allow_secrets) {
+        return Ok(exit);
+    }
     let (api, workspace) = match api_for(ctx, flag) {
         Ok(pair) => pair,
         Err(exit) => return Ok(exit),
@@ -83,8 +110,12 @@ pub async fn run_reply(
     channel_arg: &str,
     thread_ts: &str,
     text: String,
+    allow_secrets: bool,
 ) -> Result<ExitCode> {
     let text = resolve_text_arg(text)?;
+    if let Some(exit) = check_secrets(ctx, &text, allow_secrets) {
+        return Ok(exit);
+    }
     let (api, workspace) = match api_for(ctx, flag) {
         Ok(pair) => pair,
         Err(exit) => return Ok(exit),
@@ -205,8 +236,12 @@ pub async fn run_edit(
     channel_arg: &str,
     ts: &str,
     text: String,
+    allow_secrets: bool,
 ) -> Result<ExitCode> {
     let text = resolve_text_arg(text)?;
+    if let Some(exit) = check_secrets(ctx, &text, allow_secrets) {
+        return Ok(exit);
+    }
     let (api, workspace) = match api_for(ctx, flag) {
         Ok(pair) => pair,
         Err(exit) => return Ok(exit),
@@ -651,8 +686,12 @@ pub async fn run_schedule(
     text: String,
     at: &str,
     thread_ts: Option<&str>,
+    allow_secrets: bool,
 ) -> Result<ExitCode> {
     let text = resolve_text_arg(text)?;
+    if let Some(exit) = check_secrets(ctx, &text, allow_secrets) {
+        return Ok(exit);
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

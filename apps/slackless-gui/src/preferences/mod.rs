@@ -401,6 +401,15 @@ pub struct Settings {
     pub proxy_url: String,
     /// Capture redacted HTTP request/response diagnostics in memory (`F-SHELL-158`).
     pub net_log_enabled: bool,
+    // Privacy & archive ("beyond Slack" local features)
+    /// Show locally preserved deleted messages inline as muted ghost tombstones.
+    pub show_deleted_messages: bool,
+    /// Stealth mode: suppress outbound typing indicators, read receipts, and active presence.
+    pub stealth_mode: bool,
+    /// Strip tracking parameters (utm_*, fbclid, gclid, si, etc.) from opened and sent links.
+    pub strip_tracking_params: bool,
+    /// Warn before sending messages that appear to contain API keys, tokens, or private keys.
+    pub warn_before_sending_secrets: bool,
     // Audio & video (Huddles)
     /// Preferred microphone name (`None` = macOS system default).
     pub huddle_input_device: Option<String>,
@@ -448,6 +457,7 @@ pub struct DisplayPrefs {
     pub underline_links: bool,
     pub animate_emoji: bool,
     pub reduce_motion: bool,
+    pub show_deleted_messages: bool,
 }
 
 impl Default for DisplayPrefs {
@@ -465,6 +475,7 @@ impl Default for DisplayPrefs {
             underline_links: false,
             animate_emoji: true,
             reduce_motion: false,
+            show_deleted_messages: false,
         }
     }
 }
@@ -517,6 +528,7 @@ pub fn set_display_prefs(settings: &Settings, cx: &mut App) {
         underline_links: settings.underline_links,
         animate_emoji: settings.animate_emoji,
         reduce_motion: settings.reduce_motion,
+        show_deleted_messages: settings.show_deleted_messages,
     });
     let keywords: Vec<String> = settings
         .keywords
@@ -686,6 +698,10 @@ impl Default for Settings {
             ask_download_location: false,
             proxy_url: String::new(),
             net_log_enabled: false,
+            show_deleted_messages: false,
+            stealth_mode: false,
+            strip_tracking_params: true,
+            warn_before_sending_secrets: true,
             huddle_input_device: None,
             huddle_output_device: None,
             huddle_aec: true,
@@ -1138,6 +1154,14 @@ impl Preferences {
             });
         }
         cx.notify();
+    }
+
+    /// Toggle Stealth Mode directly (e.g. from the top-bar Stealth indicator pill).
+    pub fn set_stealth_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.settings.stealth_mode != enabled {
+            self.settings.stealth_mode = enabled;
+            self.changed(cx);
+        }
     }
 
     /// Jump to `section` (the DND menu opens Notifications).

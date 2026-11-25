@@ -845,9 +845,13 @@ impl App {
                                 channel: channel.clone(),
                                 thread_ts: thread_ts.clone(),
                             });
-                            if let Some(read) =
-                                this.bridge.thread(channel.clone(), thread_ts.clone())
-                            {
+                            let include_deleted =
+                                this.preferences.read(cx).settings().show_deleted_messages;
+                            if let Some(read) = this.bridge.thread(
+                                channel.clone(),
+                                thread_ts.clone(),
+                                include_deleted,
+                            ) {
                                 let (ch, ts) = (channel.clone(), thread_ts.clone());
                                 cx.spawn(async move |this, cx| {
                                     let msgs = cx.background_executor().spawn(read).await;
@@ -869,13 +873,14 @@ impl App {
                             content,
                             broadcast,
                         } => {
-                            this.bridge.send(Command::SendMessage {
-                                channel: channel.clone(),
-                                content: content.clone(),
-                                thread_ts: Some(thread_ts.clone()),
-                                broadcast: *broadcast,
-                            });
-                            this.sync_thread_sidebar_counts(cx);
+                            this.send_thread_reply(
+                                (channel.clone(), thread_ts.clone()),
+                                content.clone(),
+                                *broadcast,
+                                true,
+                                window,
+                                cx,
+                            );
                         }
                         ThreadsEvent::ReplyWithFiles {
                             channel,
@@ -1703,7 +1708,8 @@ impl App {
             // Cold-launch frame-0 preload: read the initial channel's newest viewport page
             // synchronously (80 msgs on the read-only WAL connection, <1ms) so frame 0 renders
             // immediately without a redundant second SQLite read right after.
-            let initial_history = app.bridge.history_sync(&channel);
+            let include_deleted = app.preferences.read(cx).settings().show_deleted_messages;
+            let initial_history = app.bridge.history_sync(&channel, include_deleted);
             if !initial_history.is_empty() {
                 app.resolve_named_users(&initial_history);
                 let newest = initial_history.last().map(|m| m.ts.clone());

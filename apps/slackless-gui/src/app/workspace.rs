@@ -351,12 +351,14 @@ pub(super) fn subscribe_workspace(
                     content,
                     broadcast,
                 } => {
-                    this.bridge.send(Command::SendMessage {
-                        channel: channel.clone(),
-                        content: content.clone(),
-                        thread_ts: Some(thread_ts.clone()),
-                        broadcast: *broadcast,
-                    });
+                    this.send_thread_reply(
+                        (channel.clone(), thread_ts.clone()),
+                        content.clone(),
+                        *broadcast,
+                        false,
+                        window,
+                        cx,
+                    );
                 }
                 ThreadPanelEvent::ReplyWithFiles {
                     channel,

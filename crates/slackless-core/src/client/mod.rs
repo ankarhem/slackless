@@ -316,6 +316,8 @@ pub(crate) struct Core<B: Backend> {
     has_connected_once: bool,
     /// Outgoing mutations persisted in SQLite `offline_queue`, flushed FIFO on reconnect.
     offline_queue: VecDeque<(i64, QueuedMutation)>,
+    /// True Stealth Mode: suppresses outbound typing, read-cursor updates, and active presence.
+    stealth_mode: bool,
     /// Active native Chime audio huddle session slot (at most one per workspace, guarded by
     /// generation counter so stale joins/watchers never clobber a newer session).
     huddle: Arc<Mutex<HuddleSlot>>,
@@ -378,6 +380,7 @@ impl<B: Backend> Core<B> {
             is_offline: false,
             has_connected_once: false,
             offline_queue: persisted,
+            stealth_mode: false,
             huddle: Arc::new(Mutex::new(HuddleSlot::default())),
         }
     }

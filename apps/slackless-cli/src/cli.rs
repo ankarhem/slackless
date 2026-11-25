@@ -50,6 +50,9 @@ pub(crate) enum Commands {
         /// Write search results to a file instead of stdout.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
+        /// Include locally archived deleted messages in results.
+        #[arg(long)]
+        include_deleted: bool,
     },
     /// Print recent messages from a conversation (channel id, #name or @handle).
     Read {
@@ -60,6 +63,9 @@ pub(crate) enum Commands {
         /// Only include messages at or after this cutoff (`30m`, `24h`, `7d`, `YYYY-MM-DD`, or unix secs).
         #[arg(long, value_name = "WHEN")]
         since: Option<String>,
+        /// Include locally archived deleted messages (marked as deleted).
+        #[arg(long)]
+        include_deleted: bool,
     },
     /// Read a thread's root message and replies (offline archive by default, or `--live` from Slack).
     Thread {
@@ -75,13 +81,22 @@ pub(crate) enum Commands {
         limit: u32,
     },
     /// Post a message to a conversation (needs a stored session).
-    Send { channel: String, text: String },
+    Send {
+        channel: String,
+        text: String,
+        /// Allow sending text that triggers the pre-send secret-leak detector.
+        #[arg(long)]
+        allow_secrets: bool,
+    },
     /// Reply in a thread (needs a stored session).
     Reply {
         channel: String,
         /// The ts of the thread root (first column of `slackless read`).
         thread_ts: String,
         text: String,
+        /// Allow sending text that triggers the pre-send secret-leak detector.
+        #[arg(long)]
+        allow_secrets: bool,
     },
     /// Edit an existing message (`chat.update`, needs a stored session).
     Edit {
@@ -90,6 +105,9 @@ pub(crate) enum Commands {
         ts: String,
         /// New message text.
         text: String,
+        /// Allow sending text that triggers the pre-send secret-leak detector.
+        #[arg(long)]
+        allow_secrets: bool,
     },
     /// Delete a message (`chat.delete`, needs a stored session).
     Delete {
@@ -189,6 +207,9 @@ pub(crate) enum Commands {
         /// Optional thread root ts.
         #[arg(long, value_name = "TS")]
         thread_ts: Option<String>,
+        /// Allow scheduling text that triggers the pre-send secret-leak detector.
+        #[arg(long)]
+        allow_secrets: bool,
     },
     /// List pending scheduled messages (`chat.scheduledMessages.list`, needs a stored session).
     Scheduled {

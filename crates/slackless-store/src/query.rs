@@ -45,6 +45,8 @@ pub struct SearchFilters {
     pub includes_user: Option<String>,
     /// Only thread replies (a stored `thread_ts`). Set by the "Threads only" chip.
     pub threads_only: bool,
+    /// Include locally archived deleted messages (`deleted = 1`) in search results.
+    pub include_deleted: bool,
 }
 
 /// `has:` targets.

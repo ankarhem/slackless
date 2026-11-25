@@ -1007,6 +1007,15 @@ pub(super) fn body_ends_in_text(message: &Message) -> bool {
     fallback_text || ends_in_paragraph
 }
 
+/// Whether `message` is a locally preserved deleted message rendered as a ghost tombstone.
+pub(super) fn is_deleted_ghost(message: &Message) -> bool {
+    message
+        .extra
+        .get(crate::bridge::DELETED_EXTRA_KEY)
+        .and_then(|v| v.as_bool())
+        == Some(true)
+}
+
 pub(super) fn message_body(message: &Message, kcx: &KitCx, cx: &App) -> Div {
     let has_kit = message
         .blocks

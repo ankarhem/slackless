@@ -85,10 +85,21 @@ impl App {
             .update(cx, |view, cx| view.set_enter_sends(enter_sends, cx));
         let remote_auto = settings.remote_search_auto;
         let excluded_channels = settings.excluded_channels.clone();
+        let show_deleted_messages = settings.show_deleted_messages;
         self.results.update(cx, |view, _| {
             view.set_remote_auto(remote_auto);
             view.set_excluded_channels(&excluded_channels);
+            view.set_include_deleted(show_deleted_messages);
         });
+        crate::zoom::set_strip_tracking_params(settings.strip_tracking_params);
+        if self
+            .saved_settings
+            .as_ref()
+            .is_none_or(|prev| prev.stealth_mode != settings.stealth_mode)
+        {
+            self.bridge
+                .send(Command::SetStealthMode(settings.stealth_mode));
+        }
         crate::preferences::set_display_prefs(&settings, cx);
         window.set_background_appearance(if settings.window_transparency {
             gpui::WindowBackgroundAppearance::Blurred
@@ -339,6 +350,7 @@ impl App {
             if prev.net_log_enabled != settings.net_log_enabled {
                 slackless_core::api::set_net_log_enabled(settings.net_log_enabled);
             }
+            let reload_deleted = prev.show_deleted_messages != settings.show_deleted_messages;
             if self.huddle_session.is_some() {
                 if prev.huddle_input_device != settings.huddle_input_device
                     || prev.huddle_output_device != settings.huddle_output_device
@@ -367,6 +379,15 @@ impl App {
             self.saved_settings = Some(settings.clone());
             if let Some(write) = self.bridge.remember_settings(&settings) {
                 cx.background_executor().spawn(write).detach();
+            }
+            if reload_deleted {
+                let open_channel = self.channel.clone();
+                self.load_history(&open_channel, cx);
+                if self.thread_open
+                    && let Some((thread_channel, thread_ts)) = self.thread.read(cx).open_thread()
+                {
+                    self.load_thread(&thread_channel, &thread_ts, cx);
+                }
             }
         }
         window.refresh();

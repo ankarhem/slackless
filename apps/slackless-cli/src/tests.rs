@@ -280,12 +280,14 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
             query,
             limit,
             all_workspaces,
+            include_deleted,
             format,
             out,
         } => {
             assert_eq!(query, "launch in:#eng");
             assert_eq!(limit, SEARCH_LIMIT);
             assert!(!all_workspaces);
+            assert!(!include_deleted);
             assert_eq!(format, None);
             assert_eq!(out, None);
         }
@@ -311,13 +313,54 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
             channel,
             limit,
             since,
+            include_deleted,
         } => {
             assert_eq!(channel, "#general");
             assert_eq!(limit, READ_LIMIT);
             assert_eq!(since.as_deref(), Some("24h"));
+            assert!(!include_deleted);
         }
         _ => panic!("expected Read"),
     }
+
+    assert!(matches!(
+        Cli::try_parse_from(["slackless", "search", "foo", "--include-deleted"])
+            .unwrap()
+            .command,
+        Commands::Search {
+            include_deleted: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["slackless", "read", "#eng", "--include-deleted"])
+            .unwrap()
+            .command,
+        Commands::Read {
+            include_deleted: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["slackless", "send", "#eng", "hello", "--allow-secrets"])
+            .unwrap()
+            .command,
+        Commands::Send {
+            allow_secrets: true,
+            ..
+        }
+    ));
+
+    // Pre-send secret guard blocks API keys unless --allow-secrets is set.
+    let ctx = crate::Ctx { json: false };
+    let clean = crate::write::check_secrets(&ctx, "Hej teamet, allt ser bra ut!", false);
+    assert!(clean.is_none());
+    let leaked = format!(
+        "token={} please check",
+        ["xoxb", "1234567890", "abcdefghij123456"].join("-")
+    );
+    assert!(crate::write::check_secrets(&ctx, &leaked, false).is_some());
+    assert!(crate::write::check_secrets(&ctx, &leaked, true).is_none());
 
     // Thread live, digest defaults, upload multi-file, export defaults, nested subcommands.
     assert!(matches!(

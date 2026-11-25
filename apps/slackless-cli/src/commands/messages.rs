@@ -14,7 +14,12 @@ use crate::cli::ExportFormat;
 use crate::output::{self, MessageRow};
 use crate::{Ctx, fail};
 
-pub(crate) fn cmd_search_all_workspaces(ctx: &Ctx, query: &str, limit: usize) -> Result<ExitCode> {
+pub(crate) fn cmd_search_all_workspaces(
+    ctx: &Ctx,
+    query: &str,
+    limit: usize,
+    include_deleted: bool,
+) -> Result<ExitCode> {
     let mut team_ids: Vec<TeamId> = Vec::new();
     if let Ok(sessions) = SessionStore::new().and_then(|s| s.load()) {
         for s in sessions {
@@ -42,7 +47,8 @@ pub(crate) fn cmd_search_all_workspaces(ctx: &Ctx, query: &str, limit: usize) ->
         ));
     }
 
-    let parsed = SearchQuery::parse(query);
+    let mut parsed = SearchQuery::parse(query);
+    parsed.filters.include_deleted = include_deleted;
     let mut hits: Vec<(String, Option<String>, MessageRow)> = Vec::new();
     for ws in &team_ids {
         let Some(store) = open_archive_store(ws) else {
@@ -101,6 +107,7 @@ pub(crate) fn cmd_search(
     limit: usize,
     format: Option<ExportFormat>,
     out: Option<&std::path::Path>,
+    include_deleted: bool,
 ) -> Result<ExitCode> {
     let Some(workspace) = workspace else {
         return Ok(empty_local(
@@ -109,7 +116,8 @@ pub(crate) fn cmd_search(
             "searching",
         ));
     };
-    let parsed = SearchQuery::parse(query);
+    let mut parsed = SearchQuery::parse(query);
+    parsed.filters.include_deleted = include_deleted;
     let messages = match open_archive_store(workspace) {
         Some(store) => store
             .search(workspace, &parsed, limit)
@@ -181,6 +189,7 @@ pub(crate) fn cmd_read(
     channel_arg: &str,
     limit: usize,
     since: Option<&str>,
+    include_deleted: bool,
 ) -> Result<ExitCode> {
     let cutoff_secs = match since {
         Some(spec) => match parse_since_cutoff(spec, now_epoch_secs()) {
@@ -213,6 +222,9 @@ pub(crate) fn cmd_read(
             .with_context(|| format!("reading the history of {channel_id}"))?,
         None => Vec::new(),
     };
+    if !include_deleted {
+        messages.retain(|m| !m.deleted);
+    }
     if let Some(cutoff) = cutoff_secs {
         messages.retain(|m| m.message.ts.secs().is_some_and(|s| s >= cutoff));
     }

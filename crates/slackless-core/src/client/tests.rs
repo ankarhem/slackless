@@ -5431,3 +5431,61 @@ async fn canvas_delete_access_and_comments_command_event_round_trips() {
         assert_eq!(st.quip_archive_all_calls, vec![ChannelId::from("C0CMT")]);
     }
 }
+
+#[tokio::test]
+async fn stealth_mode_suppresses_read_receipts_and_typing_until_disabled() {
+    let fake = FakeBackend::default();
+    fake.state.lock().unwrap().mark_read_ok = true;
+    fake.state.lock().unwrap().mark_all_read_ok = true;
+    let (store, events, _rx) = fake_core_parts();
+    let mut core = Core::new(fake.clone(), store, TeamId::from("T1"), events);
+
+    core.handle(Command::SetStealthMode(true));
+    core.handle(Command::MarkRead {
+        channel: ChannelId::from("C1"),
+        ts: Ts::from("1700.1"),
+    });
+    core.handle(Command::MarkThreadRead {
+        channel: ChannelId::from("C1"),
+        thread_ts: Ts::from("1700.1"),
+        ts: Ts::from("1700.2"),
+    });
+    core.handle(Command::MarkAllRead);
+    core.handle(Command::Typing {
+        channel: ChannelId::from("C1"),
+        thread_ts: None,
+    });
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    {
+        let st = fake.state.lock().unwrap();
+        assert!(
+            st.mark_calls.is_empty(),
+            "stealth mode must suppress mark_read"
+        );
+        assert!(
+            st.thread_mark_calls.is_empty(),
+            "stealth mode must suppress mark_thread_read"
+        );
+        assert_eq!(
+            st.mark_all_read_calls, 0,
+            "stealth mode must suppress mark_all_read"
+        );
+    }
+
+    // Disabling stealth mode resumes read receipts cleanly.
+    core.handle(Command::SetStealthMode(false));
+    core.handle(Command::MarkRead {
+        channel: ChannelId::from("C1"),
+        ts: Ts::from("1700.1"),
+    });
+    core.handle(Command::MarkAllRead);
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    {
+        let st = fake.state.lock().unwrap();
+        assert_eq!(st.mark_calls.len(), 1);
+        assert_eq!(st.mark_all_read_calls, 1);
+    }
+}

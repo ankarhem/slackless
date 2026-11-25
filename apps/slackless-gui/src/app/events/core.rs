@@ -109,9 +109,14 @@ impl App {
                 }
                 // Any expanded card in the Threads view refreshes when its replies land.
                 if self.threads_open {
+                    let include_deleted =
+                        self.preferences.read(cx).settings().show_deleted_messages;
                     let expanded = self.threads.read(cx).expanded_in(channel);
                     for thread_ts in expanded {
-                        if let Some(read) = self.bridge.thread(channel.clone(), thread_ts.clone()) {
+                        if let Some(read) =
+                            self.bridge
+                                .thread(channel.clone(), thread_ts.clone(), include_deleted)
+                        {
                             let (ch, ts) = (channel.clone(), thread_ts);
                             cx.spawn(async move |this, cx| {
                                 let msgs = cx.background_executor().spawn(read).await;

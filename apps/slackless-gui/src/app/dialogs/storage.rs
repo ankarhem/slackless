@@ -481,11 +481,14 @@ impl App {
         let subtitle = format!("{} · {}", self.label(&channel), ts);
         window.open_dialog(cx, move |dialog, _, cx| {
             let theme = cx.theme();
-            let (border, muted, danger, card_bg) = (
+            let (border, muted, danger, success, foreground, card_bg, font) = (
                 theme.border,
                 theme.muted_foreground,
                 theme.danger,
+                theme.success,
+                theme.foreground,
                 theme.secondary.opacity(0.35),
+                theme.font_family.clone(),
             );
             let mut body = v_flex()
                 .id("revision-history-list")
@@ -504,6 +507,64 @@ impl App {
             } else {
                 for (ix, (stamp, deleted, text)) in revisions.iter().enumerate() {
                     let copy_text = text.clone();
+                    let content_el: AnyElement = if ix > 0 && revisions[ix - 1].2 != *text {
+                        let segments = slackless_core::diff_words(&revisions[ix - 1].2, text);
+                        let mut combined = String::new();
+                        let mut runs = Vec::with_capacity(segments.len());
+                        for seg in segments {
+                            let len = seg.text.len();
+                            if len == 0 {
+                                continue;
+                            }
+                            combined.push_str(&seg.text);
+                            let (color, background_color, strikethrough) = match seg.kind {
+                                slackless_core::DiffKind::Equal => (foreground, None, None),
+                                slackless_core::DiffKind::Removed => (
+                                    danger,
+                                    Some(danger.opacity(0.14)),
+                                    Some(gpui::StrikethroughStyle {
+                                        thickness: px(1.),
+                                        color: Some(danger),
+                                    }),
+                                ),
+                                slackless_core::DiffKind::Added => {
+                                    (success, Some(success.opacity(0.14)), None)
+                                }
+                            };
+                            runs.push(gpui::TextRun {
+                                len,
+                                font: gpui::Font {
+                                    family: font.clone(),
+                                    ..Default::default()
+                                },
+                                color,
+                                background_color,
+                                underline: None,
+                                strikethrough,
+                            });
+                        }
+                        if combined.is_empty() {
+                            div()
+                                .text_sm()
+                                .text_color(muted)
+                                .child("(empty)")
+                                .into_any_element()
+                        } else {
+                            div()
+                                .text_sm()
+                                .child(gpui::StyledText::new(combined).with_runs(runs))
+                                .into_any_element()
+                        }
+                    } else {
+                        div()
+                            .text_sm()
+                            .child(if text.is_empty() {
+                                "(empty)".to_owned()
+                            } else {
+                                text.clone()
+                            })
+                            .into_any_element()
+                    };
                     body = body.child(
                         v_flex()
                             .gap_1()
@@ -549,11 +610,7 @@ impl App {
                                             }),
                                     ),
                             )
-                            .child(div().text_sm().child(if text.is_empty() {
-                                "(empty)".to_owned()
-                            } else {
-                                text.clone()
-                            })),
+                            .child(content_el),
                     );
                 }
             }

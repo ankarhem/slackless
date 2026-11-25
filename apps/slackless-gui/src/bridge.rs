@@ -39,6 +39,19 @@ use crate::blockkit::serde_json;
 use crate::preferences::{AppearanceMode, Settings};
 use crate::theme;
 
+/// Synthetic `Message::extra` marker attached to locally preserved deleted rows when the
+/// user opts into showing deleted ghost tombstones.
+pub const DELETED_EXTRA_KEY: &str = "slackless_deleted";
+
+fn row_to_message(mut row: slackless_core::store::StoredMessage) -> Message {
+    if row.deleted {
+        row.message
+            .extra
+            .insert(DELETED_EXTRA_KEY.to_owned(), serde_json::Value::Bool(true));
+    }
+    row.message
+}
+
 /// Minimal context for processing a background workspace's `Event::MessagePosted` (unread bump +
 /// desktop notification) in O(1) SQLite PK reads rather than rebuilding a full `Fixtures` snapshot.
 pub struct BgMessageContext {
@@ -323,7 +336,7 @@ impl CoreBridge {
 
     /// Synchronous single-page read of `channel`'s newest stored messages for cold-launch
     /// frame-0 seeding (bounded to `INITIAL_HISTORY_LIMIT` so cold launch stays sub-millisecond).
-    pub fn history_sync(&self, channel: &ChannelId) -> Vec<Message> {
+    pub fn history_sync(&self, channel: &ChannelId, include_deleted: bool) -> Vec<Message> {
         let Some(session) = self.session.as_ref() else {
             return Vec::new();
         };
@@ -333,20 +346,22 @@ impl CoreBridge {
         match store.channel_history(&session.team_id, channel, None, INITIAL_HISTORY_LIMIT) {
             Ok(rows) => rows
                 .into_iter()
-                .filter(|row| !row.deleted)
-                .map(|row| row.message)
+                .filter(|row| include_deleted || !row.deleted)
+                .map(row_to_message)
                 .collect(),
             Err(_) => Vec::new(),
         }
     }
 
-    /// Live mode: a read of `channel`'s stored history (oldest first, without deleted
-    /// messages) to run off the UI thread: the newest `HISTORY_LIMIT` messages, or the
-    /// `HISTORY_LIMIT` before `before` when paging older on scroll-back. `None` offline.
+    /// Live mode: a read of `channel`'s stored history (oldest first) to run off the UI thread:
+    /// the newest `HISTORY_LIMIT` messages, or the `HISTORY_LIMIT` before `before` when paging
+    /// older on scroll-back. When `include_deleted` is true, locally preserved deleted messages
+    /// are tagged with [`DELETED_EXTRA_KEY`] and retained as ghost tombstones. `None` offline.
     pub fn history(
         &self,
         channel: ChannelId,
         before: Option<Ts>,
+        include_deleted: bool,
     ) -> Option<impl Future<Output = Vec<Message>> + Send + 'static + use<>> {
         let team = self.session.as_ref()?.team_id.clone();
         let store = self.read_store()?.clone();
@@ -357,8 +372,8 @@ impl CoreBridge {
             match store.channel_history(&team, &channel, before.as_ref(), HISTORY_LIMIT) {
                 Ok(rows) => rows
                     .into_iter()
-                    .filter(|row| !row.deleted)
-                    .map(|row| row.message)
+                    .filter(|row| include_deleted || !row.deleted)
+                    .map(row_to_message)
                     .collect(),
                 Err(e) => {
                     eprintln!("slackless: could not read {channel} from the local store ({e})");
@@ -408,12 +423,14 @@ impl CoreBridge {
         })
     }
 
-    /// Live mode: a read of one thread's stored history (root + replies, oldest first,
-    /// without deleted messages) to run off the UI thread. `None` offline.
+    /// Live mode: a read of one thread's stored history (root + replies, oldest first)
+    /// to run off the UI thread. When `include_deleted` is true, locally preserved deleted
+    /// messages are tagged with [`DELETED_EXTRA_KEY`] and retained. `None` offline.
     pub fn thread(
         &self,
         channel: ChannelId,
         thread_ts: Ts,
+        include_deleted: bool,
     ) -> Option<impl Future<Output = Vec<Message>> + Send + 'static> {
         let team = self.session.as_ref()?.team_id.clone();
         let store = self.read_store()?.clone();
@@ -424,8 +441,8 @@ impl CoreBridge {
             match store.thread_replies(&team, &channel, &thread_ts) {
                 Ok(rows) => rows
                     .into_iter()
-                    .filter(|row| !row.deleted)
-                    .map(|row| row.message)
+                    .filter(|row| include_deleted || !row.deleted)
+                    .map(row_to_message)
                     .collect(),
                 Err(e) => {
                     eprintln!(
@@ -899,7 +916,7 @@ mod tests {
         let bridge = CoreBridge::offline();
         assert!(bridge.store().is_none());
         assert!(bridge.snapshot(&HashMap::new()).is_none());
-        assert!(bridge.history(ChannelId::from("C1"), None).is_none());
+        assert!(bridge.history(ChannelId::from("C1"), None, false).is_none());
         assert!(bridge.settings().is_none());
         assert!(bridge.drafts().is_none());
         assert!(bridge.section_prefs().is_none());

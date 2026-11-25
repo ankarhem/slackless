@@ -834,9 +834,131 @@ impl App {
         }
     }
 
-    /// Slack's broadcast confirmation (`F-CORE-083`): warn before posting `@channel`, `@here`,
-    /// or `@everyone` to a channel with 6 or more members.
+    /// Slack's broadcast confirmation (`F-CORE-083`) plus local pre-send secret leak guard.
     pub(super) fn send(
+        &mut self,
+        content: MessageContent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .preferences
+            .read(cx)
+            .settings()
+            .warn_before_sending_secrets
+        {
+            let matches = slackless_core::detect_secrets(&content.text);
+            if !matches.is_empty() {
+                self.confirm_secret_send(
+                    matches,
+                    content.text.clone(),
+                    true,
+                    move |app, window, cx| {
+                        app.send_after_secret_check(content.clone(), window, cx);
+                    },
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
+        self.send_after_secret_check(content, window, cx);
+    }
+
+    /// Show a confirmation dialog when outgoing text matches known API keys, tokens, or private
+    /// keys. Canceling restores `cancel_text` into the main composer when `restore_main_composer`
+    /// is true; "Send anyway" invokes `proceed`.
+    pub(super) fn confirm_secret_send(
+        &self,
+        matches: Vec<slackless_core::SecretMatch>,
+        cancel_text: String,
+        restore_main_composer: bool,
+        proceed: impl Fn(&mut App, &mut Window, &mut Context<App>) + Clone + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let summary_lines: Vec<String> = matches
+            .iter()
+            .map(|m| format!("\u{2022} {}: {}", m.kind, m.preview))
+            .collect();
+        let this = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            let (muted, danger, border, card_bg, mono) = (
+                theme.muted_foreground,
+                theme.danger,
+                theme.border,
+                theme.secondary.opacity(0.35),
+                theme.mono_font_family.clone(),
+            );
+            let this_cancel = this.clone();
+            let this_send = this.clone();
+            let cancel_text = cancel_text.clone();
+            let proceed = proceed.clone();
+            let items: Vec<_> = summary_lines
+                .iter()
+                .map(|line| {
+                    div()
+                        .font_family(mono.clone())
+                        .text_xs()
+                        .text_color(danger)
+                        .child(line.clone())
+                })
+                .collect();
+            dialog
+                .title("Possible secret detected")
+                .w(px(480.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(div().text_sm().text_color(muted).child(
+                            "This message looks like it contains credentials or a private key. Are you sure you want to send it?",
+                        ))
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .p_2p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(border)
+                                .bg(card_bg)
+                                .children(items),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("secret-guard-cancel")
+                                        .label("Cancel")
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            if restore_main_composer {
+                                                let _ = this_cancel.update(cx, |app, cx| {
+                                                    app.composer.update(cx, |composer, cx| {
+                                                        composer.load_draft(&cancel_text, cx);
+                                                    });
+                                                });
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new("secret-guard-send")
+                                        .danger()
+                                        .label("Send anyway")
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            let _ = this_send.update(cx, |app, cx| {
+                                                proceed(app, window, cx);
+                                            });
+                                        }),
+                                ),
+                        ),
+                )
+        });
+    }
+
+    fn send_after_secret_check(
         &mut self,
         content: MessageContent,
         window: &mut Window,
@@ -919,7 +1041,116 @@ impl App {
         self.deliver_send(content, cx);
     }
 
+    /// Strip tracking parameters (`utm_*`, `fbclid`, `gclid`, etc.) from outgoing text and
+    /// rich-text link elements when enabled in Preferences.
+    pub(super) fn sanitize_outgoing_content(
+        &self,
+        content: &mut MessageContent,
+        cx: &Context<Self>,
+    ) {
+        if !self.preferences.read(cx).settings().strip_tracking_params {
+            return;
+        }
+        if !content.text.is_empty() {
+            let cleaned = slackless_core::strip_tracking_params_in_text(&content.text);
+            if cleaned != content.text {
+                content.text = cleaned;
+            }
+        }
+        for block in &mut content.blocks {
+            if let slackless_core::types::Block::RichText(rich) = block {
+                for container in &mut rich.elements {
+                    let elements = match container {
+                        slackless_core::types::RichTextContainer::Section(s) => &mut s.elements,
+                        slackless_core::types::RichTextContainer::Quote(q) => &mut q.elements,
+                        slackless_core::types::RichTextContainer::Preformatted(p) => {
+                            &mut p.elements
+                        }
+                        slackless_core::types::RichTextContainer::List(list) => {
+                            for item in &mut list.elements {
+                                if let slackless_core::types::RichTextContainer::Section(s) = item {
+                                    for el in &mut s.elements {
+                                        if let slackless_core::types::RichTextElement::Link(link) =
+                                            el
+                                        {
+                                            link.url =
+                                                slackless_core::strip_tracking_params(&link.url);
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        slackless_core::types::RichTextContainer::Header(_)
+                        | slackless_core::types::RichTextContainer::Divider(_)
+                        | slackless_core::types::RichTextContainer::Unknown { .. } => continue,
+                    };
+                    for el in elements {
+                        if let slackless_core::types::RichTextElement::Link(link) = el {
+                            link.url = slackless_core::strip_tracking_params(&link.url);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send a thread reply with pre-send secret leak guard and tracking-param stripping.
+    pub(super) fn send_thread_reply(
+        &mut self,
+        target: (ChannelId, Ts),
+        mut content: MessageContent,
+        broadcast: bool,
+        sync_threads_view: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (channel, thread_ts) = target;
+        if self
+            .preferences
+            .read(cx)
+            .settings()
+            .warn_before_sending_secrets
+        {
+            let matches = slackless_core::detect_secrets(&content.text);
+            if !matches.is_empty() {
+                self.confirm_secret_send(
+                    matches,
+                    content.text.clone(),
+                    false,
+                    move |app, _window, cx| {
+                        let mut c = content.clone();
+                        app.sanitize_outgoing_content(&mut c, cx);
+                        app.bridge.send(Command::SendMessage {
+                            channel: channel.clone(),
+                            content: c,
+                            thread_ts: Some(thread_ts.clone()),
+                            broadcast,
+                        });
+                        if sync_threads_view {
+                            app.sync_thread_sidebar_counts(cx);
+                        }
+                    },
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
+        self.sanitize_outgoing_content(&mut content, cx);
+        self.bridge.send(Command::SendMessage {
+            channel,
+            content,
+            thread_ts: Some(thread_ts),
+            broadcast,
+        });
+        if sync_threads_view {
+            self.sync_thread_sidebar_counts(cx);
+        }
+    }
+
     pub(super) fn deliver_send(&mut self, mut content: MessageContent, cx: &mut Context<Self>) {
+        self.sanitize_outgoing_content(&mut content, cx);
         if self.preferences.read(cx).settings().convert_emoticons && !content.text.is_empty() {
             let converted = convert_emoticons(&content.text);
             if converted != content.text {

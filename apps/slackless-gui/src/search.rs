@@ -100,6 +100,8 @@ pub struct SearchView {
     remote_files_error: Option<String>,
     /// Channel names excluded from default local search results (Preferences -> Advanced).
     excluded_channels: Vec<String>,
+    /// Include locally preserved deleted messages in local FTS5 search results.
+    include_deleted: bool,
 }
 
 impl EventEmitter<SearchEvent> for SearchView {}
@@ -140,6 +142,7 @@ impl SearchView {
             remote_files_loading: false,
             remote_files_error: None,
             excluded_channels: Vec::new(),
+            include_deleted: false,
         })
     }
 
@@ -150,6 +153,11 @@ impl SearchView {
             .map(|s| s.trim().trim_start_matches('#').to_lowercase())
             .filter(|s| !s.is_empty())
             .collect();
+    }
+
+    /// Honor Preferences → Advanced → Privacy & archive ("Show deleted messages").
+    pub fn set_include_deleted(&mut self, include: bool) {
+        self.include_deleted = include;
     }
 
     /// Live refresh: the query and its results stay; names come from `fixtures`.
@@ -241,6 +249,7 @@ impl SearchView {
                 parsed.filters.includes_user = self.filters.includes_user.clone();
             }
             parsed.filters.threads_only |= self.filters.threads_only;
+            parsed.filters.include_deleted |= self.filters.include_deleted || self.include_deleted;
             let found = match archive.lock() {
                 Ok(store) => store
                     .search_sorted(&self.workspace, &parsed, self.sort, RESULT_LIMIT)

@@ -1,6 +1,7 @@
 //! Message row rendering: transcript rows, cards, reply bars, headers, date/unread dividers,
 //! and compact membership lines.
 
+use super::render::is_deleted_ghost;
 use super::*;
 
 /// One transcript row: optional date/new-messages divider above the (possibly grouped)
@@ -153,7 +154,34 @@ pub(super) fn transcript_row(
                     }),
             );
         }
-        body = body.child(message_body(message, &kcx, cx));
+        let deleted_ghost = is_deleted_ghost(message);
+        if deleted_ghost {
+            let danger = cx.theme().danger;
+            body = body.child(
+                h_flex().items_center().gap_1().mb_0p5().child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded(px(4.))
+                        .bg(danger.opacity(0.12))
+                        .border_1()
+                        .border_color(danger.opacity(0.35))
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(danger)
+                        .child(Icon::new(IconName::Trash).size(px(11.)).text_color(danger))
+                        .child("Deleted \u{b7} preserved locally"),
+                ),
+            );
+        }
+        body = body.child(
+            div()
+                .min_w_0()
+                .when(deleted_ghost, |el| el.opacity(0.68))
+                .child(message_body(message, &kcx, cx)),
+        );
         if prefs.inline_media {
             if let Some(files) =
                 crate::files::attachments(fixtures, message, kcx.image_open.as_ref(), cx)
@@ -236,6 +264,9 @@ pub(super) fn transcript_row(
     let saved_bg = theme.warning.opacity(0.08);
     let keyword_bg = theme.warning.opacity(0.11);
     let keyword_bar = theme.warning;
+    let deleted_ghost = is_deleted_ghost(message);
+    let deleted_bg = theme.danger.opacity(0.05);
+    let deleted_bar = theme.danger.opacity(0.5);
     let thread_open = !saved && store.open_thread.as_ref() == Some(&message.ts);
     let highlighted = store.highlighted.as_ref() == Some(&message.ts);
     let active_row = store.active.as_ref() == Some(&message.ts);
@@ -277,10 +308,13 @@ pub(super) fn transcript_row(
             .when(editing, |card| card.py_2().bg(editing_bg))
             .when(!editing, |card| {
                 card.py_0p5()
+                    .when(deleted_ghost, |card| {
+                        card.bg(deleted_bg).border_l_2().border_color(deleted_bar)
+                    })
                     .when(saved, |card| {
                         card.bg(saved_bg).child(actions::saved_banner(cx))
                     })
-                    .when(!saved && keyword_hit, |card| {
+                    .when(!saved && !deleted_ghost && keyword_hit, |card| {
                         card.bg(keyword_bg).border_l_2().border_color(keyword_bar)
                     })
                     .when(is_ephemeral, |card| {

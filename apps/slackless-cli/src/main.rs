@@ -88,9 +88,10 @@ async fn dispatch(
             all_workspaces,
             format,
             out,
+            include_deleted,
         } => {
             if all_workspaces {
-                cmd_search_all_workspaces(ctx, &query, limit)
+                cmd_search_all_workspaces(ctx, &query, limit, include_deleted)
             } else {
                 cmd_search(
                     ctx,
@@ -99,6 +100,7 @@ async fn dispatch(
                     limit,
                     format,
                     out.as_deref(),
+                    include_deleted,
                 )
             }
         }
@@ -106,7 +108,15 @@ async fn dispatch(
             channel,
             limit,
             since,
-        } => cmd_read(ctx, workspace.as_ref(), &channel, limit, since.as_deref()),
+            include_deleted,
+        } => cmd_read(
+            ctx,
+            workspace.as_ref(),
+            &channel,
+            limit,
+            since.as_deref(),
+            include_deleted,
+        ),
         Commands::Thread {
             channel,
             thread_ts,
@@ -119,13 +129,23 @@ async fn dispatch(
                 cmd_thread(ctx, workspace.as_ref(), &channel, &thread_ts)
             }
         }
-        Commands::Send { channel, text } => run_send(ctx, flag, &channel, text).await,
+        Commands::Send {
+            channel,
+            text,
+            allow_secrets,
+        } => run_send(ctx, flag, &channel, text, allow_secrets).await,
         Commands::Reply {
             channel,
             thread_ts,
             text,
-        } => run_reply(ctx, flag, &channel, &thread_ts, text).await,
-        Commands::Edit { channel, ts, text } => run_edit(ctx, flag, &channel, &ts, text).await,
+            allow_secrets,
+        } => run_reply(ctx, flag, &channel, &thread_ts, text, allow_secrets).await,
+        Commands::Edit {
+            channel,
+            ts,
+            text,
+            allow_secrets,
+        } => run_edit(ctx, flag, &channel, &ts, text, allow_secrets).await,
         Commands::Delete { channel, ts } => run_delete(ctx, flag, &channel, &ts).await,
         Commands::React { channel, ts, emoji } => run_react(ctx, flag, &channel, &ts, &emoji).await,
         Commands::Unreact { channel, ts, emoji } => {
@@ -159,7 +179,19 @@ async fn dispatch(
             text,
             at,
             thread_ts,
-        } => run_schedule(ctx, flag, &channel, text, &at, thread_ts.as_deref()).await,
+            allow_secrets,
+        } => {
+            run_schedule(
+                ctx,
+                flag,
+                &channel,
+                text,
+                &at,
+                thread_ts.as_deref(),
+                allow_secrets,
+            )
+            .await
+        }
         Commands::Scheduled { channel } => run_scheduled(ctx, flag, channel.as_deref()).await,
         Commands::Unschedule { channel, id } => run_unschedule(ctx, flag, &channel, &id).await,
         Commands::Stats { breakdown } => cmd_stats(ctx, workspace.as_ref(), breakdown),

@@ -221,16 +221,21 @@ impl Store {
         let f = &query.filters;
         let fts = query.fts_match();
         let rank_relevant = sort == crate::query::SearchSort::Relevant && fts.is_some();
+        let deleted_clause = if f.include_deleted {
+            ""
+        } else {
+            " AND m.deleted = 0"
+        };
         let mut sql = if rank_relevant {
-            String::from(
+            format!(
                 "SELECT m.channel_id, m.json, m.deleted FROM message_current m
                  JOIN message_fts ON message_fts.rowid = m.id
-                 WHERE m.workspace_id = ? AND m.deleted = 0 AND message_fts MATCH ?",
+                 WHERE m.workspace_id = ?{deleted_clause} AND message_fts MATCH ?"
             )
         } else {
-            String::from(
+            format!(
                 "SELECT m.channel_id, m.json, m.deleted FROM message_current m
-                 WHERE m.workspace_id = ? AND m.deleted = 0",
+                 WHERE m.workspace_id = ?{deleted_clause}"
             )
         };
         let mut args = vec![SqlValue::Text(workspace.as_str().to_owned())];

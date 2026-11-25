@@ -53,6 +53,30 @@ impl Preferences {
             |s| &mut s.remote_search_auto,
             cx,
         );
+        let stealth_mode = self.checkbox(
+            "adv-stealth-mode",
+            "Stealth mode \u{2014} hide typing indicators, read receipts, and active presence",
+            |s| &mut s.stealth_mode,
+            cx,
+        );
+        let show_deleted = self.checkbox(
+            "adv-show-deleted",
+            "Show deleted messages inline as ghost tombstones (preserved locally)",
+            |s| &mut s.show_deleted_messages,
+            cx,
+        );
+        let strip_tracking = self.checkbox(
+            "adv-strip-tracking",
+            "Strip tracking parameters (utm_*, fbclid, gclid, si, etc.) from links",
+            |s| &mut s.strip_tracking_params,
+            cx,
+        );
+        let warn_secrets = self.checkbox(
+            "adv-warn-secrets",
+            "Warn before sending API keys, tokens, or private keys",
+            |s| &mut s.warn_before_sending_secrets,
+            cx,
+        );
         let search_in_ch = self.checkbox(
             "adv-search-in-channel",
             "\u{2318}F searches the current conversation instead of all of Slack",
@@ -248,6 +272,17 @@ impl Preferences {
             );
         let network_group = self.network_diagnostics_group(cx);
         v_flex()
+            .child(self.group(
+                "Privacy & archive",
+                Some("Local-only controls that go beyond official Slack: stay invisible while reading, inspect locally preserved deleted messages, scrub tracking parameters, and block accidental secret leaks."),
+                v_flex()
+                    .gap_2()
+                    .child(stealth_mode)
+                    .child(show_deleted)
+                    .child(strip_tracking)
+                    .child(warn_secrets),
+                cx,
+            ))
             .child(self.group(
                 "Search",
                 Some("Local search is instant and works offline. Enable remote search when you want older history, unjoined channels, and server-indexed files automatically."),

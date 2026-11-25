@@ -614,7 +614,8 @@ impl App {
         // prefetched unread channel shows the newest messages instantly without waiting for an
         // async executor hop or HTTP round-trip; `load_history` then fills the full 500-msg page
         // and updates read state.
-        let cached_page = self.bridge.history_sync(&channel);
+        let include_deleted = self.preferences.read(cx).settings().show_deleted_messages;
+        let cached_page = self.bridge.history_sync(&channel, include_deleted);
         if !cached_page.is_empty() {
             self.resolve_named_users(&cached_page);
             let mark_read_mode = self.preferences.read(cx).settings().mark_read;

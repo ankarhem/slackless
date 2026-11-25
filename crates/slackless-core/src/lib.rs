@@ -25,15 +25,21 @@ pub use slackless_types as types;
 mod backend;
 mod backfill;
 mod client;
+pub mod diff;
 mod fetcher;
 mod notify;
+pub mod privacy;
 mod reducer;
 mod unfurl;
 
 pub use backend::Backend;
 pub use client::{Client, ClientHandle, SharedStore};
+pub use diff::{DiffKind, DiffSegment, diff_words};
 pub use fetcher::Fetcher;
 pub use notify::{NotifyLevel, notify_levels};
+pub use privacy::{
+    SecretMatch, detect_secrets, strip_tracking_params, strip_tracking_params_in_text,
+};
 pub use reducer::apply_event;
 
 use api::MessageContent;
@@ -557,6 +563,10 @@ pub enum Command {
     SetPresence {
         away: bool,
     },
+    /// Enable or disable Stealth Mode: suppresses outbound `typing` frames, read-cursor sync
+    /// (`conversations.mark`, `subscriptions.thread.mark`, `users.markAllRead`), and active
+    /// presence heartbeats while still receiving live events and browsing freely.
+    SetStealthMode(bool),
     /// Write a single user preference key/value back to Slack (`users.prefs.set`).
     SetUserPref {
         name: String,

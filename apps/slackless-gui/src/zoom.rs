@@ -18,6 +18,14 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static STRIP_TRACKING_PARAMS: AtomicBool = AtomicBool::new(true);
+
+/// Enable or disable automatic stripping of tracking query parameters on every `open_url` call.
+pub fn set_strip_tracking_params(enabled: bool) {
+    STRIP_TRACKING_PARAMS.store(enabled, Ordering::Relaxed);
+}
 
 use anyhow::Result;
 use futures::channel::oneshot;
@@ -239,7 +247,12 @@ impl Platform for ZoomPlatform {
         self.inner.button_layout()
     }
     fn open_url(&self, a0: &str) {
-        self.inner.open_url(a0)
+        if STRIP_TRACKING_PARAMS.load(Ordering::Relaxed) {
+            let cleaned = slackless_core::strip_tracking_params(a0);
+            self.inner.open_url(&cleaned);
+        } else {
+            self.inner.open_url(a0);
+        }
     }
     fn on_open_urls(&self, a0: Box<dyn FnMut(Vec<String>)>) {
         self.inner.on_open_urls(a0)

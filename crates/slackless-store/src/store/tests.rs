@@ -2619,3 +2619,46 @@ fn bench_ingest_and_fts_10k_messages() {
         max_ms,
     );
 }
+
+#[test]
+fn search_include_deleted_opt_in_returns_tombstones() {
+    let mut store = Store::open_in_memory().unwrap();
+    let live = msg("1700000100.000100", "U1", "aurora live report");
+    let doomed = msg("1700000200.000100", "U1", "aurora deleted secret note");
+    store.upsert_message(&ws(), &general(), &live).unwrap();
+    store.upsert_message(&ws(), &general(), &doomed).unwrap();
+    store
+        .record_deletion(
+            &ws(),
+            &general(),
+            &Ts::from("1700000200.000100"),
+            None,
+            None,
+        )
+        .unwrap();
+
+    // Default search excludes deleted tombstones.
+    let q_default = SearchQuery::parse("aurora");
+    let hits = store
+        .search_sorted(&ws(), &q_default, SearchSort::Recent, 20)
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].message.ts, Ts::from("1700000100.000100"));
+    assert!(!hits[0].deleted);
+
+    // Opt-in search returns both live and locally preserved deleted messages.
+    let mut q_all = SearchQuery::parse("aurora");
+    q_all.filters.include_deleted = true;
+    let hits = store
+        .search_sorted(&ws(), &q_all, SearchSort::Recent, 20)
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+    assert!(
+        hits.iter()
+            .any(|h| h.deleted && h.message.ts == Ts::from("1700000200.000100"))
+    );
+    assert!(
+        hits.iter()
+            .any(|h| !h.deleted && h.message.ts == Ts::from("1700000100.000100"))
+    );
+}

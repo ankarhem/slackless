@@ -73,7 +73,14 @@ impl<B: Backend> Core<B> {
             Command::EndDnd => self.end_dnd(),
             Command::LoadTeamDnd(users) => self.load_team_dnd(users),
             Command::UpdateProfile { update } => self.update_profile(update),
-            Command::SetPresence { away } => self.set_presence(away),
+            Command::SetPresence { away } => {
+                if away || !self.stealth_mode {
+                    self.set_presence(away);
+                }
+            }
+            Command::SetStealthMode(enabled) => {
+                self.stealth_mode = enabled;
+            }
             Command::SetUserPref { name, value } => self.set_user_pref(name, value),
             Command::FetchUserProfile(user) => self.fetch_user_profile(user),
             Command::SetUserPhoto { filename, bytes } => self.set_user_photo(filename, bytes),

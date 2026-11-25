@@ -333,6 +333,50 @@ impl App {
             )
             .on_click(cx.listener(|this, _, window, cx| this.open_status_picker(window, cx)));
 
+        let stealth_active = self.preferences.read(cx).settings().stealth_mode;
+        let stealth_pill = stealth_active.then(|| {
+            let warn = cx.theme().warning;
+            h_flex()
+                .id("stealth-mode-pill")
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .h(px(24.))
+                .rounded_full()
+                .border_1()
+                .border_color(warn.opacity(0.5))
+                .bg(warn.opacity(0.18))
+                .cursor_pointer()
+                .hover(move |el| el.bg(warn.opacity(0.28)))
+                .tooltip(|window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(
+                        "Stealth mode active: typing, read receipts & active presence suppressed. Click to turn off.",
+                    )
+                    .build(window, cx)
+                })
+                .child(Icon::new(IconName::Eye).text_color(warn).size(px(12.)))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(chrome_fg)
+                        .child("Stealth"),
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.preferences.update(cx, |prefs, cx| {
+                        prefs.set_stealth_mode(false, cx);
+                    });
+                    this.apply_preferences(window, cx);
+                    notify(
+                        "Stealth mode off",
+                        "Typing indicators, read receipts, and active presence resumed.",
+                        window,
+                        cx,
+                    );
+                }))
+        });
+
         let rail_toggle = chrome_icon(
             "toggle-workspace-rail",
             IconName::PanelLeft,
@@ -381,6 +425,7 @@ impl App {
                             .h_full()
                             .items_center()
                             .gap_1()
+                            .children(stealth_pill)
                             .child(status_button)
                             .child(
                                 chrome_icon(

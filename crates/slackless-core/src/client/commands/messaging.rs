@@ -113,6 +113,9 @@ impl<B: Backend> Core<B> {
     }
 
     pub(super) fn mark_read(&self, channel: ChannelId, ts: Ts) {
+        if self.stealth_mode {
+            return;
+        }
         let backend = self.backend.clone();
         let store = Arc::clone(&self.store);
         let ws = self.workspace.clone();
@@ -131,6 +134,9 @@ impl<B: Backend> Core<B> {
     }
 
     pub(super) fn mark_thread_read(&self, channel: ChannelId, thread_ts: Ts, ts: Ts) {
+        if self.stealth_mode {
+            return;
+        }
         let backend = self.backend.clone();
         self.spawn("subscriptions.thread.mark", async move {
             Ok(backend.mark_thread_read(channel, thread_ts, ts).await?)
@@ -138,6 +144,9 @@ impl<B: Backend> Core<B> {
     }
 
     pub(super) fn mark_all_read(&self) {
+        if self.stealth_mode {
+            return;
+        }
         let backend = self.backend.clone();
         let events = self.events.clone();
         self.spawn("users.markAllRead", async move {
@@ -193,6 +202,9 @@ impl<B: Backend> Core<B> {
     }
 
     pub(super) fn send_typing(&self, channel: ChannelId, thread_ts: Option<Ts>) {
+        if self.stealth_mode {
+            return;
+        }
         if let Some(Err(e)) = self.rtm.as_ref().map(|r| r.user_typing(channel, thread_ts)) {
             self.events.emit(Event::Error(format!("typing: {e}")));
         }
