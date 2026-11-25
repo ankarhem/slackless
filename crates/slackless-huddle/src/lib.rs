@@ -1,6 +1,7 @@
 //! Native Amazon Chime SDK (`free_willy`) signaling, WebRTC DTLS-SRTP media, pure-Rust audio
-//! processing (`cpal` + `opus` + `sonora` AEC3/NS/AGC), H.264 camera video (`nokhwa` + `openh264`),
-//! screen sharing (`xcap` + `openh264`), and Chime `DATA_MESSAGE` extras for Slack Huddles.
+//! processing (`cpal` + `opus` + `sonora` AEC3/NS/AGC), H.264 camera video (`AVFoundation` on
+//! macOS; `nokhwa` + `openh264` on Linux/Windows), screen sharing (`ScreenCaptureKit` / `xcap` +
+//! `openh264`), and Chime `DATA_MESSAGE` extras for Slack Huddles.
 
 pub mod audio;
 pub mod av1;

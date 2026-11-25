@@ -136,7 +136,7 @@ unsafe extern "C" {
         bitrate_bps: u32,
         blur_enabled: bool,
         ctx: *mut c_void,
-        on_h264: SlacklessH264Callback,
+        on_h264: Option<SlacklessH264Callback>,
         on_surface_preview: SlacklessSurfaceCallback,
         on_error: SlacklessErrorCallback,
         err_buf: *mut c_char,
@@ -382,8 +382,8 @@ impl Drop for MacVideoSurface {
 // ---------------------------------------------------------------------------
 
 struct CaptureCallbackCtx {
-    outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-    preview_tx: mpsc::UnboundedSender<VideoFrame>,
+    outbound_h264_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    on_preview: Box<dyn Fn(VideoFrame) + Send + Sync>,
     perf: Option<Arc<HuddlePerfCounters>>,
 }
 
@@ -404,7 +404,9 @@ unsafe extern "C" fn on_h264_cb(
     if let Some(perf) = &state.perf {
         perf.record_tx_frame(width, height, len as u64, encode_us);
     }
-    let _ = state.outbound_h264_tx.send(slice.to_vec());
+    if let Some(tx) = &state.outbound_h264_tx {
+        let _ = tx.send(slice.to_vec());
+    }
 }
 
 unsafe extern "C" fn on_surface_preview_cb(
@@ -421,7 +423,7 @@ unsafe extern "C" fn on_surface_preview_cb(
     }
     let state = unsafe { &*(ctx as *const CaptureCallbackCtx) };
     if let Some(surface) = unsafe { MacVideoSurface::from_retained(cv_pb, width, height) } {
-        let _ = state.preview_tx.send(VideoFrame::from_mac_surface(surface));
+        (state.on_preview)(VideoFrame::from_mac_surface(surface));
     }
 }
 
@@ -477,8 +479,10 @@ impl ScVtScreenCapture {
 
         perf.set_tx_backend("ScreenCaptureKit + VideoToolbox H.264 High (HW)");
         let ctx = Box::into_raw(Box::new(CaptureCallbackCtx {
-            outbound_h264_tx,
-            preview_tx,
+            outbound_h264_tx: Some(outbound_h264_tx),
+            on_preview: Box::new(move |frame| {
+                let _ = preview_tx.send(frame);
+            }),
             perf: Some(perf),
         }));
         let mut err_buf = [0 as c_char; 512];
@@ -557,31 +561,28 @@ unsafe extern "C" fn on_cam_enum_cb(ctx: *mut c_void, index: u32, name: *const c
     if ctx.is_null() {
         return;
     }
-    let out = unsafe { &mut *(ctx as *mut Vec<CameraDeviceInfo>) };
-    let name_str = if name.is_null() {
-        format!("Camera {}", index + 1)
+    let out = unsafe { &mut *(ctx as *mut Vec<(usize, Option<String>)>) };
+    let raw_name = if name.is_null() {
+        None
     } else {
         unsafe { CStr::from_ptr(name) }
             .to_str()
-            .unwrap_or("Camera")
-            .to_owned()
+            .ok()
+            .map(str::to_owned)
     };
-    out.push(CameraDeviceInfo {
-        index: index as usize,
-        name: name_str,
-    });
+    out.push((index as usize, raw_name));
 }
 
 /// Enumerate cameras via native `AVCaptureDeviceDiscoverySession` (built-in, external, Continuity).
 pub fn list_macos_cameras() -> Vec<CameraDeviceInfo> {
-    let mut out = Vec::new();
+    let mut raw: Vec<(usize, Option<String>)> = Vec::new();
     unsafe {
         slackless_list_cameras(
-            (&mut out as *mut Vec<CameraDeviceInfo>).cast(),
+            (&mut raw as *mut Vec<(usize, Option<String>)>).cast(),
             on_cam_enum_cb,
         );
     }
-    out
+    crate::video::normalize_camera_devices(raw)
 }
 
 /// Hardware-accelerated macOS `AVCaptureSession` (`420f`) + `VideoToolbox` H.264 webcam with
@@ -606,9 +607,60 @@ impl AvVtCameraCapture {
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
         preview_tx: mpsc::UnboundedSender<VideoFrame>,
     ) -> Result<Self> {
+        Self::start_inner(
+            device_index,
+            max_w,
+            max_h,
+            fps,
+            bitrate_bps,
+            blur_background,
+            Some(outbound_h264_tx),
+            Box::new(move |frame| {
+                let _ = preview_tx.send(frame);
+            }),
+        )
+    }
+
+    /// Start native `AVCaptureSession` (`420f`) frame delivery without allocating a `VideoToolbox`
+    /// H.264 encoder — ideal for Preferences camera preview probes and `VideoClipRecorder` webcam
+    /// capture.
+    pub fn start_preview_only(
+        device_index: Option<usize>,
+        max_w: u32,
+        max_h: u32,
+        fps: u32,
+        blur_background: bool,
+        on_preview: impl Fn(VideoFrame) + Send + Sync + 'static,
+    ) -> Result<Self> {
+        Self::start_inner(
+            device_index,
+            max_w,
+            max_h,
+            fps,
+            0,
+            blur_background,
+            None,
+            Box::new(on_preview),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_inner(
+        device_index: Option<usize>,
+        max_w: u32,
+        max_h: u32,
+        fps: u32,
+        bitrate_bps: u32,
+        blur_background: bool,
+        outbound_h264_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+        on_preview: Box<dyn Fn(VideoFrame) + Send + Sync>,
+    ) -> Result<Self> {
+        let h264_cb = outbound_h264_tx
+            .is_some()
+            .then_some(on_h264_cb as SlacklessH264Callback);
         let ctx = Box::into_raw(Box::new(CaptureCallbackCtx {
             outbound_h264_tx,
-            preview_tx,
+            on_preview,
             perf: None,
         }));
         let mut err_buf = [0 as c_char; 512];
@@ -622,7 +674,7 @@ impl AvVtCameraCapture {
                 bitrate_bps,
                 blur_background,
                 ctx.cast(),
-                on_h264_cb,
+                h264_cb,
                 on_surface_preview_cb,
                 on_error_cb,
                 err_buf.as_mut_ptr(),
@@ -642,7 +694,8 @@ impl AvVtCameraCapture {
             fps,
             bitrate_kbps = bitrate_bps / 1000,
             blur_background,
-            "started macOS AVFoundation (420f) + VideoToolbox H.264 High HW webcam"
+            hw_h264 = h264_cb.is_some(),
+            "started macOS AVFoundation (420f) webcam capture"
         );
         Ok(Self { handle, ctx })
     }
@@ -1328,5 +1381,48 @@ mod tests {
         // Missing file -> None.
         let missing = dir.join(format!("slackless-nonexistent-{pid}.wav"));
         assert!(measure_audio_file_rms(&missing).is_none());
+    }
+
+    #[test]
+    fn camera_enum_callback_normalizes_null_blank_invalid_utf8_and_trimmed_names() {
+        let mut raw: Vec<(usize, Option<String>)> = Vec::new();
+        let ctx = (&mut raw as *mut Vec<(usize, Option<String>)>).cast::<c_void>();
+
+        let valid = std::ffi::CString::new("  FaceTime HD Camera  ").unwrap();
+        let blank = std::ffi::CString::new("   ").unwrap();
+        // Invalid UTF-8 C string (0xFF followed by NUL terminator).
+        let invalid_utf8: [c_char; 2] = [-1, 0];
+
+        unsafe {
+            // Null context must safely no-op.
+            on_cam_enum_cb(std::ptr::null_mut(), 99, valid.as_ptr());
+            on_cam_enum_cb(ctx, 0, valid.as_ptr());
+            on_cam_enum_cb(ctx, 1, std::ptr::null());
+            on_cam_enum_cb(ctx, 2, blank.as_ptr());
+            on_cam_enum_cb(ctx, 3, invalid_utf8.as_ptr());
+        }
+
+        let out = crate::video::normalize_camera_devices(raw);
+        assert_eq!(
+            out,
+            vec![
+                CameraDeviceInfo {
+                    index: 0,
+                    name: "FaceTime HD Camera".to_owned(),
+                },
+                CameraDeviceInfo {
+                    index: 1,
+                    name: "Camera 2".to_owned(),
+                },
+                CameraDeviceInfo {
+                    index: 2,
+                    name: "Camera 3".to_owned(),
+                },
+                CameraDeviceInfo {
+                    index: 3,
+                    name: "Camera 4".to_owned(),
+                },
+            ]
+        );
     }
 }

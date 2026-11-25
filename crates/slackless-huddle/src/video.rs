@@ -1,12 +1,18 @@
-//! Native H.264 video pipeline: webcam capture (`nokhwa`), software portrait background blur,
-//! Cisco OpenH264 encode/decode (`openh264`), and RTP H.264 depacketization for Chime SFU.
+//! Native H.264 video pipeline: webcam capture (`AVFoundation` on macOS, `nokhwa` on
+//! Linux/Windows), software portrait background blur, Cisco OpenH264 encode/decode (`openh264`),
+//! and RTP H.264 depacketization for Chime SFU.
 
+#[cfg(not(target_os = "macos"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(not(target_os = "macos"))]
 use std::time::Duration;
 
+#[cfg(not(target_os = "macos"))]
 use nokhwa::Camera;
+#[cfg(not(target_os = "macos"))]
 use nokhwa::pixel_format::RgbFormat;
+#[cfg(not(target_os = "macos"))]
 use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
 use openh264::OpenH264API;
 use openh264::encoder::{
@@ -130,6 +136,47 @@ pub enum VideoTileKey {
 pub struct CameraDeviceInfo {
     pub index: usize,
     pub name: String,
+}
+
+/// Normalize a raw OS camera label, trimming whitespace and synthesizing `"Camera N"` for empty
+/// or missing labels.
+pub(crate) fn normalize_camera_name(index: usize, raw_name: Option<&str>) -> String {
+    match raw_name.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => name.to_owned(),
+        None => format!("Camera {}", index + 1),
+    }
+}
+
+/// Normalize a raw list of `(index, optional_name)` camera entries into [`CameraDeviceInfo`] values,
+/// preserving enumeration order while ensuring unique indices and non-empty labels.
+pub(crate) fn normalize_camera_devices<I>(raw: I) -> Vec<CameraDeviceInfo>
+where
+    I: IntoIterator<Item = (usize, Option<String>)>,
+{
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (index, raw_name) in raw {
+        if !seen.insert(index) {
+            continue;
+        }
+        let name = normalize_camera_name(index, raw_name.as_deref());
+        out.push(CameraDeviceInfo { index, name });
+    }
+    out
+}
+
+/// Resolve a requested camera index against enumerated devices, falling back to the primary
+/// (first) available device when `requested` is `None` or no longer present.
+pub fn select_camera_index(
+    requested: Option<usize>,
+    devices: &[CameraDeviceInfo],
+) -> Option<usize> {
+    if let Some(req) = requested
+        && devices.iter().any(|d| d.index == req)
+    {
+        return Some(req);
+    }
+    devices.first().map(|d| d.index)
 }
 
 /// Enumerate all host cameras via the active platform [`crate::backend::MediaBackend`].
@@ -552,6 +599,17 @@ pub fn rgb_to_bgra(rgb: &[u8]) -> Vec<u8> {
     bgra
 }
 
+/// Convert BGRA8888 into RGB888 (e.g. for OpenH264 software encoding from `MacVideoSurface` readback).
+pub fn bgra_to_rgb(bgra: &[u8]) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity((bgra.len() / 4) * 3);
+    for px in bgra.as_chunks::<4>().0 {
+        rgb.push(px[2]);
+        rgb.push(px[1]);
+        rgb.push(px[0]);
+    }
+    rgb
+}
+
 /// Convert RGBA8888 into BGRA8888 for GPUI `RenderImage` and RGB888 for OpenH264 encoding.
 pub fn rgba_to_rgb_and_bgra(rgba: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let pixels = rgba.len() / 4;
@@ -717,15 +775,88 @@ impl Drop for CameraCapture {
     }
 }
 
+const PREVIEW_MAX_W: u32 = 320;
+const PREVIEW_MAX_H: u32 = 180;
+
+/// Downscale and optionally portrait-blur an RGB888 buffer into a compact BGRA [`VideoFrame`].
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn prepare_preview_frame_rgb(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    max_w: u32,
+    max_h: u32,
+    blur: bool,
+) -> Option<VideoFrame> {
+    if width == 0 || height == 0 || rgb.len() < (width as usize) * (height as usize) * 3 {
+        return None;
+    }
+    let (mut resized, w, h) = resize_rgb_even(rgb, width, height, max_w, max_h);
+    if w < 2 || h < 2 {
+        return None;
+    }
+    if blur {
+        apply_portrait_blur(&mut resized, w as usize, h as usize);
+    }
+    Some(VideoFrame::from_bgra(w, h, rgb_to_bgra(&resized)))
+}
+
+/// Convert a captured [`VideoFrame`] (zero-copy `MacVideoSurface` or portable BGRA) into a
+/// compact BGRA preview frame fit within `(max_w, max_h)`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn fit_preview_frame(frame: &VideoFrame, max_w: u32, max_h: u32) -> Option<VideoFrame> {
+    let (w, h, bgra) = frame.to_bgra_fit(max_w, max_h)?;
+    if w < 2 || h < 2 || bgra.len() < (w as usize) * (h as usize) * 4 {
+        return None;
+    }
+    if max_w > 0 && max_h > 0 && (w > max_w || h > max_h) {
+        let rgb = bgra_to_rgb(&bgra);
+        let (resized, rw, rh) = resize_rgb_even(&rgb, w, h, max_w, max_h);
+        if rw < 2 || rh < 2 {
+            return None;
+        }
+        return Some(VideoFrame::from_bgra(rw, rh, rgb_to_bgra(&resized)));
+    }
+    Some(VideoFrame::from_bgra(w, h, bgra))
+}
+
 /// Lightweight local camera preview probe for Preferences -> Audio & video (`F-COLLAB-046`).
 pub struct CameraPreviewProbe {
+    #[cfg(target_os = "macos")]
+    capture: crate::macos_media::AvVtCameraCapture,
+    #[cfg(not(target_os = "macos"))]
     running: Arc<AtomicBool>,
+    #[cfg(not(target_os = "macos"))]
     blur: Arc<AtomicBool>,
     latest: Arc<Mutex<Option<VideoFrame>>>,
+    #[cfg(not(target_os = "macos"))]
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CameraPreviewProbe {
+    #[cfg(target_os = "macos")]
+    pub fn start(device_index: Option<usize>, blur_background: bool) -> Result<Self> {
+        let latest: Arc<Mutex<Option<VideoFrame>>> = Arc::new(Mutex::new(None));
+        let latest_cb = Arc::clone(&latest);
+        let available = crate::macos_media::list_macos_cameras();
+        let resolved = select_camera_index(device_index, &available)
+            .ok_or_else(|| HuddleError::Video("no camera device found".into()))?;
+        let capture = crate::macos_media::AvVtCameraCapture::start_preview_only(
+            Some(resolved),
+            640,
+            480,
+            15,
+            blur_background,
+            move |frame| {
+                if let Ok(mut guard) = latest_cb.lock() {
+                    *guard = Some(frame);
+                }
+            },
+        )?;
+        Ok(Self { capture, latest })
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn start(device_index: Option<usize>, blur_background: bool) -> Result<Self> {
         let running = Arc::new(AtomicBool::new(true));
         let blur = Arc::new(AtomicBool::new(blur_background));
@@ -762,18 +893,17 @@ impl CameraPreviewProbe {
                 while run_flag.load(Ordering::Relaxed) {
                     if let Ok(frame) = cam.frame()
                         && let Ok(img) = frame.decode_image::<RgbFormat>()
+                        && let Some(vf) = prepare_preview_frame_rgb(
+                            img.as_raw(),
+                            img.width(),
+                            img.height(),
+                            PREVIEW_MAX_W,
+                            PREVIEW_MAX_H,
+                            blur_flag.load(Ordering::Relaxed),
+                        )
+                        && let Ok(mut guard) = latest_cb.lock()
                     {
-                        let (mut rgb, w, h) =
-                            resize_rgb_even(img.as_raw(), img.width(), img.height(), 320, 180);
-                        if w >= 2 && h >= 2 {
-                            if blur_flag.load(Ordering::Relaxed) {
-                                apply_portrait_blur(&mut rgb, w as usize, h as usize);
-                            }
-                            let vf = VideoFrame::from_bgra(w, h, rgb_to_bgra(&rgb));
-                            if let Ok(mut guard) = latest_cb.lock() {
-                                *guard = Some(vf);
-                            }
-                        }
+                        *guard = Some(vf);
                     }
                     std::thread::sleep(Duration::from_millis(80));
                 }
@@ -794,19 +924,35 @@ impl CameraPreviewProbe {
     }
 
     pub fn set_blur(&self, enabled: bool) {
+        #[cfg(target_os = "macos")]
+        self.capture.set_blur(enabled);
+        #[cfg(not(target_os = "macos"))]
         self.blur.store(enabled, Ordering::Relaxed);
     }
 
     pub fn latest_frame(&self) -> Option<VideoFrame> {
-        self.latest.lock().ok().and_then(|g| g.clone())
+        let frame = self.latest.lock().ok().and_then(|g| g.clone())?;
+        #[cfg(target_os = "macos")]
+        {
+            fit_preview_frame(&frame, PREVIEW_MAX_W, PREVIEW_MAX_H)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Some(frame)
+        }
     }
 }
 
 impl Drop for CameraPreviewProbe {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
+        #[cfg(target_os = "macos")]
+        self.capture.stop();
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.running.store(false, Ordering::Relaxed);
+            if let Some(handle) = self.worker.take() {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -1107,6 +1253,91 @@ mod tests {
         let mut short = vec![77u8; 16 * 16 * 3 - 1];
         apply_portrait_blur(&mut short, 16, 16);
         assert!(short.iter().all(|&b| b == 77));
+    }
+
+    #[test]
+    fn camera_enumeration_normalization_and_selection_seams() {
+        assert_eq!(
+            normalize_camera_name(0, Some("  FaceTime HD Camera \n")),
+            "FaceTime HD Camera"
+        );
+        assert_eq!(normalize_camera_name(0, Some("   ")), "Camera 1");
+        assert_eq!(normalize_camera_name(2, None), "Camera 3");
+
+        let normalized = normalize_camera_devices([
+            (0, Some("  Built-in Camera  ".to_owned())),
+            (0, Some("Duplicate index ignored".to_owned())),
+            (1, Some("   ".to_owned())),
+            (3, None),
+        ]);
+        assert_eq!(
+            normalized,
+            vec![
+                CameraDeviceInfo {
+                    index: 0,
+                    name: "Built-in Camera".to_owned(),
+                },
+                CameraDeviceInfo {
+                    index: 1,
+                    name: "Camera 2".to_owned(),
+                },
+                CameraDeviceInfo {
+                    index: 3,
+                    name: "Camera 4".to_owned(),
+                },
+            ]
+        );
+
+        assert_eq!(select_camera_index(None, &[]), None);
+        assert_eq!(select_camera_index(Some(0), &[]), None);
+        assert_eq!(select_camera_index(None, &normalized), Some(0));
+        assert_eq!(select_camera_index(Some(3), &normalized), Some(3));
+        // Unplugged / out-of-range camera falls back to the first enumerated device.
+        assert_eq!(select_camera_index(Some(99), &normalized), Some(0));
+    }
+
+    #[test]
+    fn bgra_to_rgb_and_preview_frame_helpers_convert_downscale_and_guard_inputs() {
+        // BGRA -> RGB round-trips with rgb_to_bgra and ignores trailing partial bytes.
+        let rgb = vec![10, 20, 30, 40, 50, 60];
+        let mut bgra = rgb_to_bgra(&rgb);
+        bgra.push(0x99); // trailing partial pixel ignored safely
+        assert_eq!(bgra_to_rgb(&bgra), rgb);
+
+        // fit_preview_frame rejects tiny/truncated buffers and downscales oversized BGRA frames.
+        assert!(fit_preview_frame(&VideoFrame::from_bgra(1, 1, vec![0; 4]), 320, 180).is_none());
+        assert!(fit_preview_frame(&VideoFrame::from_bgra(8, 8, vec![0; 10]), 320, 180).is_none());
+
+        let big_bgra = vec![200u8; 640 * 360 * 4];
+        let fitted = fit_preview_frame(&VideoFrame::from_bgra(640, 360, big_bgra), 320, 180)
+            .expect("oversized BGRA frame should fit within preview bounds");
+        assert_eq!((fitted.width, fitted.height), (320, 180));
+        assert_eq!(fitted.into_bgra().unwrap().2.len(), 320 * 180 * 4);
+
+        // prepare_preview_frame_rgb guards short/zero buffers and supports optional blur.
+        assert!(prepare_preview_frame_rgb(&[], 0, 10, 320, 180, false).is_none());
+        assert!(prepare_preview_frame_rgb(&[0; 12], 8, 8, 320, 180, false).is_none());
+        let src_rgb = vec![128u8; 64 * 48 * 3];
+        let preview = prepare_preview_frame_rgb(&src_rgb, 64, 48, 32, 24, true)
+            .expect("valid RGB should prepare preview");
+        assert_eq!((preview.width, preview.height), (32, 24));
+
+        // On macOS, verify fit_preview_frame works directly on a real VideoToolbox MacVideoSurface
+        // synthesized from software OpenH264 (zero camera hardware touched).
+        #[cfg(target_os = "macos")]
+        {
+            let bitstream = encode_test_keyframe(160, 96, 40, 180, 220);
+            let mut vt = crate::macos_media::VtH264Decoder::new().unwrap();
+            let surface_frame = vt
+                .decode_annex_b(&bitstream)
+                .expect("VT should decode synthetic keyframe");
+            assert!(surface_frame.mac_surface().is_some());
+            let preview_bgra = fit_preview_frame(&surface_frame, 80, 48)
+                .expect("MacVideoSurface should downscale into BGRA preview");
+            assert_eq!((preview_bgra.width, preview_bgra.height), (80, 48));
+            assert!(preview_bgra.mac_surface().is_none());
+            assert_eq!(preview_bgra.into_bgra().unwrap().2.len(), 80 * 48 * 4);
+        }
     }
 
     fn build_stap_a(nals: &[&[u8]]) -> Vec<u8> {

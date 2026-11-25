@@ -5,30 +5,38 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "macos"))]
 use nokhwa::Camera;
+#[cfg(not(target_os = "macos"))]
 use nokhwa::pixel_format::RgbFormat;
+#[cfg(not(target_os = "macos"))]
 use nokhwa::utils::{ApiBackend, CameraIndex, RequestedFormat, RequestedFormatType};
 use openh264::decoder::Decoder as H264Decoder;
 use openh264::formats::YUVSource as _;
 use tokio::sync::mpsc;
 
+#[cfg(not(target_os = "macos"))]
 use super::{
     AudioDeviceChangeKind, AudioDeviceMonitorHandle, CameraConfig, CameraHandle, MediaBackend,
-    MediaCapabilities, ScreenShareConfig, ScreenShareHandle, VideoDecoderHandle,
+    MediaCapabilities,
 };
+use super::{ScreenShareConfig, ScreenShareHandle, VideoDecoderHandle};
 use crate::av1::Av1Decoder;
 use crate::metrics::HuddlePerfCounters;
 use crate::screen::{capture_once_result, fast_stride_hash, with_autorelease_pool};
+#[cfg(not(target_os = "macos"))]
 use crate::video::{
-    CameraDeviceInfo, H264VideoEncoder, ScreenScaleScratch, VideoFrame, apply_portrait_blur,
-    downscale_rgba_area_to_bgra_and_i420, resize_rgb_even, rgb_to_bgra,
+    CameraDeviceInfo, apply_portrait_blur, normalize_camera_devices, resize_rgb_even, rgb_to_bgra,
+};
+use crate::video::{
+    H264VideoEncoder, ScreenScaleScratch, VideoFrame, downscale_rgba_area_to_bgra_and_i420,
 };
 use crate::{HuddleError, Result};
 
-#[allow(dead_code)]
+#[cfg(not(target_os = "macos"))]
 pub struct PortableMediaBackend;
 
-#[allow(dead_code)]
+#[cfg(not(target_os = "macos"))]
 pub static PORTABLE_BACKEND: PortableMediaBackend = PortableMediaBackend;
 
 // ---------------------------------------------------------------------------
@@ -212,9 +220,10 @@ impl Drop for SoftwareScreenShare {
 }
 
 // ---------------------------------------------------------------------------
-// Portable Software Camera (`nokhwa` + OpenH264)
+// Portable Software Camera (`nokhwa` + OpenH264, non-macOS)
 // ---------------------------------------------------------------------------
 
+#[cfg(not(target_os = "macos"))]
 pub(crate) struct SoftwareCamera {
     running: Arc<AtomicBool>,
     blur: Arc<AtomicBool>,
@@ -222,6 +231,7 @@ pub(crate) struct SoftwareCamera {
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
+#[cfg(not(target_os = "macos"))]
 impl SoftwareCamera {
     pub(crate) fn start(
         config: CameraConfig,
@@ -312,6 +322,7 @@ impl SoftwareCamera {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 impl CameraHandle for SoftwareCamera {
     fn set_blur(&self, enabled: bool) {
         self.blur.store(enabled, Ordering::Relaxed);
@@ -331,6 +342,7 @@ impl CameraHandle for SoftwareCamera {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 impl Drop for SoftwareCamera {
     fn drop(&mut self) {
         self.stop();
@@ -400,8 +412,9 @@ impl VideoDecoderHandle for SoftwareAv1Decoder {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn list_nokhwa_cameras() -> Vec<CameraDeviceInfo> {
-    nokhwa::query(ApiBackend::Auto)
+    let raw = nokhwa::query(ApiBackend::Auto)
         .unwrap_or_default()
         .into_iter()
         .enumerate()
@@ -410,14 +423,12 @@ pub(crate) fn list_nokhwa_cameras() -> Vec<CameraDeviceInfo> {
                 CameraIndex::Index(i) => *i as usize,
                 CameraIndex::String(_) => fallback_ix,
             };
-            CameraDeviceInfo {
-                index,
-                name: info.human_name(),
-            }
-        })
-        .collect()
+            (index, Some(info.human_name()))
+        });
+    normalize_camera_devices(raw)
 }
 
+#[cfg(not(target_os = "macos"))]
 impl MediaBackend for PortableMediaBackend {
     fn name(&self) -> &'static str {
         "Portable Software (OpenH264 / rav1d)"

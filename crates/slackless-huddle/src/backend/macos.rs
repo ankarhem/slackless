@@ -9,23 +9,20 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use super::portable::{
-    LazyOpenH264Decoder, SoftwareAv1Decoder, SoftwareCamera, SoftwareScreenShare,
-    list_nokhwa_cameras,
-};
+use super::portable::{LazyOpenH264Decoder, SoftwareAv1Decoder, SoftwareScreenShare};
 use super::{
     AudioDeviceChangeKind, AudioDeviceMonitorHandle, CameraConfig, CameraHandle,
     HwAudioDuplexHandle, MediaBackend, MediaCapabilities, ScreenShareConfig, ScreenShareHandle,
     VideoDecoderHandle,
 };
-use crate::Result;
 use crate::macos_media::{
     AvVtCameraCapture, CoreAudioDeviceMonitor, MacVoiceProcessingIo, ScVtScreenCapture,
     VtAv1Decoder, VtH264Decoder, capture_macos_thumbnails, list_macos_cameras,
     supports_hw_av1_decode, supports_hw_h264_decode,
 };
 use crate::metrics::HuddlePerfCounters;
-use crate::video::{CameraDeviceInfo, VideoFrame};
+use crate::video::{CameraDeviceInfo, VideoFrame, select_camera_index};
+use crate::{HuddleError, Result};
 
 pub struct MacOsMediaBackend;
 
@@ -211,6 +208,38 @@ impl VideoDecoderHandle for MacAv1Decoder {
     }
 }
 
+/// Resolve a [`CameraConfig`]'s requested device index against the current native `AVFoundation`
+/// camera list, falling back to the primary device when `None` or unplugged.
+fn resolve_camera_start_config(
+    mut config: CameraConfig,
+    available: &[CameraDeviceInfo],
+) -> Result<CameraConfig> {
+    let picked = select_camera_index(config.device_index, available)
+        .ok_or_else(|| HuddleError::Video("no camera device found".into()))?;
+    config.device_index = Some(picked);
+    Ok(config)
+}
+
+fn start_camera_with<L, S>(
+    config: CameraConfig,
+    outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
+    preview_tx: mpsc::UnboundedSender<VideoFrame>,
+    list_devices: L,
+    start_native: S,
+) -> Result<Box<dyn CameraHandle>>
+where
+    L: FnOnce() -> Vec<CameraDeviceInfo>,
+    S: FnOnce(
+        CameraConfig,
+        mpsc::UnboundedSender<Vec<u8>>,
+        mpsc::UnboundedSender<VideoFrame>,
+    ) -> Result<Box<dyn CameraHandle>>,
+{
+    let available = list_devices();
+    let resolved = resolve_camera_start_config(config, &available)?;
+    start_native(resolved, outbound_h264_tx, preview_tx)
+}
+
 impl MediaBackend for MacOsMediaBackend {
     fn name(&self) -> &'static str {
         "macOS Native (ScreenCaptureKit / AVFoundation / VideoToolbox)"
@@ -230,11 +259,7 @@ impl MediaBackend for MacOsMediaBackend {
     }
 
     fn list_cameras(&self) -> Vec<CameraDeviceInfo> {
-        let native = list_macos_cameras();
-        if !native.is_empty() {
-            return native;
-        }
-        list_nokhwa_cameras()
+        list_macos_cameras()
     }
 
     fn capture_screen_thumbnails(
@@ -289,29 +314,25 @@ impl MediaBackend for MacOsMediaBackend {
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
         preview_tx: mpsc::UnboundedSender<VideoFrame>,
     ) -> Result<Box<dyn CameraHandle>> {
-        match AvVtCameraCapture::start(
-            config.device_index,
-            config.max_w,
-            config.max_h,
-            config.max_fps,
-            config.bitrate_bps,
-            config.blur_background,
-            outbound_h264_tx.clone(),
-            preview_tx.clone(),
-        ) {
-            Ok(hw) => Ok(Box::new(hw)),
-            Err(err) => {
-                tracing::warn!(
-                    %err,
-                    "AVFoundation + VideoToolbox camera unavailable; falling back to nokhwa + OpenH264"
-                );
-                Ok(Box::new(SoftwareCamera::start(
-                    config,
-                    outbound_h264_tx,
-                    preview_tx,
-                )?))
-            }
-        }
+        start_camera_with(
+            config,
+            outbound_h264_tx,
+            preview_tx,
+            list_macos_cameras,
+            |cfg, h264_tx, prev_tx| {
+                AvVtCameraCapture::start(
+                    cfg.device_index,
+                    cfg.max_w,
+                    cfg.max_h,
+                    cfg.max_fps,
+                    cfg.bitrate_bps,
+                    cfg.blur_background,
+                    h264_tx,
+                    prev_tx,
+                )
+                .map(|hw| Box::new(hw) as Box<dyn CameraHandle>)
+            },
+        )
     }
 
     fn create_h264_decoder(&self) -> Result<Box<dyn VideoDecoderHandle>> {
@@ -451,5 +472,135 @@ mod tests {
             .expect("SW continues decoding");
         assert_eq!(sw_created, 1);
         assert_eq!(next.into_bgra().unwrap().2[0], 7);
+    }
+
+    struct StubCameraHandle {
+        stopped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CameraHandle for StubCameraHandle {
+        fn set_blur(&self, _enabled: bool) {}
+        fn force_keyframe(&self) {}
+        fn set_target_bitrate(&self, _bitrate_bps: u32) {}
+        fn stop(&mut self) {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn sample_camera_config(device_index: Option<usize>) -> CameraConfig {
+        CameraConfig {
+            device_index,
+            max_w: 1280,
+            max_h: 720,
+            max_fps: 24,
+            bitrate_bps: 1_200_000,
+            blur_background: true,
+        }
+    }
+
+    #[test]
+    fn resolve_camera_start_config_handles_preferred_fallback_and_empty_devices() {
+        let devices = vec![
+            CameraDeviceInfo {
+                index: 0,
+                name: "FaceTime HD Camera".into(),
+            },
+            CameraDeviceInfo {
+                index: 2,
+                name: "Studio Display Camera".into(),
+            },
+        ];
+
+        // Empty list returns an explicit Video error without panicking.
+        assert!(matches!(
+            resolve_camera_start_config(sample_camera_config(None), &[]),
+            Err(HuddleError::Video(_))
+        ));
+
+        // Default None picks the first available camera.
+        let picked_default =
+            resolve_camera_start_config(sample_camera_config(None), &devices).unwrap();
+        assert_eq!(picked_default.device_index, Some(0));
+
+        // Preferred camera present in list is preserved.
+        let picked_preferred =
+            resolve_camera_start_config(sample_camera_config(Some(2)), &devices).unwrap();
+        assert_eq!(picked_preferred.device_index, Some(2));
+
+        // Stale/unplugged index falls back to the primary camera.
+        let picked_fallback =
+            resolve_camera_start_config(sample_camera_config(Some(9)), &devices).unwrap();
+        assert_eq!(picked_fallback.device_index, Some(0));
+    }
+
+    #[test]
+    fn start_camera_with_resolves_device_and_propagates_native_errors_without_fallback() {
+        let devices = vec![
+            CameraDeviceInfo {
+                index: 0,
+                name: "Built-in".into(),
+            },
+            CameraDeviceInfo {
+                index: 1,
+                name: "Continuity iPhone".into(),
+            },
+        ];
+
+        // When preferred device is unplugged (index 5), native starter receives fallback index 0.
+        let (h264_tx, _h264_rx) = mpsc::unbounded_channel();
+        let (prev_tx, _prev_rx) = mpsc::unbounded_channel();
+        let seen_idx = Arc::new(std::sync::Mutex::new(None));
+        let seen_idx_cb = Arc::clone(&seen_idx);
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped_cb = Arc::clone(&stopped);
+
+        let mut handle = start_camera_with(
+            sample_camera_config(Some(5)),
+            h264_tx,
+            prev_tx,
+            || devices.clone(),
+            move |cfg, _, _| {
+                *seen_idx_cb.lock().unwrap() = cfg.device_index;
+                Ok(Box::new(StubCameraHandle {
+                    stopped: stopped_cb,
+                }))
+            },
+        )
+        .expect("start_camera_with should succeed with fallback index");
+        assert_eq!(*seen_idx.lock().unwrap(), Some(0));
+        handle.stop();
+        assert!(stopped.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Empty device list fails before invoking native starter.
+        let (h264_tx2, _) = mpsc::unbounded_channel();
+        let (prev_tx2, _) = mpsc::unbounded_channel();
+        let err = start_camera_with(
+            sample_camera_config(None),
+            h264_tx2,
+            prev_tx2,
+            Vec::new,
+            |_, _, _| unreachable!("native starter must not run when no cameras exist"),
+        )
+        .err()
+        .expect("empty devices must fail");
+        assert!(matches!(err, HuddleError::Video(_)));
+
+        // Native startup error propagates directly (no nokhwa fallback on macOS).
+        let (h264_tx3, _) = mpsc::unbounded_channel();
+        let (prev_tx3, _) = mpsc::unbounded_channel();
+        let native_err = start_camera_with(
+            sample_camera_config(Some(1)),
+            h264_tx3,
+            prev_tx3,
+            || devices,
+            |cfg, _, _| {
+                assert_eq!(cfg.device_index, Some(1));
+                Err(HuddleError::Video("camera permission denied".into()))
+            },
+        )
+        .err()
+        .expect("native error must propagate");
+        assert!(native_err.to_string().contains("camera permission denied"));
     }
 }

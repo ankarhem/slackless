@@ -923,7 +923,7 @@ void slackless_list_cameras(void *ctx, SlacklessCameraEnumCallback cb) {
         uint32_t idx = 0;
         for (AVCaptureDevice *dev in devices) {
             const char *name = dev.localizedName.UTF8String;
-            cb(ctx, idx, name ? name : "Camera");
+            cb(ctx, idx, name);
             idx++;
         }
     }
@@ -1157,21 +1157,23 @@ static CVPixelBufferRef apply_vision_metal_blur(SlacklessCamCapture *cap, CVPixe
         uint32_t h = (uint32_t)CVPixelBufferGetHeight(rawPB);
         if (w < 2 || h < 2) return;
 
-        // Lazily create/recreate VT encoder on actual camera dimensions (always even).
-        uint32_t enc_w = w & ~1U;
-        uint32_t enc_h = h & ~1U;
-        if (!cap->enc.vt || cap->enc.width != enc_w || cap->enc.height != enc_h) {
-            if (cap->enc.vt) {
-                VTCompressionSessionInvalidate(cap->enc.vt);
-                CFRelease(cap->enc.vt);
-                cap->enc.vt = NULL;
-            }
-            cap->enc.width = enc_w;
-            cap->enc.height = enc_h;
-            atomic_store(&cap->enc.force_keyframe, true);
-            if (configure_vt_encoder(
-                    enc_w, enc_h, cap->enc.fps, cap->bitrate_bps, 8.0, &cap->enc, &cap->enc.vt) != noErr) {
-                return;
+        // Lazily create/recreate VT encoder only when an H.264 consumer is attached.
+        if (cap->enc.on_h264) {
+            uint32_t enc_w = w & ~1U;
+            uint32_t enc_h = h & ~1U;
+            if (!cap->enc.vt || cap->enc.width != enc_w || cap->enc.height != enc_h) {
+                if (cap->enc.vt) {
+                    VTCompressionSessionInvalidate(cap->enc.vt);
+                    CFRelease(cap->enc.vt);
+                    cap->enc.vt = NULL;
+                }
+                cap->enc.width = enc_w;
+                cap->enc.height = enc_h;
+                atomic_store(&cap->enc.force_keyframe, true);
+                if (configure_vt_encoder(
+                        enc_w, enc_h, cap->enc.fps, cap->bitrate_bps, 8.0, &cap->enc, &cap->enc.vt) != noErr) {
+                    return;
+                }
             }
         }
 
@@ -1184,8 +1186,10 @@ static CVPixelBufferRef apply_vision_metal_blur(SlacklessCamCapture *cap, CVPixe
             }
         }
 
-        CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-        encode_cvpb(&cap->enc, activePB, pts);
+        if (cap->enc.on_h264) {
+            CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+            encode_cvpb(&cap->enc, activePB, pts);
+        }
 
         uint64_t now_us = monotonic_us();
         if (cap->on_surface_preview && (now_us - cap->last_preview_us) >= 50000ULL) {

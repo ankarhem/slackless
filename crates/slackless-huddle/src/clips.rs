@@ -1,9 +1,9 @@
 //! Native audio and video clip recording (`F-CORE-127`, `F-CORE-128`, `F-CORE-131`):
 //! - [`AudioClipRecorder`]: captures microphone via `cpal` + `sonora` NS/AGC, computes live RMS
 //!   bars, encodes PCM WAV (or compact AAC `.m4a` via macOS `afconvert` when available).
-//! - [`VideoClipRecorder`]: captures webcam (`nokhwa`) or screen/window (`xcap`), encodes H.264
-//!   via Cisco OpenH264, and muxes a valid ISO-BMFF `.mp4` (`ftyp`/`mdat`/`moov`/`avcC`) in pure
-//!   Rust with zero external binary requirements.
+//! - [`VideoClipRecorder`]: captures webcam (`AVFoundation` on macOS, `nokhwa` on Linux/Windows)
+//!   or screen/window (`xcap`), encodes H.264 via Cisco OpenH264, and muxes a valid ISO-BMFF
+//!   `.mp4` (`ftyp`/`mdat`/`moov`/`avcC`) in pure Rust with zero external binary requirements.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -12,8 +12,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
+#[cfg(not(target_os = "macos"))]
 use nokhwa::Camera;
+#[cfg(not(target_os = "macos"))]
 use nokhwa::pixel_format::RgbFormat;
+#[cfg(not(target_os = "macos"))]
 use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
 use sonora::config::{Config as SonoraConfig, GainController2, NoiseSuppression};
 use sonora::{AudioProcessing, StreamConfig as SonoraStreamConfig};
@@ -21,8 +24,8 @@ use sonora::{AudioProcessing, StreamConfig as SonoraStreamConfig};
 use crate::audio::{FRAME_10MS, SAMPLE_RATE};
 use crate::screen::{SCREEN_MAX_H, SCREEN_MAX_W};
 use crate::video::{
-    CAMERA_MAX_H, CAMERA_MAX_W, H264VideoEncoder, VideoFrame, resize_rgb_even, rgb_to_bgra,
-    rgba_to_rgb_and_bgra,
+    CAMERA_MAX_H, CAMERA_MAX_W, H264VideoEncoder, VideoFrame, bgra_to_rgb, resize_rgb_even,
+    rgb_to_bgra, rgba_to_rgb_and_bgra,
 };
 use crate::{HuddleError, Result};
 
@@ -328,9 +331,196 @@ struct EncodedH264Frame {
     annex_b: Vec<u8>,
 }
 
+/// Raw RGB888 frame delivered by a [`ClipFrameSource`] into [`VideoClipRecorder`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapturedRgbFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgb: Vec<u8>,
+}
+
+/// Injectable frame capture seam for [`VideoClipRecorder`]: implemented by native macOS
+/// `AVFoundation`, non-macOS `nokhwa`, `xcap` screen capture, and deterministic test fakes.
+trait ClipFrameSource {
+    fn next_frame(&mut self) -> Option<CapturedRgbFrame>;
+    fn stop(&mut self) {}
+}
+
+/// Convert a [`VideoFrame`] (zero-copy macOS `MacVideoSurface` or portable BGRA) into a tightly
+/// packed [`CapturedRgbFrame`] fit within `(max_w, max_h)`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn video_frame_to_clip_rgb(
+    frame: &VideoFrame,
+    max_w: u32,
+    max_h: u32,
+) -> Option<CapturedRgbFrame> {
+    let (w, h, bgra) = frame.to_bgra_fit(max_w, max_h)?;
+    if w < 2 || h < 2 || bgra.len() < (w as usize) * (h as usize) * 4 {
+        return None;
+    }
+    Some(CapturedRgbFrame {
+        width: w,
+        height: h,
+        rgb: bgra_to_rgb(&bgra),
+    })
+}
+
+#[cfg(target_os = "macos")]
+struct AvFoundationClipCamera {
+    capture: crate::macos_media::AvVtCameraCapture,
+    latest: Arc<Mutex<Option<VideoFrame>>>,
+    max_w: u32,
+    max_h: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl AvFoundationClipCamera {
+    fn open(device_index: Option<usize>, max_w: u32, max_h: u32) -> Result<Self> {
+        let available = crate::macos_media::list_macos_cameras();
+        let resolved = crate::video::select_camera_index(device_index, &available)
+            .ok_or_else(|| HuddleError::Video("no camera device found".into()))?;
+        let latest: Arc<Mutex<Option<VideoFrame>>> = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&latest);
+        let capture = crate::macos_media::AvVtCameraCapture::start_preview_only(
+            Some(resolved),
+            max_w,
+            max_h,
+            CLIP_FPS,
+            false,
+            move |frame| {
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(frame);
+                }
+            },
+        )?;
+        Ok(Self {
+            capture,
+            latest,
+            max_w,
+            max_h,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ClipFrameSource for AvFoundationClipCamera {
+    fn next_frame(&mut self) -> Option<CapturedRgbFrame> {
+        let frame = self.latest.lock().ok().and_then(|mut g| g.take())?;
+        video_frame_to_clip_rgb(&frame, self.max_w, self.max_h)
+    }
+
+    fn stop(&mut self) {
+        self.capture.stop();
+        if let Ok(mut guard) = self.latest.lock() {
+            *guard = None;
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+struct NokhwaClipCamera {
+    cam: Camera,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl NokhwaClipCamera {
+    fn open(device_index: Option<usize>) -> Result<Self> {
+        let idx = device_index.unwrap_or(0) as u32;
+        let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+        let cam = Camera::new(CameraIndex::Index(idx), req)
+            .and_then(|mut c| {
+                c.open_stream()?;
+                Ok(c)
+            })
+            .map_err(|e| HuddleError::Video(e.to_string()))?;
+        Ok(Self { cam })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl ClipFrameSource for NokhwaClipCamera {
+    fn next_frame(&mut self) -> Option<CapturedRgbFrame> {
+        let frame = self.cam.frame().ok()?;
+        let img = frame.decode_image::<RgbFormat>().ok()?;
+        let (width, height) = (img.width(), img.height());
+        Some(CapturedRgbFrame {
+            width,
+            height,
+            rgb: img.into_raw(),
+        })
+    }
+
+    fn stop(&mut self) {
+        let _ = self.cam.stop_stream();
+    }
+}
+
+struct ScreenClipSource {
+    source_id: String,
+}
+
+impl ClipFrameSource for ScreenClipSource {
+    fn next_frame(&mut self) -> Option<CapturedRgbFrame> {
+        let rgba = crate::screen::capture_once(&self.source_id)?;
+        let (rgb, _) = rgba_to_rgb_and_bgra(rgba.as_raw());
+        Some(CapturedRgbFrame {
+            width: rgba.width(),
+            height: rgba.height(),
+            rgb,
+        })
+    }
+}
+
 impl VideoClipRecorder {
     /// Start capturing camera or screen frames into H.264 plus synchronized microphone audio.
     pub fn start(source: ClipVideoSource) -> Result<Self> {
+        let frame_interval = Duration::from_millis(1000 / CLIP_FPS as u64);
+        match source {
+            ClipVideoSource::Camera(device_index) => {
+                #[cfg(target_os = "macos")]
+                {
+                    Self::start_with_source_factory(
+                        move || {
+                            AvFoundationClipCamera::open(device_index, CAMERA_MAX_W, CAMERA_MAX_H)
+                        },
+                        CAMERA_MAX_W,
+                        CAMERA_MAX_H,
+                        true,
+                        frame_interval,
+                    )
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Self::start_with_source_factory(
+                        move || NokhwaClipCamera::open(device_index),
+                        CAMERA_MAX_W,
+                        CAMERA_MAX_H,
+                        true,
+                        frame_interval,
+                    )
+                }
+            }
+            ClipVideoSource::Screen(source_id) => Self::start_with_source_factory(
+                move || Ok(ScreenClipSource { source_id }),
+                SCREEN_MAX_W,
+                SCREEN_MAX_H,
+                true,
+                frame_interval,
+            ),
+        }
+    }
+
+    fn start_with_source_factory<S, F>(
+        open_source: F,
+        max_w: u32,
+        max_h: u32,
+        enable_audio: bool,
+        frame_interval: Duration,
+    ) -> Result<Self>
+    where
+        S: ClipFrameSource,
+        F: FnOnce() -> Result<S> + Send + 'static,
+    {
         let running = Arc::new(AtomicBool::new(true));
         let latest_preview: Arc<Mutex<Option<VideoFrame>>> = Arc::new(Mutex::new(None));
         let thumbnails: Arc<Mutex<Vec<VideoFrame>>> = Arc::new(Mutex::new(Vec::with_capacity(4)));
@@ -348,24 +538,28 @@ impl VideoClipRecorder {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
 
         // Optional synchronized microphone capture thread (fails gracefully if no mic is available).
-        let audio_run = Arc::clone(&running);
-        let audio_buf = Arc::clone(&audio_pcm);
-        let audio_worker = std::thread::Builder::new()
-            .name("slackless-video-clip-audio".to_owned())
-            .spawn(move || {
-                let Ok(rec) = AudioClipRecorder::start() else {
-                    return;
-                };
-                while audio_run.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(40));
-                }
-                if let Ok((pcm, _)) = rec.stop_to_pcm()
-                    && let Ok(mut dst) = audio_buf.lock()
-                {
-                    *dst = pcm;
-                }
-            })
-            .ok();
+        let audio_worker = if enable_audio {
+            let audio_run = Arc::clone(&running);
+            let audio_buf = Arc::clone(&audio_pcm);
+            std::thread::Builder::new()
+                .name("slackless-video-clip-audio".to_owned())
+                .spawn(move || {
+                    let Ok(rec) = AudioClipRecorder::start() else {
+                        return;
+                    };
+                    while audio_run.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(40));
+                    }
+                    if let Ok((pcm, _)) = rec.stop_to_pcm()
+                        && let Ok(mut dst) = audio_buf.lock()
+                    {
+                        *dst = pcm;
+                    }
+                })
+                .ok()
+        } else {
+            None
+        };
 
         let worker = std::thread::Builder::new()
             .name("slackless-video-clip".to_owned())
@@ -377,107 +571,66 @@ impl VideoClipRecorder {
                         return;
                     }
                 };
-                match source {
-                    ClipVideoSource::Camera(device_index) => {
-                        let idx = device_index.unwrap_or(0) as u32;
-                        let req = RequestedFormat::new::<RgbFormat>(
-                            RequestedFormatType::AbsoluteHighestFrameRate,
-                        );
-                        let mut cam = match Camera::new(CameraIndex::Index(idx), req)
-                            .and_then(|mut c| {
-                                c.open_stream()?;
-                                Ok(c)
-                            })
-                            .map_err(|e| HuddleError::Video(e.to_string()))
-                        {
-                            Ok(c) => {
-                                let _ = ready_tx.send(Ok(()));
-                                c
-                            }
-                            Err(err) => {
-                                let _ = ready_tx.send(Err(err));
-                                return;
-                            }
-                        };
-                        while run_flag.load(Ordering::Relaxed) {
-                            let tick = Instant::now();
-                            if let Ok(frame) = cam.frame()
-                                && let Ok(img) = frame.decode_image::<RgbFormat>()
-                            {
-                                let (rgb, w, h) = resize_rgb_even(
-                                    img.as_raw(),
-                                    img.width(),
-                                    img.height(),
-                                    CAMERA_MAX_W,
-                                    CAMERA_MAX_H,
-                                );
-                                if w >= 2 && h >= 2 {
-                                    record_encoded_frame(
-                                        &mut enc,
-                                        &rgb,
-                                        w,
-                                        h,
-                                        &dims_cb,
-                                        &preview_cb,
-                                        &thumbs_cb,
-                                        &frames_cb,
-                                    );
-                                }
-                            }
-                            if frames_cb.lock().is_ok_and(|f| f.len() >= MAX_VIDEO_FRAMES) {
-                                break;
-                            }
-                            let sleep = Duration::from_millis(1000 / CLIP_FPS as u64)
-                                .saturating_sub(tick.elapsed());
-                            if !sleep.is_zero() {
-                                std::thread::sleep(sleep);
-                            }
-                        }
-                        let _ = cam.stop_stream();
-                    }
-                    ClipVideoSource::Screen(source_id) => {
+                let mut source = match open_source() {
+                    Ok(src) => {
                         let _ = ready_tx.send(Ok(()));
-                        while run_flag.load(Ordering::Relaxed) {
-                            let tick = Instant::now();
-                            if let Some(rgba) = crate::screen::capture_once(&source_id) {
-                                let (rgb_full, _) = rgba_to_rgb_and_bgra(rgba.as_raw());
-                                let (rgb, w, h) = resize_rgb_even(
-                                    &rgb_full,
-                                    rgba.width(),
-                                    rgba.height(),
-                                    SCREEN_MAX_W,
-                                    SCREEN_MAX_H,
-                                );
-                                if w >= 2 && h >= 2 {
-                                    record_encoded_frame(
-                                        &mut enc,
-                                        &rgb,
-                                        w,
-                                        h,
-                                        &dims_cb,
-                                        &preview_cb,
-                                        &thumbs_cb,
-                                        &frames_cb,
-                                    );
-                                }
-                            }
-                            if frames_cb.lock().is_ok_and(|f| f.len() >= MAX_VIDEO_FRAMES) {
-                                break;
-                            }
-                            let sleep = Duration::from_millis(1000 / CLIP_FPS as u64)
-                                .saturating_sub(tick.elapsed());
-                            if !sleep.is_zero() {
-                                std::thread::sleep(sleep);
-                            }
+                        src
+                    }
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(err));
+                        return;
+                    }
+                };
+                while run_flag.load(Ordering::Relaxed) {
+                    let tick = Instant::now();
+                    if let Some(captured) = source.next_frame()
+                        && captured.rgb.len()
+                            >= (captured.width as usize) * (captured.height as usize) * 3
+                    {
+                        let (rgb, w, h) = resize_rgb_even(
+                            &captured.rgb,
+                            captured.width,
+                            captured.height,
+                            max_w,
+                            max_h,
+                        );
+                        if w >= 2 && h >= 2 {
+                            record_encoded_frame(
+                                &mut enc,
+                                &rgb,
+                                w,
+                                h,
+                                &dims_cb,
+                                &preview_cb,
+                                &thumbs_cb,
+                                &frames_cb,
+                            );
                         }
+                    }
+                    if frames_cb.lock().is_ok_and(|f| f.len() >= MAX_VIDEO_FRAMES) {
+                        break;
+                    }
+                    let sleep = frame_interval.saturating_sub(tick.elapsed());
+                    if !sleep.is_zero() {
+                        std::thread::sleep(sleep);
                     }
                 }
+                source.stop();
             })
             .map_err(|e| HuddleError::Video(e.to_string()))?;
 
-        ready_rx
+        if let Err(err) = ready_rx
             .recv()
-            .map_err(|e| HuddleError::Video(e.to_string()))??;
+            .map_err(|e| HuddleError::Video(e.to_string()))
+            .and_then(|r| r)
+        {
+            running.store(false, Ordering::Relaxed);
+            let _ = worker.join();
+            if let Some(h) = audio_worker {
+                let _ = h.join();
+            }
+            return Err(err);
+        }
 
         Ok(Self {
             running,
@@ -1736,5 +1889,177 @@ mod tests {
             finish_audio_clip(Vec::new(), 100),
             Err(HuddleError::Audio(_))
         ));
+    }
+
+    struct MockClipFrameSource {
+        frames: VecDeque<Option<CapturedRgbFrame>>,
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl ClipFrameSource for MockClipFrameSource {
+        fn next_frame(&mut self) -> Option<CapturedRgbFrame> {
+            self.frames.pop_front().flatten()
+        }
+
+        fn stop(&mut self) {
+            self.stopped.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn solid_rgb_frame(width: u32, height: u32, r: u8, g: u8, b: u8) -> CapturedRgbFrame {
+        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+        for _ in 0..(width * height) {
+            rgb.extend_from_slice(&[r, g, b]);
+        }
+        CapturedRgbFrame { width, height, rgb }
+    }
+
+    #[test]
+    fn video_frame_to_clip_rgb_converts_bgra_and_macos_surface_without_camera_hardware() {
+        // Guards: tiny or truncated frames return None.
+        assert!(
+            video_frame_to_clip_rgb(&VideoFrame::from_bgra(1, 1, vec![0; 4]), 64, 64).is_none()
+        );
+        assert!(
+            video_frame_to_clip_rgb(&VideoFrame::from_bgra(4, 4, vec![0; 8]), 64, 64).is_none()
+        );
+
+        // Portable BGRA -> RGB conversion preserves channel order ([B,G,R,A] -> [R,G,B]).
+        let mut bgra = Vec::with_capacity(4 * 4 * 4);
+        for _ in 0..16 {
+            bgra.extend_from_slice(&[30, 20, 10, 255]);
+        }
+        let converted = video_frame_to_clip_rgb(&VideoFrame::from_bgra(4, 4, bgra), 64, 64)
+            .expect("valid BGRA converts to RGB");
+        assert_eq!((converted.width, converted.height), (4, 4));
+        assert_eq!(&converted.rgb[0..3], &[10, 20, 30]);
+
+        // On macOS, verify the exact MacVideoSurface -> VTPixelTransfer/vImage -> RGB clip path
+        // using a VideoToolbox-decoded synthetic H.264 frame (zero camera hardware touched).
+        #[cfg(target_os = "macos")]
+        {
+            let mut enc = H264VideoEncoder::new_camera().unwrap();
+            let src = solid_rgb_frame(160, 96, 40, 180, 220);
+            let bs = enc
+                .encode_rgb(&src.rgb, src.width as usize, src.height as usize)
+                .unwrap();
+            let mut vt = crate::macos_media::VtH264Decoder::new().unwrap();
+            let surface_vf = vt
+                .decode_annex_b(&bs)
+                .expect("VT should decode synthetic frame");
+            assert!(surface_vf.mac_surface().is_some());
+
+            let clip_rgb = video_frame_to_clip_rgb(&surface_vf, 80, 48)
+                .expect("MacVideoSurface should convert and downscale for clip recording");
+            assert_eq!((clip_rgb.width, clip_rgb.height), (80, 48));
+            assert_eq!(clip_rgb.rgb.len(), 80 * 48 * 3);
+        }
+    }
+
+    #[test]
+    fn video_clip_recorder_pipeline_captures_locks_dims_muxes_mp4_and_handles_errors() {
+        // 1. Source startup failure propagates cleanly without leaking threads.
+        let open_err = VideoClipRecorder::start_with_source_factory::<MockClipFrameSource, _>(
+            || Err(HuddleError::Video("no camera device found".into())),
+            CAMERA_MAX_W,
+            CAMERA_MAX_H,
+            false,
+            Duration::from_millis(1),
+        )
+        .err()
+        .expect("startup failure must return Err");
+        assert!(open_err.to_string().contains("no camera device found"));
+
+        // 2. End-to-end capture with None warm-up tick, valid frames, and mid-clip resize.
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_cb = Arc::clone(&stopped);
+        let queued = VecDeque::from(vec![
+            None, // camera warming up
+            Some(solid_rgb_frame(64, 48, 220, 60, 40)),
+            Some(solid_rgb_frame(64, 48, 40, 200, 80)),
+            // Different dimensions mid-clip: must be resized/locked to initial 64x48.
+            Some(solid_rgb_frame(96, 72, 60, 100, 240)),
+            // Truncated frame must be ignored safely without crashing.
+            Some(CapturedRgbFrame {
+                width: 64,
+                height: 48,
+                rgb: vec![0; 10],
+            }),
+        ]);
+        let rec = VideoClipRecorder::start_with_source_factory(
+            move || {
+                Ok(MockClipFrameSource {
+                    frames: queued,
+                    stopped: stopped_cb,
+                })
+            },
+            CAMERA_MAX_W,
+            CAMERA_MAX_H,
+            false,
+            Duration::from_millis(1),
+        )
+        .expect("mock recorder should start");
+
+        // Wait until all 3 valid frames have been encoded (bounded wait so test is fast & deterministic).
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if rec.frames.lock().is_ok_and(|f| f.len() >= 3) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(rec.latest_preview().is_some());
+
+        let clip = rec.stop().expect("stop should mux valid MP4 clip");
+        assert!(stopped.load(Ordering::Relaxed));
+        assert_eq!(clip.mime, "video/mp4");
+        assert!(clip.filename.ends_with(".mp4"));
+        assert!(clip.preview_frame.is_some());
+        assert!(!clip.thumbnail_frames.is_empty());
+
+        let top = parse_mp4_boxes(&clip.bytes);
+        assert_eq!(top.len(), 3);
+        assert_eq!(&top[0].fourcc, b"ftyp");
+        assert_eq!(&top[1].fourcc, b"mdat");
+        assert_eq!(&top[2].fourcc, b"moov");
+
+        // 3. Empty capture returns "no video frames captured" error on stop.
+        let empty_stopped = Arc::new(AtomicBool::new(false));
+        let empty_stopped_cb = Arc::clone(&empty_stopped);
+        let empty_rec = VideoClipRecorder::start_with_source_factory(
+            move || {
+                Ok(MockClipFrameSource {
+                    frames: VecDeque::new(),
+                    stopped: empty_stopped_cb,
+                })
+            },
+            CAMERA_MAX_W,
+            CAMERA_MAX_H,
+            false,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let empty_err = empty_rec.stop().expect_err("zero frames must fail");
+        assert!(empty_err.to_string().contains("no video frames captured"));
+        assert!(empty_stopped.load(Ordering::Relaxed));
+
+        // 4. Cancel stops worker and invokes source.stop() cleanly.
+        let cancel_stopped = Arc::new(AtomicBool::new(false));
+        let cancel_stopped_cb = Arc::clone(&cancel_stopped);
+        let cancel_rec = VideoClipRecorder::start_with_source_factory(
+            move || {
+                Ok(MockClipFrameSource {
+                    frames: VecDeque::from(vec![Some(solid_rgb_frame(64, 48, 10, 20, 30))]),
+                    stopped: cancel_stopped_cb,
+                })
+            },
+            CAMERA_MAX_W,
+            CAMERA_MAX_H,
+            false,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        cancel_rec.cancel();
+        assert!(cancel_stopped.load(Ordering::Relaxed));
     }
 }
