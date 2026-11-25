@@ -15,6 +15,10 @@ use crate::types::{
 /// History page size of the fake.
 const PAGE: usize = 2;
 
+fn test_media_tx() -> HuddleMediaSender {
+    mpsc::channel(HUDDLE_MEDIA_CHANNEL_CAPACITY).0
+}
+
 /// In-process stand-in for Slack: a fixed channel history paged by index cursors.
 #[derive(Clone, Default)]
 pub(crate) struct FakeBackend {
@@ -1858,9 +1862,17 @@ async fn tab_loads_fetch_their_data_and_emit_it() {
         ..Default::default()
     }]);
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake,
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::LoadPins(c1())).await;
+    core.handle(Command::Messaging(MessagingCommand::LoadPins(c1())))
+        .await;
     let Event::PinsLoaded { channel, pins } = next(&mut rx).await else {
         panic!("expected pins");
     };
@@ -1871,7 +1883,8 @@ async fn tab_loads_fetch_their_data_and_emit_it() {
         Some("pinned")
     );
 
-    core.handle(Command::LoadBookmarks(c1())).await;
+    core.handle(Command::Messaging(MessagingCommand::LoadBookmarks(c1())))
+        .await;
     let Event::BookmarksLoaded { channel, bookmarks } = next(&mut rx).await else {
         panic!("expected bookmarks");
     };
@@ -1879,8 +1892,10 @@ async fn tab_loads_fetch_their_data_and_emit_it() {
     assert_eq!((channel, bookmarks.len()), (c1(), 1));
     assert_eq!(bookmarks[0].title, "Runbook");
 
-    core.handle(Command::LoadFiles(FilesFilter::channel(c1())))
-        .await;
+    core.handle(Command::Collab(CollabCommand::LoadFiles(
+        FilesFilter::channel(c1()),
+    )))
+    .await;
     let Event::FilesLoaded { filter, files } = next(&mut rx).await else {
         panic!("expected files");
     };
@@ -1890,8 +1905,10 @@ async fn tab_loads_fetch_their_data_and_emit_it() {
     assert_eq!(files[0].id.as_str(), "F1");
 
     // A workspace-wide load (the Files view) keeps its filter on the answer too.
-    core.handle(Command::LoadFiles(FilesFilter::workspace()))
-        .await;
+    core.handle(Command::Collab(CollabCommand::LoadFiles(
+        FilesFilter::workspace(),
+    )))
+    .await;
     let Event::FilesLoaded { filter, files } = next(&mut rx).await else {
         panic!("expected workspace files");
     };
@@ -1904,10 +1921,19 @@ async fn failed_tab_load_answers_the_tab_with_the_error_and_reports_it() {
     let fake = FakeBackend::default();
     fake.fail_tab_loads();
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake,
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::LoadFiles(FilesFilter::channel(c1())))
-        .await;
+    core.handle(Command::Collab(CollabCommand::LoadFiles(
+        FilesFilter::channel(c1()),
+    )))
+    .await;
 
     let Event::FilesLoaded { filter, files } = next(&mut rx).await else {
         panic!("a failed load still answers its tab");
@@ -1927,13 +1953,20 @@ async fn failed_tab_load_answers_the_tab_with_the_error_and_reports_it() {
 async fn add_bookmark_adds_then_refetches_the_list() {
     let fake = FakeBackend::default();
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::AddBookmark {
+    core.handle(Command::Messaging(MessagingCommand::AddBookmark {
         channel: c1(),
         title: "Roadmap".into(),
         url: "https://acme.test/roadmap".into(),
-    })
+    }))
     .await;
 
     let Event::BookmarksLoaded { channel, bookmarks } = next(&mut rx).await else {
@@ -1960,14 +1993,21 @@ async fn add_bookmark_adds_then_refetches_the_list() {
 async fn set_pinned_calls_the_pin_method_then_refetches_the_list() {
     let fake = FakeBackend::default();
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
     let ts = Ts::from("1508197641.000151");
 
-    core.handle(Command::SetPinned {
+    core.handle(Command::Messaging(MessagingCommand::SetPinned {
         channel: c1(),
         ts: ts.clone(),
         pinned: true,
-    })
+    }))
     .await;
 
     let Event::PinsLoaded { channel, pins } = next(&mut rx).await else {
@@ -1982,26 +2022,37 @@ async fn set_pinned_calls_the_pin_method_then_refetches_the_list() {
 async fn dnd_snooze_and_scheduled_messages_commands_emit_updates() {
     let fake = FakeBackend::default();
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), store, TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        store,
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::SetDndSnooze { minutes: 30 }).await;
+    core.handle(Command::Workspace(WorkspaceCommand::SetDndSnooze {
+        minutes: 30,
+    }))
+    .await;
     let Event::SelfDndUpdated(status) = next(&mut rx).await else {
         panic!("expected SelfDndUpdated");
     };
     assert!(status.snooze_enabled);
 
-    core.handle(Command::EndDndSnooze).await;
+    core.handle(Command::Workspace(WorkspaceCommand::EndDndSnooze))
+        .await;
     let Event::SelfDndUpdated(status) = next(&mut rx).await else {
         panic!("expected SelfDndUpdated");
     };
     assert!(!status.snooze_enabled);
 
-    core.handle(Command::ScheduleMessage {
+    core.handle(Command::Messaging(MessagingCommand::ScheduleMessage {
         channel: c1(),
         post_at: 1_760_010_000,
         content: MessageContent::plain("later"),
         thread_ts: None,
-    })
+    }))
     .await;
     let Event::MessageScheduled {
         channel,
@@ -2018,10 +2069,12 @@ async fn dnd_snooze_and_scheduled_messages_commands_emit_updates() {
     };
     assert_eq!(list.len(), 1);
 
-    core.handle(Command::DeleteScheduledMessage {
-        channel: c1(),
-        scheduled_message_id,
-    })
+    core.handle(Command::Messaging(
+        MessagingCommand::DeleteScheduledMessage {
+            channel: c1(),
+            scheduled_message_id,
+        },
+    ))
     .await;
     let Event::ScheduledMessagesLoaded(Ok(list)) = next(&mut rx).await else {
         panic!("expected refreshed empty ScheduledMessagesLoaded");
@@ -2044,7 +2097,14 @@ async fn create_channel_canvas_refreshes_the_conversation_and_announces_the_id()
         ..Default::default()
     });
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
     let ws = TeamId::from("T1");
     store
         .lock()
@@ -2059,7 +2119,8 @@ async fn create_channel_canvas_refreshes_the_conversation_and_announces_the_id()
         )
         .unwrap();
 
-    core.handle(Command::CreateChannelCanvas(c1())).await;
+    core.handle(Command::Collab(CollabCommand::CreateChannelCanvas(c1())))
+        .await;
 
     assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
     assert_eq!(
@@ -2095,6 +2156,7 @@ async fn hydrate_fills_conversations() {
         Arc::clone(&store),
         TeamId::from("T1"),
         events,
+        test_media_tx(),
     )
     .await;
     core.hydrate().await;
@@ -2133,15 +2195,16 @@ async fn commands_update_the_store_and_report_back() {
         Arc::clone(&store),
         TeamId::from("T1"),
         events,
+        test_media_tx(),
     )
     .await;
 
-    core.handle(Command::SendMessage {
+    core.handle(Command::Messaging(MessagingCommand::SendMessage {
         channel: c1(),
         content: MessageContent::plain("hi there"),
         thread_ts: None,
         broadcast: false,
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
     let history = store
@@ -2151,7 +2214,8 @@ async fn commands_update_the_store_and_report_back() {
         .unwrap();
     assert_eq!(history[0].message.text, "hi there");
 
-    core.handle(Command::Search("there".into())).await;
+    core.handle(Command::Collab(CollabCommand::Search("there".into())))
+        .await;
     let Event::SearchResults { query, messages } = next(&mut rx).await else {
         panic!("expected local results first");
     };
@@ -2160,10 +2224,10 @@ async fn commands_update_the_store_and_report_back() {
         matches!(next(&mut rx).await, Event::RemoteSearchResults { results, .. } if results.total == 7)
     );
 
-    core.handle(Command::MarkRead {
+    core.handle(Command::Messaging(MessagingCommand::MarkRead {
         channel: c1(),
         ts: Ts::from("1.0"),
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -2177,12 +2241,19 @@ async fn open_thread_fetches_the_full_thread_into_the_store() {
     fake.push_history(1..=5);
     fake.push_thread("5.0", 1..=3);
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::OpenThread {
+    core.handle(Command::Messaging(MessagingCommand::OpenThread {
         channel: c1(),
         thread_ts: Ts::from("5.0"),
-    })
+    }))
     .await;
     // Root + 3 replies at PAGE messages per page: two committed, announced pages.
     assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
@@ -2206,14 +2277,21 @@ async fn following_a_thread_tells_slack_then_rereads_the_thread() {
     let fake = FakeBackend::default();
     fake.push_thread("5.0", 1..=1);
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::SetThreadSubscribed {
+    core.handle(Command::Messaging(MessagingCommand::SetThreadSubscribed {
         channel: c1(),
         thread_ts: Ts::from("5.0"),
         last_read: Ts::from("5.0.1"),
         subscribed: true,
-    })
+    }))
     .await;
     // The re-read commits the thread, which is what refreshes the root's follow flag.
     assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
@@ -2228,17 +2306,26 @@ async fn following_a_thread_tells_slack_then_rereads_the_thread() {
 async fn mark_thread_read_posts_thread_cursor() {
     let fake = FakeBackend::default();
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::MarkThreadRead {
+    core.handle(Command::Messaging(MessagingCommand::MarkThreadRead {
         channel: c1(),
         thread_ts: Ts::from("5.0"),
         ts: Ts::from("5.0.3"),
-    })
+    }))
     .await;
     // Flush the spawned task by following with a synchronous-event command.
-    core.handle(Command::FetchChannelManagers { channel: c1() })
-        .await;
+    core.handle(Command::Channel(ChannelCommand::FetchChannelManagers {
+        channel: c1(),
+    }))
+    .await;
     let _ = next(&mut rx).await;
 
     assert_eq!(
@@ -2252,10 +2339,19 @@ async fn fetching_channel_managers_announces_them() {
     let fake = FakeBackend::default();
     fake.state.lock().unwrap().managers = vec![UserId::from("U9")];
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake,
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::FetchChannelManagers { channel: c1() })
-        .await;
+    core.handle(Command::Channel(ChannelCommand::FetchChannelManagers {
+        channel: c1(),
+    }))
+    .await;
     assert_eq!(
         next(&mut rx).await,
         Event::ChannelManagers {
@@ -2270,12 +2366,19 @@ async fn open_thread_reports_api_failures() {
     let fake = FakeBackend::default();
     fake.fail_replies();
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake,
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::OpenThread {
+    core.handle(Command::Messaging(MessagingCommand::OpenThread {
         channel: c1(),
         thread_ts: Ts::from("5.0"),
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -2291,6 +2394,7 @@ async fn loop_applies_socket_events_in_order_and_stops_on_shutdown() {
         Arc::clone(&store),
         TeamId::from("T1"),
         events,
+        test_media_tx(),
     )
     .await;
     let (command_tx, command_rx) = mpsc::unbounded();
@@ -2325,7 +2429,7 @@ async fn loop_applies_socket_events_in_order_and_stops_on_shutdown() {
 
     // The socket stream ended; commands are still served.
     command_tx
-        .unbounded_send(Command::OpenConversation(c1()))
+        .unbounded_send(Command::Channel(ChannelCommand::OpenConversation(c1())))
         .unwrap();
     // Opening also spawns the open-time `conversations.info` merge, so its
     // `ConversationInfo` event may interleave with the backfill's `StoreChanged`.
@@ -2356,7 +2460,14 @@ async fn open_conversation_merges_member_count_without_clobbering_stored_fields(
     // human-only re-count.
     fake.set_members((1..=42).map(|i| UserId::from(format!("U{i}"))).collect());
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake,
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
     let ws = TeamId::from("T1");
     // Stored from `client.userBoot`: no member count, but richer unread and name state.
     store
@@ -2374,7 +2485,8 @@ async fn open_conversation_merges_member_count_without_clobbering_stored_fields(
         )
         .unwrap();
 
-    core.handle(Command::OpenConversation(c1())).await;
+    core.handle(Command::Channel(ChannelCommand::OpenConversation(c1())))
+        .await;
 
     loop {
         match next(&mut rx).await {
@@ -2434,9 +2546,17 @@ async fn open_conversation_counts_humans_and_apps_for_the_header() {
                 .unwrap();
         }
     }
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::OpenConversation(c1())).await;
+    core.handle(Command::Channel(ChannelCommand::OpenConversation(c1())))
+        .await;
 
     loop {
         match next(&mut rx).await {
@@ -2486,9 +2606,17 @@ async fn open_conversation_falls_back_to_infos_count_when_members_fail() {
     });
     fake.fail_members();
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::OpenConversation(c1())).await;
+    core.handle(Command::Channel(ChannelCommand::OpenConversation(c1())))
+        .await;
 
     loop {
         match next(&mut rx).await {
@@ -2557,9 +2685,17 @@ async fn open_conversation_of_connect_channel_resolves_the_connected_teams() {
                 .unwrap();
         }
     }
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::OpenConversation(c1())).await;
+    core.handle(Command::Channel(ChannelCommand::OpenConversation(c1())))
+        .await;
 
     let mut announced = Vec::new();
     loop {
@@ -2601,18 +2737,25 @@ async fn set_topic_and_purpose_merge_into_the_stored_conversation() {
             },
         )
         .unwrap();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::SetChannelTopic {
+    core.handle(Command::Channel(ChannelCommand::SetChannelTopic {
         channel: c1(),
         topic: "Ship it".into(),
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
-    core.handle(Command::SetChannelPurpose {
+    core.handle(Command::Channel(ChannelCommand::SetChannelPurpose {
         channel: c1(),
         purpose: "Deploys at 14:00".into(),
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
     let stored = store
@@ -2669,7 +2812,14 @@ async fn hydrate_backfills_previews_only_for_dms_without_stored_messages() {
             )
             .unwrap();
     }
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
     core.hydrate().await;
 
     // The preview lands for the message-less DM through the message-store write path.
@@ -2712,7 +2862,10 @@ async fn hydrate_backfills_previews_only_for_dms_without_stored_messages() {
 
     // Opening the DM still walks the full history from the newest page: one stored
     // preview message neither satisfies nor completes it.
-    core.handle(Command::OpenConversation(dm2.clone())).await;
+    core.handle(Command::Channel(ChannelCommand::OpenConversation(
+        dm2.clone(),
+    )))
+    .await;
     loop {
         match next(&mut rx).await {
             Event::HistoryComplete { channel } if channel == dm2 => break,
@@ -2775,7 +2928,14 @@ async fn hydrate_lists_dms_and_previews_only_open_conversations() {
             },
         )
         .unwrap();
-    let core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events).await;
+    let core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
     core.hydrate().await;
 
     loop {
@@ -2871,7 +3031,14 @@ async fn hydrate_records_channel_memberships_from_users_conversations() {
             )
             .unwrap();
     }
-    let core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events).await;
+    let core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
     core.hydrate().await;
 
     async fn run_to_sidebar(rx: &mut UnboundedReceiver<Event>) -> Vec<ChannelId> {
@@ -2939,12 +3106,19 @@ async fn set_notify_level_writes_slack_prefs_then_mirrors_them() {
     let fake = FakeBackend::default();
     let (store, events, mut rx) = fake_core_parts();
     let ws = TeamId::from("T1");
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::SetNotifyLevel {
+    core.handle(Command::Channel(ChannelCommand::SetNotifyLevel {
         channel: c1(),
         level: crate::NotifyLevel::Mentions,
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::SidebarChanged);
     assert_eq!(
@@ -2980,9 +3154,17 @@ async fn leave_conversation_stores_it_as_left_once_slack_confirms() {
             },
         )
         .unwrap();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::LeaveConversation(c1())).await;
+    core.handle(Command::Channel(ChannelCommand::LeaveConversation(c1())))
+        .await;
     assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
     let stored = store.lock().unwrap().conversation(&ws, &c1()).unwrap();
     assert!(!stored.expect("stays stored").is_member, "stored as left");
@@ -2994,9 +3176,17 @@ async fn join_conversation_stores_it_as_joined_once_slack_confirms() {
     let fake = FakeBackend::default();
     let (store, events, mut rx) = fake_core_parts();
     let ws = TeamId::from("T1");
-    let mut core = Core::new(fake, Arc::clone(&store), ws.clone(), events).await;
+    let mut core = Core::new(
+        fake,
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::JoinConversation(c1())).await;
+    core.handle(Command::Channel(ChannelCommand::JoinConversation(c1())))
+        .await;
     assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
     let stored = store.lock().unwrap().conversation(&ws, &c1()).unwrap();
     assert!(stored.expect("stored").is_member, "stored as joined");
@@ -3006,18 +3196,31 @@ async fn join_conversation_stores_it_as_joined_once_slack_confirms() {
 async fn resolve_users_stores_each_missing_profile_once() {
     let fake = FakeBackend::default();
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
     let ext = UserId::from("U9");
 
-    core.handle(Command::ResolveUsers(vec![ext.clone(), ext.clone()]))
-        .await;
+    core.handle(Command::Workspace(WorkspaceCommand::ResolveUsers(vec![
+        ext.clone(),
+        ext.clone(),
+    ])))
+    .await;
     assert_eq!(next(&mut rx).await, Event::UsersChanged(vec![ext.clone()]));
     let users = store.lock().unwrap().users(&TeamId::from("T1")).unwrap();
     let names: Vec<&str> = users.iter().map(|user| user.name.as_str()).collect();
     assert_eq!(names, ["ext-U9"], "the profile lands in the store");
 
     // Asked once per session: a repeat never reaches `users.info` again.
-    core.handle(Command::ResolveUsers(vec![ext.clone()])).await;
+    core.handle(Command::Workspace(WorkspaceCommand::ResolveUsers(vec![
+        ext.clone(),
+    ])))
+    .await;
     assert_eq!(fake.user_info_calls(), vec![ext]);
 }
 
@@ -3040,11 +3243,21 @@ async fn resolve_users_skips_profiles_the_store_already_has() {
             },
         )
         .unwrap();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), ws, events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws,
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     let ext = UserId::from("U9");
-    core.handle(Command::ResolveUsers(vec![UserId::from("U1"), ext.clone()]))
-        .await;
+    core.handle(Command::Workspace(WorkspaceCommand::ResolveUsers(vec![
+        UserId::from("U1"),
+        ext.clone(),
+    ])))
+    .await;
     assert_eq!(next(&mut rx).await, Event::UsersChanged(vec![ext.clone()]));
     assert_eq!(
         fake.user_info_calls(),
@@ -3065,11 +3278,21 @@ async fn resolve_users_learns_the_organizations_of_the_people_found() {
     });
     let (store, events, mut rx) = fake_core_parts();
     let ws = TeamId::from("T1");
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     // The external person's profile lands first, then their organization's record, so a
     // Slack Connect channel can name it on its first visit.
-    core.handle(Command::ResolveUsers(vec![ext.clone()])).await;
+    core.handle(Command::Workspace(WorkspaceCommand::ResolveUsers(vec![
+        ext.clone(),
+    ])))
+    .await;
     assert_eq!(next(&mut rx).await, Event::UsersChanged(vec![ext]));
     assert_eq!(next(&mut rx).await, Event::SidebarChanged);
     assert_eq!(fake.team_info_calls(), vec![TeamId::from("T0EXT")]);
@@ -3089,9 +3312,17 @@ async fn open_conversation_announces_an_empty_member_list_when_info_fails() {
     let fake = FakeBackend::default();
     fake.fail_info();
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::OpenConversation(c1())).await;
+    core.handle(Command::Channel(ChannelCommand::OpenConversation(c1())))
+        .await;
 
     loop {
         match next(&mut rx).await {
@@ -3142,7 +3373,14 @@ async fn open_dm_fetches_peer_dnd_and_presence_once_each() {
         },
     );
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
     let ws = TeamId::from("T1");
     let dm = ChannelId::from("D1");
     store
@@ -3160,7 +3398,10 @@ async fn open_dm_fetches_peer_dnd_and_presence_once_each() {
         )
         .unwrap();
 
-    core.handle(Command::OpenConversation(dm.clone())).await;
+    core.handle(Command::Channel(ChannelCommand::OpenConversation(
+        dm.clone(),
+    )))
+    .await;
     let (mut dnd, mut presence) = (false, false);
     for _ in 0..8 {
         match next(&mut rx).await {
@@ -3188,7 +3429,8 @@ async fn open_dm_fetches_peer_dnd_and_presence_once_each() {
 
     // Re-opening re-checks DND (transient by design) but never re-polls a presence the
     // websocket subscription already covers.
-    core.handle(Command::OpenConversation(dm)).await;
+    core.handle(Command::Channel(ChannelCommand::OpenConversation(dm)))
+        .await;
     loop {
         match next(&mut rx).await {
             Event::DndPaused { paused, .. } if paused => break,
@@ -3224,9 +3466,17 @@ async fn fetch_threads_emits_the_view() {
         ..Default::default()
     });
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake,
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::FetchThreads).await;
+    core.handle(Command::Messaging(MessagingCommand::FetchThreads))
+        .await;
 
     let Event::ThreadsView(view) = next(&mut rx).await else {
         panic!("expected the threads view");
@@ -3278,12 +3528,21 @@ async fn fetch_activity_hydrates_rows_and_marks_route() {
     );
     fake.set_activity(feed, bodies);
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake,
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     // Without bodies (the boot fetch): the ref row stays empty, the inline one keeps its
     // body, and the badge state still lands.
-    core.handle(Command::FetchActivity { with_bodies: false })
-        .await;
+    core.handle(Command::Messaging(MessagingCommand::FetchActivity {
+        with_bodies: false,
+    }))
+    .await;
     let Event::ActivityView { feed } = next(&mut rx).await else {
         panic!("expected the activity view");
     };
@@ -3292,8 +3551,10 @@ async fn fetch_activity_hydrates_rows_and_marks_route() {
     assert_eq!(feed.items[1].message.as_ref().unwrap().text, "inline");
 
     // With bodies (the view opened): the ref row is hydrated by (channel, ts).
-    core.handle(Command::FetchActivity { with_bodies: true })
-        .await;
+    core.handle(Command::Messaging(MessagingCommand::FetchActivity {
+        with_bodies: true,
+    }))
+    .await;
     let Event::ActivityView { feed } = next(&mut rx).await else {
         panic!("expected the hydrated activity view");
     };
@@ -3303,15 +3564,17 @@ async fn fetch_activity_hydrates_rows_and_marks_route() {
         "hydrated <@U1>"
     );
 
-    core.handle(Command::MarkActivity {
+    core.handle(Command::Messaging(MessagingCommand::MarkActivity {
         entries: vec![feed.items[0].entry()],
         read: true,
-    })
+    }))
     .await;
     // The mark runs detached; a further fetch's event (same single-threaded runtime,
     // FIFO polling) only lands after the earlier spawn completed.
-    core.handle(Command::FetchActivity { with_bodies: false })
-        .await;
+    core.handle(Command::Messaging(MessagingCommand::FetchActivity {
+        with_bodies: false,
+    }))
+    .await;
     assert!(matches!(
         next(&mut rx).await,
         Event::ActivityView { feed: Ok(_) }
@@ -3330,12 +3593,13 @@ async fn open_dm_stores_and_announces_the_conversation() {
         Arc::clone(&store),
         TeamId::from("T1"),
         events,
+        test_media_tx(),
     )
     .await;
 
-    core.handle(Command::OpenDm {
+    core.handle(Command::Channel(ChannelCommand::OpenDm {
         users: vec![UserId::from("U2")],
-    })
+    }))
     .await;
 
     assert_eq!(
@@ -3363,12 +3627,13 @@ async fn open_group_dm_stores_mpim_conversation() {
         Arc::clone(&store),
         TeamId::from("T1"),
         events,
+        test_media_tx(),
     )
     .await;
 
-    core.handle(Command::OpenDm {
+    core.handle(Command::Channel(ChannelCommand::OpenDm {
         users: vec![UserId::from("U2"), UserId::from("U3")],
-    })
+    }))
     .await;
 
     assert_eq!(
@@ -3397,10 +3662,11 @@ async fn upload_files_calls_backend_and_emits_uploaded_count() {
         Arc::clone(&store),
         TeamId::from("T1"),
         events,
+        test_media_tx(),
     )
     .await;
 
-    core.handle(Command::UploadFiles {
+    core.handle(Command::Collab(CollabCommand::UploadFiles {
         channel: ChannelId::from("C1"),
         thread_ts: None,
         content: Some(MessageContent::plain("attached")),
@@ -3414,7 +3680,7 @@ async fn upload_files_calls_backend_and_emits_uploaded_count() {
                 bytes: vec![4, 5],
             },
         ],
-    })
+    }))
     .await;
 
     assert_eq!(
@@ -3434,12 +3700,13 @@ async fn create_section_reloads_the_stored_sections() {
         Arc::clone(&store),
         TeamId::from("T1"),
         events,
+        test_media_tx(),
     )
     .await;
 
-    core.handle(Command::CreateSection {
+    core.handle(Command::Channel(ChannelCommand::CreateSection {
         name: "Quiet".into(),
-    })
+    }))
     .await;
 
     assert_eq!(next(&mut rx).await, Event::SidebarChanged);
@@ -3461,12 +3728,19 @@ async fn rename_section_resends_the_stored_emoji_and_reloads() {
         .unwrap()
         .replace_sections(&TeamId::from("T1"), &base_sections())
         .unwrap();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::RenameSection {
+    core.handle(Command::Channel(ChannelCommand::RenameSection {
         section: "L2".into(),
         name: "Roadmap".into(),
-    })
+    }))
     .await;
 
     assert_eq!(next(&mut rx).await, Event::SidebarChanged);
@@ -3487,11 +3761,18 @@ async fn rename_section_resends_the_stored_emoji_and_reloads() {
 async fn delete_section_removes_it_and_reloads() {
     let fake = FakeBackend::default();
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::DeleteSection {
+    core.handle(Command::Channel(ChannelCommand::DeleteSection {
         section: "L2".into(),
-    })
+    }))
     .await;
 
     assert_eq!(next(&mut rx).await, Event::SidebarChanged);
@@ -3509,14 +3790,21 @@ async fn move_channel_sends_the_remove_side_and_reloads() {
         .unwrap()
         .replace_sections(&TeamId::from("T1"), &base_sections())
         .unwrap();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     // Out of the custom section, back to the Channels bucket: a remove only.
-    core.handle(Command::MoveChannel {
+    core.handle(Command::Channel(ChannelCommand::MoveChannel {
         channel: c1(),
         from: Some("L2".into()),
         to: None,
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::SidebarChanged);
     assert_eq!(
@@ -3535,11 +3823,11 @@ async fn move_channel_sends_the_remove_side_and_reloads() {
     );
 
     // Into a custom section: an insert only ("Priority" lost C1 above).
-    core.handle(Command::MoveChannel {
+    core.handle(Command::Channel(ChannelCommand::MoveChannel {
         channel: c1(),
         from: None,
         to: Some("L2".into()),
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::SidebarChanged);
     assert_eq!(
@@ -3560,12 +3848,19 @@ async fn create_section_with_channel_moves_the_channel_into_it() {
         .unwrap()
         .replace_sections(&TeamId::from("T1"), &base_sections())
         .unwrap();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::CreateSectionWithChannel {
+    core.handle(Command::Channel(ChannelCommand::CreateSectionWithChannel {
         name: "Quiet".into(),
         channel: c1(),
-    })
+    }))
     .await;
 
     assert_eq!(next(&mut rx).await, Event::SidebarChanged);
@@ -3589,9 +3884,17 @@ async fn create_section_with_channel_moves_the_channel_into_it() {
 async fn fetch_latest_history_stores_one_page_without_marking_read() {
     let fake = FakeBackend::with_history(1..=60);
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::FetchLatestHistory(c1())).await;
+    core.handle(Command::Channel(ChannelCommand::FetchLatestHistory(c1())))
+        .await;
 
     assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
     let state = fake.state.lock().unwrap();
@@ -3612,7 +3915,14 @@ async fn fetch_latest_history_stores_one_page_without_marking_read() {
 async fn offline_queue_buffers_and_flushes_on_reconnect() {
     let fake = FakeBackend::default();
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     // Drop offline via RTM reconnecting state.
     let reconnecting = ConnectionState::Reconnecting {
@@ -3624,27 +3934,27 @@ async fn offline_queue_buffers_and_flushes_on_reconnect() {
     assert_eq!(next(&mut rx).await, Event::Connection(reconnecting));
 
     // Queue a message, reaction, and read-mark while offline.
-    core.handle(Command::SendMessage {
+    core.handle(Command::Messaging(MessagingCommand::SendMessage {
         channel: c1(),
         content: MessageContent::plain("first offline"),
         thread_ts: None,
         broadcast: false,
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
 
-    core.handle(Command::AddReaction {
+    core.handle(Command::Messaging(MessagingCommand::AddReaction {
         channel: c1(),
         ts: Ts::from("100.0"),
         name: "thumbsup".into(),
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(2));
 
-    core.handle(Command::MarkRead {
+    core.handle(Command::Messaging(MessagingCommand::MarkRead {
         channel: c1(),
         ts: Ts::from("100.0"),
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(3));
 
@@ -3700,7 +4010,14 @@ async fn offline_queue_persists_across_restart_and_retries_or_discards() {
     let fake = FakeBackend::default();
     fake.state.lock().unwrap().fail_post_message = true;
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     let offline = ConnectionState::Disconnected {
         reason: "offline".into(),
@@ -3708,12 +4025,12 @@ async fn offline_queue_persists_across_restart_and_retries_or_discards() {
     core.on_rtm(RtmEvent::State(offline.clone())).await;
     assert_eq!(next(&mut rx).await, Event::Connection(offline));
 
-    core.handle(Command::SendMessage {
+    core.handle(Command::Messaging(MessagingCommand::SendMessage {
         channel: c1(),
         content: MessageContent::plain("survives restart"),
         thread_ts: None,
         broadcast: false,
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
 
@@ -3725,6 +4042,7 @@ async fn offline_queue_persists_across_restart_and_retries_or_discards() {
         Arc::clone(&store),
         TeamId::from("T1"),
         Emitter(tx2),
+        test_media_tx(),
     )
     .await;
     // Core::new announces the restored persisted queue count immediately.
@@ -3754,7 +4072,11 @@ async fn offline_queue_persists_across_restart_and_retries_or_discards() {
 
     // Now backend recovers -> RetryOfflineMutation succeeds and removes the SQLite row.
     fake.state.lock().unwrap().fail_post_message = false;
-    core2.handle(Command::RetryOfflineMutation(failed.id)).await;
+    core2
+        .handle(Command::Messaging(MessagingCommand::RetryOfflineMutation(
+            failed.id,
+        )))
+        .await;
     assert_eq!(next(&mut rx2).await, Event::StoreChanged { channel: c1() });
     wait_until("offline queue row removed after retry", || {
         store
@@ -3883,7 +4205,14 @@ async fn hydrate_prefetches_unread_dms_before_channels_and_skips_up_to_date_stor
         )
         .unwrap();
 
-    let core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
     core.hydrate().await;
 
     // Wait until all 24 prefetched channels (25 cap minus 1 skipped up-to-date DM) emit
@@ -3967,7 +4296,14 @@ async fn reconnect_refreshes_counts_and_prefetches_missed_messages() {
         )
         .unwrap();
 
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     // 1st Connected: no reconnect counts refresh yet.
     core.on_rtm(RtmEvent::State(ConnectionState::Connected {
@@ -4040,7 +4376,14 @@ async fn bot_profile_caching_shares_cache_dedups_and_persists_across_paths() {
         state.fail_bots.insert(BotId::from("BFAIL"));
     }
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     // 1. RTM Message does NOT block on `bots.info`: StoreChanged + MessagePosted land immediately,
     //    then the background `bots.info` task persists B1 to SQLite, updates the stored message,
@@ -4085,8 +4428,10 @@ async fn bot_profile_caching_shares_cache_dedups_and_persists_across_paths() {
     );
 
     // 2. ResolveBots(B1) hits memory cache immediately with 0 extra `bots.info` calls.
-    core.handle(Command::ResolveBots(vec![BotId::from("B1")]))
-        .await;
+    core.handle(Command::Workspace(WorkspaceCommand::ResolveBots(vec![
+        BotId::from("B1"),
+    ])))
+    .await;
     assert!(matches!(
         next(&mut rx).await,
         Event::BotProfileLoaded { bot_id, profile }
@@ -4099,8 +4444,10 @@ async fn bot_profile_caching_shares_cache_dedups_and_persists_across_paths() {
 
     // 3. ResolveBots(B2) fetches B2 AND populates `core.bots`, so subsequent RTM Changed
     //    attaches B2 from cache synchronously without another `bots.info` call.
-    core.handle(Command::ResolveBots(vec![BotId::from("B2")]))
-        .await;
+    core.handle(Command::Workspace(WorkspaceCommand::ResolveBots(vec![
+        BotId::from("B2"),
+    ])))
+    .await;
     assert!(matches!(
         next(&mut rx).await,
         Event::BotProfileLoaded { bot_id, profile }
@@ -4169,13 +4516,14 @@ async fn bot_profile_caching_shares_cache_dedups_and_persists_across_paths() {
         Arc::clone(&store),
         TeamId::from("T1"),
         Emitter(tx2),
+        test_media_tx(),
     )
     .await;
     core2
-        .handle(Command::ResolveBots(vec![
+        .handle(Command::Workspace(WorkspaceCommand::ResolveBots(vec![
             BotId::from("B1"),
             BotId::from("B2"),
-        ]))
+        ])))
         .await;
     assert!(
         matches!(next(&mut rx2).await, Event::BotProfileLoaded { bot_id, .. } if bot_id == BotId::from("B1"))
@@ -4193,13 +4541,20 @@ async fn bot_profile_caching_shares_cache_dedups_and_persists_across_paths() {
 async fn huddle_commands_and_lifecycle_races() {
     let fake = FakeBackend::default();
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     // 1. JoinHuddle error (UnsupportedHuddleBackend) emits Event::Error and resets `joining`.
-    core.handle(Command::JoinHuddle {
+    core.handle(Command::Huddle(HuddleCommand::Join {
         channel: c1(),
         audio: crate::huddle::HuddleAudioConfig::default(),
-    })
+    }))
     .await;
     assert!(matches!(next(&mut rx).await, Event::Error(e) if e.contains("rooms.join")));
     assert!(!core.huddle.lock().unwrap().joining);
@@ -4216,22 +4571,22 @@ async fn huddle_commands_and_lifecycle_races() {
             ..Default::default()
         });
     }
-    core.handle(Command::JoinHuddle {
+    core.handle(Command::Huddle(HuddleCommand::Join {
         channel: c1(),
         audio: crate::huddle::HuddleAudioConfig::default(),
-    })
+    }))
     .await;
     // Second concurrent JoinHuddle is ignored while `joining == true`.
-    core.handle(Command::JoinHuddle {
+    core.handle(Command::Huddle(HuddleCommand::Join {
         channel: ChannelId::from("C2"),
         audio: crate::huddle::HuddleAudioConfig::default(),
-    })
+    }))
     .await;
     tokio::task::yield_now().await;
     assert_eq!(fake.state.lock().unwrap().rooms_join_calls, vec![c1()]);
 
     // LeaveHuddle cancels the in-flight join before rooms_join returns.
-    core.handle(Command::LeaveHuddle).await;
+    core.handle(Command::Huddle(HuddleCommand::Leave)).await;
     gate.notify_waiters();
     wait_until("cancelled join clears joining flag", || {
         !core.huddle.lock().unwrap().joining
@@ -4250,41 +4605,47 @@ async fn huddle_commands_and_lifecycle_races() {
     }
 
     // 3. CopyHuddleLink (fallback default & custom API URL), InviteToHuddle, DeclineHuddleInvite.
-    core.handle(Command::CopyHuddleLink { channel: c1() }).await;
+    core.handle(Command::Huddle(HuddleCommand::GetLink { channel: c1() }))
+        .await;
     assert_eq!(
         next(&mut rx).await,
-        Event::HuddleLinkLoaded {
+        Event::Huddle(HuddleEvent::LinkLoaded {
             channel: c1(),
             url: "https://app.slack.com/huddle/T1/C1".into(),
-        }
+        })
     );
     fake.state.lock().unwrap().rooms_get_link_override =
         Some("https://app.slack.com/huddle/T1/C1/custom".into());
-    core.handle(Command::CopyHuddleLink { channel: c1() }).await;
+    core.handle(Command::Huddle(HuddleCommand::GetLink { channel: c1() }))
+        .await;
     assert_eq!(
         next(&mut rx).await,
-        Event::HuddleLinkLoaded {
+        Event::Huddle(HuddleEvent::LinkLoaded {
             channel: c1(),
             url: "https://app.slack.com/huddle/T1/C1/custom".into(),
-        }
+        })
     );
 
-    core.handle(Command::InviteToHuddle {
+    core.handle(Command::Huddle(HuddleCommand::Invite {
         channel: c1(),
         users: vec![UserId::from("U2"), UserId::from("U3")],
-    })
+    }))
     .await;
-    core.handle(Command::DeclineHuddleInvite {
+    core.handle(Command::Huddle(HuddleCommand::DeclineInvite {
         channel: c1(),
         call_id: "R99".into(),
-    })
+    }))
     .await;
 
     // 4. SetHuddleTopic / Background / Captions are no-ops when no active call_id.
-    core.handle(Command::SetHuddleTopic("No-op".into())).await;
-    core.handle(Command::SetHuddleBackground("aurora".into()))
+    core.handle(Command::Huddle(HuddleCommand::SetTopic("No-op".into())))
         .await;
-    core.handle(Command::SetHuddleCaptions(true)).await;
+    core.handle(Command::Huddle(HuddleCommand::SetBackground(
+        "aurora".into(),
+    )))
+    .await;
+    core.handle(Command::Huddle(HuddleCommand::SetCaptions(true)))
+        .await;
     wait_until("huddle invite and decline calls recorded", || {
         let state = fake.state.lock().unwrap();
         state.rooms_notify_calls.len() == 2 && state.rooms_invite_responses.len() == 1
@@ -4307,12 +4668,18 @@ async fn huddle_commands_and_lifecycle_races() {
 
     // With an active call_id, SetHuddleTopic / Background / Captions invoke REST endpoints.
     core.huddle.lock().unwrap().call_id = Some("RACTIVE".into());
-    core.handle(Command::SetHuddleTopic("Sprint sync".into()))
+    core.handle(Command::Huddle(HuddleCommand::SetTopic(
+        "Sprint sync".into(),
+    )))
+    .await;
+    core.handle(Command::Huddle(HuddleCommand::SetBackground(
+        "aurora".into(),
+    )))
+    .await;
+    core.handle(Command::Huddle(HuddleCommand::SetCaptions(true)))
         .await;
-    core.handle(Command::SetHuddleBackground("aurora".into()))
+    core.handle(Command::Huddle(HuddleCommand::SetCaptions(false)))
         .await;
-    core.handle(Command::SetHuddleCaptions(true)).await;
-    core.handle(Command::SetHuddleCaptions(false)).await;
     wait_until("active huddle control calls recorded", || {
         let state = fake.state.lock().unwrap();
         state.rooms_rename_calls.len() == 1
@@ -4341,24 +4708,31 @@ async fn huddle_commands_and_lifecycle_races() {
 async fn drafts_sync_lifecycle_concurrency_delete_failure_and_fetch_reconciliation() {
     let fake = FakeBackend::default();
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     // 1. Concurrent SyncDraft calls on C1 serialize so drafts_create runs ONCE, then drafts_update.
     let gate = Arc::new(tokio::sync::Notify::new());
     fake.state.lock().unwrap().draft_create_gate = Some(Arc::clone(&gate));
-    core.handle(Command::SyncDraft {
+    core.handle(Command::Messaging(MessagingCommand::SyncDraft {
         channel: c1(),
         text: "first".into(),
-    })
+    }))
     .await;
     wait_until("first SyncDraft entered drafts_create", || {
         fake.state.lock().unwrap().draft_creates.len() == 1
     })
     .await;
-    core.handle(Command::SyncDraft {
+    core.handle(Command::Messaging(MessagingCommand::SyncDraft {
         channel: c1(),
         text: "second".into(),
-    })
+    }))
     .await;
     tokio::task::yield_now().await;
     gate.notify_waiters();
@@ -4377,10 +4751,10 @@ async fn drafts_sync_lifecycle_concurrency_delete_failure_and_fetch_reconciliati
 
     // 2. Delete failure retains the channel in cloud_draft_ids; subsequent delete succeeds and removes it.
     fake.state.lock().unwrap().fail_draft_delete = true;
-    core.handle(Command::SyncDraft {
+    core.handle(Command::Messaging(MessagingCommand::SyncDraft {
         channel: c1(),
         text: "   ".into(),
-    })
+    }))
     .await;
     wait_until("failed drafts_delete recorded", || {
         fake.state.lock().unwrap().draft_deletes.len() == 1
@@ -4399,10 +4773,10 @@ async fn drafts_sync_lifecycle_concurrency_delete_failure_and_fetch_reconciliati
     );
 
     fake.state.lock().unwrap().fail_draft_delete = false;
-    core.handle(Command::SyncDraft {
+    core.handle(Command::Messaging(MessagingCommand::SyncDraft {
         channel: c1(),
         text: "".into(),
-    })
+    }))
     .await;
     wait_until("successful drafts_delete removes cached draft id", || {
         !core.cloud_draft_ids.lock().unwrap().contains_key(&c1())
@@ -4420,7 +4794,8 @@ async fn drafts_sync_lifecycle_concurrency_delete_failure_and_fetch_reconciliati
         text: "remote draft".into(),
         updated_secs: Some(100),
     }];
-    core.handle(Command::FetchCloudDrafts).await;
+    core.handle(Command::Messaging(MessagingCommand::FetchCloudDrafts))
+        .await;
     let Event::CloudDrafts(drafts) = next(&mut rx).await else {
         panic!("expected CloudDrafts");
     };
@@ -4501,7 +4876,14 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
         s.enqueue_offline(&TeamId::from("T1"), &valid_payload)
             .unwrap();
     }
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
     assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
 
     // Go offline: queue MarkRead and a SendMessage, then discard the SendMessage while offline.
@@ -4511,29 +4893,34 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
     .await;
     assert!(matches!(next(&mut rx).await, Event::Connection(_)));
 
-    core.handle(Command::MarkRead {
+    core.handle(Command::Messaging(MessagingCommand::MarkRead {
         channel: c1(),
         ts: Ts::from("99.0"),
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(2));
 
-    core.handle(Command::SendMessage {
+    core.handle(Command::Messaging(MessagingCommand::SendMessage {
         channel: c1(),
         content: MessageContent::plain("discard me"),
         thread_ts: None,
         broadcast: false,
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(3));
     let discard_id = core.offline_queue.back().unwrap().0;
-    core.handle(Command::DiscardOfflineMutation(discard_id))
-        .await;
+    core.handle(Command::Messaging(
+        MessagingCommand::DiscardOfflineMutation(discard_id),
+    ))
+    .await;
     assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(2));
 
     // RetryOfflineMutation while offline does NOT fire a network call immediately.
     let mark_id = core.offline_queue.back().unwrap().0;
-    core.handle(Command::RetryOfflineMutation(mark_id)).await;
+    core.handle(Command::Messaging(MessagingCommand::RetryOfflineMutation(
+        mark_id,
+    )))
+    .await;
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(fake.state.lock().unwrap().mark_calls.is_empty());
 
@@ -4580,12 +4967,12 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
     }))
     .await;
     assert!(matches!(next(&mut rx).await, Event::Connection(_)));
-    core.handle(Command::SendMessage {
+    core.handle(Command::Messaging(MessagingCommand::SendMessage {
         channel: c1(),
         content: MessageContent::plain("will fail"),
         thread_ts: None,
         broadcast: false,
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
     core.on_rtm(RtmEvent::State(ConnectionState::Connected {
@@ -4600,8 +4987,10 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
         }
     }
     let failed_id = failed_id.expect("expected OfflineMutationFailed");
-    core.handle(Command::DiscardOfflineMutation(failed_id))
-        .await;
+    core.handle(Command::Messaging(
+        MessagingCommand::DiscardOfflineMutation(failed_id),
+    ))
+    .await;
     assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(0));
     assert!(
         store
@@ -4673,10 +5062,18 @@ async fn saved_later_workflows_merge_dedup_hydrate_and_mutate() {
         );
     }
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     // 1. LoadSaved merges, deduplicates, tolerates archived failure, and hydrates bodies.
-    core.handle(Command::LoadSaved).await;
+    core.handle(Command::Messaging(MessagingCommand::LoadSaved))
+        .await;
     let Event::SavedLoaded(Ok(items)) = next(&mut rx).await else {
         panic!("expected SavedLoaded(Ok)");
     };
@@ -4692,11 +5089,11 @@ async fn saved_later_workflows_merge_dedup_hydrate_and_mutate() {
 
     // 2. SaveItem with "already_saved" + Some(date_due) falls back to saved_update.
     fake.state.lock().unwrap().saved_add_error = Some("already_saved".into());
-    core.handle(Command::SaveItem {
+    core.handle(Command::Messaging(MessagingCommand::SaveItem {
         channel: c1(),
         ts: Ts::from("1.0"),
         date_due: Some(500),
-    })
+    }))
     .await;
     assert!(matches!(next(&mut rx).await, Event::SavedLoaded(Ok(_))));
     assert_eq!(
@@ -4705,41 +5102,42 @@ async fn saved_later_workflows_merge_dedup_hydrate_and_mutate() {
     );
 
     // 3. SaveItem with "already_saved" + None does NOT call saved_update again.
-    core.handle(Command::SaveItem {
+    core.handle(Command::Messaging(MessagingCommand::SaveItem {
         channel: c1(),
         ts: Ts::from("1.0"),
         date_due: None,
-    })
+    }))
     .await;
     assert!(matches!(next(&mut rx).await, Event::SavedLoaded(Ok(_))));
     assert_eq!(fake.state.lock().unwrap().saved_update_calls.len(), 1);
 
     // 4. SaveFile (normal & "already_exists"), UpdateSavedItem, DeleteSavedItem, ClearCompletedSaved.
     fake.state.lock().unwrap().save_file_error = Some("already_exists".into());
-    core.handle(Command::SaveFile {
+    core.handle(Command::Messaging(MessagingCommand::SaveFile {
         file_id: "F99".into(),
         date_due: Some(700),
-    })
+    }))
     .await;
     assert!(matches!(next(&mut rx).await, Event::SavedLoaded(Ok(_))));
 
-    core.handle(Command::UpdateSavedItem {
+    core.handle(Command::Messaging(MessagingCommand::UpdateSavedItem {
         channel: c1(),
         ts: Ts::from("1.0"),
         mark: Some(SavedMark::Completed),
         date_due: Some(None),
-    })
+    }))
     .await;
     assert!(matches!(next(&mut rx).await, Event::SavedLoaded(Ok(_))));
 
-    core.handle(Command::DeleteSavedItem {
+    core.handle(Command::Messaging(MessagingCommand::DeleteSavedItem {
         channel: c1(),
         ts: Ts::from("2.0"),
-    })
+    }))
     .await;
     assert!(matches!(next(&mut rx).await, Event::SavedLoaded(Ok(_))));
 
-    core.handle(Command::ClearCompletedSaved).await;
+    core.handle(Command::Messaging(MessagingCommand::ClearCompletedSaved))
+        .await;
     assert!(matches!(next(&mut rx).await, Event::SavedLoaded(Ok(_))));
 
     let state = fake.state.lock().unwrap();
@@ -4766,7 +5164,14 @@ async fn rtm_handlers_dnd_huddles_emoji_unknown_and_posted_subtypes() {
         }];
     }
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     // DndUpdated & DndUpdatedUser
     let dnd_self: SlackEvent = serde_json::from_str(
@@ -4797,14 +5202,14 @@ async fn rtm_handlers_dnd_huddles_emoji_unknown_and_posted_subtypes() {
     core.on_rtm(RtmEvent::Event(room_join)).await;
     assert_eq!(
         next(&mut rx).await,
-        Event::HuddleUpdated {
+        Event::Huddle(HuddleEvent::Updated {
             channel: c1(),
             participants: vec![UserId::from("U1"), UserId::from("U2")],
             ended: false,
             topic: Some("Design".into()),
             background_id: Some("bg1".into()),
             thread_root_ts: Some(Ts::from("10.0")),
-        }
+        })
     );
 
     let room_leave: SlackEvent = serde_json::from_str(
@@ -4814,7 +5219,7 @@ async fn rtm_handlers_dnd_huddles_emoji_unknown_and_posted_subtypes() {
     core.on_rtm(RtmEvent::Event(room_leave)).await;
     assert!(matches!(
         next(&mut rx).await,
-        Event::HuddleUpdated { channel, ended: true, .. } if channel == c1()
+        Event::Huddle(HuddleEvent::Updated { channel, ended: true, .. }) if channel == c1()
     ));
 
     // HuddleInvite & HuddleInviteCancel
@@ -4825,11 +5230,11 @@ async fn rtm_handlers_dnd_huddles_emoji_unknown_and_posted_subtypes() {
     core.on_rtm(RtmEvent::Event(inv)).await;
     assert_eq!(
         next(&mut rx).await,
-        Event::HuddleInvite {
+        Event::Huddle(HuddleEvent::Invite {
             channel: ChannelId::from("D1"),
             inviter: UserId::from("U2"),
             call_id: "R2".into(),
-        }
+        })
     );
 
     let cancel: SlackEvent =
@@ -4837,10 +5242,10 @@ async fn rtm_handlers_dnd_huddles_emoji_unknown_and_posted_subtypes() {
     core.on_rtm(RtmEvent::Event(cancel)).await;
     assert_eq!(
         next(&mut rx).await,
-        Event::HuddleInviteCancelled {
+        Event::Huddle(HuddleEvent::InviteCancelled {
             channel: Some(ChannelId::from("D1")),
             call_id: None,
-        }
+        })
     );
 
     // EmojiChanged refreshes custom emoji in store and emits SidebarChanged.
@@ -4939,7 +5344,14 @@ async fn hydrate_partial_failures_self_user_dnd_and_activity_errors() {
         state.fail_activity_feed = true;
     }
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     core.hydrate().await;
     let mut errors = Vec::new();
@@ -4986,8 +5398,10 @@ async fn hydrate_partial_failures_self_user_dnd_and_activity_errors() {
             ..Default::default()
         };
     }
-    core.handle(Command::FetchActivity { with_bodies: true })
-        .await;
+    core.handle(Command::Messaging(MessagingCommand::FetchActivity {
+        with_bodies: true,
+    }))
+    .await;
     assert!(matches!(next(&mut rx).await, Event::Error(e) if e.contains("messages.list")));
     let Event::ActivityView { feed: Ok(feed) } = next(&mut rx).await else {
         panic!("expected ActivityView(Ok)");
@@ -5019,15 +5433,22 @@ async fn command_groups_slash_block_mark_all_close_and_channel_admin() {
             },
         )
         .unwrap();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     // RunCommand -> Slack error becomes CommandFailed.
-    core.handle(Command::RunCommand {
+    core.handle(Command::Messaging(MessagingCommand::RunCommand {
         channel: c1(),
         command: "/nope".into(),
         args: "".into(),
         thread_ts: None,
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -5038,7 +5459,7 @@ async fn command_groups_slash_block_mark_all_close_and_channel_admin() {
     );
 
     // BlockAction with team: None defaults to workspace TeamId("T1").
-    core.handle(Command::BlockAction {
+    core.handle(Command::Collab(CollabCommand::BlockAction {
         bot: BotId::from("B1"),
         app_id: "A1".into(),
         team: None,
@@ -5050,10 +5471,11 @@ async fn command_groups_slash_block_mark_all_close_and_channel_admin() {
             is_ephemeral: false,
             view_id: None,
         },
-    })
+    }))
     .await;
     // MarkAllRead calls mark_all_read + emits Counts.
-    core.handle(Command::MarkAllRead).await;
+    core.handle(Command::Messaging(MessagingCommand::MarkAllRead))
+        .await;
     assert!(matches!(next(&mut rx).await, Event::Counts(_)));
     assert_eq!(
         fake.state.lock().unwrap().block_action_calls,
@@ -5064,18 +5486,20 @@ async fn command_groups_slash_block_mark_all_close_and_channel_admin() {
     // CloseConversation aborts active backfill and allows re-opening later.
     core.open(c1());
     assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
-    core.handle(Command::CloseConversation(c1())).await;
+    core.handle(Command::Channel(ChannelCommand::CloseConversation(c1())))
+        .await;
     assert!(!core.backfills.contains_key(&c1()));
     core.open(c1());
     assert!(core.backfills.contains_key(&c1()));
-    core.handle(Command::CloseConversation(c1())).await;
+    core.handle(Command::Channel(ChannelCommand::CloseConversation(c1())))
+        .await;
 
     // CreateChannel (with purpose), RenameChannel, Archive/Unarchive, Delete, ConvertPrivate, Invite.
-    core.handle(Command::CreateChannel {
+    core.handle(Command::Channel(ChannelCommand::CreateChannel {
         name: "launch".into(),
         is_private: true,
         purpose: Some("Launch coordination".into()),
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -5086,14 +5510,15 @@ async fn command_groups_slash_block_mark_all_close_and_channel_admin() {
         Event::ConversationOpened(ChannelId::from("CNEW1"))
     );
 
-    core.handle(Command::RenameChannel {
+    core.handle(Command::Channel(ChannelCommand::RenameChannel {
         channel: c1(),
         name: "general-v2".into(),
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
 
-    core.handle(Command::ArchiveChannel(c1())).await;
+    core.handle(Command::Channel(ChannelCommand::ArchiveChannel(c1())))
+        .await;
     assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
     assert!(
         store
@@ -5105,7 +5530,8 @@ async fn command_groups_slash_block_mark_all_close_and_channel_admin() {
             .is_archived
     );
 
-    core.handle(Command::UnarchiveChannel(c1())).await;
+    core.handle(Command::Channel(ChannelCommand::UnarchiveChannel(c1())))
+        .await;
     assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
     assert!(
         !store
@@ -5117,7 +5543,8 @@ async fn command_groups_slash_block_mark_all_close_and_channel_admin() {
             .is_archived
     );
 
-    core.handle(Command::DeleteChannel(c1())).await;
+    core.handle(Command::Channel(ChannelCommand::DeleteChannel(c1())))
+        .await;
     assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
     let deleted = store
         .lock()
@@ -5127,14 +5554,17 @@ async fn command_groups_slash_block_mark_all_close_and_channel_admin() {
         .unwrap();
     assert!(deleted.is_archived && !deleted.is_member);
 
-    core.handle(Command::ConvertChannelToPrivate(c1())).await;
+    core.handle(Command::Channel(ChannelCommand::ConvertChannelToPrivate(
+        c1(),
+    )))
+    .await;
     assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
     assert_eq!(next(&mut rx).await, Event::SidebarChanged);
 
-    core.handle(Command::InviteToChannel {
+    core.handle(Command::Channel(ChannelCommand::InviteToChannel {
         channel: c1(),
         users: vec![UserId::from("U2")],
-    })
+    }))
     .await;
     assert!(
         matches!(next(&mut rx).await, Event::ConversationInfo { channel, .. } if channel == c1())
@@ -5195,16 +5625,23 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
             },
         )
         .unwrap();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
     *core.self_user_id.lock().unwrap() = Some(UserId::from("UME"));
 
     // UpdateProfile updates stored self user & emits UsersChanged.
-    core.handle(Command::UpdateProfile {
+    core.handle(Command::Workspace(WorkspaceCommand::UpdateProfile {
         update: api::ProfileUpdate {
             display_name: Some("Updated Me".into()),
             ..Default::default()
         },
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -5221,8 +5658,10 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
     assert_eq!(me.profile.display_name.as_deref(), Some("Updated Me"));
 
     // FetchUserProfile: inline label > team label > field id; blank value skipped; blank pronouns -> None.
-    core.handle(Command::FetchUserProfile(UserId::from("U2")))
-        .await;
+    core.handle(Command::Workspace(WorkspaceCommand::FetchUserProfile(
+        UserId::from("U2"),
+    )))
+    .await;
     let Event::UserProfileLoaded {
         user,
         pronouns,
@@ -5244,14 +5683,14 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
     );
 
     // SearchGifs: blank -> gif_featured, non-blank -> gif_search.
-    core.handle(Command::SearchGifs {
+    core.handle(Command::Collab(CollabCommand::SearchGifs {
         query: "   ".into(),
-    })
+    }))
     .await;
     assert!(matches!(next(&mut rx).await, Event::GifResults { gifs, .. } if gifs[0].id == "g1"));
-    core.handle(Command::SearchGifs {
+    core.handle(Command::Collab(CollabCommand::SearchGifs {
         query: "cats".into(),
-    })
+    }))
     .await;
     assert!(matches!(next(&mut rx).await, Event::GifResults { gifs, .. } if gifs[0].id == "g2"));
     assert_eq!(fake.state.lock().unwrap().gif_featured_calls, 1);
@@ -5261,11 +5700,13 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
     );
 
     // QuickSwitchSearch: blank is no-op, non-blank calls edge_search.
-    core.handle(Command::QuickSwitchSearch { query: "  ".into() })
-        .await;
-    core.handle(Command::QuickSwitchSearch {
+    core.handle(Command::Collab(CollabCommand::QuickSwitchSearch {
+        query: "  ".into(),
+    }))
+    .await;
+    core.handle(Command::Collab(CollabCommand::QuickSwitchSearch {
         query: "bob".into(),
-    })
+    }))
     .await;
     assert!(matches!(
         next(&mut rx).await,
@@ -5277,9 +5718,9 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
     );
 
     // LoadCanvas (ok + err), CreateCanvas, EditCanvas.
-    core.handle(Command::LoadCanvas {
+    core.handle(Command::Collab(CollabCommand::LoadCanvas {
         file_id: "FC1".into(),
-    })
+    }))
     .await;
     assert!(matches!(
         next(&mut rx).await,
@@ -5291,9 +5732,9 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
             if file_id == "FC1" && meta.comment_channel_id == ChannelId::from("CC1")
     ));
     fake.state.lock().unwrap().fail_canvas_html = true;
-    core.handle(Command::LoadCanvas {
+    core.handle(Command::Collab(CollabCommand::LoadCanvas {
         file_id: "FC_BAD".into(),
-    })
+    }))
     .await;
     assert!(matches!(
         next(&mut rx).await,
@@ -5301,11 +5742,11 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
     ));
     fake.state.lock().unwrap().fail_canvas_html = false;
 
-    core.handle(Command::CreateCanvas {
+    core.handle(Command::Collab(CollabCommand::CreateCanvas {
         title: "Doc".into(),
         markdown: "# Hi".into(),
         channel: Some(c1()),
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -5316,12 +5757,12 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
         }
     );
 
-    core.handle(Command::EditCanvas {
+    core.handle(Command::Collab(CollabCommand::EditCanvas {
         file_id: "FCANVAS1".into(),
         op: api::CanvasEditOp::InsertAtEnd {
             markdown: "More".into(),
         },
-    })
+    }))
     .await;
     assert!(matches!(
         next(&mut rx).await,
@@ -5333,18 +5774,18 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
     ));
 
     // LoadList & CreateListItem.
-    core.handle(Command::LoadList {
+    core.handle(Command::Collab(CollabCommand::LoadList {
         file_id: "FLIST1".into(),
-    })
+    }))
     .await;
     assert!(matches!(
         next(&mut rx).await,
         Event::ListLoaded { file_id, list: Ok(ref l) } if file_id == "FLIST1" && l.title == "Tasks"
     ));
-    core.handle(Command::CreateListItem {
+    core.handle(Command::Collab(CollabCommand::CreateListItem {
         list_id: "FLIST1".into(),
         initial_fields: vec![],
-    })
+    }))
     .await;
     assert!(matches!(
         next(&mut rx).await,
@@ -5352,7 +5793,8 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
     ));
 
     // LoadFilesExtras.
-    core.handle(Command::LoadFilesExtras).await;
+    core.handle(Command::Collab(CollabCommand::LoadFilesExtras))
+        .await;
     assert!(matches!(
         next(&mut rx).await,
         Event::FilesExtrasLoaded { favorites, collections, deleted }
@@ -5381,7 +5823,14 @@ async fn huddle_watcher_ignores_stale_generation_idle_and_preserves_new_session(
 
     // Old watcher (gen 1) emits Idle after gen 2 has started: must NOT clobber call_id or emit Idle.
     let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel();
-    commands::spawn_huddle_watcher(Arc::clone(&huddle), 1, rx1, events.clone(), None);
+    commands::spawn_huddle_watcher(
+        Arc::clone(&huddle),
+        1,
+        rx1,
+        events.clone(),
+        test_media_tx(),
+        None,
+    );
     tx1.send(crate::huddle::HuddleUpdate::State(Box::new(
         crate::huddle::HuddleSessionSnapshot {
             phase: crate::huddle::HuddlePhase::Idle,
@@ -5402,7 +5851,7 @@ async fn huddle_watcher_ignores_stale_generation_idle_and_preserves_new_session(
 
     // Current watcher (gen 2) emits Idle: clears call_id and emits HuddleSessionChanged(Idle).
     let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel();
-    commands::spawn_huddle_watcher(Arc::clone(&huddle), 2, rx2, events, None);
+    commands::spawn_huddle_watcher(Arc::clone(&huddle), 2, rx2, events, test_media_tx(), None);
     tx2.send(crate::huddle::HuddleUpdate::State(Box::new(
         crate::huddle::HuddleSessionSnapshot {
             phase: crate::huddle::HuddlePhase::Idle,
@@ -5412,7 +5861,7 @@ async fn huddle_watcher_ignores_stale_generation_idle_and_preserves_new_session(
     .unwrap();
     assert!(matches!(
         next(&mut rx).await,
-        Event::HuddleSessionChanged(s) if s.phase == crate::huddle::HuddlePhase::Idle
+        Event::Huddle(HuddleEvent::SessionChanged(s)) if s.phase == crate::huddle::HuddlePhase::Idle
     ));
     assert!(huddle.lock().unwrap().call_id.is_none());
 }
@@ -5421,12 +5870,19 @@ async fn huddle_watcher_ignores_stale_generation_idle_and_preserves_new_session(
 async fn canvas_delete_access_and_comments_command_event_round_trips() {
     let fake = FakeBackend::default();
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), store, TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        store,
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     // 1. DeleteCanvas (ok + formatted Slack error)
-    core.handle(Command::DeleteCanvas {
+    core.handle(Command::Collab(CollabCommand::DeleteCanvas {
         canvas_id: "F0DEL".into(),
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -5441,9 +5897,9 @@ async fn canvas_delete_access_and_comments_command_event_round_trips() {
     );
 
     fake.state.lock().unwrap().canvases_delete_error = Some("cant_delete_file".into());
-    core.handle(Command::DeleteCanvas {
+    core.handle(Command::Collab(CollabCommand::DeleteCanvas {
         canvas_id: "F0LOCKED".into(),
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -5455,13 +5911,13 @@ async fn canvas_delete_access_and_comments_command_event_round_trips() {
     fake.state.lock().unwrap().canvases_delete_error = None;
 
     // 2. SetCanvasAccess with post_permalink shares permalink into each channel
-    core.handle(Command::SetCanvasAccess {
+    core.handle(Command::Collab(CollabCommand::SetCanvasAccess {
         canvas_id: "F0SHARE".into(),
         access_level: api::CanvasAccessLevel::Write,
         channel_ids: vec![ChannelId::from("C1"), ChannelId::from("C2")],
         user_ids: vec![],
         post_permalink: Some("https://acme.slack.com/docs/T1/F0SHARE".into()),
-    })
+    }))
     .await;
     assert!(matches!(
         next(&mut rx).await,
@@ -5486,11 +5942,11 @@ async fn canvas_delete_access_and_comments_command_event_round_trips() {
     }
 
     // 3. DeleteCanvasAccess (ok + formatted error)
-    core.handle(Command::DeleteCanvasAccess {
+    core.handle(Command::Collab(CollabCommand::DeleteCanvasAccess {
         canvas_id: "F0SHARE".into(),
         channel_ids: vec![],
         user_ids: vec![UserId::from("U7")],
-    })
+    }))
     .await;
     assert!(matches!(
         next(&mut rx).await,
@@ -5506,13 +5962,13 @@ async fn canvas_delete_access_and_comments_command_event_round_trips() {
     );
 
     fake.state.lock().unwrap().canvases_access_error = Some("restricted_action".into());
-    core.handle(Command::SetCanvasAccess {
+    core.handle(Command::Collab(CollabCommand::SetCanvasAccess {
         canvas_id: "F0SHARE".into(),
         access_level: api::CanvasAccessLevel::Owner,
         channel_ids: vec![],
         user_ids: vec![UserId::from("U8")],
         post_permalink: None,
-    })
+    }))
     .await;
     assert!(matches!(
         next(&mut rx).await,
@@ -5535,9 +5991,9 @@ async fn canvas_delete_access_and_comments_command_event_round_trips() {
         resolved: false,
     };
     fake.state.lock().unwrap().canvas_comments = vec![sample_thread.clone()];
-    core.handle(Command::LoadCanvasComments {
+    core.handle(Command::Collab(CollabCommand::LoadCanvasComments {
         canvas_id: "F0CMT".into(),
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -5547,11 +6003,11 @@ async fn canvas_delete_access_and_comments_command_event_round_trips() {
         }
     );
 
-    core.handle(Command::PostCanvasComment {
+    core.handle(Command::Collab(CollabCommand::PostCanvasComment {
         canvas_id: "F0CMT".into(),
         text: "Thanks!".into(),
         thread_ts: Some(Ts::from("1700.1")),
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -5570,11 +6026,11 @@ async fn canvas_delete_access_and_comments_command_event_round_trips() {
     );
 
     // 5. ResolveCanvasComment (resolve + reopen) & ResolveAllCanvasComments
-    core.handle(Command::ResolveCanvasComment {
+    core.handle(Command::Collab(CollabCommand::ResolveCanvasComment {
         canvas_id: "F0CMT".into(),
         thread_ts: Ts::from("1700.1"),
         resolved: true,
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -5586,11 +6042,11 @@ async fn canvas_delete_access_and_comments_command_event_round_trips() {
         }
     );
 
-    core.handle(Command::ResolveCanvasComment {
+    core.handle(Command::Collab(CollabCommand::ResolveCanvasComment {
         canvas_id: "F0CMT".into(),
         thread_ts: Ts::from("1700.1"),
         resolved: false,
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -5602,9 +6058,9 @@ async fn canvas_delete_access_and_comments_command_event_round_trips() {
         }
     );
 
-    core.handle(Command::ResolveAllCanvasComments {
+    core.handle(Command::Collab(CollabCommand::ResolveAllCanvasComments {
         canvas_id: "F0CMT".into(),
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -5635,25 +6091,34 @@ async fn stealth_mode_suppresses_read_receipts_and_typing_until_disabled() {
     fake.state.lock().unwrap().mark_read_ok = true;
     fake.state.lock().unwrap().mark_all_read_ok = true;
     let (store, events, _rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), store, TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        store,
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::SetStealthMode(true)).await;
-    core.handle(Command::MarkRead {
+    core.handle(Command::Workspace(WorkspaceCommand::SetStealthMode(true)))
+        .await;
+    core.handle(Command::Messaging(MessagingCommand::MarkRead {
         channel: ChannelId::from("C1"),
         ts: Ts::from("1700.1"),
-    })
+    }))
     .await;
-    core.handle(Command::MarkThreadRead {
+    core.handle(Command::Messaging(MessagingCommand::MarkThreadRead {
         channel: ChannelId::from("C1"),
         thread_ts: Ts::from("1700.1"),
         ts: Ts::from("1700.2"),
-    })
+    }))
     .await;
-    core.handle(Command::MarkAllRead).await;
-    core.handle(Command::Typing {
+    core.handle(Command::Messaging(MessagingCommand::MarkAllRead))
+        .await;
+    core.handle(Command::Messaging(MessagingCommand::Typing {
         channel: ChannelId::from("C1"),
         thread_ts: None,
-    })
+    }))
     .await;
     tokio::task::yield_now().await;
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -5675,13 +6140,15 @@ async fn stealth_mode_suppresses_read_receipts_and_typing_until_disabled() {
     }
 
     // Disabling stealth mode resumes read receipts cleanly.
-    core.handle(Command::SetStealthMode(false)).await;
-    core.handle(Command::MarkRead {
+    core.handle(Command::Workspace(WorkspaceCommand::SetStealthMode(false)))
+        .await;
+    core.handle(Command::Messaging(MessagingCommand::MarkRead {
         channel: ChannelId::from("C1"),
         ts: Ts::from("1700.1"),
-    })
+    }))
     .await;
-    core.handle(Command::MarkAllRead).await;
+    core.handle(Command::Messaging(MessagingCommand::MarkAllRead))
+        .await;
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
     {
@@ -5711,7 +6178,14 @@ async fn huddle_watcher_persists_finalized_multilingual_captions_and_skips_parti
         enabled: Arc::clone(&enabled),
     };
     let (tx, upd_rx) = tokio::sync::mpsc::unbounded_channel();
-    commands::spawn_huddle_watcher(Arc::clone(&huddle), 1, upd_rx, events, Some(persist));
+    commands::spawn_huddle_watcher(
+        Arc::clone(&huddle),
+        1,
+        upd_rx,
+        events,
+        test_media_tx(),
+        Some(persist),
+    );
 
     // 1. Partial caption -> emitted to UI, NOT persisted to SQLite.
     tx.send(crate::huddle::HuddleUpdate::DataEvent(
@@ -5779,20 +6253,28 @@ async fn stealth_mode_blocks_mark_read_in_offline_queue_and_during_flush() {
     let fake = FakeBackend::default();
     fake.state.lock().expect("lock").mark_read_ok = true;
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     // Case 1: Stealth mode enabled BEFORE going offline -> MarkRead is never queued.
-    core.handle(Command::SetStealthMode(true)).await;
+    core.handle(Command::Workspace(WorkspaceCommand::SetStealthMode(true)))
+        .await;
     core.on_rtm(RtmEvent::State(ConnectionState::Disconnected {
         reason: "offline".into(),
     }))
     .await;
     assert!(matches!(next(&mut rx).await, Event::Connection(_)));
 
-    core.handle(Command::MarkRead {
+    core.handle(Command::Messaging(MessagingCommand::MarkRead {
         channel: c1(),
         ts: Ts::from("10.0"),
-    })
+    }))
     .await;
     assert!(
         core.offline_queue.is_empty(),
@@ -5809,15 +6291,17 @@ async fn stealth_mode_blocks_mark_read_in_offline_queue_and_during_flush() {
 
     // Case 2: MarkRead queued while stealth mode is OFF, then stealth mode is turned ON before
     // reconnect -> flushing must NOT call backend.mark_read!
-    core.handle(Command::SetStealthMode(false)).await;
-    core.handle(Command::MarkRead {
+    core.handle(Command::Workspace(WorkspaceCommand::SetStealthMode(false)))
+        .await;
+    core.handle(Command::Messaging(MessagingCommand::MarkRead {
         channel: c1(),
         ts: Ts::from("20.0"),
-    })
+    }))
     .await;
     assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
 
-    core.handle(Command::SetStealthMode(true)).await;
+    core.handle(Command::Workspace(WorkspaceCommand::SetStealthMode(true)))
+        .await;
     core.on_rtm(RtmEvent::State(ConnectionState::Connected {
         fast_reconnect: false,
     }))
@@ -5868,7 +6352,14 @@ async fn refresh_conversation_merges_without_clobbering_existing_metadata() {
         )
         .expect("seed");
 
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
     let ev: SlackEvent =
         serde_json::from_str(r#"{"type":"channel_archive","channel":"C1"}"#).expect("event");
     core.on_rtm(RtmEvent::Event(ev)).await;
@@ -5907,7 +6398,14 @@ async fn rtm_bot_info_resolution_does_not_block_event_loop() {
         );
     }
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
     let ev: SlackEvent = serde_json::from_str(
         r#"{"type":"message","channel":"C1","ts":"77.0","text":"hello","bot_id":"BSLOW"}"#,
@@ -5936,10 +6434,19 @@ async fn shutdown_aborts_tracked_background_tasks() {
     let gate = Arc::new(tokio::sync::Notify::new());
     fake.state.lock().expect("lock").bot_info_gate = Some(Arc::clone(&gate));
     let (store, events, _rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), store, TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        store,
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::ResolveBots(vec![BotId::from("BHANG")]))
-        .await;
+    core.handle(Command::Workspace(WorkspaceCommand::ResolveBots(vec![
+        BotId::from("BHANG"),
+    ])))
+    .await;
     tokio::task::yield_now().await;
     assert!(
         core.tasks.active_count() >= 1,
@@ -5959,13 +6466,20 @@ async fn collab_endpoints_propagate_auth_expired() {
     let fake = FakeBackend::default();
     fake.state.lock().expect("lock").auth_expired_collab = true;
     let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(fake.clone(), store, TeamId::from("T1"), events).await;
+    let mut core = Core::new(
+        fake.clone(),
+        store,
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
 
-    core.handle(Command::SearchRemoteMessages {
+    core.handle(Command::Collab(CollabCommand::SearchRemoteMessages {
         query: "hello".into(),
         sort: api::SearchSort::Score,
         page: 1,
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -5976,7 +6490,8 @@ async fn collab_endpoints_propagate_auth_expired() {
         Event::RemoteMessagesPage { result: Err(_), .. }
     ));
 
-    core.handle(Command::LoadAppHome(c1())).await;
+    core.handle(Command::Collab(CollabCommand::LoadAppHome(c1())))
+        .await;
     assert_eq!(
         next(&mut rx).await,
         Event::AuthExpired("token_revoked".into())
@@ -5986,9 +6501,9 @@ async fn collab_endpoints_propagate_auth_expired() {
         Event::AppHomeLoaded { home: Err(_), .. }
     ));
 
-    core.handle(Command::LoadList {
+    core.handle(Command::Collab(CollabCommand::LoadList {
         file_id: "FL1".into(),
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -5999,16 +6514,17 @@ async fn collab_endpoints_propagate_auth_expired() {
         Event::ListLoaded { list: Err(_), .. }
     ));
 
-    core.handle(Command::LoadFilesExtras).await;
+    core.handle(Command::Collab(CollabCommand::LoadFilesExtras))
+        .await;
     assert_eq!(
         next(&mut rx).await,
         Event::AuthExpired("token_revoked".into())
     );
 
-    core.handle(Command::FetchListRecordComments {
+    core.handle(Command::Collab(CollabCommand::FetchListRecordComments {
         list_id: "FL1".into(),
         record_id: "Rec1".into(),
-    })
+    }))
     .await;
     assert_eq!(
         next(&mut rx).await,
@@ -6016,11 +6532,83 @@ async fn collab_endpoints_propagate_auth_expired() {
     );
 }
 
-#[test]
-fn event_is_high_frequency_media_classifies_video_and_audio_levels() {
+#[tokio::test]
+async fn huddle_media_uses_dedicated_bounded_channel_and_drops_overflow_without_blocking_events() {
+    let huddle = Arc::new(Mutex::new(HuddleSlot::default()));
+    huddle
+        .lock()
+        .unwrap()
+        .generation
+        .store(1, Ordering::Release);
+    let (event_tx, mut event_rx) = mpsc::unbounded();
+    let events = Emitter(event_tx);
+    let (media_tx, mut media_rx) = mpsc::channel(HUDDLE_MEDIA_CHANNEL_CAPACITY);
+    let (upd_tx, upd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    commands::spawn_huddle_watcher(Arc::clone(&huddle), 1, upd_rx, events, media_tx, None);
+
+    // Flood well past HUDDLE_MEDIA_CHANNEL_CAPACITY (64) without draining `media_rx`:
+    // stale media frames must drop via `try_send` instead of stalling the watcher.
+    let tile = crate::huddle::VideoTileKey::LocalCamera;
+    for seq in 0..(HUDDLE_MEDIA_CHANNEL_CAPACITY * 2) {
+        upd_tx
+            .send(crate::huddle::HuddleUpdate::VideoFrame {
+                tile: tile.clone(),
+                frame: crate::huddle::VideoFrame {
+                    width: 2,
+                    height: 2,
+                    data: crate::huddle::VideoFrameData::Bgra(Arc::new(vec![seq as u8; 16])),
+                },
+            })
+            .unwrap();
+        upd_tx
+            .send(crate::huddle::HuddleUpdate::AudioLevels(
+                crate::huddle::HuddleAudioLevels::default(),
+            ))
+            .unwrap();
+    }
+    upd_tx
+        .send(crate::huddle::HuddleUpdate::VideoTileClosed(tile.clone()))
+        .unwrap();
+    // Follow immediately with a critical session state change on the ordered `Event` lane.
+    upd_tx
+        .send(crate::huddle::HuddleUpdate::State(Box::new(
+            crate::huddle::HuddleSessionSnapshot {
+                phase: crate::huddle::HuddlePhase::Idle,
+                ..Default::default()
+            },
+        )))
+        .unwrap();
+    drop(upd_tx);
+
+    // The ordered `Event` channel receives ONLY the session state change — zero media frames!
+    let ev = next(&mut event_rx).await;
+    assert!(matches!(
+        ev,
+        Event::Huddle(HuddleEvent::SessionChanged(s)) if s.phase == crate::huddle::HuddlePhase::Idle
+    ));
+
+    // Meanwhile `media_rx` buffered up to the bounded channel capacity (and dropped overflow).
+    let mut received = 0usize;
+    while media_rx.try_recv().is_ok() {
+        received += 1;
+    }
     assert!(
-        Event::HuddleAudioLevels(crate::huddle::HuddleAudioLevels::default())
-            .is_high_frequency_media()
+        received > 0,
+        "expected buffered media frames on huddle_media channel"
     );
-    assert!(!Event::AuthExpired("invalid_auth".into()).is_high_frequency_media());
+    assert!(
+        received <= HUDDLE_MEDIA_CHANNEL_CAPACITY + 1,
+        "media channel must stay bounded, got {received}"
+    );
+}
+
+#[test]
+fn command_domain_sub_enums_convert_into_command() {
+    let _: Command = MessagingCommand::MarkAllRead.into();
+    let _: Command = ChannelCommand::ArchiveChannel(c1()).into();
+    let _: Command = CollabCommand::LoadFilesExtras.into();
+    let _: Command = HuddleCommand::Leave.into();
+    let _: Command = crate::HuddleControlCommand::SetMuted(true).into();
+    let _: Command = WorkspaceCommand::SignOut.into();
 }

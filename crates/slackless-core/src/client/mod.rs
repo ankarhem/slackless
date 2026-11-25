@@ -34,14 +34,26 @@ use crate::types::{
     Ts, UserId,
 };
 use crate::unfurl::{Unfurls, event_messages};
-use crate::{Command, Event, FailedMutation, apply_event};
+use crate::{
+    ChannelCommand, CollabCommand, Command, Event, FailedMutation, HUDDLE_MEDIA_CHANNEL_CAPACITY,
+    HuddleCommand, HuddleEvent, HuddleMediaEvent, MessagingCommand, WorkspaceCommand, apply_event,
+};
 
 /// The store shared between the core (writer) and front-ends (readers).
 ///
 /// SQLite is blocking: front-ends should lock it off their UI thread (or keep reads short).
 pub type SharedStore = Arc<Mutex<Store>>;
 
-/// Local search results returned per [`Command::Search`].
+/// Cloneable sender for front-end [`Command`]s into the core.
+pub type CommandSender = UnboundedSender<Command>;
+/// Ordered receiver for control and store-sync [`Event`]s emitted by the core.
+pub type EventReceiver = UnboundedReceiver<Event>;
+/// Bounded sender for high-frequency [`HuddleMediaEvent`]s (`try_send`, drops stale frames).
+pub type HuddleMediaSender = mpsc::Sender<HuddleMediaEvent>;
+/// Bounded receiver for high-frequency [`HuddleMediaEvent`]s emitted by active native huddles.
+pub type HuddleMediaReceiver = mpsc::Receiver<HuddleMediaEvent>;
+
+/// Local search results returned per [`CollabCommand::Search`].
 const SEARCH_LIMIT: usize = 200;
 
 /// The orchestrator entry point.
@@ -72,6 +84,7 @@ impl Client {
         let store: SharedStore = Arc::new(Mutex::new(store));
         let (command_tx, command_rx) = mpsc::unbounded();
         let (event_tx, event_rx) = mpsc::unbounded();
+        let (huddle_media_tx, huddle_media_rx) = mpsc::channel(HUDDLE_MEDIA_CHANNEL_CAPACITY);
         let events = Emitter(event_tx);
         let thread_store = Arc::clone(&store);
         let handle = shared_runtime()?.handle().clone();
@@ -85,11 +98,18 @@ impl Client {
         let thread = std::thread::Builder::new()
             .name("slackless-core".into())
             .spawn(move || {
-                handle.block_on(run_session(session, thread_store, command_rx, events));
+                handle.block_on(run_session(
+                    session,
+                    thread_store,
+                    command_rx,
+                    events,
+                    huddle_media_tx,
+                ));
             })?;
         Ok(ClientHandle {
             commands: command_tx,
             events: event_rx,
+            huddle_media: huddle_media_rx,
             store,
             fetcher,
             thread,
@@ -102,20 +122,33 @@ impl Client {
 #[error("slackless core has shut down")]
 pub struct Closed;
 
-/// A front-end's connection to a running core: a [`Command`] sender, an [`Event`] receiver and
-/// the shared store. The channels are `futures::channel::mpsc`, so any executor (GPUI's smol,
-/// a CLI's tokio) can drive them.
+/// Unpacked channels and handles returned by [`ClientHandle::into_parts`].
+pub struct ClientHandles {
+    pub commands: CommandSender,
+    pub events: EventReceiver,
+    pub huddle_media: HuddleMediaReceiver,
+    pub store: SharedStore,
+    pub fetcher: Fetcher,
+    pub thread: JoinHandle<()>,
+}
+
+/// A front-end's connection to a running core: a [`Command`] sender, an ordered [`Event`]
+/// receiver, a bounded [`HuddleMediaEvent`] receiver, and the shared store. The channels are
+/// `futures::channel::mpsc`, so any executor (GPUI's smol, a CLI's tokio) can drive them.
 pub struct ClientHandle {
-    commands: UnboundedSender<Command>,
-    events: UnboundedReceiver<Event>,
+    commands: CommandSender,
+    events: EventReceiver,
+    huddle_media: HuddleMediaReceiver,
     store: SharedStore,
     fetcher: Fetcher,
     thread: JoinHandle<()>,
 }
 
 impl ClientHandle {
-    pub fn send(&self, command: Command) -> Result<(), Closed> {
-        self.commands.unbounded_send(command).map_err(|_| Closed)
+    pub fn send(&self, command: impl Into<Command>) -> Result<(), Closed> {
+        self.commands
+            .unbounded_send(command.into())
+            .map_err(|_| Closed)
     }
 
     /// Downloads public assets (profile photos, emoji, icons) on the core runtime.
@@ -124,42 +157,35 @@ impl ClientHandle {
     }
 
     /// A cloneable command sender, e.g. for views that issue commands.
-    pub fn commands(&self) -> UnboundedSender<Command> {
+    pub fn commands(&self) -> CommandSender {
         self.commands.clone()
     }
 
-    /// The event stream; ends when the core stops.
-    pub fn events(&mut self) -> &mut UnboundedReceiver<Event> {
+    /// The ordered control/store event stream; ends when the core stops.
+    pub fn events(&mut self) -> &mut EventReceiver {
         &mut self.events
+    }
+
+    /// The bounded high-frequency huddle media stream (video frames, tile close, audio levels).
+    pub fn huddle_media(&mut self) -> &mut HuddleMediaReceiver {
+        &mut self.huddle_media
     }
 
     pub fn store(&self) -> &SharedStore {
         &self.store
     }
 
-    /// Splits the handle so the event receiver can move into a drain task. The runtime thread
-    /// keeps running detached until a [`Command::Shutdown`] or every sender is dropped.
-    pub fn into_parts(
-        self,
-    ) -> (
-        UnboundedSender<Command>,
-        UnboundedReceiver<Event>,
-        SharedStore,
-    ) {
-        (self.commands, self.events, self.store)
-    }
-
-    /// Like [`Self::into_parts`], also returning the core runtime thread handle so the caller
-    /// can join it during graceful application quit after sending [`Command::Shutdown`].
-    pub fn into_parts_with_thread(
-        self,
-    ) -> (
-        UnboundedSender<Command>,
-        UnboundedReceiver<Event>,
-        SharedStore,
-        JoinHandle<()>,
-    ) {
-        (self.commands, self.events, self.store, self.thread)
+    /// Unpacks the handle into its owned channels, store, fetcher, and runtime thread handle so
+    /// front-ends can move receivers into separate drain tasks and join the thread on quit.
+    pub fn into_parts(self) -> ClientHandles {
+        ClientHandles {
+            commands: self.commands,
+            events: self.events,
+            huddle_media: self.huddle_media,
+            store: self.store,
+            fetcher: self.fetcher,
+            thread: self.thread,
+        }
     }
 
     /// Stops the core and waits for its thread to exit.
@@ -334,6 +360,7 @@ async fn run_session(
     store: SharedStore,
     commands: UnboundedReceiver<Command>,
     events: Emitter,
+    huddle_media: HuddleMediaSender,
 ) {
     let api = match SlackApi::new(
         &session.api_base(),
@@ -343,7 +370,14 @@ async fn run_session(
         Ok(api) => api,
         Err(e) => return events.report("api client", e.into()),
     };
-    let mut core = Core::new(api, store, session.team_id.clone(), events.clone()).await;
+    let mut core = Core::new(
+        api,
+        store,
+        session.team_id.clone(),
+        events.clone(),
+        huddle_media,
+    )
+    .await;
 
     // Start RTM immediately so live websocket events and front-end commands are responsive while
     // full workspace hydration runs concurrently in the background.
@@ -409,6 +443,7 @@ pub(crate) struct Core<B: Backend> {
     store: SharedStore,
     workspace: TeamId,
     events: Emitter,
+    huddle_media: HuddleMediaSender,
     backfill: Backfill<B>,
     backfills: HashMap<ChannelId, AbortHandle>,
     /// Names the foreign channels shared-message unfurls point at (shared with `backfill`).
@@ -454,7 +489,13 @@ pub(crate) struct Core<B: Backend> {
 }
 
 impl<B: Backend> Core<B> {
-    pub async fn new(backend: B, store: SharedStore, workspace: TeamId, events: Emitter) -> Self {
+    pub async fn new(
+        backend: B,
+        store: SharedStore,
+        workspace: TeamId,
+        events: Emitter,
+        huddle_media: HuddleMediaSender,
+    ) -> Self {
         let ws_init = workspace.clone();
         let (raw_offline, cached_bots, raw_synced) = with_store(&store, move |s| {
             let offline = s.list_offline(&ws_init).unwrap_or_default();
@@ -500,6 +541,7 @@ impl<B: Backend> Core<B> {
             store,
             workspace,
             events,
+            huddle_media,
             backfill,
             backfills: HashMap::new(),
             unfurls,

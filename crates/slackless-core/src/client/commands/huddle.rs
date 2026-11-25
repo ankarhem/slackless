@@ -5,57 +5,6 @@ use crate::domain::huddles::{CaptionDeduper, resolve_segment_at_ms};
 use crate::huddle::{HuddleAudioConfig, HuddleControl, HuddlePhase, HuddleUpdate};
 
 impl<B: Backend> Core<B> {
-    /// Dispatch any huddle media control command (legacy per-action variants or
-    /// [`Command::HuddleControl`]) to the active huddle session, returning `None` if handled or
-    /// `Some(command)` if the command should continue through the main dispatcher.
-    pub(super) fn try_dispatch_huddle_control(&mut self, command: Command) -> Option<Command> {
-        let ctrl = match command {
-            Command::HuddleControl(ctrl) => ctrl.into(),
-            Command::SetHuddleMuted(muted) => HuddleControl::SetMuted(muted),
-            Command::SetHuddleAudioDevices { input, output } => {
-                HuddleControl::SetAudioDevices { input, output }
-            }
-            Command::SetHuddleAudioProcessing { aec, ns, agc } => {
-                HuddleControl::SetAudioProcessing { aec, ns, agc }
-            }
-            Command::SetHuddleCamera {
-                enabled,
-                device_index,
-                blur,
-            } => HuddleControl::SetCamera {
-                enabled,
-                device_index,
-                blur,
-            },
-            Command::SetHuddleBlurBackground(blur) => HuddleControl::SetBlurBackground(blur),
-            Command::SetHuddleScreenShare {
-                source_id,
-                share_audio,
-            } => HuddleControl::SetScreenShare {
-                source_id,
-                share_audio,
-            },
-            Command::SendHuddleReaction {
-                emoji,
-                kind,
-                emoji_url,
-            } => HuddleControl::SendReaction {
-                emoji,
-                kind,
-                emoji_url,
-            },
-            Command::SetHuddleHandRaised(raised) => HuddleControl::SetHandRaised(raised),
-            Command::SetHuddleStickyEmoji(emoji) => HuddleControl::SetStickyEmoji(emoji),
-            Command::SendHuddleDraw(draw) => HuddleControl::SendDraw(draw),
-            Command::SetHuddleJukebox(song) => HuddleControl::SetJukebox(song),
-            Command::MuteHuddlePeer(peer_id) => HuddleControl::MutePeer(peer_id),
-            Command::SetHuddleAudioOnly(enabled) => HuddleControl::SetAudioOnly(enabled),
-            other => return Some(other),
-        };
-        self.send_huddle_control(ctrl);
-        None
-    }
-
     pub(super) fn join_huddle(&mut self, channel: ChannelId, audio: HuddleAudioConfig) {
         // Reject duplicate concurrent join while `rooms.join` is already in-flight;
         // otherwise leave any active huddle and claim a fresh atomic generation id.
@@ -78,6 +27,7 @@ impl<B: Backend> Core<B> {
         let ctx = self.ctx();
         let huddle = Arc::clone(&self.huddle);
         let save_transcripts = Arc::clone(&self.save_huddle_transcripts);
+        let huddle_media = self.huddle_media.clone();
         let tasks = self.tasks.clone();
         self.spawn("rooms.join", async move {
             struct JoinGuard {
@@ -164,6 +114,7 @@ impl<B: Backend> Core<B> {
                 my_gen,
                 upd_rx,
                 ctx.events,
+                huddle_media,
                 Some(persist),
             );
             Ok(())
@@ -224,7 +175,8 @@ impl<B: Backend> Core<B> {
                 .backend
                 .rooms_get_link(ctx.workspace, channel.clone())
                 .await?;
-            ctx.events.emit(Event::HuddleLinkLoaded { channel, url });
+            ctx.events
+                .emit(Event::Huddle(HuddleEvent::LinkLoaded { channel, url }));
             Ok(())
         });
     }
@@ -323,23 +275,35 @@ pub(in crate::client) fn spawn_huddle_watcher(
     my_gen: u64,
     upd_rx: tokio::sync::mpsc::UnboundedReceiver<HuddleUpdate>,
     events: Emitter,
+    huddle_media: HuddleMediaSender,
     persist: Option<TranscriptPersistCtx>,
 ) {
     let tasks = TaskTracker::default();
-    spawn_huddle_watcher_tracked(&tasks, huddle, my_gen, upd_rx, events, persist);
+    spawn_huddle_watcher_tracked(
+        &tasks,
+        huddle,
+        my_gen,
+        upd_rx,
+        events,
+        huddle_media,
+        persist,
+    );
 }
 
-/// Forward huddle session updates from `upd_rx` to `events`, tagged with `my_gen` so an older
-/// session transitioning to `Idle`/`Failed` can never clobber a newer active session's state.
+/// Forward huddle session updates from `upd_rx` to `events` (control/lifecycle/data) and
+/// `huddle_media` (high-frequency video frames, tile closures, audio meters via non-blocking
+/// `try_send`), tagged with `my_gen` so an older session transitioning to `Idle`/`Failed` can
+/// never clobber a newer active session's state.
 ///
-/// High-frequency media updates (60Hz video frames, audio meters, data events) check the atomic
-/// `generation` counter lock-free instead of taking the `HuddleSlot` mutex.
+/// High-frequency media updates check the atomic `generation` counter lock-free instead of taking
+/// the `HuddleSlot` mutex.
 fn spawn_huddle_watcher_tracked(
     tasks: &TaskTracker,
     huddle: Arc<Mutex<HuddleSlot>>,
     my_gen: u64,
     mut upd_rx: tokio::sync::mpsc::UnboundedReceiver<HuddleUpdate>,
     events: Emitter,
+    mut huddle_media: HuddleMediaSender,
     persist: Option<TranscriptPersistCtx>,
 ) {
     let gen_counter = Arc::clone(
@@ -364,22 +328,22 @@ fn spawn_huddle_watcher_tracked(
                         is_current || (done && slot.handle.is_none() && !slot.joining)
                     };
                     if should_emit {
-                        events.emit(Event::HuddleSessionChanged(snap));
+                        events.emit(Event::Huddle(HuddleEvent::SessionChanged(snap)));
                     }
                 }
                 HuddleUpdate::AudioLevels(levels) => {
                     if gen_counter.load(Ordering::Acquire) == my_gen {
-                        events.emit(Event::HuddleAudioLevels(levels));
+                        let _ = huddle_media.try_send(HuddleMediaEvent::AudioLevels(levels));
                     }
                 }
                 HuddleUpdate::VideoFrame { tile, frame } => {
                     if gen_counter.load(Ordering::Acquire) == my_gen {
-                        events.emit(Event::HuddleVideoFrame { tile, frame });
+                        let _ = huddle_media.try_send(HuddleMediaEvent::VideoFrame { tile, frame });
                     }
                 }
                 HuddleUpdate::VideoTileClosed(tile) => {
                     if gen_counter.load(Ordering::Acquire) == my_gen {
-                        events.emit(Event::HuddleVideoTileClosed(tile));
+                        let _ = huddle_media.try_send(HuddleMediaEvent::VideoTileClosed(tile));
                     }
                 }
                 HuddleUpdate::DataEvent(ev) => {
@@ -421,7 +385,7 @@ fn spawn_huddle_watcher_tracked(
                                 tracing::warn!(%err, "failed to persist huddle transcript segment");
                             }
                         }
-                        events.emit(Event::HuddleDataEvent(ev));
+                        events.emit(Event::Huddle(HuddleEvent::Data(ev)));
                     }
                 }
             }

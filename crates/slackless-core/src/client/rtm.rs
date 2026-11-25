@@ -80,33 +80,34 @@ impl<B: Backend> Core<B> {
                             .clone()
                             .filter(|ts| !ts.as_str().trim().is_empty());
                         for channel in ev.target_channels() {
-                            self.events.emit(Event::HuddleUpdated {
+                            self.events.emit(Event::Huddle(HuddleEvent::Updated {
                                 channel,
                                 participants: participants.clone(),
                                 ended,
                                 topic: topic.clone(),
                                 background_id: background_id.clone(),
                                 thread_root_ts: thread_root_ts.clone(),
-                            });
+                            }));
                         }
                     }
                     SlackEvent::HuddleInvite(inv) => {
                         if !inv.channel_id.as_str().is_empty()
                             && !inv.sender_user_id.as_str().is_empty()
                         {
-                            self.events.emit(Event::HuddleInvite {
+                            self.events.emit(Event::Huddle(HuddleEvent::Invite {
                                 channel: inv.channel_id.clone(),
                                 inviter: inv.sender_user_id.clone(),
                                 call_id: inv.call_id.clone(),
-                            });
+                            }));
                         }
                     }
                     SlackEvent::HuddleInviteCancel(cancel) => {
-                        self.events.emit(Event::HuddleInviteCancelled {
-                            channel: (!cancel.channel_id.as_str().is_empty())
-                                .then(|| cancel.channel_id.clone()),
-                            call_id: None,
-                        });
+                        self.events
+                            .emit(Event::Huddle(HuddleEvent::InviteCancelled {
+                                channel: (!cancel.channel_id.as_str().is_empty())
+                                    .then(|| cancel.channel_id.clone()),
+                                call_id: None,
+                            }));
                     }
                     _ => {}
                 }
