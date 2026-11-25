@@ -1617,6 +1617,69 @@ impl Render for PopoutWindow {
                         });
                     }) as crate::canvas::CanvasEditFn
                 });
+                let on_upload_file: crate::canvas::CanvasUploadFileFn = {
+                    let send = self.send.clone();
+                    let upload_channel = self.fixtures.messages.keys().next().cloned();
+                    let is_live = file_id.is_some();
+                    Rc::new(move |on_done, window: &mut Window, cx: &mut App| {
+                        let rx = cx.prompt_for_paths(gpui_kit::gpui::PathPromptOptions {
+                            files: true,
+                            directories: false,
+                            multiple: false,
+                            prompt: Some("Upload file to canvas".into()),
+                        });
+                        let send_u = send.clone();
+                        let ch_u = upload_channel.clone();
+                        window
+                            .spawn(cx, async move |cx| {
+                                let Ok(Ok(Some(paths))) = rx.await else {
+                                    return;
+                                };
+                                let Some(path) = paths.into_iter().next() else {
+                                    return;
+                                };
+                                let filename = path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("attachment")
+                                    .to_owned();
+                                let bytes = if is_live {
+                                    std::fs::read(&path).ok().filter(|b| !b.is_empty())
+                                } else {
+                                    None
+                                };
+                                let url = format!("file://{}", path.display());
+                                let _ = cx.update(|window, cx| {
+                                    if let (Some(ch), Some(bytes)) = (ch_u.clone(), bytes) {
+                                        (send_u)(Command::UploadFiles {
+                                            channel: ch,
+                                            thread_ts: None,
+                                            content: None,
+                                            files: vec![slackless_core::api::UploadFile {
+                                                filename: filename.clone(),
+                                                bytes,
+                                            }],
+                                        });
+                                    }
+                                    on_done(
+                                        crate::canvas::UploadedCanvasFile {
+                                            filename: filename.clone(),
+                                            url,
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                    actions::notify(
+                                        "Inserted file",
+                                        format!("Added {filename} to canvas."),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            })
+                            .detach();
+                    })
+                };
                 let key = file_id.as_deref().unwrap_or("popout-canvas");
                 crate::canvas::render_popout_canvas(
                     key,
@@ -1626,6 +1689,7 @@ impl Render for PopoutWindow {
                     crate::canvas::CanvasActions {
                         open_browser,
                         on_edit,
+                        on_upload_file: Some(on_upload_file),
                         ..Default::default()
                     },
                     file_id.is_none(),
