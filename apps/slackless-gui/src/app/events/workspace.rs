@@ -14,6 +14,16 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         if ws_index == self.workspace {
+            match event {
+                Event::UsergroupUsersLoaded { usergroup, users } => {
+                    self.on_usergroup_users_loaded(usergroup.clone(), users.clone(), cx);
+                    return;
+                }
+                Event::Usergroups(groups) => {
+                    crate::directory::reconcile_usergroups_from_server(groups, cx);
+                }
+                _ => {}
+            }
             self.on_core_event(event, window, cx);
             return;
         }

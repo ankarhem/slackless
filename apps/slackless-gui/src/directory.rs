@@ -1,14 +1,17 @@
-//! The workspace directory (the sidebar's "Directories" row): Slack's People and Channels
-//! tabs with a search over each. A person opens their profile panel; a channel opens, or
-//! offers the channel browser's local Join for one not joined yet. The filters and rows live
-//! in [`crate::directory_rows`].
+//! The workspace directory (the sidebar's "Directories" row): Slack's People, Channels, and
+//! User groups tabs with a search over each. A person opens their profile panel; a channel opens,
+//! or offers the channel browser's local Join for one not joined yet; user groups support
+//! browsing, searching, viewing/editing members, editing details, and disabling/enabling. The
+//! filters and rows live in [`crate::directory_rows`].
 //!
 //! `DirectoryView::new(Arc<Fixtures>, &mut Window, &mut App) -> Entity<DirectoryView>`
 //! `DirectoryView::set_fixtures(&mut self, Arc<Fixtures>, &mut Context<Self>)` (live reloads)
 //! emits `DirectoryEvent::OpenProfile(UserId)` / `Open(ChannelId)` / `Join(ChannelId)` /
-//! `Close`
+//! `CreateUsergroup` / `Close`, and dispatches user-group management actions (`Members`, `Edit`,
+//! `Disable`, `Enable`) through [`dispatch_usergroup_action`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
@@ -17,11 +20,11 @@ use gpui_kit::component::input::{InputEvent, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, px,
+    App, AppContext as _, Context, Entity, EventEmitter, FontWeight, Global,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
-use slackless_core::types::{ChannelId, UserId};
+use slackless_core::types::{ChannelId, UserId, Usergroup, UsergroupId};
 
 use crate::directory_rows::{channel_row, channels, people, person_row, usergroup_row, usergroups};
 use crate::fixtures::Fixtures;
@@ -52,6 +55,160 @@ pub enum DirectoryEvent {
     Close,
 }
 
+/// User-group management actions triggered from the Directory's User groups tab.
+#[derive(Clone, Debug)]
+pub enum UsergroupAction {
+    /// Open the member viewer/editor modal (`usergroups.users.list` / `usergroups.users.update`).
+    InspectMembers(Usergroup),
+    /// Open the edit details modal (`usergroups.update`).
+    Edit(Usergroup),
+    /// Disable an active user group (`usergroups.disable`).
+    Disable(Usergroup),
+    /// Re-enable a disabled user group (`usergroups.enable`).
+    Enable(Usergroup),
+}
+
+type UsergroupActionCallback = Rc<dyn Fn(UsergroupAction, &mut Window, &mut App)>;
+
+struct UsergroupActionRouter(UsergroupActionCallback);
+
+impl Global for UsergroupActionRouter {}
+
+/// Register the root [`App`] handler for user-group management actions (`Members`, `Edit`,
+/// `Disable`, `Enable`).
+pub(crate) fn set_usergroup_action_handler(
+    handler: impl Fn(UsergroupAction, &mut Window, &mut App) + 'static,
+    cx: &mut App,
+) {
+    cx.set_global(UsergroupActionRouter(Rc::new(handler)));
+}
+
+/// Dispatch a user-group management action to the root [`App`] handler.
+pub(crate) fn dispatch_usergroup_action(
+    action: UsergroupAction,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let handler = cx
+        .try_global::<UsergroupActionRouter>()
+        .map(|router| Rc::clone(&router.0));
+    if let Some(handler) = handler {
+        handler(action, window, cx);
+    }
+}
+
+/// Optimistic local overrides for user-group detail edits until the next `Event::Usergroups`
+/// refresh arrives from Slack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UsergroupLocalEdit {
+    pub name: String,
+    pub handle: String,
+    pub description: Option<String>,
+}
+
+/// Live client-side user-group membership cache and session disable/edit state shared between the
+/// Directory view and user-group modals.
+#[derive(Default)]
+struct UsergroupLiveState {
+    /// Fresh member lists returned by `usergroups.users.list` / `usergroups.users.update`.
+    members: HashMap<UsergroupId, Vec<UserId>>,
+    /// Groups disabled during this session (kept visible under "Show disabled" so they can be
+    /// re-enabled even when `usergroups.list` omits disabled groups).
+    disabled_groups: HashMap<UsergroupId, Usergroup>,
+    /// Optimistic detail edits applied locally before the next `usergroups.list` round-trip.
+    edited_groups: HashMap<UsergroupId, UsergroupLocalEdit>,
+}
+
+impl Global for UsergroupLiveState {}
+
+fn ensure_live_state(cx: &mut App) -> &mut UsergroupLiveState {
+    if !cx.has_global::<UsergroupLiveState>() {
+        cx.set_global(UsergroupLiveState::default());
+    }
+    cx.global_mut::<UsergroupLiveState>()
+}
+
+/// Record a fresh member list for `id` (from `Event::UsergroupUsersLoaded` or local save).
+pub(crate) fn record_usergroup_members(id: UsergroupId, users: Vec<UserId>, cx: &mut App) {
+    ensure_live_state(cx).members.insert(id, users);
+}
+
+/// Return the cached fresh member list for `id`, if already loaded this session.
+pub(crate) fn cached_usergroup_members(id: &UsergroupId, cx: &App) -> Option<Vec<UserId>> {
+    cx.try_global::<UsergroupLiveState>()
+        .and_then(|s| s.members.get(id).cloned())
+}
+
+/// Record a user group as disabled locally so it immediately appears under "Show disabled" with an
+/// Enable action.
+pub(crate) fn record_usergroup_disabled(mut group: Usergroup, cx: &mut App) {
+    if group.date_delete == 0 {
+        group.date_delete = 1;
+    }
+    ensure_live_state(cx)
+        .disabled_groups
+        .insert(group.id.clone(), group);
+}
+
+/// Clear any local disabled override when a group is re-enabled.
+pub(crate) fn record_usergroup_enabled(id: &UsergroupId, cx: &mut App) {
+    if cx.has_global::<UsergroupLiveState>() {
+        cx.global_mut::<UsergroupLiveState>()
+            .disabled_groups
+            .remove(id);
+    }
+}
+
+/// Record an optimistic detail edit (`name`, `handle`, `description`) for instant feedback.
+pub(crate) fn record_usergroup_edit(
+    id: UsergroupId,
+    name: String,
+    handle: String,
+    description: Option<String>,
+    cx: &mut App,
+) {
+    let state = ensure_live_state(cx);
+    if let Some(disabled) = state.disabled_groups.get_mut(&id) {
+        disabled.name = name.clone();
+        if !handle.is_empty() {
+            disabled.handle = handle.clone();
+        }
+        disabled.description = description.clone();
+    }
+    state.edited_groups.insert(
+        id,
+        UsergroupLocalEdit {
+            name,
+            handle,
+            description,
+        },
+    );
+}
+
+/// Reconcile local optimistic overrides after a fresh `Event::Usergroups` list lands from Slack.
+pub(crate) fn reconcile_usergroups_from_server(groups: &[Usergroup], cx: &mut App) {
+    if cx.has_global::<UsergroupLiveState>() {
+        let state = cx.global_mut::<UsergroupLiveState>();
+        for group in groups {
+            if !group.is_deleted() {
+                state.disabled_groups.remove(&group.id);
+            }
+            state.edited_groups.remove(&group.id);
+        }
+    }
+}
+
+fn live_overrides(
+    cx: &App,
+) -> (
+    HashMap<UsergroupId, Usergroup>,
+    HashMap<UsergroupId, UsergroupLocalEdit>,
+) {
+    cx.try_global::<UsergroupLiveState>()
+        .map(|s| (s.disabled_groups.clone(), s.edited_groups.clone()))
+        .unwrap_or_default()
+}
+
 pub struct DirectoryView {
     fixtures: Arc<Fixtures>,
     tab: DirectoryTab,
@@ -60,6 +217,8 @@ pub struct DirectoryView {
     joined: HashSet<ChannelId>,
     /// Expanded user group id showing clickable member and default channel chips.
     expanded_group: Option<String>,
+    /// Whether disabled user groups are shown in the User groups tab.
+    show_disabled_groups: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -88,6 +247,7 @@ impl DirectoryView {
                 filter,
                 joined: HashSet::new(),
                 expanded_group: None,
+                show_disabled_groups: false,
                 _subscriptions: subscriptions,
             }
         })
@@ -127,24 +287,38 @@ impl DirectoryView {
         }
         cx.notify();
     }
+
+    fn toggle_show_disabled_groups(&mut self, cx: &mut Context<Self>) {
+        self.show_disabled_groups = !self.show_disabled_groups;
+        cx.notify();
+    }
 }
 
 impl Render for DirectoryView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, muted, foreground, link) = (
+        let (border, muted, foreground, link, secondary, secondary_hover) = (
             theme.border,
             theme.muted_foreground,
             theme.foreground,
             theme.link,
+            theme.secondary,
+            theme.secondary_hover,
         );
         let needle = self.needle(cx);
         let fixtures = self.fixtures.clone();
-        let (tab, joined) = (self.tab, &self.joined);
-        let (matching_people, matching_channels, matching_groups) = (
+        let (tab, joined, show_disabled) = (self.tab, &self.joined, self.show_disabled_groups);
+        let (disabled_overrides, edit_overrides) = live_overrides(cx);
+        let (matching_people, matching_channels, (matching_groups, disabled_count)) = (
             people(&fixtures, &needle),
             channels(&fixtures, &needle),
-            usergroups(&fixtures, &needle),
+            usergroups(
+                &fixtures,
+                &disabled_overrides,
+                &edit_overrides,
+                &needle,
+                show_disabled,
+            ),
         );
         let count = match tab {
             DirectoryTab::People => matching_people.len(),
@@ -203,6 +377,16 @@ impl Render for DirectoryView {
                     cx.notify();
                 }))
         });
+
+        let summary_label = if tab == DirectoryTab::UserGroups && disabled_count > 0 {
+            if show_disabled {
+                format!("{count} groups ({disabled_count} disabled)")
+            } else {
+                format!("{count} active · {disabled_count} disabled hidden")
+            }
+        } else {
+            format!("{count} results")
+        };
 
         v_flex()
             .size_full()
@@ -272,12 +456,50 @@ impl Render for DirectoryView {
                     .my_2(),
             )
             .child(
-                div()
+                h_flex()
                     .px_4()
+                    .pb_1()
                     .flex_none()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(format!("{count} results")),
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_xs().text_color(muted).child(summary_label))
+                    .when(
+                        tab == DirectoryTab::UserGroups && (disabled_count > 0 || show_disabled),
+                        |bar| {
+                            bar.child(
+                                h_flex()
+                                    .id("directory-toggle-disabled-groups")
+                                    .items_center()
+                                    .gap_1()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .bg(if show_disabled {
+                                        link.opacity(0.16)
+                                    } else {
+                                        secondary
+                                    })
+                                    .text_color(if show_disabled { link } else { muted })
+                                    .hover(move |el| {
+                                        el.bg(if show_disabled {
+                                            link.opacity(0.24)
+                                        } else {
+                                            secondary_hover
+                                        })
+                                    })
+                                    .child(if show_disabled {
+                                        "Hide disabled".to_owned()
+                                    } else {
+                                        format!("Show disabled ({disabled_count})")
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_show_disabled_groups(cx);
+                                    })),
+                            )
+                        },
+                    ),
             )
             .child(
                 v_flex()

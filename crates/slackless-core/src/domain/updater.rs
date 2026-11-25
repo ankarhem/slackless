@@ -265,6 +265,26 @@ pub async fn fetch_latest_release_for(
     fetch_release_from_url(&url, user_agent).await
 }
 
+fn block_on_updater<F: std::future::Future>(fut: F) -> Result<F::Output, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return Ok(tokio::task::block_in_place(|| handle.block_on(fut)));
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to initialize updater async runtime: {e}"))?;
+    Ok(rt.block_on(fut))
+}
+
+/// Blocking wrapper around [`fetch_latest_release_for`] for non-Tokio callers (e.g. GPUI
+/// background executor threads), running `reqwest` on a lightweight temporary Tokio runtime.
+pub fn fetch_latest_release_for_blocking(
+    repo: &str,
+    user_agent: &str,
+) -> Result<Option<ReleaseInfo>, String> {
+    block_on_updater(fetch_latest_release_for(repo, user_agent))?
+}
+
 /// Query GitHub Releases over HTTPS (using `reqwest` with workspace proxy support and timeouts)
 /// for the latest non-draft, non-prerelease official Slackless release.
 pub async fn fetch_latest_release() -> Result<Option<ReleaseInfo>, String> {
@@ -370,6 +390,21 @@ pub async fn download_and_verify_release(
         ));
     }
     Ok(tarball_path)
+}
+
+/// Blocking wrapper around [`download_and_verify_release`] for non-Tokio callers (e.g. GPUI
+/// background executor threads), running `reqwest` + pure-Rust SHA-256 verification on a
+/// lightweight temporary Tokio runtime.
+pub fn download_and_verify_release_blocking(
+    release: &ReleaseInfo,
+    staging_dir: &Path,
+    user_agent: &str,
+) -> Result<PathBuf, String> {
+    block_on_updater(download_and_verify_release(
+        release,
+        staging_dir,
+        user_agent,
+    ))?
 }
 
 /// Extract a `.tar.gz` archive into `dest_dir` via `tar -xzf`, returning clear stderr on failure.
@@ -840,6 +875,73 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        let _ = server_thread.join();
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn download_and_verify_release_blocking_works_outside_tokio() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        let asset_name = "Slackless-2026.11.25-06-macos-arm64.app.tar.gz";
+        let payload = b"blocking-wrapper-tar-gz-payload".to_vec();
+        let good_hash = sha256_bytes(&payload);
+        let good_sums = format!("{good_hash}  {asset_name}\n").into_bytes();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        let payload_srv = payload.clone();
+        let server_thread = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut req_line = String::new();
+                let _ = reader.read_line(&mut req_line);
+                let path = req_line.split_whitespace().nth(1).unwrap_or("/");
+                let body: &[u8] = match path {
+                    "/asset.tar.gz" => &payload_srv,
+                    "/SHA256SUMS.txt" => &good_sums,
+                    _ => b"",
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+
+        let stage = std::env::temp_dir().join(format!(
+            "slackless-core-dl-blocking-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&stage);
+        let release = ReleaseInfo {
+            version: "2026.11.25-06".to_owned(),
+            html_url: "https://example.com".to_owned(),
+            asset_name: asset_name.to_owned(),
+            download_url: format!("http://{addr}/asset.tar.gz"),
+            sha256_url: Some(format!("http://{addr}/SHA256SUMS.txt")),
+            notes: Vec::new(),
+        };
+
+        // Run from a plain OS thread with no Tokio runtime context.
+        let stage_c = stage.clone();
+        let verified = std::thread::spawn(move || {
+            download_and_verify_release_blocking(&release, &stage_c, "Slackless-Test/1.0")
+        })
+        .join()
+        .expect("join worker thread")
+        .expect("verified blocking download");
+
+        assert_eq!(verified, stage.join(asset_name));
+        assert_eq!(std::fs::read(&verified).expect("read archive"), payload);
 
         let _ = server_thread.join();
         let _ = std::fs::remove_dir_all(&stage);
