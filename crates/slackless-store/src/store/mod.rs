@@ -2,6 +2,7 @@
 
 mod archive;
 mod bots;
+mod file_transcripts;
 mod maintenance;
 mod memberships;
 mod messages;
@@ -12,9 +13,12 @@ mod tests;
 mod transcripts;
 
 pub use archive::{ALL_CONVERSATION_KINDS, ConversationSummary, DigestChannel, UserSummary};
+pub use file_transcripts::{StoredFileTranscript, extract_inline_file_transcript};
 pub use transcripts::{
     HuddleTranscriptSegment, HuddleTranscriptSession, NewHuddleTranscriptSegment,
 };
+
+pub(crate) use messages::decode_json_value;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};

@@ -112,7 +112,7 @@ impl Store {
             json: &stored_json,
         };
         insert_revision(&tx, &write)?;
-        write_current(&tx, &write)?;
+        write_current(&tx, &write, true)?;
         tx.commit()?;
         Self::bump_message_revision();
         Ok(())
@@ -354,7 +354,7 @@ pub(super) fn encode_json_value(json: &str, force_text: bool) -> SqlValue {
 }
 
 /// Decode a `json` column stored as either legacy UTF-8 `TEXT` or zlib-compressed `BLOB`.
-pub(super) fn decode_json_value(val: ValueRef<'_>) -> rusqlite::Result<String> {
+pub(crate) fn decode_json_value(val: ValueRef<'_>) -> rusqlite::Result<String> {
     match val {
         ValueRef::Text(bytes) => std::str::from_utf8(bytes)
             .map(str::to_owned)
@@ -424,7 +424,7 @@ fn insert_revision(tx: &Transaction<'_>, w: &MessageWrite<'_>) -> Result<()> {
     Ok(())
 }
 
-fn write_current(tx: &Transaction<'_>, w: &MessageWrite<'_>) -> Result<()> {
+fn write_current(tx: &Transaction<'_>, w: &MessageWrite<'_>, existed: bool) -> Result<()> {
     let file_names = w
         .message
         .files
@@ -433,6 +433,8 @@ fn write_current(tx: &Transaction<'_>, w: &MessageWrite<'_>) -> Result<()> {
         .flatten()
         .collect::<Vec<_>>()
         .join(" ");
+    let file_transcripts =
+        file_transcripts::compute_message_file_transcripts(tx, w.workspace, &w.message.files)?;
     let has_link = w.message.text.contains("http://")
         || w.message.text.contains("https://")
         || w.message
@@ -440,42 +442,66 @@ fn write_current(tx: &Transaction<'_>, w: &MessageWrite<'_>) -> Result<()> {
             .iter()
             .any(|a| a.from_url.is_some() || a.title_link.is_some());
     let has_reaction = !w.message.reactions.is_empty();
-    let mut stmt = tx.prepare_cached(
-        "INSERT INTO message_current
-             (workspace_id, channel_id, ts, ts_key, edit_ts, user_id, thread_ts, subtype, text,
-              file_names, deleted, has_link, has_file, has_reaction, is_pinned, reply_count, json,
-              created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
-         ON CONFLICT (workspace_id, channel_id, ts) DO UPDATE SET
-             ts_key = excluded.ts_key, edit_ts = excluded.edit_ts, user_id = excluded.user_id,
-             thread_ts = excluded.thread_ts, subtype = excluded.subtype, text = excluded.text,
-             file_names = excluded.file_names, deleted = excluded.deleted,
-             has_link = excluded.has_link, has_file = excluded.has_file,
-             has_reaction = excluded.has_reaction, is_pinned = excluded.is_pinned,
-             reply_count = excluded.reply_count, json = excluded.json,
-             created_at = excluded.created_at, updated_at = excluded.updated_at",
-    )?;
-    stmt.execute(params![
-        w.workspace.as_str(),
-        w.channel.as_str(),
-        w.message.ts.as_str(),
-        ts_key(&w.message.ts),
-        w.edit_ts,
-        w.message.user.as_ref().map(|u| u.as_str()),
-        w.message.thread_ts.as_ref().map(|t| t.as_str()),
-        w.message.subtype.as_ref().map(|s| s.as_str()),
-        w.message.text,
-        file_names,
-        w.deleted,
-        has_link,
-        !w.message.files.is_empty(),
-        has_reaction,
-        !w.message.pinned_to.is_empty(),
-        w.message.reply_count,
-        w.json,
-        w.message.ts.secs(),
-        now_secs(),
-    ])?;
+    let message_id: i64 = {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO message_current
+                 (workspace_id, channel_id, ts, ts_key, edit_ts, user_id, thread_ts, subtype, text,
+                  file_names, file_transcripts, deleted, has_link, has_file, has_reaction,
+                  is_pinned, reply_count, json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                     ?18, ?19, ?20)
+             ON CONFLICT (workspace_id, channel_id, ts) DO UPDATE SET
+                 ts_key = excluded.ts_key, edit_ts = excluded.edit_ts, user_id = excluded.user_id,
+                 thread_ts = excluded.thread_ts, subtype = excluded.subtype, text = excluded.text,
+                 file_names = excluded.file_names, file_transcripts = excluded.file_transcripts,
+                 deleted = excluded.deleted, has_link = excluded.has_link,
+                 has_file = excluded.has_file, has_reaction = excluded.has_reaction,
+                 is_pinned = excluded.is_pinned, reply_count = excluded.reply_count,
+                 json = excluded.json, created_at = excluded.created_at,
+                 updated_at = excluded.updated_at
+             RETURNING id",
+        )?;
+        stmt.query_row(
+            params![
+                w.workspace.as_str(),
+                w.channel.as_str(),
+                w.message.ts.as_str(),
+                ts_key(&w.message.ts),
+                w.edit_ts,
+                w.message.user.as_ref().map(|u| u.as_str()),
+                w.message.thread_ts.as_ref().map(|t| t.as_str()),
+                w.message.subtype.as_ref().map(|s| s.as_str()),
+                w.message.text,
+                file_names,
+                file_transcripts,
+                w.deleted,
+                has_link,
+                !w.message.files.is_empty(),
+                has_reaction,
+                !w.message.pinned_to.is_empty(),
+                w.message.reply_count,
+                w.json,
+                w.message.ts.secs(),
+                now_secs(),
+            ],
+            |r| r.get(0),
+        )?
+    };
+    if existed || !w.message.files.is_empty() {
+        let mut del = tx.prepare_cached("DELETE FROM message_file WHERE message_id = ?1")?;
+        del.execute(params![message_id])?;
+        if !w.message.files.is_empty() {
+            let mut ins = tx.prepare_cached(
+                "INSERT OR IGNORE INTO message_file (workspace_id, file_id, message_id)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for file in &w.message.files {
+                if !file.id.as_str().is_empty() {
+                    ins.execute(params![w.workspace.as_str(), file.id.as_str(), message_id])?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -531,7 +557,7 @@ fn upsert_message_in_tx(
         insert_revision(tx, &write)?;
     }
     if newest {
-        write_current(tx, &write)?;
+        write_current(tx, &write, current.is_some())?;
     }
     Ok(())
 }

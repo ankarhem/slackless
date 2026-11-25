@@ -75,6 +75,14 @@ impl Store {
                     "SELECT count(*) FROM huddle_transcript WHERE workspace_id = ?1",
                 ),
                 (
+                    "file_transcript",
+                    "SELECT count(*) FROM file_transcript WHERE workspace_id = ?1",
+                ),
+                (
+                    "message_file",
+                    "SELECT count(*) FROM message_file WHERE workspace_id = ?1",
+                ),
+                (
                     "channel_section",
                     "SELECT count(*) FROM channel_section WHERE workspace_id = ?1",
                 ),
@@ -127,8 +135,8 @@ impl Store {
     pub fn vacuum(&mut self) -> Result<()> {
         self.ensure_writable()?;
         // Compress legacy plain-TEXT message payloads in batches (skipping ephemeral rows so
-        // `drop_ephemeral` can keep using `json_extract`). Because `V6` scopes `message_current_au`
-        // to `text, file_names`, updating `json` alone never churns the FTS5 index.
+        // `drop_ephemeral` can keep using `json_extract`). Because `message_current_au` is scoped
+        // to `text, file_names, file_transcripts`, updating `json` alone never churns FTS5.
         const BATCH: usize = 5_000;
         let mut last_id: i64 = 0;
         loop {

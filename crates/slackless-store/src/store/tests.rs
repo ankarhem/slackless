@@ -90,12 +90,13 @@ fn migrate_is_idempotent() {
             "SELECT count(*) FROM sqlite_master WHERE name IN
              ('message_revision','message_current','message_fts','conversation','user',
               'team','channel_section','custom_emoji','prefs','local_state','offline_queue',
-              'bot_profile','huddle_transcript','huddle_transcript_fts')",
+              'bot_profile','huddle_transcript','huddle_transcript_fts',
+              'file_transcript','message_file')",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 14);
+    assert_eq!(tables, 16);
     let legacy_reaction: i64 = store
         .conn
         .query_row(
@@ -1908,6 +1909,14 @@ fn open_read_only_rejects_writes_and_open_rejects_future_schema() {
         reader.delete_huddle_transcript(&ws(), "R0CALL"),
         Err(StoreError::ReadOnly)
     ));
+    assert!(matches!(
+        reader.upsert_file_transcript(&ws(), &FileId::from("F1"), "parakeet-v3", "hello"),
+        Err(StoreError::ReadOnly)
+    ));
+    assert!(matches!(
+        reader.delete_file_transcript(&ws(), &FileId::from("F1")),
+        Err(StoreError::ReadOnly)
+    ));
 
     drop(reader);
 
@@ -2898,4 +2907,403 @@ fn empty_upsert_does_not_bump_revision_while_transcript_insert_does() {
             > 0
     );
     assert!(Store::message_revision() > rev);
+}
+
+#[test]
+fn v10_to_v11_migration_backfills_message_file_and_inline_clip_transcripts() {
+    let dir = std::env::temp_dir().join(format!(
+        "slackless-store-v10-v11-migration-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("v10.sqlite");
+    let _ = std::fs::remove_file(&path);
+
+    // Bootstrap strictly at schema V10 with:
+    // 1. A clip message carrying Slack inline `transcription.preview.content` (compressed BLOB json).
+    // 2. A clip message carrying Slack inline `transcription.text` (plain TEXT json).
+    // 3. A video file message with no inline transcript yet (still backfilled in `message_file`).
+    {
+        let conn = Connection::open(&path).unwrap();
+        schema::apply_up_to_for_test(&conn, 10);
+        assert_eq!(schema::schema_version(&conn).unwrap(), 10);
+
+        let mut clip_preview_file = File {
+            id: FileId::from("F_PREVIEW"),
+            name: Some("standup_clip.mp4".into()),
+            ..Default::default()
+        };
+        clip_preview_file.extra.insert(
+            "transcription".into(),
+            serde_json::json!({
+                "preview": {
+                    "content": "  We decided to ship the quantum widget on Friday morning  "
+                },
+                "text": "fallback text ignored when preview content exists"
+            }),
+        );
+        let mut msg_preview = msg("1700010001.000100", "U1", "Check this clip");
+        msg_preview.files = vec![clip_preview_file];
+        // Pad JSON >= 160 bytes so encode_json_value compresses it to zlib BLOB.
+        let preview_json = encode_json_value(&serde_json::to_string(&msg_preview).unwrap(), false);
+        assert!(matches!(preview_json, SqlValue::Blob(_)));
+
+        let mut clip_text_file = File {
+            id: FileId::from("F_TEXT"),
+            name: Some("voice_note.m4a".into()),
+            ..Default::default()
+        };
+        clip_text_file.extra.insert(
+            "transcription".into(),
+            serde_json::json!({ "text": "Swedish fika at klockan tre på eftermiddagen" }),
+        );
+        let mut msg_text = msg("1700010002.000100", "U2", "");
+        msg_text.files = vec![clip_text_file];
+        let text_json = SqlValue::Text(serde_json::to_string(&msg_text).unwrap());
+
+        let video_no_tx_file = File {
+            id: FileId::from("F_LOCAL"),
+            name: Some("demo.mp4".into()),
+            ..Default::default()
+        };
+        let mut msg_no_tx = msg("1700010003.000100", "U3", "Recorded demo");
+        msg_no_tx.files = vec![video_no_tx_file];
+        let no_tx_json = SqlValue::Text(serde_json::to_string(&msg_no_tx).unwrap());
+
+        conn.execute(
+            "INSERT INTO message_current
+             (workspace_id, channel_id, ts, ts_key, edit_ts, user_id, text, file_names, deleted,
+              has_link, has_file, has_reaction, is_pinned, reply_count, json, updated_at)
+             VALUES
+             ('T1','C1','1700010001.000100',1700010001000100,'','U1','Check this clip','standup_clip.mp4',0,0,1,0,0,NULL,?1,100),
+             ('T1','C1','1700010002.000100',1700010002000100,'','U2','','voice_note.m4a',0,0,1,0,0,NULL,?2,101),
+             ('T1','C1','1700010003.000100',1700010003000100,'','U3','Recorded demo','demo.mp4',0,0,1,0,0,NULL,?3,102)",
+            params![preview_json, text_json, no_tx_json],
+        )
+        .unwrap();
+    }
+
+    // Opening via Store::open migrates V10 -> V11 and runs the post-V11 backfill.
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 11);
+
+    // Inline `transcription.preview.content` from compressed BLOB JSON is searchable immediately!
+    let hits = store
+        .search(&ws(), &SearchQuery::parse("quantum widget"), 10)
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].message.ts, Ts::from("1700010001.000100"));
+
+    // Inline `transcription.text` is searchable (diacritic-insensitive: "pa" matches "på").
+    let hits_sv = store
+        .search(&ws(), &SearchQuery::parse("klockan pa eftermiddagen"), 10)
+        .unwrap();
+    assert_eq!(hits_sv.len(), 1);
+    assert_eq!(hits_sv[0].message.ts, Ts::from("1700010002.000100"));
+
+    // `message_file` was backfilled even for the video with no inline transcript, so local
+    // transcription immediately links and indexes that existing message!
+    let updated = store
+        .upsert_file_transcript(
+            &ws(),
+            &FileId::from("F_LOCAL"),
+            "parakeet-v3",
+            "backfilled demo video spoken phrase",
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+    let hits_local = store
+        .search(
+            &ws(),
+            &SearchQuery::parse("backfilled demo video spoken"),
+            10,
+        )
+        .unwrap();
+    assert_eq!(hits_local.len(), 1);
+    assert_eq!(hits_local[0].message.ts, Ts::from("1700010003.000100"));
+
+    // FTS5 integrity check passes cleanly.
+    store
+        .conn
+        .execute(
+            "INSERT INTO message_fts(message_fts) VALUES('integrity-check')",
+            [],
+        )
+        .unwrap();
+
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_transcripts_upsert_search_edit_preserve_multi_file_and_delete() {
+    let mut store = Store::open_in_memory().unwrap();
+    let video_id = FileId::from("F_VID_1");
+    let audio_id = FileId::from("F_AUD_2");
+
+    let mut audio_with_inline = File {
+        id: audio_id.clone(),
+        name: Some("clip2.m4a".into()),
+        ..Default::default()
+    };
+    audio_with_inline.extra.insert(
+        "transcription".into(),
+        serde_json::json!({ "text": "inline slack audio note" }),
+    );
+
+    let video_file = File {
+        id: video_id.clone(),
+        name: Some("architecture_walkthrough.mp4".into()),
+        ..Default::default()
+    };
+
+    let mut m = msg("1700020001.000100", "U1", "Here is the walkthrough");
+    m.files = vec![video_file.clone(), audio_with_inline.clone()];
+    store.upsert_message(&ws(), &general(), &m).unwrap();
+
+    // Before local transcription: unique spoken phrase is NOT matched, while inline transcript IS.
+    assert!(
+        store
+            .search(&ws(), &SearchQuery::parse("zebrafish pipeline"), 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .search(&ws(), &SearchQuery::parse("inline slack audio"), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Local transcription indexes the video file while preserving the second file's transcript.
+    let rev_before = Store::message_revision();
+    let updated = store
+        .upsert_file_transcript(
+            &ws(),
+            &video_id,
+            "parakeet-v3",
+            "  The zebrafish pipeline runs every midnight  ",
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+    assert!(Store::message_revision() > rev_before);
+
+    let hits = store
+        .search(&ws(), &SearchQuery::parse("zebrafish pipeline"), 10)
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].message.ts, m.ts);
+    // Second attached file's inline transcript is still preserved!
+    assert_eq!(
+        store
+            .search(&ws(), &SearchQuery::parse("inline slack audio"), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // `file_transcript` and `all_file_transcripts` return the trimmed persisted transcript,
+    // scoped per workspace.
+    let stored = store.file_transcript(&ws(), &video_id).unwrap().unwrap();
+    assert_eq!(stored.file_id, video_id);
+    assert_eq!(stored.source, "parakeet-v3");
+    assert_eq!(stored.text, "The zebrafish pipeline runs every midnight");
+    assert!(stored.updated_at > 0);
+
+    let all = store.all_file_transcripts(&ws()).unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(
+        all.get(&video_id).map(String::as_str),
+        Some("The zebrafish pipeline runs every midnight")
+    );
+    assert!(
+        store
+            .all_file_transcripts(&TeamId::from("T2"))
+            .unwrap()
+            .is_empty()
+    );
+
+    // Re-upserting / editing the message preserves the stored file_transcript in message_fts!
+    let mut edited = m.clone();
+    edited.text = "Here is the updated walkthrough".into();
+    edited.edited = Some(Edited {
+        user: Some(UserId::from("U1")),
+        ts: Ts::from("1700020001.000500"),
+    });
+    store.upsert_message(&ws(), &general(), &edited).unwrap();
+
+    let hits_after_edit = store
+        .search(&ws(), &SearchQuery::parse("zebrafish pipeline"), 10)
+        .unwrap();
+    assert_eq!(hits_after_edit.len(), 1);
+    assert_eq!(
+        hits_after_edit[0].message.text,
+        "Here is the updated walkthrough"
+    );
+
+    // Storage breakdown reports `file_transcript` and `message_file` counts.
+    let breakdown = store.storage_breakdown(&ws(), 5).unwrap();
+    let table_map: HashMap<&str, u64> = breakdown
+        .tables
+        .iter()
+        .map(|(k, v)| (k.as_str(), *v))
+        .collect();
+    assert_eq!(table_map.get("file_transcript"), Some(&1));
+    assert_eq!(table_map.get("message_file"), Some(&2));
+
+    // Deleting a non-existent transcript returns false without bumping revision.
+    let rev_before_noop = Store::message_revision();
+    assert!(
+        !store
+            .delete_file_transcript(&ws(), &FileId::from("F_MISSING"))
+            .unwrap()
+    );
+    assert_eq!(Store::message_revision(), rev_before_noop);
+
+    // Deleting the stored transcript removes it from `file_transcript` AND `message_fts`,
+    // while keeping the second file's inline transcript intact.
+    assert!(store.delete_file_transcript(&ws(), &video_id).unwrap());
+    assert!(Store::message_revision() > rev_before_noop);
+    assert!(store.file_transcript(&ws(), &video_id).unwrap().is_none());
+    assert!(store.all_file_transcripts(&ws()).unwrap().is_empty());
+    assert!(
+        store
+            .search(&ws(), &SearchQuery::parse("zebrafish pipeline"), 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .search(&ws(), &SearchQuery::parse("inline slack audio"), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Whitespace-only transcript upsert is a no-op returning 0.
+    assert_eq!(
+        store
+            .upsert_file_transcript(&ws(), &video_id, "whisper-turbo", "   \n\t  ")
+            .unwrap(),
+        0
+    );
+    assert!(store.file_transcript(&ws(), &video_id).unwrap().is_none());
+
+    // Transcript stored BEFORE a message arrives is indexed immediately when the message is upserted,
+    // and updating a transcript shared across multiple messages updates all carrying messages.
+    let shared_id = FileId::from("F_SHARED");
+    assert_eq!(
+        store
+            .upsert_file_transcript(
+                &ws(),
+                &shared_id,
+                "whisper-turbo",
+                "initial shared clip phrase",
+            )
+            .unwrap(),
+        0
+    );
+    let shared_file = File {
+        id: shared_id.clone(),
+        name: Some("shared.mp4".into()),
+        ..Default::default()
+    };
+    let mut m1 = msg("1700030001.000100", "U1", "first post");
+    m1.files = vec![shared_file.clone()];
+    let mut m2 = msg("1700030002.000100", "U2", "second post");
+    m2.files = vec![shared_file];
+    store.upsert_message(&ws(), &general(), &m1).unwrap();
+    store
+        .upsert_message(&ws(), &ChannelId::from("C2"), &m2)
+        .unwrap();
+
+    assert_eq!(
+        store
+            .search_sorted(
+                &ws(),
+                &SearchQuery::parse("initial shared clip"),
+                SearchSort::Relevant,
+                10,
+            )
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        store
+            .upsert_file_transcript(
+                &ws(),
+                &shared_id,
+                "parakeet-v3",
+                "revised shared clip phrase",
+            )
+            .unwrap(),
+        2
+    );
+    assert!(
+        store
+            .search(&ws(), &SearchQuery::parse("initial shared clip"), 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .search(&ws(), &SearchQuery::parse("revised shared clip"), 10)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn extract_inline_file_transcript_precedence_and_empty_filtering() {
+    let mut file = File {
+        id: FileId::from("F_META"),
+        // Code snippet `preview` is NOT treated as a spoken clip transcript.
+        preview: Some("fn main() {}".into()),
+        ..Default::default()
+    };
+    assert_eq!(extract_inline_file_transcript(&file), None);
+
+    file.extra
+        .insert("transcript".into(), serde_json::json!("  direct clip  "));
+    assert_eq!(
+        extract_inline_file_transcript(&file).as_deref(),
+        Some("direct clip")
+    );
+
+    file.extra.insert(
+        "transcription".into(),
+        serde_json::json!({ "text": "  transcription text  " }),
+    );
+    assert_eq!(
+        extract_inline_file_transcript(&file).as_deref(),
+        Some("transcription text")
+    );
+
+    file.extra.insert(
+        "transcription".into(),
+        serde_json::json!({
+            "preview": { "content": "  preview content wins  " },
+            "text": "transcription text"
+        }),
+    );
+    assert_eq!(
+        extract_inline_file_transcript(&file).as_deref(),
+        Some("preview content wins")
+    );
+
+    // Blank preview falls back to transcription.text.
+    file.extra.insert(
+        "transcription".into(),
+        serde_json::json!({
+            "preview": { "content": "   " },
+            "text": "fallback text"
+        }),
+    );
+    assert_eq!(
+        extract_inline_file_transcript(&file).as_deref(),
+        Some("fallback text")
+    );
 }

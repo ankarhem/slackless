@@ -2,8 +2,10 @@
 //! [`MIGRATIONS`] moves the schema one version forward and is applied in its own transaction.
 //! Never edit a shipped migration: append a new one.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, params};
 
+use crate::store::{decode_json_value, extract_inline_file_transcript};
+use crate::types::Message;
 use crate::{Result, StoreError};
 
 /// Version 1: the append-only revision log, current-state tables and the FTS5 index.
@@ -326,13 +328,74 @@ DROP INDEX IF EXISTS message_revision_lookup;
 DROP INDEX IF EXISTS message_current_user;
 "#;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
+/// Version 11: persist searchable video/audio file transcripts (`file_transcript`), map
+/// `message_current` rows to attached files (`message_file`), and extend `message_fts` with
+/// `file_transcripts` so spoken clip words are searchable alongside message text and file names.
+const V11: &str = r#"
+CREATE TABLE file_transcript (
+    workspace_id TEXT NOT NULL,
+    file_id      TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    text         TEXT NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, file_id)
+) WITHOUT ROWID;
+
+CREATE TABLE message_file (
+    workspace_id TEXT NOT NULL,
+    file_id      TEXT NOT NULL,
+    message_id   INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, file_id, message_id)
+) WITHOUT ROWID;
+CREATE INDEX message_file_by_message ON message_file (message_id);
+
+ALTER TABLE message_current ADD COLUMN file_transcripts TEXT NOT NULL DEFAULT '';
+
+DROP TRIGGER IF EXISTS message_current_ai;
+DROP TRIGGER IF EXISTS message_current_ad;
+DROP TRIGGER IF EXISTS message_current_au;
+DROP TABLE IF EXISTS message_fts;
+
+CREATE VIRTUAL TABLE message_fts USING fts5(
+    text, file_names, file_transcripts,
+    content = 'message_current', content_rowid = 'id',
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER message_current_ai AFTER INSERT ON message_current BEGIN
+    INSERT INTO message_fts (rowid, text, file_names, file_transcripts)
+    VALUES (new.id, new.text, new.file_names, new.file_transcripts);
+END;
+CREATE TRIGGER message_current_ad AFTER DELETE ON message_current BEGIN
+    INSERT INTO message_fts (message_fts, rowid, text, file_names, file_transcripts)
+    VALUES ('delete', old.id, old.text, old.file_names, old.file_transcripts);
+    DELETE FROM message_file WHERE message_id = old.id;
+END;
+CREATE TRIGGER message_current_au AFTER UPDATE OF text, file_names, file_transcripts ON message_current BEGIN
+    INSERT INTO message_fts (message_fts, rowid, text, file_names, file_transcripts)
+    VALUES ('delete', old.id, old.text, old.file_names, old.file_transcripts);
+    INSERT INTO message_fts (rowid, text, file_names, file_transcripts)
+    VALUES (new.id, new.text, new.file_names, new.file_transcripts);
+END;
+
+INSERT INTO message_fts(message_fts) VALUES('rebuild');
+"#;
+
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
 
 /// The schema version this build migrates to.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
 
 pub(crate) fn schema_version(conn: &Connection) -> Result<u32> {
     Ok(conn.pragma_query_value(None, "user_version", |r| r.get(0))?)
+}
+
+#[cfg(test)]
+pub(crate) fn apply_up_to_for_test(conn: &Connection, target_version: usize) {
+    for (i, sql) in MIGRATIONS[..target_version].iter().enumerate() {
+        conn.execute_batch(sql).unwrap();
+        conn.pragma_update(None, "user_version", i as u32 + 1)
+            .unwrap();
+    }
 }
 
 /// Applies every migration past the stored version. Idempotent.
@@ -345,10 +408,78 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<()> {
         });
     }
     for (index, sql) in MIGRATIONS.iter().enumerate().skip(found as usize) {
+        let version = index as u32 + 1;
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
-        tx.pragma_update(None, "user_version", index as u32 + 1)?;
+        if version == 11 {
+            backfill_v11_message_files_and_transcripts(&tx)?;
+        }
+        tx.pragma_update(None, "user_version", version)?;
         tx.commit()?;
+    }
+    Ok(())
+}
+
+/// Backfill `message_file` and Slack inline clip transcripts on `message_current.file_transcripts`
+/// for existing rows with attached files during the V11 migration transaction.
+fn backfill_v11_message_files_and_transcripts(tx: &Transaction<'_>) -> Result<()> {
+    let mut rows_to_apply: Vec<(i64, String, Vec<String>, Option<String>)> = Vec::new();
+    {
+        let mut stmt =
+            tx.prepare("SELECT id, workspace_id, json FROM message_current WHERE has_file = 1")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                decode_json_value(r.get_ref(2)?)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, workspace_id, json) = row?;
+            let Ok(message) = serde_json::from_str::<Message>(&json) else {
+                continue;
+            };
+            if message.files.is_empty() {
+                continue;
+            }
+            let mut file_ids = Vec::with_capacity(message.files.len());
+            let mut transcripts = Vec::new();
+            for file in &message.files {
+                if !file.id.as_str().is_empty() {
+                    file_ids.push(file.id.as_str().to_owned());
+                }
+                if let Some(t) = extract_inline_file_transcript(file) {
+                    transcripts.push(t);
+                }
+            }
+            let combined = if transcripts.is_empty() {
+                None
+            } else {
+                Some(transcripts.join(" "))
+            };
+            if !file_ids.is_empty() || combined.is_some() {
+                rows_to_apply.push((id, workspace_id, file_ids, combined));
+            }
+        }
+    }
+
+    if rows_to_apply.is_empty() {
+        return Ok(());
+    }
+
+    let mut ins_file = tx.prepare_cached(
+        "INSERT OR IGNORE INTO message_file (workspace_id, file_id, message_id)
+         VALUES (?1, ?2, ?3)",
+    )?;
+    let mut upd_msg =
+        tx.prepare_cached("UPDATE message_current SET file_transcripts = ?1 WHERE id = ?2")?;
+    for (id, workspace_id, file_ids, combined) in rows_to_apply {
+        for file_id in file_ids {
+            ins_file.execute(params![workspace_id, file_id, id])?;
+        }
+        if let Some(transcript_text) = combined {
+            upd_msg.execute(params![transcript_text, id])?;
+        }
     }
     Ok(())
 }
@@ -608,6 +739,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fts_count(&conn, "spec"), 0);
+        assert_eq!(fts_count(&conn, "design"), 1);
+        assert_eq!(fts_count(&conn, "beta"), 1);
+        check_integrity(&conn);
+
+        // Updating file_transcripts fires the trigger and re-indexes file_transcripts.
+        conn.execute(
+            "UPDATE message_current SET file_transcripts = 'spoken quarterly roadmap' WHERE ts = '1700000001.000100'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(fts_count(&conn, "roadmap"), 1);
         assert_eq!(fts_count(&conn, "design"), 1);
         assert_eq!(fts_count(&conn, "beta"), 1);
         check_integrity(&conn);

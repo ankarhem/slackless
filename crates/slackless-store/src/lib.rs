@@ -6,8 +6,8 @@
 //! - `message_current`: latest revision per message, which the UI reads (including indexed
 //!   flags such as `has_link`, `has_file`, `has_reaction`, `is_pinned`); `conversation`, `user`
 //!   hold current state.
-//! - `message_fts`: FTS5 over current message text + file names, synced by triggers; queried
-//!   with Slack-style modifiers parsed by [`query`] (X-2).
+//! - `message_fts`: FTS5 over current message text + file names + file transcripts, synced by
+//!   triggers; queried with Slack-style modifiers parsed by [`query`] (X-2).
 //! - `team`, `channel_section`, `custom_emoji`, `prefs`: sidebar data (team record, channel
 //!   sections, custom emoji, user prefs) hydrated at boot from `client.userBoot`,
 //!   `users.channelSections.list` and `emoji.list`.
@@ -27,7 +27,8 @@ pub use schema::SCHEMA_VERSION;
 pub use store::{
     ALL_CONVERSATION_KINDS, ConversationSummary, DigestChannel, HuddleTranscriptSegment,
     HuddleTranscriptSession, MemberCounts, NewHuddleTranscriptSegment, Revision, StorageBreakdown,
-    Store, StoreStats, StoredMessage, UserSummary,
+    Store, StoreStats, StoredFileTranscript, StoredMessage, UserSummary,
+    extract_inline_file_transcript,
 };
 
 /// Store errors.
