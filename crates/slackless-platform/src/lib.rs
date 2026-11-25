@@ -25,9 +25,14 @@ mod fallback;
 pub mod logging;
 #[cfg(target_os = "macos")]
 mod macos;
+mod macos_overlay;
 
 pub use deep_link::{DeepLink, SlackLink, SlackLinkKind, WebClientLink, parse_deep_link};
 pub use logging::{default_log_path, init_file_logging};
+pub use macos_overlay::{
+    DesktopDrawOverlay, OverlayCursorState, OverlayDrawStroke, OverlayPenEvent, OverlayPenHandler,
+    configure_floating_panel,
+};
 
 /// Application data directory (`~/Library/Application Support/slackless` on macOS,
 /// `$XDG_DATA_HOME/slackless` or `~/.local/share/slackless` on Linux,

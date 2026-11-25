@@ -1,7 +1,20 @@
 // Click-through transparent desktop drawing overlay (`NSWindowSharingNone`) and floating panel
 // configuration for Huddle screen-share controls.
 
-#import "common.h"
+#import <AppKit/AppKit.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <Foundation/Foundation.h>
+#import <QuartzCore/QuartzCore.h>
+#import <dispatch/dispatch.h>
+#import <math.h>
+#import <objc/runtime.h>
+#import <stdbool.h>
+#import <stddef.h>
+#import <stdint.h>
+#import <stdlib.h>
+#import <string.h>
+
+typedef void (*SlacklessOverlayMouseCallback)(void *ctx, uint8_t kind, double nx, double ny);
 
 typedef struct SlacklessOverlaySegment {
     double ax, ay;

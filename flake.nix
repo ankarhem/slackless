@@ -69,6 +69,8 @@
 
             env = {
               RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
+              # Suppress benign cc-rs (`arm64-apple-macosx`) vs Nix (`arm64-apple-darwin`) target warning.
+              NIX_CC_WRAPPER_SUPPRESS_TARGET_WARNING = "1";
             };
           };
           _module.args.pkgs = import inputs.nixpkgs {

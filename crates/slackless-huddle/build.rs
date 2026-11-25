@@ -21,7 +21,7 @@ fn main() {
             "native/macos/vpio_audio.m",
             "native/macos/audio_player.m",
             "native/macos/audio_tap.m",
-            "native/macos/appkit_overlay.m",
+            "native/macos/video_player.m",
         ];
         println!("cargo:rerun-if-changed=native/macos/common.h");
         let mut build = cc::Build::new();
@@ -37,7 +37,6 @@ fn main() {
         for fw in [
             "AVFoundation",
             "Accelerate",
-            "AppKit",
             "AudioToolbox",
             "CoreAudio",
             "CoreGraphics",

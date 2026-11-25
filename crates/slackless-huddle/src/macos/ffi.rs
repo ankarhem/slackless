@@ -50,28 +50,8 @@ pub(crate) struct SlacklessAudioTap {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
-pub struct OverlaySegmentFfi {
-    pub ax: f64,
-    pub ay: f64,
-    pub bx: f64,
-    pub by: f64,
-    pub cx: f64,
-    pub cy: f64,
-    pub dx: f64,
-    pub dy: f64,
-    pub hue: i32,
-    pub alpha: f32,
-    pub width: f32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct OverlayCursorFfi {
-    pub x: f64,
-    pub y: f64,
-    pub hue: i32,
-    pub alpha: f32,
+pub(crate) struct SlacklessVideoPlayer {
+    _private: [u8; 0],
 }
 
 pub(crate) type SlacklessThumbCallback = unsafe extern "C" fn(
@@ -120,9 +100,6 @@ pub(crate) type SlacklessCameraEnumCallback =
 
 pub(crate) type SlacklessAudioDeviceChangeCallback =
     unsafe extern "C" fn(ctx: *mut c_void, is_input: bool);
-
-pub(crate) type SlacklessOverlayMouseCallback =
-    unsafe extern "C" fn(ctx: *mut c_void, kind: u8, nx: f64, ny: f64);
 
 unsafe extern "C" {
     pub(crate) fn slackless_has_screen_capture_permission() -> bool;
@@ -258,24 +235,28 @@ unsafe extern "C" {
     ) -> *mut SlacklessAudioTap;
     pub(crate) fn slackless_audio_tap_stop(tap: *mut SlacklessAudioTap);
 
-    pub(crate) fn slackless_draw_overlay_update(
-        is_monitor: bool,
-        target_id: u32,
-        segs: *const OverlaySegmentFfi,
-        seg_count: usize,
-        cur: *const OverlayCursorFfi,
-        cur_count: usize,
+    pub(crate) fn slackless_video_player_open(path: *const c_char) -> *mut SlacklessVideoPlayer;
+    pub(crate) fn slackless_video_player_play(player: *mut SlacklessVideoPlayer);
+    pub(crate) fn slackless_video_player_pause(player: *mut SlacklessVideoPlayer);
+    pub(crate) fn slackless_video_player_set_muted(player: *mut SlacklessVideoPlayer, muted: bool);
+    pub(crate) fn slackless_video_player_seek(player: *mut SlacklessVideoPlayer, secs: f64);
+    pub(crate) fn slackless_video_player_state(
+        player: *mut SlacklessVideoPlayer,
+        is_playing: *mut bool,
+        is_muted: *mut bool,
+        has_ended: *mut bool,
+        pos_secs: *mut f64,
+        dur_secs: *mut f64,
+        out_w: *mut u32,
+        out_h: *mut u32,
+        is_failed: *mut bool,
     );
-    pub(crate) fn slackless_draw_overlay_set_pen_mode(
-        enabled: bool,
-        is_monitor: bool,
-        target_id: u32,
-        hue: i32,
-        ctx: *mut c_void,
-        cb: Option<SlacklessOverlayMouseCallback>,
-    );
-    pub(crate) fn slackless_draw_overlay_hide();
-    pub(crate) fn slackless_configure_floating_panel(ns_view_ptr: *mut c_void);
+    pub(crate) fn slackless_video_player_copy_frame(
+        player: *mut SlacklessVideoPlayer,
+        out_w: *mut u32,
+        out_h: *mut u32,
+    ) -> *mut c_void;
+    pub(crate) fn slackless_video_player_destroy(player: *mut SlacklessVideoPlayer);
 }
 
 pub(crate) struct CaptureCallbackCtx {

@@ -6,7 +6,6 @@ pub mod audio;
 pub mod camera;
 pub mod codecs;
 pub(crate) mod ffi;
-pub mod overlay;
 pub mod pixel;
 pub mod screen;
 
@@ -16,11 +15,6 @@ pub use audio::{
 };
 pub use camera::{AvVtCameraCapture, list_macos_cameras};
 pub use codecs::{VtAv1Decoder, VtH264Decoder};
-pub use ffi::{OverlayCursorFfi, OverlaySegmentFfi};
-pub use overlay::{
-    OverlayMouseKind, configure_floating_panel, hide_desktop_draw_overlay,
-    set_desktop_draw_pen_mode, update_desktop_draw_overlay,
-};
 pub use pixel::{
     MacVideoSurface, has_screen_capture_permission, open_screen_capture_settings,
     request_screen_capture_permission, supports_hw_av1_decode, supports_hw_h264_decode,
@@ -90,14 +84,6 @@ mod tests {
         let supported = supports_hw_av1_decode();
         let dec = VtAv1Decoder::new();
         assert_eq!(dec.is_ok(), supported);
-    }
-
-    #[test]
-    fn draw_overlay_handles_empty_and_invalid_sources_safely() {
-        update_desktop_draw_overlay("invalid:abc", &[], &[]);
-        update_desktop_draw_overlay("monitor:notanumber", &[], &[]);
-        update_desktop_draw_overlay("window:notanumber", &[], &[]);
-        hide_desktop_draw_overlay();
     }
 
     #[test]

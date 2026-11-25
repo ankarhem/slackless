@@ -27,5 +27,8 @@ block2 = "0.6.2"
 # Main-queue hop for AppKit calls made off the main thread.
 dispatch2 = "0.3.1"
 
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc = "1.1"
+
 [lints]
 workspace = true

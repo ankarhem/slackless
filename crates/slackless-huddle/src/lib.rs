@@ -22,6 +22,7 @@ pub mod session;
 pub mod signaling;
 pub mod transcribe;
 pub mod video;
+pub mod video_player;
 
 /// Generated prost types for Amazon Chime SDK signaling frames (`proto/SignalingProtocol.proto`).
 pub mod proto {
@@ -48,11 +49,7 @@ pub use clips::{
 };
 pub use content_share::{detect_system_audio_loopback, system_audio_source_label};
 #[cfg(target_os = "macos")]
-pub use macos_media::{
-    MacVideoSurface, OverlayCursorFfi, OverlayMouseKind, OverlaySegmentFfi,
-    configure_floating_panel, hide_desktop_draw_overlay, set_desktop_draw_pen_mode,
-    update_desktop_draw_overlay,
-};
+pub use macos_media::MacVideoSurface;
 pub use metrics::{HuddlePerfCounters, HuddlePerfSnapshot, ProcessResourceSampler};
 pub use screen::{ScreenCapture, ScreenSource, capture_screen_thumbnails, list_screen_sources};
 pub use session::spawn_huddle_session;
@@ -65,6 +62,7 @@ pub use transcribe::{
 pub use video::{
     CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoFrameData, VideoTileKey, list_cameras,
 };
+pub use video_player::{NativeVideoPlayer, VideoPlayerState};
 
 /// Returns `true` if OS screen recording permission is granted (always `true` on non-macOS).
 pub fn has_screen_capture_permission() -> bool {
@@ -98,6 +96,8 @@ pub enum HuddleError {
     Video(String),
     #[error("codec error: {0}")]
     Codec(String),
+    #[error("unsupported on this platform: {0}")]
+    Unsupported(String),
 }
 
 pub type Result<T, E = HuddleError> = std::result::Result<T, E>;

@@ -1,4 +1,4 @@
-// CoreAudio output-device-routed native audio player (`AVAudioEngine` + `NSSound` fallback)
+// CoreAudio output-device-routed native audio player (`AVAudioEngine` + `AVAudioPlayer` fallback)
 // and `ExtAudioFile` perceptually weighted RMS loudness measurement.
 
 #import "common.h"
@@ -57,22 +57,6 @@ static AudioDeviceID resolve_output_device_id_by_name(const char *device_name) {
     return matched;
 }
 
-static NSString *resolve_output_device_uid_by_name(const char *device_name) {
-    AudioDeviceID dev = resolve_output_device_id_by_name(device_name);
-    if (dev == kAudioObjectUnknown) return nil;
-    AudioObjectPropertyAddress uidAddr = {
-        kAudioDevicePropertyDeviceUID,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain,
-    };
-    CFStringRef cfUid = NULL;
-    UInt32 uidSz = (UInt32)sizeof(cfUid);
-    if (AudioObjectGetPropertyData(dev, &uidAddr, 0, NULL, &uidSz, &cfUid) == noErr && cfUid) {
-        return (__bridge_transfer NSString *)cfUid;
-    }
-    return nil;
-}
-
 @interface SlacklessEnginePlayer : NSObject
 @property(nonatomic, strong) AVAudioEngine *engine;
 @property(nonatomic, strong) AVAudioPlayerNode *player;
@@ -125,21 +109,21 @@ static NSMutableSet<SlacklessEnginePlayer *> *g_active_oneshot_engines = nil;
 
 @end
 
-// Retains fallback NSSound instances until playback finishes so ARC never releases them prematurely.
-@interface SlacklessSoundDelegate : NSObject <NSSoundDelegate>
+// Retains fallback AVAudioPlayer instances until playback finishes so ARC never releases them prematurely.
+@interface SlacklessAudioPlayerDelegate : NSObject <AVAudioPlayerDelegate>
 @end
 
-static NSMutableSet<NSSound *> *g_active_oneshot_sounds = nil;
-static SlacklessSoundDelegate *g_sound_delegate = nil;
+static NSMutableSet<AVAudioPlayer *> *g_active_oneshot_players = nil;
+static SlacklessAudioPlayerDelegate *g_audio_player_delegate = nil;
 
-@implementation SlacklessSoundDelegate
+@implementation SlacklessAudioPlayerDelegate
 
-- (void)sound:(NSSound *)sound didFinishPlaying:(BOOL)flag {
+- (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {
     (void)flag;
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (sound) {
-            sound.delegate = nil;
-            [g_active_oneshot_sounds removeObject:sound];
+        if (player) {
+            player.delegate = nil;
+            [g_active_oneshot_players removeObject:player];
         }
     });
 }
@@ -204,7 +188,6 @@ bool slackless_audio_file_play_oneshot(const char *path, const char *device_name
     if (!path || path[0] == '\0') return false;
     NSString *nsPath = [NSString stringWithUTF8String:path];
     AudioDeviceID devId = resolve_output_device_id_by_name(device_name);
-    NSString *uid = resolve_output_device_uid_by_name(device_name);
     if (!nsPath) return false;
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
@@ -216,23 +199,24 @@ bool slackless_audio_file_play_oneshot(const char *path, const char *device_name
                 [g_active_oneshot_engines addObject:holder];
                 return;
             }
-            // Fallback to NSSound if AVAudioEngine fails to start; retain until playback completes.
-            NSSound *sound = [[NSSound alloc] initWithContentsOfFile:nsPath byReference:YES];
-            if (!sound) return;
-            sound.volume = volume > 1.0f ? 1.0f : (volume > 0.0f ? volume : 0.85f);
-            sound.loops = NO;
-            if (uid) sound.playbackDeviceIdentifier = uid;
-            if (!g_active_oneshot_sounds) {
-                g_active_oneshot_sounds = [NSMutableSet set];
+            // Fallback to AVAudioPlayer if AVAudioEngine fails to start; retain until playback completes.
+            NSURL *url = [NSURL fileURLWithPath:nsPath];
+            NSError *err = nil;
+            AVAudioPlayer *player = [[AVAudioPlayer alloc] initWithContentsOfURL:url error:&err];
+            if (!player || err) return;
+            player.volume = volume > 1.0f ? 1.0f : (volume > 0.0f ? volume : 0.85f);
+            player.numberOfLoops = 0;
+            if (!g_active_oneshot_players) {
+                g_active_oneshot_players = [NSMutableSet set];
             }
-            if (!g_sound_delegate) {
-                g_sound_delegate = [[SlacklessSoundDelegate alloc] init];
+            if (!g_audio_player_delegate) {
+                g_audio_player_delegate = [[SlacklessAudioPlayerDelegate alloc] init];
             }
-            sound.delegate = g_sound_delegate;
-            [g_active_oneshot_sounds addObject:sound];
-            if (![sound play]) {
-                sound.delegate = nil;
-                [g_active_oneshot_sounds removeObject:sound];
+            player.delegate = g_audio_player_delegate;
+            [g_active_oneshot_players addObject:player];
+            if (![player play]) {
+                player.delegate = nil;
+                [g_active_oneshot_players removeObject:player];
             }
         }
     });

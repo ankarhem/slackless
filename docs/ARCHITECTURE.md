@@ -22,33 +22,34 @@ CLI a headless verification surface for the whole core without building the GPUI
 ```
 slackless/                      (virtual workspace root: Rust 2024 edition in /Cargo.toml)
 ├── crates/
-│   ├── slackless-types         Pure data model + serde. No I/O.
+│   ├── slackless-types         Pure data model + serde + time/net helpers. No I/O.
 │   ├── slackless-api           Private web-client REST (xoxc + d cookie), edge API, uploads.
 │   ├── slackless-rtm           wss-primary WebSocket client: connect, events, reconnect.
-│   ├── slackless-store         Durable local-first zlib-compressed SQLite (rusqlite + FTS5).
+│   ├── slackless-store         Durable local-first zlib-compressed SQLite (V10 schema + FTS5).
 │   ├── slackless-auth          Session acquisition (embedded WebKit sign-in) + Keychain storage.
-│   ├── slackless-platform      Trait-based OS integration; macOS impl via objc2.
-│   ├── slackless-huddle        Native Amazon Chime WebRTC audio/video/screen-share & clip recorder.
-│   └── slackless-core          Orchestrator: owns the tokio thread; wires the above;
+│   ├── slackless-platform      Trait-based OS integration (`DesktopPlatform`) + macOS AppKit overlays.
+│   ├── slackless-huddle        Headless Chime WebRTC media, clips, and `NativeVideoPlayer` (no AppKit).
+│   └── slackless-core          Orchestrator + `domain/` logic; owns the tokio thread; wires the above;
 │                               exposes a command/event API to any front-end; backfill.
 ├── apps/
-│   ├── slackless-gui           GPUI Kit desktop app (smol↔tokio bridge + modular views).
-│   └── slackless-cli           clap binary: search/read/send/watch/huddle/canvas/list/auth (--json).
+│   ├── slackless-gui           Thin GPUI Kit desktop app (smol↔tokio bridge + modular views).
+│   └── slackless-cli           Thin clap binary: search/read/send/watch/huddle/canvas/list/auth (--json).
 └── skill/                      Agent SKILL.md for the CLI (shipped, installed separately).
 ```
 
 Dependency direction (acyclic): `types` ← {`api`, `rtm`, `store`, `auth`, `platform`, `huddle`} ← `core`
-← {`gui`, `cli`}. Nothing depends on a front-end. No Slack logic lives in `gui` that `cli`
-cannot reach.
+← {`gui`, `cli`}. Nothing depends on a front-end. No Slack domain logic lives in `gui` that `cli`
+cannot reach, and no AppKit GUI linkage lives in `slackless-huddle`.
 
 ## Crate responsibilities
 
 ### slackless-types
 
 Message, Channel/Conversation, User, Team, File, Reaction, the `rich_text` block model, and the
-id/timestamp newtypes (`Ts`, `ChannelId`, …). serde (de)serialization of Slack's JSON. The
-`#[serde(other)]`/catch-all discipline that makes the client **patchable** (unknown fields and
-event subtypes are preserved/ignored, never fatal) lives here and is tested here.
+id/timestamp newtypes (`Ts`, `ChannelId`, …). serde (de)serialization of Slack's JSON plus shared
+pure utilities (`de`, `time`, `net`, `endpoints`). The `#[serde(other)]`/catch-all discipline that
+makes the client **patchable** (unknown fields and event subtypes are preserved/ignored, never
+fatal) lives here and is tested here.
 
 ### slackless-api
 
@@ -70,39 +71,56 @@ catalog (`api-realtime.md`) into typed `types` events. Reconnect with backoff + 
 `rusqlite` with the **`bundled`** feature (ships a SQLite that includes **FTS5**). SQLite is
 blocking, so the store runs on its own thread (or `spawn_blocking`) behind an async handle.
 
-- **Immutable event log**: every message/edit/reaction/delete ever observed, append-only,
-  keyed `(workspace, channel, ts[, edit_ts])`. **Never deleted by retention.**
-- **Materialized current-state views** the UI reads (latest revision per message, counts).
-- **FTS5 virtual table** over message text (+ file names), maintained by insert/update triggers;
-  powers local search with Slack-style modifiers mapped to FTS5 MATCH + WHERE columns.
-- **Migrations** from day one (this is long-lived user data).
+- **V10 schema (`PRAGMA user_version = 10`)** with monotonic, idempotent migrations and future-schema
+  guarding.
+- **Immutable event log** (`message_revision`): every message/edit/delete ever observed,
+  append-only, keyed `(workspace_id, channel_id, ts, edit_ts)`, zlib-compressed JSON payloads.
+  **Never deleted by retention.**
+- **Materialized current-state tables** (`message_current` with an inline `has_reaction` flag
+  replacing the write-amplifying `reaction` table, plus channels, users, canvases, huddle
+  transcripts, and read cursors) with trimmed non-redundant indexes.
+- **FTS5 virtual tables** (`message_fts` over message text + file names, and `huddle_transcript_fts`
+  over huddle captions), maintained by insert/update/delete triggers; powers local search with
+  Slack-style modifiers mapped to FTS5 MATCH + WHERE columns.
 - Source of truth for rendering: API/RTM write here first; front-ends read from here.
 
 ### slackless-auth
 
 First-party sign-in: the client obtains its **own** session via an embedded WebKit sign-in
-(candidate: `wry`/WKWebView in a gpui child surface — to be spiked in phase 3), capturing its
-own token + `d` cookie — not by reading another app's storage. Persists to the macOS Keychain
-(`security-framework`/objc2). Multi-workspace. `auth.test` validation; `invalid_auth`/
+capturing its own token + `d` cookie — not by reading another app's storage. Persists to the
+macOS Keychain (`security-framework`). Multi-workspace. `auth.test` validation; `invalid_auth`/
 `token_revoked` → re-auth signal.
 
 ### slackless-platform
 
-Trait per capability, selected at compile time:
+All OS/AppKit integration lives here behind compile-time traits and safe wrappers, keeping GUI
+windowing decoupled from headless media/networking crates:
 
-- `Notifier` — GPUI's `SystemNotification` is available (guide §14), so this mostly adapts it.
-- `BadgeSetter` (dock unread badge) and `StatusItem` — **no GPUI API; macOS impl via `objc2`**
-  (`NSApplication.dockTile.badgeLabel`, `NSStatusItem`), guide §14.
-- `SecretStore` (Keychain), `DeepLinkHandler` (`slack://`, `https://app.slack.com/client`).
-  Other-OS impls are stubs that compile and no-op until those ports begin.
+- **`DesktopPlatform` supertrait** combining `Notifier`, `BadgeSetter`, `IconSetter`, `AboutPanel`,
+  `FullScreenItem`, `SoundPlayer`, `StatusBarItem`, `AttentionRequester`, and `SpellChecker`,
+  selected via `current()` (macOS `objc2` impl) or `noop()` (in-memory headless test backend).
+- **AppKit overlay & floating panel UI** (`src/macos_overlay.rs` + `native/macos/appkit_overlay.m`):
+  `DesktopDrawOverlay` (`OverlayDrawStroke`, `OverlayCursorState`, `OverlayPenEvent`) and
+  `configure_floating_panel`, compiled with `-fobjc-arc` on macOS and stubbed as safe no-ops on
+  non-macOS targets.
+- **Cross-platform utilities**: `app_data_dir` / `app_cache_dir` / `app_config_dir` /
+  `archive_store_path`, pure `DeepLink` / `parse_deep_link`, structured file logging, mouse
+  navigation / screen-lock monitors, and POSIX `SIGTERM`/`SIGINT` self-pipe termination monitor.
 
 ### slackless-huddle
 
-Pure-Rust Amazon Chime WebRTC (`webrtc 0.21` / `rtc 0.21`) media stack (`audio/`, `session/`,
-`rtc.rs`, `video.rs`, `av1.rs`, `clips.rs`, `content_share.rs`, `backend/`). On macOS, uses native
-`AVFoundation` + `ScreenCaptureKit` + `VideoToolbox` + CoreAudio `VoiceProcessingIO` / audio taps
-(zero `nokhwa` / legacy `block` dependency on macOS); non-macOS targets use portable
-`cpal`/`sonora`/`nokhwa`/`xcap`/`openh264` fallbacks behind backend traits.
+Headless Amazon Chime WebRTC (`webrtc 0.21` / `rtc 0.21`) media stack (`audio/`, `session/`,
+`rtc.rs`, `video.rs`, `av1.rs`, `clips/`, `content_share.rs`, `video_player.rs`, `backend/`),
+with **zero AppKit linkage**:
+
+- **Split modular macOS native media bridge (`native/macos/`)**:
+  - `cvpixel.m`: zero-copy `420f` IOSurface `CVPixelBuffer` (`MacVideoSurface`) & VTPixelTransfer/vImage BGRA readback.
+  - `vt_h264.m` / `vt_av1.m`: VideoToolbox hardware H.264 encode/decode and AV1 hardware decode.
+  - `screen_capture.m`: ScreenCaptureKit screen/window capture and `SCScreenshotManager` thumbnails.
+  - `camera_vision.m`: AVFoundation camera capture + Vision person segmentation background blur.
+  - `vpio_audio.m` / `audio_player.m` / `audio_tap.m`: CoreAudio `VoiceProcessingIO`, `AVAudioEngine`/`AVAudioPlayer` routed audio playback, and system audio loopback taps.
+  - `video_player.m` + `video_player.rs`: **`NativeVideoPlayer`** (`AVPlayer` + `AVPlayerItemVideoOutput` producing zero-copy `420f` IOSurface `MacVideoSurface` frames for GPUI's Metal renderer).
+- **Portable fallbacks**: non-macOS targets use `cpal`/`sonora`/`nokhwa`/`xcap`/`openh264`/`rav1d` behind backend traits, and `NativeVideoPlayer::open` returns `HuddleError::Unsupported`.
 
 ### slackless-core
 
@@ -112,15 +130,25 @@ front-end-agnostic API: a `Command` sender (send message, open channel, react, s
 an `Event` receiver (store changed, connection state, …) over `futures::mpsc`. `Client::start()`
 returns those handles; the GUI drains them via `cx.spawn`, the CLI via its own tokio loop.
 
+Shared front-end-agnostic Slack domain logic lives under **`slackless_core::domain`**:
+- `canvas`: canvas Markdown / Quill block conversion.
+- `huddles`: huddle state helpers and summary formatting.
+- `lists`: Slack Lists parsing and schema helpers.
+- `slash`: slash-command parsing and dispatch helpers.
+- `updater`: release manifest parsing and verification.
+- `webvtt`: WebVTT subtitle parsing and export.
+
 ### apps/slackless-gui
 
-GPUI Kit (`gpui-kit = "0.11.0"`, `gpui-pre = "0.3.14"`). Holds the bridge from guide §13 and
-modularized views (`app/{chrome,events,dialogs,navigation}`, `canvas/`, `composer/`, `emoji/`,
-`files/`, `lists/`, `messages/`, `preferences/sections/`, `sidebar/`, `popout/`, `blockkit/`).
+Thin GPUI Kit desktop front-end (`gpui-kit = "0.11.0"`, `gpui-pre = "0.3.14"`). Holds the
+smol↔tokio bridge from guide §13 and modularized views (`app/{chrome,events,dialogs,navigation}`,
+`canvas/`, `composer/`, `emoji/`, `files/`, `lists/`, `messages/`, `preferences/sections/`,
+`search/`, `sidebar/`, `popout/`, `blockkit/`). Delegates OS overlays to `slackless-platform`,
+media/video playback to `slackless-huddle`, and all Slack state/domain rules to `slackless-core`.
 
 ### apps/slackless-cli
 
-`clap` binary (`cli.rs`, `commands/`, `live/`). Commands: `search`, `read`, `send`, `reply`,
+Thin `clap` binary (`cli.rs`, `commands/`, `live/`). Commands: `search`, `read`, `send`, `reply`,
 `react`, `channels`, `dms`, `unread`, `watch`, `huddle`, `canvas`, `list`, `saved`, `backfill`,
 `download`, `stats`, `vacuum`, `auth`. Every command supports `--json`. Drives `slackless-core`
 and `slackless-store` directly on tokio.
@@ -134,7 +162,8 @@ and `slackless-store` directly on tokio.
 - Metal shaders compile at runtime (`runtime_shaders` default) — **no full Xcode needed**;
   disabling default features would require `xcrun metal`.
 - Common workflows live in `justfile`: `just validate`, `just test`, `just bench`, `just run`, `just install`.
-- Build with `CARGO_PROFILE_DEV_DEBUG=0` inside `nix develop` (or `direnv`) for fast, low-disk dev builds.
+- Build with `CARGO_PROFILE_DEV_DEBUG=0` inside `nix develop` (or `direnv`, which sets
+  `NIX_CC_WRAPPER_SUPPRESS_TARGET_WARNING=1`) for fast, low-disk dev builds.
 
 ## Workspace-level choices
 
@@ -145,9 +174,3 @@ and `slackless-store` directly on tokio.
   crosses the channel bridge.
 - Patchability: unknown JSON fields/subtypes are non-fatal everywhere; raw method+params are
   centralized so a Slack change is a localized edit.
-
-## Foundation build order (phase 3)
-
-`types` first → then `api`, `rtm`, `store`, `auth`, `platform` in parallel (disjoint crates) →
-`core` depends on all → front-ends last. The CLI can light up as soon as `core` can authenticate
-and read, giving an early headless test surface before the GUI.

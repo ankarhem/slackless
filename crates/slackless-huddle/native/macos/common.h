@@ -5,7 +5,6 @@
 
 #import <AVFoundation/AVFoundation.h>
 #import <Accelerate/Accelerate.h>
-#import <AppKit/AppKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreAudio/CoreAudio.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -70,7 +69,6 @@ typedef bool (*SlacklessWindowSkipCallback)(const char *app, const char *title);
 typedef void (*SlacklessVpioCaptureCallback)(void *ctx, const float *samples, size_t count);
 typedef void (*SlacklessVpioRenderCallback)(void *ctx, float *samples, size_t count);
 typedef void (*SlacklessAudioTapCallback)(void *ctx, const int16_t *stereo_pcm, size_t count);
-typedef void (*SlacklessOverlayMouseCallback)(void *ctx, uint8_t kind, double nx, double ny);
 
 // ---------------------------------------------------------------------------
 // Shared Utility Helpers
