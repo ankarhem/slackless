@@ -265,7 +265,48 @@ CREATE INDEX IF NOT EXISTS message_current_threads
     WHERE reply_count > 0 AND deleted = 0;
 "#;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8];
+/// Version 9: text-only searchable huddle transcripts (zero audio/video on disk) with FTS5
+/// unicode61 diacritic-folding index supporting English + Swedish code-switching.
+const V9: &str = r#"
+CREATE TABLE huddle_transcript (
+    id             INTEGER PRIMARY KEY,
+    workspace_id   TEXT NOT NULL,
+    channel_id     TEXT NOT NULL,
+    call_id        TEXT NOT NULL,
+    thread_root_ts TEXT,
+    speaker_id     TEXT,
+    lang           TEXT,
+    source         TEXT NOT NULL DEFAULT 'chime',
+    text           TEXT NOT NULL,
+    at_ms          INTEGER NOT NULL
+);
+CREATE INDEX huddle_transcript_call
+    ON huddle_transcript (workspace_id, call_id, at_ms);
+CREATE INDEX huddle_transcript_channel
+    ON huddle_transcript (workspace_id, channel_id, at_ms DESC);
+CREATE INDEX huddle_transcript_thread
+    ON huddle_transcript (workspace_id, channel_id, thread_root_ts, at_ms);
+
+CREATE VIRTUAL TABLE huddle_transcript_fts USING fts5(
+    text,
+    content = 'huddle_transcript', content_rowid = 'id',
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER huddle_transcript_ai AFTER INSERT ON huddle_transcript BEGIN
+    INSERT INTO huddle_transcript_fts (rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER huddle_transcript_ad AFTER DELETE ON huddle_transcript BEGIN
+    INSERT INTO huddle_transcript_fts (huddle_transcript_fts, rowid, text)
+    VALUES ('delete', old.id, old.text);
+END;
+CREATE TRIGGER huddle_transcript_au AFTER UPDATE OF text ON huddle_transcript BEGIN
+    INSERT INTO huddle_transcript_fts (huddle_transcript_fts, rowid, text)
+    VALUES ('delete', old.id, old.text);
+    INSERT INTO huddle_transcript_fts (rowid, text) VALUES (new.id, new.text);
+END;
+"#;
+
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9];
 
 /// The schema version this build migrates to.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;

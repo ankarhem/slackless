@@ -9472,6 +9472,7 @@ dependencies = [
  "rav1d",
  "rtc",
  "rustls",
+ "serde_json",
  "slackless-types",
  "sonora",
  "thiserror 2.0.21",

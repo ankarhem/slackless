@@ -249,6 +249,7 @@ impl Preferences {
             ));
 
         let camera_group = self.audio_video_camera(cx);
+        let transcripts_group = self.audio_video_transcripts(cx);
 
         v_flex()
             .child(camera_group)
@@ -270,7 +271,75 @@ impl Preferences {
                 dsp,
                 cx,
             ))
+            .child(transcripts_group)
             .child(self.group("When joining a huddle", None, behavior, cx))
+    }
+
+    fn audio_video_transcripts(&mut self, cx: &mut Context<Self>) -> Div {
+        let setup = slackless_core::huddle::detect_whisper_setup(None, None);
+        let theme = cx.theme();
+        let dot_color = if setup.is_ready() {
+            theme.success
+        } else if self.settings.huddle_local_transcribe {
+            theme.warning
+        } else {
+            theme.muted_foreground
+        };
+        let (title, note) = if setup.is_ready() {
+            let model_name = setup
+                .model
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("model");
+            (
+                "Local EN/SV Whisper ready",
+                format!("Using {model_name} with automatic English + Swedish language detection."),
+            )
+        } else {
+            (
+                "Local Whisper optional (0 MB on disk)",
+                format!(
+                    "Slack live captions archive automatically. For offline EN/SV code-switching fallback, install `brew install whisper-cpp` and place a multilingual model (e.g. `ggml-small.bin`) in {}.",
+                    setup.default_model_dir.display()
+                ),
+            )
+        };
+        let status = self.status_card(
+            dot_color,
+            title,
+            Some(SharedString::from(if setup.is_ready() {
+                "EN + SV auto"
+            } else {
+                "Not installed"
+            })),
+            note,
+            false,
+            div(),
+            cx,
+        );
+        let save_toggle = self.checkbox(
+            "prefs-huddle-save-transcripts",
+            "Save huddle captions to local searchable SQLite archive (text-only, ~30 KB/hr)",
+            |s| &mut s.huddle_save_transcripts,
+            cx,
+        );
+        let local_stt_toggle = self.checkbox(
+            "prefs-huddle-local-transcribe",
+            "Enable local multilingual transcription (English + Swedish auto-detect per utterance)",
+            |s| &mut s.huddle_local_transcribe,
+            cx,
+        );
+        self.group(
+            "Searchable transcripts (EN + SV)",
+            Some("Zero audio or video files are stored on disk. Finalized caption lines are indexed in FTS5 and searchable under Search \u{2192} Huddles."),
+            v_flex()
+                .gap_2()
+                .child(save_toggle)
+                .child(local_stt_toggle)
+                .child(status),
+            cx,
+        )
     }
 
     fn audio_video_camera(&mut self, cx: &mut Context<Self>) -> Div {

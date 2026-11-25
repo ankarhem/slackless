@@ -134,6 +134,7 @@ impl App {
             aec: settings.huddle_aec,
             ns: settings.huddle_ns,
             agc: settings.huddle_agc,
+            local_transcribe: settings.huddle_local_transcribe,
         };
         let initial = slackless_core::huddle::HuddleSessionSnapshot {
             phase: if self.fixtures.sample {

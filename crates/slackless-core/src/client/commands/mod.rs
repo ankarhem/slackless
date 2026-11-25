@@ -2,7 +2,7 @@
 
 mod channels;
 mod collab;
-mod huddle;
+pub(super) mod huddle;
 mod messaging;
 mod offline;
 
@@ -80,6 +80,10 @@ impl<B: Backend> Core<B> {
             }
             Command::SetStealthMode(enabled) => {
                 self.stealth_mode = enabled;
+            }
+            Command::SetSaveHuddleTranscripts(enabled) => {
+                self.save_huddle_transcripts
+                    .store(enabled, std::sync::atomic::Ordering::Relaxed);
             }
             Command::SetUserPref { name, value } => self.set_user_pref(name, value),
             Command::FetchUserProfile(user) => self.fetch_user_profile(user),

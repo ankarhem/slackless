@@ -24,8 +24,9 @@ mod store;
 pub use query::{Date, Has, SearchFilters, SearchQuery, SearchSort};
 pub use schema::SCHEMA_VERSION;
 pub use store::{
-    ALL_CONVERSATION_KINDS, ConversationSummary, DigestChannel, MemberCounts, Revision,
-    StorageBreakdown, Store, StoreStats, StoredMessage, UserSummary,
+    ALL_CONVERSATION_KINDS, ConversationSummary, DigestChannel, HuddleTranscriptSegment,
+    HuddleTranscriptSession, MemberCounts, NewHuddleTranscriptSegment, Revision, StorageBreakdown,
+    Store, StoreStats, StoredMessage, UserSummary,
 };
 
 /// Store errors.

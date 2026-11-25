@@ -29,6 +29,12 @@ pub struct AudioSharedState {
     pub agc: Arc<AtomicBool>,
     pub local_rms_bits: Arc<AtomicU32>,
     pub running: Arc<AtomicBool>,
+    /// Optional opt-in local multilingual Whisper transcriber tap (zero overhead when `None`).
+    pub transcribe_tap: Arc<Mutex<Option<Arc<crate::transcribe::LocalTranscriber>>>>,
+    /// Local participant user ID for tagging local microphone utterances.
+    pub self_user: Arc<Mutex<slackless_types::UserId>>,
+    /// Loudest active remote speaker for attributing remote audio utterances.
+    pub active_remote_speaker: Arc<Mutex<Option<slackless_types::UserId>>>,
 }
 
 impl AudioSharedState {
@@ -40,6 +46,9 @@ impl AudioSharedState {
             agc: Arc::new(AtomicBool::new(cfg.agc)),
             local_rms_bits: Arc::new(AtomicU32::new(0)),
             running: Arc::new(AtomicBool::new(true)),
+            transcribe_tap: Arc::new(Mutex::new(None)),
+            self_user: Arc::new(Mutex::new(slackless_types::UserId::from("U0SELF"))),
+            active_remote_speaker: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -244,6 +253,17 @@ pub(super) fn run_inbound_audio_rx_loop(
                 normalizer.process_frame(pcm);
                 if let Ok(mut pb) = playback_buf.lock() {
                     pb.push(pcm);
+                }
+                if let Ok(guard) = shared.transcribe_tap.lock()
+                    && let Some(tap) = guard.as_ref()
+                {
+                    let speaker = shared
+                        .active_remote_speaker
+                        .lock()
+                        .ok()
+                        .and_then(|s| s.clone())
+                        .unwrap_or_else(|| slackless_types::UserId::from("U0REMOTE"));
+                    tap.push(false, speaker, pcm);
                 }
                 if needs_sw_aec_ref.load(Ordering::Relaxed)
                     && !shared.muted.load(Ordering::Relaxed)
@@ -492,6 +512,17 @@ fn run_audio_dsp_loop(
                     mic_normalizer.process_frame(pcm_to_encode);
                 }
                 let rms = compute_rms_mono(pcm_to_encode);
+                if let Ok(guard) = shared.transcribe_tap.lock()
+                    && let Some(tap) = guard.as_ref()
+                {
+                    let speaker = shared
+                        .self_user
+                        .lock()
+                        .ok()
+                        .map(|s| s.clone())
+                        .unwrap_or_else(|| slackless_types::UserId::from("U0SELF"));
+                    tap.push(true, speaker, pcm_to_encode);
+                }
                 shared
                     .local_rms_bits
                     .store(rms.to_bits(), Ordering::Relaxed);

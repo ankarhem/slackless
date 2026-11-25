@@ -437,6 +437,10 @@ pub struct Settings {
     pub huddle_reaction_animations: bool,
     /// Automatically enable live captions overlay when joining a huddle (`F-COLLAB-054`).
     pub huddle_auto_captions: bool,
+    /// Save finalized huddle captions into local SQLite FTS5 (text-only; zero audio on disk).
+    pub huddle_save_transcripts: bool,
+    /// Opt-in local multilingual (English + Swedish auto-detect) Whisper transcription via `whisper-cli`.
+    pub huddle_local_transcribe: bool,
     /// Play gentle ambient music when waiting alone in a huddle (`F-COLLAB-058`).
     pub huddle_music_when_alone: bool,
 }
@@ -715,6 +719,8 @@ impl Default for Settings {
             huddle_sounds: true,
             huddle_reaction_animations: true,
             huddle_auto_captions: false,
+            huddle_save_transcripts: true,
+            huddle_local_transcribe: false,
             huddle_music_when_alone: true,
         }
     }

@@ -18,6 +18,7 @@ pub mod rtc;
 pub mod screen;
 pub mod session;
 pub mod signaling;
+pub mod transcribe;
 pub mod video;
 
 /// Generated prost types for Amazon Chime SDK signaling frames (`proto/SignalingProtocol.proto`).
@@ -54,6 +55,9 @@ pub use metrics::{HuddlePerfCounters, HuddlePerfSnapshot, ProcessResourceSampler
 pub use screen::{ScreenCapture, ScreenSource, capture_screen_thumbnails, list_screen_sources};
 pub use session::spawn_huddle_session;
 pub use signaling::install_default_crypto_provider;
+pub use transcribe::{
+    WhisperSetupStatus, default_whisper_model_dir, detect_spoken_lang, detect_whisper_setup,
+};
 pub use video::{
     CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoFrameData, VideoTileKey, list_cameras,
 };
@@ -137,6 +141,8 @@ pub struct HuddleAudioConfig {
     pub aec: bool,
     pub ns: bool,
     pub agc: bool,
+    /// Opt-in local multilingual (English + Swedish auto-detect) Whisper transcription.
+    pub local_transcribe: bool,
 }
 
 impl Default for HuddleAudioConfig {
@@ -150,6 +156,7 @@ impl Default for HuddleAudioConfig {
             aec: true,
             ns: true,
             agc: true,
+            local_transcribe: false,
         }
     }
 }
@@ -290,6 +297,8 @@ pub enum HuddleDataEvent {
         text: String,
         is_partial: bool,
         at_ms: u64,
+        /// Optional normalized language tag (`"en"`, `"sv"`, etc.) from AWS Transcribe or local STT.
+        lang: Option<String>,
     },
     Draw {
         user: UserId,

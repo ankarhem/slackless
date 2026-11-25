@@ -5,8 +5,12 @@ mod messages;
 mod search;
 #[cfg(test)]
 mod tests;
+mod transcripts;
 
 pub use archive::{ALL_CONVERSATION_KINDS, ConversationSummary, DigestChannel, UserSummary};
+pub use transcripts::{
+    HuddleTranscriptSegment, HuddleTranscriptSession, NewHuddleTranscriptSegment,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};

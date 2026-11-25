@@ -621,6 +621,199 @@ impl App {
         });
     }
 
+    /// Open a modal viewer for one locally archived text-only huddle transcript (with speaker
+    /// attribution, per-line EN/SV language badges, Copy Markdown, and Delete).
+    pub(in crate::app) fn open_huddle_transcript(
+        &self,
+        call_id: String,
+        channel: ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fixtures = self.fixtures.clone();
+        let segments: Vec<slackless_core::store::HuddleTranscriptSegment> =
+            if let (Some(store), Some(team)) = (self.bridge.store(), self.bridge.team_id()) {
+                store
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.huddle_transcript_for_call(team, &call_id).ok())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+        let ch_label = self.label(&channel);
+        let subtitle = format!(
+            "{ch_label} \u{b7} {call_id} \u{b7} {} lines",
+            segments.len()
+        );
+        let markdown_export = {
+            let mut md = format!("# Huddle Transcript \u{2014} {ch_label} (`{call_id}`)\n\n");
+            for seg in &segments {
+                let speaker = seg
+                    .speaker_id
+                    .as_ref()
+                    .map(|u| fixtures.user_name(u).to_owned())
+                    .unwrap_or_else(|| "Speaker".to_owned());
+                let ts = Ts::from(format!("{}.000000", seg.at_ms.div_euclid(1_000)));
+                let clock = crate::messages::list_stamp(&ts);
+                let lang_tag = seg
+                    .lang
+                    .as_deref()
+                    .map(|l| format!(" `[{l}]`"))
+                    .unwrap_or_default();
+                md.push_str(&format!(
+                    "- **{speaker}** ({clock}){lang_tag}: {}\n",
+                    seg.text
+                ));
+            }
+            md
+        };
+        let store_for_del = self.bridge.store().cloned();
+        let team_for_del = self.bridge.team_id().cloned();
+        let del_call_id = call_id.clone();
+        let this = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            let (border, muted, fg, accent, danger, card_bg) = (
+                theme.border,
+                theme.muted_foreground,
+                theme.foreground,
+                theme.link,
+                theme.danger,
+                theme.secondary.opacity(0.35),
+            );
+            let copy_md = markdown_export.clone();
+            let del_store = store_for_del.clone();
+            let del_team = team_for_del.clone();
+            let del_id = del_call_id.clone();
+            let del_this = this.clone();
+            let mut list = v_flex()
+                .id("huddle-transcript-lines")
+                .max_h(px(420.))
+                .overflow_y_scroll()
+                .gap_1p5();
+            if segments.is_empty() {
+                list = list.child(
+                    div()
+                        .py_6()
+                        .text_sm()
+                        .text_color(muted)
+                        .child("No archived transcript lines found for this huddle."),
+                );
+            } else {
+                for seg in &segments {
+                    let speaker = seg
+                        .speaker_id
+                        .as_ref()
+                        .map(|u| fixtures.user_name(u).to_owned())
+                        .unwrap_or_else(|| "Speaker".to_owned());
+                    let ts = Ts::from(format!("{}.000000", seg.at_ms.div_euclid(1_000)));
+                    let clock = crate::messages::list_stamp(&ts);
+                    let lang_badge = seg.lang.as_deref().map(|l| l.to_ascii_uppercase());
+                    list = list.child(
+                        v_flex()
+                            .gap_0p5()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .bg(card_bg)
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(fg)
+                                            .child(speaker),
+                                    )
+                                    .child(div().text_xs().text_color(muted).child(clock))
+                                    .when_some(lang_badge, |row, code| {
+                                        row.child(
+                                            div()
+                                                .px_1p5()
+                                                .py(px(1.))
+                                                .rounded(px(4.))
+                                                .bg(accent.opacity(0.14))
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(accent)
+                                                .child(code),
+                                        )
+                                    }),
+                            )
+                            .child(div().text_sm().text_color(fg).child(seg.text.clone())),
+                    );
+                }
+            }
+            let actions = h_flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(div().text_xs().text_color(muted).child(subtitle.clone()))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            Button::new("transcript-copy-md")
+                                .outline()
+                                .with_size(Size::Small)
+                                .icon(IconName::Copy)
+                                .label("Copy Markdown")
+                                .disabled(segments.is_empty())
+                                .on_click(move |_, window, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        copy_md.clone(),
+                                    ));
+                                    notify(
+                                        "Transcript copied",
+                                        "Copied Markdown transcript to clipboard.",
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                        )
+                        .when(!segments.is_empty(), |row| {
+                            row.child(
+                                Button::new("transcript-delete")
+                                    .ghost()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::Trash)
+                                    .tooltip("Delete local transcript")
+                                    .on_click(move |_, window, cx| {
+                                        if let (Some(st), Some(tm)) = (&del_store, &del_team)
+                                            && let Ok(guard) = st.lock()
+                                        {
+                                            let _ = guard.delete_huddle_transcript(tm, &del_id);
+                                        }
+                                        window.close_dialog(cx);
+                                        let _ = del_this.update(cx, |app, cx| {
+                                            if app.huddles_open {
+                                                app.show_huddles(cx);
+                                            }
+                                        });
+                                        notify(
+                                            "Transcript deleted",
+                                            "Removed local huddle transcript from SQLite.",
+                                            window,
+                                            cx,
+                                        );
+                                    }),
+                            )
+                        }),
+                );
+            let _ = danger;
+            dialog
+                .title(format!("Huddle transcript \u{b7} {ch_label}"))
+                .w(px(620.))
+                .child(v_flex().gap_3().child(actions).child(list))
+        });
+    }
+
     /// Export the active conversation's locally archived messages as Markdown or pretty JSON
     /// using a native save dialog.
     pub(in crate::app) fn export_conversation_transcript(

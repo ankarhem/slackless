@@ -347,11 +347,21 @@ pub fn decode_chime_transcript_frame(raw: &[u8], now_ms: u64) -> Vec<HuddleDataE
                         .find_map(|item| item.speaker_external_user_id.as_deref())
                         .and_then(parse_external_user_id)
                         .unwrap_or_else(|| UserId::from("USLACKBOT".to_owned()));
+                    let best_identified = res
+                        .language_identification
+                        .iter()
+                        .max_by(|a, b| a.score.unwrap_or(0.0).total_cmp(&b.score.unwrap_or(0.0)))
+                        .and_then(|entry| entry.language_code.as_deref());
+                    let lang = crate::transcribe::normalize_lang_tag(
+                        res.language_code.as_deref().or(best_identified),
+                    )
+                    .or_else(|| crate::transcribe::detect_spoken_lang(text).map(str::to_owned));
                     out.push(HuddleDataEvent::Caption {
                         user: speaker,
                         text: text.to_owned(),
                         is_partial,
                         at_ms: now_ms,
+                        lang,
                     });
                 }
             }
@@ -444,6 +454,7 @@ mod tests {
                 text: "Hello from AWS Transcribe".to_owned(),
                 is_partial: false,
                 at_ms: 999,
+                lang: Some("en".to_owned()),
             }]
         );
     }
@@ -718,6 +729,7 @@ mod tests {
                 text: "hello world".to_owned(),
                 is_partial: true,
                 at_ms: 1234,
+                lang: Some("en".to_owned()),
             }]
         );
 

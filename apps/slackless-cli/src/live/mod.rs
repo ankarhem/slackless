@@ -29,7 +29,7 @@ pub use channels::{run_backfill, run_unread};
 pub use files::{run_download, run_files};
 pub use huddle::{
     run_huddle_cameras, run_huddle_devices, run_huddle_invite, run_huddle_join, run_huddle_link,
-    run_huddle_screens,
+    run_huddle_screens, run_huddle_transcripts,
 };
 pub use saved::{run_mark_thread, run_saved_add, run_saved_delete, run_saved_done, run_saved_list};
 pub use status::{run_status_clear, run_status_set, run_status_show};

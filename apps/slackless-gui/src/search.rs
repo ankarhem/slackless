@@ -21,7 +21,9 @@ use slackless_core::SharedStore;
 use slackless_core::api::{
     RemoteFilePage, RemoteMessageHit, RemoteMessagePage, SearchSort as ApiSearchSort,
 };
-use slackless_core::store::{SearchFilters, SearchQuery, SearchSort, Store, StoredMessage};
+use slackless_core::store::{
+    HuddleTranscriptSegment, SearchFilters, SearchQuery, SearchSort, Store, StoredMessage,
+};
 use slackless_core::types::{
     ChannelId, Conversation, ConversationKind, File, TeamId, Ts, User, UserId,
 };
@@ -35,6 +37,7 @@ const RESULT_LIMIT: usize = 50;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SearchTab {
     Messages,
+    Transcripts,
     Files,
     Channels,
     People,
@@ -57,6 +60,11 @@ pub enum SearchEvent {
     OpenChannel(ChannelId),
     /// Open a person's profile matched in the People search tab.
     OpenProfile(UserId),
+    /// Open a locally archived huddle transcript matched in the Huddles search tab.
+    OpenTranscript {
+        call_id: String,
+        channel: ChannelId,
+    },
     /// User opted into remote Slack message search (`search.modules.messages`).
     RemoteMessages {
         query: String,
@@ -84,6 +92,8 @@ pub struct SearchView {
     /// Instant local FTS5 hits.
     local_results: Vec<StoredMessage>,
     local_error: Option<String>,
+    /// Instant local FTS5 huddle transcript hits (text-only; EN + SV diacritic-folding).
+    transcript_results: Vec<HuddleTranscriptSegment>,
     /// Opt-in remote Slack message hits (`search.modules.messages`).
     remote_messages: Vec<RemoteMessageHit>,
     remote_messages_total: usize,
@@ -129,6 +139,7 @@ impl SearchView {
             remote_auto: false,
             local_results: Vec::new(),
             local_error: None,
+            transcript_results: Vec::new(),
             remote_messages: Vec::new(),
             remote_messages_total: 0,
             remote_messages_page: 0,
@@ -219,6 +230,7 @@ impl SearchView {
 
     fn run_local(&mut self) {
         self.local_results.clear();
+        self.transcript_results.clear();
         self.local_error = None;
         if let (Some(archive), false) = (&self.archive, self.query.is_empty()) {
             let mut parsed = SearchQuery::parse(&self.query);
@@ -250,12 +262,28 @@ impl SearchView {
             }
             parsed.filters.threads_only |= self.filters.threads_only;
             parsed.filters.include_deleted |= self.filters.include_deleted || self.include_deleted;
-            let found = match archive.lock() {
-                Ok(store) => store
-                    .search_sorted(&self.workspace, &parsed, self.sort, RESULT_LIMIT)
-                    .map_err(|e| e.to_string()),
-                Err(_) => Err("the local archive is unavailable".to_owned()),
+            let (found, transcripts) = match archive.lock() {
+                Ok(store) => {
+                    let msgs = store
+                        .search_sorted(&self.workspace, &parsed, self.sort, RESULT_LIMIT)
+                        .map_err(|e| e.to_string());
+                    let trs = store
+                        .search_huddle_transcripts(
+                            &self.workspace,
+                            &self.query,
+                            None,
+                            None,
+                            RESULT_LIMIT,
+                        )
+                        .unwrap_or_default();
+                    (msgs, trs)
+                }
+                Err(_) => (
+                    Err("the local archive is unavailable".to_owned()),
+                    Vec::new(),
+                ),
             };
+            self.transcript_results = transcripts;
             match found {
                 Ok(results) => self.local_results = results,
                 Err(e) => self.local_error = Some(e),
@@ -551,6 +579,11 @@ impl SearchView {
                     format!("{} on Slack", self.remote_messages.len())
                 }
             }
+            (SearchTab::Transcripts, _) => match self.transcript_results.len() {
+                0 => "Huddle transcripts · instant".to_owned(),
+                1 => "1 transcript hit".to_owned(),
+                n => format!("{n} transcript hits"),
+            },
             (SearchTab::Files, _) => {
                 if self.remote_files_loading && self.remote_files.is_empty() {
                     "Searching Slack files…".to_owned()
@@ -656,6 +689,18 @@ impl SearchView {
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.set_tab(SearchTab::Messages, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                tab_btn(
+                                    "search-tab-transcripts",
+                                    "Huddles",
+                                    self.tab == SearchTab::Transcripts,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.set_tab(SearchTab::Transcripts, cx);
                                     },
                                 )),
                             )
@@ -846,6 +891,14 @@ impl SearchView {
                     )
                 }
             }
+            (SearchTab::Transcripts, _) => (
+                format!(
+                    "No huddle transcript matches for \u{201C}{}\u{201D}",
+                    self.query
+                ),
+                "Finalized live captions and local multilingual (EN/SV) huddle transcripts are indexed here automatically.",
+                false,
+            ),
             (SearchTab::Channels | SearchTab::People | SearchTab::Dms, _) => {
                 ("No matches".to_owned(), "Try another query.", false)
             }
@@ -1149,6 +1202,91 @@ impl Render for SearchView {
                                 ),
                             )
                         })
+                        .into_any_element()
+                }
+            }
+            (SearchTab::Transcripts, _) => {
+                if self.transcript_results.is_empty() {
+                    self.empty_state(cx).into_any_element()
+                } else {
+                    let theme = cx.theme();
+                    let (fg, link_color, hover) = (theme.foreground, theme.link, theme.accent);
+                    let rows: Vec<_> = self
+                        .transcript_results
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, seg)| {
+                            let ch_label = self
+                                .fixtures
+                                .conversation(&seg.channel)
+                                .map(|c| self.fixtures.conversation_label(c))
+                                .unwrap_or_else(|| seg.channel.to_string());
+                            let speaker = seg
+                                .speaker_id
+                                .as_ref()
+                                .map(|u| self.fixtures.user_name(u).to_owned())
+                                .unwrap_or_else(|| "Speaker".to_owned());
+                            let ts = Ts::from(format!("{}.000000", seg.at_ms.div_euclid(1_000)));
+                            let stamp = list_stamp(&ts);
+                            let lang_badge = seg.lang.as_deref().map(|l| l.to_ascii_uppercase());
+                            let call_id = seg.call_id.clone();
+                            let channel = seg.channel.clone();
+                            v_flex()
+                                .id(("search-transcript", ix))
+                                .gap_1()
+                                .px_4()
+                                .py_2p5()
+                                .border_b_1()
+                                .border_color(border)
+                                .cursor_pointer()
+                                .hover(move |el| el.bg(hover))
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            Icon::new(IconName::Headphones)
+                                                .size(px(13.))
+                                                .text_color(muted),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(muted)
+                                                .child(format!(
+                                                    "{ch_label} \u{b7} {speaker} \u{b7} {stamp}"
+                                                )),
+                                        )
+                                        .when_some(lang_badge, |row, code| {
+                                            row.child(
+                                                div()
+                                                    .px_1p5()
+                                                    .py(px(1.))
+                                                    .rounded(px(4.))
+                                                    .bg(link_color.opacity(0.14))
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(link_color)
+                                                    .child(code),
+                                            )
+                                        }),
+                                )
+                                .child(div().text_sm().text_color(fg).child(seg.text.clone()))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(SearchEvent::OpenTranscript {
+                                        call_id: call_id.clone(),
+                                        channel: channel.clone(),
+                                    });
+                                }))
+                        })
+                        .collect();
+                    v_flex()
+                        .id(SharedString::from("search-transcripts-local"))
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .children(rows)
                         .into_any_element()
                 }
             }

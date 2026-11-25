@@ -567,6 +567,8 @@ pub enum Command {
     /// (`conversations.mark`, `subscriptions.thread.mark`, `users.markAllRead`), and active
     /// presence heartbeats while still receiving live events and browsing freely.
     SetStealthMode(bool),
+    /// Enable or disable local SQLite FTS5 archiving of finalized huddle captions (text-only).
+    SetSaveHuddleTranscripts(bool),
     /// Write a single user preference key/value back to Slack (`users.prefs.set`).
     SetUserPref {
         name: String,

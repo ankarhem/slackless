@@ -236,6 +236,7 @@ pub async fn run_huddle_join(
     camera: bool,
     blur: bool,
     screen: Option<String>,
+    transcribe: bool,
 ) -> Result<ExitCode> {
     let (api, workspace) = match api_for(ctx, flag) {
         Ok(pair) => pair,
@@ -248,11 +249,14 @@ pub async fn run_huddle_join(
     };
 
     let creds = build_huddle_credentials(&workspace, &channel, joined);
+    let call_id = creds.call_id.clone();
+    let thread_root_ts = creds.thread_root_ts.clone();
     let audio = HuddleAudioConfig {
         muted,
         input_device: input,
         output_device: output_dev,
         blur_background: blur,
+        local_transcribe: transcribe,
         ..Default::default()
     };
 
@@ -320,6 +324,34 @@ pub async fn run_huddle_join(
                         }
                     }
                     Some(HuddleUpdate::DataEvent(ev)) => {
+                        if let slackless_core::huddle::HuddleDataEvent::Caption {
+                            ref user,
+                            ref text,
+                            is_partial: false,
+                            at_ms,
+                            ref lang,
+                        } = ev
+                            && let Some(store) = crate::commands::open_archive_store_rw(&workspace)
+                        {
+                            let seg_at_ms = if at_ms > 0 {
+                                i64::try_from(at_ms).unwrap_or(i64::MAX)
+                            } else {
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0))
+                            };
+                            let seg = slackless_core::store::NewHuddleTranscriptSegment {
+                                channel: &channel,
+                                call_id: &call_id,
+                                thread_root_ts: thread_root_ts.as_ref(),
+                                speaker_id: Some(user),
+                                lang: lang.as_deref(),
+                                source: if transcribe { "local-whisper" } else { "chime" },
+                                text,
+                                at_ms: seg_at_ms,
+                            };
+                            let _ = store.insert_huddle_transcript_segment(&workspace, &seg);
+                        }
                         output::emit(
                             ctx.json,
                             &serde_json::json!({
@@ -370,4 +402,234 @@ pub async fn run_huddle_join(
     .await;
 
     Ok(exit_code)
+}
+
+/// Format unix milliseconds as `YYYY-MM-DD HH:MM:SS` (UTC) for human/Markdown transcript output.
+fn format_ms_utc(ms: i64) -> String {
+    let secs = ms.div_euclid(1_000);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Howard Hinnant civil-from-days.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + i64::from(mo <= 2);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
+}
+
+/// `huddle transcripts [channel] [--search QUERY] [--lang sv|en] [--call-id ID] [--format md|json] [--limit N]`:
+/// offline query, full-text FTS5 search, and export over locally archived text-only huddle transcripts.
+#[allow(clippy::too_many_arguments)]
+pub fn run_huddle_transcripts(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    channel_arg: Option<&str>,
+    search: Option<&str>,
+    lang: Option<&str>,
+    call_id: Option<&str>,
+    format: Option<crate::cli::ExportFormat>,
+    limit: usize,
+) -> ExitCode {
+    let Some(workspace) = crate::session::resolve_workspace(flag) else {
+        return crate::commands::empty_local(
+            ctx,
+            serde_json::json!({"ok": true, "items": []}),
+            "huddle transcripts",
+        );
+    };
+    let Some(store) = crate::commands::open_archive_store(&workspace) else {
+        crate::commands::archive_hint(&workspace);
+        return crate::commands::empty_local(
+            ctx,
+            serde_json::json!({"ok": true, "items": []}),
+            "huddle transcripts",
+        );
+    };
+    let archive = crate::archive::Archive::open(&workspace);
+    let channel_names = archive
+        .as_ref()
+        .map(|a| a.channel_names(&workspace))
+        .unwrap_or_default();
+    let resolved_channel = channel_arg.map(|arg| {
+        archive
+            .as_ref()
+            .and_then(|a| a.resolve_channel(&workspace, arg))
+            .map(|c| c.id)
+            .unwrap_or_else(|| crate::commands::raw_channel_id(arg))
+    });
+    let resolve_user = |u: Option<&UserId>| -> String {
+        match u {
+            Some(uid) => archive
+                .as_ref()
+                .and_then(|a| a.user_display(&workspace, uid))
+                .unwrap_or_else(|| uid.to_string()),
+            None => "unknown".to_owned(),
+        }
+    };
+    let resolve_channel_label = |ch: &ChannelId| -> String {
+        channel_names
+            .get(ch.as_str())
+            .cloned()
+            .unwrap_or_else(|| ch.to_string())
+    };
+
+    // Mode 1: Full transcript for one specific huddle call_id.
+    if let Some(cid) = call_id {
+        let segments = match store.huddle_transcript_for_call(&workspace, cid) {
+            Ok(s) => s,
+            Err(err) => return crate::fail(ctx, "store_error", &err.to_string()),
+        };
+        let as_json = ctx.json || matches!(format, Some(crate::cli::ExportFormat::Json));
+        let json_rows: Vec<_> = segments
+            .iter()
+            .map(|seg| {
+                serde_json::json!({
+                    "id": seg.id,
+                    "call_id": seg.call_id,
+                    "channel": seg.channel.as_str(),
+                    "channel_label": resolve_channel_label(&seg.channel),
+                    "speaker_id": seg.speaker_id.as_ref().map(|u| u.as_str()),
+                    "speaker": resolve_user(seg.speaker_id.as_ref()),
+                    "lang": seg.lang,
+                    "source": seg.source,
+                    "at_ms": seg.at_ms,
+                    "text": seg.text,
+                })
+            })
+            .collect();
+        if as_json {
+            output::emit_json(&serde_json::json!({
+                "ok": true,
+                "call_id": cid,
+                "count": segments.len(),
+                "segments": json_rows,
+            }));
+            return ExitCode::SUCCESS;
+        }
+        let mut human = String::new();
+        if matches!(format, Some(crate::cli::ExportFormat::Md)) {
+            let ch_label = segments
+                .first()
+                .map(|s| resolve_channel_label(&s.channel))
+                .unwrap_or_else(|| cid.to_owned());
+            human.push_str(&format!("# Huddle Transcript — {ch_label} (`{cid}`)\n\n"));
+            for seg in &segments {
+                let who = resolve_user(seg.speaker_id.as_ref());
+                let stamp = format_ms_utc(seg.at_ms);
+                let lang_tag = seg
+                    .lang
+                    .as_deref()
+                    .map(|l| format!(" `[{l}]`"))
+                    .unwrap_or_default();
+                human.push_str(&format!("- **{who}** ({stamp}){lang_tag}: {}\n", seg.text));
+            }
+        } else {
+            for seg in &segments {
+                let who = resolve_user(seg.speaker_id.as_ref());
+                let stamp = format_ms_utc(seg.at_ms);
+                let lang_tag = seg.lang.as_deref().unwrap_or("-");
+                human.push_str(&format!("{stamp}\t{who}\t[{lang_tag}]\t{}\n", seg.text));
+            }
+        }
+        print!("{human}");
+        return ExitCode::SUCCESS;
+    }
+
+    // Mode 2: Full-text search across huddle transcripts (or filtered by --lang).
+    if search.is_some() || lang.is_some() {
+        let query = search.unwrap_or("");
+        let hits = match store.search_huddle_transcripts(
+            &workspace,
+            query,
+            resolved_channel.as_ref(),
+            lang,
+            limit,
+        ) {
+            Ok(h) => h,
+            Err(err) => return crate::fail(ctx, "store_error", &err.to_string()),
+        };
+        let json_rows: Vec<_> = hits
+            .iter()
+            .map(|seg| {
+                serde_json::json!({
+                    "id": seg.id,
+                    "call_id": seg.call_id,
+                    "channel": seg.channel.as_str(),
+                    "channel_label": resolve_channel_label(&seg.channel),
+                    "speaker_id": seg.speaker_id.as_ref().map(|u| u.as_str()),
+                    "speaker": resolve_user(seg.speaker_id.as_ref()),
+                    "lang": seg.lang,
+                    "at_ms": seg.at_ms,
+                    "text": seg.text,
+                })
+            })
+            .collect();
+        let mut human = String::new();
+        for seg in &hits {
+            let who = resolve_user(seg.speaker_id.as_ref());
+            let ch = resolve_channel_label(&seg.channel);
+            let stamp = format_ms_utc(seg.at_ms);
+            let lang_tag = seg.lang.as_deref().unwrap_or("-");
+            human.push_str(&format!(
+                "{stamp}\t{ch}\t{}\t{who}\t[{lang_tag}]\t{}\n",
+                seg.call_id, seg.text
+            ));
+        }
+        output::emit(
+            ctx.json,
+            &serde_json::json!({"ok": true, "count": hits.len(), "hits": json_rows}),
+            &human,
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    // Mode 3: List recent huddle transcript sessions.
+    let sessions =
+        match store.list_huddle_transcript_sessions(&workspace, resolved_channel.as_ref(), limit) {
+            Ok(s) => s,
+            Err(err) => return crate::fail(ctx, "store_error", &err.to_string()),
+        };
+    let json_rows: Vec<_> = sessions
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "call_id": s.call_id,
+                "channel": s.channel.as_str(),
+                "channel_label": resolve_channel_label(&s.channel),
+                "thread_root_ts": s.thread_root_ts.as_ref().map(|t| t.as_str()),
+                "started_at_ms": s.started_at_ms,
+                "ended_at_ms": s.ended_at_ms,
+                "segment_count": s.segment_count,
+                "languages": s.languages,
+                "preview": s.preview,
+            })
+        })
+        .collect();
+    let mut human = String::new();
+    for s in &sessions {
+        let ch = resolve_channel_label(&s.channel);
+        let stamp = format_ms_utc(s.started_at_ms);
+        let langs = if s.languages.is_empty() {
+            "-".to_owned()
+        } else {
+            s.languages.join(",")
+        };
+        human.push_str(&format!(
+            "{stamp}\t{ch}\t{}\t{} lines\t[{langs}]\t{}\n",
+            s.call_id, s.segment_count, s.preview
+        ));
+    }
+    output::emit(
+        ctx.json,
+        &serde_json::json!({"ok": true, "count": sessions.len(), "sessions": json_rows}),
+        &human,
+    );
+    ExitCode::SUCCESS
 }

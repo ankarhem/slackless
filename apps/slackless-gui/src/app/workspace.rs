@@ -176,9 +176,10 @@ pub(super) fn subscribe_workspace(
                 }
             },
         ),
-        cx.subscribe(
+        cx.subscribe_in(
             &views.results,
-            |this: &mut App, _, event: &SearchEvent, cx| match event {
+            window,
+            |this: &mut App, _, event: &SearchEvent, window, cx| match event {
                 SearchEvent::Close => {
                     this.searching = false;
                     cx.notify();
@@ -192,6 +193,9 @@ pub(super) fn subscribe_workspace(
                 }
                 SearchEvent::OpenProfile(user) => {
                     this.open_profile(user.clone(), cx);
+                }
+                SearchEvent::OpenTranscript { call_id, channel } => {
+                    this.open_huddle_transcript(call_id.clone(), channel.clone(), window, cx);
                 }
                 SearchEvent::RemoteMessages { query, sort, page } => {
                     this.bridge.send(Command::SearchRemoteMessages {

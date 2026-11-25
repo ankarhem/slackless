@@ -2662,3 +2662,84 @@ fn search_include_deleted_opt_in_returns_tombstones() {
             .any(|h| !h.deleted && h.message.ts == Ts::from("1700000100.000100"))
     );
 }
+
+#[test]
+fn huddle_transcripts_fts5_multilingual_en_sv_and_sessions() {
+    let store = Store::open_in_memory().unwrap();
+    let ch = ChannelId::from("C0HUDDLE");
+    let thread_ts = Ts::from("1700001000.000100");
+    let u_alice = UserId::from("U0ALICE");
+    let u_bob = UserId::from("U0BOB");
+
+    let seg1 = crate::NewHuddleTranscriptSegment {
+        channel: &ch,
+        call_id: "R0CALL1",
+        thread_root_ts: Some(&thread_ts),
+        speaker_id: Some(&u_alice),
+        lang: Some("sv"),
+        source: "local-whisper",
+        text: "Vi måste boka ett möte om utcheckningen imorgon",
+        at_ms: 1_700_001_001_000,
+    };
+    let seg2 = crate::NewHuddleTranscriptSegment {
+        channel: &ch,
+        call_id: "R0CALL1",
+        thread_root_ts: Some(&thread_ts),
+        speaker_id: Some(&u_bob),
+        lang: Some("en"),
+        source: "local-whisper",
+        text: "Sounds good, let's verify the checkout deployment before lunch",
+        at_ms: 1_700_001_005_000,
+    };
+    store
+        .insert_huddle_transcript_segment(&ws(), &seg1)
+        .unwrap();
+    store
+        .insert_huddle_transcript_segment(&ws(), &seg2)
+        .unwrap();
+
+    let call_lines = store.huddle_transcript_for_call(&ws(), "R0CALL1").unwrap();
+    assert_eq!(call_lines.len(), 2);
+    assert_eq!(call_lines[0].lang.as_deref(), Some("sv"));
+    assert_eq!(call_lines[1].lang.as_deref(), Some("en"));
+
+    let by_thread = store
+        .huddle_transcript_for_thread(&ws(), &ch, &thread_ts)
+        .unwrap();
+    assert_eq!(by_thread.len(), 2);
+    let counts = store.huddle_transcript_counts_by_thread(&ws()).unwrap();
+    assert_eq!(
+        counts.get(&(ch.clone(), thread_ts.clone())),
+        Some(&("R0CALL1".to_owned(), 2))
+    );
+
+    let sessions = store
+        .list_huddle_transcript_sessions(&ws(), None, 20)
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].call_id, "R0CALL1");
+    assert_eq!(sessions[0].segment_count, 2);
+    assert_eq!(sessions[0].languages, vec!["en", "sv"]);
+
+    // Diacritic-insensitive Swedish FTS5 search ("mote" matches "möte").
+    let sv_hits = store
+        .search_huddle_transcripts(&ws(), "mote", None, None, 20)
+        .unwrap();
+    assert_eq!(sv_hits.len(), 1);
+    assert_eq!(sv_hits[0].speaker_id, Some(u_alice));
+
+    // Language filter narrows bilingual meeting cleanly.
+    let en_only = store
+        .search_huddle_transcripts(&ws(), "", Some(&ch), Some("en"), 20)
+        .unwrap();
+    assert_eq!(en_only.len(), 1);
+    assert_eq!(en_only[0].speaker_id, Some(u_bob));
+
+    assert_eq!(store.delete_huddle_transcript(&ws(), "R0CALL1").unwrap(), 2);
+    assert!(
+        store
+            .search_huddle_transcripts(&ws(), "mote", None, None, 20)
+            .unwrap()
+            .is_empty()
+    );
+}

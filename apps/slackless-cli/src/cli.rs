@@ -592,6 +592,29 @@ pub(crate) enum HuddleCommand {
         /// Share a monitor or window source ID once connected (e.g. `monitor:2` from `huddle screens`).
         #[arg(long, value_name = "SOURCE_ID")]
         screen: Option<String>,
+        /// Enable opt-in local multilingual (English + Swedish auto-detect) Whisper transcription.
+        #[arg(long)]
+        transcribe: bool,
+    },
+    /// Search, list, or export locally archived text-only huddle transcripts (offline).
+    Transcripts {
+        /// Optional channel filter (id, #name, or @handle).
+        channel: Option<String>,
+        /// Full-text search across spoken huddle transcript lines (diacritic-insensitive EN/SV).
+        #[arg(long, value_name = "QUERY")]
+        search: Option<String>,
+        /// Filter hits by detected language code (`en`, `sv`, etc.).
+        #[arg(long, value_name = "LANG")]
+        lang: Option<String>,
+        /// Print the complete speaker-attributed transcript for a specific huddle call ID.
+        #[arg(long, value_name = "CALL_ID")]
+        call_id: Option<String>,
+        /// Export format when printing a call transcript (`md` or `json`).
+        #[arg(long, value_enum)]
+        format: Option<ExportFormat>,
+        /// Maximum sessions or search hits to return.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
     /// Fetch the shareable huddle link for a channel (`rooms.getLink`).
     Link {

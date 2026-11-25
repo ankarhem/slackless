@@ -100,6 +100,15 @@ impl App {
             self.bridge
                 .send(Command::SetStealthMode(settings.stealth_mode));
         }
+        if self
+            .saved_settings
+            .as_ref()
+            .is_none_or(|prev| prev.huddle_save_transcripts != settings.huddle_save_transcripts)
+        {
+            self.bridge.send(Command::SetSaveHuddleTranscripts(
+                settings.huddle_save_transcripts,
+            ));
+        }
         crate::preferences::set_display_prefs(&settings, cx);
         window.set_background_appearance(if settings.window_transparency {
             gpui::WindowBackgroundAppearance::Blurred

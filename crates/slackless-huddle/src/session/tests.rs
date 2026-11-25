@@ -173,6 +173,7 @@ fn parse_incoming_data_message_routes_topics_and_timestamps() {
             text: "Hi".into(),
             is_partial: false,
             at_ms: 0,
+            lang: None,
         }]
     );
 

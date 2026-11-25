@@ -65,6 +65,9 @@ pub struct RecentHuddle {
     pub live: bool,
     pub duration_secs: Option<u64>,
     pub reply_count: u32,
+    /// Local archived transcript call ID & line count when captions were captured.
+    pub transcript_call_id: Option<String>,
+    pub transcript_lines: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -83,6 +86,8 @@ pub enum HuddlesEvent {
     NewHuddle,
     /// Open the huddle's dedicated thread (`F-COLLAB-014`).
     OpenThread(ChannelId, Ts),
+    /// Open the huddle's locally archived text-only transcript viewer.
+    OpenTranscript(String, ChannelId),
     Close,
 }
 
@@ -139,6 +144,8 @@ impl HuddlesView {
                     live: true,
                     duration_secs: None,
                     reply_count: 0,
+                    transcript_call_id: None,
+                    transcript_lines: 0,
                 }
             })
             .into_iter()
@@ -439,6 +446,11 @@ impl HuddlesView {
         let meta = meta_parts.join(" · ");
 
         let open = huddle.channel.clone();
+        let transcript_target = huddle
+            .transcript_call_id
+            .clone()
+            .filter(|_| huddle.transcript_lines > 0)
+            .map(|cid| (cid, huddle.channel.clone(), huddle.transcript_lines));
         let thread_target =
             (!huddle.ts.as_str().is_empty()).then(|| (huddle.channel.clone(), huddle.ts.clone()));
         let visible_avatars: Vec<&UserId> = huddle.participants.iter().take(3).collect();
@@ -557,6 +569,19 @@ impl HuddlesView {
                                     .child(format!("+{overflow}")),
                             )
                         }),
+                )
+            })
+            .when_some(transcript_target, |row, (call_id, ch, lines)| {
+                row.child(
+                    Button::new(("huddle-transcript", ix))
+                        .outline()
+                        .with_size(Size::XSmall)
+                        .icon(IconName::Captions)
+                        .label(format!("Transcript ({lines})"))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(HuddlesEvent::OpenTranscript(call_id.clone(), ch.clone()));
+                        })),
                 )
             })
             .when_some(thread_target, |row, (ch, ts)| {
@@ -803,6 +828,9 @@ pub fn store_huddles(store: &Store, team: &TeamId) -> Vec<RecentHuddle> {
     let Ok(conversations) = store.conversations(team) else {
         return Vec::new();
     };
+    let transcript_counts = store
+        .huddle_transcript_counts_by_thread(team)
+        .unwrap_or_default();
     let mut huddles = Vec::new();
     for conversation in &conversations {
         let Ok(rows) = store.channel_history(team, &conversation.id, None, SCAN_LIMIT) else {
@@ -844,6 +872,9 @@ pub fn store_huddles(store: &Store, team: &TeamId) -> Vec<RecentHuddle> {
                 let end = room.get("date_end")?.as_u64()?;
                 (end > start).then_some(end - start)
             });
+            let (transcript_call_id, transcript_lines) = transcript_counts
+                .get(&(conversation.id.clone(), message.ts.clone()))
+                .map_or((None, 0), |(cid, count)| (Some(cid.clone()), *count));
             huddles.push(RecentHuddle {
                 channel: conversation.id.clone(),
                 ts: message.ts.clone(),
@@ -851,6 +882,8 @@ pub fn store_huddles(store: &Store, team: &TeamId) -> Vec<RecentHuddle> {
                 live,
                 duration_secs,
                 reply_count: message.reply_count.unwrap_or(0),
+                transcript_call_id,
+                transcript_lines,
             });
         }
     }

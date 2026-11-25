@@ -127,6 +127,18 @@ pub(super) async fn run_connected_loop(
         parse_external_user_id(&creds.external_user_id).unwrap_or_else(|| UserId::from("U0SELF"));
     let self_content_attendee = format!("{}#content", creds.attendee_id);
 
+    if let Ok(mut su) = hs.shared.self_user.lock() {
+        *su = self_user.clone();
+    }
+    if config.local_transcribe
+        && let Some(tap) =
+            crate::transcribe::LocalTranscriber::try_start(updates.clone(), None, None)
+        && let Ok(mut guard) = hs.shared.transcribe_tap.lock()
+    {
+        tracing::info!("local multilingual Whisper transcriber active for huddle");
+        *guard = Some(Arc::new(tap));
+    }
+
     let mut state = SessionRuntime {
         creds,
         updates,
@@ -365,6 +377,13 @@ pub(super) async fn run_connected_loop(
                     last_levels_rms_bucket = rms_bucket;
                     last_levels_speakers = state.remote_speakers.clone();
                     last_levels_muted = cur_muted.clone();
+                    if let Ok(mut active) = state.shared.active_remote_speaker.lock() {
+                        *active = state
+                            .remote_speakers
+                            .iter()
+                            .max_by(|a, b| a.1.total_cmp(&b.1))
+                            .map(|(u, _)| u.clone());
+                    }
                     let _ = updates.send(HuddleUpdate::AudioLevels(HuddleAudioLevels {
                         local_rms: if rms_bucket == 0 { 0.0 } else { local_rms },
                         active_speakers: state.remote_speakers.clone(),

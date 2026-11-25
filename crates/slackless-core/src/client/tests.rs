@@ -5194,7 +5194,7 @@ async fn huddle_watcher_ignores_stale_generation_idle_and_preserves_new_session(
 
     // Old watcher (gen 1) emits Idle after gen 2 has started: must NOT clobber call_id or emit Idle.
     let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel();
-    commands::spawn_huddle_watcher(Arc::clone(&huddle), 1, rx1, events.clone());
+    commands::spawn_huddle_watcher(Arc::clone(&huddle), 1, rx1, events.clone(), None);
     tx1.send(crate::huddle::HuddleUpdate::State(Box::new(
         crate::huddle::HuddleSessionSnapshot {
             phase: crate::huddle::HuddlePhase::Idle,
@@ -5215,7 +5215,7 @@ async fn huddle_watcher_ignores_stale_generation_idle_and_preserves_new_session(
 
     // Current watcher (gen 2) emits Idle: clears call_id and emits HuddleSessionChanged(Idle).
     let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel();
-    commands::spawn_huddle_watcher(Arc::clone(&huddle), 2, rx2, events);
+    commands::spawn_huddle_watcher(Arc::clone(&huddle), 2, rx2, events, None);
     tx2.send(crate::huddle::HuddleUpdate::State(Box::new(
         crate::huddle::HuddleSessionSnapshot {
             phase: crate::huddle::HuddlePhase::Idle,
@@ -5488,4 +5488,87 @@ async fn stealth_mode_suppresses_read_receipts_and_typing_until_disabled() {
         assert_eq!(st.mark_calls.len(), 1);
         assert_eq!(st.mark_all_read_calls, 1);
     }
+}
+
+#[tokio::test]
+async fn huddle_watcher_persists_finalized_multilingual_captions_and_skips_partials_and_dups() {
+    let (store, events, mut rx) = fake_core_parts();
+    let huddle = Arc::new(Mutex::new(HuddleSlot {
+        generation: 1,
+        joining: false,
+        call_id: Some("R0BILINGUAL".into()),
+        handle: None,
+    }));
+    let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let persist = commands::huddle::TranscriptPersistCtx {
+        store: Arc::clone(&store),
+        workspace: TeamId::from("T1"),
+        channel: ChannelId::from("C1"),
+        call_id: "R0BILINGUAL".into(),
+        thread_root_ts: Some(Ts::from("1700.1")),
+        source: "chime",
+        enabled: Arc::clone(&enabled),
+    };
+    let (tx, upd_rx) = tokio::sync::mpsc::unbounded_channel();
+    commands::spawn_huddle_watcher(Arc::clone(&huddle), 1, upd_rx, events, Some(persist));
+
+    // 1. Partial caption -> emitted to UI, NOT persisted to SQLite.
+    tx.send(crate::huddle::HuddleUpdate::DataEvent(
+        crate::huddle::HuddleDataEvent::Caption {
+            user: UserId::from("U1"),
+            text: "Vi ska...".into(),
+            is_partial: true,
+            at_ms: 1_700_000_001_000,
+            lang: Some("sv".into()),
+        },
+    ))
+    .unwrap();
+    // 2. Final Swedish caption -> persisted.
+    tx.send(crate::huddle::HuddleUpdate::DataEvent(
+        crate::huddle::HuddleDataEvent::Caption {
+            user: UserId::from("U1"),
+            text: "Vi ska lansera idag".into(),
+            is_partial: false,
+            at_ms: 1_700_000_002_000,
+            lang: Some("sv".into()),
+        },
+    ))
+    .unwrap();
+    // 3. Duplicate within 2.5s -> skipped.
+    tx.send(crate::huddle::HuddleUpdate::DataEvent(
+        crate::huddle::HuddleDataEvent::Caption {
+            user: UserId::from("U1"),
+            text: "Vi ska lansera idag".into(),
+            is_partial: false,
+            at_ms: 1_700_000_003_000,
+            lang: Some("sv".into()),
+        },
+    ))
+    .unwrap();
+    // 4. Final English code-switched caption -> persisted.
+    tx.send(crate::huddle::HuddleUpdate::DataEvent(
+        crate::huddle::HuddleDataEvent::Caption {
+            user: UserId::from("U2"),
+            text: "Let's ship it after the standup".into(),
+            is_partial: false,
+            at_ms: 1_700_000_005_000,
+            lang: Some("en".into()),
+        },
+    ))
+    .unwrap();
+
+    for _ in 0..4 {
+        let _ = next(&mut rx).await;
+    }
+
+    let stored = store
+        .lock()
+        .unwrap()
+        .huddle_transcript_for_call(&TeamId::from("T1"), "R0BILINGUAL")
+        .unwrap();
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].text, "Vi ska lansera idag");
+    assert_eq!(stored[0].lang.as_deref(), Some("sv"));
+    assert_eq!(stored[1].text, "Let's ship it after the standup");
+    assert_eq!(stored[1].lang.as_deref(), Some("en"));
 }

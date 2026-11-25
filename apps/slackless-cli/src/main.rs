@@ -336,13 +336,31 @@ async fn dispatch(
                 camera,
                 blur,
                 screen,
+                transcribe,
             } => {
                 live::run_huddle_join(
                     ctx, flag, &channel, muted, duration, input, output, react, camera, blur,
-                    screen,
+                    screen, transcribe,
                 )
                 .await
             }
+            HuddleCommand::Transcripts {
+                channel,
+                search,
+                lang,
+                call_id,
+                format,
+                limit,
+            } => Ok(live::run_huddle_transcripts(
+                ctx,
+                flag,
+                channel.as_deref(),
+                search.as_deref(),
+                lang.as_deref(),
+                call_id.as_deref(),
+                format,
+                limit,
+            )),
             HuddleCommand::Link { channel } => live::run_huddle_link(ctx, flag, &channel).await,
             HuddleCommand::Invite { channel, user } => {
                 live::run_huddle_invite(ctx, flag, &channel, &user).await

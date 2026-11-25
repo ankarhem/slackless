@@ -24,6 +24,8 @@ impl<B: Backend> Core<B> {
         let events = self.events.clone();
         let huddle = Arc::clone(&self.huddle);
         let team_id = self.workspace.clone();
+        let store = Arc::clone(&self.store);
+        let save_transcripts = Arc::clone(&self.save_huddle_transcripts);
         self.spawn("rooms.join", async move {
             struct JoinGuard {
                 huddle: Arc<Mutex<HuddleSlot>>,
@@ -49,6 +51,17 @@ impl<B: Backend> Core<B> {
                 }
             }
             let call_id = joined.call_id.clone();
+            let thread_root_ts = joined
+                .huddle
+                .thread_root_ts
+                .filter(|ts| !ts.as_str().trim().is_empty())
+                .or_else(|| {
+                    joined
+                        .canvas
+                        .as_ref()
+                        .and_then(|c| c.root_thread_ts.clone())
+                        .filter(|ts| !ts.as_str().trim().is_empty())
+                });
             let creds = crate::huddle::HuddleCredentials {
                 channel: channel.clone(),
                 call_id: joined.call_id,
@@ -59,30 +72,21 @@ impl<B: Backend> Core<B> {
                 signaling_url: joined.chime.meeting.media_placement.signaling_url,
                 turn_control_url: joined.chime.meeting.media_placement.turn_control_url,
                 audio_host_url: joined.chime.meeting.media_placement.audio_host_url,
-                thread_root_ts: joined
-                    .huddle
-                    .thread_root_ts
-                    .filter(|ts| !ts.as_str().trim().is_empty())
-                    .or_else(|| {
-                        joined
-                            .canvas
-                            .as_ref()
-                            .and_then(|c| c.root_thread_ts.clone())
-                            .filter(|ts| !ts.as_str().trim().is_empty())
-                    }),
+                thread_root_ts: thread_root_ts.clone(),
                 canvas_file_id: joined.canvas.as_ref().and_then(|c| c.file_id.clone()),
                 huddle_link: joined
                     .huddle
                     .huddle_link
                     .or_else(|| Some(format!("https://app.slack.com/huddle/{team_id}/{channel}"))),
             };
+            let local_transcribe = audio.local_transcribe;
             let (upd_tx, upd_rx) = tokio::sync::mpsc::unbounded_channel();
             let handle = crate::huddle::spawn_huddle_session(creds, audio, upd_tx);
             let rejected = {
                 let mut slot = huddle.lock().unwrap_or_else(PoisonError::into_inner);
                 if slot.generation == my_gen {
                     slot.joining = false;
-                    slot.call_id = Some(call_id);
+                    slot.call_id = Some(call_id.clone());
                     slot.handle = Some(handle);
                     None
                 } else {
@@ -93,7 +97,20 @@ impl<B: Backend> Core<B> {
                 handle.leave();
                 return Ok(());
             }
-            spawn_huddle_watcher(Arc::clone(&huddle), my_gen, upd_rx, events);
+            let persist = TranscriptPersistCtx {
+                store,
+                workspace: team_id,
+                channel,
+                call_id,
+                thread_root_ts,
+                source: if local_transcribe {
+                    "local-whisper"
+                } else {
+                    "chime"
+                },
+                enabled: save_transcripts,
+            };
+            spawn_huddle_watcher(Arc::clone(&huddle), my_gen, upd_rx, events, Some(persist));
             Ok(())
         });
     }
@@ -235,6 +252,17 @@ impl<B: Backend> Core<B> {
     }
 }
 
+/// Context used by [`spawn_huddle_watcher`] to archive finalized captions into SQLite FTS5.
+pub(in crate::client) struct TranscriptPersistCtx {
+    pub store: SharedStore,
+    pub workspace: TeamId,
+    pub channel: ChannelId,
+    pub call_id: String,
+    pub thread_root_ts: Option<Ts>,
+    pub source: &'static str,
+    pub enabled: Arc<std::sync::atomic::AtomicBool>,
+}
+
 /// Forward huddle session updates from `upd_rx` to `events`, tagged with `my_gen` so an older
 /// session transitioning to `Idle`/`Failed` can never clobber a newer active session's state.
 pub(in crate::client) fn spawn_huddle_watcher(
@@ -242,8 +270,10 @@ pub(in crate::client) fn spawn_huddle_watcher(
     my_gen: u64,
     mut upd_rx: tokio::sync::mpsc::UnboundedReceiver<HuddleUpdate>,
     events: Emitter,
+    persist: Option<TranscriptPersistCtx>,
 ) {
     tokio::spawn(async move {
+        let mut last_caption: Option<(UserId, String, u64)> = None;
         while let Some(upd) = upd_rx.recv().await {
             match upd {
                 HuddleUpdate::State(snap) => {
@@ -298,6 +328,45 @@ pub(in crate::client) fn spawn_huddle_watcher(
                         .generation
                         == my_gen
                     {
+                        if let crate::huddle::HuddleDataEvent::Caption {
+                            ref user,
+                            ref text,
+                            is_partial: false,
+                            at_ms,
+                            ref lang,
+                        } = ev
+                            && let Some(ctx) = persist.as_ref()
+                            && ctx.enabled.load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            let trimmed = text.trim();
+                            let is_dup = last_caption.as_ref().is_some_and(|(u, t, ts)| {
+                                u == user && t == trimmed && at_ms.saturating_sub(*ts) < 2_500
+                            });
+                            if !trimmed.is_empty() && !is_dup {
+                                last_caption = Some((user.clone(), trimmed.to_owned(), at_ms));
+                                let seg_at_ms = if at_ms > 0 {
+                                    i64::try_from(at_ms).unwrap_or(i64::MAX)
+                                } else {
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0))
+                                };
+                                let seg = slackless_store::NewHuddleTranscriptSegment {
+                                    channel: &ctx.channel,
+                                    call_id: &ctx.call_id,
+                                    thread_root_ts: ctx.thread_root_ts.as_ref(),
+                                    speaker_id: Some(user),
+                                    lang: lang.as_deref(),
+                                    source: ctx.source,
+                                    text: trimmed,
+                                    at_ms: seg_at_ms,
+                                };
+                                if let Ok(store) = ctx.store.lock() {
+                                    let _ = store
+                                        .insert_huddle_transcript_segment(&ctx.workspace, &seg);
+                                }
+                            }
+                        }
                         events.emit(Event::HuddleDataEvent(ev));
                     }
                 }

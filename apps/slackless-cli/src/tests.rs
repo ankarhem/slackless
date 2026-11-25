@@ -362,6 +362,41 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
     assert!(crate::write::check_secrets(&ctx, &leaked, false).is_some());
     assert!(crate::write::check_secrets(&ctx, &leaked, true).is_none());
 
+    // Huddle transcripts & --transcribe flags.
+    assert!(matches!(
+        Cli::try_parse_from([
+            "slackless",
+            "huddle",
+            "transcripts",
+            "#eng",
+            "--search",
+            "möte",
+            "--lang",
+            "sv"
+        ])
+        .unwrap()
+        .command,
+        Commands::Huddle {
+            command: HuddleCommand::Transcripts {
+                channel: Some(ref ch),
+                search: Some(ref q),
+                lang: Some(ref l),
+                ..
+            }
+        } if ch == "#eng" && q == "möte" && l == "sv"
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["slackless", "huddle", "join", "#eng", "--transcribe"])
+            .unwrap()
+            .command,
+        Commands::Huddle {
+            command: HuddleCommand::Join {
+                transcribe: true,
+                ..
+            }
+        }
+    ));
+
     // Thread live, digest defaults, upload multi-file, export defaults, nested subcommands.
     assert!(matches!(
         Cli::try_parse_from(["slackless", "thread", "#eng", "1700.1", "--live"])

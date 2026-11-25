@@ -318,6 +318,8 @@ pub(crate) struct Core<B: Backend> {
     offline_queue: VecDeque<(i64, QueuedMutation)>,
     /// True Stealth Mode: suppresses outbound typing, read-cursor updates, and active presence.
     stealth_mode: bool,
+    /// When true (default), persist finalized huddle captions to local SQLite FTS5 (text-only).
+    save_huddle_transcripts: Arc<std::sync::atomic::AtomicBool>,
     /// Active native Chime audio huddle session slot (at most one per workspace, guarded by
     /// generation counter so stale joins/watchers never clobber a newer session).
     huddle: Arc<Mutex<HuddleSlot>>,
@@ -381,6 +383,7 @@ impl<B: Backend> Core<B> {
             has_connected_once: false,
             offline_queue: persisted,
             stealth_mode: false,
+            save_huddle_transcripts: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             huddle: Arc::new(Mutex::new(HuddleSlot::default())),
         }
     }

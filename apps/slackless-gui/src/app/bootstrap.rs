@@ -1158,6 +1158,14 @@ impl App {
                             this.open_thread(channel.clone(), ts.clone(), cx);
                             cx.notify();
                         }
+                        HuddlesEvent::OpenTranscript(call_id, channel) => {
+                            this.open_huddle_transcript(
+                                call_id.clone(),
+                                channel.clone(),
+                                window,
+                                cx,
+                            );
+                        }
                         HuddlesEvent::Close => {
                             this.huddles_open = false;
                             cx.notify();
