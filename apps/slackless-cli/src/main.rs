@@ -7,8 +7,6 @@
 //! `--json` for machines and a tab-separated human default. Nothing here needs a live Slack
 //! connection to start.
 
-#![allow(clippy::large_unopt_stack_frames)]
-
 mod archive;
 mod cli;
 mod commands;

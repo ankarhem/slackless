@@ -1,3 +1,5 @@
+#![allow(unknown_lints, clippy::large_unopt_stack_frames)]
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};

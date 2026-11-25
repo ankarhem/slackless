@@ -15,6 +15,16 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
+# Fast headless test profile for CI: disables -O3 on dependencies and DWARF debuginfo so
+# workspace tests compile quickly and keep CI caches compact.
+[profile.ci-test]
+inherits = "dev"
+opt-level = 0
+debug = 0
+
+[profile.ci-test.package."*"]
+opt-level = 0
+
 [profile.release]
 lto = "thin"
 strip = "debuginfo"
