@@ -1981,7 +1981,7 @@ pub(super) fn parse_list_records(records: &[Value]) -> Vec<SlackListRow> {
     rows
 }
 
-fn parse_list_cell(field: &Value) -> SlackListCellValue {
+pub(super) fn parse_list_cell(field: &Value) -> SlackListCellValue {
     if let Some(b) = field.get("checkbox").and_then(Value::as_bool) {
         return SlackListCellValue::Checkbox(b);
     }

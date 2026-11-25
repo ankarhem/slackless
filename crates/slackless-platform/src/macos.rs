@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::process::{Command, Stdio};
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
@@ -264,40 +264,69 @@ fn declared_url_schemes() -> Vec<String> {
     schemes
 }
 
-type StatusBarCallback = Box<dyn Fn(StatusBarAction) + Send + Sync + 'static>;
+type StatusBarCallback = Arc<dyn Fn(StatusBarAction) + Send + Sync + 'static>;
 
-static STATUS_ACTIONS: LazyLock<Mutex<VecDeque<StatusBarAction>>> =
-    LazyLock::new(|| Mutex::new(VecDeque::new()));
-static STATUS_CALLBACK: LazyLock<Mutex<Option<StatusBarCallback>>> =
-    LazyLock::new(|| Mutex::new(None));
+#[derive(Default)]
+struct StatusBarDispatchState {
+    pending: VecDeque<StatusBarAction>,
+    callback: Option<StatusBarCallback>,
+}
 
-fn emit_status_bar_action(action: StatusBarAction) {
-    if let Ok(guard) = STATUS_CALLBACK.lock() {
-        if let Some(cb) = guard.as_ref() {
+/// Synchronized queue/callback handoff for status-bar menu actions.
+/// Holding one mutex across draining `pending` and installing `callback` prevents actions
+/// emitted concurrently during startup from being stranded in `pending`.
+#[derive(Default)]
+struct StatusBarDispatch {
+    state: Mutex<StatusBarDispatchState>,
+}
+
+impl StatusBarDispatch {
+    fn emit(&self, action: StatusBarAction) {
+        let cb = {
+            let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(cb) = guard.callback.as_ref() {
+                Some(Arc::clone(cb))
+            } else {
+                guard.pending.push_back(action);
+                return;
+            }
+        };
+        if let Some(cb) = cb {
             cb(action);
-            return;
         }
     }
-    STATUS_ACTIONS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .push_back(action);
+
+    fn install(&self, on_action: impl Fn(StatusBarAction) + Send + Sync + 'static) {
+        let cb: StatusBarCallback = Arc::new(on_action);
+        let drained: Vec<StatusBarAction> = {
+            let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.callback = Some(Arc::clone(&cb));
+            guard.pending.drain(..).collect()
+        };
+        for action in drained {
+            cb(action);
+        }
+    }
+
+    fn take(&self) -> Option<StatusBarAction> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .pop_front()
+    }
+}
+
+static STATUS_DISPATCH: LazyLock<StatusBarDispatch> = LazyLock::new(StatusBarDispatch::default);
+
+fn emit_status_bar_action(action: StatusBarAction) {
+    STATUS_DISPATCH.emit(action);
 }
 
 pub(crate) fn install_status_bar_action_monitor(
     on_action: impl Fn(StatusBarAction) + Send + Sync + 'static,
 ) {
-    let drained: Vec<StatusBarAction> = STATUS_ACTIONS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .drain(..)
-        .collect();
-    for action in drained {
-        on_action(action);
-    }
-    if let Ok(mut guard) = STATUS_CALLBACK.lock() {
-        *guard = Some(Box::new(on_action));
-    }
+    STATUS_DISPATCH.install(on_action);
 }
 
 define_class!(
@@ -375,10 +404,7 @@ impl StatusBarItem for MacPlatform {
     }
 
     fn take_status_bar_action(&self) -> Option<StatusBarAction> {
-        STATUS_ACTIONS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front()
+        STATUS_DISPATCH.take()
     }
 }
 
@@ -651,4 +677,74 @@ pub(crate) fn install_screen_lock_monitor(on_lock: impl Fn() + Send + Sync + 'st
         };
         std::mem::forget(observer);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf16_to_utf8_offset_handles_ascii_multibyte_surrogates_and_bounds() {
+        // Empty string
+        assert_eq!(utf16_to_utf8_offset("", 0), Some(0));
+        assert_eq!(utf16_to_utf8_offset("", 1), None);
+
+        // Pure ASCII
+        assert_eq!(utf16_to_utf8_offset("hello", 0), Some(0));
+        assert_eq!(utf16_to_utf8_offset("hello", 3), Some(3));
+        assert_eq!(utf16_to_utf8_offset("hello", 5), Some(5));
+        assert_eq!(utf16_to_utf8_offset("hello", 6), None);
+
+        // Multi-byte BMP chars: 'é' (2 UTF-8 bytes, 1 UTF-16 unit), '中' (3 UTF-8 bytes, 1 UTF-16 unit)
+        let bmp = "aé中b";
+        assert_eq!(utf16_to_utf8_offset(bmp, 0), Some(0));
+        assert_eq!(utf16_to_utf8_offset(bmp, 1), Some(1));
+        assert_eq!(utf16_to_utf8_offset(bmp, 2), Some(3));
+        assert_eq!(utf16_to_utf8_offset(bmp, 3), Some(6));
+        assert_eq!(utf16_to_utf8_offset(bmp, 4), Some(7));
+        assert_eq!(utf16_to_utf8_offset(bmp, 5), None);
+
+        // Emoji surrogate pair: '😀' is 4 UTF-8 bytes and 2 UTF-16 code units.
+        let emoji = "a😀b";
+        assert_eq!(utf16_to_utf8_offset(emoji, 0), Some(0));
+        assert_eq!(utf16_to_utf8_offset(emoji, 1), Some(1));
+        assert_eq!(
+            utf16_to_utf8_offset(emoji, 2),
+            None,
+            "mid-surrogate offset must return None"
+        );
+        assert_eq!(utf16_to_utf8_offset(emoji, 3), Some(5));
+        assert_eq!(utf16_to_utf8_offset(emoji, 4), Some(6));
+        assert_eq!(utf16_to_utf8_offset(emoji, 5), None);
+    }
+
+    #[test]
+    fn status_bar_dispatch_queues_before_install_drains_atomically_and_forwards_after() {
+        let dispatch = StatusBarDispatch::default();
+
+        // Queued actions before monitor installation are returned FIFO by `take`.
+        dispatch.emit(StatusBarAction::ShowWindow);
+        dispatch.emit(StatusBarAction::ToggleDnd);
+        assert_eq!(dispatch.take(), Some(StatusBarAction::ShowWindow));
+
+        // Queue another action, then install monitor: remaining queued actions drain into callback.
+        dispatch.emit(StatusBarAction::SwitchWorkspace(2));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let rec_clone = Arc::clone(&received);
+        dispatch.install(move |action| {
+            rec_clone.lock().unwrap().push(action);
+        });
+
+        // After installation, subsequent actions bypass the queue and go straight to the callback.
+        dispatch.emit(StatusBarAction::Quit);
+        assert_eq!(dispatch.take(), None);
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![
+                StatusBarAction::ToggleDnd,
+                StatusBarAction::SwitchWorkspace(2),
+                StatusBarAction::Quit,
+            ]
+        );
+    }
 }

@@ -20,7 +20,6 @@
 //! status-bar item are no-ops.
 
 mod deep_link;
-#[cfg(not(target_os = "macos"))]
 mod fallback;
 pub mod logging;
 #[cfg(target_os = "macos")]
@@ -373,6 +372,25 @@ pub fn current() -> impl Notifier
 + Sync
 + 'static {
     Platform::new()
+}
+
+/// An in-memory, no-op platform backend that never touches OS APIs (notifications, dock badges,
+/// AppKit, or Keychain). Intended for headless tests on all operating systems.
+pub fn noop() -> impl Notifier
++ BadgeSetter
++ IconSetter
++ AboutPanel
++ FullScreenItem
++ SoundPlayer
++ SecretStore
++ DeepLinkHandler
++ StatusBarItem
++ AttentionRequester
++ SpellChecker
++ Send
++ Sync
++ 'static {
+    fallback::FallbackPlatform::new()
 }
 
 #[cfg(test)]

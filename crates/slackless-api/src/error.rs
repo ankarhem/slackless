@@ -77,3 +77,28 @@ impl From<ResponseError> for ApiError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ApiResponse;
+
+    #[test]
+    fn classifies_all_auth_expired_errors_and_missing_error_string() {
+        for code in AUTH_EXPIRED_ERRORS {
+            let err = ApiError::from_slack_error(*code);
+            assert!(err.is_auth_expired(), "{code} must be auth expired");
+            assert!(matches!(&err, ApiError::AuthExpired(s) if s == code));
+        }
+
+        let other = ApiError::from_slack_error("channel_not_found");
+        assert!(!other.is_auth_expired());
+        assert!(matches!(other, ApiError::Slack(s) if s == "channel_not_found"));
+
+        let missing: ApiError =
+            ApiResponse::<serde_json::Value>::from_value(serde_json::json!({"ok": false}))
+                .unwrap_err()
+                .into();
+        assert!(matches!(missing, ApiError::Slack(s) if s == "unknown_error"));
+    }
+}

@@ -103,4 +103,51 @@ mod tests {
         let err = validate(&session_for(&server)).await.unwrap_err();
         assert!(matches!(err, AuthError::Api(_)), "{err:?}");
     }
+
+    #[tokio::test]
+    async fn remaining_auth_expired_codes_map_to_needs_reauth() {
+        for code in ["not_authed", "token_expired", "account_inactive"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/auth.test"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": false,
+                    "error": code,
+                })))
+                .mount(&server)
+                .await;
+
+            let err = validate(&session_for(&server)).await.unwrap_err();
+            assert!(
+                matches!(err, AuthError::NeedsReauth(ref msg) if msg.contains(code)),
+                "expected NeedsReauth({code}), got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_5xx_and_malformed_url_surface_as_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth.test"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("<html>unavailable</html>"))
+            .mount(&server)
+            .await;
+
+        let err = validate(&session_for(&server)).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuthError::Api(slackless_api::ApiError::Status { status: 503, .. })
+            ),
+            "{err:?}"
+        );
+
+        let bad_session = Session::new("://not-a-valid-url", "T1", "xoxc-1", "xoxd-1", "U1");
+        let err = validate(&bad_session).await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::Api(slackless_api::ApiError::Url(_))),
+            "{err:?}"
+        );
+    }
 }

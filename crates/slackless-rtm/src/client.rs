@@ -568,4 +568,592 @@ mod tests {
             .unwrap();
         server.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn ping_pong_liveness_resets_on_pong_and_reconnects_after_max_missed_pongs() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Session 1: answer 1st ping with pong (resets unanswered counter), ignore subsequent pings.
+            let (stream1, _) = listener.accept().await.unwrap();
+            let mut ws1 = tokio_tungstenite::accept_async(stream1).await.unwrap();
+            ws1.send(Message::text(r#"{"type":"hello"}"#))
+                .await
+                .unwrap();
+
+            let ping1: serde_json::Value =
+                serde_json::from_str(&ws1.next().await.unwrap().unwrap().into_text().unwrap())
+                    .unwrap();
+            assert_eq!(ping1["type"], "ping");
+            let id1 = ping1["id"].as_u64().unwrap();
+            ws1.send(Message::text(format!(
+                r#"{{"type":"pong","reply_to":{id1}}}"#
+            )))
+            .await
+            .unwrap();
+
+            // Next 2 pings go unanswered (max_missed_pongs = 2); on the 3rd tick client drops.
+            let ping2: serde_json::Value =
+                serde_json::from_str(&ws1.next().await.unwrap().unwrap().into_text().unwrap())
+                    .unwrap();
+            assert_eq!(ping2["type"], "ping");
+            let ping3: serde_json::Value =
+                serde_json::from_str(&ws1.next().await.unwrap().unwrap().into_text().unwrap())
+                    .unwrap();
+            assert_eq!(ping3["type"], "ping");
+
+            // Session 2 confirms the client reconnected after missing pongs.
+            let (stream2, _) = listener.accept().await.unwrap();
+            let mut ws2 = tokio_tungstenite::accept_async(stream2).await.unwrap();
+            ws2.send(Message::text(r#"{"type":"hello"}"#))
+                .await
+                .unwrap();
+            let _ = ws2.next().await;
+        });
+
+        let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-ping"));
+        cfg.base_url = format!("ws://{addr}/link/");
+        cfg.ping_interval = Duration::from_millis(25);
+        cfg.max_missed_pongs = 2;
+        cfg.backoff = Backoff {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(20),
+        };
+        let (client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+        let drv = tokio::spawn(driver);
+
+        let mut saw_pong = false;
+        let mut saw_missed_reconnect = false;
+        let mut connected_count = 0;
+        for _ in 0..15 {
+            match next_event(&mut rx).await {
+                RtmEvent::Event(SlackEvent::Pong(_)) => saw_pong = true,
+                RtmEvent::State(ConnectionState::Reconnecting { reason, .. }) => {
+                    assert!(reason.contains("2 pings unanswered"), "got: {reason}");
+                    saw_missed_reconnect = true;
+                }
+                RtmEvent::State(ConnectionState::Connected { .. }) => {
+                    connected_count += 1;
+                    if connected_count == 2 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_pong);
+        assert!(saw_missed_reconnect);
+        assert_eq!(connected_count, 2);
+
+        client.close();
+        let _ = tokio::time::timeout(Duration::from_secs(2), drv).await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_url_is_single_use_and_falls_back_to_base_url() {
+        let base_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_addr = base_listener.local_addr().unwrap();
+        let redir_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redir_addr = redir_listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Session 1 on base_url: send reconnect_url pointing to redir_listener, then goodbye.
+            let (s1, _) = base_listener.accept().await.unwrap();
+            let mut ws1 = tokio_tungstenite::accept_async(s1).await.unwrap();
+            ws1.send(Message::text(r#"{"type":"hello"}"#))
+                .await
+                .unwrap();
+            ws1.send(Message::text(format!(
+                r#"{{"type":"reconnect_url","url":"ws://{redir_addr}/custom-path"}}"#
+            )))
+            .await
+            .unwrap();
+            ws1.send(Message::text(r#"{"type":"goodbye"}"#))
+                .await
+                .unwrap();
+            let _ = ws1.close(None).await;
+
+            // Session 2 MUST dial redir_listener with `/custom-path`.
+            let (s2, _) = redir_listener.accept().await.unwrap();
+            let mut seen_path = String::new();
+            #[allow(clippy::result_large_err)]
+            let mut ws2 = tokio_tungstenite::accept_hdr_async(
+                s2,
+                |req: &tungstenite::handshake::server::Request,
+                 resp: tungstenite::handshake::server::Response| {
+                    seen_path = req.uri().path().to_owned();
+                    Ok(resp)
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(seen_path, "/custom-path");
+            ws2.send(Message::text(r#"{"type":"hello","fast_reconnect":true}"#))
+                .await
+                .unwrap();
+            ws2.send(Message::text(r#"{"type":"goodbye"}"#))
+                .await
+                .unwrap();
+            let _ = ws2.close(None).await;
+
+            // Session 3 MUST fall back to base_listener (reconnect_url was single-use).
+            let (s3, _) = base_listener.accept().await.unwrap();
+            let mut ws3 = tokio_tungstenite::accept_async(s3).await.unwrap();
+            ws3.send(Message::text(r#"{"type":"hello"}"#))
+                .await
+                .unwrap();
+            let _ = ws3.next().await;
+        });
+
+        let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-redir"));
+        cfg.base_url = format!("ws://{base_addr}/link/");
+        cfg.backoff = Backoff {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(20),
+        };
+        let (client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+        let drv = tokio::spawn(driver);
+
+        let mut connects = Vec::new();
+        for _ in 0..20 {
+            if let RtmEvent::State(ConnectionState::Connected { fast_reconnect }) =
+                next_event(&mut rx).await
+            {
+                connects.push(fast_reconnect);
+                if connects.len() == 3 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(connects, vec![false, true, false]);
+
+        client.close();
+        let _ = tokio::time::timeout(Duration::from_secs(2), drv).await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn error_url_expired_clears_stored_reconnect_url() {
+        let base_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_addr = base_listener.local_addr().unwrap();
+        let unused_redir = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redir_addr = unused_redir.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (s1, _) = base_listener.accept().await.unwrap();
+            let mut ws1 = tokio_tungstenite::accept_async(s1).await.unwrap();
+            ws1.send(Message::text(r#"{"type":"hello"}"#))
+                .await
+                .unwrap();
+            ws1.send(Message::text(format!(
+                r#"{{"type":"reconnect_url","url":"ws://{redir_addr}/expired"}}"#
+            )))
+            .await
+            .unwrap();
+            ws1.send(Message::text(
+                r#"{"type":"error","error":{"code":1,"msg":"Socket URL has expired"}}"#,
+            ))
+            .await
+            .unwrap();
+            ws1.send(Message::text(r#"{"type":"goodbye"}"#))
+                .await
+                .unwrap();
+            let _ = ws1.close(None).await;
+
+            // Because code 1 cleared reconnect_url, session 2 must hit base_listener directly.
+            let (s2, _) = base_listener.accept().await.unwrap();
+            let mut ws2 = tokio_tungstenite::accept_async(s2).await.unwrap();
+            ws2.send(Message::text(r#"{"type":"hello"}"#))
+                .await
+                .unwrap();
+            let _ = ws2.next().await;
+        });
+
+        let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-exp"));
+        cfg.base_url = format!("ws://{base_addr}/link/");
+        cfg.backoff = Backoff {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(20),
+        };
+        let (client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+        let drv = tokio::spawn(driver);
+
+        let mut connected = 0;
+        for _ in 0..15 {
+            if let RtmEvent::State(ConnectionState::Connected { .. }) = next_event(&mut rx).await {
+                connected += 1;
+                if connected == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(connected, 2);
+
+        client.close();
+        let _ = tokio::time::timeout(Duration::from_secs(2), drv).await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn in_band_401_and_http_403_stop_while_502_and_503_retry() {
+        // 1. In-band error code 401 -> terminal Disconnected
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (s, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
+                ws.send(Message::text(
+                    r#"{"type":"error","error":{"code":401,"msg":"bad token"}}"#,
+                ))
+                .await
+                .unwrap();
+            });
+            let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-bad"));
+            cfg.base_url = format!("ws://{addr}/link/");
+            let (_client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+            let drv = tokio::spawn(driver);
+
+            let mut stopped = None;
+            for _ in 0..5 {
+                if let RtmEvent::State(ConnectionState::Disconnected { reason }) =
+                    next_event(&mut rx).await
+                {
+                    stopped = Some(reason);
+                    break;
+                }
+            }
+            assert!(
+                stopped
+                    .as_deref()
+                    .is_some_and(|r| r.contains("invalid auth")),
+                "{stopped:?}"
+            );
+            tokio::time::timeout(Duration::from_secs(2), drv)
+                .await
+                .unwrap()
+                .unwrap();
+            server.await.unwrap();
+        }
+
+        // 2. HTTP 403 -> terminal Disconnected
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                let _ = sock.shutdown().await;
+            });
+            let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-403"));
+            cfg.base_url = format!("ws://{addr}/link/");
+            let (_client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+            let drv = tokio::spawn(driver);
+
+            assert_eq!(
+                next_event(&mut rx).await,
+                RtmEvent::State(ConnectionState::Connecting)
+            );
+            match next_event(&mut rx).await {
+                RtmEvent::State(ConnectionState::Disconnected { reason }) => {
+                    assert!(reason.contains("403"), "got: {reason}");
+                }
+                other => panic!("expected Disconnected on 403, got {other:?}"),
+            }
+            tokio::time::timeout(Duration::from_secs(2), drv)
+                .await
+                .unwrap()
+                .unwrap();
+            server.await.unwrap();
+        }
+
+        // 3. HTTP 502 then 503 then WebSocket success -> retryable reconnects
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for status in ["502 Bad Gateway", "503 Service Unavailable"] {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                        )
+                        .await;
+                    let _ = sock.shutdown().await;
+                }
+                let (s, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
+                ws.send(Message::text(r#"{"type":"hello"}"#)).await.unwrap();
+                let _ = ws.next().await;
+            });
+
+            let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-retry"));
+            cfg.base_url = format!("ws://{addr}/link/");
+            cfg.backoff = Backoff {
+                initial: Duration::from_millis(10),
+                max: Duration::from_millis(20),
+            };
+            let (client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+            let drv = tokio::spawn(driver);
+
+            let mut attempts = Vec::new();
+            let mut connected = false;
+            for _ in 0..12 {
+                match next_event(&mut rx).await {
+                    RtmEvent::State(ConnectionState::Reconnecting { attempt, .. }) => {
+                        attempts.push(attempt);
+                    }
+                    RtmEvent::State(ConnectionState::Connected { .. }) => {
+                        connected = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(attempts, vec![1, 2]);
+            assert!(connected);
+
+            client.close();
+            let _ = tokio::time::timeout(Duration::from_secs(2), drv).await;
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_sends_origin_cookie_and_user_agent_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let mut seen_origin = None;
+            let mut seen_cookie = None;
+            let mut seen_ua = None;
+            #[allow(clippy::result_large_err)]
+            let mut ws = tokio_tungstenite::accept_hdr_async(
+                s,
+                |req: &tungstenite::handshake::server::Request,
+                 resp: tungstenite::handshake::server::Response| {
+                    seen_origin = req
+                        .headers()
+                        .get(ORIGIN)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    seen_cookie = req
+                        .headers()
+                        .get(COOKIE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    seen_ua = req
+                        .headers()
+                        .get(USER_AGENT)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    Ok(resp)
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(seen_origin.as_deref(), Some(WEB_ORIGIN));
+            assert_eq!(seen_cookie.as_deref(), Some("d=xoxd-cookie-val"));
+            assert_eq!(seen_ua.as_deref(), Some("SlacklessTest/1.0"));
+            ws.send(Message::text(r#"{"type":"hello"}"#)).await.unwrap();
+            let _ = ws.next().await;
+        });
+
+        let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-hdr"));
+        cfg.base_url = format!("ws://{addr}/link/");
+        cfg.d_cookie = Some("xoxd-cookie-val".to_owned());
+        cfg.user_agent = Some("SlacklessTest/1.0".to_owned());
+        let (client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+        let drv = tokio::spawn(driver);
+
+        for _ in 0..4 {
+            if matches!(
+                next_event(&mut rx).await,
+                RtmEvent::State(ConnectionState::Connected { .. })
+            ) {
+                break;
+            }
+        }
+        client.close();
+        let _ = tokio::time::timeout(Duration::from_secs(2), drv).await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_aborts_backoff_wait_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = sock.shutdown().await;
+        });
+
+        let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-wait"));
+        cfg.base_url = format!("ws://{addr}/link/");
+        cfg.backoff = Backoff {
+            initial: Duration::from_secs(30),
+            max: Duration::from_secs(30),
+        };
+        let (client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+        let drv = tokio::spawn(driver);
+
+        assert_eq!(
+            next_event(&mut rx).await,
+            RtmEvent::State(ConnectionState::Connecting)
+        );
+        assert!(matches!(
+            next_event(&mut rx).await,
+            RtmEvent::State(ConnectionState::Reconnecting { .. })
+        ));
+
+        let started = Instant::now();
+        client.close();
+        assert!(matches!(
+            next_event(&mut rx).await,
+            RtmEvent::State(ConnectionState::Disconnected { .. })
+        ));
+        tokio::time::timeout(Duration::from_secs(1), drv)
+            .await
+            .expect("close should abort long backoff immediately")
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn presence_sub_during_backoff_replays_server_close_reconnects_healthy_resets_and_ids_monotonic()
+     {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Session 1: short-lived, receives typing (id=1) & tickle (id=2), closes with CloseFrame.
+            let (s1, _) = listener.accept().await.unwrap();
+            let mut ws1 = tokio_tungstenite::accept_async(s1).await.unwrap();
+            ws1.send(Message::text(r#"{"type":"hello"}"#))
+                .await
+                .unwrap();
+            let f1: serde_json::Value =
+                serde_json::from_str(&ws1.next().await.unwrap().unwrap().into_text().unwrap())
+                    .unwrap();
+            let f2: serde_json::Value =
+                serde_json::from_str(&ws1.next().await.unwrap().unwrap().into_text().unwrap())
+                    .unwrap();
+            assert_eq!(f1["id"], 1);
+            assert_eq!(f2["id"], 2);
+            ws1.send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Restart,
+                reason: "restarting".into(),
+            })))
+            .await
+            .unwrap();
+
+            // Session 2: stays alive >= healthy_after (80ms), verifies presence_sub queued during
+            // backoff replays with id=3, then closes with goodbye.
+            let (s2, _) = listener.accept().await.unwrap();
+            let mut ws2 = tokio_tungstenite::accept_async(s2).await.unwrap();
+            ws2.send(Message::text(r#"{"type":"hello"}"#))
+                .await
+                .unwrap();
+            let sub: serde_json::Value =
+                serde_json::from_str(&ws2.next().await.unwrap().unwrap().into_text().unwrap())
+                    .unwrap();
+            assert_eq!(sub["type"], "presence_sub");
+            assert_eq!(sub["ids"], serde_json::json!(["U999"]));
+            assert_eq!(sub["id"], 3);
+
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            ws2.send(Message::text(r#"{"type":"goodbye"}"#))
+                .await
+                .unwrap();
+            let _ = ws2.close(None).await;
+
+            // Session 3: receives replayed presence_sub with id=4 (monotonic across reconnects).
+            let (s3, _) = listener.accept().await.unwrap();
+            let mut ws3 = tokio_tungstenite::accept_async(s3).await.unwrap();
+            ws3.send(Message::text(r#"{"type":"hello"}"#))
+                .await
+                .unwrap();
+            let sub2: serde_json::Value =
+                serde_json::from_str(&ws3.next().await.unwrap().unwrap().into_text().unwrap())
+                    .unwrap();
+            assert_eq!(sub2["type"], "presence_sub");
+            assert_eq!(sub2["id"], 4);
+            let _ = ws3.next().await;
+        });
+
+        let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-lifecycle"));
+        cfg.base_url = format!("ws://{addr}/link/");
+        cfg.healthy_after = Duration::from_millis(70);
+        cfg.backoff = Backoff {
+            initial: Duration::from_millis(40),
+            max: Duration::from_millis(80),
+        };
+        let (client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+        let drv = tokio::spawn(driver);
+
+        // Wait for Connected #1, send 2 frames (ids 1, 2).
+        for _ in 0..4 {
+            if matches!(
+                next_event(&mut rx).await,
+                RtmEvent::State(ConnectionState::Connected { .. })
+            ) {
+                break;
+            }
+        }
+        client.user_typing(ChannelId::from("C1"), None).unwrap();
+        client.tickle(TickleReason::Focus).unwrap();
+
+        // Wait for Reconnecting #1 (from Message::Close), then queue presence_sub during backoff wait.
+        let mut attempts = Vec::new();
+        let mut saw_server_close = false;
+        let mut connected = 1;
+        for _ in 0..20 {
+            match next_event(&mut rx).await {
+                RtmEvent::State(ConnectionState::Reconnecting {
+                    attempt, reason, ..
+                }) => {
+                    attempts.push(attempt);
+                    if attempts.len() == 1 {
+                        saw_server_close = reason.contains("closed by server");
+                        client.presence_sub(vec![UserId::from("U999")]).unwrap();
+                    }
+                }
+                RtmEvent::State(ConnectionState::Connected { .. }) => {
+                    connected += 1;
+                    if connected == 3 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_server_close);
+        // Attempt 1 after short session 1; after healthy session 2 (>= 70ms), attempt resets to 1!
+        assert_eq!(attempts, vec![1, 1]);
+        assert_eq!(connected, 3);
+
+        client.close();
+        let _ = tokio::time::timeout(Duration::from_secs(2), drv).await;
+        server.await.unwrap();
+    }
 }

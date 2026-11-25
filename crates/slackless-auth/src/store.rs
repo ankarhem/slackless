@@ -16,6 +16,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use slackless_types::TeamId;
 
@@ -34,11 +35,37 @@ const SECURITY: &str = "/usr/bin/security";
 #[cfg(target_os = "macos")]
 const ITEM_NOT_FOUND: i32 = 44;
 
+/// Seam over the OS Keychain so [`SessionStore`] can be tested without touching the login Keychain.
+pub(crate) trait KeychainBackend: std::fmt::Debug + Send + Sync {
+    fn set(&self, team_id: &TeamId, xoxc: &str, d: &str) -> Result<()>;
+    fn get(&self, team_id: &TeamId) -> Result<Option<(String, String)>>;
+    fn delete(&self, team_id: &TeamId) -> Result<()>;
+}
+
+/// Default Keychain backend backed by Apple's `/usr/bin/security` tool on macOS (no-op elsewhere).
+#[derive(Debug)]
+struct OsKeychain;
+
+impl KeychainBackend for OsKeychain {
+    fn set(&self, team_id: &TeamId, xoxc: &str, d: &str) -> Result<()> {
+        keychain_set(team_id, xoxc, d)
+    }
+
+    fn get(&self, team_id: &TeamId) -> Result<Option<(String, String)>> {
+        keychain_get(team_id)
+    }
+
+    fn delete(&self, team_id: &TeamId) -> Result<()> {
+        keychain_delete(team_id)
+    }
+}
+
 /// Durable store for one-or-more [`Session`]s.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     path: PathBuf,
     use_keychain: bool,
+    keychain: Arc<dyn KeychainBackend>,
 }
 
 impl SessionStore {
@@ -50,6 +77,7 @@ impl SessionStore {
         Ok(Self {
             path: dir.join("slackless").join("sessions.json"),
             use_keychain: cfg!(target_os = "macos"),
+            keychain: Arc::new(OsKeychain),
         })
     }
 
@@ -59,6 +87,17 @@ impl SessionStore {
         Self {
             path: path.into(),
             use_keychain: false,
+            keychain: Arc::new(OsKeychain),
+        }
+    }
+
+    /// A store backed by `path` and an injected Keychain implementation (for tests).
+    #[cfg(test)]
+    fn with_keychain(path: impl Into<PathBuf>, keychain: Arc<dyn KeychainBackend>) -> Self {
+        Self {
+            path: path.into(),
+            use_keychain: true,
+            keychain,
         }
     }
 
@@ -83,7 +122,7 @@ impl SessionStore {
         if self.use_keychain {
             for s in &mut sessions {
                 if !s.has_secrets() {
-                    if let Some((xoxc, d)) = keychain_get(&s.team_id)? {
+                    if let Some((xoxc, d)) = self.keychain.get(&s.team_id)? {
                         s.xoxc_token = xoxc;
                         s.d_cookie = d;
                     }
@@ -102,7 +141,7 @@ impl SessionStore {
 
         let on_disk: Vec<Session> = if self.use_keychain {
             for s in sessions {
-                keychain_set(&s.team_id, &s.xoxc_token, &s.d_cookie)?;
+                self.keychain.set(&s.team_id, &s.xoxc_token, &s.d_cookie)?;
             }
             sessions
                 .iter()
@@ -171,7 +210,7 @@ impl SessionStore {
         let removed = sessions.len() != before;
         if removed {
             if self.use_keychain {
-                keychain_delete(team_id)?;
+                self.keychain.delete(team_id)?;
             }
             self.save(&sessions)?;
         }
@@ -251,7 +290,7 @@ fn keychain_delete(team_id: &TeamId) -> Result<()> {
 }
 
 /// A team's Keychain account: its id, which must stay one bare word on a `security` command.
-#[cfg(target_os = "macos")]
+#[cfg(any(test, target_os = "macos"))]
 fn keychain_account(team_id: &TeamId) -> Result<&str> {
     let id = team_id.as_str();
     if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -359,5 +398,166 @@ mod tests {
             raw.contains("xoxc-a"),
             "disk store should retain secrets: {raw}"
         );
+    }
+
+    #[derive(Debug, Default)]
+    struct MockKeychain {
+        entries: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+        ops: std::sync::Mutex<Vec<String>>,
+        fail_delete: std::sync::atomic::AtomicBool,
+    }
+
+    impl KeychainBackend for MockKeychain {
+        fn set(&self, team_id: &TeamId, xoxc: &str, d: &str) -> Result<()> {
+            let acct = keychain_account(team_id)?.to_owned();
+            self.ops.lock().unwrap().push(format!("set:{acct}"));
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(acct, (xoxc.to_owned(), d.to_owned()));
+            Ok(())
+        }
+
+        fn get(&self, team_id: &TeamId) -> Result<Option<(String, String)>> {
+            let acct = keychain_account(team_id)?.to_owned();
+            self.ops.lock().unwrap().push(format!("get:{acct}"));
+            Ok(self.entries.lock().unwrap().get(&acct).cloned())
+        }
+
+        fn delete(&self, team_id: &TeamId) -> Result<()> {
+            let acct = keychain_account(team_id)?.to_owned();
+            self.ops.lock().unwrap().push(format!("del:{acct}"));
+            if self.fail_delete.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(AuthError::Keychain("mock delete failure".into()));
+            }
+            self.entries.lock().unwrap().remove(&acct);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn keychain_save_blanks_disk_load_hydrates_tolerates_not_found_and_remove_deletes_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockKeychain::default());
+        let store = SessionStore::with_keychain(dir.path().join("sessions.json"), mock.clone());
+
+        let s1 = Session::new(
+            "https://a.slack.com/",
+            "T1",
+            "xoxc-secret1",
+            "xoxd-cookie1",
+            "U1",
+        );
+        let s2 = Session::new(
+            "https://b.slack.com/",
+            "T2",
+            "xoxc-secret2",
+            "xoxd-cookie2",
+            "U2",
+        );
+        store.save(&[s1.clone(), s2.clone()]).unwrap();
+
+        // Secrets must be blanked in the JSON file on disk.
+        let raw = std::fs::read_to_string(store.path()).unwrap();
+        assert!(!raw.contains("xoxc-secret1"), "token leaked to disk: {raw}");
+        assert!(
+            !raw.contains("xoxd-cookie1"),
+            "cookie leaked to disk: {raw}"
+        );
+        assert!(raw.contains("\"T1\""));
+
+        // `load()` hydrates blanked sessions from the keychain.
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded, vec![s1.clone(), s2.clone()]);
+
+        // Simulate ITEM_NOT_FOUND (`Ok(None)`) for T1: load succeeds without error, leaving T1 blank.
+        mock.entries.lock().unwrap().remove("T1");
+        let loaded_missing = store.load().unwrap();
+        assert!(!loaded_missing[0].has_secrets());
+        assert_eq!(loaded_missing[1], s2);
+
+        // If keychain delete fails during remove(), disk file is untouched (delete happens before save).
+        mock.fail_delete
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(
+            store.remove(&TeamId::from("T2")),
+            Err(AuthError::Keychain(_))
+        ));
+        assert!(
+            std::fs::read_to_string(store.path())
+                .unwrap()
+                .contains("\"T2\"")
+        );
+
+        // Re-enable delete: remove() deletes keychain entry before saving remaining sessions.
+        mock.fail_delete
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        mock.ops.lock().unwrap().clear();
+        assert!(store.remove(&TeamId::from("T2")).unwrap());
+        let ops = mock.ops.lock().unwrap().clone();
+        let del_pos = ops
+            .iter()
+            .position(|o| o == "del:T2")
+            .expect("del:T2 recorded");
+        let set_pos = ops
+            .iter()
+            .position(|o| o == "set:T1")
+            .expect("set:T1 recorded");
+        assert!(del_pos < set_pos, "delete must precede save: {ops:?}");
+        assert!(!mock.entries.lock().unwrap().contains_key("T2"));
+        assert!(
+            !std::fs::read_to_string(store.path())
+                .unwrap()
+                .contains("\"T2\"")
+        );
+    }
+
+    #[test]
+    fn creates_nested_dirs_sets_0600_perms_and_errors_on_corrupt_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("deep/nested/dir/sessions.json");
+        let store = SessionStore::with_path(&nested);
+        store
+            .save(&[Session::new("https://a.slack.com/", "T1", "x", "y", "U1")])
+            .unwrap();
+        assert!(nested.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "session file must be owner-only 0600");
+        }
+
+        std::fs::write(&nested, "{corrupt json").unwrap();
+        assert!(matches!(store.load(), Err(AuthError::Json(_))));
+    }
+
+    #[test]
+    fn keychain_account_validates_strictly_alphanumeric_ids() {
+        assert_eq!(
+            keychain_account(&TeamId::from("T0123ABC")).unwrap(),
+            "T0123ABC"
+        );
+        assert_eq!(keychain_account(&TeamId::from("E999")).unwrap(), "E999");
+
+        for bad in [
+            "",
+            " ",
+            "T1 T2",
+            "T1\nadd",
+            "T1\r",
+            "T1\"quote",
+            "-T1",
+            "T1_2",
+        ] {
+            assert!(
+                matches!(
+                    keychain_account(&TeamId::from(bad)),
+                    Err(AuthError::Keychain(_))
+                ),
+                "expected rejection for {bad:?}"
+            );
+        }
     }
 }

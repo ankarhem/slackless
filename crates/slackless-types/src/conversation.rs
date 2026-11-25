@@ -451,4 +451,134 @@ mod tests {
         });
         assert_eq!(merged.properties, Some(fresh));
     }
+
+    #[test]
+    fn kind_resolves_overlapping_flags_by_precedence() {
+        let im = Conversation {
+            is_im: true,
+            is_mpim: true,
+            is_private: true,
+            is_group: true,
+            is_channel: true,
+            ..Default::default()
+        };
+        assert_eq!(im.kind(), ConversationKind::Im);
+
+        let mpim = Conversation {
+            is_mpim: true,
+            is_private: true,
+            is_group: true,
+            is_channel: true,
+            ..Default::default()
+        };
+        assert_eq!(mpim.kind(), ConversationKind::Mpim);
+
+        let private_channel = Conversation {
+            is_private: true,
+            is_channel: true,
+            ..Default::default()
+        };
+        assert_eq!(private_channel.kind(), ConversationKind::PrivateChannel);
+
+        let legacy_group = Conversation {
+            is_group: true,
+            ..Default::default()
+        };
+        assert_eq!(legacy_group.kind(), ConversationKind::PrivateChannel);
+
+        let public_channel = Conversation {
+            is_channel: true,
+            ..Default::default()
+        };
+        assert_eq!(public_channel.kind(), ConversationKind::PublicChannel);
+        assert_eq!(
+            Conversation::default().kind(),
+            ConversationKind::PublicChannel
+        );
+    }
+
+    #[test]
+    fn merge_preserves_members_on_empty_fresh_and_overlays_extra_keys() {
+        let mut stored = Conversation {
+            id: ChannelId::from("C1"),
+            members: vec![UserId::from("U1"), UserId::from("U2")],
+            extra: Map::from_iter([
+                ("kept".to_owned(), serde_json::json!(1)),
+                ("overwritten".to_owned(), serde_json::json!("old")),
+            ]),
+            ..Default::default()
+        };
+        let fresh = Conversation {
+            id: ChannelId::from("C1"),
+            members: Vec::new(),
+            extra: Map::from_iter([
+                ("overwritten".to_owned(), serde_json::json!("new")),
+                ("added".to_owned(), serde_json::json!(true)),
+            ]),
+            ..Default::default()
+        };
+
+        stored.merge(&fresh);
+        assert_eq!(
+            stored.members,
+            vec![UserId::from("U1"), UserId::from("U2")],
+            "empty fresh members must not erase stored members"
+        );
+        assert_eq!(stored.extra.get("kept"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            stored.extra.get("overwritten"),
+            Some(&serde_json::json!("new"))
+        );
+        assert_eq!(stored.extra.get("added"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn latest_parses_bare_ts_numeric_ts_full_message_and_empty_object() {
+        let bare: Conversation = serde_json::from_value(serde_json::json!({
+            "id": "C1",
+            "latest": "1700000000.000100"
+        }))
+        .unwrap();
+        assert_eq!(bare.latest, Some(Latest::Ts(Ts::from("1700000000.000100"))));
+        assert_eq!(
+            bare.latest.as_ref().unwrap().ts().as_str(),
+            "1700000000.000100"
+        );
+
+        let numeric: Conversation = serde_json::from_value(serde_json::json!({
+            "id": "C1",
+            "latest": 1700000000
+        }))
+        .unwrap();
+        assert_eq!(numeric.latest, Some(Latest::Ts(Ts::from("1700000000"))));
+
+        let full_msg: Conversation = serde_json::from_value(serde_json::json!({
+            "id": "C1",
+            "latest": {
+                "type": "message",
+                "ts": "1700000000.000200",
+                "user": "U1",
+                "text": "hello"
+            }
+        }))
+        .unwrap();
+        match full_msg.latest.as_ref().unwrap() {
+            Latest::Message(m) => {
+                assert_eq!(m.ts.as_str(), "1700000000.000200");
+                assert_eq!(m.text, "hello");
+            }
+            other => panic!("expected Latest::Message, got {other:?}"),
+        }
+        assert_eq!(
+            full_msg.latest.as_ref().unwrap().ts().as_str(),
+            "1700000000.000200"
+        );
+
+        let empty_obj: Conversation = serde_json::from_value(serde_json::json!({
+            "id": "C1",
+            "latest": {}
+        }))
+        .unwrap();
+        assert_eq!(empty_obj.latest, None);
+    }
 }

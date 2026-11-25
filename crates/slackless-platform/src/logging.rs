@@ -66,12 +66,11 @@ pub fn default_log_path() -> PathBuf {
 }
 
 fn parse_level_env() -> Option<Level> {
-    match std::env::var("SLACKLESS_LOG")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    parse_level_str(&std::env::var("SLACKLESS_LOG").unwrap_or_default())
+}
+
+fn parse_level_str(raw: &str) -> Option<Level> {
+    match raw.trim().to_ascii_lowercase().as_str() {
         "trace" => Some(Level::TRACE),
         "debug" => Some(Level::DEBUG),
         "info" => Some(Level::INFO),
@@ -79,6 +78,17 @@ fn parse_level_env() -> Option<Level> {
         "error" => Some(Level::ERROR),
         "off" => None,
         _ => Some(Level::INFO),
+    }
+}
+
+fn log_max_level(app_max: Option<Level>) -> log::LevelFilter {
+    match app_max {
+        Some(Level::TRACE) => log::LevelFilter::Trace,
+        Some(Level::DEBUG) => log::LevelFilter::Debug,
+        Some(Level::INFO) => log::LevelFilter::Info,
+        Some(Level::WARN) => log::LevelFilter::Warn,
+        Some(Level::ERROR) => log::LevelFilter::Error,
+        None => log::LevelFilter::Off,
     }
 }
 
@@ -119,11 +129,12 @@ fn target_allowed(target: &str, level: Level, app_max: Option<Level>) -> bool {
         level <= app_max
     } else {
         // Keep external crate noise (webrtc, gpui, hyper, cpal) to warnings and errors unless
-        // the user explicitly asked for trace logging.
+        // the user explicitly asked for trace logging, and clamp to `app_max` when stricter
+        // (e.g. `SLACKLESS_LOG=error`).
         let ext_max = if app_max == Level::TRACE {
             Level::DEBUG
         } else {
-            Level::WARN
+            Level::WARN.min(app_max)
         };
         level <= ext_max
     }
@@ -359,15 +370,7 @@ pub fn init_file_logging(app_name: &str) -> Option<PathBuf> {
         app_max,
     };
     if log::set_boxed_logger(Box::new(bridge)).is_ok() {
-        let log_max = match app_max {
-            Some(Level::TRACE) => log::LevelFilter::Trace,
-            Some(Level::DEBUG) => log::LevelFilter::Debug,
-            Some(Level::INFO) => log::LevelFilter::Info,
-            Some(Level::WARN) => log::LevelFilter::Warn,
-            Some(Level::ERROR) => log::LevelFilter::Error,
-            None => log::LevelFilter::Off,
-        };
-        log::set_max_level(log_max.max(log::LevelFilter::Warn));
+        log::set_max_level(log_max_level(app_max));
     }
 
     // Chain onto the existing panic hook so panics are always captured in the log file.
@@ -442,5 +445,164 @@ mod tests {
             backup_path(Path::new("/tmp/slackless.log")),
             PathBuf::from("/tmp/slackless.log.1")
         );
+    }
+
+    #[test]
+    fn target_filter_clamps_external_warn_when_app_max_is_error_or_off() {
+        // When app_max is ERROR, external WARN must be suppressed while ERROR still passes.
+        assert!(!target_allowed(
+            "webrtc_ice::agent",
+            Level::WARN,
+            Some(Level::ERROR)
+        ));
+        assert!(target_allowed(
+            "webrtc_ice::agent",
+            Level::ERROR,
+            Some(Level::ERROR)
+        ));
+        assert!(!target_allowed("webrtc_ice::agent", Level::WARN, None));
+        assert!(!target_allowed("webrtc_ice::agent", Level::ERROR, None));
+
+        // When app_max is TRACE, external DEBUG is allowed but TRACE is still filtered.
+        assert!(target_allowed(
+            "webrtc_ice::agent",
+            Level::DEBUG,
+            Some(Level::TRACE)
+        ));
+        assert!(!target_allowed(
+            "webrtc_ice::agent",
+            Level::TRACE,
+            Some(Level::TRACE)
+        ));
+
+        assert_eq!(log_max_level(None), log::LevelFilter::Off);
+        assert_eq!(log_max_level(Some(Level::ERROR)), log::LevelFilter::Error);
+        assert_eq!(log_max_level(Some(Level::WARN)), log::LevelFilter::Warn);
+        assert_eq!(log_max_level(Some(Level::INFO)), log::LevelFilter::Info);
+        assert_eq!(log_max_level(Some(Level::DEBUG)), log::LevelFilter::Debug);
+        assert_eq!(log_max_level(Some(Level::TRACE)), log::LevelFilter::Trace);
+    }
+
+    #[test]
+    fn parse_level_str_handles_all_levels_case_and_defaults() {
+        assert_eq!(parse_level_str("trace"), Some(Level::TRACE));
+        assert_eq!(parse_level_str(" DEBUG "), Some(Level::DEBUG));
+        assert_eq!(parse_level_str("info"), Some(Level::INFO));
+        assert_eq!(parse_level_str("warn"), Some(Level::WARN));
+        assert_eq!(parse_level_str("WARNING"), Some(Level::WARN));
+        assert_eq!(parse_level_str("error"), Some(Level::ERROR));
+        assert_eq!(parse_level_str("off"), None);
+        assert_eq!(parse_level_str("OFF"), None);
+        assert_eq!(parse_level_str(""), Some(Level::INFO));
+        assert_eq!(parse_level_str("unknown"), Some(Level::INFO));
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "slackless-platform-logtest-{label}-{}-{n}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn rolling_writer_creates_dirs_rotates_on_open_and_write_and_overwrites_backup() {
+        let tmp = TempDir::new("rotate");
+        let log_path = tmp.0.join("nested/dir/slackless.log");
+        let bak_path = backup_path(&log_path);
+
+        // 1. Creates missing parent directories and rotates on write once >= 5 MiB.
+        let writer = RollingWriter::open(log_path.clone()).unwrap();
+        assert!(log_path.exists());
+        let big_line = format!("{}\n", "A".repeat(MAX_LOG_BYTES as usize));
+        writer.write_line(&big_line);
+        assert!(!bak_path.exists(), "rotation happens on the next write");
+
+        writer.write_line("after-first-rotation\n");
+        assert!(bak_path.exists());
+        assert_eq!(
+            fs::metadata(&bak_path).unwrap().len(),
+            big_line.len() as u64
+        );
+        assert_eq!(
+            fs::read_to_string(&log_path).unwrap(),
+            "after-first-rotation\n"
+        );
+
+        // 2. Second rotation overwrites `.1`.
+        let big_b = format!("{}\n", "B".repeat(MAX_LOG_BYTES as usize));
+        writer.write_line(&big_b);
+        writer.write_line("after-second-rotation\n");
+        let bak_prefix = &fs::read(&bak_path).unwrap()[..32];
+        assert!(
+            bak_prefix.starts_with(b"after-first-rotation\nBBB"),
+            "second rotation should overwrite .1"
+        );
+        assert_eq!(
+            fs::read_to_string(&log_path).unwrap(),
+            "after-second-rotation\n"
+        );
+        drop(writer);
+
+        // 3. Rotation on `open()` when existing active file is already >= 5 MiB.
+        fs::write(&log_path, vec![b'C'; MAX_LOG_BYTES as usize]).unwrap();
+        let reopened = RollingWriter::open(log_path.clone()).unwrap();
+        reopened.write_line("fresh-after-open\n");
+        assert_eq!(fs::metadata(&bak_path).unwrap().len(), MAX_LOG_BYTES);
+        assert_eq!(fs::read(&bak_path).unwrap()[0], b'C');
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), "fresh-after-open\n");
+    }
+
+    #[test]
+    fn field_formatter_and_file_subscriber_format_all_value_types() {
+        let tmp = TempDir::new("fmt");
+        let log_path = tmp.0.join("events.log");
+        let writer = Arc::new(RollingWriter::open(log_path.clone()).unwrap());
+        let subscriber = FileSubscriber {
+            writer: Arc::clone(&writer),
+            app_max: Some(Level::DEBUG),
+            next_span_id: AtomicU64::new(1),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "slackless_test", "plain message");
+            tracing::info!(
+                target: "slackless_test",
+                s = "hello",
+                i = -5_i64,
+                u = 42_u64,
+                b = true,
+                f = 1.5_f64,
+                dbg = ?vec![1, 2],
+                "with fields"
+            );
+            tracing::info!(target: "slackless_test", only_field = "v");
+            // External info must be filtered out while external warn is written.
+            tracing::info!(target: "external_crate", "muted info");
+            tracing::warn!(target: "external_crate", "kept warn");
+        });
+
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert!(content.contains("[INFO ] slackless_test: plain message\n"));
+        assert!(content.contains(
+            "[INFO ] slackless_test: with fields | s=hello i=-5 u=42 b=true f=1.5 dbg=[1, 2]\n"
+        ));
+        assert!(content.contains("[INFO ] slackless_test: only_field=v\n"));
+        assert!(!content.contains("muted info"));
+        assert!(content.contains("[WARN ] external_crate: kept warn\n"));
     }
 }

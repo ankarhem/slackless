@@ -110,9 +110,14 @@ impl Ord for Ts {
     fn cmp(&self, other: &Self) -> Ordering {
         let (a_secs, a_frac) = self.split();
         let (b_secs, b_frac) = other.split();
+        // Order non-numeric strings (including the `""` sentinel for unedited revisions)
+        // consistently before numeric-parsed seconds so `Ord` is strictly transitive across
+        // mixed strings while preserving `Ts("") < Ts("<epoch>")`.
         let secs = match (a_secs.parse::<u64>(), b_secs.parse::<u64>()) {
             (Ok(a), Ok(b)) => a.cmp(&b),
-            _ => a_secs.cmp(b_secs),
+            (Err(_), Ok(_)) => Ordering::Less,
+            (Ok(_), Err(_)) => Ordering::Greater,
+            (Err(_), Err(_)) => a_secs.cmp(b_secs),
         };
         // Comparing fractional digit strings lexicographically, trailing zeros stripped, is
         // decimal-fraction order. The raw-string tiebreak keeps Ord consistent with Eq.
@@ -215,5 +220,72 @@ mod tests {
             "\"C1\""
         );
         assert_eq!(serde_json::to_string(&Ts::from("1.2")).unwrap(), "\"1.2\"");
+    }
+
+    #[test]
+    fn ts_ord_is_strictly_transitive_across_mixed_strings() {
+        let samples: Vec<Ts> = [
+            "",
+            "0",
+            "0.0",
+            "01.5",
+            "1.5",
+            "2",
+            "2.5",
+            "10",
+            "10.0",
+            "10.00",
+            "10a",
+            "2a",
+            "-1",
+            "abc",
+            "999999999.9",
+            "1700000000.0001",
+            "1700000000.000100",
+        ]
+        .into_iter()
+        .map(Ts::from)
+        .collect();
+
+        for a in &samples {
+            assert_eq!(a.cmp(a), Ordering::Equal);
+            for b in &samples {
+                assert_eq!(a.cmp(b), b.cmp(a).reverse(), "antisymmetry for {a} vs {b}");
+                assert_eq!(a == b, a.cmp(b) == Ordering::Equal, "Ord/Eq for {a} vs {b}");
+                for c in &samples {
+                    if a <= b && b <= c {
+                        assert!(
+                            a <= c,
+                            "transitivity violated: {a:?} <= {b:?} <= {c:?}, but {a:?} > {c:?}"
+                        );
+                    }
+                    if a < b && b < c {
+                        assert!(a < c, "strict transitivity violated: {a:?} < {b:?} < {c:?}");
+                    }
+                }
+            }
+        }
+        // Non-numeric strings (including the empty `""` original-revision sentinel) sort
+        // strictly before numeric timestamps, preserving both transitivity and revision order.
+        assert!(Ts::from("") < Ts::from("0"));
+        assert!(Ts::from("") < Ts::from("1700000000.000100"));
+        assert!(Ts::from("10a") < Ts::from("2"));
+        assert!(Ts::from("2") < Ts::from("10"));
+        assert!(Ts::from("10a") < Ts::from("10"));
+    }
+
+    #[test]
+    fn ts_deserializes_f64_negative_i64_and_malformed_secs() {
+        let from_float: Ts = serde_json::from_str("1700000000.125").unwrap();
+        assert_eq!(from_float, Ts::from("1700000000.125000"));
+        assert_eq!(from_float.secs(), Some(1_700_000_000));
+
+        let from_neg: Ts = serde_json::from_str("-42").unwrap();
+        assert_eq!(from_neg, Ts::from("-42"));
+        assert_eq!(from_neg.secs(), Some(-42));
+
+        assert_eq!(Ts::from("").secs(), None);
+        assert_eq!(Ts::from("not-a-ts.123").secs(), None);
+        assert_eq!(Ts::from("10a.000001").secs(), None);
     }
 }

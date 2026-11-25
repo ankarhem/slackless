@@ -1050,3 +1050,851 @@ async fn upload_files_runs_get_url_raw_post_and_complete_external() {
     assert_eq!(uploaded.len(), 1);
     assert_eq!(uploaded[0].id.as_str(), "F09UP1");
 }
+
+#[tokio::test]
+async fn rooms_join_validates_chime_credentials_and_fallbacks() {
+    let ch = ChannelId::from("C1");
+
+    // 1. Missing `call` block
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/rooms.join"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+        let err = api.rooms_join(&ch, None, None).await.unwrap_err();
+        assert!(
+            matches!(err, ApiError::UnsupportedHuddleBackend(_)),
+            "{err:?}"
+        );
+    }
+
+    // 2. Non-free_willy media_backend_type
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/rooms.join"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "call": {
+                    "call_id": "R1",
+                    "huddle": { "id": "R1", "media_backend_type": "screenhero" }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let err = api.rooms_join(&ch, None, None).await.unwrap_err();
+        assert!(
+            matches!(&err, ApiError::UnsupportedHuddleBackend(msg) if msg == "screenhero"),
+            "{err:?}"
+        );
+    }
+
+    // 3. Missing free_willy credentials
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/rooms.join"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "call": {
+                    "call_id": "R1",
+                    "huddle": { "id": "R1", "media_backend_type": "free_willy" }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let err = api.rooms_join(&ch, None, None).await.unwrap_err();
+        assert!(
+            matches!(err, ApiError::UnsupportedHuddleBackend(_)),
+            "{err:?}"
+        );
+    }
+
+    // 4. Empty SignalingUrl or JoinToken
+    for (sig, tok) in [("", "tok-1"), ("wss://signal.chime.aws/x", "")] {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/rooms.join"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "call": {
+                    "call_id": "R1",
+                    "free_willy": {
+                        "attendee": { "JoinToken": tok },
+                        "meeting": { "MediaPlacement": { "SignalingUrl": sig } }
+                    },
+                    "huddle": { "id": "R1", "media_backend_type": "free_willy" }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let err = api.rooms_join(&ch, None, None).await.unwrap_err();
+        assert!(
+            matches!(err, ApiError::UnsupportedHuddleBackend(_)),
+            "{err:?}"
+        );
+    }
+
+    // 5. Empty call_id falls back to call.huddle.id, passes thread_ts & regions
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/rooms.join"))
+            .and(body_string_contains("thread_ts=1700000000.000100"))
+            .and(body_string_contains("regions=eu-central-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "call": {
+                    "call_id": "",
+                    "free_willy": {
+                        "attendee": { "AttendeeId": "a1", "JoinToken": "tok-ok" },
+                        "meeting": {
+                            "MeetingId": "m1",
+                            "MediaPlacement": { "SignalingUrl": "wss://signal.chime.aws/ok" }
+                        }
+                    },
+                    "huddle": {
+                        "id": "R_FALLBACK",
+                        "media_backend_type": "free_willy",
+                        "participants": ["U1"]
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let joined = api
+            .rooms_join(
+                &ch,
+                Some(&Ts::from("1700000000.000100")),
+                Some("eu-central-1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(joined.call_id, "R_FALLBACK");
+        assert_eq!(joined.chime.attendee.join_token, "tok-ok");
+    }
+}
+
+#[tokio::test]
+async fn slack_lists_dual_endpoint_fallbacks_work() {
+    use slackless_api::{ListCellInput, ListCellInputValue, SlackListCellValue};
+
+    let (server, api) = setup().await;
+
+    // fetch_list: files.info has no schema, lists.records.list fails -> falls back to
+    // slackLists.items.list and backfills title/description/columns from `list`.
+    Mock::given(method("POST"))
+        .and(path("/api/files.info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "file": { "id": "F_LIST" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/lists.records.list"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "unknown_method"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/slackLists.items.list"))
+        .and(body_string_contains("include_list=true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "list": {
+                "title": "Backfilled Title",
+                "list_metadata": {
+                    "description": "From items.list",
+                    "schema": [
+                        { "id": "Col1", "key": "name", "name": "Task", "type": "text", "is_primary_column": true }
+                    ]
+                }
+            },
+            "items": [
+                {
+                    "id": "It1",
+                    "fields": [{ "column_id": "Col1", "key": "name", "text": "Fallback item" }]
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let data = api.fetch_list("F_LIST").await.unwrap();
+    assert_eq!(data.title, "Backfilled Title");
+    assert_eq!(data.description, "From items.list");
+    assert_eq!(data.columns.len(), 1);
+    assert_eq!(data.rows.len(), 1);
+    assert_eq!(
+        data.rows[0].cells.get("Col1"),
+        Some(&SlackListCellValue::Text("Fallback item".into()))
+    );
+
+    // lists_records_create: private endpoint fails -> falls back to slackLists.items.create
+    // and renames `parent_record_id` -> `parent_item_id`.
+    Mock::given(method("POST"))
+        .and(path("/api/lists.records.create"))
+        .and(body_string_contains("parent_record_id=RecParent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "unknown_method"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/slackLists.items.create"))
+        .and(body_string_contains("parent_item_id=RecParent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "item": {
+                "id": "ItNew",
+                "fields": [{ "column_id": "Col1", "text": "Created via fallback" }]
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let created = api
+        .lists_records_create(
+            "F_LIST",
+            &[ListCellInput {
+                column_id: "Col1".into(),
+                value: ListCellInputValue::Text("Created via fallback".into()),
+            }],
+            Some("RecParent"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.id, "ItNew");
+    assert_eq!(
+        created.cells.get("Col1"),
+        Some(&SlackListCellValue::Text("Created via fallback".into()))
+    );
+
+    // lists_cells_update fallback -> slackLists.items.update
+    Mock::given(method("POST"))
+        .and(path("/api/lists.cells.update"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "unknown_method"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/slackLists.items.update"))
+        .and(body_string_contains("list_id=F_LIST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    api.lists_cells_update(
+        "F_LIST",
+        "ItNew",
+        &[ListCellInput {
+            column_id: "Col2".into(),
+            value: ListCellInputValue::Checkbox(true),
+        }],
+    )
+    .await
+    .unwrap();
+
+    // lists_records_delete fallback -> slackLists.items.delete
+    Mock::given(method("POST"))
+        .and(path("/api/lists.records.delete"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "unknown_method"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/slackLists.items.delete"))
+        .and(body_string_contains("id=ItNew"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    api.lists_records_delete("F_LIST", "ItNew").await.unwrap();
+}
+
+#[tokio::test]
+async fn http_error_truncation_decode_auth_expired_and_download_edge_cases() {
+    // 1. Non-2xx HTML body -> ApiError::Status truncated to 512 chars
+    {
+        let (server, api) = setup().await;
+        let long_html = format!("<html>{}</html>", "x".repeat(700));
+        Mock::given(method("POST"))
+            .and(path("/api/auth.test"))
+            .respond_with(ResponseTemplate::new(502).set_body_raw(long_html, "text/html"))
+            .mount(&server)
+            .await;
+
+        let err = api.auth_test().await.unwrap_err();
+        match err {
+            ApiError::Status { status, body } => {
+                assert_eq!(status, 502);
+                assert_eq!(body.chars().count(), 512);
+                assert!(body.starts_with("<html>"));
+            }
+            other => panic!("expected ApiError::Status, got {other:?}"),
+        }
+    }
+
+    // 2. 200 invalid JSON -> ApiError::Decode
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth.test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{not json"))
+            .mount(&server)
+            .await;
+        let err = api.auth_test().await.unwrap_err();
+        assert!(matches!(err, ApiError::Decode(_)), "{err:?}");
+    }
+
+    // 3. download_file non-2xx -> ApiError::Status, mixed-case Text/HTML -> FileAuthRejected
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/files/missing.png"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files/signin.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("<html>login</html>", "Text/HTML; charset=UTF-8"),
+            )
+            .mount(&server)
+            .await;
+
+        let err = api
+            .download_file(&format!("{}/files/missing.png", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Status { status: 404, ref body } if body == "not found"),
+            "{err:?}"
+        );
+
+        let err = api
+            .download_file(&format!("{}/files/signin.png", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::FileAuthRejected), "{err:?}");
+    }
+
+    // 4. All AUTH_EXPIRED_ERRORS map to AuthExpired, and missing `error` maps to "unknown_error"
+    for code in [
+        "invalid_auth",
+        "not_authed",
+        "token_revoked",
+        "token_expired",
+        "account_inactive",
+    ] {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth.test"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": code})),
+            )
+            .mount(&server)
+            .await;
+        let err = api.auth_test().await.unwrap_err();
+        assert!(
+            matches!(&err, ApiError::AuthExpired(e) if e == code),
+            "expected AuthExpired({code}), got {err:?}"
+        );
+    }
+
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth.test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": false})))
+            .mount(&server)
+            .await;
+        let err = api.auth_test().await.unwrap_err();
+        assert!(
+            matches!(&err, ApiError::Slack(e) if e == "unknown_error"),
+            "{err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn users_set_photo_multipart_framing_sanitization_mime_and_errors() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/users.setPhoto"))
+        .and(header("cookie", COOKIE_HEADER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .expect(5)
+        .mount(&server)
+        .await;
+
+    let cases = [
+        ("bad\"\r\nname.jpg", "bad___name.jpg", "image/jpeg"),
+        ("pic.JPEG", "pic.JPEG", "image/jpeg"),
+        ("anim.gif", "anim.gif", "image/gif"),
+        ("shot.webp", "shot.webp", "image/webp"),
+        ("avatar.bin", "avatar.bin", "image/png"),
+    ];
+    for (filename, _, _) in &cases {
+        api.users_set_photo(filename, b"\x89PNGDATA").await.unwrap();
+    }
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), cases.len());
+    for (req, (_, safe_name, expected_mime)) in requests.iter().zip(cases.iter()) {
+        let ct = req.headers.get("content-type").unwrap().to_str().unwrap();
+        assert!(
+            ct.starts_with("multipart/form-data; boundary="),
+            "unexpected content-type: {ct}"
+        );
+        let body = String::from_utf8_lossy(&req.body);
+        assert!(body.contains("name=\"token\"\r\n\r\nxoxc-1-2-3-deadbeef\r\n"));
+        assert!(
+            body.contains(&format!("name=\"image\"; filename=\"{safe_name}\"")),
+            "body did not sanitize filename {safe_name}: {body}"
+        );
+        assert!(
+            body.contains(&format!("Content-Type: {expected_mime}\r\n\r\n")),
+            "body missing MIME {expected_mime}: {body}"
+        );
+        assert!(
+            req.body
+                .windows(b"\x89PNGDATA".len())
+                .any(|w| w == b"\x89PNGDATA"),
+            "raw binary payload must be preserved verbatim"
+        );
+    }
+
+    // Error decoding on users.setPhoto (Slack error, non-2xx status, 200 bad JSON)
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/users.setPhoto"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"ok": false, "error": "bad_image"})),
+            )
+            .mount(&server)
+            .await;
+        let err = api.users_set_photo("a.png", b"x").await.unwrap_err();
+        assert!(
+            matches!(err, ApiError::Slack(ref e) if e == "bad_image"),
+            "{err:?}"
+        );
+    }
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/users.setPhoto"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("server boom"))
+            .mount(&server)
+            .await;
+        let err = api.users_set_photo("a.png", b"x").await.unwrap_err();
+        assert!(
+            matches!(err, ApiError::Status { status: 500, .. }),
+            "{err:?}"
+        );
+    }
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/users.setPhoto"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+            .mount(&server)
+            .await;
+        let err = api.users_set_photo("a.png", b"x").await.unwrap_err();
+        assert!(matches!(err, ApiError::Decode(_)), "{err:?}");
+    }
+}
+
+#[tokio::test]
+async fn messages_list_chunks_into_batches_of_eight_channels() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/messages.list"))
+        .respond_with(|req: &Request| {
+            let pairs = form(req);
+            let raw = field(&pairs, "message_ids").unwrap();
+            let list: Vec<serde_json::Value> = serde_json::from_str(raw).unwrap();
+            let mut data = serde_json::Map::new();
+            for entry in list {
+                let ch = entry["channel"].as_str().unwrap().to_owned();
+                let ts = entry["timestamps"][0].as_str().unwrap().to_owned();
+                data.insert(
+                    ch.clone(),
+                    json!({ "messages": [{ "ts": ts, "text": format!("msg-{ch}") }] }),
+                );
+            }
+            ResponseTemplate::new(200).set_body_json(json!({ "ok": true, "messages_data": data }))
+        })
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let ids: Vec<(ChannelId, Vec<Ts>)> = (0..17)
+        .map(|i| {
+            (
+                ChannelId::from(format!("C{i}")),
+                vec![Ts::from(format!("1.{i:06}"))],
+            )
+        })
+        .collect();
+    let result = api.messages_list(&ids).await.unwrap();
+    assert_eq!(result.len(), 17);
+    assert_eq!(result[&ChannelId::from("C16")][0].text, "msg-C16");
+
+    let requests = server.received_requests().await.unwrap();
+    let sizes: Vec<usize> = requests
+        .iter()
+        .map(|r| {
+            let pairs = form(r);
+            let arr: Vec<serde_json::Value> =
+                serde_json::from_str(field(&pairs, "message_ids").unwrap()).unwrap();
+            arr.len()
+        })
+        .collect();
+    assert_eq!(sizes, vec![8, 8, 1]);
+}
+
+#[tokio::test]
+async fn dnd_team_info_chunks_by_fifty_and_skips_empty_input() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/dnd.teamInfo"))
+        .respond_with(|req: &Request| {
+            let pairs = form(req);
+            let csv = field(&pairs, "users").unwrap();
+            let mut users = serde_json::Map::new();
+            for u in csv.split(',') {
+                users.insert(u.to_owned(), json!({ "dnd_enabled": true }));
+            }
+            ResponseTemplate::new(200).set_body_json(json!({ "ok": true, "users": users }))
+        })
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    // Empty input must make zero HTTP requests.
+    assert!(api.dnd_team_info(&[]).await.unwrap().is_empty());
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    let ids: Vec<UserId> = (0..105).map(|i| UserId::from(format!("U{i}"))).collect();
+    let res = api.dnd_team_info(&ids).await.unwrap();
+    assert_eq!(res.len(), 105);
+
+    let requests = server.received_requests().await.unwrap();
+    let batch_counts: Vec<usize> = requests
+        .iter()
+        .map(|r| {
+            let pairs = form(r);
+            field(&pairs, "users").unwrap().split(',').count()
+        })
+        .collect();
+    assert_eq!(batch_counts, vec![50, 50, 5]);
+}
+
+#[tokio::test]
+async fn edge_channels_and_users_search_use_edge_base_and_mark_membership() {
+    use slackless_api::types::TeamId;
+
+    let server = MockServer::start().await;
+    let api = SlackApi::new(&format!("{}/api/", server.uri()), TOKEN, COOKIE)
+        .unwrap()
+        .with_edge_base(&format!("{}/cache", server.uri()))
+        .unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/cache/T1/channels/search"))
+        .and(header("cookie", COOKIE_HEADER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "member_channels": ["C_JOINED"],
+            "results": [
+                { "id": "C_JOINED", "name": "general", "is_member": false },
+                { "id": "C_OTHER", "name": "random", "is_member": false }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/cache/T1/users/search"))
+        .and(header("cookie", COOKIE_HEADER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "results": [{ "id": "U1", "name": "alice" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let channels = api
+        .edge_channels_search(&TeamId::from("T1"), "gen", 10)
+        .await
+        .unwrap();
+    assert_eq!(channels.len(), 2);
+    assert!(
+        channels[0].is_member,
+        "member_channels marks is_member=true"
+    );
+    assert!(!channels[1].is_member);
+
+    let users = api
+        .edge_users_search(&TeamId::from("T1"), "ali", 10)
+        .await
+        .unwrap();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].id.as_str(), "U1");
+
+    let reqs = server.received_requests().await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(payload["token"], TOKEN);
+    assert_eq!(reqs[0].url.query(), Some("_x_app_name=client"));
+}
+
+#[tokio::test]
+async fn blocks_suggestions_upload_errors_canvas_html_workflows_and_asset_client() {
+    use slackless_api::types::BotId;
+    use slackless_api::{ActionContainer, AssetClient, UploadFile};
+
+    // 1. blocks_suggestions merges flat options and option_groups (object + string text)
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/blocks.suggestions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "options": [
+                    { "text": { "type": "plain_text", "text": "Opt A" }, "value": "a" },
+                    { "text": "Opt B", "value": "b" }
+                ],
+                "option_groups": [
+                    {
+                        "label": { "type": "plain_text", "text": "Group" },
+                        "options": [
+                            { "text": { "type": "plain_text", "text": "Opt C" }, "value": "c" }
+                        ]
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let container = ActionContainer {
+            channel: ChannelId::from("C1"),
+            message_ts: Ts::from("1.0"),
+            attachment_id: None,
+            is_ephemeral: false,
+            view_id: None,
+        };
+        let opts = api
+            .blocks_suggestions(
+                &BotId::from("B1"),
+                "A1",
+                &slackless_api::types::TeamId::from("T1"),
+                "act",
+                "blk",
+                "query",
+                &container,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            opts,
+            vec![
+                ("Opt A".to_owned(), "a".to_owned()),
+                ("Opt B".to_owned(), "b".to_owned()),
+                ("Opt C".to_owned(), "c".to_owned()),
+            ]
+        );
+    }
+
+    // 2. upload_files empty-file & mid-flow error
+    {
+        let (server, api) = setup().await;
+        let err = api
+            .upload_files(
+                &ChannelId::from("C1"),
+                None,
+                None,
+                &[UploadFile {
+                    filename: "empty.txt".into(),
+                    bytes: Vec::new(),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Slack(ref e) if e == "empty_file"),
+            "{err:?}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        let upload_url = format!("{}/upload/fail", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/api/files.getUploadURLExternal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "file_id": "F1",
+                "upload_url": upload_url
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/upload/fail"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upload failed"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/files.completeUploadExternal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let err = api
+            .upload_files(
+                &ChannelId::from("C1"),
+                None,
+                None,
+                &[UploadFile {
+                    filename: "a.txt".into(),
+                    bytes: b"abc".to_vec(),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Status { status: 500, .. }),
+            "{err:?}"
+        );
+    }
+
+    // 3. fetch_canvas_html fallback (name + url_private_download, and missing URL error)
+    {
+        let (server, api) = setup().await;
+        let dl_url = format!("{}/files-pri/T1-FC1/canvas.html", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/api/files.info"))
+            .and(body_string_contains("file=FC1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "file": {
+                    "id": "FC1",
+                    "title": "",
+                    "name": "Fallback Name",
+                    "url_private_download": dl_url
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files-pri/T1-FC1/canvas.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("<main>canvas body</main>", "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/files.info"))
+            .and(body_string_contains("file=FC_NO_URL"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "file": { "id": "FC_NO_URL" }
+            })))
+            .mount(&server)
+            .await;
+
+        let (title, html) = api.fetch_canvas_html("FC1").await.unwrap();
+        assert_eq!(title, "Fallback Name");
+        assert_eq!(html, "<main>canvas body</main>");
+
+        let err = api.fetch_canvas_html("FC_NO_URL").await.unwrap_err();
+        assert!(
+            matches!(err, ApiError::Slack(ref e) if e == "canvas_no_private_url"),
+            "{err:?}"
+        );
+    }
+
+    // 4. workflows_triggers_trip rejects non-HTTPS and sends HTTPS
+    {
+        let (server, api) = setup().await;
+        let err = api
+            .workflows_triggers_trip("http://slack.com/shortcuts/Ft1", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::UntrustedUrl(_)), "{err:?}");
+
+        Mock::given(method("POST"))
+            .and(path("/api/workflows.triggers.trip"))
+            .and(body_string_contains("Ft123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        api.workflows_triggers_trip("https://slack.com/shortcuts/Ft123", &json!({"a": 1}))
+            .await
+            .unwrap();
+    }
+
+    // 5. AssetClient::get
+    {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/avatar.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PNG!".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/404.png"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AssetClient::new();
+        let bytes = client
+            .get(&format!("{}/avatar.png", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"PNG!");
+        let reqs = server.received_requests().await.unwrap();
+        assert!(reqs[0].headers.get("cookie").is_none());
+
+        let err = client
+            .get(&format!("{}/404.png", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Status { status: 404, .. }),
+            "{err:?}"
+        );
+    }
+}

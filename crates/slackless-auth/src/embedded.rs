@@ -107,13 +107,21 @@ fn team_workspace_url(team: &Value) -> Option<String> {
         .map(domain_url)
 }
 
-/// `acme` -> `https://acme.slack.com/`; a full host (`acme.enterprise.slack.com`) is kept.
+/// `acme` -> `https://acme.slack.com/`; Grid `acme.enterprise` -> `https://acme.enterprise.slack.com/`;
+/// a full `*.slack.com` host (`acme.enterprise.slack.com`) is kept.
 fn domain_url(domain: &str) -> String {
-    if domain.contains('.') {
+    if domain.ends_with(".slack.com") {
         format!("https://{domain}/")
     } else {
         format!("https://{domain}.slack.com/")
     }
+}
+
+/// Whether a cookie `domain` belongs to Slack (`slack.com` or any subdomain like `.slack.com`).
+#[cfg(any(test, feature = "webview"))]
+fn is_slack_cookie_domain(domain: &str) -> bool {
+    let d = domain.to_ascii_lowercase();
+    d == "slack.com" || d.ends_with(".slack.com")
 }
 
 /// Posts the page's `localConfig_v2` to the host once it holds a token. Re-posts every second
@@ -154,11 +162,11 @@ fn user_agent() -> String {
     )
 }
 
-/// The `<string>` value of `key` in an XML property list.
-#[cfg(feature = "webview")]
+/// The `<string>` value immediately following `key` in an XML property list.
+#[cfg(any(test, feature = "webview"))]
 fn plist_string(plist: &str, key: &str) -> Option<String> {
     let (_, after) = plist.split_once(&format!("<key>{key}</key>"))?;
-    let (_, value) = after.split_once("<string>")?;
+    let value = after.trim_start().strip_prefix("<string>")?;
     let (value, _) = value.split_once("</string>")?;
     Some(value.trim().to_owned())
 }
@@ -232,7 +240,7 @@ pub fn embedded_sign_in(request: SignInRequest) -> Result<Vec<Session>> {
                     .into_iter()
                     .find(|cookie| {
                         cookie.name() == "d"
-                            && cookie.domain().is_some_and(|d| d.ends_with("slack.com"))
+                            && cookie.domain().is_some_and(is_slack_cookie_domain)
                     })
                     .map(|cookie| cookie.value().to_owned());
                 let Some(d_cookie) = d_cookie else {
@@ -338,15 +346,55 @@ mod tests {
         assert_eq!(url(Some("")), "https://app.slack.com/signin");
         assert_eq!(url(Some("acme")), "https://acme.slack.com/");
         assert_eq!(
+            url(Some("acme.enterprise")),
+            "https://acme.enterprise.slack.com/"
+        );
+        assert_eq!(
             url(Some("acme.enterprise.slack.com")),
             "https://acme.enterprise.slack.com/"
         );
     }
 
-    #[cfg(feature = "webview")]
     #[test]
-    fn reads_a_plist_string_value() {
+    fn capture_sessions_handles_empty_url_fallback_empty_cookie_and_non_object_entries() {
+        let json = r#"{
+            "teams": {
+                "T1": { "token": "xoxc-1", "url": "", "domain": "acme.enterprise", "user_id": "U1" },
+                "T_STR": "not-an-object",
+                "T_NUM": 123,
+                "T_NULL": null
+            }
+        }"#;
+        let cap = WebviewCapture {
+            local_config_v2: json.to_owned(),
+            d_cookie: String::new(),
+        };
+        let sessions = capture_sessions(&cap).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].team_id.as_str(), "T1");
+        assert_eq!(
+            sessions[0].workspace_url,
+            "https://acme.enterprise.slack.com/"
+        );
+        assert_eq!(sessions[0].d_cookie, "");
+        assert!(!sessions[0].has_secrets());
+    }
+
+    #[test]
+    fn cookie_domain_matching_rejects_lookalike_hosts() {
+        assert!(is_slack_cookie_domain("slack.com"));
+        assert!(is_slack_cookie_domain(".slack.com"));
+        assert!(is_slack_cookie_domain("app.slack.com"));
+        assert!(is_slack_cookie_domain("APP.SLACK.COM"));
+        assert!(!is_slack_cookie_domain("evilslack.com"));
+        assert!(!is_slack_cookie_domain("slack.com.evil.example"));
+        assert!(!is_slack_cookie_domain("example.com"));
+    }
+
+    #[test]
+    fn reads_a_plist_string_value_without_skipping_non_string_values() {
         let plist = "<dict>\n\t<key>CFBundleName</key>\n\t<string>Safari</string>\n\t\
+                     <key>BuildNumber</key>\n\t<integer>42</integer>\n\t\
                      <key>CFBundleShortVersionString</key>\n\t<string>27.2</string>\n</dict>";
         assert_eq!(
             plist_string(plist, "CFBundleShortVersionString").as_deref(),
@@ -355,6 +403,11 @@ mod tests {
         assert_eq!(
             plist_string(plist, "CFBundleName").as_deref(),
             Some("Safari")
+        );
+        assert_eq!(
+            plist_string(plist, "BuildNumber"),
+            None,
+            "non-string value must not bleed into a subsequent key's <string>"
         );
         assert_eq!(plist_string(plist, "Missing"), None);
     }

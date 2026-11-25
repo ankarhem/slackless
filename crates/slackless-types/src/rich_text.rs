@@ -303,3 +303,137 @@ pub struct AttachmentMentionElement {
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn header_divider_and_default_bullet_list_round_trip() {
+        let block: Block = serde_json::from_value(json!({
+            "type": "rich_text",
+            "elements": [
+                {
+                    "type": "rich_text_header",
+                    "level": 1,
+                    "elements": [{"type": "text", "text": "Heading"}]
+                },
+                {
+                    "type": "rich_text_header",
+                    "elements": [{"type": "text", "text": "Default level"}]
+                },
+                {
+                    "type": "rich_text_divider"
+                },
+                {
+                    "type": "rich_text_list",
+                    "elements": [
+                        {"type": "rich_text_section", "elements": [{"type": "text", "text": "item"}]}
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let Block::RichText(rt) = &block else {
+            panic!("expected RichText, got {block:?}");
+        };
+        assert_eq!(rt.elements.len(), 4);
+        assert!(matches!(
+            &rt.elements[0],
+            RichTextContainer::Header(h) if h.level == Some(1) && h.elements.len() == 1
+        ));
+        assert!(matches!(
+            &rt.elements[1],
+            RichTextContainer::Header(h) if h.level.is_none()
+        ));
+        assert!(matches!(
+            &rt.elements[2],
+            RichTextContainer::Divider(RichTextDivider {})
+        ));
+        assert!(matches!(
+            &rt.elements[3],
+            RichTextContainer::List(l) if l.style == ListStyle::Bullet
+        ));
+
+        let serialized = serde_json::to_value(&block).unwrap();
+        assert_eq!(
+            serialized["elements"][2],
+            json!({"type": "rich_text_divider"})
+        );
+        let reparsed: Block = serde_json::from_value(serialized).unwrap();
+        assert_eq!(reparsed, block);
+    }
+
+    #[test]
+    fn team_message_mention_and_canvas_elements_round_trip() {
+        let section: RichTextContainer = serde_json::from_value(json!({
+            "type": "rich_text_section",
+            "elements": [
+                {"type": "team", "team_id": "T123", "style": {"bold": true}},
+                {
+                    "type": "message_mention",
+                    "channel_id": "C123",
+                    "message_ts": "1700000000.000100",
+                    "author_id": "U456",
+                    "text": "preview",
+                    "url": "https://acme.slack.com/archives/C123/p1700000000000100"
+                },
+                {"type": "canvas", "file_id": "F789"}
+            ]
+        }))
+        .unwrap();
+
+        let RichTextContainer::Section(sec) = &section else {
+            panic!("expected Section");
+        };
+        assert!(matches!(
+            &sec.elements[0],
+            RichTextElement::Team(TeamElement { team_id, style })
+                if team_id.as_str() == "T123" && style.unwrap().bold
+        ));
+        assert!(matches!(
+            &sec.elements[1],
+            RichTextElement::MessageMention(MessageMentionElement {
+                channel_id,
+                message_ts,
+                author_id,
+                text,
+                url,
+            }) if channel_id.as_str() == "C123"
+                && message_ts.as_str() == "1700000000.000100"
+                && author_id.as_ref().map(UserId::as_str) == Some("U456")
+                && text.as_deref() == Some("preview")
+                && url.is_some()
+        ));
+        assert!(matches!(
+            &sec.elements[2],
+            RichTextElement::Canvas(CanvasElement { file_id }) if file_id.as_str() == "F789"
+        ));
+
+        let round =
+            serde_json::from_value::<RichTextContainer>(serde_json::to_value(&section).unwrap())
+                .unwrap();
+        assert_eq!(round, section);
+    }
+
+    #[test]
+    fn text_style_omits_false_booleans_on_serialization() {
+        assert_eq!(
+            serde_json::to_value(TextStyle::default()).unwrap(),
+            json!({})
+        );
+
+        let style = TextStyle {
+            bold: true,
+            code: true,
+            underline: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(style).unwrap(),
+            json!({"bold": true, "code": true, "underline": true})
+        );
+    }
+}

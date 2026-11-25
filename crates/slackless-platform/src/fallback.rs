@@ -145,14 +145,97 @@ impl SpellChecker for FallbackPlatform {
     fn learn_word(&self, _word: &str) {}
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn install_mouse_nav_monitor(
     _on_nav: impl Fn(crate::MouseNavDirection) + Send + Sync + 'static,
 ) {
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn install_screen_lock_monitor(_on_lock: impl Fn() + Send + Sync + 'static) {}
 
+#[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn install_status_bar_action_monitor(
     _on_action: impl Fn(StatusBarAction) + Send + Sync + 'static,
 ) {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deep_link::{SlackLink, SlackLinkKind};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn fallback_secret_store_roundtrip_overwrite_and_idempotent_delete() {
+        let p = FallbackPlatform::default();
+        assert_eq!(
+            p.load_secret("svc", "missing").unwrap_err(),
+            PlatformError::SecretNotFound {
+                service: "svc".into(),
+                name: "missing".into(),
+            }
+        );
+
+        p.store_secret("svc", "k1", b"v1").unwrap();
+        assert_eq!(p.load_secret("svc", "k1").unwrap(), b"v1");
+
+        // Overwrite updates value without affecting other keys.
+        p.store_secret("svc", "k2", b"v2").unwrap();
+        p.store_secret("svc", "k1", b"v1-updated").unwrap();
+        assert_eq!(p.load_secret("svc", "k1").unwrap(), b"v1-updated");
+        assert_eq!(p.load_secret("svc", "k2").unwrap(), b"v2");
+
+        // Delete is idempotent.
+        p.delete_secret("svc", "k1").unwrap();
+        p.delete_secret("svc", "k1").unwrap();
+        assert!(matches!(
+            p.load_secret("svc", "k1"),
+            Err(PlatformError::SecretNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn fallback_deep_link_and_noop_capabilities_work_safely() {
+        let p = FallbackPlatform::new();
+        assert!(p.register().unwrap().is_empty());
+        assert_eq!(p.take_link(), None);
+
+        let url = "slack://channel?id=C1&team=T1";
+        let parsed = p.handle_url(url).unwrap();
+        assert_eq!(
+            parsed,
+            DeepLink::Slack(SlackLink {
+                kind: SlackLinkKind::Channel {
+                    channel_id: "C1".into(),
+                    team_id: Some("T1".into()),
+                },
+                extra: BTreeMap::new(),
+                raw: url.into(),
+            })
+        );
+        assert_eq!(p.take_link(), Some(parsed));
+        assert_eq!(p.take_link(), None);
+        assert!(p.handle_url("not a url").is_err());
+
+        // Exercise no-op trait implementations and monitor installers.
+        p.notify("title", "body");
+        p.set_badge(Some("3"));
+        p.set_badge(None);
+        p.set_icon(&[]);
+        p.show_about();
+        p.drop_system_full_screen_item();
+        p.play_sound(&[]);
+        p.update_status_bar(None, &StatusBarState::default());
+        assert_eq!(p.take_status_bar_action(), None);
+        p.request_attention(false);
+        p.request_attention(true);
+        assert!(p.check_spelling("helo", Some("en_US")).is_empty());
+        assert!(p.spelling_guesses("helo", None).is_empty());
+        p.learn_word("slackless");
+
+        install_mouse_nav_monitor(|_| {});
+        install_screen_lock_monitor(|| {});
+        install_status_bar_action_monitor(|_| {});
+    }
 }

@@ -800,4 +800,269 @@ fn serializes_canvas_edit_ops_and_list_cell_inputs() {
     .to_json(None);
     assert!(sel_cell.get("row_id").is_none());
     assert_eq!(sel_cell["select"], serde_json::json!(["OptDone"]));
+
+    // Additional ListCellInput variants: link URL text, Users, Date, Number, Link (with/without display), Clear
+    let url_text = ListCellInput {
+        column_id: "ColUrl".into(),
+        value: ListCellInputValue::Text("https://example.com".into()),
+    }
+    .to_json(None);
+    assert_eq!(
+        url_text["rich_text"][0]["elements"][0]["elements"][0],
+        serde_json::json!({ "type": "link", "url": "https://example.com" })
+    );
+
+    let users_cell = ListCellInput {
+        column_id: "ColUsers".into(),
+        value: ListCellInputValue::Users(vec![UserId::from("U1"), UserId::from("U2")]),
+    }
+    .to_json(Some("R1"));
+    assert_eq!(users_cell["user"], serde_json::json!(["U1", "U2"]));
+
+    let date_cell = ListCellInput {
+        column_id: "ColDate".into(),
+        value: ListCellInputValue::Date(vec!["2026-11-25".into()]),
+    }
+    .to_json(None);
+    assert_eq!(date_cell["date"], serde_json::json!(["2026-11-25"]));
+
+    let num_cell = ListCellInput {
+        column_id: "ColNum".into(),
+        value: ListCellInputValue::Number(vec![42.5]),
+    }
+    .to_json(None);
+    assert_eq!(num_cell["number"], serde_json::json!([42.5]));
+
+    let link_named = ListCellInput {
+        column_id: "ColLink".into(),
+        value: ListCellInputValue::Link {
+            url: "https://slack.com".into(),
+            display_name: Some("Slack".into()),
+        },
+    }
+    .to_json(None);
+    assert_eq!(
+        link_named["link"][0],
+        serde_json::json!({
+            "original_url": "https://slack.com",
+            "display_as_url": false,
+            "display_name": "Slack"
+        })
+    );
+
+    let link_bare = ListCellInput {
+        column_id: "ColLink".into(),
+        value: ListCellInputValue::Link {
+            url: "https://slack.com".into(),
+            display_name: None,
+        },
+    }
+    .to_json(None);
+    assert_eq!(link_bare["link"][0]["display_as_url"], true);
+    assert!(link_bare["link"][0].get("display_name").is_none());
+
+    let clear_cell = ListCellInput {
+        column_id: "ColClear".into(),
+        value: ListCellInputValue::Clear,
+    }
+    .to_json(Some("R1"));
+    assert_eq!(clear_cell["rich_text"], serde_json::json!([]));
+}
+
+#[test]
+fn parse_list_cell_covers_all_cell_shapes_and_rating_cap() {
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({ "checkbox": [true] })),
+        SlackListCellValue::Checkbox(true)
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({ "checkbox": [false] })),
+        SlackListCellValue::Checkbox(false)
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({ "date": ["2026-11-25"] })),
+        SlackListCellValue::Date("2026-11-25".into())
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({
+            "link": [{ "originalUrl": "https://a.test", "displayName": "Site A" }]
+        })),
+        SlackListCellValue::Link {
+            label: "Site A".into(),
+            url: "https://a.test".into()
+        }
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({
+            "link": [{ "original_url": "https://b.test" }]
+        })),
+        SlackListCellValue::Link {
+            label: "https://b.test".into(),
+            url: "https://b.test".into()
+        }
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({ "number": [42.0] })),
+        SlackListCellValue::Number("42".into())
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({ "number": [3.5] })),
+        SlackListCellValue::Number("3.5".into())
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({ "number": ["99"] })),
+        SlackListCellValue::Number("99".into())
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({ "rating": [3] })),
+        SlackListCellValue::Text("\u{2605}\u{2605}\u{2605}".into())
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({ "rating": [25] })),
+        SlackListCellValue::Text("\u{2605}".repeat(10))
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({
+            "rich_text": [{
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_section",
+                    "elements": [
+                        { "type": "text", "text": "See " },
+                        { "type": "link", "url": "https://docs.test" }
+                    ]
+                }]
+            }]
+        })),
+        SlackListCellValue::Text("See https://docs.test".into())
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({ "email": ["a@b.com", "c@d.com"] })),
+        SlackListCellValue::Text("a@b.com, c@d.com".into())
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({ "phone": ["+15551234"] })),
+        SlackListCellValue::Text("+15551234".into())
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({ "channel": ["C1", "C2"] })),
+        SlackListCellValue::Text("C1, C2".into())
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({ "value": "  raw  " })),
+        SlackListCellValue::Text("raw".into())
+    );
+    assert_eq!(
+        parse_list_cell(&serde_json::json!({})),
+        SlackListCellValue::Empty
+    );
+}
+
+#[test]
+fn parse_cloud_drafts_filters_deleted_sent_empty_and_picks_timestamps() {
+    let raw = serde_json::json!({
+        "drafts": [
+            {
+                "id": "Dr1",
+                "is_deleted": false,
+                "is_sent": false,
+                "date_created": 100,
+                "date_last_updated": 200,
+                "destinations": [{ "channel_id": "C1" }],
+                "blocks": [{
+                    "type": "rich_text",
+                    "elements": [{
+                        "type": "rich_text_section",
+                        "elements": [
+                            { "type": "text", "text": "hello " },
+                            { "type": "text", "text": "world" }
+                        ]
+                    }]
+                }]
+            },
+            {
+                "id": "Dr2",
+                "date_created": 150,
+                "destinations": [{ "channel_id": "C2" }],
+                "blocks": [{
+                    "elements": [{ "elements": [{ "text": "fallback ts" }] }]
+                }]
+            },
+            {
+                "id": "DrDeleted",
+                "is_deleted": true,
+                "destinations": [{ "channel_id": "C1" }],
+                "blocks": [{ "elements": [{ "elements": [{ "text": "skip" }] }] }]
+            },
+            {
+                "id": "DrSent",
+                "is_sent": true,
+                "destinations": [{ "channel_id": "C1" }],
+                "blocks": [{ "elements": [{ "elements": [{ "text": "skip" }] }] }]
+            },
+            {
+                "id": "DrWhitespace",
+                "destinations": [{ "channel_id": "C1" }],
+                "blocks": [{ "elements": [{ "elements": [{ "text": "   \n  " }] }] }]
+            },
+            {
+                "id": "DrNoDest",
+                "destinations": [],
+                "blocks": [{ "elements": [{ "elements": [{ "text": "orphan" }] }] }]
+            }
+        ]
+    });
+    let drafts = parse_cloud_drafts(&raw);
+    assert_eq!(drafts.len(), 2);
+    assert_eq!(drafts[0].id, "Dr1");
+    assert_eq!(drafts[0].channel.as_str(), "C1");
+    assert_eq!(drafts[0].text, "hello world");
+    assert_eq!(drafts[0].updated_secs, Some(200));
+    assert_eq!(drafts[1].id, "Dr2");
+    assert_eq!(drafts[1].updated_secs, Some(150));
+}
+
+#[test]
+fn dm_wire_into_conversation_fills_missing_id_and_latest() {
+    use crate::types::Latest;
+
+    // 1. Nested channel missing id & latest inherits from outer DmWire
+    let wire = DmWire {
+        id: ChannelId::from("D1"),
+        latest: Some(Ts::from("1700000001.000100")),
+        channel: Some(Conversation {
+            id: ChannelId::from(""),
+            is_im: true,
+            latest: None,
+            ..Default::default()
+        }),
+    };
+    let conv = wire.into_conversation();
+    assert_eq!(conv.id.as_str(), "D1");
+    assert!(conv.is_im);
+    assert_eq!(conv.latest, Some(Latest::Ts(Ts::from("1700000001.000100"))));
+
+    // 2. Nested channel with its own id & latest preserves them
+    let wire = DmWire {
+        id: ChannelId::from("D_OUTER"),
+        latest: Some(Ts::from("1.0")),
+        channel: Some(Conversation {
+            id: ChannelId::from("D_INNER"),
+            latest: Some(Latest::Ts(Ts::from("2.0"))),
+            ..Default::default()
+        }),
+    };
+    let conv = wire.into_conversation();
+    assert_eq!(conv.id.as_str(), "D_INNER");
+    assert_eq!(conv.latest, Some(Latest::Ts(Ts::from("2.0"))));
+
+    // 3. No nested channel builds minimal Conversation
+    let wire = DmWire {
+        id: ChannelId::from("D_MIN"),
+        latest: Some(Ts::from("3.0")),
+        channel: None,
+    };
+    let conv = wire.into_conversation();
+    assert_eq!(conv.id.as_str(), "D_MIN");
+    assert_eq!(conv.latest, Some(Latest::Ts(Ts::from("3.0"))));
 }

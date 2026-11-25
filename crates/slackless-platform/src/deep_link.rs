@@ -137,7 +137,7 @@ fn parse_slack(url: &Url, raw: &str) -> Result<DeepLink> {
             let team_id = path
                 .first()
                 .cloned()
-                .or_else(|| param("id").map(str::to_string))
+                .or_else(|| param("id").filter(|id| !id.is_empty()).map(str::to_string))
                 .ok_or_else(|| {
                     PlatformError::BadLink(format!("{raw}: team link without a team id"))
                 })?;
@@ -163,7 +163,7 @@ fn parse_slack(url: &Url, raw: &str) -> Result<DeepLink> {
     };
     let extra: BTreeMap<String, String> = pairs
         .into_iter()
-        .filter(|(k, _)| !consumed.contains(&k.as_str()))
+        .filter(|(k, _)| !consumed.iter().any(|c| k.eq_ignore_ascii_case(c)))
         .collect();
 
     Ok(DeepLink::Slack(SlackLink {
@@ -419,5 +419,121 @@ mod tests {
     fn garbage_is_error() {
         assert!(parse_deep_link("this is not a url").is_err());
         assert!(parse_deep_link("mailto:someone@example.com").is_err());
+    }
+
+    #[test]
+    fn consumed_query_keys_are_stripped_case_insensitively() {
+        let ch = parse_deep_link("slack://channel?ID=C1&TEAM=T2&Message=1.2").unwrap();
+        match &ch {
+            DeepLink::Slack(link) => {
+                assert_eq!(
+                    link.kind,
+                    SlackLinkKind::Channel {
+                        channel_id: "C1".into(),
+                        team_id: Some("T2".into()),
+                    }
+                );
+                assert_eq!(link.extra.len(), 1);
+                assert_eq!(link.extra.get("Message").map(String::as_str), Some("1.2"));
+            }
+            other => panic!("expected Slack link, got {other:?}"),
+        }
+        assert_eq!(ch.raw(), "slack://channel?ID=C1&TEAM=T2&Message=1.2");
+
+        let team = parse_deep_link("slack://team?ID=T1&ref=mail").unwrap();
+        match team {
+            DeepLink::Slack(link) => {
+                assert_eq!(
+                    link.kind,
+                    SlackLinkKind::Team {
+                        team_id: "T1".into()
+                    }
+                );
+                assert_eq!(link.extra.len(), 1);
+                assert_eq!(link.extra.get("ref").map(String::as_str), Some("mail"));
+            }
+            other => panic!("expected Slack link, got {other:?}"),
+        }
+
+        let open = parse_deep_link("slack://open?TEAM=T1&ID=C2").unwrap();
+        match open {
+            DeepLink::Slack(link) => {
+                assert!(link.extra.is_empty());
+                assert_eq!(
+                    link.kind,
+                    SlackLinkKind::Open {
+                        team_id: Some("T1".into()),
+                        target_id: Some("C2".into()),
+                    }
+                );
+            }
+            other => panic!("expected Slack link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn team_query_fallback_and_empty_or_missing_id_errors() {
+        assert_eq!(
+            parse_deep_link("slack://team?id=T1").unwrap(),
+            DeepLink::Slack(SlackLink {
+                kind: SlackLinkKind::Team {
+                    team_id: "T1".into()
+                },
+                extra: BTreeMap::new(),
+                raw: "slack://team?id=T1".into(),
+            })
+        );
+
+        for bad in [
+            "slack://channel?id=",
+            "slack://user",
+            "slack://user?id=",
+            "slack://team",
+            "slack://team?id=",
+        ] {
+            assert!(
+                parse_deep_link(bad).is_err(),
+                "expected BadLink error for {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_segment_and_archive_edge_cases() {
+        assert_eq!(decode_segment("hello%20world"), "hello world");
+        assert_eq!(decode_segment("%C3%A5"), "å");
+        // Invalid UTF-8 bytes fall back to the raw segment text.
+        assert_eq!(decode_segment("%FF%FE"), "%FF%FE");
+
+        // parse_archive_p_ts boundary lengths (<=6 digits invalid, 7 digits valid).
+        assert_eq!(parse_archive_p_ts("p123456"), None);
+        assert_eq!(parse_archive_p_ts("p1234567"), Some("1.234567".to_owned()));
+        assert_eq!(parse_archive_p_ts("p123456a"), None);
+        assert_eq!(parse_archive_p_ts("1234567"), None);
+
+        // `cid` query overrides the path channel id.
+        let cid_override = parse_deep_link(
+            "https://acme.slack.com/archives/C_PATH/p1700000001234567?cid=C_OVERRIDE",
+        )
+        .unwrap();
+        match cid_override {
+            DeepLink::WebClient(link) => {
+                assert_eq!(link.channel_id.as_deref(), Some("C_OVERRIDE"));
+                assert_eq!(link.thread_ts.as_deref(), Some("1700000001.234567"));
+            }
+            other => panic!("expected WebClient, got {other:?}"),
+        }
+
+        // Channel-only archive link (no message timestamp segment).
+        let channel_only = parse_deep_link("https://acme.slack.com/archives/C0456DEF").unwrap();
+        assert_eq!(
+            channel_only,
+            DeepLink::WebClient(WebClientLink {
+                team_id: None,
+                channel_id: Some("C0456DEF".into()),
+                thread_ts: None,
+                raw: "https://acme.slack.com/archives/C0456DEF".into(),
+            })
+        );
     }
 }

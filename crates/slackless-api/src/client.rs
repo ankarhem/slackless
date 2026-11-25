@@ -147,6 +147,8 @@ pub struct SlackApi {
     http: reqwest::Client,
     /// API base ending in `/`, e.g. `https://acme.slack.com/api/`.
     base: Url,
+    /// Edge cache API base ending in `/`, e.g. `https://edgeapi.slack.com/cache/`.
+    edge_base: Url,
     token: String,
     /// Prebuilt `d=<url-encoded xoxd>` header value.
     cookie: HeaderValue,
@@ -198,9 +200,20 @@ impl SlackApi {
         Ok(Self {
             http,
             base,
+            edge_base: Url::parse(endpoints::EDGE_API_BASE).expect("EDGE_API_BASE is a valid URL"),
             token: token.into(),
             cookie,
         })
+    }
+
+    /// Overrides the Edge cache API base URL (defaults to [`endpoints::EDGE_API_BASE`]).
+    pub fn with_edge_base(mut self, edge_base: &str) -> Result<Self> {
+        let mut url = Url::parse(edge_base)?;
+        if !url.path().ends_with('/') {
+            url.set_path(&format!("{}/", url.path()));
+        }
+        self.edge_base = url;
+        Ok(self)
     }
 
     /// The API base URL this client posts to.
@@ -254,9 +267,7 @@ impl SlackApi {
     ) -> Result<ApiResponse<T>> {
         let url = Url::parse(&format!(
             "{}{}/{}?_x_app_name=client",
-            endpoints::EDGE_API_BASE,
-            team_id,
-            path
+            self.edge_base, team_id, path
         ))?;
         if let Some(obj) = payload.as_object_mut() {
             obj.insert(
@@ -313,7 +324,11 @@ impl SlackApi {
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.trim_start().starts_with("text/html"));
+            .is_some_and(|ct| {
+                ct.trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("text/html")
+            });
         if is_html {
             return Err(ApiError::FileAuthRejected);
         }
@@ -447,8 +462,11 @@ impl SlackApi {
 
 /// `Retry-After` in seconds, defaulted when missing/unparseable and capped.
 fn retry_after(resp: &Response) -> Duration {
-    resp.headers()
-        .get(RETRY_AFTER)
+    parse_retry_after(resp.headers().get(RETRY_AFTER))
+}
+
+fn parse_retry_after(header: Option<&HeaderValue>) -> Duration {
+    header
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map_or(DEFAULT_RETRY_AFTER, Duration::from_secs)
@@ -549,8 +567,13 @@ mod tests {
 
     #[test]
     fn net_log_redacts_query_strings_and_caps_entries() {
+        static TEST_GUARD: Mutex<()> = Mutex::new(());
+        let _lock = TEST_GUARD.lock().unwrap();
+
         clear_net_log();
         set_net_log_enabled(true);
+        assert!(net_log_enabled());
+
         let url =
             Url::parse("https://acme.slack.com/api/auth.test?token=xoxc-secret#frag").unwrap();
         record_net_log("POST", &url, Some(200), Duration::from_millis(12), None);
@@ -559,7 +582,80 @@ mod tests {
         assert_eq!(snap[0].url, "https://acme.slack.com/api/auth.test");
         assert_eq!(snap[0].status, Some(200));
         assert!(!net_log_export_json().contains("xoxc-secret"));
-        set_net_log_enabled(false);
+
+        // Pushing more than MAX_NET_LOG_ENTRIES (500) evicts oldest entries first.
         clear_net_log();
+        for i in 0..(MAX_NET_LOG_ENTRIES + 25) {
+            let entry_url = Url::parse(&format!("https://acme.slack.com/api/m{i}")).unwrap();
+            record_net_log(
+                "POST",
+                &entry_url,
+                Some(200),
+                Duration::from_millis(1),
+                None,
+            );
+        }
+        let capped = net_log_snapshot();
+        assert_eq!(capped.len(), MAX_NET_LOG_ENTRIES);
+        assert_eq!(capped[0].url, "https://acme.slack.com/api/m25");
+        assert_eq!(
+            capped.last().unwrap().url,
+            format!("https://acme.slack.com/api/m{}", MAX_NET_LOG_ENTRIES + 24)
+        );
+
+        set_net_log_enabled(false);
+        assert!(!net_log_enabled());
+        clear_net_log();
+    }
+
+    #[test]
+    fn proxy_url_override_trims_and_clears() {
+        static PROXY_GUARD: Mutex<()> = Mutex::new(());
+        let _lock = PROXY_GUARD.lock().unwrap();
+
+        set_proxy_url(None);
+        set_proxy_url(Some("  http://127.0.0.1:8080  ".to_owned()));
+        assert_eq!(proxy_url().as_deref(), Some("http://127.0.0.1:8080"));
+
+        set_proxy_url(Some("   ".to_owned()));
+        assert_ne!(proxy_url().as_deref(), Some(""));
+        assert_ne!(proxy_url().as_deref(), Some("http://127.0.0.1:8080"));
+
+        set_proxy_url(None);
+    }
+
+    #[test]
+    fn retry_after_defaults_on_missing_or_invalid_and_clamps_to_max() {
+        assert_eq!(parse_retry_after(None), Duration::from_secs(5));
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("not-a-number"))),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static(
+                "Wed, 21 Oct 2015 07:28:00 GMT"
+            ))),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("-10"))),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static(" 12 "))),
+            Duration::from_secs(12)
+        );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("0"))),
+            Duration::from_secs(0)
+        );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("120"))),
+            MAX_RETRY_AFTER
+        );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("999999"))),
+            MAX_RETRY_AFTER
+        );
     }
 }

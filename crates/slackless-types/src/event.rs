@@ -786,4 +786,177 @@ mod tests {
         assert_eq!(p.presence, Presence::Away);
         assert_eq!(p.user_ids().count(), 2);
     }
+
+    #[test]
+    fn huddle_events_active_state_and_target_channels_precedence() {
+        let join = parse(
+            r#"{
+                "type": "sh_room_join",
+                "user": "U1",
+                "channel_id": "C_TOP",
+                "huddle": {"channel_id": "C_HUDDLE"},
+                "room": {
+                    "id": "R1",
+                    "name": "Standup",
+                    "channels": ["C_ROOM1", "C_ROOM2"],
+                    "participants": ["U1"],
+                    "has_ended": false,
+                    "media_backend_type": "free_willy",
+                    "extra_flag": true
+                }
+            }"#,
+        );
+        let SlackEvent::ShRoomJoin(ev) = &join else {
+            panic!("expected ShRoomJoin, got {join:?}");
+        };
+        assert!(ev.room.is_active());
+        assert_eq!(
+            ev.target_channels(),
+            vec![ChannelId::from("C_ROOM1"), ChannelId::from("C_ROOM2")]
+        );
+        assert_eq!(
+            ev.room.extra.get("extra_flag"),
+            Some(&serde_json::json!(true))
+        );
+
+        let leave = parse(
+            r#"{
+                "type": "sh_room_leave",
+                "channel_id": "C_TOP",
+                "huddle": {"channel_id": "C_HUDDLE"},
+                "room": {
+                    "id": "R1",
+                    "channels": [],
+                    "participants": [],
+                    "has_ended": false
+                }
+            }"#,
+        );
+        let SlackEvent::ShRoomLeave(ev) = &leave else {
+            panic!("expected ShRoomLeave, got {leave:?}");
+        };
+        assert!(!ev.room.is_active(), "empty participants is not active");
+        assert_eq!(
+            ev.target_channels(),
+            vec![ChannelId::from("C_HUDDLE")],
+            "huddle.channel_id wins over top-level channel_id when room.channels is empty"
+        );
+
+        let update = parse(
+            r#"{
+                "type": "sh_room_update",
+                "channel_id": "C_TOP",
+                "room": {
+                    "id": "R1",
+                    "participants": ["U1"],
+                    "has_ended": true
+                }
+            }"#,
+        );
+        let SlackEvent::ShRoomUpdate(ev) = &update else {
+            panic!("expected ShRoomUpdate, got {update:?}");
+        };
+        assert!(!ev.room.is_active(), "ended room is never active");
+        assert_eq!(
+            ev.target_channels(),
+            vec![ChannelId::from("C_TOP")],
+            "top-level channel_id used when room.channels and huddle.channel_id are absent"
+        );
+        assert!(HuddleRoomEvent::default().target_channels().is_empty());
+
+        let invite = parse(
+            r#"{
+                "type": "huddle_invite",
+                "call_id": "R2",
+                "channel_id": "D1",
+                "sender_user_id": "U2",
+                "team_id": "T1",
+                "event_ts": "1700000000.000100",
+                "extra_k": 42
+            }"#,
+        );
+        let SlackEvent::HuddleInvite(inv) = &invite else {
+            panic!("expected HuddleInvite, got {invite:?}");
+        };
+        assert_eq!(inv.call_id, "R2");
+        assert_eq!(inv.channel_id.as_str(), "D1");
+        assert_eq!(inv.sender_user_id.as_str(), "U2");
+        assert_eq!(inv.extra.get("extra_k"), Some(&serde_json::json!(42)));
+
+        let cancel = parse(
+            r#"{
+                "type": "huddle_invite_cancel",
+                "channel_id": "D1",
+                "team_id": "T1",
+                "event_ts": "1700000001.000000"
+            }"#,
+        );
+        assert!(matches!(
+            cancel,
+            SlackEvent::HuddleInviteCancel(c) if c.channel_id.as_str() == "D1"
+        ));
+
+        let user_huddle = parse(
+            r#"{
+                "type": "user_huddle_changed",
+                "user": {"id": "U9", "name": "ada", "profile": {"huddle_state": "in_a_huddle"}}
+            }"#,
+        );
+        assert!(matches!(
+            user_huddle,
+            SlackEvent::UserHuddleChanged(u) if u.user.id.as_str() == "U9"
+        ));
+    }
+
+    #[test]
+    fn message_deleted_and_replied_round_trip_and_drifted_fallback_to_unknown() {
+        let deleted = parse(
+            r#"{"type": "message", "subtype": "message_deleted", "channel": "C1",
+                "ts": "1700000003.000000", "deleted_ts": "1700000000.000100",
+                "previous_message": {"ts": "1700000000.000100", "text": "gone"}}"#,
+        );
+        let del_json = serde_json::to_value(&deleted).unwrap();
+        assert_eq!(del_json["type"], "message");
+        assert_eq!(del_json["subtype"], "message_deleted");
+        assert_eq!(
+            serde_json::from_value::<SlackEvent>(del_json).unwrap(),
+            deleted
+        );
+        if let SlackEvent::Message(ref me) = deleted {
+            assert_eq!(me.channel().map(ChannelId::as_str), Some("C1"));
+        }
+
+        let replied = parse(
+            r#"{"type": "message", "subtype": "message_replied", "channel": "C2",
+                "ts": "1700000004.000000",
+                "message": {"ts": "1700000000.000100", "text": "root", "reply_count": 2}}"#,
+        );
+        let rep_json = serde_json::to_value(&replied).unwrap();
+        assert_eq!(rep_json["type"], "message");
+        assert_eq!(rep_json["subtype"], "message_replied");
+        assert_eq!(
+            serde_json::from_value::<SlackEvent>(rep_json).unwrap(),
+            replied
+        );
+        if let SlackEvent::Message(ref me) = replied {
+            assert_eq!(me.channel().map(ChannelId::as_str), Some("C2"));
+        }
+
+        // Drifted message_changed (missing required `message` object) falls back to Unknown.
+        let drifted_changed = parse(
+            r#"{"type": "message", "subtype": "message_changed", "channel": "C1", "message": "oops"}"#,
+        );
+        assert!(matches!(
+            drifted_changed,
+            SlackEvent::Unknown { r#type, .. } if r#type == "message"
+        ));
+
+        // Drifted message_deleted (missing required `deleted_ts`) falls back to Unknown.
+        let drifted_deleted =
+            parse(r#"{"type": "message", "subtype": "message_deleted", "channel": "C1"}"#);
+        assert!(matches!(
+            drifted_deleted,
+            SlackEvent::Unknown { r#type, .. } if r#type == "message"
+        ));
+    }
 }
