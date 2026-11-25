@@ -19,9 +19,12 @@ use crate::unfurl::Unfurls;
 pub(crate) const PAGE_DELAY: Duration = Duration::from_millis(1200);
 /// How many times one page waits out a rate limit (on top of the API client's own retries).
 const MAX_RATE_LIMIT_WAITS: u32 = 5;
+/// `local_state` key persisting known backfill spans per workspace so restarts skip completed
+/// history walks.
+pub(crate) const BACKFILL_SYNCED_KEY: &str = "backfill_synced_spans";
 
 /// The contiguous span of a conversation's channel-level history known to be in the store.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Synced {
     pub newest: Ts,
     pub oldest: Ts,
@@ -30,6 +33,13 @@ pub(crate) struct Synced {
 }
 
 pub(crate) type SyncedMap = Arc<Mutex<HashMap<ChannelId, Synced>>>;
+
+/// Deserialize persisted [`Synced`] spans from `local_state`, returning an empty map if absent
+/// or malformed.
+pub(crate) fn decode_synced_spans(raw: Option<String>) -> HashMap<ChannelId, Synced> {
+    raw.and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
 
 /// One backfill worker configuration; [`Backfill::run`] walks one conversation. Cancel by
 /// aborting its task: every page is committed before the next is fetched, so an aborted walk
@@ -98,6 +108,7 @@ impl<B: Backend> Backfill<B> {
                 span.complete |= next.is_none() && !overlaps;
                 catching_up = None;
                 self.lock().insert(channel.clone(), span.clone());
+                self.persist_synced().await;
                 if span.complete {
                     self.events.emit(Event::HistoryComplete {
                         channel: channel.clone(),
@@ -131,6 +142,7 @@ impl<B: Backend> Backfill<B> {
                     span.complete = true;
                 }
             }
+            self.persist_synced().await;
             match next {
                 Some(next) => cursor = Some(next),
                 None => {
@@ -140,6 +152,20 @@ impl<B: Backend> Backfill<B> {
                     return Ok(());
                 }
             }
+        }
+    }
+
+    async fn persist_synced(&self) {
+        let Ok(payload) = serde_json::to_string(&*self.lock()) else {
+            return;
+        };
+        let ws = self.workspace.clone();
+        if let Err(err) = with_store(&self.store, move |s| {
+            s.set_local(&ws, BACKFILL_SYNCED_KEY, &payload)
+        })
+        .await
+        {
+            tracing::warn!(%err, "failed to persist backfill synced spans");
         }
     }
 
@@ -166,7 +192,11 @@ impl<B: Backend> Backfill<B> {
         thread_ts: Ts,
     ) -> Result<(), CoreError> {
         let mut cursor: Option<String> = None;
+        let mut first = true;
         loop {
+            if !std::mem::take(&mut first) {
+                tokio::time::sleep(self.page_delay).await;
+            }
             let page = wait_out_rate_limits(|| {
                 self.backend
                     .replies_page(channel.clone(), thread_ts.clone(), cursor.clone())
@@ -175,12 +205,7 @@ impl<B: Backend> Backfill<B> {
             let next = page
                 .next_cursor
                 .filter(|next| Some(next) != cursor.as_ref());
-            self.unfurls.resolve(page.items.iter());
-            let (ws, target) = (self.workspace.clone(), channel.clone());
-            with_store(&self.store, move |store| {
-                store.upsert_messages(&ws, &target, &page.items)
-            })
-            .await?;
+            self.store_page(&channel, page.items).await?;
             if !self.events.emit(Event::StoreChanged {
                 channel: channel.clone(),
             }) {
@@ -248,7 +273,13 @@ mod tests {
             events: events.clone(),
             synced: SyncedMap::default(),
             page_delay: PAGE_DELAY,
-            unfurls: Unfurls::new(fake.clone(), store, TeamId::from("T1"), events),
+            unfurls: Unfurls::new(
+                fake.clone(),
+                store,
+                TeamId::from("T1"),
+                events,
+                crate::client::TaskTracker::default(),
+            ),
         };
         (backfill, rx)
     }
@@ -562,5 +593,55 @@ mod tests {
             1,
             "thread fetch stops after first page once receiver drops"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synced_spans_persist_in_local_state_across_restarts() {
+        let fake = FakeBackend::with_history(1..=7);
+        let (bf, _rx) = backfill(&fake);
+        bf.clone().run(ChannelId::from("C1")).await;
+        assert_eq!(fake.calls().len(), 4);
+
+        // Simulate restart: decode persisted spans from the same SQLite store.
+        let persisted_raw = bf
+            .store
+            .lock()
+            .expect("store lock")
+            .local(&bf.workspace, BACKFILL_SYNCED_KEY)
+            .expect("local read");
+        let restored = decode_synced_spans(persisted_raw);
+        assert_eq!(
+            restored.get(&ChannelId::from("C1")),
+            Some(&Synced {
+                newest: Ts::from("7.0"),
+                oldest: Ts::from("1.0"),
+                complete: true,
+            })
+        );
+
+        fake.push_history(8..=8);
+        fake.clear_calls();
+        let (events2, _rx2) = {
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            (Emitter(tx), rx)
+        };
+        let bf2 = Backfill {
+            backend: fake.clone(),
+            store: Arc::clone(&bf.store),
+            workspace: bf.workspace.clone(),
+            events: events2.clone(),
+            synced: Arc::new(Mutex::new(restored)),
+            page_delay: PAGE_DELAY,
+            unfurls: Unfurls::new(
+                fake.clone(),
+                Arc::clone(&bf.store),
+                bf.workspace.clone(),
+                events2,
+                crate::client::TaskTracker::default(),
+            ),
+        };
+        bf2.run(ChannelId::from("C1")).await;
+        // Only 1 page (8.0 + 7.0 overlap) instead of re-walking all 4 pages!
+        assert_eq!(fake.calls().len(), 1);
     }
 }

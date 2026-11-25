@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::Event;
 use crate::api::ApiError;
 use crate::backend::Backend;
-use crate::backfill::PAGE_DELAY;
-use crate::client::{CoreError, Emitter, SharedStore, with_store};
+use crate::backfill::{PAGE_DELAY, wait_out_rate_limits};
+use crate::client::{CoreError, Emitter, SharedStore, TaskTracker, with_store};
 use crate::types::event::MessageEvent;
 use crate::types::{ChannelId, Message, SlackEvent, TeamId};
 
@@ -30,17 +30,25 @@ pub(crate) struct Unfurls<B: Backend> {
     events: Emitter,
     /// Ids already claimed this session (resolved, skipped or failed).
     asked: Arc<Mutex<HashSet<ChannelId>>>,
+    tasks: TaskTracker,
 }
 
 impl<B: Backend> Unfurls<B> {
     /// A resolver sharing `asked` with every clone handed to the core's other workers.
-    pub(crate) fn new(backend: B, store: SharedStore, workspace: TeamId, events: Emitter) -> Self {
+    pub(crate) fn new(
+        backend: B,
+        store: SharedStore,
+        workspace: TeamId,
+        events: Emitter,
+        tasks: TaskTracker,
+    ) -> Self {
         Self {
             backend,
             store,
             workspace,
             events,
             asked: Arc::new(Mutex::new(HashSet::new())),
+            tasks,
         }
     }
 
@@ -49,7 +57,7 @@ impl<B: Backend> Unfurls<B> {
     pub(crate) fn resolve<'a>(&self, messages: impl IntoIterator<Item = &'a Message>) {
         if let Some(claimed) = self.claim(messages) {
             let this = self.clone();
-            tokio::spawn(async move {
+            self.tasks.spawn(async move {
                 if let Err(e) = this.walk(claimed).await {
                     this.events.report("unfurl conversations.info", e);
                 }
@@ -129,7 +137,7 @@ impl<B: Backend> Unfurls<B> {
                 guard.completed = n + 1;
                 continue;
             }
-            match self.backend.conversation_info(id.clone()).await {
+            match wait_out_rate_limits(|| self.backend.conversation_info(id.clone())).await {
                 Ok(mut conversation) => {
                     conversation.is_member = false;
                     let (ws, conversation) = (self.workspace.clone(), conversation);
@@ -198,6 +206,7 @@ mod tests {
                 workspace: TeamId::from("T1"),
                 events,
                 asked: Arc::new(Mutex::new(HashSet::new())),
+                tasks: TaskTracker::default(),
             },
             store,
         )
@@ -337,10 +346,10 @@ mod tests {
         let m1 = unfurling("5.0", "CEXT1");
         let m2 = unfurling("6.0", "CEXT2");
         assert!(unfurls.resolve_now([&m1, &m2]).await.is_err());
-        assert_eq!(
-            fake.info_calls(),
-            vec![ChannelId::from("CEXT1")],
-            "early exit before attempting CEXT2"
+        let calls = fake.info_calls();
+        assert!(
+            !calls.is_empty() && calls.iter().all(|c| *c == ChannelId::from("CEXT1")),
+            "rate-limit retries stay on CEXT1 and exit before attempting CEXT2: {calls:?}"
         );
 
         // Once the transient outage clears, retrying resolves BOTH CEXT1 and CEXT2.

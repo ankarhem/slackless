@@ -7,12 +7,13 @@ use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::runtime::Handle;
 
 use crate::api::{AssetClient, SlackApi};
+use crate::types::time::now_epoch_secs;
 
 /// Where Slack serves workspace files and their thumbnails; these need the session cookie and are
 /// kept in memory only (never written to the public asset disk cache).
@@ -25,6 +26,10 @@ const MAX_CACHE_ENTRIES: usize = 384;
 const MAX_SINGLE_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum total size of the persistent disk cache for public avatars and custom emoji (128 MiB).
 const MAX_DISK_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+/// Minimum interval (seconds) between periodic disk-cache prune sweeps.
+const PRUNE_INTERVAL_SECS: i64 = 30 * 60;
+/// Trigger a disk-cache prune check every N disk writes even inside the time window.
+const PRUNE_EVERY_WRITES: u64 = 128;
 
 /// Stable 128-bit FNV-1a hex filename for caching a public asset URL on disk without extra deps.
 fn cache_key(url: &str) -> String {
@@ -41,13 +46,7 @@ fn cache_key(url: &str) -> String {
 
 /// Platform cache directory for persistent public media assets (avatars, workspace icons, emoji).
 pub fn disk_cache_dir() -> Option<PathBuf> {
-    let mut path = PathBuf::from(std::env::var_os("HOME")?);
-    if cfg!(target_os = "macos") {
-        path.push("Library/Caches/slackless/media");
-    } else {
-        path.push(".cache/slackless/media");
-    }
-    Some(path)
+    crate::platform::app_cache_dir().map(|dir| dir.join("media"))
 }
 
 fn read_disk_cache(dir: &Path, url: &str) -> Option<Vec<u8>> {
@@ -55,17 +54,51 @@ fn read_disk_cache(dir: &Path, url: &str) -> Option<Vec<u8>> {
 }
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+static LAST_PRUNED_SECS: AtomicI64 = AtomicI64::new(0);
+static WRITES_SINCE_PRUNE: AtomicU64 = AtomicU64::new(0);
+
+fn should_prune_now(now: i64) -> bool {
+    let prev = LAST_PRUNED_SECS.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) >= PRUNE_INTERVAL_SECS {
+        return LAST_PRUNED_SECS
+            .compare_exchange(prev, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok();
+    }
+    let writes = WRITES_SINCE_PRUNE.fetch_add(1, Ordering::Relaxed) + 1;
+    if writes >= PRUNE_EVERY_WRITES {
+        WRITES_SINCE_PRUNE.store(0, Ordering::Relaxed);
+        LAST_PRUNED_SECS.store(now, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
 
 fn write_disk_cache(dir: &Path, url: &str, bytes: &[u8]) {
-    if std::fs::create_dir_all(dir).is_err() {
+    if let Err(err) = std::fs::create_dir_all(dir) {
+        tracing::warn!(dir = %dir.display(), %err, "failed to create media cache directory");
         return;
     }
     let key = cache_key(url);
     let final_path = dir.join(&key);
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_path = dir.join(format!("{key}.tmp.{}.{seq}", std::process::id()));
-    if std::fs::write(&tmp_path, bytes).is_ok() {
-        let _ = std::fs::rename(&tmp_path, &final_path);
+    if let Err(err) = std::fs::write(&tmp_path, bytes) {
+        tracing::warn!(path = %tmp_path.display(), %err, "failed to write temp media cache file");
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
+        tracing::warn!(
+            from = %tmp_path.display(),
+            to = %final_path.display(),
+            %err,
+            "failed to rename media cache temp file; removing temp file"
+        );
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+    if should_prune_now(now_epoch_secs()) {
+        prune_disk_cache_if_needed(dir, MAX_DISK_CACHE_BYTES);
     }
 }
 
@@ -200,13 +233,10 @@ fn shared_asset_client() -> AssetClient {
 impl Fetcher {
     pub(crate) fn new(runtime: Handle, files: Option<SlackApi>) -> Self {
         let disk_dir = disk_cache_dir();
-        if let Some(dir) = disk_dir.clone() {
-            static PRUNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !PRUNED.swap(true, Ordering::Relaxed) {
-                runtime
-                    .spawn_blocking(move || prune_disk_cache_if_needed(&dir, MAX_DISK_CACHE_BYTES));
-            }
+        if let Some(dir) = disk_dir.clone()
+            && should_prune_now(now_epoch_secs())
+        {
+            runtime.spawn_blocking(move || prune_disk_cache_if_needed(&dir, MAX_DISK_CACHE_BYTES));
         }
         Self {
             runtime,
@@ -250,14 +280,19 @@ impl Fetcher {
         &self,
         url: String,
     ) -> impl Future<Output = Result<Vec<u8>, String>> + Send + 'static + use<> {
-        if let Ok(mut guard) = self.cache.lock()
-            && let Some(hit) = guard.get(&url)
         {
-            return futures::future::Either::Left(async move { Ok(hit) });
+            let mut guard = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(hit) = guard.get(&url) {
+                return futures::future::Either::Left(async move { Ok(hit) });
+            }
         }
         let mut follower_rx = None;
         let mut leader_tx = None;
-        if let Ok(mut flights) = self.in_flight.lock() {
+        {
+            let mut flights = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(tx) = flights.get(&url) {
                 follower_rx = Some(tx.subscribe());
             } else {
@@ -292,10 +327,11 @@ impl Fetcher {
                     if let Ok(Some(bytes)) =
                         tokio::task::spawn_blocking(move || read_disk_cache(&dir_r, &url_r)).await
                     {
-                        if bytes.len() <= MAX_SINGLE_ENTRY_BYTES
-                            && let Ok(mut guard) = cache.lock()
-                        {
-                            guard.insert(url.clone(), bytes.clone());
+                        if bytes.len() <= MAX_SINGLE_ENTRY_BYTES {
+                            cache
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .insert(url.clone(), bytes.clone());
                         }
                         return Ok(bytes);
                     }
@@ -311,9 +347,10 @@ impl Fetcher {
                 if let Ok(ref bytes) = result
                     && bytes.len() <= MAX_SINGLE_ENTRY_BYTES
                 {
-                    if let Ok(mut guard) = cache.lock() {
-                        guard.insert(url.clone(), bytes.clone());
-                    }
+                    cache
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(url.clone(), bytes.clone());
                     if let Some(dir) = disk_dir {
                         let data = bytes.clone();
                         let url_w = url.clone();

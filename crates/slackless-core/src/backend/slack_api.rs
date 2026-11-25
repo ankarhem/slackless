@@ -1,11 +1,12 @@
-//! [`Backend`] implementation backed by the real [`SlackApi`] HTTP client.
+//! Domain backend trait implementations backed by the real [`SlackApi`] HTTP client.
 
 use std::collections::HashMap;
 
 use crate::api::{
-    self, ActionContainer, ActivityEntry, ActivityFeed, ChannelBookmark, ClientCounts, FilesFilter,
-    MessageContent, Page, PinnedItem, PostedMessage, ScheduledMessage, ScheduledMessageCreated,
-    SearchMessages, SearchOpts, SectionCreated, SlackApi, ThreadsView, UploadFile, UserBoot,
+    self, ActionContainer, ActivityEntry, ActivityFeed, BlockSuggestionsRequest, ChannelBookmark,
+    ClientCounts, FilesFilter, MessageContent, Page, PinnedItem, PostedMessage, ScheduledMessage,
+    ScheduledMessageCreated, SearchMessages, SearchOpts, SectionCreated, SlackApi, ThreadsView,
+    UploadFile, UserBoot,
 };
 use crate::types::{
     BotId, BotProfile, ChannelId, ChannelSection, Conversation, DndStatus, File, Message, Team,
@@ -13,10 +14,12 @@ use crate::types::{
 };
 
 use super::slack_api_helpers as helpers;
-use super::{ACTIVITY_PAGE_LIMIT, Backend, THREADS_PAGE_LIMIT};
+use super::{
+    ACTIVITY_PAGE_LIMIT, ChannelsBackend, CollabBackend, FilesBackend, HuddleBackend,
+    MessagingBackend, THREADS_PAGE_LIMIT, UsersBackend, WorkspaceBackend,
+};
 
-impl Backend for SlackApi {
-    // --- Boot, workspace & sidebar ---
+impl WorkspaceBackend for SlackApi {
     async fn user_boot(&self) -> api::Result<UserBoot> {
         self.client_user_boot().await
     }
@@ -47,35 +50,14 @@ impl Backend for SlackApi {
     async fn auth_revoke(&self) -> api::Result<()> {
         SlackApi::auth_revoke(self).await
     }
+}
 
-    // --- Conversations, history, sections & tabs ---
-    async fn history_page(
-        &self,
-        channel: ChannelId,
-        latest: Option<Ts>,
-        cursor: Option<String>,
-    ) -> api::Result<Page<Message>> {
-        helpers::history_page(self, channel, latest, cursor).await
-    }
-    async fn replies_page(
-        &self,
-        channel: ChannelId,
-        thread_ts: Ts,
-        cursor: Option<String>,
-    ) -> api::Result<Page<Message>> {
-        helpers::replies_page(self, channel, thread_ts, cursor).await
-    }
+impl ChannelsBackend for SlackApi {
     async fn conversation_info(&self, channel: ChannelId) -> api::Result<Conversation> {
         self.conversations_info(&channel).await
     }
     async fn conversation_members(&self, channel: ChannelId) -> api::Result<Vec<UserId>> {
         self.conversations_members_all(&channel).await
-    }
-    async fn latest_message(&self, channel: ChannelId) -> api::Result<Option<Message>> {
-        helpers::latest_message(self, channel).await
-    }
-    async fn recent_history(&self, channel: ChannelId, limit: u32) -> api::Result<Vec<Message>> {
-        helpers::recent_history(self, channel, limit).await
     }
     async fn leave_conversation(&self, channel: ChannelId) -> api::Result<()> {
         self.conversations_leave(&channel).await
@@ -163,8 +145,31 @@ impl Backend for SlackApi {
         self.conversations_move_tab(&channel, &tab_id, after.as_deref())
             .await
     }
+}
 
-    // --- Messaging, reactions, threads, activity, drafts, scheduled, pins, bookmarks, saved ---
+impl MessagingBackend for SlackApi {
+    async fn history_page(
+        &self,
+        channel: ChannelId,
+        latest: Option<Ts>,
+        cursor: Option<String>,
+    ) -> api::Result<Page<Message>> {
+        helpers::history_page(self, channel, latest, cursor).await
+    }
+    async fn replies_page(
+        &self,
+        channel: ChannelId,
+        thread_ts: Ts,
+        cursor: Option<String>,
+    ) -> api::Result<Page<Message>> {
+        helpers::replies_page(self, channel, thread_ts, cursor).await
+    }
+    async fn latest_message(&self, channel: ChannelId) -> api::Result<Option<Message>> {
+        helpers::latest_message(self, channel).await
+    }
+    async fn recent_history(&self, channel: ChannelId, limit: u32) -> api::Result<Vec<Message>> {
+        helpers::recent_history(self, channel, limit).await
+    }
     async fn post_message(
         &self,
         channel: ChannelId,
@@ -349,8 +354,9 @@ impl Backend for SlackApi {
     async fn save_file(&self, file_id: String, date_due: Option<u64>) -> api::Result<()> {
         self.saved_add_file(&file_id, date_due).await
     }
+}
 
-    // --- Users, bots, profiles, presence, prefs, DND & usergroups ---
+impl UsersBackend for SlackApi {
     async fn user_info(&self, user: UserId) -> api::Result<User> {
         self.users_info(&user).await
     }
@@ -438,40 +444,9 @@ impl Backend for SlackApi {
     async fn usergroups(&self) -> api::Result<Vec<Usergroup>> {
         self.usergroups_list().await
     }
+}
 
-    // --- Search, GIFs, files, canvases, lists, app home, workflows & modals ---
-    async fn search(&self, query: String) -> api::Result<SearchMessages> {
-        self.search_messages(&query, &SearchOpts::default()).await
-    }
-    async fn edge_search(
-        &self,
-        team_id: TeamId,
-        query: String,
-    ) -> api::Result<api::EdgeSearchResults> {
-        helpers::edge_search(self, team_id, query).await
-    }
-    async fn search_remote_messages(
-        &self,
-        query: String,
-        sort: api::SearchSort,
-        page: usize,
-    ) -> api::Result<api::RemoteMessagePage> {
-        SlackApi::search_modules_messages(self, &query, sort, page).await
-    }
-    async fn search_remote_files(
-        &self,
-        query: String,
-        sort: api::SearchSort,
-        page: usize,
-    ) -> api::Result<api::RemoteFilePage> {
-        SlackApi::search_modules_files(self, &query, sort, page).await
-    }
-    async fn gif_featured(&self, limit: u32) -> api::Result<Vec<api::GifItem>> {
-        SlackApi::gif_featured(self, limit).await
-    }
-    async fn gif_search(&self, query: String, limit: u32) -> api::Result<Vec<api::GifItem>> {
-        SlackApi::gif_search(self, &query, limit).await
-    }
+impl FilesBackend for SlackApi {
     async fn files(&self, filter: FilesFilter) -> api::Result<Vec<File>> {
         helpers::files(self, filter).await
     }
@@ -523,6 +498,41 @@ impl Backend for SlackApi {
     }
     async fn files_undelete(&self, file_id: String) -> api::Result<()> {
         SlackApi::files_undelete(self, &file_id).await
+    }
+}
+
+impl CollabBackend for SlackApi {
+    async fn search(&self, query: String) -> api::Result<SearchMessages> {
+        self.search_messages(&query, &SearchOpts::default()).await
+    }
+    async fn edge_search(
+        &self,
+        team_id: TeamId,
+        query: String,
+    ) -> api::Result<api::EdgeSearchResults> {
+        helpers::edge_search(self, team_id, query).await
+    }
+    async fn search_remote_messages(
+        &self,
+        query: String,
+        sort: api::SearchSort,
+        page: usize,
+    ) -> api::Result<api::RemoteMessagePage> {
+        SlackApi::search_modules_messages(self, &query, sort, page).await
+    }
+    async fn search_remote_files(
+        &self,
+        query: String,
+        sort: api::SearchSort,
+        page: usize,
+    ) -> api::Result<api::RemoteFilePage> {
+        SlackApi::search_modules_files(self, &query, sort, page).await
+    }
+    async fn gif_featured(&self, limit: u32) -> api::Result<Vec<api::GifItem>> {
+        SlackApi::gif_featured(self, limit).await
+    }
+    async fn gif_search(&self, query: String, limit: u32) -> api::Result<Vec<api::GifItem>> {
+        SlackApi::gif_search(self, &query, limit).await
     }
     async fn create_canvas(&self, channel: ChannelId) -> api::Result<String> {
         helpers::create_canvas(self, channel).await
@@ -681,29 +691,21 @@ impl Backend for SlackApi {
     }
     async fn block_suggestions(
         &self,
-        bot: BotId,
-        app_id: String,
-        team: TeamId,
-        action_id: String,
-        block_id: String,
-        value: String,
-        container: ActionContainer,
+        req: BlockSuggestionsRequest<'_>,
     ) -> api::Result<Vec<(String, String)>> {
-        self.blocks_suggestions(
-            &bot, &app_id, &team, &action_id, &block_id, &value, &container,
-        )
-        .await
+        self.blocks_suggestions_for(&req).await
     }
+}
 
-    // --- Huddles ---
+impl HuddleBackend for SlackApi {
     async fn rooms_join(&self, channel: ChannelId) -> api::Result<api::RoomJoinResponse> {
         SlackApi::rooms_join(self, &channel, None, None).await
     }
     async fn rooms_notify_member(&self, channel: ChannelId, user: UserId) -> api::Result<()> {
         SlackApi::rooms_notify_member(self, &channel, &user).await
     }
-    async fn rooms_get_link(&self, channel: ChannelId) -> api::Result<String> {
-        helpers::rooms_get_link(self, channel).await
+    async fn rooms_get_link(&self, workspace: TeamId, channel: ChannelId) -> api::Result<String> {
+        helpers::rooms_get_link(self, workspace, channel).await
     }
     async fn rooms_rename(&self, room_id: String, name: String) -> api::Result<()> {
         SlackApi::rooms_rename(self, &room_id, &name).await

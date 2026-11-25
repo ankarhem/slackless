@@ -11,13 +11,28 @@ pub(super) use huddle::spawn_huddle_watcher;
 pub(super) use offline::QueuedMutation;
 
 use super::*;
-use crate::huddle::HuddleControl;
 
 impl<B: Backend> Core<B> {
-    pub(super) fn handle(&mut self, command: Command) {
-        if self.enqueue_or_run(&command) {
+    pub(super) async fn handle(&mut self, command: Command) {
+        // Stealth mode MUST be enforced before `enqueue_or_run` so offline `MarkRead` commands
+        // are never persisted into the offline queue and flushed on reconnect.
+        if self.stealth_mode.load(Ordering::Relaxed)
+            && matches!(
+                command,
+                Command::MarkRead { .. }
+                    | Command::MarkThreadRead { .. }
+                    | Command::MarkAllRead
+                    | Command::Typing { .. }
+            )
+        {
             return;
         }
+        if self.enqueue_or_run(&command).await {
+            return;
+        }
+        let Some(command) = self.try_dispatch_huddle_control(command) else {
+            return;
+        };
         match command {
             // --- Conversations, channels, sections, tabs, users, profile, DND, usergroups ---
             Command::OpenConversation(channel) => self.open_conversation(channel),
@@ -74,16 +89,16 @@ impl<B: Backend> Core<B> {
             Command::LoadTeamDnd(users) => self.load_team_dnd(users),
             Command::UpdateProfile { update } => self.update_profile(update),
             Command::SetPresence { away } => {
-                if away || !self.stealth_mode {
+                if away || !self.stealth_mode.load(Ordering::Relaxed) {
                     self.set_presence(away);
                 }
             }
             Command::SetStealthMode(enabled) => {
-                self.stealth_mode = enabled;
+                self.stealth_mode.store(enabled, Ordering::Relaxed);
             }
             Command::SetSaveHuddleTranscripts(enabled) => {
                 self.save_huddle_transcripts
-                    .store(enabled, std::sync::atomic::Ordering::Relaxed);
+                    .store(enabled, Ordering::Relaxed);
             }
             Command::SetUserPref { name, value } => self.set_user_pref(name, value),
             Command::FetchUserProfile(user) => self.fetch_user_profile(user),
@@ -326,88 +341,54 @@ impl<B: Backend> Core<B> {
                 block_id,
                 value,
                 container,
-            } => self.block_suggestions(
-                key, bot, app_id, team, action_id, block_id, value, container,
-            ),
+            } => self.block_suggestions(collab::BlockSuggestionsParams {
+                key,
+                bot,
+                app_id,
+                team,
+                action_id,
+                block_id,
+                value,
+                container,
+            }),
 
             // --- Offline mutation queue ---
-            Command::RetryOfflineMutation(id) => self.retry_offline_mutation(id),
-            Command::DiscardOfflineMutation(id) => self.discard_offline_mutation(id),
+            Command::RetryOfflineMutation(id) => self.retry_offline_mutation(id).await,
+            Command::DiscardOfflineMutation(id) => self.discard_offline_mutation(id).await,
 
-            // --- Huddles ---
+            // --- Huddles (lifecycle / REST; media controls handled above) ---
             Command::JoinHuddle { channel, audio } => self.join_huddle(channel, audio),
             Command::LeaveHuddle => self.leave_huddle(),
-            Command::SetHuddleMuted(muted) => {
-                self.send_huddle_control(HuddleControl::SetMuted(muted));
-            }
-            Command::SetHuddleAudioDevices { input, output } => {
-                self.send_huddle_control(HuddleControl::SetAudioDevices { input, output });
-            }
-            Command::SetHuddleAudioProcessing { aec, ns, agc } => {
-                self.send_huddle_control(HuddleControl::SetAudioProcessing { aec, ns, agc });
-            }
             Command::InviteToHuddle { channel, users } => self.invite_to_huddle(channel, users),
             Command::CopyHuddleLink { channel } => self.copy_huddle_link(channel),
             Command::TestHuddleSpeaker { output_device } => {
                 self.test_huddle_speaker(output_device);
-            }
-            Command::SetHuddleCamera {
-                enabled,
-                device_index,
-                blur,
-            } => self.send_huddle_control(HuddleControl::SetCamera {
-                enabled,
-                device_index,
-                blur,
-            }),
-            Command::SetHuddleBlurBackground(blur) => {
-                self.send_huddle_control(HuddleControl::SetBlurBackground(blur));
-            }
-            Command::SetHuddleScreenShare {
-                source_id,
-                share_audio,
-            } => self.send_huddle_control(HuddleControl::SetScreenShare {
-                source_id,
-                share_audio,
-            }),
-            Command::SendHuddleReaction {
-                emoji,
-                kind,
-                emoji_url,
-            } => self.send_huddle_control(HuddleControl::SendReaction {
-                emoji,
-                kind,
-                emoji_url,
-            }),
-            Command::SetHuddleHandRaised(raised) => {
-                self.send_huddle_control(HuddleControl::SetHandRaised(raised));
-            }
-            Command::SetHuddleStickyEmoji(emoji) => {
-                self.send_huddle_control(HuddleControl::SetStickyEmoji(emoji));
-            }
-            Command::SendHuddleDraw(draw) => {
-                self.send_huddle_control(HuddleControl::SendDraw(draw));
-            }
-            Command::SetHuddleJukebox(song) => {
-                self.send_huddle_control(HuddleControl::SetJukebox(song));
-            }
-            Command::MuteHuddlePeer(peer_id) => {
-                self.send_huddle_control(HuddleControl::MutePeer(peer_id));
             }
             Command::SetHuddleTopic(topic) => self.set_huddle_topic(topic),
             Command::SetHuddleBackground(background_id) => {
                 self.set_huddle_background(background_id);
             }
             Command::SetHuddleCaptions(enabled) => self.set_huddle_captions(enabled),
-            Command::SetHuddleAudioOnly(enabled) => {
-                self.send_huddle_control(HuddleControl::SetAudioOnly(enabled));
-            }
             Command::DeclineHuddleInvite { channel, call_id } => {
                 self.decline_huddle_invite(channel, call_id);
             }
 
-            // Handled by the loop.
-            Command::Shutdown => {}
+            // Already handled above or by the loop.
+            Command::HuddleControl(_)
+            | Command::SetHuddleMuted(_)
+            | Command::SetHuddleAudioDevices { .. }
+            | Command::SetHuddleAudioProcessing { .. }
+            | Command::SetHuddleCamera { .. }
+            | Command::SetHuddleBlurBackground(_)
+            | Command::SetHuddleScreenShare { .. }
+            | Command::SendHuddleReaction { .. }
+            | Command::SetHuddleHandRaised(_)
+            | Command::SetHuddleStickyEmoji(_)
+            | Command::SendHuddleDraw(_)
+            | Command::SetHuddleJukebox(_)
+            | Command::MuteHuddlePeer(_)
+            | Command::SetHuddleAudioOnly(_)
+            | Command::Shutdown => {}
         }
     }
 }

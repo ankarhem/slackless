@@ -3,6 +3,10 @@
 
 use super::super::*;
 use crate::api::{ActionContainer, ActivityEntry, MessageContent, SavedMark};
+use crate::reducer::update_conversation_last_read;
+
+/// Prune idle `draft_locks` entries once the per-channel lock map exceeds this threshold.
+const DRAFT_LOCKS_PRUNE_THRESHOLD: usize = 64;
 
 impl<B: Backend> Core<B> {
     pub(super) fn open_thread(&self, channel: ChannelId, thread_ts: Ts) {
@@ -19,54 +23,40 @@ impl<B: Backend> Core<B> {
         thread_ts: Option<Ts>,
         broadcast: bool,
     ) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
-        let unfurls = self.unfurls.clone();
+        let ctx = self.ctx();
         self.spawn("chat.postMessage", async move {
-            let posted = backend
-                .post_message(channel.clone(), content, thread_ts, broadcast)
-                .await?;
-            // Store the echo now; the websocket copy of it is an idempotent re-upsert.
-            if let Some(message) = posted.message {
-                unfurls.resolve(std::slice::from_ref(&message));
-                let target = channel.clone();
-                with_store(&store, move |s| s.upsert_message(&ws, &target, &message)).await?;
-                events.emit(Event::StoreChanged { channel });
-            }
-            Ok(())
+            post_message_and_store(&ctx, channel, content, thread_ts, broadcast).await
         });
     }
 
     // Edits, deletions and reactions reach the store through their websocket echo
     // (`message_changed`, `message_deleted`, `reaction_*`), which carries the edit ts.
     pub(super) fn edit_message(&self, channel: ChannelId, ts: Ts, content: MessageContent) {
-        let backend = self.backend.clone();
+        let ctx = self.ctx();
         self.spawn("chat.update", async move {
-            backend.update_message(channel, ts, content).await?;
+            ctx.backend.update_message(channel, ts, content).await?;
             Ok(())
         });
     }
 
     pub(super) fn delete_message(&self, channel: ChannelId, ts: Ts) {
-        let backend = self.backend.clone();
+        let ctx = self.ctx();
         self.spawn("chat.delete", async move {
-            Ok(backend.delete_message(channel, ts).await?)
+            Ok(ctx.backend.delete_message(channel, ts).await?)
         });
     }
 
     pub(super) fn add_reaction(&self, channel: ChannelId, ts: Ts, name: String) {
-        let backend = self.backend.clone();
+        let ctx = self.ctx();
         self.spawn("reactions.add", async move {
-            Ok(backend.add_reaction(channel, ts, name).await?)
+            Ok(ctx.backend.add_reaction(channel, ts, name).await?)
         });
     }
 
     pub(super) fn remove_reaction(&self, channel: ChannelId, ts: Ts, name: String) {
-        let backend = self.backend.clone();
+        let ctx = self.ctx();
         self.spawn("reactions.remove", async move {
-            Ok(backend.remove_reaction(channel, ts, name).await?)
+            Ok(ctx.backend.remove_reaction(channel, ts, name).await?)
         });
     }
 
@@ -77,16 +67,15 @@ impl<B: Backend> Core<B> {
         args: String,
         thread_ts: Option<Ts>,
     ) {
-        let backend = self.backend.clone();
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("chat.command", async move {
-            let ran = backend
-                .run_command(channel, command.clone(), args, thread_ts, ws)
+            let ran = ctx
+                .backend
+                .run_command(channel, command.clone(), args, thread_ts, ctx.workspace)
                 .await;
             match ran {
                 Err(ApiError::Slack(error)) => {
-                    events.emit(Event::CommandFailed { command, error });
+                    ctx.events.emit(Event::CommandFailed { command, error });
                     Ok(())
                 }
                 ran => Ok(ran?),
@@ -102,56 +91,45 @@ impl<B: Backend> Core<B> {
         action: serde_json::Value,
         container: ActionContainer,
     ) {
-        let backend = self.backend.clone();
-        let ws = self.workspace.clone();
+        let ctx = self.ctx();
         self.spawn("blocks.actions", async move {
-            let team = team.unwrap_or(ws);
-            Ok(backend
+            let team = team.unwrap_or(ctx.workspace);
+            Ok(ctx
+                .backend
                 .block_action(bot, app_id, team, action, container)
                 .await?)
         });
     }
 
     pub(super) fn mark_read(&self, channel: ChannelId, ts: Ts) {
-        if self.stealth_mode {
+        if self.stealth_mode.load(Ordering::Relaxed) {
             return;
         }
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.mark", async move {
-            backend.mark_read(channel.clone(), ts.clone()).await?;
-            let _ = with_store(&store, move |s| {
-                if let Some(mut conv) = s.conversation(&ws, &channel)? {
-                    conv.last_read = Some(ts);
-                    s.upsert_conversation(&ws, &conv)?;
-                }
-                Ok::<_, StoreError>(())
-            })
-            .await;
-            Ok(())
+            mark_read_and_store(&ctx, channel, ts).await
         });
     }
 
     pub(super) fn mark_thread_read(&self, channel: ChannelId, thread_ts: Ts, ts: Ts) {
-        if self.stealth_mode {
+        if self.stealth_mode.load(Ordering::Relaxed) {
             return;
         }
-        let backend = self.backend.clone();
+        let ctx = self.ctx();
         self.spawn("subscriptions.thread.mark", async move {
-            Ok(backend.mark_thread_read(channel, thread_ts, ts).await?)
+            Ok(ctx.backend.mark_thread_read(channel, thread_ts, ts).await?)
         });
     }
 
     pub(super) fn mark_all_read(&self) {
-        if self.stealth_mode {
+        if self.stealth_mode.load(Ordering::Relaxed) {
             return;
         }
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("users.markAllRead", async move {
-            backend.mark_all_read().await?;
-            events.emit(Event::Counts(Box::new(backend.counts().await?)));
+            ctx.backend.mark_all_read().await?;
+            ctx.events
+                .emit(Event::Counts(Box::new(ctx.backend.counts().await?)));
             Ok(())
         });
     }
@@ -163,7 +141,7 @@ impl<B: Backend> Core<B> {
         last_read: Ts,
         subscribed: bool,
     ) {
-        let backend = self.backend.clone();
+        let ctx = self.ctx();
         let backfill = self.backfill.clone();
         let method = if subscribed {
             "subscriptions.thread.add"
@@ -171,7 +149,7 @@ impl<B: Backend> Core<B> {
             "subscriptions.thread.remove"
         };
         self.spawn(method, async move {
-            backend
+            ctx.backend
                 .set_thread_subscribed(channel.clone(), thread_ts.clone(), last_read, subscribed)
                 .await?;
             // The stored root still carries the old follow flag.
@@ -180,29 +158,28 @@ impl<B: Backend> Core<B> {
     }
 
     pub(super) fn fetch_threads(&self) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("subscriptions.thread.getView", async move {
-            let view = Box::new(backend.threads_view().await?);
-            events.emit(Event::ThreadsView(view));
+            let view = Box::new(ctx.backend.threads_view().await?);
+            ctx.events.emit(Event::ThreadsView(view));
             Ok(())
         });
     }
 
     pub(super) fn mark_activity(&self, entries: Vec<ActivityEntry>, read: bool) {
-        let backend = self.backend.clone();
+        let ctx = self.ctx();
         self.spawn("activity.mark", async move {
             if read {
-                backend.activity_mark_read(entries).await?
+                ctx.backend.activity_mark_read(entries).await?
             } else {
-                backend.activity_mark_unread(entries).await?
+                ctx.backend.activity_mark_unread(entries).await?
             }
             Ok(())
         });
     }
 
     pub(super) fn send_typing(&self, channel: ChannelId, thread_ts: Option<Ts>) {
-        if self.stealth_mode {
+        if self.stealth_mode.load(Ordering::Relaxed) {
             return;
         }
         if let Some(Err(e)) = self.rtm.as_ref().map(|r| r.user_typing(channel, thread_ts)) {
@@ -211,49 +188,45 @@ impl<B: Backend> Core<B> {
     }
 
     pub(super) fn load_pins(&self, channel: ChannelId) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("pins.list", async move {
-            let pins = backend.pins(channel.clone()).await;
-            answer_load(&events, pins, |pins| Event::PinsLoaded { channel, pins })
+            let pins = ctx.backend.pins(channel.clone()).await;
+            answer_load(&ctx.events, pins, |pins| Event::PinsLoaded {
+                channel,
+                pins,
+            })
         });
     }
 
     pub(super) fn set_pinned(&self, channel: ChannelId, ts: Ts, pinned: bool) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         let method = if pinned { "pins.add" } else { "pins.remove" };
         self.spawn(method, async move {
-            backend
+            ctx.backend
                 .set_pinned(channel.clone(), ts.clone(), pinned)
                 .await?;
-            let pins = backend.pins(channel.clone()).await;
-            answer_load(&events, pins, |pins| Event::PinsLoaded { channel, pins })
+            let pins = ctx.backend.pins(channel.clone()).await;
+            answer_load(&ctx.events, pins, |pins| Event::PinsLoaded {
+                channel,
+                pins,
+            })
         });
     }
 
     pub(super) fn load_bookmarks(&self, channel: ChannelId) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("bookmarks.list", async move {
-            let bookmarks = backend.bookmarks(channel.clone()).await;
-            answer_load(&events, bookmarks, |bookmarks| Event::BookmarksLoaded {
-                channel,
-                bookmarks,
-            })
+            reload_bookmarks(&ctx.backend, &ctx.events, channel).await
         });
     }
 
     pub(super) fn add_bookmark(&self, channel: ChannelId, title: String, url: String) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("bookmarks.add", async move {
-            backend.add_bookmark(channel.clone(), title, url).await?;
-            let bookmarks = backend.bookmarks(channel.clone()).await;
-            answer_load(&events, bookmarks, |bookmarks| Event::BookmarksLoaded {
-                channel,
-                bookmarks,
-            })
+            ctx.backend
+                .add_bookmark(channel.clone(), title, url)
+                .await?;
+            reload_bookmarks(&ctx.backend, &ctx.events, channel).await
         });
     }
 
@@ -264,32 +237,22 @@ impl<B: Backend> Core<B> {
         url: String,
         parent_id: String,
     ) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("bookmarks.add", async move {
-            backend
+            ctx.backend
                 .add_bookmark_in_folder(channel.clone(), title, url, parent_id)
                 .await?;
-            let bookmarks = backend.bookmarks(channel.clone()).await;
-            answer_load(&events, bookmarks, |bookmarks| Event::BookmarksLoaded {
-                channel,
-                bookmarks,
-            })
+            reload_bookmarks(&ctx.backend, &ctx.events, channel).await
         });
     }
 
     pub(super) fn remove_bookmark(&self, channel: ChannelId, bookmark_id: String) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("bookmarks.remove", async move {
-            backend
+            ctx.backend
                 .remove_bookmark(channel.clone(), bookmark_id)
                 .await?;
-            let bookmarks = backend.bookmarks(channel.clone()).await;
-            answer_load(&events, bookmarks, |bookmarks| Event::BookmarksLoaded {
-                channel,
-                bookmarks,
-            })
+            reload_bookmarks(&ctx.backend, &ctx.events, channel).await
         });
     }
 
@@ -300,28 +263,25 @@ impl<B: Backend> Core<B> {
         content: MessageContent,
         thread_ts: Option<Ts>,
     ) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("chat.scheduleMessage", async move {
-            let created = backend
+            let created = ctx
+                .backend
                 .schedule_message(channel.clone(), post_at, content, thread_ts)
                 .await?;
-            events.emit(Event::MessageScheduled {
+            ctx.events.emit(Event::MessageScheduled {
                 channel: created.channel,
                 scheduled_message_id: created.scheduled_message_id,
                 post_at: created.post_at,
             });
-            let list = backend.scheduled_messages().await;
-            answer_load(&events, list, Event::ScheduledMessagesLoaded)
+            reload_scheduled_messages(&ctx.backend, &ctx.events).await
         });
     }
 
     pub(super) fn load_scheduled_messages(&self) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("chat.scheduledMessages.list", async move {
-            let list = backend.scheduled_messages().await;
-            answer_load(&events, list, Event::ScheduledMessagesLoaded)
+            reload_scheduled_messages(&ctx.backend, &ctx.events).await
         });
     }
 
@@ -330,42 +290,44 @@ impl<B: Backend> Core<B> {
         channel: ChannelId,
         scheduled_message_id: String,
     ) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("chat.deleteScheduledMessage", async move {
-            backend
+            ctx.backend
                 .delete_scheduled_message(channel, scheduled_message_id)
                 .await?;
-            let list = backend.scheduled_messages().await;
-            answer_load(&events, list, Event::ScheduledMessagesLoaded)
+            reload_scheduled_messages(&ctx.backend, &ctx.events).await
         });
     }
 
     pub(super) fn fetch_cloud_drafts(&self) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         let draft_ids = Arc::clone(&self.cloud_draft_ids);
         self.spawn("drafts.list", async move {
-            let drafts = backend.drafts_list().await?;
-            if let Ok(mut guard) = draft_ids.lock() {
+            let drafts = ctx.backend.drafts_list().await?;
+            {
+                let mut guard = draft_ids.lock().unwrap_or_else(PoisonError::into_inner);
                 guard.clear();
                 for d in &drafts {
                     guard.insert(d.channel.clone(), d.id.clone());
                 }
             }
-            events.emit(Event::CloudDrafts(drafts));
+            ctx.events.emit(Event::CloudDrafts(drafts));
             Ok(())
         });
     }
 
     pub(super) fn sync_draft(&self, channel: ChannelId, text: String) {
-        let backend = self.backend.clone();
+        let ctx = self.ctx();
         let draft_ids = Arc::clone(&self.cloud_draft_ids);
+        let draft_locks = Arc::clone(&self.draft_locks);
         let channel_lock = {
             let mut locks = self
                 .draft_locks
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            if locks.len() > DRAFT_LOCKS_PRUNE_THRESHOLD {
+                locks.retain(|k, v| k == &channel || Arc::strong_count(v) > 1);
+            }
             Arc::clone(
                 locks
                     .entry(channel.clone())
@@ -374,30 +336,73 @@ impl<B: Backend> Core<B> {
         };
         self.spawn("drafts.sync", async move {
             let _permit = channel_lock.lock().await;
-            let existing = draft_ids.lock().ok().and_then(|g| g.get(&channel).cloned());
-            if text.trim().is_empty() {
-                if let Some(id) = existing
-                    && backend.drafts_delete(id).await.is_ok()
-                    && let Ok(mut guard) = draft_ids.lock()
-                {
-                    guard.remove(&channel);
+            let existing = draft_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&channel)
+                .cloned();
+            let result = if text.trim().is_empty() {
+                if let Some(id) = existing {
+                    match ctx.backend.drafts_delete(id).await {
+                        Ok(()) => {
+                            draft_ids
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .remove(&channel);
+                            Ok(())
+                        }
+                        Err(e) if e.is_auth_expired() => Err(e),
+                        Err(e) => {
+                            tracing::debug!(%channel, %e, "drafts.delete failed");
+                            Ok(())
+                        }
+                    }
+                } else {
+                    Ok(())
                 }
             } else if let Some(id) = existing {
-                let _ = backend.drafts_update(id, channel, text).await;
-            } else if let Ok(Some(new_id)) = backend.drafts_create(channel.clone(), text).await
-                && let Ok(mut guard) = draft_ids.lock()
+                match ctx.backend.drafts_update(id, channel.clone(), text).await {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.is_auth_expired() => Err(e),
+                    Err(e) => {
+                        tracing::debug!(%channel, %e, "drafts.update failed");
+                        Ok(())
+                    }
+                }
+            } else {
+                match ctx.backend.drafts_create(channel.clone(), text).await {
+                    Ok(Some(new_id)) => {
+                        draft_ids
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(channel.clone(), new_id);
+                        Ok(())
+                    }
+                    Ok(None) => Ok(()),
+                    Err(e) if e.is_auth_expired() => Err(e),
+                    Err(e) => {
+                        tracing::debug!(%channel, %e, "drafts.create failed");
+                        Ok(())
+                    }
+                }
+            };
+            drop(_permit);
+            // Prune idle channel locks when map grows large.
             {
-                guard.insert(channel, new_id);
+                let mut locks = draft_locks.lock().unwrap_or_else(PoisonError::into_inner);
+                if locks.len() > DRAFT_LOCKS_PRUNE_THRESHOLD {
+                    locks.retain(|_, v| Arc::strong_count(v) > 1);
+                }
             }
-            Ok(())
+            Ok(result?)
         });
     }
 
     pub(super) fn save_item(&self, channel: ChannelId, ts: Ts, date_due: Option<u64>) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("saved.add", async move {
-            match backend
+            match ctx
+                .backend
                 .saved_add(channel.clone(), ts.clone(), date_due)
                 .await
             {
@@ -406,30 +411,27 @@ impl<B: Backend> Core<B> {
                     if error == "already_saved" || error == "already_exists" =>
                 {
                     if let Some(due) = date_due {
-                        backend
+                        ctx.backend
                             .saved_update(channel, ts, None, Some(Some(due)))
                             .await?;
                     }
                 }
                 Err(e) => return Err(e.into()),
             }
-            let loaded = load_saved_items(&backend, &events).await;
-            answer_load(&events, loaded, Event::SavedLoaded)
+            reload_saved(&ctx.backend, &ctx.events).await
         });
     }
 
     pub(super) fn save_file(&self, file_id: String, date_due: Option<u64>) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("saved.add(file)", async move {
-            match backend.save_file(file_id, date_due).await {
+            match ctx.backend.save_file(file_id, date_due).await {
                 Ok(()) => {}
                 Err(ApiError::Slack(ref error))
                     if error == "already_saved" || error == "already_exists" => {}
                 Err(e) => return Err(e.into()),
             }
-            let loaded = load_saved_items(&backend, &events).await;
-            answer_load(&events, loaded, Event::SavedLoaded)
+            reload_saved(&ctx.backend, &ctx.events).await
         });
     }
 
@@ -440,32 +442,98 @@ impl<B: Backend> Core<B> {
         mark: Option<SavedMark>,
         date_due: Option<Option<u64>>,
     ) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("saved.update", async move {
-            backend.saved_update(channel, ts, mark, date_due).await?;
-            let loaded = load_saved_items(&backend, &events).await;
-            answer_load(&events, loaded, Event::SavedLoaded)
+            ctx.backend
+                .saved_update(channel, ts, mark, date_due)
+                .await?;
+            reload_saved(&ctx.backend, &ctx.events).await
         });
     }
 
     pub(super) fn delete_saved_item(&self, channel: ChannelId, ts: Ts) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("saved.delete", async move {
-            backend.saved_delete(channel, ts).await?;
-            let loaded = load_saved_items(&backend, &events).await;
-            answer_load(&events, loaded, Event::SavedLoaded)
+            ctx.backend.saved_delete(channel, ts).await?;
+            reload_saved(&ctx.backend, &ctx.events).await
         });
     }
 
     pub(super) fn clear_completed_saved(&self) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("saved.clearCompleted", async move {
-            backend.saved_clear_completed().await?;
-            let loaded = load_saved_items(&backend, &events).await;
-            answer_load(&events, loaded, Event::SavedLoaded)
+            ctx.backend.saved_clear_completed().await?;
+            reload_saved(&ctx.backend, &ctx.events).await
         });
     }
+}
+
+/// Post a message to Slack, store the echoed message locally, resolve unfurls, and emit
+/// [`Event::StoreChanged`]. Shared by online [`Core::send_message`] and offline queue flushing.
+pub(super) async fn post_message_and_store<B: Backend>(
+    ctx: &TaskCtx<B>,
+    channel: ChannelId,
+    content: MessageContent,
+    thread_ts: Option<Ts>,
+    broadcast: bool,
+) -> Result<(), CoreError> {
+    let posted = ctx
+        .backend
+        .post_message(channel.clone(), content, thread_ts, broadcast)
+        .await?;
+    if let Some(message) = posted.message {
+        ctx.unfurls.resolve(std::slice::from_ref(&message));
+        let target = channel.clone();
+        let ws = ctx.workspace.clone();
+        with_store(&ctx.store, move |s| {
+            s.upsert_message(&ws, &target, &message)
+        })
+        .await?;
+        ctx.events.emit(Event::StoreChanged { channel });
+    }
+    Ok(())
+}
+
+/// Mark a conversation read on Slack and mirror `last_read` into the local store. Shared by
+/// online [`Core::mark_read`] and offline queue flushing.
+pub(super) async fn mark_read_and_store<B: Backend>(
+    ctx: &TaskCtx<B>,
+    channel: ChannelId,
+    ts: Ts,
+) -> Result<(), CoreError> {
+    ctx.backend.mark_read(channel.clone(), ts.clone()).await?;
+    let ws = ctx.workspace.clone();
+    if let Err(err) = with_store(&ctx.store, move |s| {
+        update_conversation_last_read(s, &ws, &channel, ts, None)
+    })
+    .await
+    {
+        tracing::warn!(%err, "failed to persist last_read after conversations.mark");
+    }
+    Ok(())
+}
+
+async fn reload_bookmarks<B: Backend>(
+    backend: &B,
+    events: &Emitter,
+    channel: ChannelId,
+) -> Result<(), CoreError> {
+    let bookmarks = backend.bookmarks(channel.clone()).await;
+    answer_load(events, bookmarks, |bookmarks| Event::BookmarksLoaded {
+        channel,
+        bookmarks,
+    })
+}
+
+async fn reload_scheduled_messages<B: Backend>(
+    backend: &B,
+    events: &Emitter,
+) -> Result<(), CoreError> {
+    let list = backend.scheduled_messages().await;
+    answer_load(events, list, Event::ScheduledMessagesLoaded)
+}
+
+async fn reload_saved<B: Backend>(backend: &B, events: &Emitter) -> Result<(), CoreError> {
+    let loaded = load_saved_items(backend, events).await;
+    answer_load(events, loaded, Event::SavedLoaded)
 }

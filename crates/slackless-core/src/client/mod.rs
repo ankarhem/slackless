@@ -9,6 +9,7 @@ use self::hydrate::*;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
@@ -19,12 +20,15 @@ use tokio::task::AbortHandle;
 use crate::api::{ApiError, SlackApi};
 use crate::auth::Session;
 use crate::backend::Backend;
-use crate::backfill::{Backfill, PAGE_DELAY, SyncedMap, wait_out_rate_limits};
+use crate::backfill::{
+    BACKFILL_SYNCED_KEY, Backfill, PAGE_DELAY, SyncedMap, decode_synced_spans, wait_out_rate_limits,
+};
 use crate::fetcher::Fetcher;
 use crate::rtm::ConnectionState;
 use crate::rtm::{ConnectParams, RtmClient, RtmConfig, RtmEvent};
 use crate::store::{SearchQuery, Store, StoreError};
 use crate::types::event::MessageEvent;
+use crate::types::time::now_epoch_secs;
 use crate::types::{
     BotId, BotProfile, ChannelId, ConversationKind, Message, MessageSubtype, SlackEvent, TeamId,
     Ts, UserId,
@@ -59,10 +63,11 @@ fn shared_runtime() -> std::io::Result<&'static tokio::runtime::Runtime> {
 impl Client {
     /// Starts the core for one signed-in workspace on a shared multi-thread tokio runtime.
     ///
-    /// Hydrates the store (`client.userBoot`, `client.counts`), connects the websocket and feeds
-    /// every inbound event into `store`, then serves [`Command`]s until [`Command::Shutdown`] or
-    /// until every command sender is dropped. The caller opens `store` (on disk for real sessions)
-    /// so the location stays a front-end decision.
+    /// Connects the websocket immediately and hydrates the store (`client.userBoot`,
+    /// `client.counts`, ...) concurrently in the background, feeding every inbound event into
+    /// `store` and serving [`Command`]s until [`Command::Shutdown`] or until every command sender
+    /// is dropped. The caller opens `store` (on disk for real sessions) so the location stays a
+    /// front-end decision.
     pub fn start(session: Session, store: Store) -> std::io::Result<ClientHandle> {
         let store: SharedStore = Arc::new(Mutex::new(store));
         let (command_tx, command_rx) = mpsc::unbounded();
@@ -171,6 +176,8 @@ pub(crate) enum CoreError {
     Api(#[from] ApiError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error("background task cancelled")]
+    Cancelled,
 }
 
 /// The event sender.
@@ -184,15 +191,129 @@ impl Emitter {
     }
 
     pub fn report(&self, context: &str, err: CoreError) {
-        self.emit(match err {
-            CoreError::Api(ApiError::AuthExpired(code)) => Event::AuthExpired(code),
-            err => Event::Error(format!("{context}: {err}")),
-        });
+        match err {
+            CoreError::Cancelled => {
+                tracing::debug!(context, "core task cancelled");
+            }
+            CoreError::Api(ApiError::AuthExpired(code)) => {
+                self.emit(Event::AuthExpired(code));
+            }
+            err => {
+                self.emit(Event::Error(format!("{context}: {err}")));
+            }
+        }
     }
 }
 
-/// Runs `f` against the store on tokio's blocking pool.
-pub(crate) async fn with_store<T, F>(store: &SharedStore, f: F) -> T
+/// Structured concurrency registry: tracks all background tasks spawned by a [`Core`] instance
+/// (removing each entry automatically on completion or abort) so [`Core::shutdown`] cancels every
+/// in-flight task cleanly instead of leaking onto the shared runtime.
+#[derive(Clone, Default)]
+pub(crate) struct TaskTracker {
+    inner: Arc<Mutex<TaskRegistry>>,
+}
+
+#[derive(Default)]
+struct TaskRegistry {
+    closed: bool,
+    next_id: u64,
+    handles: HashMap<u64, AbortHandle>,
+}
+
+struct RemoveOnDrop {
+    inner: Arc<Mutex<TaskRegistry>>,
+    id: u64,
+}
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .handles
+            .remove(&self.id);
+    }
+}
+
+impl TaskTracker {
+    /// Spawn `fut` on the current tokio runtime and register its [`AbortHandle`] until completion
+    /// or [`Self::abort_all`]. Returns `None` once shutdown has closed the tracker.
+    pub(crate) fn spawn<F>(&self, fut: F) -> Option<AbortHandle>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let mut reg = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if reg.closed {
+            return None;
+        }
+        let id = reg.next_id;
+        reg.next_id = reg.next_id.wrapping_add(1);
+        let guard = RemoveOnDrop {
+            inner: Arc::clone(&self.inner),
+            id,
+        };
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            fut.await;
+        });
+        let abort = handle.abort_handle();
+        reg.handles.insert(id, abort.clone());
+        Some(abort)
+    }
+
+    /// Close the tracker and abort every tracked background task.
+    pub(crate) fn abort_all(&self) {
+        let handles: Vec<AbortHandle> = {
+            let mut reg = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            reg.closed = true;
+            reg.handles.drain().map(|(_, h)| h).collect()
+        };
+        for handle in handles {
+            handle.abort();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .handles
+            .len()
+    }
+}
+
+/// Lightweight cloned context handed to spawned command/background tasks, eliminating repeated
+/// multi-field clone preambles across handlers.
+#[derive(Clone)]
+pub(super) struct TaskCtx<B: Backend> {
+    pub backend: B,
+    pub store: SharedStore,
+    pub workspace: TeamId,
+    pub events: Emitter,
+    pub unfurls: Unfurls<B>,
+}
+
+/// Runs a fallible store closure on tokio's blocking pool without panicking on cancellation.
+pub(crate) async fn with_store<T, F>(store: &SharedStore, f: F) -> Result<T, CoreError>
+where
+    F: FnOnce(&mut Store) -> crate::store::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let store = Arc::clone(store);
+    let task = tokio::task::spawn_blocking(move || {
+        f(&mut store.lock().unwrap_or_else(PoisonError::into_inner))
+    });
+    match task.await {
+        Ok(res) => res.map_err(CoreError::Store),
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(_) => Err(CoreError::Cancelled),
+    }
+}
+
+/// Runs an infallible store closure on tokio's blocking pool, returning `None` if cancelled during
+/// shutdown (only resuming unwinds on actual panics).
+pub(crate) async fn with_store_opt<T, F>(store: &SharedStore, f: F) -> Option<T>
 where
     F: FnOnce(&mut Store) -> T + Send + 'static,
     T: Send + 'static,
@@ -202,8 +323,9 @@ where
         f(&mut store.lock().unwrap_or_else(PoisonError::into_inner))
     });
     match task.await {
-        Ok(value) => value,
-        Err(e) => std::panic::resume_unwind(e.into_panic()),
+        Ok(value) => Some(value),
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(_) => None,
     }
 }
 
@@ -221,15 +343,16 @@ async fn run_session(
         Ok(api) => api,
         Err(e) => return events.report("api client", e.into()),
     };
-    let mut core = Core::new(api, store, session.team_id.clone(), events.clone());
-    core.hydrate().await;
+    let mut core = Core::new(api, store, session.team_id.clone(), events.clone()).await;
 
+    // Start RTM immediately so live websocket events and front-end commands are responsive while
+    // full workspace hydration runs concurrently in the background.
     let mut config =
         RtmConfig::new(ConnectParams::new(session.xoxc_token.clone()).with_team(&session.team_id));
     config.d_cookie = Some(session.d_cookie.clone());
     let rtm = match RtmClient::new(config) {
         Ok((client, rx, driver)) => {
-            tokio::spawn(driver);
+            core.tasks.spawn(driver);
             core.rtm = Some(client);
             Some(rx)
         }
@@ -238,6 +361,7 @@ async fn run_session(
             None
         }
     };
+    core.spawn_hydrate();
     run(core, commands, rtm).await;
 }
 
@@ -252,7 +376,7 @@ pub(crate) async fn run<B: Backend>(
         tokio::select! {
             command = commands.next() => match command {
                 None | Some(Command::Shutdown) => break,
-                Some(command) => core.handle(command),
+                Some(command) => core.handle(command).await,
             },
             event = next_rtm(&mut rtm) => core.on_rtm(event).await,
         }
@@ -273,7 +397,8 @@ async fn next_rtm(rtm: &mut Option<tokio::sync::mpsc::Receiver<RtmEvent>>) -> Rt
 
 #[derive(Default)]
 pub(super) struct HuddleSlot {
-    pub generation: u64,
+    /// Atomic generation counter checked lock-free by the 60Hz huddle media watcher.
+    pub generation: Arc<AtomicU64>,
     pub joining: bool,
     pub handle: Option<crate::huddle::HuddleHandle>,
     pub call_id: Option<String>,
@@ -288,6 +413,8 @@ pub(crate) struct Core<B: Backend> {
     backfills: HashMap<ChannelId, AbortHandle>,
     /// Names the foreign channels shared-message unfurls point at (shared with `backfill`).
     unfurls: Unfurls<B>,
+    /// Tracks all background tasks spawned by this core so `shutdown` aborts them cleanly.
+    tasks: TaskTracker,
     rtm: Option<RtmClient>,
     /// DM peers whose presence is already covered: fetched once through `users.getPresence`
     /// and subscribed on the websocket. Every `presence_sub` frame replaces the whole
@@ -316,22 +443,29 @@ pub(crate) struct Core<B: Backend> {
     has_connected_once: bool,
     /// Outgoing mutations persisted in SQLite `offline_queue`, flushed FIFO on reconnect.
     offline_queue: VecDeque<(i64, QueuedMutation)>,
-    /// True Stealth Mode: suppresses outbound typing, read-cursor updates, and active presence.
-    stealth_mode: bool,
+    /// True Stealth Mode: suppresses outbound typing, read-cursor updates, and active presence
+    /// (shared atomically with background offline-queue flushers).
+    stealth_mode: Arc<AtomicBool>,
     /// When true (default), persist finalized huddle captions to local SQLite FTS5 (text-only).
-    save_huddle_transcripts: Arc<std::sync::atomic::AtomicBool>,
+    save_huddle_transcripts: Arc<AtomicBool>,
     /// Active native Chime audio huddle session slot (at most one per workspace, guarded by
-    /// generation counter so stale joins/watchers never clobber a newer session).
+    /// atomic generation counter so stale joins/watchers never clobber a newer session).
     huddle: Arc<Mutex<HuddleSlot>>,
 }
 
 impl<B: Backend> Core<B> {
-    pub fn new(backend: B, store: SharedStore, workspace: TeamId, events: Emitter) -> Self {
-        let persisted: VecDeque<(i64, QueuedMutation)> = store
-            .lock()
-            .ok()
-            .and_then(|s| s.list_offline(&workspace).ok())
-            .unwrap_or_default()
+    pub async fn new(backend: B, store: SharedStore, workspace: TeamId, events: Emitter) -> Self {
+        let ws_init = workspace.clone();
+        let (raw_offline, cached_bots, raw_synced) = with_store(&store, move |s| {
+            let offline = s.list_offline(&ws_init).unwrap_or_default();
+            let bots = s.bot_profiles(&ws_init).unwrap_or_default();
+            let synced = s.local(&ws_init, BACKFILL_SYNCED_KEY).unwrap_or_default();
+            Ok((offline, bots, synced))
+        })
+        .await
+        .unwrap_or_default();
+
+        let persisted: VecDeque<(i64, QueuedMutation)> = raw_offline
             .into_iter()
             .filter_map(|(id, payload)| {
                 serde_json::from_str::<QueuedMutation>(&payload)
@@ -342,26 +476,25 @@ impl<B: Backend> Core<B> {
         if !persisted.is_empty() {
             events.emit(Event::OfflineQueueChanged(persisted.len()));
         }
+
+        let tasks = TaskTracker::default();
         let unfurls = Unfurls::new(
             backend.clone(),
             Arc::clone(&store),
             workspace.clone(),
             events.clone(),
+            tasks.clone(),
         );
+        let synced: SyncedMap = Arc::new(Mutex::new(decode_synced_spans(raw_synced)));
         let backfill = Backfill {
             backend: backend.clone(),
             store: Arc::clone(&store),
             workspace: workspace.clone(),
             events: events.clone(),
-            synced: SyncedMap::default(),
+            synced,
             page_delay: PAGE_DELAY,
             unfurls: unfurls.clone(),
         };
-        let cached_bots = store
-            .lock()
-            .ok()
-            .and_then(|s| s.bot_profiles(&workspace).ok())
-            .unwrap_or_default();
         Self {
             backend,
             store,
@@ -370,6 +503,7 @@ impl<B: Backend> Core<B> {
             backfill,
             backfills: HashMap::new(),
             unfurls,
+            tasks,
             rtm: None,
             presence_peers: Arc::new(Mutex::new(Vec::new())),
             users_asked: HashSet::new(),
@@ -382,9 +516,19 @@ impl<B: Backend> Core<B> {
             is_offline: false,
             has_connected_once: false,
             offline_queue: persisted,
-            stealth_mode: false,
-            save_huddle_transcripts: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            stealth_mode: Arc::new(AtomicBool::new(false)),
+            save_huddle_transcripts: Arc::new(AtomicBool::new(true)),
             huddle: Arc::new(Mutex::new(HuddleSlot::default())),
+        }
+    }
+
+    pub(super) fn ctx(&self) -> TaskCtx<B> {
+        TaskCtx {
+            backend: self.backend.clone(),
+            store: Arc::clone(&self.store),
+            workspace: self.workspace.clone(),
+            events: self.events.clone(),
+            unfurls: self.unfurls.clone(),
         }
     }
 
@@ -392,18 +536,13 @@ impl<B: Backend> Core<B> {
     where
         F: Future<Output = Result<(), CoreError>> + Send + 'static,
     {
-        let events = self.events.clone();
-        tokio::spawn(async move {
-            if let Err(e) = task.await {
-                events.report(context, e);
-            }
-        });
+        spawn_tracked(&self.tasks, &self.events, context, task);
     }
 
     async fn shutdown(&mut self) {
         let active = {
             let mut slot = self.huddle.lock().unwrap_or_else(PoisonError::into_inner);
-            slot.generation = slot.generation.wrapping_add(1);
+            slot.generation.fetch_add(1, Ordering::AcqRel);
             slot.joining = false;
             slot.call_id = None;
             slot.handle.take()
@@ -416,17 +555,32 @@ impl<B: Backend> Core<B> {
         for (_, task) in self.backfills.drain() {
             task.abort();
         }
+        self.tasks.abort_all();
         if let Some(rtm) = self.rtm.take() {
             rtm.close();
         }
     }
 }
 
+pub(super) fn spawn_tracked<F>(
+    tasks: &TaskTracker,
+    events: &Emitter,
+    context: &'static str,
+    task: F,
+) where
+    F: Future<Output = Result<(), CoreError>> + Send + 'static,
+{
+    let events = events.clone();
+    tasks.spawn(async move {
+        if let Err(e) = task.await {
+            events.report(context, e);
+        }
+    });
+}
+
 /// Unix seconds now; 0 if the clock is somehow before the epoch.
 fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+    now_epoch_secs()
 }
 
 #[cfg(test)]

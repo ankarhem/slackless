@@ -3,7 +3,27 @@
 use crate::Event;
 use crate::store::{self, Store};
 use crate::types::event::{MessageEvent, ReactionEvent};
-use crate::types::{ChannelId, Reaction, SlackEvent, TeamId, UserId};
+use crate::types::{ChannelId, Reaction, SlackEvent, TeamId, Ts, UserId};
+
+/// Update a stored conversation's `last_read` (and optionally `unread_count_display`) without
+/// clobbering other metadata. Shared across RTM read-marker events, online `mark_read`, and
+/// offline queue flush.
+pub(crate) fn update_conversation_last_read(
+    store: &mut Store,
+    ws: &TeamId,
+    channel: &ChannelId,
+    ts: Ts,
+    unread_count: Option<u32>,
+) -> store::Result<()> {
+    if let Some(mut conv) = store.conversation(ws, channel)? {
+        conv.last_read = Some(ts);
+        if let Some(unread) = unread_count {
+            conv.unread_count_display = Some(unread);
+        }
+        store.upsert_conversation(ws, &conv)?;
+    }
+    Ok(())
+}
 
 /// Applies one websocket event to the store and says what changed.
 ///
@@ -23,7 +43,7 @@ fn apply(store: &mut Store, ws: &TeamId, event: SlackEvent) -> store::Result<Opt
         | SlackEvent::ChannelJoined(e)
         | SlackEvent::ChannelRename(e)
         | SlackEvent::GroupRename(e) => {
-            store.upsert_conversation(ws, &e.channel)?;
+            store.merge_conversation(ws, &e.channel)?;
             Some(Event::Conversations(vec![e.channel.id.clone()]))
         }
         SlackEvent::UserChange(e)
@@ -36,15 +56,10 @@ fn apply(store: &mut Store, ws: &TeamId, event: SlackEvent) -> store::Result<Opt
         | SlackEvent::ImMarked(m)
         | SlackEvent::GroupMarked(m)
         | SlackEvent::MpimMarked(m) => {
-            if let Some(mut conv) = store.conversation(ws, &m.channel)? {
-                conv.last_read = Some(m.ts.clone());
-                if let Some(unread) = m.unread_count_display {
-                    conv.unread_count_display = Some(unread);
-                } else if m.dm_count == Some(0) {
-                    conv.unread_count_display = Some(0);
-                }
-                store.upsert_conversation(ws, &conv)?;
-            }
+            let unread = m
+                .unread_count_display
+                .or_else(|| (m.dm_count == Some(0)).then_some(0));
+            update_conversation_last_read(store, ws, &m.channel, m.ts.clone(), unread)?;
             Some(Event::ReadMarker {
                 channel: m.channel,
                 ts: m.ts,
@@ -568,6 +583,71 @@ mod tests {
                 users: vec![UserId::from("U2"), UserId::from("U3")],
                 presence: crate::types::Presence::Active,
             })
+        );
+    }
+
+    #[test]
+    fn channel_and_group_rename_preserve_existing_conversation_metadata() {
+        let mut store = Store::open_in_memory().expect("in-memory store");
+        let existing = crate::types::Conversation {
+            id: ChannelId::from("C2"),
+            name: Some("ops".into()),
+            is_channel: true,
+            is_member: true,
+            topic: Some(crate::types::TopicPurpose {
+                value: "On-call rotation".into(),
+                ..Default::default()
+            }),
+            purpose: Some(crate::types::TopicPurpose {
+                value: "Incident response".into(),
+                ..Default::default()
+            }),
+            last_read: Some(Ts::from("1700.5")),
+            properties: Some(crate::types::ConversationProperties {
+                canvas: Some(crate::types::ChannelCanvas {
+                    file_id: Some(crate::types::FileId::from("FCANV")),
+                    is_empty: false,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        store.upsert_conversation(&ws(), &existing).expect("seed");
+
+        // Partial Slack `channel_rename` payload omits `is_member`, `topic`, `purpose`, `last_read`, `properties`.
+        let ev = apply_event(
+            &mut store,
+            &ws(),
+            event(
+                r#"{"type":"channel_rename","channel":{"id":"C2","name":"ops-v2","is_channel":true}}"#,
+            ),
+        );
+        assert_eq!(ev, Some(Event::Conversations(vec![ChannelId::from("C2")])));
+
+        let stored = store
+            .conversation(&ws(), &ChannelId::from("C2"))
+            .expect("query")
+            .expect("row");
+        assert_eq!(stored.name.as_deref(), Some("ops-v2"));
+        assert!(stored.is_member, "rename must preserve is_member");
+        assert_eq!(
+            stored.topic.as_ref().map(|t| t.value.as_str()),
+            Some("On-call rotation")
+        );
+        assert_eq!(
+            stored.purpose.as_ref().map(|p| p.value.as_str()),
+            Some("Incident response")
+        );
+        assert_eq!(stored.last_read, Some(Ts::from("1700.5")));
+        assert_eq!(
+            stored
+                .properties
+                .as_ref()
+                .and_then(|p| p.canvas.as_ref())
+                .and_then(|c| c.file_id.as_ref())
+                .map(|id| id.as_str()),
+            Some("FCANV")
         );
     }
 }
