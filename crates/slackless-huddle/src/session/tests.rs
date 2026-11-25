@@ -101,10 +101,10 @@ fn resolve_remote_video_tile_matches_mid_ssrc_and_fallback() {
         resolve_remote_video_tile(555, "99", &ssrc_map, &sources),
         Some(VideoTileKey::RemoteScreen(UserId::from("U2")))
     );
-    // Unmatched mid and unmatched SSRC falls back to first source.
+    // Unmatched mid and unmatched SSRC must NOT hijack tile 0.
     assert_eq!(
         resolve_remote_video_tile(999, "99", &ssrc_map, &sources),
-        Some(VideoTileKey::RemoteCamera(UserId::from("U1")))
+        None
     );
     // Empty sources -> None.
     assert_eq!(resolve_remote_video_tile(555, "2", &ssrc_map, &[]), None);
@@ -495,27 +495,8 @@ fn remote_video_decoder_h264_propagates_seq_gaps_and_keyframe_requests() {
     let annex_b = enc.encode_rgb(&rgb, w, h).unwrap();
 
     // Extract NALs and pack into a single STAP-A packet for deterministic test delivery.
-    let mut starts = Vec::new();
-    let mut i = 0;
-    while i + 3 <= annex_b.len() {
-        if annex_b[i] == 0 && annex_b[i + 1] == 0 {
-            if i + 4 <= annex_b.len() && annex_b[i + 2] == 0 && annex_b[i + 3] == 1 {
-                starts.push((i, 4));
-                i += 4;
-                continue;
-            }
-            if annex_b[i + 2] == 1 {
-                starts.push((i, 3));
-                i += 3;
-                continue;
-            }
-        }
-        i += 1;
-    }
     let mut stap_a = vec![24u8];
-    for (idx, &(pos, sc)) in starts.iter().enumerate() {
-        let end = starts.get(idx + 1).map_or(annex_b.len(), |&(n, _)| n);
-        let nal = &annex_b[pos + sc..end];
+    for nal in crate::video::split_annex_b_nals(&annex_b) {
         if !nal.is_empty() {
             stap_a.extend_from_slice(&(nal.len() as u16).to_be_bytes());
             stap_a.extend_from_slice(nal);

@@ -9739,7 +9739,6 @@ dependencies = [
  "cpal",
  "flate2",
  "futures-util",
- "image",
  "nokhwa",
  "openh264",
  "opus",

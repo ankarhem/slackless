@@ -5,6 +5,7 @@ mod devices;
 mod dsp;
 mod engine;
 mod jitter;
+pub mod ring;
 mod streams;
 #[cfg(test)]
 mod tests;
@@ -21,6 +22,7 @@ pub(crate) use devices::cpal_device_name;
 pub use devices::{
     AudioDeviceInfo, AudioDevices, MicLevelProbe, list_audio_devices, play_speaker_test_tone,
 };
+pub(crate) use dsp::resample_linear_into;
 pub use dsp::{LoudnessNormalizer, compute_rms_mono, normalized_gain_for_rms, resample_linear};
 pub use engine::{AudioEngine, AudioSharedState};
 pub(crate) use jitter::{AudioJitterBuffer, JitterStep, PlaybackBuffer, decode_opus_or_plc};

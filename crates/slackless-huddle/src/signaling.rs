@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flate2::Compression;
 use flate2::read::DeflateDecoder;
@@ -112,6 +112,91 @@ impl ChimeSignalClient {
             }
         }
         Ok(None)
+    }
+
+    /// Wait up to `timeout` for an expected signaling ACK frame, handling clean-close and
+    /// Chime protocol error frames uniformly while passing intermediate frames to `match_frame`.
+    pub async fn wait_for_ack<T>(
+        &mut self,
+        timeout: Duration,
+        ack_name: &str,
+        mut match_frame: impl FnMut(SdkSignalFrame) -> Result<Option<T>>,
+    ) -> Result<T> {
+        tokio::time::timeout(timeout, async {
+            while let Some(frame) = self.next_frame().await? {
+                if let Some(err) = frame.error {
+                    return Err(HuddleError::Protocol {
+                        status: err.status.unwrap_or(500),
+                        description: err.description.unwrap_or_default(),
+                    });
+                }
+                if let Some(val) = match_frame(frame)? {
+                    return Ok(val);
+                }
+            }
+            Err(HuddleError::Signaling(format!(
+                "signaling socket closed before {ack_name}"
+            )))
+        })
+        .await
+        .map_err(|_| HuddleError::Signaling(format!("timed out waiting for {ack_name}")))?
+    }
+
+    /// Wait up to `timeout` for a `JOIN_ACK` frame, forwarding any other frames to `on_other`.
+    pub async fn wait_for_join_ack(
+        &mut self,
+        timeout: Duration,
+        mut on_other: impl FnMut(&mut SdkSignalFrame),
+    ) -> Result<crate::proto::SdkJoinAckFrame> {
+        self.wait_for_ack(timeout, "JOIN_ACK", |mut frame| {
+            on_other(&mut frame);
+            if frame.r#type == Some(sdk_signal_frame::Type::JoinAck as i32) {
+                return frame
+                    .joinack
+                    .ok_or_else(|| HuddleError::Signaling("JOIN_ACK missing payload".into()))
+                    .map(Some);
+            }
+            Ok(None)
+        })
+        .await
+    }
+
+    /// Wait up to `timeout` for a `SUBSCRIBE_ACK` frame, forwarding any other frames to `on_other`.
+    pub async fn wait_for_subscribe_ack(
+        &mut self,
+        timeout: Duration,
+        mut on_other: impl FnMut(&mut SdkSignalFrame),
+    ) -> Result<crate::proto::SdkSubscribeAckFrame> {
+        self.wait_for_ack(timeout, "SUBSCRIBE_ACK", |mut frame| {
+            on_other(&mut frame);
+            if frame.r#type == Some(sdk_signal_frame::Type::SubscribeAck as i32) {
+                return frame
+                    .suback
+                    .ok_or_else(|| HuddleError::Signaling("SUBSCRIBE_ACK missing payload".into()))
+                    .map(Some);
+            }
+            Ok(None)
+        })
+        .await
+    }
+
+    /// Reply with a `PONG` frame when `pp` is a server `PING` (returns `true` if a `PONG` was sent).
+    pub async fn reply_ping_if_needed(&mut self, pp: &SdkPingPongFrame) -> bool {
+        if pp.r#type == Some(SdkPingPongType::Ping as i32) {
+            return self
+                .send_frame(&build_pong_frame(pp.ping_id.unwrap_or(0)))
+                .await
+                .is_ok();
+        }
+        false
+    }
+
+    /// Send a Chime `LEAVE` frame, drain up to `drain_timeout` for server acknowledgement, and
+    /// close the websocket cleanly.
+    pub async fn send_leave_and_close(mut self, drain_timeout: Duration) {
+        let _ = self.send_frame(&build_leave_frame()).await;
+        let _ = tokio::time::timeout(drain_timeout, self.next_frame()).await;
+        self.close().await;
     }
 
     /// Close the websocket cleanly.

@@ -17,8 +17,8 @@ use tokio::sync::mpsc;
 
 #[cfg(not(target_os = "macos"))]
 use super::{
-    AudioDeviceChangeKind, AudioDeviceMonitorHandle, CameraConfig, CameraHandle, MediaBackend,
-    MediaCapabilities,
+    AudioDeviceChangeKind, AudioDeviceMonitorHandle, CameraConfig, CameraHandle,
+    CameraPreviewConfig, CameraPreviewHandle, MediaBackend, MediaCapabilities,
 };
 use super::{ScreenShareConfig, ScreenShareHandle, VideoDecoderHandle};
 use crate::av1::Av1Decoder;
@@ -26,7 +26,8 @@ use crate::metrics::HuddlePerfCounters;
 use crate::screen::{capture_once_result, fast_stride_hash, with_autorelease_pool};
 #[cfg(not(target_os = "macos"))]
 use crate::video::{
-    CameraDeviceInfo, apply_portrait_blur, normalize_camera_devices, resize_rgb_even, rgb_to_bgra,
+    CameraDeviceInfo, apply_portrait_blur, normalize_camera_devices, prepare_preview_frame_rgb,
+    resize_rgb_even, rgb_to_bgra,
 };
 use crate::video::{
     H264VideoEncoder, ScreenScaleScratch, VideoFrame, downscale_rgba_area_to_bgra_and_i420,
@@ -349,6 +350,111 @@ impl Drop for SoftwareCamera {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+struct SoftwareCameraPreview {
+    running: Arc<AtomicBool>,
+    blur: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl SoftwareCameraPreview {
+    fn start(
+        config: CameraPreviewConfig,
+        on_frame: Arc<dyn Fn(VideoFrame) + Send + Sync>,
+    ) -> Result<Self> {
+        let running = Arc::new(AtomicBool::new(true));
+        let blur = Arc::new(AtomicBool::new(config.blur_background));
+        let run_flag = Arc::clone(&running);
+        let blur_flag = Arc::clone(&blur);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
+        let idx = config.device_index.unwrap_or(0) as u32;
+        let max_w = config.max_w;
+        let max_h = config.max_h;
+        let sleep_dur = Duration::from_millis((1000 / config.max_fps.max(1)) as u64);
+
+        let worker = std::thread::Builder::new()
+            .name("slackless-cam-probe".to_owned())
+            .spawn(move || {
+                let open = (|| -> Result<Camera> {
+                    let req = RequestedFormat::new::<RgbFormat>(
+                        RequestedFormatType::AbsoluteHighestFrameRate,
+                    );
+                    let mut cam = Camera::new(CameraIndex::Index(idx), req)
+                        .map_err(|e| HuddleError::Video(e.to_string()))?;
+                    cam.open_stream()
+                        .map_err(|e| HuddleError::Video(e.to_string()))?;
+                    Ok(cam)
+                })();
+                let mut cam = match open {
+                    Ok(c) => {
+                        let _ = ready_tx.send(Ok(()));
+                        c
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                while run_flag.load(Ordering::Relaxed) {
+                    if let Ok(frame) = cam.frame()
+                        && let Ok(img) = frame.decode_image::<RgbFormat>()
+                        && let Some(vf) = prepare_preview_frame_rgb(
+                            img.as_raw(),
+                            img.width(),
+                            img.height(),
+                            max_w,
+                            max_h,
+                            blur_flag.load(Ordering::Relaxed),
+                        )
+                    {
+                        on_frame(vf);
+                    }
+                    std::thread::sleep(sleep_dur);
+                }
+                let _ = cam.stop_stream();
+            })
+            .map_err(|e| HuddleError::Video(e.to_string()))?;
+
+        if let Err(err) = ready_rx
+            .recv()
+            .map_err(|e| HuddleError::Video(e.to_string()))
+            .and_then(|r| r)
+        {
+            running.store(false, Ordering::Relaxed);
+            let _ = worker.join();
+            return Err(err);
+        }
+
+        Ok(Self {
+            running,
+            blur,
+            worker: Some(worker),
+        })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl CameraPreviewHandle for SoftwareCameraPreview {
+    fn set_blur(&self, enabled: bool) {
+        self.blur.store(enabled, Ordering::Relaxed);
+    }
+
+    fn stop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl Drop for SoftwareCameraPreview {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Portable Software Decoders (Lazy OpenH264 & rav1d)
 // ---------------------------------------------------------------------------
@@ -477,6 +583,14 @@ impl MediaBackend for PortableMediaBackend {
             outbound_h264_tx,
             preview_tx,
         )?))
+    }
+
+    fn start_camera_preview(
+        &self,
+        config: CameraPreviewConfig,
+        on_frame: Arc<dyn Fn(VideoFrame) + Send + Sync>,
+    ) -> Result<Box<dyn CameraPreviewHandle>> {
+        Ok(Box::new(SoftwareCameraPreview::start(config, on_frame)?))
     }
 
     fn create_h264_decoder(&self) -> Result<Box<dyn VideoDecoderHandle>> {

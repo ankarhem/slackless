@@ -3,9 +3,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
-use cpal::{Stream, StreamConfig};
+use cpal::{SampleFormat, Stream, StreamConfig};
 
-use super::dsp::compute_rms_interleaved;
+use super::dsp::compute_rms_interleaved_map;
+use super::streams::build_output_stream_any_format;
 use crate::{HuddleError, Result};
 
 /// One enumerated audio device (mic or speaker).
@@ -114,37 +115,33 @@ pub fn play_speaker_test_tone(output_device: Option<&str>) -> Result<()> {
                     .default_output_config()
                     .map_err(|e| HuddleError::Audio(e.to_string()))?;
                 let rate = supported.sample_rate() as f32;
-                let channels = supported.channels() as usize;
+                let channels = (supported.channels() as usize).max(1);
                 let total_frames = (rate * 0.45) as usize;
                 let frame_ix = Arc::new(AtomicU32::new(0));
                 let ix_cb = Arc::clone(&frame_ix);
 
-                let config: StreamConfig = supported.into();
-                let stream = device
-                    .build_output_stream(
-                        config,
-                        move |data: &mut [f32], _| {
-                            let mut ix = ix_cb.load(Ordering::Relaxed) as usize;
-                            for frame in data.chunks_mut(channels) {
-                                let sample = if ix < total_frames {
-                                    let t = ix as f32 / rate;
-                                    let freq = if t < 0.22 { 523.25 } else { 659.25 }; // C5 -> E5
-                                    let env = (1.0 - (t / 0.45)).clamp(0.0, 1.0) * 0.22;
-                                    (2.0 * std::f32::consts::PI * freq * t).sin() * env
-                                } else {
-                                    0.0
-                                };
-                                for ch in frame.iter_mut() {
-                                    *ch = sample;
-                                }
-                                ix += 1;
+                let stream = build_output_stream_any_format(
+                    &device,
+                    supported,
+                    move |data: &mut [f32]| {
+                        let mut ix = ix_cb.load(Ordering::Relaxed) as usize;
+                        for frame in data.chunks_mut(channels) {
+                            let sample = if ix < total_frames {
+                                let t = ix as f32 / rate;
+                                let freq = if t < 0.22 { 523.25 } else { 659.25 }; // C5 -> E5
+                                let env = (1.0 - (t / 0.45)).clamp(0.0, 1.0) * 0.22;
+                                (2.0 * std::f32::consts::PI * freq * t).sin() * env
+                            } else {
+                                0.0
+                            };
+                            for ch in frame.iter_mut() {
+                                *ch = sample;
                             }
-                            ix_cb.store(ix as u32, Ordering::Relaxed);
-                        },
-                        |_| {},
-                        None,
-                    )
-                    .map_err(|e| HuddleError::Audio(e.to_string()))?;
+                            ix += 1;
+                        }
+                        ix_cb.store(ix as u32, Ordering::Relaxed);
+                    },
+                )?;
 
                 stream
                     .play()
@@ -194,20 +191,70 @@ impl MicLevelProbe {
                     let supported = device
                         .default_input_config()
                         .map_err(|e| HuddleError::Audio(e.to_string()))?;
-                    let channels = supported.channels() as usize;
+                    let channels = (supported.channels() as usize).max(1);
+                    let fmt = supported.sample_format();
                     let config: StreamConfig = supported.into();
 
-                    let stream = device
-                        .build_input_stream(
+                    let stream = match fmt {
+                        SampleFormat::F32 => device.build_input_stream(
                             config,
                             move |data: &[f32], _| {
-                                let rms = compute_rms_interleaved(data, channels);
+                                let rms = compute_rms_interleaved_map(data, channels, |s| s);
                                 rms_cb.store(rms.to_bits(), Ordering::Relaxed);
                             },
                             |_| {},
                             None,
-                        )
-                        .map_err(|e| HuddleError::Audio(e.to_string()))?;
+                        ),
+                        SampleFormat::I16 => device.build_input_stream(
+                            config,
+                            move |data: &[i16], _| {
+                                let rms = compute_rms_interleaved_map(data, channels, |s| {
+                                    f32::from(s) / 32_768.0
+                                });
+                                rms_cb.store(rms.to_bits(), Ordering::Relaxed);
+                            },
+                            |_| {},
+                            None,
+                        ),
+                        SampleFormat::U16 => device.build_input_stream(
+                            config,
+                            move |data: &[u16], _| {
+                                let rms = compute_rms_interleaved_map(data, channels, |s| {
+                                    (f32::from(s) - 32_768.0) / 32_768.0
+                                });
+                                rms_cb.store(rms.to_bits(), Ordering::Relaxed);
+                            },
+                            |_| {},
+                            None,
+                        ),
+                        SampleFormat::I32 => device.build_input_stream(
+                            config,
+                            move |data: &[i32], _| {
+                                let inv = 1.0 / f64::from(i32::MAX);
+                                let rms = compute_rms_interleaved_map(data, channels, |s| {
+                                    (f64::from(s) * inv) as f32
+                                });
+                                rms_cb.store(rms.to_bits(), Ordering::Relaxed);
+                            },
+                            |_| {},
+                            None,
+                        ),
+                        SampleFormat::F64 => device.build_input_stream(
+                            config,
+                            move |data: &[f64], _| {
+                                let rms = compute_rms_interleaved_map(data, channels, |s| s as f32);
+                                rms_cb.store(rms.to_bits(), Ordering::Relaxed);
+                            },
+                            |_| {},
+                            None,
+                        ),
+                        other => {
+                            return Err(HuddleError::Audio(format!(
+                                "unsupported mic probe sample format {other:?}"
+                            )));
+                        }
+                    }
+                    .map_err(|e| HuddleError::Audio(e.to_string()))?;
                     stream
                         .play()
                         .map_err(|e| HuddleError::Audio(e.to_string()))?;

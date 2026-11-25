@@ -108,7 +108,7 @@ pub fn list_screen_sources() -> Vec<ScreenSource> {
     out
 }
 
-fn is_system_chrome_window(app: &str, title: &str) -> bool {
+pub(crate) fn is_system_chrome_window(app: &str, title: &str) -> bool {
     let app_l = app.trim().to_ascii_lowercase();
     let title_l = title.trim().to_ascii_lowercase();
     matches!(
@@ -226,48 +226,24 @@ fn downscale_rgba_thumbnail(
     if sw == 0 || sh == 0 || max_w == 0 || max_h == 0 {
         return None;
     }
-    let scale = (max_w as f64 / sw as f64)
-        .min(max_h as f64 / sh as f64)
-        .min(1.0);
-    let dw = ((sw as f64 * scale).round() as u32).max(2);
-    let dh = ((sh as f64 * scale).round() as u32).max(2);
+    let (dw, dh) = crate::video::compute_fit_dimensions(sw, sh, max_w, max_h, false);
     let raw = src.as_raw();
     let mut bgra = vec![0u8; (dw * dh * 4) as usize];
-    for dy in 0..dh {
-        let sy0 = ((dy as u64 * sh as u64) / dh as u64) as u32;
-        let sy1 = (((dy + 1) as u64 * sh as u64) / dh as u64)
-            .max(sy0 as u64 + 1)
-            .min(sh as u64) as u32;
-        for dx in 0..dw {
-            let sx0 = ((dx as u64 * sw as u64) / dw as u64) as u32;
-            let sx1 = (((dx + 1) as u64 * sw as u64) / dw as u64)
-                .max(sx0 as u64 + 1)
-                .min(sw as u64) as u32;
-            let step_y = ((sy1 - sy0) / 4).max(1);
-            let step_x = ((sx1 - sx0) / 4).max(1);
-            let (mut r, mut g, mut b, mut count) = (0u32, 0u32, 0u32, 0u32);
-            let mut sy = sy0;
-            while sy < sy1 {
-                let row = (sy * sw) as usize;
-                let mut sx = sx0;
-                while sx < sx1 {
-                    let off = (row + sx as usize) * 4;
-                    r += raw[off] as u32;
-                    g += raw[off + 1] as u32;
-                    b += raw[off + 2] as u32;
-                    count += 1;
-                    sx += step_x;
-                }
-                sy += step_y;
-            }
-            let c = count.max(1);
-            let dst = ((dy * dw + dx) * 4) as usize;
-            bgra[dst] = (b / c) as u8;
-            bgra[dst + 1] = (g / c) as u8;
-            bgra[dst + 2] = (r / c) as u8;
+    crate::video::box_downscale_rgb::<4, _>(
+        raw,
+        sw as usize,
+        sh as usize,
+        dw as usize,
+        dh as usize,
+        4,
+        |dx, dy, r, g, b| {
+            let dst = (dy * dw as usize + dx) * 4;
+            bgra[dst] = b;
+            bgra[dst + 1] = g;
+            bgra[dst + 2] = r;
             bgra[dst + 3] = 255;
-        }
-    }
+        },
+    );
     Some(VideoFrame::from_bgra(dw, dh, bgra))
 }
 

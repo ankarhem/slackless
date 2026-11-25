@@ -1,42 +1,11 @@
 //! Pure-Rust ISO-BMFF H.264 (+ optional AAC) `.mp4` muxer (`ftyp`/`mdat`/`moov`/`avcC`).
 
+use crate::video::split_annex_b_nals;
 use crate::{HuddleError, Result};
 
 use super::audio::AacAudioTrack;
 
-// ---------------------------------------------------------------------------
-// Pure-Rust ISO-BMFF H.264 `.mp4` muxer (`ftyp` + `mdat` + `moov`/`avcC`)
-// ---------------------------------------------------------------------------
-
-pub(super) fn split_annex_b_nals(data: &[u8]) -> Vec<&[u8]> {
-    let mut starts = Vec::new();
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        if data[i] == 0 && data[i + 1] == 0 {
-            if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
-                starts.push((i, 4));
-                i += 4;
-                continue;
-            }
-            if data[i + 2] == 1 {
-                starts.push((i, 3));
-                i += 3;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    let mut nals = Vec::with_capacity(starts.len());
-    for idx in 0..starts.len() {
-        let (pos, sc_len) = starts[idx];
-        let end = starts.get(idx + 1).map_or(data.len(), |&(next, _)| next);
-        let nal = &data[pos + sc_len..end];
-        if !nal.is_empty() {
-            nals.push(nal);
-        }
-    }
-    nals
-}
+const UNITY_MATRIX: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
 
 fn mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let size = (8 + payload.len()) as u32;
@@ -53,6 +22,137 @@ fn mp4_full_box(fourcc: &[u8; 4], version: u8, flags: u32, payload: &[u8]) -> Ve
     body.extend_from_slice(&vf.to_be_bytes());
     body.extend_from_slice(payload);
     mp4_box(fourcc, &body)
+}
+
+/// Shared track specification for building either a video (`vide`) or audio (`soun`) ISO-BMFF `trak`.
+struct TrakSpec<'a> {
+    track_id: u32,
+    movie_duration: u32,
+    alternate_group: u16,
+    volume: u16,
+    width: u32,
+    height: u32,
+    media_timescale: u32,
+    media_duration: u32,
+    handler_type: &'a [u8; 4],
+    handler_name: &'a [u8],
+    media_header: Vec<u8>,
+    sample_entry: Vec<u8>,
+    sample_sizes: &'a [u32],
+    sample_delta: u32,
+    chunk_offset: u32,
+    sync_samples: Option<&'a [u32]>,
+}
+
+fn build_mp4_trak(spec: &TrakSpec<'_>) -> Vec<u8> {
+    let mut stsd_body = Vec::new();
+    stsd_body.extend_from_slice(&1u32.to_be_bytes());
+    stsd_body.extend_from_slice(&spec.sample_entry);
+    let stsd = mp4_full_box(b"stsd", 0, 0, &stsd_body);
+
+    let mut stts_body = Vec::new();
+    stts_body.extend_from_slice(&1u32.to_be_bytes());
+    stts_body.extend_from_slice(&(spec.sample_sizes.len() as u32).to_be_bytes());
+    stts_body.extend_from_slice(&spec.sample_delta.to_be_bytes());
+    let stts = mp4_full_box(b"stts", 0, 0, &stts_body);
+
+    let stss = spec.sync_samples.map(|sync| {
+        let mut stss_body = Vec::new();
+        stss_body.extend_from_slice(&(sync.len() as u32).to_be_bytes());
+        for &idx in sync {
+            stss_body.extend_from_slice(&idx.to_be_bytes());
+        }
+        mp4_full_box(b"stss", 0, 0, &stss_body)
+    });
+
+    let mut stsc_body = Vec::new();
+    stsc_body.extend_from_slice(&1u32.to_be_bytes()); // entry_count = 1 chunk holds all samples
+    stsc_body.extend_from_slice(&1u32.to_be_bytes()); // first_chunk
+    stsc_body.extend_from_slice(&(spec.sample_sizes.len() as u32).to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes()); // sample_description_index
+    let stsc = mp4_full_box(b"stsc", 0, 0, &stsc_body);
+
+    let mut stsz_body = Vec::new();
+    stsz_body.extend_from_slice(&0u32.to_be_bytes()); // variable sample sizes
+    stsz_body.extend_from_slice(&(spec.sample_sizes.len() as u32).to_be_bytes());
+    for &sz in spec.sample_sizes {
+        stsz_body.extend_from_slice(&sz.to_be_bytes());
+    }
+    let stsz = mp4_full_box(b"stsz", 0, 0, &stsz_body);
+
+    let mut stco_body = Vec::new();
+    stco_body.extend_from_slice(&1u32.to_be_bytes());
+    stco_body.extend_from_slice(&spec.chunk_offset.to_be_bytes());
+    let stco = mp4_full_box(b"stco", 0, 0, &stco_body);
+
+    let mut stbl_body = Vec::new();
+    stbl_body.extend_from_slice(&stsd);
+    stbl_body.extend_from_slice(&stts);
+    if let Some(stss_box) = &stss {
+        stbl_body.extend_from_slice(stss_box);
+    }
+    stbl_body.extend_from_slice(&stsc);
+    stbl_body.extend_from_slice(&stsz);
+    stbl_body.extend_from_slice(&stco);
+    let stbl = mp4_box(b"stbl", &stbl_body);
+
+    let url_box = mp4_full_box(b"url ", 0, 1, &[]);
+    let mut dref_body = Vec::new();
+    dref_body.extend_from_slice(&1u32.to_be_bytes());
+    dref_body.extend_from_slice(&url_box);
+    let dref = mp4_full_box(b"dref", 0, 0, &dref_body);
+    let dinf = mp4_box(b"dinf", &dref);
+
+    let mut minf_body = Vec::new();
+    minf_body.extend_from_slice(&spec.media_header);
+    minf_body.extend_from_slice(&dinf);
+    minf_body.extend_from_slice(&stbl);
+    let minf = mp4_box(b"minf", &minf_body);
+
+    let mut mdhd_body = Vec::new();
+    mdhd_body.extend_from_slice(&0u32.to_be_bytes()); // creation_time
+    mdhd_body.extend_from_slice(&0u32.to_be_bytes()); // modification_time
+    mdhd_body.extend_from_slice(&spec.media_timescale.to_be_bytes());
+    mdhd_body.extend_from_slice(&spec.media_duration.to_be_bytes());
+    mdhd_body.extend_from_slice(&0x55C4u16.to_be_bytes()); // und language
+    mdhd_body.extend_from_slice(&0u16.to_be_bytes());
+    let mdhd = mp4_full_box(b"mdhd", 0, 0, &mdhd_body);
+
+    let mut hdlr_body = Vec::new();
+    hdlr_body.extend_from_slice(&0u32.to_be_bytes()); // pre_defined
+    hdlr_body.extend_from_slice(spec.handler_type);
+    hdlr_body.extend_from_slice(&[0u8; 12]); // reserved
+    hdlr_body.extend_from_slice(spec.handler_name);
+    let hdlr = mp4_full_box(b"hdlr", 0, 0, &hdlr_body);
+
+    let mut mdia_body = Vec::new();
+    mdia_body.extend_from_slice(&mdhd);
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let mdia = mp4_box(b"mdia", &mdia_body);
+
+    let mut tkhd_body = Vec::new();
+    tkhd_body.extend_from_slice(&0u32.to_be_bytes()); // creation_time
+    tkhd_body.extend_from_slice(&0u32.to_be_bytes()); // modification_time
+    tkhd_body.extend_from_slice(&spec.track_id.to_be_bytes());
+    tkhd_body.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    tkhd_body.extend_from_slice(&spec.movie_duration.to_be_bytes());
+    tkhd_body.extend_from_slice(&[0u8; 8]); // reserved
+    tkhd_body.extend_from_slice(&0u16.to_be_bytes()); // layer
+    tkhd_body.extend_from_slice(&spec.alternate_group.to_be_bytes());
+    tkhd_body.extend_from_slice(&spec.volume.to_be_bytes());
+    tkhd_body.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    for m in UNITY_MATRIX {
+        tkhd_body.extend_from_slice(&m.to_be_bytes());
+    }
+    tkhd_body.extend_from_slice(&(spec.width << 16).to_be_bytes());
+    tkhd_body.extend_from_slice(&(spec.height << 16).to_be_bytes());
+    let tkhd = mp4_full_box(b"tkhd", 0, 0x0000_0003, &tkhd_body); // enabled + in_movie
+
+    let mut trak_body = Vec::new();
+    trak_body.extend_from_slice(&tkhd);
+    trak_body.extend_from_slice(&mdia);
+    mp4_box(b"trak", &trak_body)
 }
 
 /// Mux Annex-B H.264 access units into a self-contained ISO-BMFF `.mp4` container.
@@ -125,7 +225,6 @@ pub fn mux_h264_aac_mp4(
         sync_samples.push(1);
     }
 
-    // ftyp box
     let mut ftyp_body = Vec::new();
     ftyp_body.extend_from_slice(b"isom");
     ftyp_body.extend_from_slice(&0x0000_0200u32.to_be_bytes());
@@ -143,149 +242,20 @@ pub fn mux_h264_aac_mp4(
         }
     }
     let mdat = mp4_box(b"mdat", &mdat_payload);
-    let mdat_data_offset = video_chunk_offset;
-
     let total_duration = sample_sizes.len() as u32 * sample_delta;
 
-    // avcC box (ISO/IEC 14496-15)
-    let profile_idc = *sps.get(1).unwrap_or(&66);
-    let profile_compat = *sps.get(2).unwrap_or(&0);
-    let level_idc = *sps.get(3).unwrap_or(&31);
-    let mut avcc_body = vec![
-        1, // configurationVersion
-        profile_idc,
-        profile_compat,
-        level_idc,
-        0xFF, // 4-byte NALU length prefix (lengthSizeMinusOne = 3)
-        0xE1, // numOfSequenceParameterSets = 1
-    ];
-    avcc_body.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    avcc_body.extend_from_slice(&sps);
-    avcc_body.push(1); // numOfPictureParameterSets = 1
-    avcc_body.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    avcc_body.extend_from_slice(&pps);
-    let avcc = mp4_box(b"avcC", &avcc_body);
-
-    // avc1 sample entry
-    let mut avc1_body = Vec::new();
-    avc1_body.extend_from_slice(&[0u8; 6]); // reserved
-    avc1_body.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
-    avc1_body.extend_from_slice(&[0u8; 16]); // pre_defined + reserved
-    avc1_body.extend_from_slice(&(width as u16).to_be_bytes());
-    avc1_body.extend_from_slice(&(height as u16).to_be_bytes());
-    avc1_body.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // horizresolution 72 dpi
-    avc1_body.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // vertresolution 72 dpi
-    avc1_body.extend_from_slice(&0u32.to_be_bytes()); // reserved
-    avc1_body.extend_from_slice(&1u16.to_be_bytes()); // frame_count
-    avc1_body.extend_from_slice(&[0u8; 32]); // compressorname
-    avc1_body.extend_from_slice(&0x0018u16.to_be_bytes()); // depth = 24
-    avc1_body.extend_from_slice(&(-1i16).to_be_bytes()); // pre_defined = -1
-    avc1_body.extend_from_slice(&avcc);
-    let avc1 = mp4_box(b"avc1", &avc1_body);
-
-    let mut stsd_body = Vec::new();
-    stsd_body.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-    stsd_body.extend_from_slice(&avc1);
-    let stsd = mp4_full_box(b"stsd", 0, 0, &stsd_body);
-
-    let mut stts_body = Vec::new();
-    stts_body.extend_from_slice(&1u32.to_be_bytes());
-    stts_body.extend_from_slice(&(sample_sizes.len() as u32).to_be_bytes());
-    stts_body.extend_from_slice(&sample_delta.to_be_bytes());
-    let stts = mp4_full_box(b"stts", 0, 0, &stts_body);
-
-    let mut stss_body = Vec::new();
-    stss_body.extend_from_slice(&(sync_samples.len() as u32).to_be_bytes());
-    for &idx in &sync_samples {
-        stss_body.extend_from_slice(&idx.to_be_bytes());
-    }
-    let stss = mp4_full_box(b"stss", 0, 0, &stss_body);
-
-    let mut stsc_body = Vec::new();
-    stsc_body.extend_from_slice(&1u32.to_be_bytes()); // entry_count = 1 chunk holds all samples
-    stsc_body.extend_from_slice(&1u32.to_be_bytes()); // first_chunk
-    stsc_body.extend_from_slice(&(sample_sizes.len() as u32).to_be_bytes()); // samples_per_chunk
-    stsc_body.extend_from_slice(&1u32.to_be_bytes()); // sample_description_index
-    let stsc = mp4_full_box(b"stsc", 0, 0, &stsc_body);
-
-    let mut stsz_body = Vec::new();
-    stsz_body.extend_from_slice(&0u32.to_be_bytes()); // variable sample sizes
-    stsz_body.extend_from_slice(&(sample_sizes.len() as u32).to_be_bytes());
-    for &sz in &sample_sizes {
-        stsz_body.extend_from_slice(&sz.to_be_bytes());
-    }
-    let stsz = mp4_full_box(b"stsz", 0, 0, &stsz_body);
-
-    let mut stco_body = Vec::new();
-    stco_body.extend_from_slice(&1u32.to_be_bytes());
-    stco_body.extend_from_slice(&mdat_data_offset.to_be_bytes());
-    let stco = mp4_full_box(b"stco", 0, 0, &stco_body);
-
-    let mut stbl_body = Vec::new();
-    for b in [&stsd, &stts, &stss, &stsc, &stsz, &stco] {
-        stbl_body.extend_from_slice(b);
-    }
-    let stbl = mp4_box(b"stbl", &stbl_body);
-
-    let vmhd = mp4_full_box(b"vmhd", 0, 1, &[0u8; 8]);
-    let url_box = mp4_full_box(b"url ", 0, 1, &[]);
-    let mut dref_body = Vec::new();
-    dref_body.extend_from_slice(&1u32.to_be_bytes());
-    dref_body.extend_from_slice(&url_box);
-    let dref = mp4_full_box(b"dref", 0, 0, &dref_body);
-    let dinf = mp4_box(b"dinf", &dref);
-
-    let mut minf_body = Vec::new();
-    minf_body.extend_from_slice(&vmhd);
-    minf_body.extend_from_slice(&dinf);
-    minf_body.extend_from_slice(&stbl);
-    let minf = mp4_box(b"minf", &minf_body);
-
-    let mut mdhd_body = Vec::new();
-    mdhd_body.extend_from_slice(&0u32.to_be_bytes()); // creation_time
-    mdhd_body.extend_from_slice(&0u32.to_be_bytes()); // modification_time
-    mdhd_body.extend_from_slice(&timescale.to_be_bytes());
-    mdhd_body.extend_from_slice(&total_duration.to_be_bytes());
-    mdhd_body.extend_from_slice(&0x55C4u16.to_be_bytes()); // und language
-    mdhd_body.extend_from_slice(&0u16.to_be_bytes());
-    let mdhd = mp4_full_box(b"mdhd", 0, 0, &mdhd_body);
-
-    let mut hdlr_body = Vec::new();
-    hdlr_body.extend_from_slice(&0u32.to_be_bytes()); // pre_defined
-    hdlr_body.extend_from_slice(b"vide");
-    hdlr_body.extend_from_slice(&[0u8; 12]); // reserved
-    hdlr_body.extend_from_slice(b"VideoHandler\0");
-    let hdlr = mp4_full_box(b"hdlr", 0, 0, &hdlr_body);
-
-    let mut mdia_body = Vec::new();
-    mdia_body.extend_from_slice(&mdhd);
-    mdia_body.extend_from_slice(&hdlr);
-    mdia_body.extend_from_slice(&minf);
-    let mdia = mp4_box(b"mdia", &mdia_body);
-
-    let unity_matrix: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
-    let mut tkhd_body = Vec::new();
-    tkhd_body.extend_from_slice(&0u32.to_be_bytes()); // creation_time
-    tkhd_body.extend_from_slice(&0u32.to_be_bytes()); // modification_time
-    tkhd_body.extend_from_slice(&1u32.to_be_bytes()); // track_id
-    tkhd_body.extend_from_slice(&0u32.to_be_bytes()); // reserved
-    tkhd_body.extend_from_slice(&total_duration.to_be_bytes());
-    tkhd_body.extend_from_slice(&[0u8; 8]); // reserved
-    tkhd_body.extend_from_slice(&0u16.to_be_bytes()); // layer
-    tkhd_body.extend_from_slice(&0u16.to_be_bytes()); // alternate_group
-    tkhd_body.extend_from_slice(&0u16.to_be_bytes()); // volume (video = 0)
-    tkhd_body.extend_from_slice(&0u16.to_be_bytes()); // reserved
-    for m in unity_matrix {
-        tkhd_body.extend_from_slice(&m.to_be_bytes());
-    }
-    tkhd_body.extend_from_slice(&(width << 16).to_be_bytes());
-    tkhd_body.extend_from_slice(&(height << 16).to_be_bytes());
-    let tkhd = mp4_full_box(b"tkhd", 0, 0x0000_0003, &tkhd_body); // enabled + in_movie
-
-    let mut trak_body = Vec::new();
-    trak_body.extend_from_slice(&tkhd);
-    trak_body.extend_from_slice(&mdia);
-    let trak = mp4_box(b"trak", &trak_body);
+    let video_trak = build_video_mp4_trak(&VideoTrakParams {
+        width,
+        height,
+        sps: &sps,
+        pps: &pps,
+        sample_sizes: &sample_sizes,
+        sync_samples: &sync_samples,
+        timescale,
+        sample_delta,
+        total_duration,
+        chunk_offset: video_chunk_offset,
+    });
 
     let has_audio = audio.is_some() && !audio_sizes.is_empty();
     let next_track_id: u32 = if has_audio { 3 } else { 2 };
@@ -297,7 +267,7 @@ pub fn mux_h264_aac_mp4(
     mvhd_body.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate 1.0
     mvhd_body.extend_from_slice(&0x0100u16.to_be_bytes()); // volume 1.0
     mvhd_body.extend_from_slice(&[0u8; 10]); // reserved
-    for m in unity_matrix {
+    for m in UNITY_MATRIX {
         mvhd_body.extend_from_slice(&m.to_be_bytes());
     }
     mvhd_body.extend_from_slice(&[0u8; 24]); // pre_defined
@@ -306,15 +276,9 @@ pub fn mux_h264_aac_mp4(
 
     let mut moov_body = Vec::new();
     moov_body.extend_from_slice(&mvhd);
-    moov_body.extend_from_slice(&trak);
+    moov_body.extend_from_slice(&video_trak);
     if has_audio && let Some(a) = audio {
-        let audio_trak = build_aac_mp4_trak(
-            a,
-            &audio_sizes,
-            audio_chunk_offset,
-            total_duration,
-            unity_matrix,
-        );
+        let audio_trak = build_aac_mp4_trak(a, &audio_sizes, audio_chunk_offset, total_duration);
         moov_body.extend_from_slice(&audio_trak);
     }
     let moov = mp4_box(b"moov", &moov_body);
@@ -326,148 +290,128 @@ pub fn mux_h264_aac_mp4(
     Ok(out)
 }
 
+struct VideoTrakParams<'a> {
+    width: u32,
+    height: u32,
+    sps: &'a [u8],
+    pps: &'a [u8],
+    sample_sizes: &'a [u32],
+    sync_samples: &'a [u32],
+    timescale: u32,
+    sample_delta: u32,
+    total_duration: u32,
+    chunk_offset: u32,
+}
+
+fn build_video_mp4_trak(p: &VideoTrakParams<'_>) -> Vec<u8> {
+    let profile_idc = *p.sps.get(1).unwrap_or(&66);
+    let profile_compat = *p.sps.get(2).unwrap_or(&0);
+    let level_idc = *p.sps.get(3).unwrap_or(&31);
+    let mut avcc_body = vec![1, profile_idc, profile_compat, level_idc, 0xFF, 0xE1];
+    avcc_body.extend_from_slice(&(p.sps.len() as u16).to_be_bytes());
+    avcc_body.extend_from_slice(p.sps);
+    avcc_body.push(1);
+    avcc_body.extend_from_slice(&(p.pps.len() as u16).to_be_bytes());
+    avcc_body.extend_from_slice(p.pps);
+    let avcc = mp4_box(b"avcC", &avcc_body);
+
+    let mut avc1_body = Vec::new();
+    avc1_body.extend_from_slice(&[0u8; 6]);
+    avc1_body.extend_from_slice(&1u16.to_be_bytes());
+    avc1_body.extend_from_slice(&[0u8; 16]);
+    avc1_body.extend_from_slice(&(p.width as u16).to_be_bytes());
+    avc1_body.extend_from_slice(&(p.height as u16).to_be_bytes());
+    avc1_body.extend_from_slice(&0x0048_0000u32.to_be_bytes());
+    avc1_body.extend_from_slice(&0x0048_0000u32.to_be_bytes());
+    avc1_body.extend_from_slice(&0u32.to_be_bytes());
+    avc1_body.extend_from_slice(&1u16.to_be_bytes());
+    avc1_body.extend_from_slice(&[0u8; 32]);
+    avc1_body.extend_from_slice(&0x0018u16.to_be_bytes());
+    avc1_body.extend_from_slice(&(-1i16).to_be_bytes());
+    avc1_body.extend_from_slice(&avcc);
+
+    build_mp4_trak(&TrakSpec {
+        track_id: 1,
+        movie_duration: p.total_duration,
+        alternate_group: 0,
+        volume: 0,
+        width: p.width,
+        height: p.height,
+        media_timescale: p.timescale,
+        media_duration: p.total_duration,
+        handler_type: b"vide",
+        handler_name: b"VideoHandler\0",
+        media_header: mp4_full_box(b"vmhd", 0, 1, &[0u8; 8]),
+        sample_entry: mp4_box(b"avc1", &avc1_body),
+        sample_sizes: p.sample_sizes,
+        sample_delta: p.sample_delta,
+        chunk_offset: p.chunk_offset,
+        sync_samples: Some(p.sync_samples),
+    })
+}
+
 fn build_aac_mp4_trak(
     audio: &AacAudioTrack,
     sample_sizes: &[u32],
     chunk_offset: u32,
     movie_duration: u32,
-    unity_matrix: [u32; 9],
 ) -> Vec<u8> {
     let audio_timescale = audio.sample_rate.max(8_000);
-    let sample_delta = 1024u32; // AAC-LC frame length
+    let sample_delta = 1024u32;
     let audio_duration = sample_sizes.len() as u32 * sample_delta;
 
-    // MPEG-4 ES_Descriptor (`esds`) carrying DecoderSpecificInfo = AudioSpecificConfig.
     let asc = audio.audio_specific_config;
     let dec_spec = vec![0x05, 0x02, asc[0], asc[1]];
     let mut dec_cfg = vec![
         0x04,
         (13 + dec_spec.len()) as u8,
-        0x40, // objectTypeIndication: MPEG-4 Audio
-        0x15, // streamType=Audio (5<<2 | 1)
+        0x40,
+        0x15,
         0x00,
         0x00,
-        0x00, // bufferSizeDB
+        0x00,
     ];
-    dec_cfg.extend_from_slice(&128_000u32.to_be_bytes()); // maxBitrate
-    dec_cfg.extend_from_slice(&96_000u32.to_be_bytes()); // avgBitrate
+    dec_cfg.extend_from_slice(&128_000u32.to_be_bytes());
+    dec_cfg.extend_from_slice(&96_000u32.to_be_bytes());
     dec_cfg.extend_from_slice(&dec_spec);
     let sl_cfg = [0x06u8, 0x01, 0x02];
     let mut es_desc = vec![
         0x03,
         (3 + dec_cfg.len() + sl_cfg.len()) as u8,
         0x00,
-        0x02, // ES_ID = 2
-        0x00, // flags
+        0x02,
+        0x00,
     ];
     es_desc.extend_from_slice(&dec_cfg);
     es_desc.extend_from_slice(&sl_cfg);
     let esds = mp4_full_box(b"esds", 0, 0, &es_desc);
 
     let mut mp4a_body = Vec::new();
-    mp4a_body.extend_from_slice(&[0u8; 6]); // reserved
-    mp4a_body.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
-    mp4a_body.extend_from_slice(&[0u8; 8]); // reserved
+    mp4a_body.extend_from_slice(&[0u8; 6]);
+    mp4a_body.extend_from_slice(&1u16.to_be_bytes());
+    mp4a_body.extend_from_slice(&[0u8; 8]);
     mp4a_body.extend_from_slice(&audio.channels.to_be_bytes());
-    mp4a_body.extend_from_slice(&16u16.to_be_bytes()); // sampleSize
-    mp4a_body.extend_from_slice(&0u32.to_be_bytes()); // pre_defined + reserved
-    mp4a_body.extend_from_slice(&(audio_timescale << 16).to_be_bytes()); // 16.16 fixed point
+    mp4a_body.extend_from_slice(&16u16.to_be_bytes());
+    mp4a_body.extend_from_slice(&0u32.to_be_bytes());
+    mp4a_body.extend_from_slice(&(audio_timescale << 16).to_be_bytes());
     mp4a_body.extend_from_slice(&esds);
-    let mp4a = mp4_box(b"mp4a", &mp4a_body);
 
-    let mut stsd_body = Vec::new();
-    stsd_body.extend_from_slice(&1u32.to_be_bytes());
-    stsd_body.extend_from_slice(&mp4a);
-    let stsd = mp4_full_box(b"stsd", 0, 0, &stsd_body);
-
-    let mut stts_body = Vec::new();
-    stts_body.extend_from_slice(&1u32.to_be_bytes());
-    stts_body.extend_from_slice(&(sample_sizes.len() as u32).to_be_bytes());
-    stts_body.extend_from_slice(&sample_delta.to_be_bytes());
-    let stts = mp4_full_box(b"stts", 0, 0, &stts_body);
-
-    let mut stsc_body = Vec::new();
-    stsc_body.extend_from_slice(&1u32.to_be_bytes());
-    stsc_body.extend_from_slice(&1u32.to_be_bytes());
-    stsc_body.extend_from_slice(&(sample_sizes.len() as u32).to_be_bytes());
-    stsc_body.extend_from_slice(&1u32.to_be_bytes());
-    let stsc = mp4_full_box(b"stsc", 0, 0, &stsc_body);
-
-    let mut stsz_body = Vec::new();
-    stsz_body.extend_from_slice(&0u32.to_be_bytes());
-    stsz_body.extend_from_slice(&(sample_sizes.len() as u32).to_be_bytes());
-    for &sz in sample_sizes {
-        stsz_body.extend_from_slice(&sz.to_be_bytes());
-    }
-    let stsz = mp4_full_box(b"stsz", 0, 0, &stsz_body);
-
-    let mut stco_body = Vec::new();
-    stco_body.extend_from_slice(&1u32.to_be_bytes());
-    stco_body.extend_from_slice(&chunk_offset.to_be_bytes());
-    let stco = mp4_full_box(b"stco", 0, 0, &stco_body);
-
-    let mut stbl_body = Vec::new();
-    for b in [&stsd, &stts, &stsc, &stsz, &stco] {
-        stbl_body.extend_from_slice(b);
-    }
-    let stbl = mp4_box(b"stbl", &stbl_body);
-
-    let smhd = mp4_full_box(b"smhd", 0, 0, &[0u8; 4]);
-    let url_box = mp4_full_box(b"url ", 0, 1, &[]);
-    let mut dref_body = Vec::new();
-    dref_body.extend_from_slice(&1u32.to_be_bytes());
-    dref_body.extend_from_slice(&url_box);
-    let dref = mp4_full_box(b"dref", 0, 0, &dref_body);
-    let dinf = mp4_box(b"dinf", &dref);
-
-    let mut minf_body = Vec::new();
-    minf_body.extend_from_slice(&smhd);
-    minf_body.extend_from_slice(&dinf);
-    minf_body.extend_from_slice(&stbl);
-    let minf = mp4_box(b"minf", &minf_body);
-
-    let mut mdhd_body = Vec::new();
-    mdhd_body.extend_from_slice(&0u32.to_be_bytes());
-    mdhd_body.extend_from_slice(&0u32.to_be_bytes());
-    mdhd_body.extend_from_slice(&audio_timescale.to_be_bytes());
-    mdhd_body.extend_from_slice(&audio_duration.to_be_bytes());
-    mdhd_body.extend_from_slice(&0x55C4u16.to_be_bytes());
-    mdhd_body.extend_from_slice(&0u16.to_be_bytes());
-    let mdhd = mp4_full_box(b"mdhd", 0, 0, &mdhd_body);
-
-    let mut hdlr_body = Vec::new();
-    hdlr_body.extend_from_slice(&0u32.to_be_bytes());
-    hdlr_body.extend_from_slice(b"soun");
-    hdlr_body.extend_from_slice(&[0u8; 12]);
-    hdlr_body.extend_from_slice(b"SoundHandler\0");
-    let hdlr = mp4_full_box(b"hdlr", 0, 0, &hdlr_body);
-
-    let mut mdia_body = Vec::new();
-    mdia_body.extend_from_slice(&mdhd);
-    mdia_body.extend_from_slice(&hdlr);
-    mdia_body.extend_from_slice(&minf);
-    let mdia = mp4_box(b"mdia", &mdia_body);
-
-    let mut tkhd_body = Vec::new();
-    tkhd_body.extend_from_slice(&0u32.to_be_bytes());
-    tkhd_body.extend_from_slice(&0u32.to_be_bytes());
-    tkhd_body.extend_from_slice(&2u32.to_be_bytes()); // track_id = 2
-    tkhd_body.extend_from_slice(&0u32.to_be_bytes());
-    tkhd_body.extend_from_slice(&movie_duration.to_be_bytes());
-    tkhd_body.extend_from_slice(&[0u8; 8]);
-    tkhd_body.extend_from_slice(&0u16.to_be_bytes());
-    tkhd_body.extend_from_slice(&1u16.to_be_bytes()); // alternate_group
-    tkhd_body.extend_from_slice(&0x0100u16.to_be_bytes()); // volume = 1.0
-    tkhd_body.extend_from_slice(&0u16.to_be_bytes());
-    for m in unity_matrix {
-        tkhd_body.extend_from_slice(&m.to_be_bytes());
-    }
-    tkhd_body.extend_from_slice(&0u32.to_be_bytes()); // width = 0
-    tkhd_body.extend_from_slice(&0u32.to_be_bytes()); // height = 0
-    let tkhd = mp4_full_box(b"tkhd", 0, 0x0000_0003, &tkhd_body);
-
-    let mut trak_body = Vec::new();
-    trak_body.extend_from_slice(&tkhd);
-    trak_body.extend_from_slice(&mdia);
-    mp4_box(b"trak", &trak_body)
+    build_mp4_trak(&TrakSpec {
+        track_id: 2,
+        movie_duration,
+        alternate_group: 1,
+        volume: 0x0100,
+        width: 0,
+        height: 0,
+        media_timescale: audio_timescale,
+        media_duration: audio_duration,
+        handler_type: b"soun",
+        handler_name: b"SoundHandler\0",
+        media_header: mp4_full_box(b"smhd", 0, 0, &[0u8; 4]),
+        sample_entry: mp4_box(b"mp4a", &mp4a_body),
+        sample_sizes,
+        sample_delta,
+        chunk_offset,
+        sync_samples: None,
+    })
 }

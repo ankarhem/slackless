@@ -1,14 +1,18 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use cpal::StreamConfig;
 use cpal::traits::{DeviceTrait as _, StreamTrait as _};
 
 use super::devices::select_output_device;
+use super::streams::build_output_stream_any_format;
+use crate::backend::platform_backend;
 use crate::{HuddleError, Result};
 
 const SLACK_CDN_AUDIO_BASE: &str = "https://a.slack-edge.com/bv1-13";
+static AUDIO_DOWNLOAD_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Official Slack huddle lifecycle sound effects (`https://a.slack-edge.com/bv1-13/`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,22 +64,34 @@ pub fn slack_lounge_music_filename(song_key: Option<&str>) -> &'static str {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn slack_sound_cache_dir() -> std::path::PathBuf {
+fn slack_sound_cache_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
     if let Some(home) = std::env::var_os("HOME") {
-        return std::path::PathBuf::from(home)
+        return PathBuf::from(home)
             .join("Library")
             .join("Caches")
             .join("Slackless")
             .join("sounds");
     }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+            return PathBuf::from(xdg).join("slackless").join("sounds");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join(".cache")
+                .join("slackless")
+                .join("sounds");
+        }
+    }
     std::env::temp_dir().join("slackless-sounds")
 }
 
 /// Ensure official Slack MP3 `filename` is cached on disk, downloading it once from Slack's
-/// public CDN (`a.slack-edge.com/bv1-13/`). Returns `None` if offline or download fails.
-#[cfg(target_os = "macos")]
-fn ensure_cached_slack_audio(filename: &str) -> Option<std::path::PathBuf> {
+/// public CDN (`a.slack-edge.com/bv1-13/`) via `reqwest`. Returns `None` if offline or download
+/// fails.
+fn ensure_cached_slack_audio(filename: &str) -> Option<PathBuf> {
     let dir = slack_sound_cache_dir();
     let dest = dir.join(filename);
     if std::fs::metadata(&dest).is_ok_and(|m| m.len() > 256) {
@@ -83,14 +99,26 @@ fn ensure_cached_slack_audio(filename: &str) -> Option<std::path::PathBuf> {
     }
     let _ = std::fs::create_dir_all(&dir);
     let url = format!("{SLACK_CDN_AUDIO_BASE}/{filename}");
-    let tmp = dir.join(format!(".{filename}.{}.tmp", std::process::id()));
-    let ok = std::process::Command::new("/usr/bin/curl")
-        .args(["-fsSL", "--max-time", "8", "-o"])
-        .arg(&tmp)
-        .arg(&url)
-        .status()
-        .is_ok_and(|s| s.success());
-    if ok && std::fs::metadata(&tmp).is_ok_and(|m| m.len() > 256) {
+    let seq = AUDIO_DOWNLOAD_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{filename}.{}.{seq}.tmp", std::process::id()));
+
+    let bytes = crate::transcribe::block_on_http(async move {
+        let client = reqwest::Client::builder()
+            .user_agent("slackless/1.0")
+            .timeout(Duration::from_secs(8))
+            .build()
+            .ok()?;
+        let resp = client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.bytes().await.ok()
+    });
+
+    if let Some(bytes) = bytes
+        && bytes.len() > 256
+        && std::fs::write(&tmp, &bytes).is_ok()
+    {
         let _ = std::fs::rename(&tmp, &dest);
         if std::fs::metadata(&dest).is_ok_and(|m| m.len() > 256) {
             return Some(dest);
@@ -100,25 +128,20 @@ fn ensure_cached_slack_audio(filename: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-#[cfg(target_os = "macos")]
 fn normalized_file_volume(
-    path: &std::path::Path,
+    path: &Path,
     target_rms: f32,
     min_gain: f32,
     max_gain: f32,
     fallback: f32,
 ) -> f32 {
-    use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
-
     static FILE_RMS_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<f32>>>> = OnceLock::new();
     let cache = FILE_RMS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let cached = cache.lock().ok().and_then(|g| g.get(path).copied());
     let measured = match cached {
         Some(v) => v,
         None => {
-            let rms = crate::macos_media::measure_audio_file_rms(path);
+            let rms = platform_backend().measure_audio_file_rms(path);
             if let Ok(mut g) = cache.lock() {
                 g.insert(path.to_path_buf(), rms);
             }
@@ -144,27 +167,26 @@ fn normalized_file_volume(
 
 /// Play an official Slack huddle lifecycle sound (`you_joined_call_v2`, `you_left_call_v2`,
 /// `they_joined_call_v2`, `they_left_call_v2`, `outgoing_ring_v2`) without blocking the caller.
-/// Uses the cached official MP3 via native macOS `NSSound` routed to `output_device`, with loudness
-/// normalization and fallback to `afplay` or a synthesized chime.
+/// Uses the cached official MP3 via the platform backend's native routed player (with loudness
+/// normalization) and falls back to a synthesized chime.
 pub fn play_huddle_chime(chime: HuddleChime, output_device: Option<&str>) -> Result<()> {
     let device_name = output_device.map(ToOwned::to_owned);
     std::thread::Builder::new()
         .name("slackless-huddle-chime".to_owned())
         .spawn(move || {
-            #[cfg(target_os = "macos")]
+            let backend = platform_backend();
+            if backend.supports_routed_audio_files()
+                && let Some(path) = ensure_cached_slack_audio(chime.slack_asset_filename())
             {
-                if let Some(path) = ensure_cached_slack_audio(chime.slack_asset_filename()) {
-                    // Normalize chimes to ~ -22 dBFS weighted RMS (0.080 linear), supporting real
-                    // boost up to +20 dB (10.0x) via AVAudioEngine + AVAudioUnitEQ so quiet MP3s
-                    // match louder ones cleanly.
-                    let volume = normalized_file_volume(&path, 0.080, 0.15, 10.0, 1.0);
-                    if crate::macos_media::play_routed_audio_oneshot(
-                        &path,
-                        device_name.as_deref(),
-                        volume,
-                    ) {
-                        return;
-                    }
+                // Normalize chimes to ~ -22 dBFS weighted RMS (0.080 linear), supporting real
+                // boost up to +20 dB (10.0x) via AVAudioEngine + AVAudioUnitEQ so quiet MP3s
+                // match louder ones cleanly.
+                let volume = normalized_file_volume(&path, 0.080, 0.15, 10.0, 1.0);
+                if backend.play_routed_audio_oneshot(&path, device_name.as_deref(), volume) {
+                    return;
+                }
+                #[cfg(target_os = "macos")]
+                {
                     let vol_arg = format!("{volume:.3}");
                     if std::process::Command::new("/usr/bin/afplay")
                         .args(["-v", &vol_arg])
@@ -190,7 +212,7 @@ fn play_synthesized_huddle_chime(chime: HuddleChime, output_device: Option<&str>
         return;
     };
     let rate = supported.sample_rate() as f32;
-    let channels = supported.channels() as usize;
+    let channels = (supported.channels() as usize).max(1);
     let duration_secs: f32 = match chime {
         HuddleChime::Join | HuddleChime::PeerJoin => 0.34,
         HuddleChime::Leave | HuddleChime::PeerLeave => 0.28,
@@ -200,10 +222,8 @@ fn play_synthesized_huddle_chime(chime: HuddleChime, output_device: Option<&str>
     let frame_ix = Arc::new(AtomicU32::new(0));
     let ix_cb = Arc::clone(&frame_ix);
 
-    let config: StreamConfig = supported.into();
-    let Ok(stream) = device.build_output_stream(
-        config,
-        move |data: &mut [f32], _| {
+    let Ok(stream) =
+        build_output_stream_any_format(&device, supported, move |data: &mut [f32]| {
             let mut ix = ix_cb.load(Ordering::Relaxed) as usize;
             for frame in data.chunks_mut(channels) {
                 let sample = if ix < total_frames {
@@ -240,10 +260,8 @@ fn play_synthesized_huddle_chime(chime: HuddleChime, output_device: Option<&str>
                 ix += 1;
             }
             ix_cb.store(ix as u32, Ordering::Relaxed);
-        },
-        |_| {},
-        None,
-    ) else {
+        })
+    else {
         return;
     };
     if stream.play().is_ok() {
@@ -255,9 +273,10 @@ fn play_synthesized_huddle_chime(chime: HuddleChime, output_device: Option<&str>
 /// Official Slack huddle lounge / idle music player (`F-COLLAB-036`, `F-COLLAB-058`).
 ///
 /// Plays Official Slack's cached lounge tracks (`waiting_muzak` Smooth Jazz by default, plus
-/// `waiting`, `subway`, `whistle`, `focus`, `lofi`, `disco`, `zen`, `nature`, `piano`) via native
-/// macOS `afplay` with gentle background volume and instant teardown on `stop()`/`Drop`. Falls
-/// back to a soft synthesized lo-fi chord progression only when offline or on non-macOS hosts.
+/// `waiting`, `subway`, `whistle`, `focus`, `lofi`, `disco`, `zen`, `nature`, `piano`) via the
+/// platform backend's native routed audio loop with gentle background volume and instant teardown
+/// on `stop()`/`Drop`. Falls back to a soft synthesized lo-fi chord progression when offline or on
+/// hosts without native file routing.
 pub struct AmbientMusicPlayer {
     running: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -271,28 +290,27 @@ impl AmbientMusicPlayer {
         let worker = std::thread::Builder::new()
             .name("slackless-huddle-music".to_owned())
             .spawn(move || {
-                #[cfg(target_os = "macos")]
+                let backend = platform_backend();
+                if backend.supports_routed_audio_files()
+                    && let Some(path) = ensure_cached_slack_audio(&filename)
                 {
-                    if let Some(path) = ensure_cached_slack_audio(&filename) {
-                        // Normalize every lounge track to an identical gentle background loudness
-                        // (-30 dBFS 200Hz-weighted RMS = 0.032 linear). Slack's CDN MP3s span a
-                        // 30 dB range (-46 dBFS piano_concerto to -16 dBFS lofihaus), so allow
-                        // true linear gain from 0.08x (-22 dB) up to 14.0x (+23 dB) via
-                        // AVAudioEngine + AVAudioUnitEQ!
-                        let volume = normalized_file_volume(&path, 0.032, 0.08, 14.0, 1.0);
-                        // Prefer CoreAudio device-routed looping NSSound (routes Smooth Jazz
-                        // directly to the user's chosen huddle headset/speaker with 0 subprocesses).
-                        if let Some(mut routed) = crate::macos_media::MacRoutedAudioLoop::start(
-                            &path,
-                            output_device.as_deref(),
-                            volume,
-                        ) {
-                            while run_flag.load(Ordering::Relaxed) {
-                                std::thread::sleep(Duration::from_millis(80));
-                            }
-                            routed.stop();
-                            return;
+                    // Normalize every lounge track to an identical gentle background loudness
+                    // (-30 dBFS 200Hz-weighted RMS = 0.032 linear). Slack's CDN MP3s span a
+                    // 30 dB range (-46 dBFS piano_concerto to -16 dBFS lofihaus), so allow
+                    // true linear gain from 0.08x (-22 dB) up to 14.0x (+23 dB) via
+                    // AVAudioEngine + AVAudioUnitEQ!
+                    let volume = normalized_file_volume(&path, 0.032, 0.08, 14.0, 1.0);
+                    if let Some(mut routed) =
+                        backend.start_routed_audio_loop(&path, output_device.as_deref(), volume)
+                    {
+                        while run_flag.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(80));
                         }
+                        routed.stop();
+                        return;
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
                         let vol_arg = format!("{volume:.3}");
                         while run_flag.load(Ordering::Relaxed) {
                             let Ok(mut child) = std::process::Command::new("/usr/bin/afplay")
@@ -320,8 +338,7 @@ impl AmbientMusicPlayer {
                         }
                     }
                 }
-                let _ = &filename;
-                // Offline / non-macOS fallback: warm lo-fi 4-chord progression.
+                // Offline / portable fallback: warm lo-fi 4-chord progression.
                 let Ok(device) = select_output_device(output_device.as_deref()) else {
                     return;
                 };
@@ -329,8 +346,7 @@ impl AmbientMusicPlayer {
                     return;
                 };
                 let rate = supported.sample_rate() as f32;
-                let channels = supported.channels() as usize;
-                let config: StreamConfig = supported.into();
+                let channels = (supported.channels() as usize).max(1);
                 const CHORDS: [[f32; 4]; 4] = [
                     [261.63, 329.63, 392.00, 493.88],
                     [220.00, 261.63, 329.63, 392.00],
@@ -339,9 +355,8 @@ impl AmbientMusicPlayer {
                 ];
                 let mut sample_idx: u64 = 0;
                 let chord_samples = (rate * 3.5) as u64;
-                let stream = device.build_output_stream(
-                    config,
-                    move |out: &mut [f32], _| {
+                let Ok(stream) =
+                    build_output_stream_any_format(&device, supported, move |out: &mut [f32]| {
                         for frame in out.chunks_mut(channels) {
                             let chord_ix = ((sample_idx / chord_samples) % 4) as usize;
                             let pos_in_chord =
@@ -359,11 +374,8 @@ impl AmbientMusicPlayer {
                             }
                             sample_idx = sample_idx.wrapping_add(1);
                         }
-                    },
-                    |_| {},
-                    None,
-                );
-                let Ok(stream) = stream else {
+                    })
+                else {
                     return;
                 };
                 if stream.play().is_err() {

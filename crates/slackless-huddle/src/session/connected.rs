@@ -9,15 +9,21 @@ use webrtc::peer_connection::RTCPeerConnectionState;
 
 use super::controls::handle_control;
 use super::handshake::perform_handshake;
-use super::signaling_handlers::{apply_index_frame, handle_signal_frame};
+use super::signaling_handlers::{
+    apply_index_frame, content_share_source_type, handle_signal_frame,
+};
 use super::supervisor::{LoopExit, classify_handshake_err, classify_signal_close, now_secs};
-use super::video_rx::{VideoRoutingTable, spawn_video_decoder_thread};
+use super::video_rx::{VideoDecoderThreadArgs, VideoRoutingTable, spawn_video_decoder_thread};
 use crate::audio::{AmbientMusicPlayer, AudioEngine, AudioSharedState};
 use crate::content_share::ContentShareSession;
 use crate::metrics::{HuddlePerfCounters, ProcessResourceSampler};
-use crate::rtc::{InboundVideoPacket, VideoSenderFeedback};
+use crate::peer_message::{
+    SLACK_DATA_CHANNEL_TOPIC, build_capabilities_message, build_content_share_details_message,
+};
+use crate::rtc::{InboundAudioPacket, InboundVideoPacket, VideoSenderFeedback};
 use crate::signaling::{
-    RemoteVideoSource, build_client_metric_frame, build_leave_frame, parse_external_user_id,
+    ChimeSignalClient, RemoteVideoSource, build_client_metric_frame, build_data_message_frame,
+    parse_external_user_id,
 };
 use crate::video::{CameraCapture, VideoFrame, VideoTileKey};
 use crate::{
@@ -32,6 +38,9 @@ pub(super) struct SessionRuntime<'a> {
     pub(super) self_user: UserId,
     pub(super) self_content_attendee: String,
     pub(super) audio_engine: AudioEngine,
+    /// Preserved inbound Opus receiver if an audio hot-swap fails to restart both the new and
+    /// previous devices, so a subsequent `SetAudioDevices` can recover session audio cleanly.
+    pub(super) parked_inbound_opus_rx: Option<mpsc::UnboundedReceiver<InboundAudioPacket>>,
     pub(super) shared: AudioSharedState,
     pub(super) camera_capture: Option<CameraCapture>,
     pub(super) content_share: Option<ContentShareSession>,
@@ -52,6 +61,48 @@ pub(super) struct SessionRuntime<'a> {
     pub(super) outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
     pub(super) local_cam_tx: mpsc::UnboundedSender<VideoFrame>,
     pub(super) local_screen_tx: mpsc::UnboundedSender<VideoFrame>,
+}
+
+/// Announce desktop draw capability + content source details on official `"data-channel"`
+/// (`desktop:screen` / `desktop:window` is required by Official Slack to enable remote drawing).
+pub(super) async fn announce_screen_share_capabilities(
+    attendee_id: &str,
+    signal: &mut ChimeSignalClient,
+    src_id: &str,
+) {
+    let cap_bytes = build_capabilities_message(attendee_id, true);
+    let _ = signal
+        .send_frame(&build_data_message_frame(
+            SLACK_DATA_CHANNEL_TOPIC,
+            cap_bytes,
+            300_000,
+        ))
+        .await;
+    let det_bytes =
+        build_content_share_details_message(attendee_id, content_share_source_type(src_id));
+    let _ = signal
+        .send_frame(&build_data_message_frame(
+            SLACK_DATA_CHANNEL_TOPIC,
+            det_bytes,
+            300_000,
+        ))
+        .await;
+}
+
+impl SessionRuntime<'_> {
+    /// Stop any active ambient jukebox player and optionally start a new track.
+    pub(super) fn set_jukebox_player(
+        &mut self,
+        output_device: Option<String>,
+        song_key: Option<&str>,
+    ) {
+        if let Some(mut prev) = self.music_player.take() {
+            prev.stop();
+        }
+        if song_key.is_some() {
+            self.music_player = AmbientMusicPlayer::start(output_device, song_key).ok();
+        }
+    }
 }
 
 pub(super) async fn run_connected_loop(
@@ -100,16 +151,16 @@ pub(super) async fn run_connected_loop(
             }
         }
     });
-    let vdec_handle = spawn_video_decoder_thread(
-        vdec_rx,
-        Arc::clone(&vdec_audio_only),
-        Arc::clone(&vdec_clear),
-        Arc::clone(&vdec_routing),
-        Arc::clone(&perf),
-        updates.clone(),
-        hs.keyframe_req_tx,
-        hs.codec_tx,
-    );
+    let vdec_handle = spawn_video_decoder_thread(VideoDecoderThreadArgs {
+        inbound_video_rx: vdec_rx,
+        audio_only: Arc::clone(&vdec_audio_only),
+        clear_decoders: Arc::clone(&vdec_clear),
+        routing: Arc::clone(&vdec_routing),
+        perf: Arc::clone(&perf),
+        updates: updates.clone(),
+        keyframe_req_tx: hs.keyframe_req_tx,
+        codec_tx: hs.codec_tx,
+    });
 
     let mut ever_connected = peer.connection_state() == RTCPeerConnectionState::Connected;
     if ever_connected {
@@ -151,6 +202,7 @@ pub(super) async fn run_connected_loop(
         self_user,
         self_content_attendee,
         audio_engine: hs.audio_engine,
+        parked_inbound_opus_rx: None,
         shared: hs.shared,
         camera_capture: None,
         content_share: None,
@@ -427,15 +479,15 @@ pub(super) async fn run_connected_loop(
     snap.packets_received = peer.total_packets_received();
     snap.phase = HuddlePhase::Leaving;
     let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
-    let _ = signal.send_frame(&build_leave_frame()).await;
-    let _ = tokio::time::timeout(Duration::from_millis(800), signal.next_frame()).await;
+    signal
+        .send_leave_and_close(Duration::from_millis(800))
+        .await;
     state.audio_engine.stop();
     video_tx_task.abort();
     vdec_fwd.abort();
     let _ = vdec_tx.send(None);
     peer.close().await;
     drop(peer);
-    signal.close().await;
     if let Some(handle) = vdec_handle {
         let _ = handle.join();
     }

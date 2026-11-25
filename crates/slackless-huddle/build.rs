@@ -12,9 +12,25 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     {
-        println!("cargo:rerun-if-changed=native/macos_media.m");
-        cc::Build::new()
-            .file("native/macos_media.m")
+        const NATIVE_SOURCES: &[&str] = &[
+            "native/macos/cvpixel.m",
+            "native/macos/vt_h264.m",
+            "native/macos/vt_av1.m",
+            "native/macos/screen_capture.m",
+            "native/macos/camera_vision.m",
+            "native/macos/vpio_audio.m",
+            "native/macos/audio_player.m",
+            "native/macos/audio_tap.m",
+            "native/macos/appkit_overlay.m",
+        ];
+        println!("cargo:rerun-if-changed=native/macos/common.h");
+        let mut build = cc::Build::new();
+        build.include("native/macos");
+        for src in NATIVE_SOURCES {
+            println!("cargo:rerun-if-changed={src}");
+            build.file(src);
+        }
+        build
             .flag("-fobjc-arc")
             .flag("-Wno-deprecated-declarations")
             .compile("slackless_macos_media");

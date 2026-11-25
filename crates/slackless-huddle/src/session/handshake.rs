@@ -8,13 +8,15 @@ use webrtc::peer_connection::RTCPeerConnectionState;
 use super::supervisor::{LoopExit, classify_handshake_err};
 use crate::audio::{AudioEngine, AudioSharedState};
 use crate::backend::platform_backend;
-use crate::proto::{SdkAudioStreamIdInfoFrame, SdkIndexFrame, sdk_signal_frame};
+use crate::proto::{SdkAudioStreamIdInfoFrame, SdkIndexFrame};
 use crate::rtc::{ChimeRtcPeer, InboundVideoPacket, VideoSenderFeedback};
 use crate::signaling::{
     ChimeSignalClient, build_join_frame, build_subscribe_frame, decode_sdp_answer_with_prev,
 };
 use crate::video::VideoFrame;
-use crate::{HuddleAudioConfig, HuddleCredentials, HuddleError, HuddleSessionSnapshot};
+use crate::{HuddleAudioConfig, HuddleCredentials, HuddleError, HuddleSessionSnapshot, Result};
+
+const HANDSHAKE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) struct HandshakeResult {
     pub(super) signal: ChimeSignalClient,
@@ -41,6 +43,55 @@ pub(super) struct HandshakeResult {
     pub(super) codec_rx: mpsc::UnboundedReceiver<String>,
     pub(super) cam_fb_rx: mpsc::UnboundedReceiver<VideoSenderFeedback>,
     pub(super) wants_compressed: bool,
+}
+
+/// Scope guard ensuring the background `AudioEngine::start` task is always stopped if the
+/// handshake fails or is cancelled before ownership is transferred to `HandshakeResult`.
+struct AudioStartGuard {
+    handle: Option<tokio::task::JoinHandle<Result<AudioEngine>>>,
+}
+
+impl AudioStartGuard {
+    fn new(handle: tokio::task::JoinHandle<Result<AudioEngine>>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn finish(mut self) -> std::result::Result<AudioEngine, LoopExit> {
+        let Some(handle) = self.handle.take() else {
+            return Err(LoopExit::Fatal(HuddleError::Audio(
+                "audio start task already consumed".to_owned(),
+            )));
+        };
+        match handle.await {
+            Ok(Ok(engine)) => Ok(engine),
+            Ok(Err(e)) => Err(LoopExit::Fatal(e)),
+            Err(e) => Err(LoopExit::Fatal(HuddleError::Audio(e.to_string()))),
+        }
+    }
+
+    async fn cancel_and_stop(mut self) {
+        if let Some(handle) = self.handle.take()
+            && let Ok(Ok(mut ae)) = handle.await
+        {
+            ae.stop();
+        }
+    }
+}
+
+impl Drop for AudioStartGuard {
+    fn drop(&mut self) {
+        // Fallback when the handshake future is dropped/cancelled mid-flight without calling
+        // `finish()` or `cancel_and_stop()`.
+        if let Some(handle) = self.handle.take() {
+            tokio::spawn(async move {
+                if let Ok(Ok(mut ae)) = handle.await {
+                    ae.stop();
+                }
+            });
+        }
+    }
 }
 
 pub(super) async fn perform_handshake(
@@ -76,35 +127,19 @@ pub(super) async fn perform_handshake(
     let mut pending_audio_info: Vec<SdkAudioStreamIdInfoFrame> = Vec::new();
 
     // 2. Await JOIN_ACK carrying TURN credentials.
-    let join_ack = match tokio::time::timeout(Duration::from_secs(10), async {
-        while let Some(frame) = signal.next_frame().await? {
-            if let Some(idx) = frame.index {
+    let join_ack = match signal
+        .wait_for_join_ack(HANDSHAKE_ACK_TIMEOUT, |frame| {
+            if let Some(idx) = frame.index.take() {
                 pending_index = Some(idx);
             }
-            if let Some(info) = frame.audio_stream_id_info {
+            if let Some(info) = frame.audio_stream_id_info.take() {
                 pending_audio_info.push(info);
             }
-            if frame.r#type == Some(sdk_signal_frame::Type::JoinAck as i32)
-                && let Some(ack) = frame.joinack
-            {
-                return Ok(ack);
-            }
-            if let Some(err) = frame.error {
-                return Err(HuddleError::Protocol {
-                    status: err.status.unwrap_or(500),
-                    description: err.description.unwrap_or_default(),
-                });
-            }
-        }
-        Err(HuddleError::Signaling(
-            "signaling socket closed before JOIN_ACK".to_owned(),
-        ))
-    })
-    .await
-    .map_err(|_| HuddleError::Signaling("timed out waiting for JOIN_ACK".to_owned()))
+        })
+        .await
     {
-        Ok(Ok(ack)) => ack,
-        Ok(Err(e)) | Err(e) => {
+        Ok(ack) => ack,
+        Err(e) => {
             tracing::error!(%e, "JOIN_ACK failed");
             return Err(classify_handshake_err(e, is_reconnect));
         }
@@ -137,17 +172,17 @@ pub(super) async fn perform_handshake(
     let (keyframe_req_tx, keyframe_req_rx) = mpsc::unbounded_channel::<u32>();
     let (codec_tx, codec_rx) = mpsc::unbounded_channel::<String>();
 
-    // 3. Kick off full-duplex audio engine initialization (CoreAudio VoiceProcessingIO / cpal)
+    // Kick off full-duplex audio engine initialization (CoreAudio VoiceProcessingIO / cpal)
     // in parallel with WebRTC ICE gathering & Chime SUBSCRIBE/SUBSCRIBE_ACK so the ~1.5s audio
     // unit startup overlaps completely with network signaling!
     let shared = AudioSharedState::from_config(config);
-    let audio_start_handle = {
+    let audio_guard = {
         let audio_cfg = config.clone();
         let audio_shared = shared.clone();
         let audio_out_tx = outbound_opus_tx.clone();
-        tokio::task::spawn_blocking(move || {
+        AudioStartGuard::new(tokio::task::spawn_blocking(move || {
             AudioEngine::start(&audio_cfg, audio_shared, audio_out_tx, inbound_opus_rx)
-        })
+        }))
     };
 
     let (cam_fb_tx, cam_fb_rx) = mpsc::unbounded_channel::<VideoSenderFeedback>();
@@ -158,128 +193,70 @@ pub(super) async fn perform_handshake(
         "huddle media backend capabilities"
     );
 
-    let peer = match ChimeRtcPeer::new(&turn, inbound_opus_tx, inbound_video_tx, pc_state_tx).await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            if let Ok(Ok(mut ae)) = audio_start_handle.await {
-                ae.stop();
-            }
-            return Err(classify_handshake_err(e, is_reconnect));
-        }
-    };
-    peer.attach_video_feedback(cam_fb_tx).await;
-    let sdp_offer = match peer.create_gathered_offer().await {
-        Ok(s) => s,
-        Err(e) => {
-            if let Ok(Ok(mut ae)) = audio_start_handle.await {
-                ae.stop();
-            }
-            return Err(classify_handshake_err(e, is_reconnect));
-        }
-    };
+    // Single fallible block so every WebRTC/SUBSCRIBE failure tears down `audio_guard` once.
+    let rtc_res: Result<(ChimeRtcPeer, HashMap<u32, u32>, Option<String>)> = async {
+        let peer = ChimeRtcPeer::new(&turn, inbound_opus_tx, inbound_video_tx, pc_state_tx).await?;
+        peer.attach_video_feedback(cam_fb_tx).await;
+        let sdp_offer = peer.create_gathered_offer().await?;
 
-    // 4. Send SUBSCRIBE and await SUBSCRIBE_ACK with SDP answer.
-    let sub = match build_subscribe_frame(
-        creds,
-        &sdp_offer,
-        wants_compressed,
-        config.muted,
-        snap.video,
-        &[],
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            if let Ok(Ok(mut ae)) = audio_start_handle.await {
-                ae.stop();
+        // 4. Send SUBSCRIBE and await SUBSCRIBE_ACK with SDP answer.
+        let sub = build_subscribe_frame(
+            creds,
+            &sdp_offer,
+            wants_compressed,
+            config.muted,
+            snap.video,
+            &[],
+        )?;
+        signal.send_frame(&sub).await?;
+
+        let sub_ack = signal
+            .wait_for_subscribe_ack(HANDSHAKE_ACK_TIMEOUT, |frame| {
+                if let Some(idx) = frame.index.take() {
+                    pending_index = Some(idx);
+                }
+                if let Some(info) = frame.audio_stream_id_info.take() {
+                    pending_audio_info.push(info);
+                }
+            })
+            .await
+            .inspect_err(|e| tracing::error!(%e, "initial SUBSCRIBE_ACK failed"))?;
+
+        let mut ssrc_to_stream_id: HashMap<u32, u32> = HashMap::new();
+        for tm in &sub_ack.tracks {
+            if let (Some(ssrc), Some(sid)) = (tm.ssrc, tm.stream_id) {
+                ssrc_to_stream_id.insert(ssrc, sid);
             }
-            return Err(classify_handshake_err(e, is_reconnect));
         }
-    };
-    if let Err(e) = signal.send_frame(&sub).await {
-        if let Ok(Ok(mut ae)) = audio_start_handle.await {
-            ae.stop();
-        }
-        return Err(classify_handshake_err(e, is_reconnect));
+
+        let sdp_answer = decode_sdp_answer_with_prev(
+            sub_ack.sdp_answer.as_deref(),
+            sub_ack.compressed_sdp_answer.as_deref(),
+            None,
+        )?;
+        let last_sdp_answer = Some(sdp_answer.clone());
+        peer.set_remote_answer(sdp_answer)
+            .await
+            .inspect_err(|e| tracing::error!(%e, "initial set_remote_answer failed"))?;
+        tracing::info!(
+            tracks = sub_ack.tracks.len(),
+            buffered_index = pending_index.is_some(),
+            "initial SUBSCRIBE_ACK applied"
+        );
+        Ok((peer, ssrc_to_stream_id, last_sdp_answer))
     }
+    .await;
 
-    let sub_ack = match tokio::time::timeout(Duration::from_secs(10), async {
-        while let Some(frame) = signal.next_frame().await? {
-            if let Some(idx) = frame.index {
-                pending_index = Some(idx);
-            }
-            if let Some(info) = frame.audio_stream_id_info {
-                pending_audio_info.push(info);
-            }
-            if frame.r#type == Some(sdk_signal_frame::Type::SubscribeAck as i32)
-                && let Some(ack) = frame.suback
-            {
-                return Ok(ack);
-            }
-            if let Some(err) = frame.error {
-                return Err(HuddleError::Protocol {
-                    status: err.status.unwrap_or(500),
-                    description: err.description.unwrap_or_default(),
-                });
-            }
-        }
-        Err(HuddleError::Signaling(
-            "signaling socket closed before SUBSCRIBE_ACK".to_owned(),
-        ))
-    })
-    .await
-    .map_err(|_| HuddleError::Signaling("timed out waiting for SUBSCRIBE_ACK".to_owned()))
-    {
-        Ok(Ok(ack)) => ack,
-        Ok(Err(e)) | Err(e) => {
-            tracing::error!(%e, "initial SUBSCRIBE_ACK failed");
-            if let Ok(Ok(mut ae)) = audio_start_handle.await {
-                ae.stop();
-            }
-            return Err(classify_handshake_err(e, is_reconnect));
-        }
-    };
-
-    let mut ssrc_to_stream_id: HashMap<u32, u32> = HashMap::new();
-    for tm in &sub_ack.tracks {
-        if let (Some(ssrc), Some(sid)) = (tm.ssrc, tm.stream_id) {
-            ssrc_to_stream_id.insert(ssrc, sid);
-        }
-    }
-
-    let sdp_answer = match decode_sdp_answer_with_prev(
-        sub_ack.sdp_answer.as_deref(),
-        sub_ack.compressed_sdp_answer.as_deref(),
-        None,
-    ) {
-        Ok(s) => s,
+    let (peer, ssrc_to_stream_id, last_sdp_answer) = match rtc_res {
+        Ok(ok) => ok,
         Err(e) => {
-            if let Ok(Ok(mut ae)) = audio_start_handle.await {
-                ae.stop();
-            }
+            audio_guard.cancel_and_stop().await;
             return Err(classify_handshake_err(e, is_reconnect));
         }
     };
-    let last_sdp_answer = Some(sdp_answer.clone());
-    if let Err(e) = peer.set_remote_answer(sdp_answer).await {
-        tracing::error!(%e, "initial set_remote_answer failed");
-        if let Ok(Ok(mut ae)) = audio_start_handle.await {
-            ae.stop();
-        }
-        return Err(classify_handshake_err(e, is_reconnect));
-    }
-    tracing::info!(
-        tracks = sub_ack.tracks.len(),
-        buffered_index = pending_index.is_some(),
-        "initial SUBSCRIBE_ACK applied"
-    );
 
     // 5. Collect the full-duplex audio engine started in parallel with signaling above.
-    let audio_engine = match audio_start_handle.await {
-        Ok(Ok(e)) => e,
-        Ok(Err(e)) => return Err(LoopExit::Fatal(e)),
-        Err(e) => return Err(LoopExit::Fatal(HuddleError::Audio(e.to_string()))),
-    };
+    let audio_engine = audio_guard.finish().await?;
 
     Ok(HandshakeResult {
         signal,

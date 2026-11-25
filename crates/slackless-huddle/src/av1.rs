@@ -16,8 +16,29 @@ use rav1d::src::lib::{
     dav1d_open, dav1d_picture_unref, dav1d_send_data,
 };
 
-use crate::video::VideoFrame;
+use crate::video::{RtpSeqStep, RtpSeqTracker, VideoFrame};
 use crate::{HuddleError, Result};
+
+/// Platform-correct negated `EAGAIN` returned by `rav1d` (`DAV1D_ERR(EAGAIN)`):
+/// `-35` on macOS/BSD (`EAGAIN = 35`), `-11` on Linux/Windows (`EAGAIN = 11`).
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+))]
+const NEG_EAGAIN: i32 = -35;
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+)))]
+const NEG_EAGAIN: i32 = -11;
 
 /// Reads an unsigned LEB128 integer; returns `(value, bytes_consumed)`.
 fn read_leb128(buf: &[u8]) -> Option<(usize, usize)> {
@@ -73,16 +94,15 @@ fn append_sized_obu(out: &mut Vec<u8>, obu: &[u8]) {
 pub struct Av1Frames {
     unit: Vec<u8>,
     partial: Vec<u8>,
-    last_seq: Option<u16>,
+    seq_tracker: RtpSeqTracker,
     broken: bool,
-    seq_gaps: u64,
     needs_keyframe: bool,
 }
 
 impl Av1Frames {
     /// Total number of RTP 16-bit sequence gaps observed on this stream.
     pub fn seq_gaps(&self) -> u64 {
-        self.seq_gaps
+        self.seq_tracker.seq_gaps()
     }
 
     /// Returns `true` (and clears the flag) if a mid-frame sequence gap requires a PLI keyframe.
@@ -93,32 +113,17 @@ impl Av1Frames {
     /// Push one RTP packet payload; returns `Some(temporal_unit)` when `marker` closes a valid unit.
     pub fn push(&mut self, seq: u16, marker: bool, payload: &[u8]) -> Option<Vec<u8>> {
         let Some(&header) = payload.first() else {
-            self.last_seq = Some(seq);
+            self.seq_tracker.set_last_seq(seq);
             return None;
         };
         let z_continues_prev = header & 0b1000_0000 != 0;
         let n_new_cvs = header & 0b0000_1000 != 0;
 
-        let missing_pkts = match self.last_seq {
-            None => {
-                self.last_seq = Some(seq);
-                0
-            }
-            Some(prev) => {
-                let diff = seq.wrapping_sub(prev) as i16;
-                if diff <= 0 {
-                    // Late/reordered or duplicate RTP packet; drop without inflating loss or
-                    // regressing `last_seq`.
-                    return None;
-                }
-                self.last_seq = Some(seq);
-                (diff - 1) as u64
-            }
+        let seq_gap = match self.seq_tracker.advance(seq) {
+            RtpSeqStep::First | RtpSeqStep::Contiguous => false,
+            RtpSeqStep::LateOrDuplicate => return None,
+            RtpSeqStep::Gap(_) => true,
         };
-        let seq_gap = missing_pkts > 0;
-        if seq_gap {
-            self.seq_gaps = self.seq_gaps.saturating_add(missing_pkts);
-        }
 
         // An SFU routinely skips RTP sequence numbers between complete frames (e.g. dropped
         // non-reference frames, layer switches, or padding). Only treat a gap as breaking an
@@ -286,21 +291,21 @@ impl Av1Decoder {
 
             let mut out_frame = None;
             let mut send_res = dav1d_send_data(self.ctx, NonNull::new(&mut data as *mut _));
-            if send_res.0 == -11 {
+            if send_res.0 == NEG_EAGAIN {
                 // EAGAIN: drain any queued picture first, then retry sending the new unit.
                 if let Some(frame) = self.drain_picture()? {
                     out_frame = Some(frame);
                 }
                 send_res = dav1d_send_data(self.ctx, NonNull::new(&mut data as *mut _));
             }
-            if send_res.0 < 0 && send_res.0 != -11 {
+            if send_res.0 < 0 && send_res.0 != NEG_EAGAIN {
                 dav1d_data_unref(NonNull::new(&mut data as *mut _));
                 return Err(HuddleError::Codec(format!(
                     "rav1d send_data error {}",
                     send_res.0
                 )));
             }
-            if send_res.0 == -11 {
+            if send_res.0 == NEG_EAGAIN {
                 dav1d_data_unref(NonNull::new(&mut data as *mut _));
             }
 
@@ -315,7 +320,7 @@ impl Av1Decoder {
         unsafe {
             let mut pic = std::mem::MaybeUninit::<Dav1dPicture>::zeroed().assume_init();
             let res = dav1d_get_picture(self.ctx, NonNull::new(&mut pic as *mut _));
-            if res.0 == -11 {
+            if res.0 == NEG_EAGAIN {
                 return Ok(None);
             }
             if res.0 < 0 {
@@ -429,9 +434,35 @@ unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
                 }
             }
         }
-        if pairs_h == h && pairs_w == w {
-            return Some(VideoFrame::from_bgra(w as u32, h as u32, bgra));
+        // Handle any trailing odd right column and/or odd bottom row without re-converting the
+        // already-completed 2x2 interior.
+        if pairs_w < w {
+            let col = pairs_w;
+            let cx = (col >> 1) as isize;
+            for row in 0..pairs_h {
+                let y = unsafe { *y_ptr.offset((row as isize) * y_stride + col as isize) } as i32;
+                let c_row = ((row >> 1) as isize) * c_stride;
+                let u = unsafe { *up.offset(c_row + cx) } as i32;
+                let v = unsafe { *vp.offset(c_row + cx) } as i32;
+                let o = (row * w + col) * 4;
+                write_yuv_pixel(&mut bgra[o..o + 4], y, u, v);
+            }
         }
+        if pairs_h < h {
+            let row = pairs_h;
+            let y_row = (row as isize) * y_stride;
+            let c_row = ((row >> 1) as isize) * c_stride;
+            let out_row = row * w * 4;
+            for col in 0..w {
+                let cx = (col >> 1) as isize;
+                let y = unsafe { *y_ptr.offset(y_row + col as isize) } as i32;
+                let u = unsafe { *up.offset(c_row + cx) } as i32;
+                let v = unsafe { *vp.offset(c_row + cx) } as i32;
+                let o = out_row + col * 4;
+                write_yuv_pixel(&mut bgra[o..o + 4], y, u, v);
+            }
+        }
+        return Some(VideoFrame::from_bgra(w as u32, h as u32, bgra));
     }
 
     let shift16 = (bpc - 8) as u32;
@@ -454,13 +485,25 @@ unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
                 };
                 (y, u, v)
             } else {
-                let y16 = unsafe { *(y_ptr.offset(y_row) as *const u16).add(col) };
+                // SAFETY: `read_unaligned` safely loads 16-bit samples regardless of plane stride
+                // or base pointer alignment.
+                let y16 = unsafe {
+                    std::ptr::read_unaligned(y_ptr.offset(y_row + (col * 2) as isize) as *const u16)
+                };
                 let y = (y16 >> shift16) as i32;
                 let (u, v) = match (u_ptr, v_ptr) {
                     (Some(up), Some(vp)) => {
                         let cx = col >> cw_shift;
-                        let u16v = unsafe { *(up.offset(c_row) as *const u16).add(cx) };
-                        let v16v = unsafe { *(vp.offset(c_row) as *const u16).add(cx) };
+                        let u16v = unsafe {
+                            std::ptr::read_unaligned(
+                                up.offset(c_row + (cx * 2) as isize) as *const u16
+                            )
+                        };
+                        let v16v = unsafe {
+                            std::ptr::read_unaligned(
+                                vp.offset(c_row + (cx * 2) as isize) as *const u16
+                            )
+                        };
                         ((u16v >> shift16) as i32, (v16v >> shift16) as i32)
                     }
                     _ => (128, 128),
@@ -810,7 +853,7 @@ mod tests {
 
         // Empty payload updates last_seq and returns None.
         assert!(f.push(1, false, &[]).is_none());
-        assert_eq!(f.last_seq, Some(1));
+        assert_eq!(f.seq_tracker.last_seq(), Some(1));
 
         // Z=0 while partial is non-empty is a protocol violation -> marks broken and resets on marker.
         assert!(
@@ -840,11 +883,16 @@ mod tests {
     }
 
     #[test]
+    fn neg_eagain_matches_platform_would_block() {
+        let err = std::io::Error::from_raw_os_error(-NEG_EAGAIN);
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
     fn picture_to_bgra_handles_i420_odd_i422_i444_i400_10bit_and_padded_strides() {
         use rav1d::include::dav1d::headers::Dav1dPixelLayout;
 
-        #[allow(clippy::too_many_arguments)]
-        unsafe fn build_pic(
+        struct TestPicSpec {
             w: i32,
             h: i32,
             bpc: i32,
@@ -854,17 +902,19 @@ mod tests {
             v_ptr: Option<*const u8>,
             y_stride: isize,
             c_stride: isize,
-        ) -> Dav1dPicture {
+        }
+
+        unsafe fn build_pic(spec: TestPicSpec) -> Dav1dPicture {
             let mut pic = unsafe { std::mem::MaybeUninit::<Dav1dPicture>::zeroed().assume_init() };
-            pic.p.w = w;
-            pic.p.h = h;
-            pic.p.bpc = bpc;
-            pic.p.layout = layout;
-            pic.data[0] = NonNull::new(y_ptr as *mut _);
-            pic.data[1] = u_ptr.and_then(|p| NonNull::new(p as *mut _));
-            pic.data[2] = v_ptr.and_then(|p| NonNull::new(p as *mut _));
-            pic.stride[0] = y_stride;
-            pic.stride[1] = c_stride;
+            pic.p.w = spec.w;
+            pic.p.h = spec.h;
+            pic.p.bpc = spec.bpc;
+            pic.p.layout = spec.layout;
+            pic.data[0] = NonNull::new(spec.y_ptr as *mut _);
+            pic.data[1] = spec.u_ptr.and_then(|p| NonNull::new(p as *mut _));
+            pic.data[2] = spec.v_ptr.and_then(|p| NonNull::new(p as *mut _));
+            pic.stride[0] = spec.y_stride;
+            pic.stride[1] = spec.c_stride;
             pic
         }
 
@@ -887,17 +937,17 @@ mod tests {
             }
         }
         let pic = unsafe {
-            build_pic(
-                w as i32,
-                h as i32,
-                8,
-                DAV1D_PIXEL_LAYOUT_I420,
-                y_buf.as_ptr(),
-                Some(u_buf.as_ptr()),
-                Some(v_buf.as_ptr()),
-                y_stride as isize,
-                c_stride as isize,
-            )
+            build_pic(TestPicSpec {
+                w: w as i32,
+                h: h as i32,
+                bpc: 8,
+                layout: DAV1D_PIXEL_LAYOUT_I420,
+                y_ptr: y_buf.as_ptr(),
+                u_ptr: Some(u_buf.as_ptr()),
+                v_ptr: Some(v_buf.as_ptr()),
+                y_stride: y_stride as isize,
+                c_stride: c_stride as isize,
+            })
         };
         let frame = unsafe { picture_to_bgra(&pic) }.expect("8-bit I420");
         let (fw, fh, bgra) = frame.into_bgra().unwrap();
@@ -906,23 +956,23 @@ mod tests {
             assert_eq!(px, &[255, 255, 255, 255]);
         }
 
-        // 2. Odd dimensions 5x3 I420 (exercises fallback path after 2x2 fast path).
+        // 2. Odd dimensions 5x3 I420 (exercises edge handling in 2x2 fast path without double pass).
         let (ow, oh) = (5usize, 3usize);
         let oy = vec![16u8; ow * oh]; // studio black Y=16
         let ou = vec![128u8; ow.div_ceil(2) * oh.div_ceil(2)];
         let ov = vec![128u8; ow.div_ceil(2) * oh.div_ceil(2)];
         let pic_odd = unsafe {
-            build_pic(
-                ow as i32,
-                oh as i32,
-                8,
-                DAV1D_PIXEL_LAYOUT_I420,
-                oy.as_ptr(),
-                Some(ou.as_ptr()),
-                Some(ov.as_ptr()),
-                ow as isize,
-                ow.div_ceil(2) as isize,
-            )
+            build_pic(TestPicSpec {
+                w: ow as i32,
+                h: oh as i32,
+                bpc: 8,
+                layout: DAV1D_PIXEL_LAYOUT_I420,
+                y_ptr: oy.as_ptr(),
+                u_ptr: Some(ou.as_ptr()),
+                v_ptr: Some(ov.as_ptr()),
+                y_stride: ow as isize,
+                c_stride: ow.div_ceil(2) as isize,
+            })
         };
         let frame_odd = unsafe { picture_to_bgra(&pic_odd) }.expect("odd I420");
         let (fw, fh, bgra_odd) = frame_odd.into_bgra().unwrap();
@@ -936,17 +986,17 @@ mod tests {
         let u422 = [90u8; 2 * 2];
         let v422 = [240u8; 2 * 2];
         let pic_422 = unsafe {
-            build_pic(
-                4,
-                2,
-                8,
-                DAV1D_PIXEL_LAYOUT_I422,
-                y422.as_ptr(),
-                Some(u422.as_ptr()),
-                Some(v422.as_ptr()),
-                4,
-                2,
-            )
+            build_pic(TestPicSpec {
+                w: 4,
+                h: 2,
+                bpc: 8,
+                layout: DAV1D_PIXEL_LAYOUT_I422,
+                y_ptr: y422.as_ptr(),
+                u_ptr: Some(u422.as_ptr()),
+                v_ptr: Some(v422.as_ptr()),
+                y_stride: 4,
+                c_stride: 2,
+            })
         };
         let (_, _, bgra_422) = unsafe { picture_to_bgra(&pic_422) }
             .expect("I422")
@@ -959,17 +1009,17 @@ mod tests {
         let u444 = [240u8; 2 * 2];
         let v444 = [110u8; 2 * 2];
         let pic_444 = unsafe {
-            build_pic(
-                2,
-                2,
-                8,
-                DAV1D_PIXEL_LAYOUT_I444,
-                y444.as_ptr(),
-                Some(u444.as_ptr()),
-                Some(v444.as_ptr()),
-                2,
-                2,
-            )
+            build_pic(TestPicSpec {
+                w: 2,
+                h: 2,
+                bpc: 8,
+                layout: DAV1D_PIXEL_LAYOUT_I444,
+                y_ptr: y444.as_ptr(),
+                u_ptr: Some(u444.as_ptr()),
+                v_ptr: Some(v444.as_ptr()),
+                y_stride: 2,
+                c_stride: 2,
+            })
         };
         let (_, _, bgra_444) = unsafe { picture_to_bgra(&pic_444) }
             .expect("I444")
@@ -980,17 +1030,17 @@ mod tests {
         // 5. I400 (grayscale, no chroma pointers).
         let y400 = [126u8; 3 * 2];
         let pic_400 = unsafe {
-            build_pic(
-                3,
-                2,
-                8,
-                DAV1D_PIXEL_LAYOUT_I400,
-                y400.as_ptr(),
-                None,
-                None,
-                3,
-                0,
-            )
+            build_pic(TestPicSpec {
+                w: 3,
+                h: 2,
+                bpc: 8,
+                layout: DAV1D_PIXEL_LAYOUT_I400,
+                y_ptr: y400.as_ptr(),
+                u_ptr: None,
+                v_ptr: None,
+                y_stride: 3,
+                c_stride: 0,
+            })
         };
         let (_, _, bgra_400) = unsafe { picture_to_bgra(&pic_400) }
             .expect("I400")
@@ -1000,22 +1050,29 @@ mod tests {
         assert_eq!(bgra_400[1], bgra_400[2]);
         assert!(bgra_400[0] > 110 && bgra_400[0] < 145);
 
-        // 6. 10-bit I420 shift path (`<< 2` matches 8-bit white).
-        let y10 = [235u16 << 2; 4 * 2];
-        let u10 = [128u16 << 2; 2];
-        let v10 = [128u16 << 2; 2];
+        // 6. 10-bit I420 shift path with deliberately unaligned byte pointers (`+1` offset).
+        let mut y10_raw = [0u8; 1 + 4 * 2 * 2];
+        for i in 0..(4 * 2) {
+            y10_raw[1 + i * 2..1 + i * 2 + 2].copy_from_slice(&(235u16 << 2).to_ne_bytes());
+        }
+        let mut u10_raw = [0u8; 1 + 2 * 2];
+        let mut v10_raw = [0u8; 1 + 2 * 2];
+        for i in 0..2 {
+            u10_raw[1 + i * 2..1 + i * 2 + 2].copy_from_slice(&(128u16 << 2).to_ne_bytes());
+            v10_raw[1 + i * 2..1 + i * 2 + 2].copy_from_slice(&(128u16 << 2).to_ne_bytes());
+        }
         let pic_10 = unsafe {
-            build_pic(
-                4,
-                2,
-                10,
-                DAV1D_PIXEL_LAYOUT_I420,
-                y10.as_ptr().cast(),
-                Some(u10.as_ptr().cast()),
-                Some(v10.as_ptr().cast()),
-                (4 * 2) as isize,
-                (2 * 2) as isize,
-            )
+            build_pic(TestPicSpec {
+                w: 4,
+                h: 2,
+                bpc: 10,
+                layout: DAV1D_PIXEL_LAYOUT_I420,
+                y_ptr: y10_raw.as_ptr().add(1),
+                u_ptr: Some(u10_raw.as_ptr().add(1)),
+                v_ptr: Some(v10_raw.as_ptr().add(1)),
+                y_stride: (4 * 2) as isize,
+                c_stride: (2 * 2) as isize,
+            })
         };
         let (_, _, bgra_10) = unsafe { picture_to_bgra(&pic_10) }
             .expect("10-bit I420")
@@ -1027,31 +1084,31 @@ mod tests {
 
         // 7. Invalid dimensions or unsupported bpc return None.
         let pic_zero = unsafe {
-            build_pic(
-                0,
-                4,
-                8,
-                DAV1D_PIXEL_LAYOUT_I400,
-                y400.as_ptr(),
-                None,
-                None,
-                0,
-                0,
-            )
+            build_pic(TestPicSpec {
+                w: 0,
+                h: 4,
+                bpc: 8,
+                layout: DAV1D_PIXEL_LAYOUT_I400,
+                y_ptr: y400.as_ptr(),
+                u_ptr: None,
+                v_ptr: None,
+                y_stride: 0,
+                c_stride: 0,
+            })
         };
         assert!(unsafe { picture_to_bgra(&pic_zero) }.is_none());
         let pic_12bit = unsafe {
-            build_pic(
-                2,
-                2,
-                12,
-                DAV1D_PIXEL_LAYOUT_I400,
-                y400.as_ptr(),
-                None,
-                None,
-                4,
-                0,
-            )
+            build_pic(TestPicSpec {
+                w: 2,
+                h: 2,
+                bpc: 12,
+                layout: DAV1D_PIXEL_LAYOUT_I400,
+                y_ptr: y400.as_ptr(),
+                u_ptr: None,
+                v_ptr: None,
+                y_stride: 4,
+                c_stride: 0,
+            })
         };
         assert!(unsafe { picture_to_bgra(&pic_12bit) }.is_none());
     }

@@ -1,6 +1,5 @@
-use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -10,6 +9,7 @@ use tokio::sync::mpsc;
 use super::dsp::{build_sonora, downmix_to_mono_f32, soft_limit_sample};
 use super::engine::run_inbound_audio_rx_loop;
 use super::jitter::{PLAYBACK_MAX_SAMPLES, PLAYBACK_PRIME_SAMPLES, PLAYBACK_TRIM_TARGET};
+use super::ring::SpscRing;
 use super::*;
 use crate::HuddleAudioConfig;
 use crate::rtc::InboundAudioPacket;
@@ -135,7 +135,7 @@ fn linear_resampler_scales_length_accurately() {
 
 #[test]
 fn playback_buffer_prebuffers_and_fades_smoothly_on_underrun() {
-    let mut pb = PlaybackBuffer::new();
+    let pb = PlaybackBuffer::new();
     let mut out = vec![1.0f32; 512];
 
     // Below 60ms prime threshold: outputs silence so 512-sample CoreAudio pulls never sputter.
@@ -155,7 +155,7 @@ fn playback_buffer_prebuffers_and_fades_smoothly_on_underrun() {
     let tail_start = PLAYBACK_PRIME_SAMPLES - 512;
     assert!(big[tail_start] > 0.2 && big[tail_start] < 0.4);
     assert!(big[tail_start + 64].abs() < 1e-4);
-    assert!(!pb.primed);
+    assert!(!pb.is_primed());
 }
 
 #[test]
@@ -386,14 +386,17 @@ fn jitter_buffer_wraparound_stale_multi_loss_fast_trigger_dtx_resync_overflow_an
 
 #[test]
 fn playback_buffer_overflow_crossfade_exact_drain_clamping_reprime_and_snap() {
-    let mut pb = PlaybackBuffer::new();
+    let pb = PlaybackBuffer::new();
 
     // Exact drain stays primed!
     pb.push(&vec![0.5f32; PLAYBACK_PRIME_SAMPLES]);
-    assert!(pb.primed);
+    assert!(pb.is_primed());
     let mut exact = vec![0.0f32; PLAYBACK_PRIME_SAMPLES];
     pb.pull_into(&mut exact);
-    assert!(pb.primed, "exact drain without shortage must stay primed");
+    assert!(
+        pb.is_primed(),
+        "exact drain without shortage must stay primed"
+    );
     assert!(exact.iter().all(|&s| (s - 0.5).abs() < 1e-6));
 
     // Clamping out-of-range samples [-1.0, 1.0].
@@ -405,29 +408,29 @@ fn playback_buffer_overflow_crossfade_exact_drain_clamping_reprime_and_snap() {
     // Re-priming cycle: trigger underrun -> unprimed -> fade snaps to exact 0.0.
     let mut fade = vec![99.0f32; 128];
     pb.pull_into(&mut fade);
-    assert!(!pb.primed);
+    assert!(!pb.is_primed());
     assert_eq!(
         *fade.last().unwrap(),
         0.0,
         "fade_to_silence must snap to 0.0"
     );
     pb.push(&vec![0.3f32; FRAME_20MS * 2]);
-    assert!(!pb.primed);
+    assert!(!pb.is_primed());
     pb.push(&vec![0.3f32; FRAME_20MS]);
-    assert!(pb.primed);
+    assert!(pb.is_primed());
 
-    // Overflow trim + 32-sample crossfade splice.
-    let mut pb_ov = PlaybackBuffer::new();
+    // Overflow trim + 32-sample crossfade splice (consumer-side lock-free trim).
+    let pb_ov = PlaybackBuffer::new();
     // Fill first portion with -0.6 and later portion with +0.6 up to PLAYBACK_MAX_SAMPLES.
     pb_ov.push(&vec![-0.6f32; PLAYBACK_MAX_SAMPLES - PLAYBACK_TRIM_TARGET]);
     pb_ov.push(&vec![0.6f32; PLAYBACK_TRIM_TARGET]);
-    assert_eq!(pb_ov.samples.len(), PLAYBACK_MAX_SAMPLES);
-    // Pushing 1 more frame exceeds PLAYBACK_MAX_SAMPLES -> trims to PLAYBACK_TRIM_TARGET + FRAME_20MS.
+    assert_eq!(pb_ov.len(), PLAYBACK_MAX_SAMPLES);
+    // Pushing 1 more frame exceeds PLAYBACK_MAX_SAMPLES -> consumer trims to PLAYBACK_TRIM_TARGET
+    // and crossfades the first 32 pulled samples smoothly from -0.6 toward +0.6.
     pb_ov.push(&vec![0.6f32; FRAME_20MS]);
-    assert_eq!(pb_ov.samples.len(), PLAYBACK_TRIM_TARGET + FRAME_20MS);
     let mut splice = vec![0.0f32; 40];
     pb_ov.pull_into(&mut splice);
-    // First 32 samples ramp smoothly from -0.6 toward +0.6.
+    assert_eq!(pb_ov.len(), PLAYBACK_TRIM_TARGET - 40);
     assert!(splice[0] < -0.4);
     assert!(splice[15].abs() < 0.15);
     assert!((splice[31] - 0.6).abs() < 0.1);
@@ -525,12 +528,12 @@ fn inbound_audio_rx_loop_reorders_fec_plc_primes_playback_and_gates_aec_tap() {
         packets.push(Bytes::copy_from_slice(&out_buf[..n]));
     }
 
-    // Case 1: needs_sw_aec_ref = true, unmuted, aec = true -> populates both PlaybackBuffer and aec_render_tap (with overflow trim).
+    // Case 1: needs_sw_aec_ref = true, unmuted, aec = true -> populates both PlaybackBuffer and aec_render_tap.
     let cfg = HuddleAudioConfig::default();
     let shared = AudioSharedState::from_config(&cfg);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let playback = Arc::new(Mutex::new(PlaybackBuffer::new()));
-    let aec_tap = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+    let playback = Arc::new(PlaybackBuffer::new());
+    let aec_tap = Arc::new(SpscRing::<f32>::new(FRAME_20MS * 8));
     let needs_aec = Arc::new(AtomicBool::new(true));
 
     let s_clone = shared.clone();
@@ -553,52 +556,44 @@ fn inbound_audio_rx_loop_reorders_fec_plc_primes_playback_and_gates_aec_tap() {
 
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        let primed = playback.lock().unwrap().primed;
-        let tap_len = aec_tap.lock().unwrap().len();
-        if primed && tap_len > 0 {
-            // Wait briefly for remaining packets to decode through the jitter buffer.
-            if playback.lock().unwrap().samples.len() >= FRAME_20MS * 8 {
-                break;
-            }
+        if playback.is_primed() && !aec_tap.is_empty() && playback.len() >= FRAME_20MS * 8 {
+            break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    shared.running.store(false, Ordering::Relaxed);
+    shared.running.store(false, Ordering::Release);
     handle.join().unwrap();
 
     {
-        let mut pb = playback.lock().unwrap();
         assert!(
-            pb.primed,
+            playback.is_primed(),
             "playback buffer should be primed after decoding Opus packets"
         );
         let mut rendered = vec![0.0f32; FRAME_20MS * 3];
-        pb.pull_into(&mut rendered);
+        playback.pull_into(&mut rendered);
         assert!(
             compute_rms_mono(&rendered) > 0.01,
             "decoded playback audio should contain non-silent tone"
         );
     }
     {
-        let tap = aec_tap.lock().unwrap();
         assert!(
-            !tap.is_empty(),
+            !aec_tap.is_empty(),
             "aec_render_tap should receive decoded samples"
         );
-        // Overflow cap trims when > FRAME_20MS * 6 down to FRAME_20MS * 3 before extending.
         assert!(
-            tap.len() <= FRAME_20MS * 7,
-            "aec_render_tap must be bounded by overflow trim, got {}",
-            tap.len()
+            aec_tap.len() <= aec_tap.capacity(),
+            "aec_render_tap must be bounded by ring capacity, got {}",
+            aec_tap.len()
         );
     }
 
     // Case 2: needs_sw_aec_ref = false -> aec_render_tap stays empty while playback still works.
     let shared2 = AudioSharedState::from_config(&cfg);
     let (tx2, mut rx2) = mpsc::unbounded_channel();
-    let pb2 = Arc::new(Mutex::new(PlaybackBuffer::new()));
-    let tap2 = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+    let pb2 = Arc::new(PlaybackBuffer::new());
+    let tap2 = Arc::new(SpscRing::<f32>::new(FRAME_20MS * 8));
     let needs2 = Arc::new(AtomicBool::new(false));
     let s2 = shared2.clone();
     let pb2_c = Arc::clone(&pb2);
@@ -616,15 +611,15 @@ fn inbound_audio_rx_loop_reorders_fec_plc_primes_playback_and_gates_aec_tap() {
     }
     let dl2 = Instant::now() + Duration::from_secs(2);
     while Instant::now() < dl2 {
-        if pb2.lock().unwrap().primed {
+        if pb2.is_primed() {
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    shared2.running.store(false, Ordering::Relaxed);
+    shared2.running.store(false, Ordering::Release);
     h2.join().unwrap();
-    assert!(pb2.lock().unwrap().primed);
-    assert!(tap2.lock().unwrap().is_empty());
+    assert!(pb2.is_primed());
+    assert!(tap2.is_empty());
 }
 
 #[test]

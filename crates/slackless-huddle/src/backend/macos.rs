@@ -5,21 +5,27 @@
 
 #![cfg(target_os = "macos")]
 
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
 use super::portable::{LazyOpenH264Decoder, SoftwareAv1Decoder, SoftwareScreenShare};
 use super::{
-    AudioDeviceChangeKind, AudioDeviceMonitorHandle, CameraConfig, CameraHandle,
-    HwAudioDuplexHandle, MediaBackend, MediaCapabilities, ScreenShareConfig, ScreenShareHandle,
+    AudioDeviceChangeKind, AudioDeviceMonitorHandle, AudioLoopHandle, CameraConfig, CameraHandle,
+    CameraPreviewConfig, CameraPreviewHandle, HwAudioDuplexConfig, HwAudioDuplexHandle,
+    MediaBackend, MediaCapabilities, ScreenShareConfig, ScreenShareHandle, SystemAudioTapHandle,
     VideoDecoderHandle,
 };
-use crate::macos_media::{
-    AvVtCameraCapture, CoreAudioDeviceMonitor, MacVoiceProcessingIo, ScVtScreenCapture,
-    VtAv1Decoder, VtH264Decoder, capture_macos_thumbnails, list_macos_cameras,
-    supports_hw_av1_decode, supports_hw_h264_decode,
+use crate::audio::ring::SpscRing;
+use crate::macos::{
+    AvVtCameraCapture, CoreAudioDeviceMonitor, MacRoutedAudioLoop, MacVoiceProcessingIo,
+    ScVtScreenCapture, VtAv1Decoder, VtH264Decoder, capture_macos_thumbnails,
+    has_screen_capture_permission, list_macos_cameras, measure_audio_file_rms,
+    open_screen_capture_settings, play_routed_audio_oneshot, request_screen_capture_permission,
+    supports_hw_av1_decode, supports_hw_h264_decode, supports_native_system_audio_tap,
 };
+use crate::macos_audio_tap::SystemAudioTap;
 use crate::metrics::HuddlePerfCounters;
 use crate::video::{CameraDeviceInfo, VideoFrame, select_camera_index};
 use crate::{HuddleError, Result};
@@ -64,11 +70,29 @@ impl CameraHandle for AvVtCameraCapture {
     }
 }
 
+impl CameraPreviewHandle for AvVtCameraCapture {
+    fn set_blur(&self, enabled: bool) {
+        AvVtCameraCapture::set_blur(self, enabled);
+    }
+
+    fn stop(&mut self) {
+        AvVtCameraCapture::stop(self);
+    }
+}
+
 struct MacAudioDeviceMonitor {
     _inner: CoreAudioDeviceMonitor,
 }
 
 impl AudioDeviceMonitorHandle for MacAudioDeviceMonitor {}
+
+impl SystemAudioTapHandle for SystemAudioTap {}
+
+impl AudioLoopHandle for MacRoutedAudioLoop {
+    fn stop(&mut self) {
+        MacRoutedAudioLoop::stop(self);
+    }
+}
 
 impl HwAudioDuplexHandle for MacVoiceProcessingIo {
     fn set_processing(&self, enable_aec_ns: bool, enable_agc: bool) {
@@ -252,10 +276,22 @@ impl MediaBackend for MacOsMediaBackend {
             hw_av1_decode: supports_hw_av1_decode(),
             hw_camera_capture: true,
             zero_copy_gpu_surface: true,
-            native_system_audio_tap: crate::macos_audio_tap::supports_native_system_audio_tap(),
+            native_system_audio_tap: supports_native_system_audio_tap(),
             native_device_hotplug: true,
             hw_audio_dsp: true,
         }
+    }
+
+    fn has_screen_capture_permission(&self) -> bool {
+        has_screen_capture_permission()
+    }
+
+    fn request_screen_capture_permission(&self) -> bool {
+        request_screen_capture_permission()
+    }
+
+    fn open_screen_capture_settings(&self) {
+        open_screen_capture_settings();
     }
 
     fn list_cameras(&self) -> Vec<CameraDeviceInfo> {
@@ -268,7 +304,7 @@ impl MediaBackend for MacOsMediaBackend {
         max_w: u32,
         max_h: u32,
     ) -> Vec<(String, VideoFrame)> {
-        if !crate::has_screen_capture_permission() {
+        if !self.has_screen_capture_permission() {
             return Vec::new();
         }
         if let Some(thumbs) = capture_macos_thumbnails(monitors_only, max_w, max_h) {
@@ -284,25 +320,21 @@ impl MediaBackend for MacOsMediaBackend {
         preview_tx: mpsc::UnboundedSender<VideoFrame>,
         perf: Arc<HuddlePerfCounters>,
     ) -> Result<Box<dyn ScreenShareHandle>> {
-        if !crate::has_screen_capture_permission() {
+        if !self.has_screen_capture_permission() {
             return Err(HuddleError::Video(
                 "Screen Recording permission not granted. Grant access in System Settings > Privacy & Security > Screen Recording."
                     .into(),
             ));
         }
         match ScVtScreenCapture::start(
-            &config.source_id,
-            config.max_w,
-            config.max_h,
-            config.max_fps,
-            config.bitrate_bps,
+            &config,
             outbound_h264_tx.clone(),
             preview_tx.clone(),
             Arc::clone(&perf),
         ) {
             Ok(hw) => Ok(Box::new(hw)),
             Err(err) => {
-                if !crate::has_screen_capture_permission() {
+                if !self.has_screen_capture_permission() {
                     return Err(err);
                 }
                 tracing::warn!(
@@ -332,19 +364,29 @@ impl MediaBackend for MacOsMediaBackend {
             preview_tx,
             list_macos_cameras,
             |cfg, h264_tx, prev_tx| {
-                AvVtCameraCapture::start(
-                    cfg.device_index,
-                    cfg.max_w,
-                    cfg.max_h,
-                    cfg.max_fps,
-                    cfg.bitrate_bps,
-                    cfg.blur_background,
-                    h264_tx,
-                    prev_tx,
-                )
-                .map(|hw| Box::new(hw) as Box<dyn CameraHandle>)
+                AvVtCameraCapture::start(&cfg, h264_tx, prev_tx)
+                    .map(|hw| Box::new(hw) as Box<dyn CameraHandle>)
             },
         )
+    }
+
+    fn start_camera_preview(
+        &self,
+        config: CameraPreviewConfig,
+        on_frame: Arc<dyn Fn(VideoFrame) + Send + Sync>,
+    ) -> Result<Box<dyn CameraPreviewHandle>> {
+        let available = list_macos_cameras();
+        let resolved = select_camera_index(config.device_index, &available)
+            .ok_or_else(|| HuddleError::Video("no camera device found".into()))?;
+        let cap = AvVtCameraCapture::start_preview_only(
+            Some(resolved),
+            config.max_w,
+            config.max_h,
+            config.max_fps,
+            config.blur_background,
+            move |frame| on_frame(frame),
+        )?;
+        Ok(Box::new(cap))
     }
 
     fn create_h264_decoder(&self) -> Result<Box<dyn VideoDecoderHandle>> {
@@ -369,27 +411,61 @@ impl MediaBackend for MacOsMediaBackend {
         Some(Box::new(MacAudioDeviceMonitor { _inner: inner }))
     }
 
+    fn native_system_audio_label(&self) -> Option<&'static str> {
+        supports_native_system_audio_tap().then_some("macOS Native System Audio")
+    }
+
+    fn start_system_audio_tap(
+        &self,
+        ring: Arc<SpscRing<i16>>,
+    ) -> Option<Result<Box<dyn SystemAudioTapHandle>>> {
+        if !supports_native_system_audio_tap() {
+            return None;
+        }
+        Some(SystemAudioTap::start(ring).map(|t| Box::new(t) as Box<dyn SystemAudioTapHandle>))
+    }
+
+    fn measure_audio_file_rms(&self, path: &Path) -> Option<f32> {
+        measure_audio_file_rms(path)
+    }
+
+    fn play_routed_audio_oneshot(
+        &self,
+        path: &Path,
+        device_name: Option<&str>,
+        volume: f32,
+    ) -> bool {
+        play_routed_audio_oneshot(path, device_name, volume)
+    }
+
+    fn start_routed_audio_loop(
+        &self,
+        path: &Path,
+        device_name: Option<&str>,
+        volume: f32,
+    ) -> Option<Box<dyn AudioLoopHandle>> {
+        MacRoutedAudioLoop::start(path, device_name, volume)
+            .map(|l| Box::new(l) as Box<dyn AudioLoopHandle>)
+    }
+
+    fn supports_routed_audio_files(&self) -> bool {
+        true
+    }
+
     fn start_hw_audio_duplex(
         &self,
-        sample_rate: u32,
-        input_device: Option<&str>,
-        output_device: Option<&str>,
-        enable_aec_ns: bool,
-        enable_agc: bool,
+        config: HwAudioDuplexConfig<'_>,
         on_capture: super::AudioCaptureCallback,
         on_render: super::AudioRenderCallback,
     ) -> Option<Result<Box<dyn HwAudioDuplexHandle>>> {
-        // VoiceProcessingIO binds the system default aggregate device seamlessly (including
-        // AirPods/Bluetooth hot-swaps). When the user explicitly pins custom non-default devices,
-        // return `None` so `AudioEngine` uses `cpal` + `sonora` with exact device selection.
-        if input_device.is_some() || output_device.is_some() {
+        if config.input_device.is_some() || config.output_device.is_some() {
             return None;
         }
         Some(
             MacVoiceProcessingIo::start(
-                sample_rate,
-                enable_aec_ns,
-                enable_agc,
+                config.sample_rate,
+                config.enable_aec_ns,
+                config.enable_agc,
                 move |samples| on_capture(samples),
                 move |samples| on_render(samples),
             )
