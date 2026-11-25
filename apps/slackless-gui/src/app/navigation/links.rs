@@ -310,7 +310,7 @@ impl App {
         let tick = self.calendar_sync_ticks;
         self.calendar_sync_ticks = self.calendar_sync_ticks.wrapping_add(1);
         // Probe immediately on first enabled tick, then once every 60s (6 × 10s).
-        if tick % 6 != 0 || self.self_state.focused() {
+        if !tick.is_multiple_of(6) || self.self_state.focused() {
             return;
         }
         #[cfg(target_os = "macos")]

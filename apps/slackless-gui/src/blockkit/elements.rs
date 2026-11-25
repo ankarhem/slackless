@@ -799,7 +799,7 @@ pub(super) fn datepicker(
     let base = action_base(element, block);
     let mut cells: Vec<Option<u32>> = vec![None; first_dow];
     cells.extend((1..=total_days as u32).map(Some));
-    while cells.len() % 7 != 0 {
+    while !cells.len().is_multiple_of(7) {
         cells.push(None);
     }
 

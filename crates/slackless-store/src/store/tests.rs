@@ -887,9 +887,9 @@ fn chunked_in_queries_and_batch_upserts_handle_large_sets() {
         .map(|i| User {
             id: UserId::from(format!("U{i:05}")),
             name: format!("user{i}"),
-            is_bot: i % 10 == 0,
-            deleted: i % 25 == 0,
-            team_id: Some(if i % 50 == 0 {
+            is_bot: i.is_multiple_of(10),
+            deleted: i.is_multiple_of(25),
+            team_id: Some(if i.is_multiple_of(50) {
                 TeamId::from("TEXTERNAL")
             } else {
                 ws()
@@ -2393,7 +2393,7 @@ fn bench_ingest_and_fts_10k_messages() {
             // In #ops (C02) by U03 (user03) with unique needle (25 deterministic matches).
             expected_ops_u03_postmortem += 1;
             format!("ops_postmortem_needle #{i}: {topic} https://status.example/{i}")
-        } else if i % 17 == 0 {
+        } else if i.is_multiple_of(17) {
             format!("msg #{i}: {topic} https://docs.example/runbook/{i}")
         } else {
             format!("msg #{i}: {topic}")
@@ -2405,14 +2405,14 @@ fn bench_ingest_and_fts_10k_messages() {
             text,
             ..Default::default()
         };
-        if i % 23 == 0 {
+        if i.is_multiple_of(23) {
             m.files.push(File {
                 id: FileId::from(format!("F{i:05}")),
                 name: Some(format!("report-{i}.pdf")),
                 ..Default::default()
             });
         }
-        if i % 37 == 0 {
+        if i.is_multiple_of(37) {
             m.reactions.push(Reaction {
                 name: "rocket".into(),
                 count: 2,
