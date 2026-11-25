@@ -1,36 +1,28 @@
 //! In-app auto-updater (`F-SHELL-163`) backed by GitHub Releases (`ankarhem/slackless`).
 //!
-//! Checks `https://api.github.com/repos/ankarhem/slackless/releases/latest` for newer
-//! `YYYY.MM.DD-xx` releases, verifies `SHA256SUMS.txt`, atomically swaps the running `.app`
-//! bundle in place without setting `com.apple.quarantine`, and relaunches Slackless.
+//! Delegates version parsing, release parsing, checksum lookup, and path resolution to
+//! [`slackless_core::domain::updater`], while handling the macOS bundle swap & CLI symlink
+//! lifecycle for the running GUI app.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde::Deserialize;
-
-use crate::blockkit::serde_json;
-
-/// GitHub repository hosting official Slackless releases.
-pub const RELEASES_REPO: &str = "ankarhem/slackless";
+pub use slackless_core::domain::updater::{
+    RELEASES_REPO, ReleaseInfo, current_app_bundle, dir_in_path, find_sha256_entry,
+    is_newer_version, is_safe_asset_name,
+};
+use slackless_core::domain::updater::{
+    cli_candidate_dirs, is_dev_version, parse_github_release, resolve_cli_link_path,
+    resolve_target_app_bundle,
+};
+#[cfg(test)]
+pub use slackless_core::domain::updater::{parse_release_highlights, parse_version};
 
 /// Release version embedded at build time (`SLACKLESS_VERSION` in CI, falling back to Cargo.toml).
 pub const CURRENT_VERSION: &str = match option_env!("SLACKLESS_VERSION") {
     Some(v) if !v.is_empty() => v,
     _ => env!("CARGO_PKG_VERSION"),
 };
-
-/// Metadata for an available GitHub Release.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReleaseInfo {
-    pub version: String,
-    pub html_url: String,
-    pub asset_name: String,
-    pub download_url: String,
-    pub sha256_url: Option<String>,
-    /// Concise bullet highlights parsed from the GitHub Release body for in-app preview.
-    pub notes: Vec<String>,
-}
 
 /// UI state for the top update banner and `Slackless -> Check for Updates…`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -44,213 +36,29 @@ pub enum UpdateState {
     Error(String),
 }
 
-#[derive(Deserialize)]
-struct GhRelease {
-    tag_name: String,
-    html_url: String,
-    #[serde(default)]
-    body: Option<String>,
-    #[serde(default)]
-    draft: bool,
-    #[serde(default)]
-    prerelease: bool,
-    #[serde(default)]
-    assets: Vec<GhAsset>,
-}
-
-/// Extract up to 8 concise bullet highlights from a GitHub Release markdown body, skipping
-/// install/changelog boilerplate and stripping trailing `(`abc1234`)` commit hashes.
-pub fn parse_release_highlights(body: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut in_install_section = false;
-    for raw_line in body.lines() {
-        let line = raw_line.trim();
-        if line.starts_with('#') {
-            let lower = line.to_ascii_lowercase();
-            in_install_section = lower.contains("install") || lower.contains("update (macos");
-            continue;
-        }
-        if in_install_section {
-            continue;
-        }
-        let Some(item) = line
-            .strip_prefix("- ")
-            .or_else(|| line.strip_prefix("* "))
-            .map(str::trim)
-        else {
-            continue;
-        };
-        if item.is_empty() {
-            continue;
-        }
-        // Strip trailing commit hash link/code suffix like ` (`34f04a1`)`.
-        let cleaned = match item.rsplit_once(" (`") {
-            Some((prefix, tail)) if tail.ends_with("`)") && tail.len() <= 16 => prefix.trim(),
-            _ => item,
-        };
-        if !cleaned.is_empty() {
-            out.push(cleaned.to_owned());
-            if out.len() >= 8 {
-                break;
-            }
-        }
-    }
-    out
-}
-
-#[derive(Deserialize)]
-struct GhAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-/// Parse a `YYYY.MM.DD-xx`, `YYYY.MM.DD.xx`, or `major.minor.patch` version into a comparable tuple.
-pub fn parse_version(raw: &str) -> Option<(u32, u32, u32, u32)> {
-    let s = raw.trim().trim_start_matches('v');
-    if s.is_empty() {
-        return None;
-    }
-    // Split `YYYY.MM.DD-xx` first if `-` is present.
-    let (base, seq) = match s.split_once('-') {
-        Some((lhs, rhs)) => {
-            let seq = rhs.parse::<u32>().ok()?;
-            (lhs, Some(seq))
-        }
-        None => (s, None),
-    };
-    let nums: Vec<u32> = base
-        .split('.')
-        .map(|part| part.parse::<u32>().ok())
-        .collect::<Option<Vec<_>>>()?;
-    match (nums.as_slice(), seq) {
-        (&[y, m, d], Some(n)) => Some((y, m, d, n)),
-        (&[y, m, d, n], None) => Some((y, m, d, n)),
-        (&[maj, min, patch], None) => Some((maj, min, patch, 0)),
-        _ => None,
-    }
-}
-
-/// Returns `true` if `latest` is strictly newer than `current`.
-pub fn is_newer_version(latest: &str, current: &str) -> bool {
-    match (parse_version(latest), parse_version(current)) {
-        (Some(l), Some(c)) => l > c,
-        _ => latest.trim() != current.trim() && !latest.trim().is_empty(),
-    }
-}
-
-/// Locate the `.app` bundle containing the currently running executable (macOS only).
-/// Returns `None` when running unbundled (e.g. `cargo run`).
-pub fn current_app_bundle() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        let exe = std::env::current_exe().ok()?;
-        let macos_dir = exe.parent()?;
-        if macos_dir.file_name()?.to_str()? != "MacOS" {
-            return None;
-        }
-        let contents_dir = macos_dir.parent()?;
-        if contents_dir.file_name()?.to_str()? != "Contents" {
-            return None;
-        }
-        let app_dir = contents_dir.parent()?;
-        if app_dir.extension()?.to_str()? != "app" {
-            return None;
-        }
-        Some(app_dir.to_path_buf())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
-}
-
 /// Installation status of the bundled `slackless` CLI symlink (`~/.local/bin/slackless`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliInstallStatus {
-    /// `~/.local/bin/slackless` is symlinked directly to this bundle's `Contents/MacOS/slackless`.
+    /// Symlinked directly to this bundle's `Contents/MacOS/slackless`.
     Installed(PathBuf),
-    /// `~/.local/bin/slackless` exists, but is a stale copy or points to a different bundle path.
+    /// Exists, but is a stale copy or points to a different bundle path.
     OutOfSync(PathBuf),
-    /// Bundled CLI is present in `Slackless.app`, ready to symlink into `~/.local/bin/slackless`.
+    /// Bundled CLI is present in `Slackless.app`, ready to symlink.
     NotInstalled,
     /// Running unbundled (e.g. `cargo run`) or without `Contents/MacOS/slackless`.
     Unavailable,
 }
 
-/// Candidate directories for installing the `slackless` CLI symlink, ordered by macOS default
-/// `$PATH` availability without requiring `sudo`:
-/// 1. `/usr/local/bin` (in macOS `/etc/paths` by default; used by VS Code, Zed, Cursor, Docker)
-/// 2. `~/.local/bin` (user-writable fallback when `/usr/local/bin` is not writable)
-fn cli_candidate_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    #[cfg(target_os = "macos")]
-    {
-        dirs.push(PathBuf::from("/usr/local/bin"));
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    dirs.push(home.join(".local/bin"));
-    dirs
-}
-
-fn dir_is_writable(dir: &Path) -> bool {
-    if !dir.is_dir() {
-        return false;
-    }
-    let probe = dir.join(format!(".slackless-probe-{}", std::process::id()));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-    {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
-}
-
 /// Best writable symlink path for the `slackless` CLI (`/usr/local/bin/slackless` when writable,
 /// else `~/.local/bin/slackless`).
 pub fn cli_link_path() -> PathBuf {
-    let dirs = cli_candidate_dirs();
-    for dir in &dirs {
-        if dir_is_writable(dir) {
-            return dir.join("slackless");
-        }
-    }
-    dirs.into_iter()
-        .last()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("slackless")
+    resolve_cli_link_path().unwrap_or_else(|| PathBuf::from(".local/bin/slackless"))
 }
 
 /// Locate the matching `slackless` CLI executable embedded inside the running `Slackless.app`.
 pub fn bundled_cli_path() -> Option<PathBuf> {
     let cli = current_app_bundle()?.join("Contents/MacOS/slackless");
     cli.is_file().then_some(cli)
-}
-
-/// Returns `true` if `dir` is present in `$PATH` (or on macOS `/etc/paths`, which LaunchServices
-/// omits from a GUI app's own `PATH` even though every interactive shell includes it).
-pub fn dir_in_path(dir: &Path) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        if dir == Path::new("/usr/local/bin") {
-            return true;
-        }
-        if let Ok(etc_paths) = std::fs::read_to_string("/etc/paths")
-            && etc_paths.lines().any(|line| Path::new(line.trim()) == dir)
-        {
-            return true;
-        }
-    }
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path_var).any(|p| p == dir)
 }
 
 /// Inspect whether `slackless` CLI is installed (checking `/usr/local/bin` and `~/.local/bin`)
@@ -332,8 +140,7 @@ pub fn uninstall_cli_symlink() -> Result<(), String> {
 /// stamped CalVer release (`YYYY.MM.DD-xx`). Startup auto-update checks are skipped on dev builds
 /// so local development bundles never nag or overwrite themselves with older releases.
 pub fn is_dev_build() -> bool {
-    let v = installed_version();
-    v == "0.1.0" || v.ends_with("-dev") || v.contains("-dev.")
+    is_dev_version(&installed_version())
 }
 
 /// Return the installed app's version string (prefers `SLACKLESS_VERSION` compiled into the binary;
@@ -387,49 +194,14 @@ pub fn check_for_update() -> Result<Option<ReleaseInfo>, String> {
         });
     }
 
-    let rel: GhRelease = serde_json::from_slice(&out.stdout)
-        .map_err(|e| format!("invalid GitHub release JSON: {e}"))?;
-    if rel.draft || rel.prerelease {
+    let Some(info) = parse_github_release(&out.stdout)? else {
         return Ok(None);
-    }
-
+    };
     let current = installed_version();
-    if !is_newer_version(&rel.tag_name, &current) {
+    if !is_newer_version(&info.version, &current) {
         return Ok(None);
     }
-
-    let expected_name = format!("Slackless-{}-macos-arm64.app.tar.gz", rel.tag_name);
-    let asset = rel
-        .assets
-        .iter()
-        .find(|a| a.name == expected_name)
-        .or_else(|| {
-            rel.assets
-                .iter()
-                .find(|a| a.name.ends_with("-macos-arm64.app.tar.gz"))
-        })
-        .ok_or_else(|| format!("release {} has no macOS arm64 app archive", rel.tag_name))?;
-
-    let sha256_url = rel
-        .assets
-        .iter()
-        .find(|a| a.name == "SHA256SUMS.txt")
-        .map(|a| a.browser_download_url.clone());
-
-    let notes = rel
-        .body
-        .as_deref()
-        .map(parse_release_highlights)
-        .unwrap_or_default();
-
-    Ok(Some(ReleaseInfo {
-        version: rel.tag_name,
-        html_url: rel.html_url,
-        asset_name: asset.name.clone(),
-        download_url: asset.browser_download_url.clone(),
-        sha256_url,
-        notes,
-    }))
+    Ok(Some(info))
 }
 
 fn verify_sha256(archive_path: &Path, expected_hex: &str) -> Result<(), String> {
@@ -460,17 +232,8 @@ fn verify_sha256(archive_path: &Path, expected_hex: &str) -> Result<(), String> 
 /// app (`cx.quit()`) upon `Ok(())`.
 #[cfg(target_os = "macos")]
 pub fn download_and_schedule_swap(release: &ReleaseInfo) -> Result<(), String> {
-    let target_app = current_app_bundle().unwrap_or_else(|| {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        let sys_apps = PathBuf::from("/Applications/Slackless.app");
-        if sys_apps.exists() {
-            sys_apps
-        } else {
-            home.join("Applications/Slackless.app")
-        }
-    });
+    let target_app = resolve_target_app_bundle()
+        .ok_or_else(|| "cannot determine Applications directory".to_owned())?;
     let parent = target_app
         .parent()
         .ok_or_else(|| "cannot determine Applications directory".to_owned())?;
@@ -521,7 +284,7 @@ pub fn download_and_schedule_swap(release: &ReleaseInfo) -> Result<(), String> {
                 release.asset_name
             )
         })?;
-        verify_sha256(&archive, expected)?;
+        verify_sha256(&archive, &expected)?;
 
         let extract = Command::new("/usr/bin/tar")
             .args(["-xzf"])
@@ -616,30 +379,6 @@ pub fn download_and_schedule_swap(_release: &ReleaseInfo) -> Result<(), String> 
     Err("in-app updates are currently supported on macOS only".to_owned())
 }
 
-/// Returns `true` when `name` is a single safe filename component (no path separators or `..`).
-pub fn is_safe_asset_name(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        && Path::new(name).file_name() == Some(std::ffi::OsStr::new(name))
-}
-
-/// Extract the lowercase hex SHA-256 hash matching `asset_name` from a `SHA256SUMS.txt` body.
-pub fn find_sha256_entry<'a>(sums_text: &'a str, asset_name: &str) -> Option<&'a str> {
-    sums_text.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        let hash = parts.next()?;
-        let name = parts.next()?.trim_start_matches('*');
-        if name == asset_name && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-            Some(hash)
-        } else {
-            None
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,7 +412,7 @@ mod tests {
         let sums = format!("{good_hash}  Slackless-2026.11.24-03-macos-arm64.app.tar.gz\n");
         assert_eq!(
             find_sha256_entry(&sums, "Slackless-2026.11.24-03-macos-arm64.app.tar.gz"),
-            Some(good_hash.as_str())
+            Some(good_hash)
         );
         assert_eq!(find_sha256_entry(&sums, "other.tar.gz"), None);
         assert_eq!(

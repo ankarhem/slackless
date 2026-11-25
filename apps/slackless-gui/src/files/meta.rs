@@ -166,73 +166,9 @@ pub(super) fn file_name(file: &File) -> String {
         .unwrap_or_else(|| file.id.to_string())
 }
 
-/// Extract inline transcript text from Slack clip metadata (`transcription.preview.content`,
-/// `transcription.text`, `transcript`, or `file.preview` on audio/video clips).
-pub(super) fn inline_clip_transcript(file: &File) -> Option<String> {
-    if let Some(t) = file.extra.get("transcription") {
-        if let Some(s) = t
-            .get("preview")
-            .and_then(|p| p.get("content"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-        {
-            return Some(s.trim().to_owned());
-        }
-        if let Some(s) = t
-            .get("text")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-        {
-            return Some(s.trim().to_owned());
-        }
-    }
-    if let Some(s) = file
-        .extra
-        .get("transcript")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-    {
-        return Some(s.trim().to_owned());
-    }
-    file.preview
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-/// Optional WebVTT URL (`vtt` or `transcription.vtt`) for lazy transcript loading.
-pub(super) fn clip_vtt_url(file: &File) -> Option<String> {
-    file.extra
-        .get("vtt")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            file.extra
-                .get("transcription")
-                .and_then(|t| t.get("vtt"))
-                .and_then(|v| v.as_str())
-        })
-        .filter(|s| s.starts_with("http"))
-        .map(ToOwned::to_owned)
-}
-
-/// Strip WebVTT headers, cue numbers, and timestamp arrows into clean readable transcript text.
-pub(super) fn parse_webvtt(raw: &str) -> String {
-    let mut lines = Vec::new();
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with("WEBVTT")
-            || trimmed.starts_with("NOTE")
-            || trimmed.contains("-->")
-            || trimmed.chars().all(|c| c.is_ascii_digit())
-        {
-            continue;
-        }
-        lines.push(trimmed);
-    }
-    lines.join(" ")
-}
+pub(super) use slackless_core::domain::webvtt::{
+    clip_vtt_url, inline_clip_transcript, parse_webvtt,
+};
 
 /// Normalized waveform samples (`0.12..=1.0`) from Slack's `audio_wave_samples` metadata.
 pub(super) fn audio_wave_bars(file: &File) -> Vec<f32> {

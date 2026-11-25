@@ -1,4 +1,4 @@
-//! GPUI rendering for [`ChannelDetails`] (About, Members, Integrations, Settings tabs).
+//! GPUI rendering for [`ChannelDetails`] (About & Members tabs).
 
 use std::sync::Arc;
 
@@ -14,6 +14,7 @@ use gpui_kit::gpui::{
     StatefulInteractiveElement as _, Styled as _, Window, div, point, px,
 };
 use slackless_core::NotifyLevel;
+use slackless_core::types::Conversation;
 
 use crate::avatars::{user_chip, with_external_badge};
 
@@ -22,15 +23,28 @@ use super::{ChannelDetails, ChannelDetailsEvent, DetailsTab, EditField, MAX_ROWS
 
 impl Render for ChannelDetails {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tab = self.tab;
+        // Slack's dialog grows with the window; the member list scrolls inside it.
+        let height = (window.viewport_size().height * 0.85 - px(100.)).max(px(360.));
+        v_flex()
+            .h(height)
+            .w_full()
+            .child(self.button_row(cx))
+            .child(self.render_tab_bar(cx))
+            .child(match tab {
+                DetailsTab::About => self.render_about_tab(cx).into_any_element(),
+                DetailsTab::Members => self.render_members_tab(window, cx).into_any_element(),
+            })
+    }
+}
+
+impl ChannelDetails {
+    /// Slack's tab row under the title: tabs 20pt apart, the active one in the text color
+    /// over a 2pt underline that covers the rule; a tab's count keeps the regular weight.
+    fn render_tab_bar(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
-        let (border, input_border, muted_foreground, foreground, ring, background) = (
-            theme.border,
-            theme.input,
-            theme.muted_foreground,
-            theme.foreground,
-            theme.ring,
-            theme.background,
-        );
+        let (border, muted_foreground, foreground) =
+            (theme.border, theme.muted_foreground, theme.foreground);
         let tab = self.tab;
         let member_count = if self.members.is_empty() {
             self.conversation()
@@ -39,9 +53,6 @@ impl Render for ChannelDetails {
         } else {
             self.rows.len() as u32
         };
-
-        // Slack's tab row under the title: tabs 20pt apart, the active one in the text color
-        // over a 2pt underline that covers the rule; a tab's count keeps the regular weight.
         let underline = foreground.opacity(0.82);
         let tab_row = [
             (DetailsTab::About, "About", None, "details-tab-About"),
@@ -77,150 +88,157 @@ impl Render for ChannelDetails {
                 }))
         });
 
-        // Slack's dialog grows with the window; the member list scrolls inside it.
-        let height = (window.viewport_size().height * 0.85 - px(100.)).max(px(360.));
+        h_flex()
+            .items_stretch()
+            .flex_none()
+            .px(px(PAD))
+            .gap(px(20.))
+            .h(px(32.))
+            .border_b_1()
+            .border_color(border)
+            .children(tab_row)
+    }
+
+    /// The Members tab: search input, account-type/org filter, "Add people", and scrollable list.
+    fn render_members_tab(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        let border = cx.theme().border;
+        let needle = self.needle(cx);
+        let filtering = !needle.is_empty() || self.member_filter != MemberFilter::All;
+        let member_filter = &self.member_filter;
+        let matching: Vec<&MemberRow> = self
+            .rows
+            .iter()
+            .filter(|row| member_filter.keeps(row))
+            .filter(|row| needle.is_empty() || row.key.contains(&needle))
+            .collect();
+
+        let find_people = self.render_find_people_field(window, cx);
+        let filter_select = self.filter_select(cx);
+        let add_channel = self.channel.clone();
+        let add_people = crate::preferences::form_button(
+            Button::new("details-add-people")
+                .outline()
+                .flex_none()
+                .icon(IconName::UserPlus)
+                .label("Add people"),
+            cx,
+        )
+        .on_click(cx.listener(move |_, _, _, cx| {
+            cx.emit(ChannelDetailsEvent::AddPeople(add_channel.clone()));
+        }));
+
         v_flex()
-            .h(height)
-            .w_full()
-            .child(self.button_row(cx))
+            .flex_1()
+            .min_h_0()
             .child(
                 h_flex()
-                    .items_stretch()
                     .flex_none()
+                    .items_center()
+                    .gap_2()
                     .px(px(PAD))
-                    .gap(px(20.))
-                    .h(px(32.))
+                    .py_4()
                     .border_b_1()
                     .border_color(border)
-                    .children(tab_row),
+                    .child(find_people)
+                    .child(filter_select)
+                    .child(add_people),
             )
-            .child(match tab {
-                DetailsTab::About => self.about_tab(cx).into_any_element(),
-                DetailsTab::Members => {
-                    let needle = self.needle(cx);
-                    // Slack's field carries the blue focus ring while the caret is in it
-                    // (the dialog opens with it focused).
-                    let find_focused = self.filter.read(cx).focus_handle(cx).is_focused(window);
-                    let filtering = !needle.is_empty() || self.member_filter != MemberFilter::All;
-                    let member_filter = &self.member_filter;
-                    let matching: Vec<&MemberRow> = self
-                        .rows
-                        .iter()
-                        .filter(|row| member_filter.keeps(row))
-                        .filter(|row| needle.is_empty() || row.key.contains(&needle))
-                        .collect();
-                    let m = crate::preferences::control_metrics(cx);
-                    let find_people = h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .items_center()
-                        .gap_0p5()
-                        .pl_2p5()
-                        .pr_1()
-                        .h(m.height)
-                        .rounded_md()
-                        // Opaque, so the focus ring's spread shows only outside the field.
-                        .bg(background)
-                        .border_1()
-                        .border_color(if find_focused { ring } else { input_border })
-                        .when(find_focused, |field| {
-                            field.shadow(vec![BoxShadow {
-                                color: ring.opacity(0.3),
-                                offset: point(px(0.), px(0.)),
-                                blur_radius: px(0.),
-                                spread_radius: px(3.),
-                                inset: false,
-                            }])
-                        })
-                        .child(
-                            Icon::new(IconName::Search)
-                                .flex_none()
-                                .text_color(muted_foreground)
-                                .size(px(14.)),
-                        )
-                        .child(
-                            div().flex_1().min_w_0().child(
-                                Textarea::new(&self.filter)
-                                    .with_size(m.input_size)
-                                    .appearance(false)
-                                    .bordered(false),
-                            ),
-                        );
-                    let filter_select = self.filter_select(cx);
-                    let add_channel = self.channel.clone();
-                    let add_people = crate::preferences::form_button(
-                        Button::new("details-add-people")
-                            .outline()
-                            .flex_none()
-                            .icon(IconName::UserPlus)
-                            .label("Add people"),
-                        cx,
-                    )
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(ChannelDetailsEvent::AddPeople(add_channel.clone()));
-                    }));
-                    v_flex()
-                        .flex_1()
-                        .min_h_0()
-                        .child(
-                            h_flex()
-                                .flex_none()
-                                .items_center()
-                                .gap_2()
-                                .px(px(PAD))
-                                .py_4()
-                                .border_b_1()
-                                .border_color(border)
-                                .child(find_people)
-                                .child(filter_select)
-                                .child(add_people),
-                        )
-                        .child(v_flex().flex_1().min_h_0().child(
-                            if let Some(note) = self.member_note(matching.is_empty(), filtering) {
-                                div()
-                                    .px(px(PAD))
-                                    .py_6()
-                                    .text_sm()
-                                    .text_color(muted_foreground)
-                                    .child(note)
-                                    .into_any_element()
-                            } else {
-                                v_flex()
-                                    .id("details-member-list")
-                                    .flex_1()
-                                    .min_h_0()
-                                    .overflow_y_scroll()
-                                    .children(
-                                        matching
-                                            .iter()
-                                            .take(MAX_ROWS)
-                                            .enumerate()
-                                            .map(|(ix, row)| self.member_row(ix, row, cx)),
-                                    )
-                                    .when(matching.len() > MAX_ROWS, |list| {
-                                        list.child(
-                                            div()
-                                                .px(px(PAD))
-                                                .py_3()
-                                                .text_xs()
-                                                .text_color(muted_foreground)
-                                                .child(format!(
-                                                    "{} of {} members shown",
-                                                    MAX_ROWS,
-                                                    matching.len()
-                                                )),
-                                        )
-                                    })
-                                    .into_any_element()
-                            },
-                        ))
-                        .into_any_element()
-                }
-            })
+            .child(self.render_member_list_body(&matching, filtering, cx))
     }
-}
 
-impl ChannelDetails {
+    /// Search input with blue focus ring while the caret is in it.
+    fn render_find_people_field(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let (input_border, muted_foreground, ring, background) = (
+            theme.input,
+            theme.muted_foreground,
+            theme.ring,
+            theme.background,
+        );
+        let find_focused = self.filter.read(cx).focus_handle(cx).is_focused(window);
+        let m = crate::preferences::control_metrics(cx);
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap_0p5()
+            .pl_2p5()
+            .pr_1()
+            .h(m.height)
+            .rounded_md()
+            // Opaque, so the focus ring's spread shows only outside the field.
+            .bg(background)
+            .border_1()
+            .border_color(if find_focused { ring } else { input_border })
+            .when(find_focused, |field| {
+                field.shadow(vec![BoxShadow {
+                    color: ring.opacity(0.3),
+                    offset: point(px(0.), px(0.)),
+                    blur_radius: px(0.),
+                    spread_radius: px(3.),
+                    inset: false,
+                }])
+            })
+            .child(
+                Icon::new(IconName::Search)
+                    .flex_none()
+                    .text_color(muted_foreground)
+                    .size(px(14.)),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
+                    Textarea::new(&self.filter)
+                        .with_size(m.input_size)
+                        .appearance(false)
+                        .bordered(false),
+                ),
+            )
+    }
+
+    fn render_member_list_body(
+        &self,
+        matching: &[&MemberRow],
+        filtering: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let muted_foreground = cx.theme().muted_foreground;
+        v_flex().flex_1().min_h_0().child(
+            if let Some(note) = self.member_note(matching.is_empty(), filtering) {
+                div()
+                    .px(px(PAD))
+                    .py_6()
+                    .text_sm()
+                    .text_color(muted_foreground)
+                    .child(note)
+                    .into_any_element()
+            } else {
+                v_flex()
+                    .id("details-member-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(
+                        matching
+                            .iter()
+                            .take(MAX_ROWS)
+                            .enumerate()
+                            .map(|(ix, row)| self.member_row(ix, row, cx)),
+                    )
+                    .when(matching.len() > MAX_ROWS, |list| {
+                        list.child(
+                            div()
+                                .px(px(PAD))
+                                .py_3()
+                                .text_xs()
+                                .text_color(muted_foreground)
+                                .child(format!("{} of {} members shown", MAX_ROWS, matching.len())),
+                        )
+                    })
+                    .into_any_element()
+            },
+        )
+    }
+
     /// The row of actions under the title: the notification level's dropdown and the huddle
     /// button (the header row's siblings, Slack shows the star unstarred there but
     /// slackless has no star backend, so it is left out).
@@ -286,21 +304,55 @@ impl ChannelDetails {
             )
     }
 
-    /// The About tab: Slack's cards.
-    fn about_tab(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let theme = cx.theme();
-        let (border, muted_foreground, link_color, accent_color) = (
-            theme.border,
-            theme.muted_foreground,
-            theme.link,
-            theme.accent,
-        );
+    /// The About tab: Slack's cards (name, topic, description, creator, permissions, actions, orgs).
+    fn render_about_tab(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let conversation = self.conversation().cloned().unwrap_or_default();
-        let mut cards = v_flex().w_full().px(px(PAD)).py_4().gap_2();
-
-        // Channel name: editable on channels other than #general, with Slack's privacy note on private channels.
         let is_channel = !conversation.is_im && !conversation.is_mpim;
         let can_manage = is_channel && !conversation.is_general;
+
+        let cards = v_flex()
+            .w_full()
+            .px(px(PAD))
+            .py_4()
+            .gap_2()
+            .child(self.render_name_card(&conversation, can_manage, cx))
+            .child(self.field_card(
+                "Topic",
+                EditField::Topic,
+                self.topic(&conversation),
+                "Add a topic",
+                cx,
+            ))
+            .child(self.field_card(
+                "Description",
+                EditField::Description,
+                self.purpose(&conversation),
+                "Add a description",
+                cx,
+            ))
+            .child(self.render_created_card(&conversation, cx))
+            .child(self.render_permissions_card(&conversation, cx))
+            .child(self.render_channel_actions(&conversation, can_manage, cx))
+            .children(self.render_organizations_section(&conversation, cx));
+
+        div()
+            .id("details-about")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .child(cards)
+    }
+
+    /// Channel name card: editable on channels other than #general, with Slack's privacy note on
+    /// private channels.
+    fn render_name_card(
+        &self,
+        conversation: &Conversation,
+        can_manage: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = cx.theme();
+        let (border, muted_foreground) = (theme.border, theme.muted_foreground);
         let raw_name = self
             .local_name
             .clone()
@@ -311,8 +363,9 @@ impl ChannelDetails {
             .as_ref()
             .filter(|e| e.field == EditField::Name)
             .map(|e| e.draft.clone());
-        let name_card = if let Some(draft) = editing_name {
-            card("Channel name", None, border)
+
+        if let Some(draft) = editing_name {
+            return card("Channel name", None, border)
                 .child(crate::preferences::text_input_box(&draft, false, cx))
                 .child(
                     h_flex()
@@ -335,63 +388,47 @@ impl ChannelDetails {
                                 cx.notify();
                             })),
                         ),
-                )
-        } else {
-            let edit_name = can_manage.then(|| {
-                Button::new("details-edit-Name")
-                    .ghost()
-                    .with_size(Size::XSmall)
-                    .label("Edit")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.edit(EditField::Name, window, cx)),
-                    )
-                    .into_any_element()
-            });
-            let mut c = card("Channel name", edit_name, border);
-            if conversation.is_private {
-                c = c.child(
-                    div()
-                        .text_xs()
-                        .text_color(muted_foreground)
-                        .child("Only visible to your organization"),
                 );
-            }
-            c.child(
-                h_flex()
-                    .items_center()
-                    .gap_1()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(
-                        Icon::new(if conversation.is_private {
-                            IconName::Lock
-                        } else {
-                            IconName::Hash
-                        })
-                        .size(px(14.)),
-                    )
-                    .child(raw_name),
-            )
-        };
-        cards = cards.child(name_card);
+        }
 
-        // Topic and description: the cards Slack lets a member edit.
-        cards = cards.child(self.field_card(
-            "Topic",
-            EditField::Topic,
-            self.topic(&conversation),
-            "Add a topic",
-            cx,
-        ));
-        cards = cards.child(self.field_card(
-            "Description",
-            EditField::Description,
-            self.purpose(&conversation),
-            "Add a description",
-            cx,
-        ));
+        let edit_name = can_manage.then(|| {
+            Button::new("details-edit-Name")
+                .ghost()
+                .with_size(Size::XSmall)
+                .label("Edit")
+                .on_click(cx.listener(|this, _, window, cx| this.edit(EditField::Name, window, cx)))
+                .into_any_element()
+        });
+        let mut c = card("Channel name", edit_name, border);
+        if conversation.is_private {
+            c = c.child(
+                div()
+                    .text_xs()
+                    .text_color(muted_foreground)
+                    .child("Only visible to your organization"),
+            );
+        }
+        c.child(
+            h_flex()
+                .items_center()
+                .gap_1()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(
+                    Icon::new(if conversation.is_private {
+                        IconName::Lock
+                    } else {
+                        IconName::Hash
+                    })
+                    .size(px(14.)),
+                )
+                .child(raw_name),
+        )
+    }
 
-        // Created by: the creator's name and the creation date.
+    fn render_created_card(&self, conversation: &Conversation, cx: &Context<Self>) -> Div {
+        let theme = cx.theme();
+        let (border, muted_foreground) = (theme.border, theme.muted_foreground);
         let created = match conversation.created {
             Some(secs) => format!("on {}", created_on(secs)),
             None => String::new(),
@@ -405,16 +442,18 @@ impl ChannelDetails {
                     .to_owned()
             })
             .unwrap_or_else(|| "Unknown member".to_owned());
-        cards = cards.child(
-            card("Created by", None, border).child(
-                div()
-                    .text_sm()
-                    .text_color(muted_foreground)
-                    .child(created_by),
-            ),
-        );
+        card("Created by", None, border).child(
+            div()
+                .text_sm()
+                .text_color(muted_foreground)
+                .child(created_by),
+        )
+    }
 
-        // Posting & management permissions card (`F-CORE-064`).
+    /// Posting & management permissions card (`F-CORE-064`).
+    fn render_permissions_card(&self, conversation: &Conversation, cx: &Context<Self>) -> Div {
+        let theme = cx.theme();
+        let (border, muted_foreground) = (theme.border, theme.muted_foreground);
         let manager_names: Vec<String> = self
             .managers
             .iter()
@@ -438,37 +477,51 @@ impl ChannelDetails {
         } else {
             manager_names.join(", ")
         };
-        cards = cards.child(
-            v_flex()
-                .flex_none()
-                .gap_1p5()
-                .p_3()
-                .rounded_md()
-                .border_1()
-                .border_color(cx.theme().border)
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Posting & management permissions"),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted_foreground)
-                        .child(posting_policy),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted_foreground)
-                        .child(format!("Channel managers: {managers_line}")),
-                ),
-        );
+        v_flex()
+            .flex_none()
+            .gap_1p5()
+            .p_3()
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Posting & management permissions"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted_foreground)
+                    .child(posting_policy),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted_foreground)
+                    .child(format!("Channel managers: {managers_line}")),
+            )
+    }
 
-        // Leave channel, Slack's red row at the end of the cards.
+    /// Channel management actions: Leave, Convert to private, Follow all threads, Archive/Delete.
+    fn render_channel_actions(
+        &self,
+        conversation: &Conversation,
+        can_manage: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = cx.theme();
+        let (border, muted_foreground, link_color, accent_color) = (
+            theme.border,
+            theme.muted_foreground,
+            theme.link,
+            theme.accent,
+        );
+        let danger = crate::theme::danger_text(cx);
+
         let channel = self.channel.clone();
-        cards = cards.child(
+        let mut actions = v_flex().flex_none().gap_2().child(
             h_flex()
                 .id("details-leave")
                 .flex_none()
@@ -480,8 +533,8 @@ impl ChannelDetails {
                 .cursor_pointer()
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(crate::theme::danger_text(cx))
-                .hover(|row| row.bg(crate::theme::danger_text(cx).alpha(0.12)))
+                .text_color(danger)
+                .hover(move |row| row.bg(danger.alpha(0.12)))
                 .child(Icon::new(IconName::LogOut).size(px(16.)))
                 .child("Leave channel")
                 .on_click(cx.listener(move |_, _, _, cx| {
@@ -499,7 +552,7 @@ impl ChannelDetails {
             } else {
                 "Change to a private channel"
             };
-            cards = cards.child(
+            actions = actions.child(
                 h_flex()
                     .id("details-convert-private")
                     .flex_none()
@@ -525,7 +578,7 @@ impl ChannelDetails {
         if !conversation.is_im {
             let follow_ch = self.channel.clone();
             let following = self.follow_all_threads;
-            cards = cards.child(
+            actions = actions.child(
                 h_flex()
                     .id("details-follow-threads")
                     .flex_none()
@@ -536,7 +589,7 @@ impl ChannelDetails {
                     .py_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(cx.theme().border)
+                    .border_color(border)
                     .cursor_pointer()
                     .text_sm()
                     .hover(move |row| row.bg(accent_color))
@@ -577,8 +630,7 @@ impl ChannelDetails {
             let archived = conversation.is_archived;
             let arch_channel = self.channel.clone();
             let del_channel = self.channel.clone();
-            let danger = crate::theme::danger_text(cx);
-            cards = cards
+            actions = actions
                 .child(
                     h_flex()
                         .id("details-archive")
@@ -635,36 +687,39 @@ impl ChannelDetails {
                 );
         }
 
-        // Organizations, on a Slack Connect channel: one row per organization (`rebuild`
-        // builds the lines for shared channels only).
-        if !self.orgs.is_empty() {
-            let host = host_team(&conversation);
-            let mut section = v_flex().flex_none().gap_1().mt_2().child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Organizations"),
-            );
-            // Slack lists the other organizations only, not the viewer's own.
-            let own = own_team(&self.fixtures);
-            for org in self.orgs.iter().filter(|org| org.team.id != own) {
-                let is_host = Some(&org.team.id) == host.as_ref();
-                section = section.child(org_row(
-                    &org.team,
-                    org.members,
-                    is_host,
-                    &conversation,
-                    muted_foreground,
-                ));
-            }
-            cards = cards.child(section);
+        actions
+    }
+
+    /// Connected organizations section on Slack Connect channels.
+    fn render_organizations_section(
+        &self,
+        conversation: &Conversation,
+        cx: &Context<Self>,
+    ) -> Option<Div> {
+        if self.orgs.is_empty() {
+            return None;
         }
-        div()
-            .id("details-about")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .child(cards)
+        let muted_foreground = cx.theme().muted_foreground;
+        let host = host_team(conversation);
+        let mut section = v_flex().flex_none().gap_1().mt_2().child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("Organizations"),
+        );
+        // Slack lists the other organizations only, not the viewer's own.
+        let own = own_team(&self.fixtures);
+        for org in self.orgs.iter().filter(|org| org.team.id != own) {
+            let is_host = Some(&org.team.id) == host.as_ref();
+            section = section.child(org_row(
+                &org.team,
+                org.members,
+                is_host,
+                conversation,
+                muted_foreground,
+            ));
+        }
+        Some(section)
     }
 
     /// One of the editable cards (topic, description): the value, or Slack's "Add a …"
@@ -758,8 +813,6 @@ impl ChannelDetails {
         card(label, Some(edit.into_any_element()), border).child(content)
     }
 
-    /// One member row: avatar, name, and Slack's External marker for people from another
-    /// organization; a click opens their profile.
     /// Slack's member filter beside "Find people": a 36pt select whose menu lists each
     /// choice with its count at the right, the organizations under "People from".
     fn filter_select(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {

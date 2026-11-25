@@ -36,7 +36,7 @@ pub enum CanvasInlineSegment {
     BroadcastMention(String),
 }
 
-fn is_upper_alnum_id(s: &str, prefixes: &[u8]) -> bool {
+pub(super) fn is_upper_alnum_id(s: &str, prefixes: &[u8]) -> bool {
     let bytes = s.as_bytes();
     bytes.len() >= 3
         && prefixes.contains(&bytes[0])

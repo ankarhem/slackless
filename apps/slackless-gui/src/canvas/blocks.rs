@@ -25,10 +25,22 @@ use crate::canvas::model::{
 };
 use crate::canvas::parse::{media_format_pill, resolve_canvas_emoji};
 use crate::canvas::{
-    CanvasActions, CanvasChannelLookupFn, CanvasEditFn, CanvasOpenChannelFn, CanvasOpenEmbedFn,
+    CanvasActions, CanvasChannelLookupFn, CanvasOpenChannelFn, CanvasOpenEmbedFn,
     CanvasOpenMediaFn, CanvasOpenProfileFn, CanvasUiState, CanvasUserLookupFn, commit_block_edit,
     mutate_ui, section_delete_op, section_insert_after_op, section_replace_op,
 };
+
+/// Shared per-block render context passed across block callbacks, menus, and renderers.
+pub(super) struct CanvasBlockRenderCtx<'a> {
+    pub(super) key: &'a str,
+    pub(super) canvas: &'a CanvasDoc,
+    pub(super) ui: &'a CanvasUiState,
+    pub(super) actions: &'a CanvasActions,
+    pub(super) block_ix: usize,
+    pub(super) section_id: Option<String>,
+    pub(super) can_edit: bool,
+    pub(super) is_fixture: bool,
+}
 
 /// Drag payload and floating preview chip for drag-to-reorder canvas blocks (`F-COLLAB-144`).
 #[derive(Clone, Debug)]
@@ -128,16 +140,14 @@ pub(super) struct BlockCallbacks {
     pub(super) on_open_embed: Option<CanvasOpenEmbedFn>,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn build_block_callbacks(
-    key: &str,
-    canvas: &CanvasDoc,
-    block_ix: usize,
-    section_id: Option<String>,
-    can_edit: bool,
-    is_fixture: bool,
-    actions: &CanvasActions,
-) -> BlockCallbacks {
+pub(super) fn build_block_callbacks(ctx: &CanvasBlockRenderCtx<'_>) -> BlockCallbacks {
+    let key = ctx.key;
+    let canvas = ctx.canvas;
+    let block_ix = ctx.block_ix;
+    let section_id = ctx.section_id.clone();
+    let can_edit = ctx.can_edit;
+    let is_fixture = ctx.is_fixture;
+    let actions = ctx.actions;
     let mut cbs = BlockCallbacks {
         on_open_media: actions.on_open_media.clone(),
         user_lookup: actions.user_lookup.clone(),
@@ -258,20 +268,18 @@ pub(super) fn build_block_callbacks(
 }
 
 /// Compact per-section actions menu trigger button (`F-COLLAB-145`).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn render_section_actions_button(
-    key: &str,
-    block_ix: usize,
-    block_count: usize,
-    can_edit: bool,
-    is_fixture: bool,
-    canvas: &CanvasDoc,
-    section_id: Option<String>,
+    ctx: &CanvasBlockRenderCtx<'_>,
     block_md: String,
-    on_edit: Option<CanvasEditFn>,
 ) -> impl IntoElement {
+    let key = ctx.key;
+    let block_ix = ctx.block_ix;
+    let can_edit = ctx.can_edit;
+    let is_fixture = ctx.is_fixture;
     let key_owned = key.to_owned();
-    let canvas_owned = canvas.clone();
+    let canvas_owned = ctx.canvas.clone();
+    let section_id = ctx.section_id.clone();
+    let on_edit = ctx.actions.on_edit.clone();
     Button::new(SharedString::from(format!(
         "canvas-sec-actions-{key}-{block_ix}"
     )))
@@ -293,32 +301,45 @@ pub(super) fn render_section_actions_button(
             }),
         );
         if can_edit {
-            menu = append_section_edit_menu_items(
-                menu,
-                &key_owned,
+            let edit_ctx = SectionEditCtx {
+                key: &key_owned,
                 block_ix,
-                block_count,
+                block_count: canvas_owned.blocks.len(),
                 is_fixture,
-                &canvas_owned,
-                section_id.as_deref(),
-                on_edit.as_ref(),
-            );
+                canvas: &canvas_owned,
+                section_id: section_id.as_deref(),
+                on_edit: on_edit.as_ref(),
+            };
+            menu = append_section_edit_menu_items(menu, &edit_ctx);
         }
         menu
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Owned/borrowed target metadata for section edit menu actions.
+pub(super) struct SectionEditCtx<'a> {
+    pub(super) key: &'a str,
+    pub(super) block_ix: usize,
+    pub(super) block_count: usize,
+    pub(super) is_fixture: bool,
+    pub(super) canvas: &'a CanvasDoc,
+    pub(super) section_id: Option<&'a str>,
+    pub(super) on_edit: Option<&'a crate::canvas::CanvasEditFn>,
+}
+
 pub(super) fn append_section_edit_menu_items(
     mut menu: PopupMenu,
-    key: &str,
-    block_ix: usize,
-    block_count: usize,
-    is_fixture: bool,
-    canvas: &CanvasDoc,
-    section_id: Option<&str>,
-    on_edit: Option<&CanvasEditFn>,
+    ctx: &SectionEditCtx<'_>,
 ) -> PopupMenu {
+    let SectionEditCtx {
+        key,
+        block_ix,
+        block_count,
+        is_fixture,
+        canvas,
+        section_id,
+        on_edit,
+    } = *ctx;
     let sid = section_id.map(str::to_owned);
     let (c_up, k_up, e_up) = (canvas.clone(), key.to_owned(), on_edit.cloned());
     menu = menu.separator().item(
@@ -408,19 +429,19 @@ pub(super) fn append_section_edit_menu_items(
 }
 
 /// Inline keyboard-accessible Section Actions bar opened by `Cmd+Shift+.` or `.` (`F-COLLAB-196`).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn render_inline_section_actions_bar(
-    key: &str,
-    block_ix: usize,
-    block_count: usize,
-    can_edit: bool,
-    is_fixture: bool,
-    canvas: &CanvasDoc,
-    section_id: Option<String>,
+    ctx: &CanvasBlockRenderCtx<'_>,
     block_md: String,
-    on_edit: Option<CanvasEditFn>,
     cx: &App,
 ) -> Div {
+    let key = ctx.key;
+    let block_ix = ctx.block_ix;
+    let block_count = ctx.canvas.blocks.len();
+    let can_edit = ctx.can_edit;
+    let is_fixture = ctx.is_fixture;
+    let canvas = ctx.canvas;
+    let section_id = ctx.section_id.clone();
+    let on_edit = ctx.actions.on_edit.clone();
     let theme = cx.theme();
     let k_close = key.to_owned();
     let copy_md = block_md;
@@ -595,17 +616,17 @@ pub(super) fn render_inline_section_actions_bar(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn render_block(
-    key: &str,
-    block_ix: usize,
+    ctx: &CanvasBlockRenderCtx<'_>,
     block: &CanvasBlock,
-    section_id: Option<&str>,
-    canvas_url: Option<&str>,
-    ui: &CanvasUiState,
     cbs: &BlockCallbacks,
     cx: &App,
 ) -> Div {
+    let key = ctx.key;
+    let block_ix = ctx.block_ix;
+    let section_id = ctx.section_id.as_deref();
+    let canvas_url = ctx.actions.canvas_url.as_deref();
+    let ui = ctx.ui;
     let theme = cx.theme();
     match block {
         CanvasBlock::Heading { level, text } => {
@@ -892,14 +913,15 @@ pub(super) fn render_block(
             duration,
             mime,
         } => render_media_embed_block(
-            key,
-            block_ix,
-            *kind,
-            title,
-            url,
-            file_id.as_deref(),
-            duration.as_deref(),
-            mime.as_deref(),
+            ctx,
+            MediaEmbedSpec {
+                kind: *kind,
+                title,
+                url,
+                file_id: file_id.as_deref(),
+                duration: duration.as_deref(),
+                mime: mime.as_deref(),
+            },
             cbs,
             cx,
         ),
@@ -909,12 +931,13 @@ pub(super) fn render_block(
             title,
             handle,
         } => render_profile_card_block(
-            key,
-            block_ix,
-            user_id,
-            display_name.as_deref(),
-            title.as_deref(),
-            handle.as_deref(),
+            ctx,
+            ProfileCardSpec {
+                user_id,
+                display_name: display_name.as_deref(),
+                title: title.as_deref(),
+                handle: handle.as_deref(),
+            },
             cbs,
             cx,
         ),
@@ -923,24 +946,45 @@ pub(super) fn render_block(
             file_id,
             title,
             url,
-        } => render_doc_embed_block(key, block_ix, *kind, file_id, title, url, cbs, cx),
+        } => render_doc_embed_block(
+            ctx,
+            DocEmbedSpec {
+                kind: *kind,
+                file_id,
+                title,
+                url,
+            },
+            cbs,
+            cx,
+        ),
         CanvasBlock::Divider => div().h(px(1.)).w_full().bg(theme.border),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_media_embed_block(
-    key: &str,
-    block_ix: usize,
+struct MediaEmbedSpec<'a> {
     kind: MediaKind,
-    title: &str,
-    url: &str,
-    file_id: Option<&str>,
-    duration: Option<&str>,
-    mime: Option<&str>,
+    title: &'a str,
+    url: &'a str,
+    file_id: Option<&'a str>,
+    duration: Option<&'a str>,
+    mime: Option<&'a str>,
+}
+
+fn render_media_embed_block(
+    ctx: &CanvasBlockRenderCtx<'_>,
+    spec: MediaEmbedSpec<'_>,
     cbs: &BlockCallbacks,
     cx: &App,
 ) -> Div {
+    let (key, block_ix) = (ctx.key, ctx.block_ix);
+    let MediaEmbedSpec {
+        kind,
+        title,
+        url,
+        file_id,
+        duration,
+        mime,
+    } = spec;
     let theme = cx.theme();
     let icon = match kind {
         MediaKind::Audio => IconName::Headphones,
@@ -1038,17 +1082,26 @@ fn render_media_embed_block(
         )
 }
 
-#[allow(clippy::too_many_arguments)]
+struct ProfileCardSpec<'a> {
+    user_id: &'a str,
+    display_name: Option<&'a str>,
+    title: Option<&'a str>,
+    handle: Option<&'a str>,
+}
+
 fn render_profile_card_block(
-    key: &str,
-    block_ix: usize,
-    user_id: &str,
-    display_name: Option<&str>,
-    title: Option<&str>,
-    handle: Option<&str>,
+    ctx: &CanvasBlockRenderCtx<'_>,
+    spec: ProfileCardSpec<'_>,
     cbs: &BlockCallbacks,
     cx: &App,
 ) -> Div {
+    let (key, block_ix) = (ctx.key, ctx.block_ix);
+    let ProfileCardSpec {
+        user_id,
+        display_name,
+        title,
+        handle,
+    } = spec;
     let theme = cx.theme();
     let profile = resolve_profile_card(
         user_id,
@@ -1134,17 +1187,26 @@ fn render_profile_card_block(
         })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_doc_embed_block(
-    key: &str,
-    block_ix: usize,
+struct DocEmbedSpec<'a> {
     kind: CanvasEmbedKind,
-    file_id: &str,
-    title: &str,
-    url: &str,
+    file_id: &'a str,
+    title: &'a str,
+    url: &'a str,
+}
+
+fn render_doc_embed_block(
+    ctx: &CanvasBlockRenderCtx<'_>,
+    spec: DocEmbedSpec<'_>,
     cbs: &BlockCallbacks,
     cx: &App,
 ) -> Div {
+    let (key, block_ix) = (ctx.key, ctx.block_ix);
+    let DocEmbedSpec {
+        kind,
+        file_id,
+        title,
+        url,
+    } = spec;
     let theme = cx.theme();
     let icon = match kind {
         CanvasEmbedKind::Canvas => IconName::LayoutTemplate,

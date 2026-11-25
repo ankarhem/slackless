@@ -2,16 +2,18 @@
 
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn render_live_detail_drawer(
-    data: &SlackListData,
-    fixtures: &Fixtures,
-    list_key: &str,
-    primary_ix: usize,
-    state: &ListPanelState,
-    actions: &ListActions,
+    ctx: &ListRenderCtx<'_>,
     cx: &App,
 ) -> Option<Stateful<Div>> {
+    let ListRenderCtx {
+        data,
+        fixtures,
+        list_key,
+        primary_ix,
+        state,
+        actions,
+    } = *ctx;
     let theme = cx.theme();
     let list_key = list_key.to_owned();
     state

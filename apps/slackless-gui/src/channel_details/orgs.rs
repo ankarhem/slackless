@@ -397,26 +397,6 @@ pub(crate) fn created_on(secs: i64) -> String {
         "November",
         "December",
     ];
-    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let (year, month, day) = slackless_core::types::time::civil_from_days(secs.div_euclid(86_400));
     format!("{} {}, {}", MONTHS[(month - 1) as usize], day, year)
-}
-
-/// (year, month, day) from days since the Unix epoch, proleptic Gregorian (Howard Hinnant's
-/// `civil_from_days`).
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    let shifted = days + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_shift = (5 * day_of_year + 2) / 153;
-    let day = (day_of_year - (153 * month_shift + 2) / 5 + 1) as u32;
-    let month = if month_shift < 10 {
-        month_shift + 3
-    } else {
-        month_shift - 9
-    } as u32;
-    ((year + i64::from(month <= 2)) as i32, month, day)
 }

@@ -3,7 +3,6 @@
 use super::*;
 
 /// Native live editable Slack Lists view (`F-COLLAB-226..229`, `F-COLLAB-234..239`, `F-COLLAB-248`).
-#[allow(clippy::too_many_arguments)]
 pub fn live_list_view(
     loaded: Option<&Result<SlackListData, String>>,
     fixtures: &Fixtures,
@@ -129,8 +128,7 @@ pub(crate) fn group_live_rows(
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_live_list(
+pub(super) fn render_live_list(
     data: &SlackListData,
     fixtures: &Fixtures,
     query: &str,
@@ -495,23 +493,26 @@ fn render_live_list(
             .children(rows_ui)
     };
 
-    let detail_drawer = detail::render_live_detail_drawer(
-        data, fixtures, &list_key, primary_ix, &state, &actions, cx,
-    );
-    let add_bar = toolbar::render_live_add_bar(data, &list_key, primary_ix, &state, &actions, cx);
-    let find_bar = toolbar::render_live_find_bar(query, search, cx);
-    let header_bar = toolbar::render_live_toolbar(
+    let render_ctx = ListRenderCtx {
         data,
         fixtures,
-        &list_key,
+        list_key: &list_key,
         primary_ix,
-        visible_indices.len(),
-        archived_count,
-        &completed_to_archive,
-        toggleable_cols,
-        &state,
+        state: &state,
+        actions: &actions,
+    };
+    let detail_drawer = detail::render_live_detail_drawer(&render_ctx, cx);
+    let add_bar = toolbar::render_live_add_bar(&render_ctx, cx);
+    let find_bar = toolbar::render_live_find_bar(query, search, cx);
+    let header_bar = toolbar::render_live_toolbar(
+        &render_ctx,
+        toolbar::ToolbarCounts {
+            visible_count: visible_indices.len(),
+            archived_count,
+            completed_to_archive: &completed_to_archive,
+            toggleable_cols,
+        },
         find_bar,
-        &actions,
         cx,
     );
 

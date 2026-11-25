@@ -28,18 +28,28 @@ use crate::canvas::{
     mutate_ui,
 };
 
+/// Inputs for [`render_canvas_editor`].
+pub(super) struct CanvasEditorCtx<'a> {
+    pub(super) key: &'a str,
+    pub(super) canvas: &'a CanvasDoc,
+    pub(super) ui: &'a CanvasUiState,
+    pub(super) editor: Entity<TextareaState>,
+    pub(super) on_edit: Option<CanvasEditFn>,
+    pub(super) on_upload_file: Option<CanvasUploadFileFn>,
+    pub(super) is_fixture: bool,
+}
+
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
-pub(super) fn render_canvas_editor(
-    key: &str,
-    canvas: &CanvasDoc,
-    ui: &CanvasUiState,
-    editor: Entity<TextareaState>,
-    on_edit: Option<CanvasEditFn>,
-    on_upload_file: Option<CanvasUploadFileFn>,
-    is_fixture: bool,
-    cx: &App,
-) -> Div {
+pub(super) fn render_canvas_editor(ctx: CanvasEditorCtx<'_>, cx: &App) -> Div {
+    let CanvasEditorCtx {
+        key,
+        canvas,
+        ui,
+        editor,
+        on_edit,
+        on_upload_file,
+        is_fixture,
+    } = ctx;
     let theme = cx.theme();
     let current_text = editor.read(cx).value().to_string();
     let current_sel = editor.read(cx).selected_range();

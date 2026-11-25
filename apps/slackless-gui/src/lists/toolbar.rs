@@ -2,14 +2,22 @@
 
 use super::*;
 
-pub(super) fn render_live_add_bar(
-    data: &SlackListData,
-    list_key: &str,
-    primary_ix: usize,
-    state: &ListPanelState,
-    actions: &ListActions,
-    cx: &App,
-) -> Option<Div> {
+pub(super) struct ToolbarCounts<'a> {
+    pub(super) visible_count: usize,
+    pub(super) archived_count: usize,
+    pub(super) completed_to_archive: &'a [String],
+    pub(super) toggleable_cols: Vec<(String, String)>,
+}
+
+pub(super) fn render_live_add_bar(ctx: &ListRenderCtx<'_>, cx: &App) -> Option<Div> {
+    let ListRenderCtx {
+        data,
+        list_key,
+        primary_ix,
+        state,
+        actions,
+        ..
+    } = *ctx;
     let theme = cx.theme();
     let list_key = list_key.to_owned();
     let add_bar = state.adding.then(|| {
@@ -139,21 +147,26 @@ pub(super) fn render_live_find_bar(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn render_live_toolbar(
-    data: &SlackListData,
-    fixtures: &Fixtures,
-    list_key: &str,
-    primary_ix: usize,
-    visible_count: usize,
-    archived_count: usize,
-    completed_to_archive: &[String],
-    toggleable_cols: Vec<(String, String)>,
-    state: &ListPanelState,
+    ctx: &ListRenderCtx<'_>,
+    counts: ToolbarCounts<'_>,
     find_bar: Option<Div>,
-    actions: &ListActions,
     cx: &App,
 ) -> Div {
+    let ListRenderCtx {
+        data,
+        fixtures,
+        list_key,
+        primary_ix,
+        state,
+        actions,
+    } = *ctx;
+    let ToolbarCounts {
+        visible_count,
+        archived_count,
+        completed_to_archive,
+        toggleable_cols,
+    } = counts;
     let theme = cx.theme();
     let list_key = list_key.to_owned();
     let can_edit = actions.on_update_cell.is_some() || actions.on_create_item.is_some();

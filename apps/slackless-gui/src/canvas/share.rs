@@ -16,16 +16,11 @@ use slackless_core::types::{ChannelId, UserId};
 
 use crate::canvas::{CanvasActions, CanvasUiState, mutate_ui};
 
-/// Payload emitted when granting or updating access in the Share & Access panel (`F-COLLAB-160..170`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShareAccessRequest {
-    pub access_level: CanvasAccessLevel,
-    pub channel_ids: Vec<ChannelId>,
-    pub user_ids: Vec<UserId>,
-    /// `Some(permalink)` posts the canvas link to shared channels (`F-COLLAB-160`);
-    /// `None` grants silent access without posting (`F-COLLAB-161`).
-    pub post_permalink: Option<String>,
-}
+#[cfg(test)]
+pub use slackless_core::domain::canvas::parse_share_targets;
+pub use slackless_core::domain::canvas::{
+    ShareAccessRequest, build_share_access_request, general_access_summary,
+};
 
 /// Callback invoked when granting/updating canvas access (`Command::SetCanvasAccess`).
 pub type CanvasAccessSetFn = Rc<dyn Fn(ShareAccessRequest, &mut Window, &mut App)>;
@@ -33,105 +28,6 @@ pub type CanvasAccessSetFn = Rc<dyn Fn(ShareAccessRequest, &mut Window, &mut App
 pub type CanvasAccessDeleteFn = Rc<dyn Fn(Vec<ChannelId>, Vec<UserId>, &mut Window, &mut App)>;
 /// Callback invoked when deleting a canvas permanently (`Command::DeleteCanvas`, `F-COLLAB-158`).
 pub type CanvasDeleteFn = Rc<dyn Fn(&mut Window, &mut App)>;
-
-/// Parse comma- or whitespace-separated channel/user IDs (e.g. `#C01ENG, @U01ALICE`).
-pub fn parse_share_targets(raw: &str) -> (Vec<ChannelId>, Vec<UserId>) {
-    let mut channels = Vec::new();
-    let mut users = Vec::new();
-    for token in raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
-        let clean = token.trim().trim_start_matches('#').trim_start_matches('@');
-        if clean.len() < 3 {
-            continue;
-        }
-        let upper = clean.to_ascii_uppercase();
-        if !upper
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-        {
-            continue;
-        }
-        match upper.as_bytes()[0] {
-            b'C' | b'G' | b'D' => {
-                let cid = ChannelId::from(upper.as_str());
-                if !channels.contains(&cid) {
-                    channels.push(cid);
-                }
-            }
-            b'U' | b'W' => {
-                let uid = UserId::from(upper.as_str());
-                if !users.contains(&uid) {
-                    users.push(uid);
-                }
-            }
-            _ => {}
-        }
-    }
-    (channels, users)
-}
-
-/// Validate and build a [`ShareAccessRequest`] from Share panel form inputs
-/// (`F-COLLAB-160`, `F-COLLAB-161`, `F-COLLAB-165`, `F-COLLAB-167`, `F-COLLAB-170`).
-pub fn build_share_access_request(
-    raw_targets: &str,
-    access_level: CanvasAccessLevel,
-    share_without_posting: bool,
-    permalink: Option<&str>,
-) -> Result<ShareAccessRequest, String> {
-    let (channel_ids, user_ids) = parse_share_targets(raw_targets);
-    if channel_ids.is_empty() && user_ids.is_empty() {
-        return Err(
-            "Enter at least one Slack channel ID (C…) or user ID (U…) to share with.".to_owned(),
-        );
-    }
-    let post_permalink = if share_without_posting || channel_ids.is_empty() {
-        None
-    } else {
-        permalink
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    };
-    Ok(ShareAccessRequest {
-        access_level,
-        channel_ids,
-        user_ids,
-        post_permalink,
-    })
-}
-
-/// Summarize the canvas's general access and sharing-limit state (`F-COLLAB-163`, `F-COLLAB-164`,
-/// `F-COLLAB-168`).
-pub fn general_access_summary(
-    meta: Option<&CanvasMeta>,
-    local_override: Option<&str>,
-    limit_sharing: bool,
-) -> (&'static str, String) {
-    let raw = local_override
-        .filter(|s| !s.is_empty())
-        .or_else(|| meta.and_then(|m| m.org_or_workspace_access.as_deref()))
-        .or_else(|| meta.and_then(|m| m.access.as_deref()))
-        .unwrap_or("private")
-        .to_ascii_lowercase();
-
-    let (badge, mut desc) = match raw.as_str() {
-        "write" | "edit" | "workspace_edit" => (
-            "Workspace can edit",
-            "Anyone in this workspace with the link can view, comment, and edit.".to_owned(),
-        ),
-        "read" | "view" | "workspace_view" => (
-            "Workspace can view",
-            "Anyone in this workspace with the link can view and comment.".to_owned(),
-        ),
-        _ => (
-            "Invite only",
-            "Only people and channels explicitly added below can open this canvas.".to_owned(),
-        ),
-    };
-    if limit_sharing {
-        desc.push_str(" Re-sharing is limited to canvas owners.");
-    }
-    (badge, desc)
-}
 
 /// Translate Slack server-enforced canvas errors into clear user-facing guidance
 /// (`F-COLLAB-120`, `F-COLLAB-171..174`, `F-COLLAB-204`).

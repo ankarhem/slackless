@@ -101,22 +101,12 @@ pub(crate) fn media_format_pill(mime: Option<&str>, url: &str) -> Option<String>
 
 /// Whether `s` looks like a Slack user ID (`U...` or `W...`, uppercase ASCII alphanumeric).
 fn is_slack_user_id(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    bytes.len() >= 3
-        && matches!(bytes[0], b'U' | b'W')
-        && bytes
-            .iter()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    crate::canvas::mentions::is_upper_alnum_id(s, b"UW")
 }
 
 /// Whether `s` looks like a Slack file/canvas/list ID (`F...`, uppercase ASCII alphanumeric).
 fn is_slack_file_id(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    bytes.len() >= 3
-        && bytes[0] == b'F'
-        && bytes
-            .iter()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    crate::canvas::mentions::is_upper_alnum_id(s, b"F")
 }
 
 /// Parse a Slack profile URL (`https://<ws>.slack.com/team/U...` or `/team/U...`) into its

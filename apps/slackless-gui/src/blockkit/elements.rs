@@ -4,7 +4,7 @@ use super::*;
 
 /// Fixture mode has no app to receive `block_actions`: log the interaction and toast it.
 pub(super) fn log_action(key: &str, detail: &str, window: &mut Window, cx: &mut App) {
-    eprintln!("slackless: block action {key}: {detail}");
+    tracing::warn!("slackless: block action {key}: {detail}");
     actions::notify("Block Kit action", format!("{detail} ({key})"), window, cx);
 }
 
@@ -225,13 +225,15 @@ pub(super) fn block_element(
         "datepicker" => datepicker(element, block, key, kcx, cx),
         "datetimepicker" => datetimepicker(element, block, key, kcx, cx),
         "timepicker" => picker(
-            element,
-            block,
-            key,
-            "initial_time",
-            "selected_time",
-            IconName::Clock,
-            timepicker_slots(),
+            PickerSpec {
+                element,
+                block,
+                key,
+                initial_field: "initial_time",
+                selected_field: "selected_time",
+                icon: IconName::Clock,
+                options: timepicker_slots(),
+            },
             kcx,
             cx,
         ),
@@ -603,14 +605,16 @@ pub(super) fn select(
         .and_then(|value| options.iter().find(|(_, option)| option == value))
         .map_or(placeholder, |(label, _)| label.clone());
     dropdown(
-        key,
-        label,
-        None,
-        options,
-        selected,
-        kcx.kit.cloned(),
-        kcx.on_action.clone(),
-        kcx.attachment,
+        DropdownSpec {
+            key,
+            label,
+            icon: None,
+            options,
+            selected,
+            kit: kcx.kit.cloned(),
+            on_action: kcx.on_action.clone(),
+            attachment: kcx.attachment,
+        },
         move |text, value| {
             let mut action = base.clone();
             match kind.as_str() {
@@ -688,22 +692,10 @@ pub(super) fn shift_date_by_months(
 }
 
 pub(super) fn days_in_month(year: i32, month: u32) -> u32 {
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => 30,
-    }
+    slackless_core::types::time::days_in_month(i64::from(year), month).unwrap_or(30)
 }
 
-/// Day of week for `year-month-day` (0 = Sunday .. 6 = Saturday), Sakamoto's algorithm.
-pub(super) fn weekday_sunday0(year: i32, month: u32, day: u32) -> u32 {
-    const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
-    let y = if month < 3 { year - 1 } else { year };
-    ((y + y / 4 - y / 100 + y / 400 + T[(month - 1) as usize] + day as i32).rem_euclid(7)) as u32
-}
+pub(super) use slackless_core::types::time::weekday_sunday0;
 
 pub(super) fn month_name(month: u32) -> &'static str {
     const NAMES: [&str; 12] = [
@@ -945,36 +937,51 @@ pub(super) fn datepicker(
         .into_any_element()
 }
 
+/// Parameters for [`picker`].
+pub(super) struct PickerSpec<'a> {
+    pub(super) element: &'a Json,
+    pub(super) block: &'a Json,
+    pub(super) key: String,
+    pub(super) initial_field: &'a str,
+    pub(super) selected_field: &'static str,
+    pub(super) icon: IconName,
+    pub(super) options: Vec<(String, String)>,
+}
+
+/// Parameters for [`dropdown`].
+pub(super) struct DropdownSpec {
+    pub(super) key: String,
+    pub(super) label: String,
+    pub(super) icon: Option<IconName>,
+    pub(super) options: Vec<(String, String)>,
+    pub(super) selected: Option<String>,
+    pub(super) kit: Option<Entity<BlockKitState>>,
+    pub(super) on_action: Option<actions::ActionHandler>,
+    pub(super) attachment: Option<i64>,
+}
+
 /// Date / time pickers: the chosen value (or `initial_field`) on a button with `icon`, the
 /// next values in a checked menu.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn picker(
-    element: &Json,
-    block: &Json,
-    key: String,
-    initial_field: &str,
-    selected_field: &'static str,
-    icon: IconName,
-    options: Vec<(String, String)>,
-    kcx: &KitCx,
-    cx: &App,
-) -> AnyElement {
-    let selected =
-        choice(kcx, &key, cx).or_else(|| element[initial_field].as_str().map(str::to_owned));
+pub(super) fn picker(spec: PickerSpec<'_>, kcx: &KitCx, cx: &App) -> AnyElement {
+    let selected = choice(kcx, &spec.key, cx)
+        .or_else(|| spec.element[spec.initial_field].as_str().map(str::to_owned));
     let label = selected
         .clone()
-        .or_else(|| text_of(&element["placeholder"]).map(str::to_owned))
+        .or_else(|| text_of(&spec.element["placeholder"]).map(str::to_owned))
         .unwrap_or_else(|| "Select".to_owned());
-    let base = action_base(element, block);
+    let base = action_base(spec.element, spec.block);
+    let selected_field = spec.selected_field;
     dropdown(
-        key,
-        label,
-        Some(icon),
-        options,
-        selected,
-        kcx.kit.cloned(),
-        kcx.on_action.clone(),
-        kcx.attachment,
+        DropdownSpec {
+            key: spec.key,
+            label,
+            icon: Some(spec.icon),
+            options: spec.options,
+            selected,
+            kit: kcx.kit.cloned(),
+            on_action: kcx.on_action.clone(),
+            attachment: kcx.attachment,
+        },
         move |_, value| {
             let mut action = base.clone();
             action[selected_field] = value.into();
@@ -984,18 +991,20 @@ pub(super) fn picker(
     .into_any_element()
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn dropdown(
-    key: String,
-    label: String,
-    icon: Option<IconName>,
-    options: Vec<(String, String)>,
-    selected: Option<String>,
-    kit: Option<Entity<BlockKitState>>,
-    on_action: Option<actions::ActionHandler>,
-    attachment: Option<i64>,
+    spec: DropdownSpec,
     build_action: impl Fn(&str, &str) -> Json + 'static,
 ) -> impl IntoElement {
+    let DropdownSpec {
+        key,
+        label,
+        icon,
+        options,
+        selected,
+        kit,
+        on_action,
+        attachment,
+    } = spec;
     let build_action = std::rc::Rc::new(build_action);
     Button::new(SharedString::from(format!("bk-{key}")))
         .outline()

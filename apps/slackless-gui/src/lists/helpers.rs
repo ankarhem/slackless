@@ -2,14 +2,8 @@
 
 use super::*;
 
-pub(super) fn row_cell<'a>(
-    row: &'a SlackListRow,
-    column: &SlackListColumn,
-) -> Option<&'a SlackListCellValue> {
-    row.cells
-        .get(&column.id)
-        .or_else(|| row.cells.get(&column.key))
-}
+pub(crate) use slackless_core::domain::lists::parse_csv_rows;
+pub(super) use slackless_core::domain::lists::{map_csv_row_to_cells, row_cell};
 
 pub(super) fn live_column_icon(kind: &str) -> IconName {
     match kind {
@@ -325,103 +319,10 @@ pub(super) fn live_cell(
     }
 }
 
-pub(super) fn fixture_to_csv(list: &SlackList) -> String {
-    let mut out = String::new();
-    for (ix, col) in list.columns.iter().enumerate() {
-        if ix > 0 {
-            out.push(',');
-        }
-        push_csv_field(&mut out, col.name);
-    }
-    out.push('\n');
-    for row in &list.rows {
-        for (ix, field) in row.iter().enumerate() {
-            if ix > 0 {
-                out.push(',');
-            }
-            let val = match field {
-                Field::Text(s) | Field::Person(s) | Field::Date(s) => s.as_str(),
-                Field::Select(Status::Todo) => "To do",
-                Field::Select(Status::InProgress) => "In progress",
-                Field::Select(Status::Blocked) => "Blocked",
-                Field::Select(Status::Done) => "Done",
-                Field::Checkbox(true) => "true",
-                Field::Checkbox(false) => "false",
-            };
-            push_csv_field(&mut out, val);
-        }
-        out.push('\n');
-    }
-    out
-}
-
 /// Serialize a live Slack List to RFC 4180 CSV (`F-COLLAB-217`), resolving user IDs and
-/// select option labels cleanly.
+/// select option labels cleanly via [`slackless_core::domain::lists::list_to_csv`].
 pub fn list_to_csv(data: &SlackListData, fixtures: &Fixtures) -> String {
-    let mut out = String::new();
-    for (ix, col) in data.columns.iter().enumerate() {
-        if ix > 0 {
-            out.push(',');
-        }
-        push_csv_field(&mut out, &col.name);
-    }
-    out.push('\n');
-    for row in &data.rows {
-        for (ix, col) in data.columns.iter().enumerate() {
-            if ix > 0 {
-                out.push(',');
-            }
-            let val = match row_cell(row, col) {
-                None | Some(SlackListCellValue::Empty) => String::new(),
-                Some(SlackListCellValue::Text(s)) | Some(SlackListCellValue::Date(s)) => s.clone(),
-                Some(SlackListCellValue::Link { url, label }) => {
-                    if label.is_empty() || label == url {
-                        url.clone()
-                    } else {
-                        format!("{label} ({url})")
-                    }
-                }
-                Some(SlackListCellValue::Number(n)) => n.to_string(),
-                Some(SlackListCellValue::Checkbox(checked)) => {
-                    if *checked { "true" } else { "false" }.to_owned()
-                }
-                Some(SlackListCellValue::Users(users)) => users
-                    .iter()
-                    .map(|u| fixtures.user_name(u))
-                    .collect::<Vec<_>>()
-                    .join("; "),
-                Some(SlackListCellValue::Select(opts)) => opts
-                    .iter()
-                    .map(|opt| {
-                        col.choices
-                            .iter()
-                            .find(|c| c.value == *opt)
-                            .map(|c| c.label.as_str())
-                            .unwrap_or(opt.as_str())
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            };
-            push_csv_field(&mut out, &val);
-        }
-        out.push('\n');
-    }
-    out
-}
-
-pub(super) fn push_csv_field(out: &mut String, field: &str) {
-    if field.contains([',', '"', '\n', '\r']) {
-        out.push('"');
-        for ch in field.chars() {
-            if ch == '"' {
-                out.push('"');
-            }
-            out.push(ch);
-        }
-        out.push('"');
-    } else {
-        out.push_str(field);
-    }
+    slackless_core::domain::lists::list_to_csv(data, |u| fixtures.user_name(u).to_owned())
 }
 
 pub(super) fn sanitize_filename(name: &str) -> String {
@@ -443,95 +344,10 @@ pub(super) fn sanitize_filename(name: &str) -> String {
     }
 }
 
-pub(super) fn fixture_to_json(list: &SlackList) -> String {
-    use crate::blockkit::serde_json::{Map, Value, json};
-    let rows: Vec<Value> = list
-        .rows
-        .iter()
-        .map(|fields| {
-            let mut obj = Map::new();
-            for (col, field) in list.columns.iter().zip(fields) {
-                let val = match field {
-                    Field::Text(s) | Field::Person(s) | Field::Date(s) => Value::String(s.clone()),
-                    Field::Select(Status::Todo) => Value::String("To do".into()),
-                    Field::Select(Status::InProgress) => Value::String("In progress".into()),
-                    Field::Select(Status::Blocked) => Value::String("Blocked".into()),
-                    Field::Select(Status::Done) => Value::String("Done".into()),
-                    Field::Checkbox(b) => Value::Bool(*b),
-                };
-                obj.insert(col.name.to_owned(), val);
-            }
-            Value::Object(obj)
-        })
-        .collect();
-    let payload = json!({
-        "title": list.title,
-        "columns": list.columns.iter().map(|c| c.name).collect::<Vec<_>>(),
-        "items": rows,
-    });
-    crate::blockkit::serde_json::to_string_pretty(&payload).unwrap_or_default()
-}
-
 /// Serialize a live Slack List to pretty-printed JSON (`F-COLLAB-218`), resolving user IDs and
-/// select option labels cleanly.
+/// select option labels cleanly via [`slackless_core::domain::lists::list_to_json`].
 pub fn list_to_json(data: &SlackListData, fixtures: &Fixtures) -> String {
-    use crate::blockkit::serde_json::{Map, Value, json};
-    let items: Vec<Value> = data
-        .rows
-        .iter()
-        .map(|row| {
-            let mut obj = Map::new();
-            obj.insert("id".to_owned(), Value::String(row.id.clone()));
-            for col in &data.columns {
-                let val = match row_cell(row, col) {
-                    None | Some(SlackListCellValue::Empty) => Value::Null,
-                    Some(SlackListCellValue::Text(s)) | Some(SlackListCellValue::Date(s)) => {
-                        Value::String(s.clone())
-                    }
-                    Some(SlackListCellValue::Number(n)) => n
-                        .parse::<f64>()
-                        .ok()
-                        .and_then(crate::blockkit::serde_json::Number::from_f64)
-                        .map(Value::Number)
-                        .unwrap_or_else(|| Value::String(n.clone())),
-                    Some(SlackListCellValue::Checkbox(b)) => Value::Bool(*b),
-                    Some(SlackListCellValue::Link { label, url }) => json!({
-                        "label": label,
-                        "url": url,
-                    }),
-                    Some(SlackListCellValue::Users(users)) => Value::Array(
-                        users
-                            .iter()
-                            .map(|u| Value::String(fixtures.user_name(u).to_owned()))
-                            .collect(),
-                    ),
-                    Some(SlackListCellValue::Select(opts)) => Value::Array(
-                        opts.iter()
-                            .map(|opt| {
-                                let label = col
-                                    .choices
-                                    .iter()
-                                    .find(|c| c.value == *opt)
-                                    .map(|c| c.label.as_str())
-                                    .unwrap_or(opt.as_str());
-                                Value::String(label.to_owned())
-                            })
-                            .collect(),
-                    ),
-                };
-                obj.insert(col.name.clone(), val);
-            }
-            Value::Object(obj)
-        })
-        .collect();
-    let payload = json!({
-        "file_id": data.file_id,
-        "title": data.title,
-        "description": data.description,
-        "columns": data.columns.iter().map(|c| json!({ "id": c.id, "name": c.name, "type": c.kind })).collect::<Vec<_>>(),
-        "items": items,
-    });
-    crate::blockkit::serde_json::to_string_pretty(&payload).unwrap_or_default()
+    slackless_core::domain::lists::list_to_json(data, |u| fixtures.user_name(u).to_owned())
 }
 
 pub(super) fn render_record_comments_section(
@@ -724,109 +540,6 @@ pub(super) fn render_record_comments_section(
     }
 
     section
-}
-
-/// Parse RFC 4180 CSV text into rows of unescaped fields (`F-COLLAB-216`).
-pub(crate) fn parse_csv_rows(input: &str) -> Vec<Vec<String>> {
-    let mut rows = Vec::new();
-    let mut row = Vec::new();
-    let mut field = String::new();
-    let mut chars = input.chars().peekable();
-    let mut in_quotes = false;
-    while let Some(ch) = chars.next() {
-        if in_quotes {
-            if ch == '"' {
-                if chars.peek() == Some(&'"') {
-                    chars.next();
-                    field.push('"');
-                } else {
-                    in_quotes = false;
-                }
-            } else {
-                field.push(ch);
-            }
-        } else {
-            match ch {
-                '"' if field.is_empty() => in_quotes = true,
-                ',' => {
-                    row.push(std::mem::take(&mut field));
-                }
-                '\r' => {
-                    if chars.peek() == Some(&'\n') {
-                        chars.next();
-                    }
-                    row.push(std::mem::take(&mut field));
-                    if row.iter().any(|c| !c.trim().is_empty()) {
-                        rows.push(std::mem::take(&mut row));
-                    } else {
-                        row.clear();
-                    }
-                }
-                '\n' => {
-                    row.push(std::mem::take(&mut field));
-                    if row.iter().any(|c| !c.trim().is_empty()) {
-                        rows.push(std::mem::take(&mut row));
-                    } else {
-                        row.clear();
-                    }
-                }
-                other => field.push(other),
-            }
-        }
-    }
-    if !field.is_empty() || !row.is_empty() {
-        row.push(field);
-        if row.iter().any(|c| !c.trim().is_empty()) {
-            rows.push(row);
-        }
-    }
-    rows
-}
-
-pub(super) fn map_csv_row_to_cells(
-    headers: &[String],
-    values: &[String],
-    cols: &[(String, String, String)],
-    primary_ix: usize,
-) -> Vec<ListCellInput> {
-    let mut cells = Vec::new();
-    for (idx, val) in values.iter().enumerate() {
-        let trimmed = val.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let header = headers.get(idx).map(|s| s.trim()).unwrap_or("");
-        let matched = cols
-            .iter()
-            .find(|(_, name, _)| !header.is_empty() && name.eq_ignore_ascii_case(header))
-            .or_else(|| (idx == 0).then(|| cols.get(primary_ix)).flatten());
-        let Some((col_id, _, kind)) = matched else {
-            continue;
-        };
-        let cell_val = match kind.as_str() {
-            "checkbox" | "todo_completed" | "completed" => ListCellInputValue::Checkbox(matches!(
-                trimmed.to_ascii_lowercase().as_str(),
-                "true" | "1" | "yes" | "x"
-            )),
-            "date" | "todo_due_date" | "due_date" => {
-                ListCellInputValue::Date(vec![trimmed.to_owned()])
-            }
-            "number" | "rating" | "currency" => trimmed
-                .parse::<f64>()
-                .map(|n| ListCellInputValue::Number(vec![n]))
-                .unwrap_or_else(|_| ListCellInputValue::Text(trimmed.to_owned())),
-            "link" => ListCellInputValue::Link {
-                url: trimmed.to_owned(),
-                display_name: None,
-            },
-            _ => ListCellInputValue::Text(trimmed.to_owned()),
-        };
-        cells.push(ListCellInput {
-            column_id: col_id.clone(),
-            value: cell_val,
-        });
-    }
-    cells
 }
 
 pub(super) fn export_file(

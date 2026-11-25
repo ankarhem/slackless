@@ -46,8 +46,8 @@ struct ListPanelState {
     new_item_input: Option<Entity<TextareaState>>,
     /// Currently edited `(row_id, col_id, input)` in the item detail drawer.
     editing_cell: Option<(String, String, Entity<TextareaState>)>,
-    /// Mutable local rows for fixture mode.
-    fixture_rows: Option<Vec<Vec<Field>>>,
+    /// Mutable local list data for fixture mode.
+    fixture_data: Option<SlackListData>,
     /// Optimistically archived record IDs (`F-COLLAB-255`, `F-COLLAB-256`, `F-COLLAB-257`).
     archived_rows: HashSet<String>,
     /// View-level filter showing archived items alongside active rows (`F-COLLAB-257`).
@@ -56,6 +56,16 @@ struct ListPanelState {
     comment_input: Option<Entity<TextareaState>>,
     /// Locally posted comments per `(list_id, record_id)` appended alongside server comments.
     local_comments: HashMap<String, Vec<(String, String)>>,
+}
+
+/// Shared render context passed across list table/board, toolbar, and detail-drawer builders.
+struct ListRenderCtx<'a> {
+    data: &'a SlackListData,
+    fixtures: &'a Fixtures,
+    list_key: &'a str,
+    primary_ix: usize,
+    state: &'a ListPanelState,
+    actions: &'a ListActions,
 }
 
 /// Persistent per-list UI state (layout mode, hidden columns, open item detail drawer, inline edits).
@@ -236,7 +246,6 @@ mod tests;
 mod toolbar;
 
 pub use fixture::list_view;
-use fixture::{Field, SlackList, Status};
 use helpers::*;
 pub(crate) use helpers::{filter_and_sort_rows, parse_csv_rows};
 pub use helpers::{list_to_csv, list_to_json};

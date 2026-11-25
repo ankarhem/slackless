@@ -20,14 +20,9 @@ use crate::canvas::keyboard::CanvasFocusRegion;
 use crate::canvas::parse::resolve_canvas_emoji;
 use crate::canvas::{CanvasActions, CanvasUiState, mutate_ui};
 
-/// Filter tab for the Canvas Comments drawer (`F-COLLAB-155`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CanvasCommentFilter {
-    #[default]
-    All,
-    Open,
-    Resolved,
-}
+pub use slackless_core::domain::canvas::{
+    CanvasCommentFilter, comment_thread_counts, filter_comment_threads,
+};
 
 /// Callback invoked when opening or refreshing the Comments drawer (`Command::LoadCanvasComments`).
 pub type CanvasCommentsLoadFn = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -37,29 +32,6 @@ pub type CanvasCommentPostFn = Rc<dyn Fn(String, Option<Ts>, &mut Window, &mut A
 pub type CanvasCommentResolveFn = Rc<dyn Fn(Ts, bool, &mut Window, &mut App)>;
 /// Callback invoked when resolving all open comment threads (`Command::ResolveAllCanvasComments`).
 pub type CanvasCommentResolveAllFn = Rc<dyn Fn(&mut Window, &mut App)>;
-
-/// Filter comment threads by [`CanvasCommentFilter`] (`F-COLLAB-155`).
-pub fn filter_comment_threads(
-    threads: &[CanvasCommentThread],
-    filter: CanvasCommentFilter,
-) -> Vec<&CanvasCommentThread> {
-    threads
-        .iter()
-        .filter(|t| match filter {
-            CanvasCommentFilter::All => true,
-            CanvasCommentFilter::Open => !t.resolved,
-            CanvasCommentFilter::Resolved => t.resolved,
-        })
-        .collect()
-}
-
-/// Compute `(total, open, resolved)` counts for the Comments drawer filter tabs.
-pub fn comment_thread_counts(threads: &[CanvasCommentThread]) -> (usize, usize, usize) {
-    let total = threads.len();
-    let resolved = threads.iter().filter(|t| t.resolved).count();
-    let open = total.saturating_sub(resolved);
-    (total, open, resolved)
-}
 
 /// Pre-seeded sample comment threads for fixture mode so threaded replies & resolve/reopen work
 /// out of the box without a live Slack backend.

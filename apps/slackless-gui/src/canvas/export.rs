@@ -3,12 +3,75 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use slackless_core::api::CanvasMeta;
 
 use crate::canvas::mentions::{CanvasInlineSegment, parse_inline_canvas_segments};
 use crate::canvas::model::{CanvasBlock, CanvasDoc};
 use crate::canvas::parse::resolve_canvas_emoji;
+
+/// Counter ensuring concurrent print/PDF exports never collide on temp HTML paths.
+static EXPORT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum age before temporary canvas export HTML files are pruned.
+const TEMP_HTML_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+/// Maximum number of recent temporary canvas export HTML files retained on disk.
+const TEMP_HTML_MAX_FILES: usize = 8;
+
+/// RAII guard that removes a temporary file on drop (covering success, error, and panic paths).
+#[cfg_attr(test, allow(dead_code))]
+struct TempFileGuard(PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Remove stale temporary canvas export HTML files (`slackless-print-*.html` /
+/// `slackless-pdf-*.html`) in `dir` older than `max_age` or exceeding `max_files` newest entries.
+pub(super) fn prune_stale_export_files(dir: &Path, max_age: Duration, max_files: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    let mut kept: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let is_canvas_tmp = (name.starts_with("slackless-print-")
+            || name.starts_with("slackless-pdf-"))
+            && name.ends_with(".html");
+        if !is_canvas_tmp {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let expired = now.duration_since(modified).is_ok_and(|age| age > max_age);
+        if expired {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            kept.push((modified, path));
+        }
+    }
+    if kept.len() > max_files {
+        kept.sort_by_key(|a| std::cmp::Reverse(a.0));
+        for (_, path) in kept.into_iter().skip(max_files) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn next_temp_html_path(prefix: &str, stem: &str) -> PathBuf {
+    let seq = EXPORT_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{stem}-{}-{seq}.html", std::process::id()))
+}
 
 /// Whether workspace/canvas policy allows printing or exporting this canvas as PDF (`F-COLLAB-184`).
 pub fn canvas_print_allowed(meta: Option<&CanvasMeta>) -> bool {
@@ -324,42 +387,67 @@ pub fn canvas_export_stem(title: &str) -> String {
 }
 
 /// Write printable HTML for `doc` to `path` (pure filesystem helper, safe to test on temp dirs).
+#[cfg(test)]
 pub fn write_printable_html(doc: &CanvasDoc, path: &Path) -> std::io::Result<()> {
     let html = canvas_to_printable_html(doc);
     std::fs::write(path, html)
 }
 
 /// Open a print-ready HTML export in the OS print/browser flow (`F-COLLAB-182`).
+/// Runs disk I/O and the `open` subprocess on a background thread so the GPUI UI thread never
+/// blocks, and prunes stale temporary print HTML files to bound temp-directory growth.
 /// Never spawns OS subprocesses or dialogs in `#[cfg(test)]`.
 pub fn trigger_canvas_print(doc: &CanvasDoc) -> Result<PathBuf, String> {
     #[cfg(test)]
     {
-        let _ = doc;
+        let _ = (
+            doc,
+            next_temp_html_path,
+            TEMP_HTML_MAX_AGE,
+            TEMP_HTML_MAX_FILES,
+        );
         Err("OS print dialog disabled in test builds".to_owned())
     }
     #[cfg(not(test))]
     {
         let stem = canvas_export_stem(&doc.title);
-        let path = std::env::temp_dir().join(format!("slackless-print-{stem}.html"));
+        let path = next_temp_html_path("slackless-print", &stem);
         let html = canvas_to_printable_html(doc).replace(
             "</body>",
             "<script>window.addEventListener('load',function(){window.print();});</script>\n</body>",
         );
-        std::fs::write(&path, html).map_err(|e| format!("Failed to write print HTML: {e}"))?;
-        let status = std::process::Command::new("open")
-            .arg(&path)
-            .status()
-            .map_err(|e| format!("Failed to open print preview: {e}"))?;
-        if status.success() {
-            Ok(path)
-        } else {
-            Err("Could not launch print preview.".to_owned())
-        }
+        let path_bg = path.clone();
+        std::thread::Builder::new()
+            .name("canvas-print".into())
+            .spawn(move || {
+                prune_stale_export_files(
+                    &std::env::temp_dir(),
+                    TEMP_HTML_MAX_AGE,
+                    TEMP_HTML_MAX_FILES,
+                );
+                if let Err(err) = std::fs::write(&path_bg, html) {
+                    tracing::warn!(path = %path_bg.display(), %err, "Failed to write print HTML");
+                    return;
+                }
+                match std::process::Command::new("open").arg(&path_bg).status() {
+                    Ok(status) if status.success() => {}
+                    Ok(status) => {
+                        tracing::warn!(%status, path = %path_bg.display(), "Print preview launch exited non-zero");
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, path = %path_bg.display(), "Failed to launch print preview");
+                    }
+                }
+            })
+            .map_err(|e| format!("Failed to schedule print preview: {e}"))?;
+        Ok(path)
     }
 }
 
-/// Save a canvas as PDF to `target_pdf` (`F-COLLAB-183`), using macOS `cupsfilter` when available
-/// and falling back to a print-ready HTML file next to `target_pdf`.
+/// Save a canvas as PDF to `target_pdf` (`F-COLLAB-183`), running macOS `cupsfilter` on a
+/// background thread so clicking Save as PDF never freezes the GPUI UI thread, falling back to a
+/// print-ready HTML file next to `target_pdf` when `cupsfilter` is unavailable, and always
+/// cleaning up the temporary HTML file via an RAII guard.
 /// Never spawns OS subprocesses in `#[cfg(test)]`.
 pub fn save_canvas_pdf_to_path(doc: &CanvasDoc, target_pdf: &Path) -> Result<PathBuf, String> {
     #[cfg(test)]
@@ -370,28 +458,107 @@ pub fn save_canvas_pdf_to_path(doc: &CanvasDoc, target_pdf: &Path) -> Result<Pat
     #[cfg(not(test))]
     {
         let stem = canvas_export_stem(&doc.title);
-        let tmp_html = std::env::temp_dir().join(format!("slackless-pdf-{stem}.html"));
-        write_printable_html(doc, &tmp_html)
-            .map_err(|e| format!("Failed to write HTML for PDF: {e}"))?;
+        let html = canvas_to_printable_html(doc);
+        let target = target_pdf.to_path_buf();
+        let tmp_html = next_temp_html_path("slackless-pdf", &stem);
 
-        if let Ok(output) = std::process::Command::new("/usr/sbin/cupsfilter")
-            .args(["-m", "application/pdf"])
-            .arg(&tmp_html)
-            .output()
-            && output.status.success()
-            && !output.stdout.is_empty()
+        std::thread::Builder::new()
+            .name("canvas-pdf-export".into())
+            .spawn(move || {
+                prune_stale_export_files(
+                    &std::env::temp_dir(),
+                    TEMP_HTML_MAX_AGE,
+                    TEMP_HTML_MAX_FILES,
+                );
+                let _guard = TempFileGuard(tmp_html.clone());
+                if let Err(err) = std::fs::write(&tmp_html, &html) {
+                    tracing::warn!(path = %tmp_html.display(), %err, "Failed to write temp HTML for PDF export");
+                    return;
+                }
+
+                match std::process::Command::new("/usr/sbin/cupsfilter")
+                    .args(["-m", "application/pdf"])
+                    .arg(&tmp_html)
+                    .output()
+                {
+                    Ok(output) if output.status.success() && !output.stdout.is_empty() => {
+                        if let Err(err) = std::fs::write(&target, &output.stdout) {
+                            tracing::warn!(path = %target.display(), %err, "Failed to write canvas PDF");
+                        }
+                        return;
+                    }
+                    Ok(output) => {
+                        tracing::warn!(
+                            status = %output.status,
+                            "cupsfilter PDF conversion failed; falling back to printable HTML"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            %err,
+                            "cupsfilter unavailable; falling back to printable HTML"
+                        );
+                    }
+                }
+
+                let fallback_html = target.with_extension("html");
+                if let Err(err) = std::fs::write(&fallback_html, &html) {
+                    tracing::warn!(
+                        path = %fallback_html.display(),
+                        %err,
+                        "Failed to write fallback printable HTML export"
+                    );
+                }
+            })
+            .map_err(|e| format!("Failed to schedule PDF export: {e}"))?;
+
+        Ok(target_pdf.to_path_buf())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temp_file_guard_and_stale_pruning_clean_up_temp_html() {
+        let dir = std::env::temp_dir().join(format!(
+            "slackless-canvas-export-prune-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+
+        // TempFileGuard removes its file on drop.
+        let guarded = dir.join("slackless-pdf-guarded.html");
         {
-            std::fs::write(target_pdf, &output.stdout)
-                .map_err(|e| format!("Failed to write PDF: {e}"))?;
-            let _ = std::fs::remove_file(&tmp_html);
-            return Ok(target_pdf.to_path_buf());
+            let _g = TempFileGuard(guarded.clone());
+            std::fs::write(&guarded, "<html></html>").expect("write guarded");
+            assert!(guarded.exists());
         }
+        assert!(!guarded.exists());
 
-        // Fallback: save print-ready HTML alongside the requested path so the user always gets an export.
-        let fallback_html = target_pdf.with_extension("html");
-        write_printable_html(doc, &fallback_html)
-            .map_err(|e| format!("Failed to write printable HTML export: {e}"))?;
-        let _ = std::fs::remove_file(&tmp_html);
-        Ok(fallback_html)
+        // Create 5 temp export files + 1 unrelated file; prune down to max_files=2.
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("slackless-print-doc-{i}.html")), "x")
+                .expect("write print tmp");
+        }
+        let unrelated = dir.join("keep-me.html");
+        std::fs::write(&unrelated, "keep").expect("write unrelated");
+
+        prune_stale_export_files(&dir, Duration::from_secs(3600), 2);
+        let remaining_tmp = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("slackless-print-"))
+            })
+            .count();
+        assert_eq!(remaining_tmp, 2);
+        assert!(unrelated.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

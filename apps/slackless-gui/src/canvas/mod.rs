@@ -27,36 +27,31 @@ use gpui_kit::gpui::{App, Entity, FocusHandle, Global, Window};
 use slackless_core::api::{CanvasAccessLevel, CanvasCommentThread, CanvasEditOp, CanvasMeta};
 use slackless_core::types::{ChannelId, Ts, UserId};
 
-#[allow(unused_imports)]
 pub use comments::{
     CanvasCommentFilter, CanvasCommentPostFn, CanvasCommentResolveAllFn, CanvasCommentResolveFn,
-    CanvasCommentsLoadFn, comment_thread_counts, filter_comment_threads,
-};
-#[allow(unused_imports)]
-pub use export::{
-    canvas_export_stem, canvas_print_allowed, canvas_to_printable_html, html_escape,
-    save_canvas_pdf_to_path, trigger_canvas_print, write_printable_html,
-};
-#[allow(unused_imports)]
-pub use keyboard::{
-    CanvasActivation, CanvasFocusRegion, CanvasKeyboardState, activate_focused_block, cycle_region,
-    step_block, toggle_section_actions_shortcut,
-};
-#[allow(unused_imports)]
-pub use mentions::{CanvasInlineSegment, parse_inline_canvas_segments};
-#[allow(unused_imports)]
-pub use model::{
-    CanvasBlock, CanvasDoc, CanvasEmbedKind, CanvasEmbeddedFile, CanvasUserProfile, MediaKind,
-    resolve_profile_card,
+    CanvasCommentsLoadFn,
 };
 #[cfg(test)]
-pub use parse::parse_canvas_html;
-#[allow(unused_imports)]
-pub use parse::{parse_canvas_html_with_ids, parse_canvas_markdown};
+pub use comments::{comment_thread_counts, filter_comment_threads};
+pub use export::{canvas_export_stem, save_canvas_pdf_to_path, trigger_canvas_print};
+#[cfg(test)]
+pub use export::{canvas_print_allowed, canvas_to_printable_html, write_printable_html};
+#[cfg(test)]
+pub use keyboard::{
+    CanvasActivation, activate_focused_block, step_block, toggle_section_actions_shortcut,
+};
+pub use keyboard::{CanvasFocusRegion, CanvasKeyboardState, cycle_region};
+#[cfg(test)]
+pub use mentions::{CanvasInlineSegment, parse_inline_canvas_segments};
+#[cfg(test)]
+pub use model::{CanvasBlock, resolve_profile_card};
+pub use model::{CanvasDoc, CanvasEmbedKind, CanvasUserProfile, MediaKind};
+#[cfg(test)]
+pub use parse::{parse_canvas_html, parse_canvas_markdown};
 pub use render::{canvas_view, live_canvas_view, read_only_badge, render_popout_canvas};
-#[allow(unused_imports)]
+pub use share::{CanvasAccessDeleteFn, CanvasAccessSetFn, CanvasDeleteFn, ShareAccessRequest};
+#[cfg(test)]
 pub use share::{
-    CanvasAccessDeleteFn, CanvasAccessSetFn, CanvasDeleteFn, ShareAccessRequest,
     build_share_access_request, canvas_server_rule_notice, general_access_summary,
     parse_share_targets,
 };
