@@ -1069,6 +1069,7 @@ impl PopoutWindow {
         self.deliver_content(content, cx);
     }
 
+    #[cfg(test)]
     fn send_content(&mut self, mut content: MessageContent, cx: &mut Context<Self>) {
         composer::apply_outgoing_transforms(&mut content, &self.fixtures, cx);
         self.deliver_content(content, cx);

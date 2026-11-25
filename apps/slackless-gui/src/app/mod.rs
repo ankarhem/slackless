@@ -285,7 +285,7 @@ use crate::search::{SearchEvent, SearchView, fixture_archive};
 use crate::search_menu::{SEARCH_PLACEHOLDER, SearchMenu, SearchMenuEvent, Snapshot};
 use crate::shortcuts::shortcuts_view;
 use crate::sidebar::{NavItem, Sidebar, SidebarEvent, WorkspaceBadge};
-use crate::slash::{Invocation, SHRUG, SlashKind};
+use crate::slash::{Invocation, SlashKind};
 use crate::status::{
     FOCUS_UNTIL_OFF, SelfState, StatusEvent, StatusPicker, UserMenu, UserMenuEvent,
 };
@@ -584,6 +584,7 @@ impl RightPane {
         matches!(self, Self::Thread)
     }
 
+    #[cfg(test)]
     pub(super) fn is_profile(self) -> bool {
         matches!(self, Self::Profile { .. })
     }

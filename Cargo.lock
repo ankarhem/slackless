@@ -9684,7 +9684,6 @@ dependencies = [
  "serde_json",
  "slackless-auth",
  "slackless-core",
- "slackless-store",
  "tokio",
 ]
 

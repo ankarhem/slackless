@@ -289,6 +289,7 @@ pub(crate) fn parse_canvas_share_target(
 }
 
 /// Validate that `--post` is only requested when sharing with channels.
+#[cfg(test)]
 pub(crate) fn validate_canvas_share_post(
     target: &CanvasShareTarget,
     post: bool,

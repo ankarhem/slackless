@@ -3,6 +3,7 @@
 use super::chrome::*;
 use super::helpers::*;
 use super::*;
+use crate::slash::SHRUG;
 use gpui_kit::gpui;
 use slackless_core::types::User;
 
