@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rand::RngExt as _;
 use slackless_types::UserId;
 use tokio::sync::mpsc;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::peer_connection::RTCPeerConnectionState;
 
 use crate::audio::{AmbientMusicPlayer, AudioEngine, AudioSharedState};
 use crate::av1::Av1Frames;

@@ -15,7 +15,7 @@ use std::time::Duration;
 use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use tokio::sync::mpsc;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::peer_connection::RTCPeerConnectionState;
 
 use crate::metrics::HuddlePerfCounters;
 use crate::proto::{SdkPingPongType, sdk_signal_frame};

@@ -16,7 +16,7 @@ clap = { version = "4", features = ["derive"] }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 
 [lints]
 workspace = true

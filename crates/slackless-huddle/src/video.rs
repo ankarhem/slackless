@@ -14,10 +14,10 @@ use openh264::encoder::{
     RateControlMode, UsageType,
 };
 use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSlices};
+use rtc::rtp::codec::h264::H264Packet;
+use rtc::rtp::packetizer::Depacketizer as _;
 use slackless_types::UserId;
 use tokio::sync::mpsc;
-use webrtc::rtp::codecs::h264::H264Packet;
-use webrtc::rtp::packetizer::Depacketizer as _;
 
 use crate::backend::{CameraConfig, CameraHandle, VideoDecoderHandle, platform_backend};
 use crate::{HuddleError, Result};
