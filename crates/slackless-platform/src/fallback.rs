@@ -1,39 +1,19 @@
 //! Non-macOS fallback backend: compiles everywhere, touches no OS API.
 //!
-//! `Notifier`, `BadgeSetter`, `IconSetter`, `AboutPanel`, `FullScreenItem` and
-//! `SoundPlayer` are true no-ops until their platform ports begin. `SecretStore` keeps secrets in-process only
-//! (a `HashMap` behind a mutex) so the trait contract is exercised without a system keychain;
-//! persistence arrives with each OS backend. `DeepLinkHandler` shares the
-//! pure parser in [`crate::deep_link`]; nothing can be registered with an OS.
+//! All capabilities are true no-ops until platform ports begin.
 
-use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
-
-use crate::deep_link::{self, DeepLink};
 use crate::{
-    AboutPanel, AttentionRequester, BadgeSetter, DeepLinkHandler, FullScreenItem, IconSetter,
-    Misspelling, Notifier, PlatformError, Result, SecretStore, SoundPlayer, SpellChecker,
-    StatusBarAction, StatusBarItem, StatusBarState,
+    AboutPanel, AttentionRequester, BadgeSetter, FullScreenItem, IconSetter, Misspelling, Notifier,
+    SoundPlayer, SpellChecker, StatusBarAction, StatusBarItem, StatusBarState,
 };
 
-/// No-op backend for platforms without a port yet.
-pub struct FallbackPlatform {
-    secrets: Mutex<HashMap<(String, String), Vec<u8>>>,
-    pending_link: Mutex<Option<DeepLink>>,
-}
+/// No-op backend for platforms without a port yet (and for headless tests).
+#[derive(Default)]
+pub struct FallbackPlatform;
 
 impl FallbackPlatform {
     pub fn new() -> Self {
-        Self {
-            secrets: Mutex::new(HashMap::new()),
-            pending_link: Mutex::new(None),
-        }
-    }
-}
-
-impl Default for FallbackPlatform {
-    fn default() -> Self {
-        Self::new()
+        Self
     }
 }
 
@@ -66,59 +46,6 @@ impl FullScreenItem for FallbackPlatform {
 impl SoundPlayer for FallbackPlatform {
     /// No-op: no audio output is wired for this platform yet.
     fn play_sound(&self, _data: &[u8]) {}
-}
-
-impl SecretStore for FallbackPlatform {
-    fn store_secret(&self, service: &str, name: &str, secret: &[u8]) -> Result<()> {
-        self.secrets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert((service.to_string(), name.to_string()), secret.to_vec());
-        Ok(())
-    }
-
-    fn load_secret(&self, service: &str, name: &str) -> Result<Vec<u8>> {
-        self.secrets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&(service.to_string(), name.to_string()))
-            .cloned()
-            .ok_or_else(|| PlatformError::SecretNotFound {
-                service: service.to_string(),
-                name: name.to_string(),
-            })
-    }
-
-    fn delete_secret(&self, service: &str, name: &str) -> Result<()> {
-        self.secrets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&(service.to_string(), name.to_string()));
-        Ok(())
-    }
-}
-
-impl DeepLinkHandler for FallbackPlatform {
-    fn register(&self) -> Result<Vec<String>> {
-        // Nothing to register: OS scheme delivery is wired by each port.
-        Ok(Vec::new())
-    }
-
-    fn handle_url(&self, url: &str) -> Result<DeepLink> {
-        let link = deep_link::parse_deep_link(url)?;
-        *self
-            .pending_link
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(link.clone());
-        Ok(link)
-    }
-
-    fn take_link(&self) -> Option<DeepLink> {
-        self.pending_link
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-    }
 }
 
 impl StatusBarItem for FallbackPlatform {
@@ -163,62 +90,11 @@ pub(crate) fn install_status_bar_action_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deep_link::{SlackLink, SlackLinkKind};
-    use std::collections::BTreeMap;
 
     #[test]
-    fn fallback_secret_store_roundtrip_overwrite_and_idempotent_delete() {
-        let p = FallbackPlatform::default();
-        assert_eq!(
-            p.load_secret("svc", "missing").unwrap_err(),
-            PlatformError::SecretNotFound {
-                service: "svc".into(),
-                name: "missing".into(),
-            }
-        );
-
-        p.store_secret("svc", "k1", b"v1").unwrap();
-        assert_eq!(p.load_secret("svc", "k1").unwrap(), b"v1");
-
-        // Overwrite updates value without affecting other keys.
-        p.store_secret("svc", "k2", b"v2").unwrap();
-        p.store_secret("svc", "k1", b"v1-updated").unwrap();
-        assert_eq!(p.load_secret("svc", "k1").unwrap(), b"v1-updated");
-        assert_eq!(p.load_secret("svc", "k2").unwrap(), b"v2");
-
-        // Delete is idempotent.
-        p.delete_secret("svc", "k1").unwrap();
-        p.delete_secret("svc", "k1").unwrap();
-        assert!(matches!(
-            p.load_secret("svc", "k1"),
-            Err(PlatformError::SecretNotFound { .. })
-        ));
-    }
-
-    #[test]
-    fn fallback_deep_link_and_noop_capabilities_work_safely() {
+    fn fallback_noop_capabilities_work_safely() {
         let p = FallbackPlatform::new();
-        assert!(p.register().unwrap().is_empty());
-        assert_eq!(p.take_link(), None);
 
-        let url = "slack://channel?id=C1&team=T1";
-        let parsed = p.handle_url(url).unwrap();
-        assert_eq!(
-            parsed,
-            DeepLink::Slack(SlackLink {
-                kind: SlackLinkKind::Channel {
-                    channel_id: "C1".into(),
-                    team_id: Some("T1".into()),
-                },
-                extra: BTreeMap::new(),
-                raw: url.into(),
-            })
-        );
-        assert_eq!(p.take_link(), Some(parsed));
-        assert_eq!(p.take_link(), None);
-        assert!(p.handle_url("not a url").is_err());
-
-        // Exercise no-op trait implementations and monitor installers.
         p.notify("title", "body");
         p.set_badge(Some("3"));
         p.set_badge(None);

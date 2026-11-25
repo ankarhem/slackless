@@ -1,13 +1,13 @@
 //! Pure deep-link parsing: `slack://…` and `https://app.slack.com/client/…`.
 //!
-//! No OS calls here — the OS hand-off lives in [`crate::DeepLinkHandler`].
 //! Patchability rule (ARCHITECTURE): unknown URL parameters are preserved in
-//! [`SlackLink::extra`] and unmodeled `slack://` link kinds come back as
+//! `extra` and unmodeled `slack://` link kinds come back as
 //! [`DeepLink::Other`]; parsing never drops data silently.
 
 use std::collections::BTreeMap;
 
 use percent_encoding::percent_decode_str;
+use slackless_types::net::is_trusted_slack_host;
 use url::Url;
 
 use crate::{PlatformError, Result};
@@ -23,6 +23,8 @@ pub enum DeepLink {
     Huddle {
         team_id: Option<String>,
         channel_id: String,
+        /// Query parameters beyond the modeled ones (never dropped).
+        extra: BTreeMap<String, String>,
         raw: String,
     },
     /// `slack://app?team=<team>&id=<app>[&tab=home|messages|about]` (`F-COLLAB-628`, `F-COLLAB-629`).
@@ -30,6 +32,8 @@ pub enum DeepLink {
         team_id: Option<String>,
         app_id: String,
         tab: Option<String>,
+        /// Query parameters beyond the modeled ones (never dropped).
+        extra: BTreeMap<String, String>,
         raw: String,
     },
     /// A `slack://` link kind we do not model yet, preserved verbatim.
@@ -103,7 +107,7 @@ pub fn parse_deep_link(url: &str) -> Result<DeepLink> {
     let parsed = Url::parse(url).map_err(|e| PlatformError::BadLink(format!("{url}: {e}")))?;
     match parsed.scheme() {
         "slack" => parse_slack(&parsed, url),
-        "https" | "http" => parse_web_client(&parsed, url),
+        "https" => parse_web_client(&parsed, url),
         _ => Err(PlatformError::BadLink(format!(
             "{url}: unsupported scheme {:?}",
             parsed.scheme()
@@ -170,9 +174,12 @@ fn parse_slack(url: &Url, raw: &str) -> Result<DeepLink> {
                 .ok_or_else(|| {
                     PlatformError::BadLink(format!("{raw}: huddle link without ?id="))
                 })?;
+            let team_id = param("team").map(str::to_string);
+            let extra = collect_extra(pairs, &["id", "channel", "team"]);
             return Ok(DeepLink::Huddle {
-                team_id: param("team").map(str::to_string),
+                team_id,
                 channel_id,
+                extra,
                 raw: raw.to_string(),
             });
         }
@@ -181,12 +188,16 @@ fn parse_slack(url: &Url, raw: &str) -> Result<DeepLink> {
                 .filter(|id| !id.is_empty())
                 .map(str::to_string)
                 .ok_or_else(|| PlatformError::BadLink(format!("{raw}: app link without ?id=")))?;
+            let team_id = param("team").map(str::to_string);
+            let tab = param("tab")
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_ascii_lowercase());
+            let extra = collect_extra(pairs, &["id", "team", "tab"]);
             return Ok(DeepLink::AppHome {
-                team_id: param("team").map(str::to_string),
+                team_id,
                 app_id,
-                tab: param("tab")
-                    .filter(|t| !t.is_empty())
-                    .map(|t| t.to_ascii_lowercase()),
+                tab,
+                extra,
                 raw: raw.to_string(),
             });
         }
@@ -204,16 +215,20 @@ fn parse_slack(url: &Url, raw: &str) -> Result<DeepLink> {
         SlackLinkKind::Team { .. } => &["id"],
         SlackLinkKind::Open { .. } => &["team", "id"],
     };
-    let extra: BTreeMap<String, String> = pairs
-        .into_iter()
-        .filter(|(k, _)| !consumed.iter().any(|c| k.eq_ignore_ascii_case(c)))
-        .collect();
+    let extra = collect_extra(pairs, consumed);
 
     Ok(DeepLink::Slack(SlackLink {
         kind,
         extra,
         raw: raw.to_string(),
     }))
+}
+
+fn collect_extra(pairs: Vec<(String, String)>, consumed: &[&str]) -> BTreeMap<String, String> {
+    pairs
+        .into_iter()
+        .filter(|(k, _)| !consumed.iter().any(|c| k.eq_ignore_ascii_case(c)))
+        .collect()
 }
 
 fn parse_web_client(url: &Url, raw: &str) -> Result<DeepLink> {
@@ -237,9 +252,14 @@ fn parse_web_client(url: &Url, raw: &str) -> Result<DeepLink> {
                         "{raw}: app.slack.com huddle link missing channel id"
                     ))
                 })?;
+            let extra: BTreeMap<String, String> = url
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
             return Ok(DeepLink::Huddle {
                 team_id,
                 channel_id,
+                extra,
                 raw: raw.to_string(),
             });
         }
@@ -262,7 +282,10 @@ fn parse_web_client(url: &Url, raw: &str) -> Result<DeepLink> {
     }
 
     // Workspace permalink: `https://<domain>.slack.com/archives/<C...>[/p<ts_digits>[?thread_ts=...&cid=...]]`
-    if host.ends_with(".slack.com") && path.first().map(String::as_str) == Some("archives") {
+    if is_trusted_slack_host(&host)
+        && host != "slack.com"
+        && path.first().map(String::as_str) == Some("archives")
+    {
         let cid_query = url
             .query_pairs()
             .find(|(k, _)| k == "cid")
@@ -603,29 +626,48 @@ mod tests {
             DeepLink::Huddle {
                 team_id: Some("T02HD8VA1".into()),
                 channel_id: "C02QYDW99ML".into(),
+                extra: BTreeMap::new(),
                 raw: "https://app.slack.com/huddle/T02HD8VA1/C02QYDW99ML".into(),
             }
         );
 
-        let slack_huddle = parse_deep_link("slack://huddle?team=T02HD8VA1&id=C02QYDW99ML").unwrap();
+        let slack_huddle =
+            parse_deep_link("slack://huddle?team=T02HD8VA1&id=C02QYDW99ML&source=invite").unwrap();
         assert_eq!(
             slack_huddle,
             DeepLink::Huddle {
                 team_id: Some("T02HD8VA1".into()),
                 channel_id: "C02QYDW99ML".into(),
-                raw: "slack://huddle?team=T02HD8VA1&id=C02QYDW99ML".into(),
+                extra: BTreeMap::from([("source".into(), "invite".into())]),
+                raw: "slack://huddle?team=T02HD8VA1&id=C02QYDW99ML&source=invite".into(),
             }
         );
 
-        let app_home = parse_deep_link("slack://app?team=T02HD8VA1&id=A01234567&tab=home").unwrap();
+        let app_home =
+            parse_deep_link("slack://app?team=T02HD8VA1&id=A01234567&tab=home&ref=banner").unwrap();
         assert_eq!(
             app_home,
             DeepLink::AppHome {
                 team_id: Some("T02HD8VA1".into()),
                 app_id: "A01234567".into(),
                 tab: Some("home".into()),
-                raw: "slack://app?team=T02HD8VA1&id=A01234567&tab=home".into(),
+                extra: BTreeMap::from([("ref".into(), "banner".into())]),
+                raw: "slack://app?team=T02HD8VA1&id=A01234567&tab=home&ref=banner".into(),
             }
         );
+    }
+
+    #[test]
+    fn rejects_cleartext_http_links() {
+        for link in [
+            "http://app.slack.com/client/T0123ABC/C0456DEF",
+            "http://app.slack.com/huddle/T0123ABC/C0456DEF",
+            "http://acme.slack.com/archives/C0456DEF/p1700000001234567",
+        ] {
+            assert!(
+                parse_deep_link(link).is_err(),
+                "expected cleartext http link to be rejected: {link}"
+            );
+        }
     }
 }

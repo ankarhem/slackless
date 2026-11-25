@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::de::{lenient_i64, null_default, ok_or_none};
+use crate::de::{is_false, lenient_i64, null_default, ok_or_none};
 use crate::file::File;
 use crate::ids::{BotId, ChannelId, TeamId, Ts, UserId};
 use crate::macros::string_enum;
@@ -258,10 +258,6 @@ pub struct Attachment {
     /// Fields this crate does not model (`actions`, `mrkdwn_in`, ...), preserved verbatim.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
 }
 
 /// A title/value pair inside an attachment.

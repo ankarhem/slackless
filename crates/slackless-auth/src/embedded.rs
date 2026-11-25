@@ -15,7 +15,14 @@
 //! once it holds an `xoxc-` token; the host then reads `d` from the webview cookie store and
 //! hands both to [`capture_sessions`].
 
+use std::fmt;
+
 use serde_json::Value;
+#[cfg(any(test, feature = "webview"))]
+use slackless_types::endpoints::APP_CLIENT_URL;
+use slackless_types::endpoints::WEB_ORIGIN;
+#[cfg(any(test, feature = "webview"))]
+use slackless_types::net::is_trusted_slack_host;
 use slackless_types::{TeamId, UserId};
 
 #[cfg(feature = "webview")]
@@ -36,19 +43,28 @@ impl SignInRequest {
     pub fn url(&self) -> String {
         match self.workspace_domain.as_deref().filter(|d| !d.is_empty()) {
             Some(domain) => domain_url(domain),
-            None => "https://app.slack.com/signin".to_owned(),
+            None => format!("{WEB_ORIGIN}/signin"),
         }
     }
 }
 
 /// The raw material extracted from the embedded webview after a successful sign-in: the webview's
 /// own `localConfig_v2` localStorage value and the `d` cookie read from its cookie store.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WebviewCapture {
     /// The JSON string stored under `localStorage["localConfig_v2"]`.
     pub local_config_v2: String,
     /// The `d` cookie value (`xoxd-…`) from the webview cookie store, already in clear.
     pub d_cookie: String,
+}
+
+impl fmt::Debug for WebviewCapture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebviewCapture")
+            .field("local_config_v2", &"[REDACTED]")
+            .field("d_cookie", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Builds the signed-in [`Session`]s from one [`WebviewCapture`].
@@ -120,32 +136,36 @@ fn domain_url(domain: &str) -> String {
 /// Whether a cookie `domain` belongs to Slack (`slack.com` or any subdomain like `.slack.com`).
 #[cfg(any(test, feature = "webview"))]
 fn is_slack_cookie_domain(domain: &str) -> bool {
-    let d = domain.to_ascii_lowercase();
-    d == "slack.com" || d.ends_with(".slack.com")
+    is_trusted_slack_host(domain)
 }
 
-/// Posts the page's `localConfig_v2` to the host once it holds a token. Re-posts every second
-/// so a `d` cookie that lands after the token is still picked up on a later tick.
+/// Builds the initialization script that posts the page's `localConfig_v2` to the host once it
+/// holds a token. Re-posts every second so a `d` cookie that lands after the token is still picked
+/// up on a later tick.
 ///
 /// Sign-in ends on Slack's "Launching <workspace>" page (`/ssb/redirect`), which hands off to
 /// the desktop app and never boots the web client that writes `localConfig_v2`; the script
 /// leaves it for the page's web-client link (Slack's own "use Slack in your browser").
-#[cfg(feature = "webview")]
-const CAPTURE_SCRIPT: &str = r#"(() => {
+#[cfg(any(test, feature = "webview"))]
+fn capture_script() -> String {
+    format!(
+        r#"(() => {{
   let leaving = false;
-  setInterval(() => {
-    try {
-      if (!leaving && location.pathname.startsWith("/ssb/redirect")) {
+  setInterval(() => {{
+    try {{
+      if (!leaving && location.pathname.startsWith("/ssb/redirect")) {{
         leaving = true;
         const web = document.querySelector('a[href*="/client"]');
-        location.replace(web ? web.href : "https://app.slack.com/client");
+        location.replace(web ? web.href : "{APP_CLIENT_URL}");
         return;
-      }
+      }}
       const config = window.localStorage.getItem("localConfig_v2");
       if (config && config.includes("xoxc-")) window.ipc.postMessage(config);
-    } catch (_) {}
-  }, 1000);
-})();"#;
+    }} catch (_) {{}}
+  }}, 1000);
+}})();"#
+    )
+}
 
 /// Safari's user agent at the installed Safari's version. WKWebView's default omits
 /// `Version/… Safari/…`, and Slack's sign-in page rejects that, and outdated versions, as an
@@ -201,10 +221,11 @@ pub fn embedded_sign_in(request: SignInRequest) -> Result<Vec<Session>> {
         .map_err(|e| window_error(&e))?;
     let ipc = event_loop.create_proxy();
     let popups = event_loop.create_proxy();
+    let script = capture_script();
     let webview = WebViewBuilder::new()
         .with_url(request.url())
         .with_user_agent(user_agent())
-        .with_initialization_script(CAPTURE_SCRIPT)
+        .with_initialization_script(&script)
         // The launcher page opens `slack://` links: never hand the session to the desktop app.
         .with_navigation_handler(|url| !url.starts_with("slack:"))
         .with_ipc_handler(move |message| {
@@ -246,8 +267,8 @@ pub fn embedded_sign_in(request: SignInRequest) -> Result<Vec<Session>> {
                 let Some(d_cookie) = d_cookie else {
                     if !reported_missing_cookie {
                         reported_missing_cookie = true;
-                        eprintln!(
-                            "slackless: Slack's web client has a token, but its `d` cookie is not in the cookie store yet"
+                        tracing::warn!(
+                            "Slack's web client has a token, but its `d` cookie is not in the cookie store yet"
                         );
                     }
                     return;
@@ -410,5 +431,20 @@ mod tests {
             "non-string value must not bleed into a subsequent key's <string>"
         );
         assert_eq!(plist_string(plist, "Missing"), None);
+    }
+
+    #[test]
+    fn webview_capture_debug_redacts_secrets_and_script_uses_app_client_url() {
+        let cap = WebviewCapture {
+            local_config_v2: r#"{"teams":{"T1":{"token":"xoxc-secret-value"}}}"#.to_owned(),
+            d_cookie: "xoxd-secret-cookie".to_owned(),
+        };
+        let dbg = format!("{cap:?}");
+        assert!(dbg.contains("[REDACTED]"), "{dbg}");
+        assert!(!dbg.contains("xoxc-secret-value"), "{dbg}");
+        assert!(!dbg.contains("xoxd-secret-cookie"), "{dbg}");
+
+        let script = capture_script();
+        assert!(script.contains(APP_CLIENT_URL), "{script}");
     }
 }

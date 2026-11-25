@@ -10,6 +10,7 @@ slackless-api.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 
 # Config-dir discovery for the on-disk session store.
 dirs = "7"

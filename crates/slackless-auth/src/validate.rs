@@ -19,7 +19,7 @@ pub async fn validate(session: &Session) -> Result<AuthTest> {
     )?;
     match api.auth_test().await {
         Ok(test) => Ok(test),
-        Err(e) if e.is_auth_expired() => Err(AuthError::NeedsReauth(e.to_string())),
+        Err(slackless_api::ApiError::AuthExpired(code)) => Err(AuthError::NeedsReauth(code)),
         Err(e) => Err(AuthError::Api(e)),
     }
 }
@@ -67,7 +67,7 @@ mod tests {
 
         let err = validate(&session_for(&server)).await.unwrap_err();
         assert!(
-            matches!(err, AuthError::NeedsReauth(ref e) if e.contains("invalid_auth")),
+            matches!(err, AuthError::NeedsReauth(ref e) if e == "invalid_auth"),
             "{err:?}"
         );
     }
@@ -85,7 +85,10 @@ mod tests {
             .await;
 
         let err = validate(&session_for(&server)).await.unwrap_err();
-        assert!(matches!(err, AuthError::NeedsReauth(_)), "{err:?}");
+        assert!(
+            matches!(err, AuthError::NeedsReauth(ref e) if e == "token_revoked"),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -119,7 +122,7 @@ mod tests {
 
             let err = validate(&session_for(&server)).await.unwrap_err();
             assert!(
-                matches!(err, AuthError::NeedsReauth(ref msg) if msg.contains(code)),
+                matches!(err, AuthError::NeedsReauth(ref msg) if msg == code),
                 "expected NeedsReauth({code}), got {err:?}"
             );
         }

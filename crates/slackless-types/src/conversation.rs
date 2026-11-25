@@ -1,6 +1,6 @@
 //! Conversations: public/private channels, DMs (IMs) and group DMs (MPIMs).
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
 use crate::de::{lenient_i64, null_default, ok_or_none};
@@ -8,10 +8,53 @@ use crate::ids::{ChannelId, FileId, TeamId, Ts, UserId};
 use crate::macros::string_enum;
 use crate::message::Message;
 
+const FLAG_IS_CHANNEL: u16 = 1 << 0;
+const FLAG_IS_GROUP: u16 = 1 << 1;
+const FLAG_IS_IM: u16 = 1 << 2;
+const FLAG_IS_MPIM: u16 = 1 << 3;
+const FLAG_IS_PRIVATE: u16 = 1 << 4;
+const FLAG_IS_ARCHIVED: u16 = 1 << 5;
+const FLAG_IS_GENERAL: u16 = 1 << 6;
+const FLAG_IS_MEMBER: u16 = 1 << 7;
+const FLAG_IS_OPEN: u16 = 1 << 8;
+const FLAG_IS_SHARED: u16 = 1 << 9;
+const FLAG_IS_EXT_SHARED: u16 = 1 << 10;
+const FLAG_IS_ORG_SHARED: u16 = 1 << 11;
+
+/// Tracks which `is_*` boolean keys were explicitly present when deserializing a [`Conversation`]
+/// from JSON so [`Conversation::merge`] can distinguish an explicit `false` (e.g. unarchiving or
+/// leaving a channel) from an omitted key.
+///
+/// Equality ignores wire-presence metadata so programmatic and deserialized [`Conversation`]
+/// values with identical fields compare equal.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PresentFlags(u16);
+
+impl PresentFlags {
+    #[inline]
+    fn contains(self, bit: u16) -> bool {
+        (self.0 & bit) != 0
+    }
+
+    #[inline]
+    fn insert(&mut self, bit: u16) {
+        self.0 |= bit;
+    }
+}
+
+impl PartialEq for PresentFlags {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PresentFlags {}
+
 /// A conversation object (`conversations.info/list/view`, `client.userBoot.channels/ims`,
 /// `channel_created`, ...). Which flags are present depends on the endpoint and conversation
 /// kind, so missing flags read as `false`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Conversation {
     pub id: ChannelId,
     /// Absent for IMs.
@@ -19,29 +62,29 @@ pub struct Conversation {
     pub name: Option<String>,
     #[serde(default)]
     pub name_normalized: Option<String>,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(default)]
     pub is_channel: bool,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(default)]
     pub is_group: bool,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(default)]
     pub is_im: bool,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(default)]
     pub is_mpim: bool,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(default)]
     pub is_private: bool,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(default)]
     pub is_archived: bool,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(default)]
     pub is_general: bool,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(default)]
     pub is_member: bool,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(default)]
     pub is_open: bool,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(default)]
     pub is_shared: bool,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(default)]
     pub is_ext_shared: bool,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(default)]
     pub is_org_shared: bool,
     #[serde(default)]
     pub topic: Option<TopicPurpose>,
@@ -50,7 +93,7 @@ pub struct Conversation {
     /// The other party of an IM.
     #[serde(default)]
     pub user: Option<UserId>,
-    #[serde(default, deserialize_with = "ok_or_none")]
+    #[serde(default)]
     pub latest: Option<Latest>,
     #[serde(default)]
     pub last_read: Option<Ts>,
@@ -60,15 +103,15 @@ pub struct Conversation {
     pub unread_count_display: Option<u32>,
     #[serde(default)]
     pub num_members: Option<u32>,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(default)]
     pub members: Vec<UserId>,
     #[serde(default)]
     pub creator: Option<UserId>,
     /// Unix seconds.
-    #[serde(default, deserialize_with = "lenient_i64")]
+    #[serde(default)]
     pub created: Option<i64>,
     /// Last metadata change; unix millis in most responses.
-    #[serde(default, deserialize_with = "lenient_i64")]
+    #[serde(default)]
     pub updated: Option<i64>,
     #[serde(default)]
     pub context_team_id: Option<TeamId>,
@@ -81,6 +124,137 @@ pub struct Conversation {
     /// Fields this crate does not model (`shared_team_ids`, ...), preserved verbatim.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+    /// Bitmask of `is_*` flags explicitly present in the deserialized JSON payload.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub present_flags: PresentFlags,
+}
+
+#[derive(Deserialize)]
+struct ConversationWire {
+    id: ChannelId,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    name_normalized: Option<String>,
+    #[serde(default)]
+    is_channel: Option<bool>,
+    #[serde(default)]
+    is_group: Option<bool>,
+    #[serde(default)]
+    is_im: Option<bool>,
+    #[serde(default)]
+    is_mpim: Option<bool>,
+    #[serde(default)]
+    is_private: Option<bool>,
+    #[serde(default)]
+    is_archived: Option<bool>,
+    #[serde(default)]
+    is_general: Option<bool>,
+    #[serde(default)]
+    is_member: Option<bool>,
+    #[serde(default)]
+    is_open: Option<bool>,
+    #[serde(default)]
+    is_shared: Option<bool>,
+    #[serde(default)]
+    is_ext_shared: Option<bool>,
+    #[serde(default)]
+    is_org_shared: Option<bool>,
+    #[serde(default)]
+    topic: Option<TopicPurpose>,
+    #[serde(default)]
+    purpose: Option<TopicPurpose>,
+    #[serde(default)]
+    user: Option<UserId>,
+    #[serde(default, deserialize_with = "ok_or_none")]
+    latest: Option<Latest>,
+    #[serde(default)]
+    last_read: Option<Ts>,
+    #[serde(default)]
+    unread_count: Option<u32>,
+    #[serde(default)]
+    unread_count_display: Option<u32>,
+    #[serde(default)]
+    num_members: Option<u32>,
+    #[serde(default, deserialize_with = "null_default")]
+    members: Vec<UserId>,
+    #[serde(default)]
+    creator: Option<UserId>,
+    #[serde(default, deserialize_with = "lenient_i64")]
+    created: Option<i64>,
+    #[serde(default, deserialize_with = "lenient_i64")]
+    updated: Option<i64>,
+    #[serde(default)]
+    context_team_id: Option<TeamId>,
+    #[serde(default)]
+    priority: Option<f64>,
+    #[serde(default)]
+    properties: Option<ConversationProperties>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for Conversation {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let w = ConversationWire::deserialize(deserializer)?;
+        let mut present_flags = PresentFlags::default();
+        let mut unpack = |opt: Option<bool>, bit: u16| -> bool {
+            if let Some(v) = opt {
+                present_flags.insert(bit);
+                v
+            } else {
+                false
+            }
+        };
+        let is_channel = unpack(w.is_channel, FLAG_IS_CHANNEL);
+        let is_group = unpack(w.is_group, FLAG_IS_GROUP);
+        let is_im = unpack(w.is_im, FLAG_IS_IM);
+        let is_mpim = unpack(w.is_mpim, FLAG_IS_MPIM);
+        let is_private = unpack(w.is_private, FLAG_IS_PRIVATE);
+        let is_archived = unpack(w.is_archived, FLAG_IS_ARCHIVED);
+        let is_general = unpack(w.is_general, FLAG_IS_GENERAL);
+        let is_member = unpack(w.is_member, FLAG_IS_MEMBER);
+        let is_open = unpack(w.is_open, FLAG_IS_OPEN);
+        let is_shared = unpack(w.is_shared, FLAG_IS_SHARED);
+        let is_ext_shared = unpack(w.is_ext_shared, FLAG_IS_EXT_SHARED);
+        let is_org_shared = unpack(w.is_org_shared, FLAG_IS_ORG_SHARED);
+
+        Ok(Self {
+            id: w.id,
+            name: w.name,
+            name_normalized: w.name_normalized,
+            is_channel,
+            is_group,
+            is_im,
+            is_mpim,
+            is_private,
+            is_archived,
+            is_general,
+            is_member,
+            is_open,
+            is_shared,
+            is_ext_shared,
+            is_org_shared,
+            topic: w.topic,
+            purpose: w.purpose,
+            user: w.user,
+            latest: w.latest,
+            last_read: w.last_read,
+            unread_count: w.unread_count,
+            unread_count_display: w.unread_count_display,
+            num_members: w.num_members,
+            members: w.members,
+            creator: w.creator,
+            created: w.created,
+            updated: w.updated,
+            context_team_id: w.context_team_id,
+            priority: w.priority,
+            properties: w.properties,
+            extra: w.extra,
+            present_flags,
+        })
+    }
 }
 
 /// The four conversation kinds the UI distinguishes.
@@ -109,8 +283,9 @@ impl Conversation {
     /// conversation objects (`client.userBoot` IMs carry unread counts that
     /// `conversations.info` omits; only `conversations.info` carries `num_members`), so a
     /// field moves only when the fresh copy actually carries it: `Option`s when `Some`,
-    /// `members` when non-empty, flags when `true` (an omitted flag deserializes as `false`
-    /// and must not erase a stored `true`).
+    /// `members` when non-empty, and boolean flags whenever JSON explicitly provided them
+    /// (including `false`, so unarchiving/leaving/closing clears a stored `true`) or when a
+    /// programmatically constructed `fresh` sets a flag to `true`.
     pub fn merge(&mut self, fresh: &Conversation) {
         macro_rules! carried {
             ($($field:ident),* $(,)?) => {$(
@@ -138,25 +313,28 @@ impl Conversation {
             properties,
         );
         macro_rules! flagged {
-            ($($field:ident),* $(,)?) => {$(
-                if fresh.$field {
+            ($(($field:ident, $bit:ident)),* $(,)?) => {$(
+                if fresh.present_flags.contains($bit) {
+                    self.$field = fresh.$field;
+                    self.present_flags.insert($bit);
+                } else if fresh.$field {
                     self.$field = true;
                 }
             )*};
         }
         flagged!(
-            is_channel,
-            is_group,
-            is_im,
-            is_mpim,
-            is_private,
-            is_archived,
-            is_general,
-            is_member,
-            is_open,
-            is_shared,
-            is_ext_shared,
-            is_org_shared,
+            (is_channel, FLAG_IS_CHANNEL),
+            (is_group, FLAG_IS_GROUP),
+            (is_im, FLAG_IS_IM),
+            (is_mpim, FLAG_IS_MPIM),
+            (is_private, FLAG_IS_PRIVATE),
+            (is_archived, FLAG_IS_ARCHIVED),
+            (is_general, FLAG_IS_GENERAL),
+            (is_member, FLAG_IS_MEMBER),
+            (is_open, FLAG_IS_OPEN),
+            (is_shared, FLAG_IS_SHARED),
+            (is_ext_shared, FLAG_IS_EXT_SHARED),
+            (is_org_shared, FLAG_IS_ORG_SHARED),
         );
         if !fresh.members.is_empty() {
             self.members = fresh.members.clone();
@@ -580,5 +758,60 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(empty_obj.latest, None);
+    }
+
+    #[test]
+    fn merge_clears_flags_when_explicitly_false_in_json_and_preserves_omitted() {
+        let mut stored: Conversation = serde_json::from_value(serde_json::json!({
+            "id": "C1",
+            "name": "ops",
+            "is_channel": true,
+            "is_archived": true,
+            "is_member": true,
+            "is_open": true
+        }))
+        .unwrap();
+
+        // Unarchived + left channel, while `is_channel` and `is_open` are omitted (and `is_open`
+        // null in another payload): explicit `false` must clear the stored `true`, while omitted
+        // and `null` flags must preserve the stored `true`.
+        let fresh: Conversation = serde_json::from_value(serde_json::json!({
+            "id": "C1",
+            "is_archived": false,
+            "is_member": false,
+            "is_open": null
+        }))
+        .unwrap();
+
+        stored.merge(&fresh);
+        assert!(
+            !stored.is_archived,
+            "explicit is_archived:false must clear true"
+        );
+        assert!(
+            !stored.is_member,
+            "explicit is_member:false must clear true"
+        );
+        assert!(stored.is_channel, "omitted is_channel must remain true");
+        assert!(stored.is_open, "null is_open must remain true");
+
+        // Closing a DM via explicit `is_open: false`.
+        let closed: Conversation = serde_json::from_value(serde_json::json!({
+            "id": "C1",
+            "is_open": false
+        }))
+        .unwrap();
+        stored.merge(&closed);
+        assert!(!stored.is_open, "explicit is_open:false must clear true");
+        assert!(stored.is_channel, "omitted is_channel still preserved");
+
+        // Deserialized and programmatic conversations with equal public fields compare equal.
+        let programmatic = Conversation {
+            id: ChannelId::from("C1"),
+            name: Some("ops".into()),
+            is_channel: true,
+            ..Default::default()
+        };
+        assert_eq!(stored, programmatic);
     }
 }
