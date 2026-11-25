@@ -347,33 +347,15 @@ impl Driver {
     }
 }
 
-/// URL-encodes the `d` cookie value exactly once. Browsers store it already encoded
-/// (`xoxd-...%2F...%3D`); double-encoding breaks auth, so a value made only of URL-safe
-/// characters and `%` escapes is kept as is.
+/// URL-encodes the `d` cookie value exactly once via [`slackless_types::net::encode_cookie`].
 pub(crate) fn encode_cookie(value: &str) -> String {
-    let already_encoded = value
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"-._~%".contains(&b));
-    if already_encoded {
-        value.to_owned()
-    } else {
-        url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
-    }
+    slackless_types::net::encode_cookie(value)
 }
 
-/// Redact query string, fragment, and userinfo before logging a rejected URL so signed Slack
-/// tokens/tickets never land in log files.
+/// Redact query string, fragment, and userinfo before logging a rejected URL via
+/// [`slackless_types::net::redact_url`].
 pub(crate) fn redact_url_for_log(raw: &str) -> String {
-    match url::Url::parse(raw) {
-        Ok(mut parsed) => {
-            parsed.set_query(None);
-            parsed.set_fragment(None);
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            parsed.to_string()
-        }
-        Err(_) => "<invalid-url>".to_owned(),
-    }
+    slackless_types::net::redact_url(raw)
 }
 
 /// Returns whether `target_url` is a trusted host for forwarding the `d` session cookie.
@@ -393,9 +375,7 @@ pub(crate) fn is_trusted_cookie_host(base_url: &str, target_url: &str) -> bool {
         return false;
     }
 
-    let is_slack = target_scheme == "wss"
-        && (target_host == "slack.com" || target_host.ends_with(".slack.com"));
-    if is_slack {
+    if target_scheme == "wss" && slackless_types::net::is_trusted_slack_host(target_host) {
         return true;
     }
 

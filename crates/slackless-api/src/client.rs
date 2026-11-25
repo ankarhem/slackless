@@ -90,12 +90,7 @@ pub fn proxy_url() -> Option<String> {
 }
 
 fn redact_url(url: &Url) -> String {
-    let mut clean = url.clone();
-    clean.set_query(None);
-    clean.set_fragment(None);
-    let _ = clean.set_username("");
-    let _ = clean.set_password(None);
-    clean.to_string()
+    slackless_types::net::redact_url(url.as_str())
 }
 
 pub(crate) fn record_net_log(
@@ -160,7 +155,7 @@ pub(crate) fn is_trusted_slack_https_url(url: &Url) -> bool {
     url.scheme() == "https"
         && url
             .host_str()
-            .is_some_and(|h| h == "slack.com" || h.ends_with(".slack.com"))
+            .is_some_and(slackless_types::net::is_trusted_slack_host)
 }
 
 /// Form fields of one API call, `token` excluded (added by the client).
@@ -537,18 +532,9 @@ fn status_error(status: StatusCode, body: &[u8]) -> ApiError {
     }
 }
 
-/// URL-encodes the `d` cookie value exactly once. Browsers store it already encoded
-/// (`xoxd-...%2F...%3D`); double-encoding breaks auth, so a value made only of URL-safe
-/// characters and `%` escapes is kept as is.
+/// URL-encodes the `d` cookie value exactly once via [`slackless_types::net::encode_cookie`].
 fn encode_cookie(value: &str) -> String {
-    let already_encoded = value
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"-._~%".contains(&b));
-    if already_encoded {
-        value.to_owned()
-    } else {
-        url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
-    }
+    slackless_types::net::encode_cookie(value)
 }
 
 /// Heuristic for Slack's HTML sign-in interstitial returned when a file-host `d` cookie is

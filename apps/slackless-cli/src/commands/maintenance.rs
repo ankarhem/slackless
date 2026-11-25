@@ -100,7 +100,7 @@ pub(crate) fn cmd_vacuum(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCo
             "compacting archive",
         ));
     };
-    let Some(store) = open_archive_store_rw(workspace) else {
+    let Some(mut store) = open_archive_store_rw(workspace) else {
         archive_hint(workspace);
         return Ok(ExitCode::SUCCESS);
     };

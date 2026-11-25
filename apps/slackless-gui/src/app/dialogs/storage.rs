@@ -382,7 +382,7 @@ impl App {
             .and_then(|s| s.stats(team).ok())
             .map(|s| s.db_bytes())
             .unwrap_or(0);
-        let res = store.lock().ok().map(|s| s.vacuum());
+        let res = store.lock().ok().map(|mut s| s.vacuum());
         match res {
             Some(Ok(())) => {
                 let after = store
@@ -969,7 +969,7 @@ impl App {
                                     .tooltip("Delete local transcript")
                                     .on_click(move |_, window, cx| {
                                         if let (Some(st), Some(tm)) = (&del_store, &del_team)
-                                            && let Ok(guard) = st.lock()
+                                            && let Ok(mut guard) = st.lock()
                                         {
                                             let _ = guard.delete_huddle_transcript(tm, &del_id);
                                         }

@@ -96,14 +96,7 @@ impl Date {
         let year: i32 = y_str.parse().ok()?;
         let month: u32 = m_str.parse().ok()?;
         let day: u32 = d_str.parse().ok()?;
-        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-        let days_in_month = match month {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            2 if leap => 29,
-            2 => 28,
-            _ => return None,
-        };
+        let days_in_month = slackless_types::time::days_in_month(i64::from(year), month)?;
         (1..=days_in_month)
             .contains(&day)
             .then_some(Self { year, month, day })
@@ -111,14 +104,7 @@ impl Date {
 
     /// Unix seconds at 00:00 UTC of this day.
     pub fn unix_start(&self) -> i64 {
-        // Howard Hinnant's days_from_civil.
-        let (m, d) = (i64::from(self.month), i64::from(self.day));
-        let y = i64::from(self.year) - i64::from(m <= 2);
-        let era = if y >= 0 { y } else { y - 399 } / 400;
-        let yoe = y - era * 400;
-        let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        (era * 146_097 + doe - 719_468) * 86_400
+        slackless_types::time::days_from_civil(i64::from(self.year), self.month, self.day) * 86_400
     }
 }
 

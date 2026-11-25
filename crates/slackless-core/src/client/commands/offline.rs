@@ -90,7 +90,7 @@ impl<B: Backend> Core<B> {
                 .store
                 .lock()
                 .ok()
-                .and_then(|s| s.enqueue_offline(&self.workspace, &payload).ok())
+                .and_then(|mut s| s.enqueue_offline(&self.workspace, &payload).ok())
                 .unwrap_or(0);
             self.offline_queue.push_back((id, mutation));
             self.events
@@ -125,7 +125,7 @@ impl<B: Backend> Core<B> {
 
     pub(super) fn discard_offline_mutation(&mut self, id: i64) {
         self.offline_queue.retain(|(row_id, _)| *row_id != id);
-        if let Ok(s) = self.store.lock() {
+        if let Ok(mut s) = self.store.lock() {
             let _ = s.delete_offline(id);
         }
         self.events

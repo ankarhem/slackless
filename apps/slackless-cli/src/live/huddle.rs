@@ -345,7 +345,7 @@ pub async fn run_huddle_join(
                             at_ms,
                             ref lang,
                         } = ev
-                            && let Some(store) = crate::commands::open_archive_store_rw(&workspace)
+                            && let Some(mut store) = crate::commands::open_archive_store_rw(&workspace)
                         {
                             let seg_at_ms = if at_ms > 0 {
                                 i64::try_from(at_ms).unwrap_or(i64::MAX)

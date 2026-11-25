@@ -1,57 +1,13 @@
 //! Lenient deserializers for response fields whose shape Slack varies.
+//!
+//! Shared serde deserializers live in [`slackless_types::de`]; this module re-exports them and
+//! provides `serde_json::Value` helpers used by wire parsers.
 
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
-/// `null`, a missing field (with `#[serde(default)]`), or any value that does not parse as `T`
-/// becomes `T::default()` instead of failing the enclosing response.
-pub(crate) fn or_default<'de, D, T>(d: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: DeserializeOwned + Default,
-{
-    let value = Value::deserialize(d)?;
-    Ok(T::deserialize(&value).unwrap_or_default())
-}
-
-/// `null` (or a missing field, with `#[serde(default)]`) becomes `T::default()`; any other
-/// shape mismatch is still an error.
-pub(crate) fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de> + Default,
-{
-    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
-}
-
-/// A directory-style list (channels, users, counts): entries that do not parse are skipped so
-/// one odd object never empties the whole list; a non-array becomes empty.
-pub(crate) fn lenient_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: DeserializeOwned,
-{
-    Ok(match Value::deserialize(d)? {
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|v| T::deserialize(v).ok())
-            .collect(),
-        _ => Vec::new(),
-    })
-}
-
-/// A count that may arrive as a number, a numeric string, or `null`.
-pub(crate) fn lenient_u32<'de, D>(d: D) -> Result<u32, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Ok(match Value::deserialize(d)? {
-        Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0),
-        Value::String(s) => s.parse().unwrap_or(0),
-        _ => 0,
-    })
-}
+pub(crate) use slackless_types::de::{
+    lenient_bool, lenient_u32, lenient_u64, lenient_vec, null_default, or_default,
+};
 
 /// Parses a `serde_json::Value` as a non-negative `u64` (integer, finite non-negative float,
 /// or numeric / timestamp string).
@@ -82,25 +38,10 @@ pub(crate) fn value_as_lenient_bool(val: &Value) -> Option<bool> {
     }
 }
 
-/// A unix timestamp / 64-bit count that may arrive as an integer, numeric string, or `null`.
-pub(crate) fn lenient_u64<'de, D>(d: D) -> Result<u64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Ok(value_as_u64(&Value::deserialize(d)?).unwrap_or(0))
-}
-
-/// A flag that may arrive as a bool, `0`/`1`, `"0"`/`"1"`, or `null`.
-pub(crate) fn lenient_bool<'de, D>(d: D) -> Result<bool, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Ok(value_as_lenient_bool(&Value::deserialize(d)?).unwrap_or(false))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
     use serde_json::json;
 
     #[derive(Debug, Default, PartialEq, Deserialize)]

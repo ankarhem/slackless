@@ -357,7 +357,7 @@ pub(in crate::client) fn spawn_huddle_watcher(
                                     text: trimmed,
                                     at_ms: seg_at_ms,
                                 };
-                                if let Ok(store) = ctx.store.lock() {
+                                if let Ok(mut store) = ctx.store.lock() {
                                     let _ = store
                                         .insert_huddle_transcript_segment(&ctx.workspace, &seg);
                                 }
