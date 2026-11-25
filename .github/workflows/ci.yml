@@ -38,6 +38,19 @@ jobs:
           command -v cmake >/dev/null || brew install cmake
           command -v pkg-config >/dev/null || brew install pkg-config
 
+      - name: Check formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+
+      - name: Lint workspace (clippy)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --workspace -- -D warnings
+          cargo clippy --workspace --tests -- -D warnings
+
       - name: Check dependencies (cargo-deny)
         uses: EmbarkStudios/cargo-deny-action@v2
 
@@ -46,3 +59,9 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --workspace
+
+      - name: Build workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --workspace
