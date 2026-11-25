@@ -103,6 +103,7 @@ impl Preferences {
         };
         let custom_hex_row = {
             let input_border = cx.theme().input;
+            let mono = cx.theme().mono_font_family.clone();
             let sb_preview = theme::parse_hex_rgb(&self.custom_sidebar_hex.read(cx).value())
                 .map(theme::swatch_color);
             let ac_preview = theme::parse_hex_rgb(&self.custom_accent_hex.read(cx).value())
@@ -110,13 +111,15 @@ impl Preferences {
             let hex_box = |state: &Entity<TextareaState>, preview: Option<gpui_kit::gpui::Hsla>| {
                 h_flex()
                     .items_center()
-                    .gap_1p5()
-                    .px_2()
-                    .py_1()
-                    .w(px(120.))
+                    .gap_1()
+                    .pl_2p5()
+                    .pr_1()
+                    .w(px(148.))
+                    .h(px(32.))
                     .rounded_md()
                     .border_1()
                     .border_color(input_border)
+                    .font_family(mono.clone())
                     .text_xs()
                     .when_some(preview, |row, col| {
                         row.child(
@@ -130,10 +133,12 @@ impl Preferences {
                         )
                     })
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Textarea::new(state).appearance(false).bordered(false)),
+                        div().flex_1().min_w_0().child(
+                            Textarea::new(state)
+                                .with_size(Size::Small)
+                                .appearance(false)
+                                .bordered(false),
+                        ),
                     )
             };
             h_flex()
@@ -159,6 +164,7 @@ impl Preferences {
         };
         let slack_theme_row = {
             let input_border = cx.theme().input;
+            let mono = cx.theme().mono_font_family.clone();
             v_flex().gap_2().child(
                 h_flex()
                     .items_center()
@@ -168,14 +174,15 @@ impl Preferences {
                             .flex_1()
                             .min_w_0()
                             .max_w(px(360.))
-                            .px_2()
-                            .py_1()
+                            .px_1()
                             .rounded_md()
                             .border_1()
                             .border_color(input_border)
+                            .font_family(mono)
                             .text_xs()
                             .child(
                                 Textarea::new(&self.slack_theme_import)
+                                    .with_size(Size::Small)
                                     .appearance(false)
                                     .bordered(false),
                             ),
