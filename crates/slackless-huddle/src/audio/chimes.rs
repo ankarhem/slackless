@@ -7,6 +7,7 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait as _, StreamTrait as _};
 
 use super::devices::select_output_device;
+use super::ring::WorkerWake;
 use super::streams::build_output_stream_any_format;
 use crate::backend::platform_backend;
 use crate::{HuddleError, Result};
@@ -281,17 +282,21 @@ fn play_synthesized_huddle_chime(chime: HuddleChime, output_device: Option<&str>
 /// hosts without native file routing.
 pub struct AmbientMusicPlayer {
     running: Arc<AtomicBool>,
+    wake: Arc<WorkerWake>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AmbientMusicPlayer {
     pub fn start(output_device: Option<String>, song_key: Option<&str>) -> Result<Self> {
         let running = Arc::new(AtomicBool::new(true));
+        let wake = Arc::new(WorkerWake::default());
         let run_flag = Arc::clone(&running);
+        let wake_worker = Arc::clone(&wake);
         let filename = slack_lounge_music_filename(song_key).to_owned();
         let worker = std::thread::Builder::new()
             .name("slackless-huddle-music".to_owned())
             .spawn(move || {
+                wake_worker.register();
                 let backend = platform_backend();
                 if backend.supports_routed_audio_files()
                     && let Some(path) = ensure_cached_slack_audio(&filename)
@@ -305,9 +310,7 @@ impl AmbientMusicPlayer {
                     if let Some(mut routed) =
                         backend.start_routed_audio_loop(&path, output_device.as_deref(), volume)
                     {
-                        while run_flag.load(Ordering::Relaxed) {
-                            std::thread::sleep(Duration::from_millis(80));
-                        }
+                        wake_worker.park_until_cleared(&run_flag);
                         routed.stop();
                         return;
                     }
@@ -325,7 +328,10 @@ impl AmbientMusicPlayer {
                             while run_flag.load(Ordering::Relaxed) {
                                 match child.try_wait() {
                                     Ok(Some(_)) => break,
-                                    Ok(None) => std::thread::sleep(Duration::from_millis(80)),
+                                    Ok(None) => wake_worker
+                                        .park_while(Duration::from_millis(80), || {
+                                            run_flag.load(Ordering::Relaxed)
+                                        }),
                                     Err(_) => break,
                                 }
                             }
@@ -383,19 +389,19 @@ impl AmbientMusicPlayer {
                 if stream.play().is_err() {
                     return;
                 }
-                while run_flag.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(80));
-                }
+                wake_worker.park_until_cleared(&run_flag);
             })
             .map_err(|e| HuddleError::Audio(e.to_string()))?;
         Ok(Self {
             running,
+            wake,
             worker: Some(worker),
         })
     }
 
     pub fn stop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
+        self.running.store(false, Ordering::Release);
+        self.wake.wake_now();
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }

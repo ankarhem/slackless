@@ -9,7 +9,7 @@ use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use sonora::config::{Config as SonoraConfig, GainController2, NoiseSuppression};
 use sonora::{AudioProcessing, StreamConfig as SonoraStreamConfig};
 
-use crate::audio::ring::SpscRing;
+use crate::audio::ring::{SpscRing, WorkerWake};
 use crate::audio::{FRAME_10MS, RateConverter, SAMPLE_RATE, build_input_stream_any_format};
 use crate::{HuddleError, Result};
 
@@ -23,6 +23,7 @@ static AFCONVERT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct AudioClipRecorder {
     stream: Option<cpal::Stream>,
     running: Arc<AtomicBool>,
+    wake: Arc<WorkerWake>,
     worker: Option<std::thread::JoinHandle<()>>,
     samples: Arc<Mutex<Vec<i16>>>,
     bars: Arc<Mutex<VecDeque<f32>>>,
@@ -74,16 +75,20 @@ impl AudioClipRecorder {
         // Lock-free SPSC ring (~1.3s at 48 kHz mono) decouples the real-time cpal callback from
         // Sonora DSP and sample accumulation.
         let ring = Arc::new(SpscRing::<f32>::new(65_536));
+        let wake = Arc::new(WorkerWake::default());
 
         let ring_cb = Arc::clone(&ring);
+        let wake_cb = Arc::clone(&wake);
         let stream = build_input_stream_any_format(&device, supported, move |data| {
             push_downmixed_rt(data, in_channels, &ring_cb);
+            wake_cb.wake_if_parked();
         })?;
 
         let samples_worker = Arc::clone(&samples);
         let bars_worker = Arc::clone(&bars);
         let run_worker = Arc::clone(&running);
         let ring_worker = Arc::clone(&ring);
+        let wake_worker = Arc::clone(&wake);
 
         let worker = std::thread::Builder::new()
             .name("slackless-clip-audio-dsp".to_owned())
@@ -163,6 +168,7 @@ impl AudioClipRecorder {
                     }
                 };
 
+                wake_worker.register();
                 loop {
                     let got = ring_worker.pop_slice(&mut raw_buf);
                     if got > 0 {
@@ -170,7 +176,9 @@ impl AudioClipRecorder {
                     } else if !run_worker.load(Ordering::Acquire) {
                         break;
                     } else {
-                        std::thread::sleep(Duration::from_millis(5));
+                        wake_worker.park_while(Duration::from_millis(100), || {
+                            ring_worker.is_empty() && run_worker.load(Ordering::Acquire)
+                        });
                     }
                 }
             })
@@ -179,6 +187,7 @@ impl AudioClipRecorder {
         if let Err(e) = stream.play() {
             drop(stream);
             running.store(false, Ordering::Release);
+            wake.wake_now();
             let _ = worker.join();
             return Err(HuddleError::Audio(e.to_string()));
         }
@@ -186,6 +195,7 @@ impl AudioClipRecorder {
         Ok(Self {
             stream: Some(stream),
             running,
+            wake,
             worker: Some(worker),
             samples,
             bars,
@@ -208,6 +218,7 @@ impl AudioClipRecorder {
         // Drop stream first so no more callbacks push to the ring, then drain and join worker.
         drop(self.stream.take());
         self.running.store(false, Ordering::Release);
+        self.wake.wake_now();
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }

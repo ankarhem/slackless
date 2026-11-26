@@ -16,7 +16,7 @@ use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use tokio::sync::mpsc;
 use webrtc::peer_connection::RTCPeerConnectionState;
 
-use crate::audio::ring::SpscRing;
+use crate::audio::ring::{SpscRing, WorkerWake};
 use crate::backend::{ScreenShareConfig, VideoFrameSink, platform_backend};
 use crate::metrics::HuddlePerfCounters;
 use crate::proto::sdk_signal_frame;
@@ -182,6 +182,8 @@ impl ContentShareSession {
         let opus = rtc.opus_sender();
         let loopback_pcm = Arc::new(SpscRing::<i16>::new(LOOPBACK_RING_CAPACITY));
         let loopback_capture_running = Arc::clone(&running);
+        let loopback_wake = Arc::new(WorkerWake::default());
+        let loopback_wake_worker = Arc::clone(&loopback_wake);
         let loopback_pcm_tx = Arc::clone(&loopback_pcm);
 
         // Priority 1: Zero-driver OS-native system audio tap (`F-COLLAB-022`).
@@ -255,10 +257,11 @@ impl ContentShareSession {
                             return;
                         }
                     };
-                    let _ = stream.play();
-                    while loopback_capture_running.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(50));
+                    if let Err(err) = stream.play() {
+                        tracing::warn!(%err, "screen-share loopback capture failed to start");
+                        return;
                     }
+                    loopback_wake_worker.park_until_cleared(&loopback_capture_running);
                 });
         }
         // Feed live system audio (CoreAudio tap or loopback, `F-COLLAB-022`) or a cached 20ms
@@ -380,7 +383,8 @@ impl ContentShareSession {
                 }
             }
 
-            running.store(false, Ordering::Relaxed);
+            running.store(false, Ordering::Release);
+            loopback_wake.wake_now();
             // Screen capture teardown waits on ScreenCaptureKit (up to 1.5 s): keep it off the executor.
             let _ = tokio::task::spawn_blocking(move || drop(capture)).await;
             perf.clear_tx();

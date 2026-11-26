@@ -51,6 +51,16 @@ impl WorkerWake {
             self.parked.store(false, Ordering::Release);
         }
     }
+
+    /// Worker side: register the calling thread and park it until `running` is cleared. The
+    /// owner clears the flag, then calls [`Self::wake_now`], so the worker exits at once instead
+    /// of on its next poll.
+    pub(crate) fn park_until_cleared(&self, running: &AtomicBool) {
+        self.register();
+        while running.load(Ordering::Acquire) {
+            self.park_while(Duration::from_secs(1), || running.load(Ordering::Acquire));
+        }
+    }
 }
 
 /// Fixed-capacity lock-free SPSC ring buffer of `Copy` samples.
@@ -96,7 +106,6 @@ impl<T: Copy + Default> SpscRing<T> {
         tail.wrapping_sub(head)
     }
 
-    #[cfg(test)]
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0

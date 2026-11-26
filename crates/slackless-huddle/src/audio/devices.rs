@@ -6,6 +6,7 @@ use cpal::Stream;
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 
 use super::dsp::compute_rms_interleaved;
+use super::ring::WorkerWake;
 use super::streams::{build_input_stream_any_format, build_output_stream_any_format};
 use crate::{HuddleError, Result};
 
@@ -170,6 +171,7 @@ pub fn play_speaker_test_tone(output_device: Option<&str>) -> Result<()> {
 /// Lightweight live microphone level probe for Preferences -> Audio & video (`F-COLLAB-048`).
 pub struct MicLevelProbe {
     running: Arc<AtomicBool>,
+    wake: Arc<WorkerWake>,
     rms_bits: Arc<AtomicU32>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -178,8 +180,10 @@ impl MicLevelProbe {
     pub fn start(input_device: Option<&str>) -> Result<Self> {
         let device_name = input_device.map(ToOwned::to_owned);
         let running = Arc::new(AtomicBool::new(true));
+        let wake = Arc::new(WorkerWake::default());
         let rms_bits = Arc::new(AtomicU32::new(0));
         let run_flag = Arc::clone(&running);
+        let wake_worker = Arc::clone(&wake);
         let rms_cb = Arc::clone(&rms_bits);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
 
@@ -205,9 +209,7 @@ impl MicLevelProbe {
                 match start {
                     Ok(stream) => {
                         let _ = ready_tx.send(Ok(()));
-                        while run_flag.load(Ordering::Relaxed) {
-                            std::thread::sleep(Duration::from_millis(25));
-                        }
+                        wake_worker.park_until_cleared(&run_flag);
                         drop(stream);
                     }
                     Err(err) => {
@@ -223,6 +225,7 @@ impl MicLevelProbe {
 
         Ok(Self {
             running,
+            wake,
             rms_bits,
             worker: Some(worker),
         })
@@ -236,7 +239,8 @@ impl MicLevelProbe {
 
 impl Drop for MicLevelProbe {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
+        self.running.store(false, Ordering::Release);
+        self.wake.wake_now();
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
