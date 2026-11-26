@@ -272,9 +272,26 @@ impl LaterItem {
         self.workspace == workspace && self.channel == *channel && self.ts == *ts
     }
 
+    fn key(&self) -> LaterKey {
+        LaterKey {
+            workspace: self.workspace,
+            channel: self.channel.clone(),
+            ts: self.ts.clone(),
+        }
+    }
+
     pub fn is_personal_todo(&self) -> bool {
         self.channel.as_str() == PERSONAL_TODO_CHANNEL
     }
+}
+
+/// A Later item's identity, what the row actions capture instead of a position that a save
+/// or a refresh landing meanwhile can shift onto another item.
+#[derive(Clone)]
+struct LaterKey {
+    workspace: usize,
+    channel: ChannelId,
+    ts: Ts,
 }
 
 pub enum LaterEvent {
@@ -362,9 +379,9 @@ impl LaterView {
         cx.notify();
     }
 
-    /// Toggle whether item `ix` lives in To-dos or Saved (`F-CORE-165`).
-    pub fn toggle_todo(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if let Some(item) = self.items.get_mut(ix) {
+    /// Toggle whether item `key` lives in To-dos or Saved (`F-CORE-165`).
+    fn toggle_todo(&mut self, key: &LaterKey, cx: &mut Context<Self>) {
+        if let Some(item) = self.item_mut(key) {
             item.is_todo = !item.is_todo;
             cx.emit(LaterEvent::Changed);
             cx.notify();
@@ -545,16 +562,25 @@ impl LaterView {
         cx.notify();
     }
 
-    fn set_state(&mut self, ix: usize, state: LaterState, cx: &mut Context<Self>) {
-        let prev = self.items[ix].state;
-        self.items[ix].state = state;
+    /// The item `key` names, if it is still listed.
+    fn item_mut(&mut self, key: &LaterKey) -> Option<&mut LaterItem> {
+        self.items
+            .iter_mut()
+            .find(|item| item.is(key.workspace, &key.channel, &key.ts))
+    }
+
+    fn set_state(&mut self, key: &LaterKey, state: LaterState, cx: &mut Context<Self>) {
+        let Some(item) = self.item_mut(key) else {
+            return;
+        };
+        let prev = item.state;
+        item.state = state;
         let mark = match (prev, state) {
             (_, LaterState::Completed) => SavedMark::Completed,
             (_, LaterState::Archived) => SavedMark::Archived,
             (LaterState::Archived, LaterState::InProgress) => SavedMark::Unarchived,
             _ => SavedMark::Uncompleted,
         };
-        let item = &self.items[ix];
         cx.emit(LaterEvent::Update {
             workspace: item.workspace,
             channel: item.channel.clone(),
@@ -566,8 +592,10 @@ impl LaterView {
         cx.notify();
     }
 
-    fn set_due(&mut self, ix: usize, due: Option<u64>, cx: &mut Context<Self>) {
-        let item = &mut self.items[ix];
+    fn set_due(&mut self, key: &LaterKey, due: Option<u64>, cx: &mut Context<Self>) {
+        let Some(item) = self.item_mut(key) else {
+            return;
+        };
         item.due = due;
         item.fired = false;
         cx.emit(LaterEvent::Update {
@@ -580,7 +608,14 @@ impl LaterView {
         cx.notify();
     }
 
-    fn remove(&mut self, ix: usize, cx: &mut Context<Self>) {
+    fn remove(&mut self, key: &LaterKey, cx: &mut Context<Self>) {
+        let Some(ix) = self
+            .items
+            .iter()
+            .position(|item| item.is(key.workspace, &key.channel, &key.ts))
+        else {
+            return;
+        };
         let item = self.items.remove(ix);
         cx.emit(LaterEvent::Unsaved {
             workspace: item.workspace,
@@ -627,15 +662,16 @@ impl LaterView {
             .count()
     }
 
-    /// The reminder dropdown of item `ix`: the presets plus "Remove reminder" when one is set.
+    /// The reminder dropdown of item `key`: the presets plus "Remove reminder" when one is set.
     fn reminder_button(
         &self,
-        ix: usize,
+        key: LaterKey,
         has_due: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let this = cx.weak_entity();
-        Button::new(("later-remind", ix))
+        let id = SharedString::from(format!("later-remind-{}", key.ts.as_str()));
+        Button::new(id)
             .ghost()
             .with_size(Size::Small)
             .icon(IconName::AlarmClock)
@@ -643,34 +679,39 @@ impl LaterView {
             .dropdown_menu(move |mut menu, _, _| {
                 for remind in Remind::ALL {
                     let this = this.clone();
+                    let key = key.clone();
                     menu = menu.item(PopupMenuItem::new(remind.label()).on_click(
                         move |_, _, cx| {
                             this.update(cx, |view, cx| {
-                                view.set_due(ix, Some(remind.at(now_secs())), cx)
+                                view.set_due(&key, Some(remind.at(now_secs())), cx)
                             })
                             .ok();
                         },
                     ));
                 }
                 let custom_this = this.clone();
+                let custom_key = key.clone();
                 menu = menu.separator().item(
                     PopupMenuItem::new("Custom\u{2026}")
                         .icon(IconName::Calendar)
                         .on_click(move |_, window, cx| {
                             let this = custom_this.clone();
+                            let key = custom_key.clone();
                             open_custom_remind_dialog(window, cx, move |due, _, cx| {
-                                this.update(cx, |view, cx| view.set_due(ix, Some(due), cx))
+                                this.update(cx, |view, cx| view.set_due(&key, Some(due), cx))
                                     .ok();
                             });
                         }),
                 );
                 if has_due {
                     let this = this.clone();
+                    let key = key.clone();
                     menu = menu.separator().item(
                         PopupMenuItem::new("Remove reminder")
                             .icon(IconName::BellOff)
                             .on_click(move |_, _, cx| {
-                                this.update(cx, |view, cx| view.set_due(ix, None, cx)).ok();
+                                this.update(cx, |view, cx| view.set_due(&key, None, cx))
+                                    .ok();
                             }),
                     );
                 }
@@ -798,8 +839,11 @@ impl Render for LaterView {
                         .child(text)
                 });
                 let mut actions = h_flex().flex_none().gap_0p5();
+                let key = item.key();
                 match item.state {
                     LaterState::InProgress => {
+                        let complete_key = key.clone();
+                        let archive_key = key.clone();
                         actions = actions
                             .child(
                                 Button::new(("later-complete", ix))
@@ -808,10 +852,10 @@ impl Render for LaterView {
                                     .icon(IconName::CircleCheck)
                                     .tooltip("Mark complete")
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.set_state(ix, LaterState::Completed, cx);
+                                        this.set_state(&complete_key, LaterState::Completed, cx);
                                     })),
                             )
-                            .child(self.reminder_button(ix, item.due.is_some(), cx))
+                            .child(self.reminder_button(key.clone(), item.due.is_some(), cx))
                             .child(
                                 Button::new(("later-archive", ix))
                                     .ghost()
@@ -819,11 +863,12 @@ impl Render for LaterView {
                                     .icon(IconName::Archive)
                                     .tooltip("Archive")
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.set_state(ix, LaterState::Archived, cx);
+                                        this.set_state(&archive_key, LaterState::Archived, cx);
                                     })),
                             );
                     }
                     LaterState::Archived | LaterState::Completed => {
+                        let restore_key = key.clone();
                         actions = actions.child(
                             Button::new(("later-restore", ix))
                                 .ghost()
@@ -831,12 +876,14 @@ impl Render for LaterView {
                                 .icon(IconName::RotateCcw)
                                 .tooltip("Move to in progress")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.set_state(ix, LaterState::InProgress, cx);
+                                    this.set_state(&restore_key, LaterState::InProgress, cx);
                                 })),
                         );
                     }
                 }
                 let is_todo_item = item.is_todo;
+                let todo_key = key.clone();
+                let remove_key = key.clone();
                 actions = actions
                     .child(
                         Button::new(("later-toggle-todo", ix))
@@ -852,7 +899,9 @@ impl Render for LaterView {
                             } else {
                                 "Move to To-dos"
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_todo(ix, cx))),
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.toggle_todo(&todo_key, cx)),
+                            ),
                     )
                     .child(
                         Button::new(("later-remove", ix))
@@ -860,7 +909,9 @@ impl Render for LaterView {
                             .with_size(Size::Small)
                             .icon(IconName::Trash)
                             .tooltip("Remove from Later")
-                            .on_click(cx.listener(move |this, _, _, cx| this.remove(ix, cx))),
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.remove(&remove_key, cx)),
+                            ),
                     );
                 let (workspace, channel) = (item.workspace, item.channel.clone());
                 let is_personal_todo = item.is_personal_todo();
@@ -927,6 +978,7 @@ impl Render for LaterView {
                             )
                             .on_click(cx.listener({
                                 let open_ts = item.ts.clone();
+                                let key = key.clone();
                                 move |this, _, _, cx| {
                                     if is_personal_todo {
                                         let next = if completed {
@@ -934,7 +986,7 @@ impl Render for LaterView {
                                         } else {
                                             LaterState::Completed
                                         };
-                                        this.set_state(ix, next, cx);
+                                        this.set_state(&key, next, cx);
                                     } else {
                                         cx.emit(LaterEvent::Open {
                                             workspace,
@@ -1268,6 +1320,85 @@ mod tests {
             assert_eq!(v.in_progress_count(), 0);
             assert_eq!(v.saved_in(1).len(), 1);
         });
+    }
+
+    /// Row actions address their item by identity: while a reminder menu is open another save
+    /// lands in front of it, so the position it captured is another item's.
+    #[gpui::test]
+    fn row_actions_edit_the_item_they_were_opened_on(cx: &mut gpui::TestAppContext) {
+        let view = cx.update(LaterView::new);
+        let (c1, c2) = (ChannelId::from("C1"), ChannelId::from("C2"));
+        let (ts1, ts2) = (Ts::from("100.0"), Ts::from("200.0"));
+        let save = |channel: &ChannelId, ts: &Ts, text: &str| SaveRequest {
+            channel: channel.clone(),
+            ts: ts.clone(),
+            author: "Ada".into(),
+            text: text.into(),
+            saved: true,
+            due: None,
+        };
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = events.clone();
+        let recorder = cx.new(|cx| {
+            struct Recorder {
+                _sub: gpui::Subscription,
+            }
+            let subscription =
+                cx.subscribe(&view, move |_, _, event: &LaterEvent, _| match event {
+                    LaterEvent::Update {
+                        workspace,
+                        channel,
+                        ts,
+                        mark,
+                        date_due,
+                    } => seen.borrow_mut().push(format!(
+                        "update {workspace} {channel} {} {mark:?} {date_due:?}",
+                        ts.as_str()
+                    )),
+                    LaterEvent::Unsaved {
+                        workspace,
+                        channel,
+                        ts,
+                    } => seen
+                        .borrow_mut()
+                        .push(format!("unsaved {workspace} {channel} {}", ts.as_str())),
+                    _ => {}
+                });
+            Recorder { _sub: subscription }
+        });
+        view.update(cx, |v, cx| {
+            v.save(save(&c1, &ts1, "A"), 0, "# general".into(), cx);
+            // A's row captured its identity; a newer save then lands in front of it.
+            let a = v.items[0].key();
+            v.save(save(&c2, &ts2, "B"), 0, "# ops".into(), cx);
+            v.set_due(&a, Some(1_000), cx);
+            v.set_state(&a, LaterState::Archived, cx);
+            v.remove(&a, cx);
+            // An item that is gone is a no-op, not an edit of whatever took its place.
+            v.set_due(&a, None, cx);
+        });
+        assert_eq!(
+            *events.borrow(),
+            [
+                "update 0 C1 100.0 None Some(Some(1000))",
+                "update 0 C1 100.0 Some(Archived) None",
+                "unsaved 0 C1 100.0",
+            ],
+            "every action lands on A, the item it was opened on"
+        );
+        view.read_with(cx, |v, _| {
+            assert_eq!(
+                v.items
+                    .iter()
+                    .map(|item| item.ts.clone())
+                    .collect::<Vec<_>>(),
+                vec![ts2],
+                "B stays, untouched"
+            );
+            assert!(v.items[0].state == LaterState::InProgress);
+            assert_eq!(v.items[0].due, None);
+        });
+        drop(recorder);
     }
 
     #[test]

@@ -542,7 +542,13 @@ impl UnreadsView {
                 true
             }
             "escape" if !self.groups.is_empty() => {
-                self.mark_read(self.focused.unwrap_or(0), cx);
+                if let Some(channel) = self
+                    .groups
+                    .get(self.focused.unwrap_or(0))
+                    .map(|group| group.channel.clone())
+                {
+                    self.mark_read(&channel, cx);
+                }
                 true
             }
             _ => false,
@@ -560,21 +566,28 @@ impl UnreadsView {
         cx.notify();
     }
 
-    /// Mark group `ix` read: drop its card, pass the focus to the group that takes its
+    /// Mark `channel`'s group read, looked up when the action runs (a refresh that moved the
+    /// groups cannot redirect it): drop its card, pass the focus to the group that takes its
     /// place, and tell the root where Slack's read cursor moves.
-    fn mark_read(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(group) = self.groups.get(ix) else {
+    fn mark_read(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        let Some(ix) = self
+            .groups
+            .iter()
+            .position(|group| &group.channel == channel)
+        else {
             return;
         };
-        let (channel, ts) = (group.channel.clone(), group.newest_ts.clone());
-        self.groups.remove(ix);
-        self.collapsed.remove(&channel);
-        if self.replying.as_ref().is_some_and(|(ch, _)| *ch == channel) {
+        let group = self.groups.remove(ix);
+        self.collapsed.remove(channel);
+        if self.replying.as_ref().is_some_and(|(ch, _)| ch == channel) {
             self.replying = None;
         }
         self.focused = (!self.groups.is_empty() && self.focused.is_some())
             .then(|| ix.min(self.groups.len() - 1));
-        cx.emit(UnreadsEvent::MarkRead { channel, ts });
+        cx.emit(UnreadsEvent::MarkRead {
+            channel: group.channel,
+            ts: group.newest_ts,
+        });
         cx.notify();
     }
 
@@ -590,7 +603,7 @@ impl UnreadsView {
         cx.notify();
     }
 
-    fn submit_reply(&mut self, ix: usize, cx: &mut Context<Self>) {
+    fn submit_reply(&mut self, cx: &mut Context<Self>) {
         let Some((channel, input)) = self.replying.take() else {
             return;
         };
@@ -599,8 +612,11 @@ impl UnreadsView {
             cx.notify();
             return;
         }
-        cx.emit(UnreadsEvent::Reply { channel, text });
-        self.mark_read(ix, cx);
+        cx.emit(UnreadsEvent::Reply {
+            channel: channel.clone(),
+            text,
+        });
+        self.mark_read(&channel, cx);
     }
 }
 
@@ -822,6 +838,7 @@ fn card_view(args: UnreadCardArgs<'_>, cx: &mut Context<UnreadsView>) -> AnyElem
         _ => label,
     };
     let open = group.channel.clone();
+    let mark_read = group.channel.clone();
 
     let count_label = (!group.messages.is_empty()).then(|| {
         if group.messages.len() == 1 {
@@ -966,7 +983,9 @@ fn card_view(args: UnreadCardArgs<'_>, cx: &mut Context<UnreadsView>) -> AnyElem
                         .outline()
                         .with_size(Size::Small)
                         .label("Mark as Read")
-                        .on_click(cx.listener(move |this, _, _, cx| this.mark_read(ix, cx))),
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.mark_read(&mark_read, cx)),
+                        ),
                 ),
         );
 
@@ -1169,7 +1188,7 @@ fn card_view(args: UnreadCardArgs<'_>, cx: &mut Context<UnreadsView>) -> AnyElem
                             .label("Send"),
                         cx,
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| this.submit_reply(ix, cx))),
+                    .on_click(cx.listener(move |this, _, _, cx| this.submit_reply(cx))),
                 )
         })
     } else {
@@ -1600,7 +1619,7 @@ mod tests {
                     vec![group("C1", &["100.000001"]), group("C2", &["200.000001"])],
                     cx,
                 );
-                view.mark_read(0, cx);
+                view.mark_read(&ChannelId::from("C1"), cx);
                 assert_eq!(view.groups.len(), 1, "the marked group left");
                 // The store derivation still lists C1 (the read raced the query); only
                 // channels Slack still counts unread take part.
@@ -1628,6 +1647,79 @@ mod tests {
                 );
             });
         });
+    }
+
+    /// The quick-reply Send button marks the conversation replied to read, looked up by
+    /// identity: a store refresh that lands while the user types reorders the groups, so the
+    /// position the button captured may now be another conversation's.
+    #[gpui::test]
+    fn quick_reply_marks_its_own_conversation_read(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let fixtures = Arc::new(fixtures::load());
+        let mounted = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = mounted.clone();
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = UnreadsView::new(fixtures.clone(), cx);
+            *slot.borrow_mut() = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let view = mounted.borrow_mut().take().unwrap();
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = events.clone();
+        let recorder = cx.new(|cx| {
+            struct Recorder {
+                _sub: Subscription,
+            }
+            let subscription =
+                cx.subscribe(&view, move |_, _, event: &UnreadsEvent, _| match event {
+                    UnreadsEvent::MarkRead { channel, .. } => {
+                        seen.borrow_mut().push(format!("read {channel}"));
+                    }
+                    UnreadsEvent::Reply { channel, .. } => {
+                        seen.borrow_mut().push(format!("reply {channel}"));
+                    }
+                    _ => {}
+                });
+            Recorder { _sub: subscription }
+        });
+        let (c2, c3) = (ChannelId::from("C2"), ChannelId::from("C3"));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.show_local(
+                    fixtures.clone(),
+                    vec![group("C1", &["100.000001"]), group("C2", &["200.000001"])],
+                    cx,
+                );
+                view.start_reply(c2.clone(), window, cx);
+                let input = view.replying.as_ref().unwrap().1.clone();
+                input.update(cx, |input, cx| input.set_value("ok", window, cx));
+                // C2's Send button captured position 1; a refresh lands meanwhile: C1 was read
+                // elsewhere and C3 is new, so C2 now sits first and C3 at position 1.
+                view.show_store(
+                    vec![group("C2", &["200.000001"]), group("C3", &["300.000001"])],
+                    &[c2.clone(), c3.clone()],
+                    cx,
+                );
+                view.submit_reply(cx);
+                assert_eq!(
+                    view.groups
+                        .iter()
+                        .map(|group| group.channel.clone())
+                        .collect::<Vec<_>>(),
+                    vec![c3],
+                    "C3 stays unread"
+                );
+            });
+        });
+        assert_eq!(
+            *events.borrow(),
+            ["reply C2", "read C2"],
+            "the reply and the mark-read land on the conversation replied to"
+        );
+        drop(recorder);
     }
 
     #[gpui::test]
