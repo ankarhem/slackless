@@ -105,10 +105,10 @@ pub(crate) fn compute_local_semantic_similarity(text: &str, topic: &str) -> Opti
     #[cfg(not(test))]
     {
         use slackless_core::embeddings::{
-            Embedder as _, EmbeddingModel, OnnxEmbedder, detect_embedding_model_setup,
+            Embedder as _, EmbeddingModel, detect_embedding_model_setup,
         };
         use std::collections::HashMap;
-        use std::sync::{Arc, Mutex, OnceLock};
+        use std::sync::{Mutex, OnceLock};
 
         let text = text.trim();
         let topic = topic.trim();
@@ -120,20 +120,11 @@ pub(crate) fn compute_local_semantic_similarity(text: &str, topic: &str) -> Opti
             return None;
         }
 
-        static EMBEDDER: OnceLock<Mutex<Option<Arc<OnnxEmbedder>>>> = OnceLock::new();
         static TOPIC_CACHE: OnceLock<Mutex<HashMap<String, Vec<f32>>>> = OnceLock::new();
 
-        let embedder = {
-            let slot = EMBEDDER.get_or_init(|| Mutex::new(None));
-            let mut guard = slot.lock().ok()?;
-            if let Some(existing) = guard.as_ref() {
-                Arc::clone(existing)
-            } else {
-                let loaded = Arc::new(OnnxEmbedder::load_default(model).ok()?);
-                *guard = Some(Arc::clone(&loaded));
-                loaded
-            }
-        };
+        // Reuse the shared ONNX embedder slot so Smart Rules never loads a duplicate ~90 MiB
+        // session and inherits the 5-minute idle auto-unload TTL and model-deletion clearing.
+        let embedder = crate::search::load_or_get_onnx_embedder().ok()?;
 
         let topic_vec = {
             let cache = TOPIC_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
