@@ -1,4 +1,5 @@
 use super::render::*;
+use super::rows::membership_run;
 use gpui_kit::gpui::TextLayout;
 use std::cell::RefCell;
 
@@ -171,6 +172,36 @@ fn message_order_separates_messages_and_their_paragraphs() {
     assert!(first < second);
     // A message owns room for several blocks' worth of paragraphs.
     assert!(first + THEME_ORDER_STRIDE * 4 < second);
+}
+
+/// A run of joins (or leaves) ends at midnight, so the next day's first join opens its own
+/// line under the date divider instead of being counted into the day before's.
+#[test]
+fn membership_runs_end_at_day_boundaries() {
+    let membership = |subtype: &MessageSubtype, ts: &str| Message {
+        subtype: Some(subtype.clone()),
+        ts: Ts::from(ts),
+        ..Default::default()
+    };
+    let (join, leave) = (MessageSubtype::ChannelJoin, MessageSubtype::ChannelLeave);
+    assert!(membership_run(
+        &membership(&join, "1000.000001"),
+        &membership(&join, "1000.000002")
+    ));
+    assert!(
+        !membership_run(
+            &membership(&join, "1000.000001"),
+            &membership(&join, "173800.000001")
+        ),
+        "a run does not cross into the next day"
+    );
+    assert!(
+        !membership_run(
+            &membership(&join, "1000.000001"),
+            &membership(&leave, "1000.000002")
+        ),
+        "joins and leaves are separate runs"
+    );
 }
 
 #[gpui::test]

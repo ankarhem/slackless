@@ -1213,15 +1213,18 @@ fn is_membership(message: &Message) -> bool {
 }
 
 /// Whether `next` continues `message`'s run of joins (or of leaves), which Slack shows as one
-/// line.
-fn membership_run(message: &Message, next: &Message) -> bool {
+/// line; a run ends at midnight, where the next day's date divider starts a fresh line.
+pub(super) fn membership_run(message: &Message, next: &Message) -> bool {
     let leave = |m: &Message| {
         matches!(
             m.subtype,
             Some(MessageSubtype::ChannelLeave | MessageSubtype::GroupLeave)
         )
     };
-    is_membership(message) && is_membership(next) && leave(message) == leave(next)
+    is_membership(message)
+        && is_membership(next)
+        && leave(message) == leave(next)
+        && day_index(&message.ts) == day_index(&next.ts)
 }
 
 /// Slack's compact join / leave line: a person icon in the avatar gutter, "<name> joined
