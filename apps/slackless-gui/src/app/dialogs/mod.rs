@@ -2,7 +2,7 @@
 
 mod channels;
 pub(super) mod modal;
-mod profile;
+pub(super) mod profile;
 pub(super) mod storage;
 mod usergroups;
 pub(super) mod workflow;
@@ -88,6 +88,8 @@ impl App {
             .update(cx, |view, cx| view.set_enter_sends(enter_sends, cx));
         self.compose
             .update(cx, |view, cx| view.set_enter_sends(enter_sends, cx));
+        self.profile
+            .update(cx, |p, cx| p.set_show_pronouns(settings.show_pronouns, cx));
         let remote_auto = settings.remote_search_auto;
         let excluded_channels = settings.excluded_channels.clone();
         let show_deleted_messages = settings.show_deleted_messages;
@@ -664,9 +666,19 @@ impl App {
             target,
             PickerTarget::Message { .. } | PickerTarget::ThreadMessage(_)
         );
+        let target_channel = match &target {
+            PickerTarget::Message { channel, .. } => channel,
+            _ => &self.channel,
+        };
+        let external_channel = self
+            .fixtures
+            .conversation(target_channel)
+            .is_some_and(|c| c.is_ext_shared);
         self.picker = Some((target, position));
-        self.emoji_picker
-            .update(cx, |picker, cx| picker.open_tab(tab, show_gifs, window, cx));
+        self.emoji_picker.update(cx, |picker, cx| {
+            picker.set_external_channel(external_channel, cx);
+            picker.open_tab(tab, show_gifs, window, cx);
+        });
         cx.notify();
     }
 

@@ -208,6 +208,25 @@ impl MessagingBackend for SlackApi {
         self.chat_command(&channel, &command, &args, thread_ts.as_ref(), &team)
             .await
     }
+    async fn run_command_for_app(
+        &self,
+        channel: ChannelId,
+        command: String,
+        args: String,
+        thread_ts: Option<Ts>,
+        team: TeamId,
+        app_id: Option<String>,
+    ) -> api::Result<api::CommandResponse> {
+        self.chat_command_for_app(
+            &channel,
+            &command,
+            &args,
+            thread_ts.as_ref(),
+            &team,
+            app_id.as_deref(),
+        )
+        .await
+    }
     async fn block_action(
         &self,
         bot: BotId,
@@ -380,6 +399,9 @@ impl UsersBackend for SlackApi {
     }
     async fn team_profile_fields(&self) -> api::Result<HashMap<String, String>> {
         SlackApi::team_profile_get(self).await
+    }
+    async fn team_profile_field_defs(&self) -> api::Result<Vec<api::TeamProfileField>> {
+        SlackApi::team_profile_get_detailed(self).await
     }
     async fn users_set_photo(&self, filename: String, bytes: Vec<u8>) -> api::Result<()> {
         SlackApi::users_set_photo(self, &filename, &bytes).await

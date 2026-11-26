@@ -210,13 +210,15 @@ pub enum MessagingCommand {
     },
     /// Clear all completed Later items (`saved.clearCompleted`).
     ClearCompletedSaved,
-    /// Run a slash command Slack handles (`chat.command`, e.g. `/giphy`).
+    /// Run a slash command Slack handles (`chat.command`, e.g. `/giphy`), optionally
+    /// targeting a specific `app_id` when multiple apps register the same command (`F-COLLAB-686`).
     RunCommand {
         channel: ChannelId,
         /// With its slash: `/giphy`.
         command: String,
         args: String,
         thread_ts: Option<Ts>,
+        app_id: Option<String>,
     },
     /// Retry a persisted offline mutation that previously failed to flush.
     RetryOfflineMutation(i64),

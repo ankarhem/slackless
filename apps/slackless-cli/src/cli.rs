@@ -342,6 +342,9 @@ pub(crate) struct UpdateArgs {
     /// Quit and relaunch Slackless.app automatically after installing an update.
     #[arg(long)]
     pub(crate) restart: bool,
+    /// Include beta / pre-release builds from GitHub Releases (`F-SHELL-164`).
+    #[arg(long)]
+    pub(crate) beta: bool,
 }
 
 #[derive(Subcommand)]

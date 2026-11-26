@@ -1010,6 +1010,109 @@ fn strip_quote_prefix_hex_color_huddle_duration_and_ts_just_before() {
 }
 
 #[test]
+fn classify_author_badge_distinguishes_human_bot_and_via_app() {
+    use slackless_core::types::{BotId, BotProfile, File, FileId, Team, TeamId};
+
+    let mut fixtures = crate::fixtures::load();
+    let human_id = UserId::from("U0ALICE");
+    let bot_user_id = UserId::from("U9APPBOT");
+    let bot_user = slackless_core::types::User {
+        id: bot_user_id.clone(),
+        name: "deploybot".to_owned(),
+        is_bot: true,
+        ..Default::default()
+    };
+    fixtures.users.push(bot_user);
+
+    // 1. Plain human message -> None
+    let human_msg = Message {
+        user: Some(human_id.clone()),
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_author_badge(&human_msg, &fixtures),
+        AuthorBadge::None
+    );
+
+    // 2. Bot user message -> App
+    let bot_msg = Message {
+        user: Some(bot_user_id),
+        ..Default::default()
+    };
+    assert_eq!(classify_author_badge(&bot_msg, &fixtures), AuthorBadge::App);
+
+    // 3. MessageSubtype::BotMessage -> App
+    let subtype_bot = Message {
+        subtype: Some(MessageSubtype::BotMessage),
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_author_badge(&subtype_bot, &fixtures),
+        AuthorBadge::App
+    );
+
+    // 4. Human user posting via an app (e.g. /giphy, workflow) -> ViaApp(app name)
+    let via_msg = Message {
+        user: Some(human_id),
+        bot_id: Some(BotId::from("B9GIPHY")),
+        bot_profile: Some(BotProfile {
+            id: BotId::from("B9GIPHY"),
+            name: "Giphy".to_owned(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_author_badge(&via_msg, &fixtures),
+        AuthorBadge::ViaApp("Giphy".to_owned())
+    );
+
+    // 5. External file sharing label (F-COLLAB-879): external uploader & ext-shared channel
+    let ext_team_id = TeamId::from("T9EXTFILE");
+    fixtures.teams.push(Team {
+        id: ext_team_id.clone(),
+        name: "Acme Partner".to_owned(),
+        domain: "acmepartner".to_owned(),
+        ..Default::default()
+    });
+    let ext_user_id = UserId::from("U9EXTFILE");
+    let ext_user = slackless_core::types::User {
+        id: ext_user_id.clone(),
+        team_id: Some(ext_team_id),
+        ..Default::default()
+    };
+    fixtures.users.push(ext_user);
+
+    let mut file_msg = Message {
+        user: Some(ext_user_id),
+        files: vec![File {
+            id: FileId::from("F9EXT"),
+            name: Some("contract.pdf".to_owned()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let ch = fixtures.channels[0].id.clone();
+    assert_eq!(
+        external_file_sharing_label(&fixtures, &ch, &file_msg).as_deref(),
+        Some("External file · Acme Partner")
+    );
+
+    // Internal uploader in an externally shared channel -> "Shared with external organizations"
+    let mut shared_ch = fixtures.channels[0].clone();
+    shared_ch.id = ChannelId::from("C9EXTSHARED");
+    shared_ch.is_ext_shared = true;
+    fixtures.channels.push(shared_ch.clone());
+    file_msg.user = Some(fixtures.self_user.clone());
+    assert_eq!(
+        external_file_sharing_label(&fixtures, &shared_ch.id, &file_msg).as_deref(),
+        Some("Shared with external organizations")
+    );
+    // Internal uploader in an internal channel -> None
+    assert_eq!(external_file_sharing_label(&fixtures, &ch, &file_msg), None);
+}
+
+#[test]
 #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
 fn benchmark_highlight_mrkdwn_and_time_1000_messages() {
     use std::time::Instant;

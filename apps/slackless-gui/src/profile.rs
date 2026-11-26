@@ -42,6 +42,7 @@ pub enum ProfileEvent {
 struct LoadedProfile {
     pronouns: Option<String>,
     fields: Vec<(String, String)>,
+    locked_fields: Vec<(String, String)>,
 }
 
 pub struct ProfilePanel {
@@ -50,10 +51,13 @@ pub struct ProfilePanel {
     /// Opened over another pane: the header leads with Slack's back chevron.
     back: bool,
     self_state: SelfState,
-    /// Live-hydrated pronouns & custom fields from `users.profile.get` + `team.profile.get`.
+    /// Live-hydrated pronouns, custom fields & SCIM/admin lock metadata from
+    /// `users.profile.get` + `team.profile.get` (`F-SHELL-005`).
     loaded_profiles: HashMap<UserId, LoadedProfile>,
     /// Preview own profile as teammates see it (`F-SHELL-006`).
     preview_as_other: bool,
+    /// Whether the signed-in user's pronouns are displayed publicly (`F-SHELL-010`, default true).
+    show_pronouns: bool,
 }
 
 impl EventEmitter<ProfileEvent> for ProfilePanel {}
@@ -67,6 +71,7 @@ impl ProfilePanel {
             self_state: SelfState::default(),
             loaded_profiles: HashMap::new(),
             preview_as_other: false,
+            show_pronouns: true,
         })
     }
 
@@ -78,17 +83,41 @@ impl ProfilePanel {
             .unwrap_or_default()
     }
 
-    /// Store live custom fields & pronouns hydrated from `users.profile.get`.
+    /// Read live-hydrated SCIM/admin locked field metadata for `user` (`F-SHELL-005`).
+    pub fn loaded_locked_fields(&self, user: &UserId) -> Vec<(String, String)> {
+        self.loaded_profiles
+            .get(user)
+            .map(|p| p.locked_fields.clone())
+            .unwrap_or_default()
+    }
+
+    /// Store live custom fields, pronouns & locked-field metadata hydrated from
+    /// `users.profile.get` + `team.profile.get`.
     pub fn set_user_profile(
         &mut self,
         user: UserId,
         pronouns: Option<String>,
         fields: Vec<(String, String)>,
+        locked_fields: Vec<(String, String)>,
         cx: &mut Context<Self>,
     ) {
-        self.loaded_profiles
-            .insert(user, LoadedProfile { pronouns, fields });
+        self.loaded_profiles.insert(
+            user,
+            LoadedProfile {
+                pronouns,
+                fields,
+                locked_fields,
+            },
+        );
         cx.notify();
+    }
+
+    /// Update pronoun visibility preference (`F-SHELL-010`).
+    pub fn set_show_pronouns(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.show_pronouns != show {
+            self.show_pronouns = show;
+            cx.notify();
+        }
     }
 
     /// Live refresh: the shown profile stays open, drawn from `fixtures`.
@@ -112,11 +141,13 @@ impl ProfilePanel {
     }
 }
 
-/// Custom status shortcode (colons trimmed) + text derived for a user.
+/// Custom status shortcode (colons trimmed), text, automatic source & expiration derived for a user.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DerivedStatus {
     pub emoji: String,
     pub text: String,
+    pub source: crate::status::StatusSource,
+    pub expiration: Option<i64>,
 }
 
 /// Shared user-profile summary derived from workspace [`Fixtures`], [`SelfState`], and optional
@@ -132,6 +163,7 @@ pub(crate) struct DerivedUserProfile {
     /// `("4:12 PM local time", Some("2 hours ahead"))` when the user's timezone offset is known.
     pub local_time: Option<(String, Option<String>)>,
     pub is_self: bool,
+    pub is_bot: bool,
     pub can_message: bool,
     /// True when the user belongs to an external Slack Connect organization (`F-COLLAB-800`).
     pub is_external: bool,
@@ -148,6 +180,7 @@ pub(crate) fn derive_user_profile(
 ) -> DerivedUserProfile {
     let is_self = *user_id == fixtures.self_user;
     let user = fixtures.user(user_id);
+    let is_bot = user.is_some_and(|u| u.is_bot || u.is_app_user);
     let name = user
         .map(|user| fixtures.name_of(user).to_owned())
         .unwrap_or_else(|| user_id.as_str().to_owned());
@@ -180,6 +213,8 @@ pub(crate) fn derive_user_profile(
         self_state.status.as_ref().map(|status| DerivedStatus {
             emoji: status.emoji.trim_matches(':').to_owned(),
             text: status.text.clone(),
+            source: status.source,
+            expiration: status.expiration,
         })
     } else {
         user.and_then(|user| {
@@ -187,19 +222,32 @@ pub(crate) fn derive_user_profile(
             let unexpired = profile
                 .status_expiration
                 .is_none_or(|end| end == 0 || end > now_secs());
-            let text = profile
-                .status_text
-                .clone()
-                .filter(|text| !text.is_empty())?;
-            unexpired.then(|| DerivedStatus {
-                emoji: profile
+            let text = profile.status_text.clone().filter(|text| !text.is_empty());
+            if let Some(text) = text {
+                let emoji = profile
                     .status_emoji
                     .clone()
                     .unwrap_or_default()
                     .trim_matches(':')
-                    .to_owned(),
-                text,
-            })
+                    .to_owned();
+                let source = crate::status::infer_profile_status_source(profile, &emoji, &text);
+                unexpired.then(|| DerivedStatus {
+                    emoji,
+                    text,
+                    source,
+                    expiration: profile.status_expiration.filter(|&ts| ts > 0),
+                })
+            } else if profile.huddle_state.as_deref() == Some("in_a_huddle") {
+                let exp = profile.huddle_state_expiration_ts.filter(|&ts| ts > 0);
+                exp.is_none_or(|ts| ts > now_secs()).then(|| DerivedStatus {
+                    emoji: "headphones".to_owned(),
+                    text: "In a huddle".to_owned(),
+                    source: crate::status::StatusSource::Huddle,
+                    expiration: exp,
+                })
+            } else {
+                None
+            }
         })
     };
     let local_time = user.and_then(|user| user.tz_offset).map(local_time);
@@ -216,6 +264,7 @@ pub(crate) fn derive_user_profile(
         status,
         local_time,
         is_self,
+        is_bot,
         can_message: !is_self && user.is_some_and(|user| !user.deleted),
         is_external,
         external_team,
@@ -383,7 +432,21 @@ impl Render for ProfilePanel {
             loaded.and_then(|p| p.pronouns.as_deref()),
         );
         let is_self = derived.is_self;
-        let pronouns = derived.pronouns;
+        let is_bot = derived.is_bot;
+        let pronouns_hidden = is_self && !self.show_pronouns;
+        let pronouns = if pronouns_hidden && previewing {
+            None
+        } else {
+            derived.pronouns
+        };
+        let locked_field_keys: std::collections::HashSet<String> = loaded
+            .map(|p| {
+                p.locked_fields
+                    .iter()
+                    .map(|(k, _)| k.to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
         let custom_fields: Vec<(String, String)> = match loaded {
             Some(p) if !p.fields.is_empty() => p.fields.clone(),
             _ => extras.map(|e| e.fields.clone()).unwrap_or_default(),
@@ -416,7 +479,7 @@ impl Render for ProfilePanel {
                     .map(str::to_owned)
                     .unwrap_or(s.emoji)
             };
-            (glyph, s.text)
+            (glyph, s.text, s.source, s.expiration)
         });
         let away = derived.away;
         let is_external = derived.is_external;
@@ -556,8 +619,19 @@ impl Render for ProfilePanel {
                     .child(div().text_sm().child(zone))
             }))
             .children(custom_fields.into_iter().map(|(label, value)| {
+                let locked = locked_field_keys.contains(&label.to_ascii_lowercase());
                 v_flex()
-                    .child(div().text_xs().text_color(muted).child(label))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(label)
+                            .when(locked, |row| {
+                                row.child(Icon::new(IconName::Lock).size(px(11.)).text_color(muted))
+                            }),
+                    )
                     .child(div().text_sm().child(value))
             }));
 
@@ -592,6 +666,7 @@ impl Render for ProfilePanel {
                     .child(
                         h_flex()
                             .items_baseline()
+                            .flex_wrap()
                             .gap_2()
                             .child(
                                 div()
@@ -599,7 +674,36 @@ impl Render for ProfilePanel {
                                     .font_weight(FontWeight::BOLD)
                                     .child(name.clone()),
                             )
-                            .children(pronouns.map(|p| div().text_sm().text_color(muted).child(p))),
+                            .when(is_bot, |row| {
+                                row.child(
+                                    div()
+                                        .px_1p5()
+                                        .py(px(1.))
+                                        .rounded_sm()
+                                        .bg(theme.secondary)
+                                        .text_size(px(10.))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(muted)
+                                        .child("APP"),
+                                )
+                            })
+                            .children(pronouns.map(|p| {
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(div().text_sm().text_color(muted).child(p))
+                                    .when(pronouns_hidden && !previewing, |row| {
+                                        row.child(
+                                            div()
+                                                .px_1()
+                                                .rounded_sm()
+                                                .bg(theme.secondary)
+                                                .text_size(px(10.))
+                                                .text_color(muted)
+                                                .child("Hidden"),
+                                        )
+                                    })
+                            })),
                     )
                     .when(!real_name.is_empty() && real_name != name, |col| {
                         col.child(div().text_sm().text_color(muted).child(real_name.clone()))
@@ -671,17 +775,47 @@ impl Render for ProfilePanel {
                         )),
                 )
             })
-            .children(status.map(|(glyph, text)| {
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
+            .children(status.map(|(glyph, text, source, expiration)| {
+                let meta = match (
+                    source.badge_label(),
+                    expiration.map(|ts| format!("Clears at {}", clock(ts, None))),
+                ) {
+                    (Some(src), Some(exp)) => {
+                        format!("{src} \u{b7} {exp} \u{b7} Visible to workspace")
+                    }
+                    (Some(src), None) => format!("{src} \u{b7} Visible to workspace"),
+                    (None, Some(exp)) => format!("{exp} \u{b7} Visible to workspace"),
+                    (None, None) => "Visible to workspace".to_owned(),
+                };
+                v_flex()
+                    .gap_0p5()
+                    .px_2p5()
+                    .py_1p5()
                     .rounded_md()
                     .bg(hover)
-                    .text_sm()
-                    .child(glyph)
-                    .child(text)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .child(glyph)
+                            .child(text),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(muted)
+                            .when(source.is_automatic(), |row| {
+                                row.child(
+                                    Icon::new(IconName::Sparkles)
+                                        .size(px(11.))
+                                        .text_color(muted),
+                                )
+                            })
+                            .child(meta),
+                    )
             }))
             .child(presence)
             .children(time)

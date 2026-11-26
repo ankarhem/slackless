@@ -1473,6 +1473,7 @@ fn qa_personal_todo_and_major_views_render_cleanly(cx: &mut gpui::TestAppContext
                     "Add cross-workspace search".to_owned(),
                     "Keep scroll smooth over hover popovers".to_owned(),
                 ],
+                is_prerelease: false,
             };
             app.preferences.update(cx, |prefs, cx| {
                 prefs.set_update_state(
@@ -1858,6 +1859,7 @@ fn run_slash_broadcast_confirmation_and_draft_persistence_across_channels(
                 clear_after: 0,
                 pause: false,
                 expiration: None,
+                source: crate::status::StatusSource::Manual,
             }));
             app.run_slash(
                 &crate::slash::parse("/status clear").unwrap(),
@@ -2699,6 +2701,290 @@ fn cross_workspace_search_jump_storage_backfill_progress_and_export_engine(
                 "AllWorkspaces search from workspace 1 must find workspace 0 hits"
             );
         });
+    });
+    drop(root);
+}
+
+#[test]
+fn duplicate_slash_candidates_broadcast_guards_locked_profile_and_settings_defaults() {
+    use slackless_core::api::AppCommand;
+    use slackless_core::types::{Conversation, ConversationProperties, User};
+
+    // 1. Duplicate slash command disambiguation candidates (F-COLLAB-686)
+    let commands = vec![
+        AppCommand {
+            name: "deploy".to_owned(),
+            description: "Deploy via CI".to_owned(),
+            usage: "[env]".to_owned(),
+            app_name: Some("CI Bot".to_owned()),
+            app_id: Some("A1".to_owned()),
+        },
+        AppCommand {
+            name: "deploy".to_owned(),
+            description: "Deploy via Release Manager".to_owned(),
+            usage: "[service]".to_owned(),
+            app_name: Some("ReleaseBot".to_owned()),
+            app_id: Some("A2".to_owned()),
+        },
+        AppCommand {
+            name: "shrug".to_owned(),
+            description: "Custom shrug".to_owned(),
+            usage: String::new(),
+            app_name: Some("FunApp".to_owned()),
+            app_id: Some("A3".to_owned()),
+        },
+    ];
+    let deploy_inv = crate::slash::parse("/deploy prod").expect("parse /deploy");
+    let deploy_candidates = matching_slash_candidates(&deploy_inv, &commands);
+    assert_eq!(deploy_candidates.len(), 2);
+    assert_eq!(deploy_candidates[0].app_id.as_deref(), Some("A1"));
+    assert_eq!(deploy_candidates[1].app_id.as_deref(), Some("A2"));
+
+    // Built-in command shadowed by an app command also surfaces both candidates.
+    let shrug_inv = crate::slash::parse("/shrug hi").expect("parse /shrug");
+    let shrug_candidates = matching_slash_candidates(&shrug_inv, &commands);
+    assert_eq!(shrug_candidates.len(), 2);
+    assert!(shrug_candidates[0].is_builtin);
+    assert_eq!(shrug_candidates[1].app_id.as_deref(), Some("A3"));
+
+    // 2. Large-channel & restricted broadcast mention guardrails (F-COLLAB-1248..1249)
+    let mut small_ch = Conversation {
+        id: ChannelId::from("C1"),
+        name: Some("team".to_owned()),
+        is_channel: true,
+        ..Default::default()
+    };
+    assert!(evaluate_broadcast_guard(&BroadcastRange::Channel, &small_ch, 4, None).is_none());
+    assert_eq!(broadcast_autocomplete_hint(&small_ch, 4), None);
+
+    let big_guard = evaluate_broadcast_guard(&BroadcastRange::Channel, &small_ch, 42, None)
+        .expect("large channel triggers confirmation");
+    assert!(big_guard.body.contains("42 people"));
+    assert_eq!(big_guard.member_count, 42);
+    assert!(!big_guard.is_restricted);
+    assert_eq!(
+        broadcast_autocomplete_hint(&small_ch, 42).as_deref(),
+        Some("42 members")
+    );
+
+    // Enterprise large channel (>= 10,000 members) warns non-admins as restricted.
+    let member = User {
+        is_admin: false,
+        ..Default::default()
+    };
+    let ent_guard =
+        evaluate_broadcast_guard(&BroadcastRange::Here, &small_ch, 10_500, Some(&member))
+            .expect("enterprise channel triggers warning");
+    assert!(ent_guard.is_restricted);
+    assert!(ent_guard.restriction_note.is_some());
+    assert!(mention_permission_summary(&small_ch, 10_500).contains("10500"));
+
+    // Explicit channel restriction via properties.at_channel_restricted
+    let mut props = ConversationProperties::default();
+    props
+        .extra
+        .insert("at_channel_restricted".to_owned(), serde_json::json!(true));
+    small_ch.properties = Some(props);
+    let restricted_guard =
+        evaluate_broadcast_guard(&BroadcastRange::Channel, &small_ch, 3, Some(&member))
+            .expect("restricted channel always warns");
+    assert!(restricted_guard.is_restricted);
+    assert_eq!(
+        broadcast_autocomplete_hint(&small_ch, 3).as_deref(),
+        Some("Restricted")
+    );
+    assert!(
+        mention_permission_summary(&small_ch, 3).contains("restricted to Channel Managers"),
+        "unexpected permission summary: {}",
+        mention_permission_summary(&small_ch, 3)
+    );
+
+    // 3. Locked profile fields detection (F-SHELL-005)
+    let mut scim_user = User::default();
+    scim_user
+        .extra
+        .insert("is_scim_managed".to_owned(), serde_json::json!(true));
+    let locks = detect_locked_profile_fields(
+        Some(&scim_user),
+        &[(
+            "Department".to_owned(),
+            "Managed by workspace admin".to_owned(),
+        )],
+    );
+    assert!(locks.contains_key("display_name"));
+    assert!(locks.contains_key("title"));
+    assert!(locks.contains_key("phone"));
+    assert!(locks.contains_key("department"));
+
+    // 4. Settings defaults & serde round-trip (F-SHELL-010, F-SHELL-164)
+    let defaults = crate::preferences::Settings::default();
+    assert!(!defaults.beta_updates);
+    assert!(defaults.show_pronouns);
+    assert_eq!(
+        defaults.update_channel(),
+        crate::updater::UpdateChannel::Stable
+    );
+
+    // Old JSON lacking new keys deserializes with safe defaults (show_pronouns=true, beta_updates=false)
+    let migrated: crate::preferences::Settings =
+        serde_json::from_str("{}").expect("empty JSON migrates");
+    assert!(!migrated.beta_updates);
+    assert!(migrated.show_pronouns);
+
+    let mut beta_settings = defaults;
+    beta_settings.beta_updates = true;
+    beta_settings.show_pronouns = false;
+    assert_eq!(
+        beta_settings.update_channel(),
+        crate::updater::UpdateChannel::Beta
+    );
+    let json = serde_json::to_string(&beta_settings).expect("serialize settings");
+    let roundtrip: crate::preferences::Settings =
+        serde_json::from_str(&json).expect("deserialize settings");
+    assert!(roundtrip.beta_updates);
+    assert!(!roundtrip.show_pronouns);
+}
+
+#[gpui::test]
+fn parity_finish_gui_slash_disambiguation_profile_general_rename_and_beta_prefs(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut fx = fixtures::load();
+    fx.app_commands.push(slackless_core::api::AppCommand {
+        name: "deploy".to_owned(),
+        description: "Deploy via CI".to_owned(),
+        usage: "[env]".to_owned(),
+        app_name: Some("CI Bot".to_owned()),
+        app_id: Some("A1".to_owned()),
+    });
+    fx.app_commands.push(slackless_core::api::AppCommand {
+        name: "deploy".to_owned(),
+        description: "Deploy via Release".to_owned(),
+        usage: "[env]".to_owned(),
+        app_name: Some("ReleaseBot".to_owned()),
+        app_id: Some("A2".to_owned()),
+    });
+    let (root, app, cx) = mount_test_app(fx, cx);
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            // 1. Slash command CommandResponse (in_channel & ephemeral) + CommandFailed (F-COLLAB-684..685)
+            let channel = app.channel.clone();
+            let before = app.messages.read(cx).message_count_for_test(cx);
+            app.on_core_event(
+                &Event::CommandResponse {
+                    channel: channel.clone(),
+                    command: "/deploy".to_owned(),
+                    response_type: Some("in_channel".to_owned()),
+                    text: "Build #42 deployed".to_owned(),
+                    thread_ts: None,
+                },
+                window,
+                cx,
+            );
+            assert_eq!(app.messages.read(cx).message_count_for_test(cx), before + 1);
+            assert_eq!(
+                app.messages
+                    .read(cx)
+                    .last_message_text_for_test(cx)
+                    .as_deref(),
+                Some("Build #42 deployed")
+            );
+
+            app.on_core_event(
+                &Event::CommandFailed {
+                    command: "/deploy".to_owned(),
+                    error: "timeout".to_owned(),
+                },
+                window,
+                cx,
+            );
+            assert_eq!(app.messages.read(cx).message_count_for_test(cx), before + 2);
+            let last_err = app
+                .messages
+                .read(cx)
+                .last_message_text_for_test(cx)
+                .expect("ephemeral timeout error rendered");
+            assert!(
+                last_err.contains("did not respond in time"),
+                "expected timeout feedback, got: {last_err}"
+            );
+
+            // 2. Duplicate slash command disambiguation opens modal dialog (F-COLLAB-686)
+            let inv = crate::slash::parse("/deploy prod").expect("parse /deploy");
+            app.run_slash(&inv, None, window, cx);
+            assert!(
+                window.has_active_dialog(cx),
+                "duplicate slash command must open disambiguation dialog"
+            );
+            window.close_dialog(cx);
+
+            // 3. ProfilePanel locked fields, automatic status source, and pronoun toggle (F-SHELL-005/010/020..021)
+            let self_id = app.fixtures.self_user.clone();
+            app.profile.update(cx, |p, cx| {
+                p.set_user_profile(
+                    self_id.clone(),
+                    Some("they/them".to_owned()),
+                    vec![("Department".to_owned(), "Engineering".to_owned())],
+                    vec![(
+                        "Department".to_owned(),
+                        "Managed by SCIM / identity provider".to_owned(),
+                    )],
+                    cx,
+                );
+                p.set_show_pronouns(false, cx);
+                p.open(self_id.clone(), false, cx);
+            });
+            assert_eq!(
+                app.profile.read(cx).loaded_locked_fields(&self_id),
+                vec![(
+                    "Department".to_owned(),
+                    "Managed by SCIM / identity provider".to_owned()
+                )]
+            );
+            app.right_pane = RightPane::Profile { over_thread: false };
+
+            // 4. Open #general channel details so F-COLLAB-1236 rename path renders cleanly
+            if let Some(gen_ch) = app.fixtures.channels.iter().find(|c| c.is_general) {
+                let gen_id = gen_ch.id.clone();
+                let fx_arc = Arc::clone(&app.fixtures);
+                app.details.update(cx, |d, cx| {
+                    d.open(
+                        fx_arc,
+                        gen_id,
+                        Vec::new(),
+                        false,
+                        crate::channel_details::DetailsTab::About,
+                        cx,
+                    );
+                });
+            }
+
+            // 5. Preferences -> Advanced renders Beta updates toggle + prerelease badge (F-SHELL-164)
+            let beta_info = crate::updater::ReleaseInfo {
+                version: "2026.12.01-beta.1".to_owned(),
+                html_url: "https://github.com/ankarhem/slackless/releases/tag/v2026.12.01-beta.1"
+                    .to_owned(),
+                asset_name: "Slackless-2026.12.01-beta.1-macos-arm64.app.tar.gz".to_owned(),
+                download_url: "https://example.com/beta.tar.gz".to_owned(),
+                sha256_url: None,
+                notes: vec!["Beta preview build".to_owned()],
+                is_prerelease: true,
+            };
+            app.preferences.update(cx, |prefs, cx| {
+                let mut s = prefs.settings().clone();
+                s.beta_updates = true;
+                prefs.load_settings(s, window, cx);
+                prefs.set_update_state(
+                    crate::updater::UpdateState::Available(beta_info.clone()),
+                    Some(beta_info),
+                    cx,
+                );
+                prefs.show(Section::Advanced, cx);
+            });
+            assert!(app.preferences.read(cx).settings().beta_updates);
+        });
+        let _ = window.draw(cx);
     });
     drop(root);
 }

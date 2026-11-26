@@ -142,6 +142,8 @@ pub(crate) struct Profile {
     pub local_time: Option<String>,
     /// The signed-in user ("Set a status" instead of "Message").
     pub is_self: bool,
+    /// Bot or app user (`F-COLLAB-495`).
+    pub is_bot: bool,
     /// Another, undeleted member with a resolved record: the "Message" button.
     pub can_message: bool,
     /// True when the member belongs to an external Slack Connect organization (`F-COLLAB-800`).
@@ -166,6 +168,7 @@ pub(crate) fn derive(fixtures: &Fixtures, self_state: &SelfState, user_id: &User
         status: derived.status,
         local_time: derived.local_time.map(|(time, _)| time),
         is_self: derived.is_self,
+        is_bot: derived.is_bot,
         can_message: derived.can_message,
         is_external: derived.is_external,
         external_team: derived.external_team,
@@ -257,6 +260,20 @@ pub(crate) fn card(
                 .child(profile.name)
                 .on_click(move |_, window, cx| open_profile(window, cx)),
         )
+        .when(profile.is_bot, |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .px_1()
+                    .py(px(1.))
+                    .rounded(px(2.))
+                    .bg(theme.secondary)
+                    .text_size(px(10.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(muted)
+                    .child("APP"),
+            )
+        })
         .children(profile.pronouns.map(|pronouns| {
             div()
                 .flex_none()
@@ -450,6 +467,7 @@ mod tests {
                 clear_after: 0,
                 pause: false,
                 expiration: None,
+                source: crate::status::StatusSource::Manual,
             }),
             ..SelfState::default()
         };

@@ -262,7 +262,7 @@ async fn dispatch(
             ArchiveCommand::Status => cmd_archive_status(ctx, workspace),
         },
         Commands::Update(args) => {
-            update::run_update(ctx, args.check, args.force, args.restart).await
+            update::run_update(ctx, args.check, args.force, args.restart, args.beta).await
         }
         Commands::Mcp => mcp::run_mcp(flag).await,
         Commands::Auth { command } => dispatch_auth(ctx, flag, *command),

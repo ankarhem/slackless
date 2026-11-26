@@ -393,6 +393,7 @@ impl App {
                                 clear_after: 0,
                                 pause: false,
                                 expiration: None,
+                                source: crate::status::StatusSource::Calendar,
                             };
                             app.self_state.set_status(Some(status.clone()));
                             app.calendar_status_active = true;

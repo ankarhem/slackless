@@ -28,10 +28,11 @@ impl App {
             self.update_state = UpdateState::Checking;
             self.sync_update_ui(cx);
         }
+        let channel = self.preferences.read(cx).settings().update_channel();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { crate::updater::check_for_update() })
+                .spawn(async move { crate::updater::check_for_update_on(channel) })
                 .await;
             let _ = this.update(cx, |app, cx| {
                 match result {
@@ -197,6 +198,11 @@ impl App {
             ),
             UpdateState::Available(rel) => {
                 let ver = rel.version.clone();
+                let banner_text = if rel.is_prerelease {
+                    format!("Slackless {ver} (Beta) is available")
+                } else {
+                    format!("Slackless {ver} is available")
+                };
                 let notes_url = rel.html_url.clone();
                 let dismiss_ver = ver.clone();
                 Some(
@@ -220,7 +226,7 @@ impl App {
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(fg)
-                                .child(format!("Slackless {ver} is available")),
+                                .child(banner_text),
                         )
                         .child(
                             Button::new("update-banner-install")

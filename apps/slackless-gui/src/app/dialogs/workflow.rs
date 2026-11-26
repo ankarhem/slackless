@@ -580,6 +580,7 @@ impl App {
             command: command_str,
             args,
             thread_ts: None,
+            app_id: None,
         });
         notify(
             calling_app.name.as_str(),

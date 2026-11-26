@@ -65,6 +65,8 @@ pub(crate) use render::{
     render_block, selectable_code, selectable_text, short_date, unescape,
 };
 use rows::transcript_row;
+#[cfg(test)]
+pub(crate) use rows::{AuthorBadge, classify_author_badge, external_file_sharing_label};
 pub use rows::{Jump, message_row, message_row_linked};
 pub(crate) use rows::{editing_avatar, reply_bar, same_group};
 pub use time::set_timezone_override;

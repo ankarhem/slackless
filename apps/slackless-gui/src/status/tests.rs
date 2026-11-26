@@ -1,5 +1,5 @@
 use super::pause::parse_until_time;
-use super::{ScheduledStatus, SelfState, UserStatus};
+use super::{ScheduledStatus, SelfState, StatusSource, UserStatus};
 
 #[test]
 fn activates_due_scheduled_statuses_in_earliest_timestamp_order() {
@@ -55,6 +55,7 @@ fn scheduled_status_clears_at_respects_timezone_boundaries() {
         clear_after: 4, // Today
         pause: false,
         expiration: None,
+        source: StatusSource::Manual,
     };
     assert_eq!(
         status_today.clears_at_from(now_utc, 0),
@@ -88,6 +89,7 @@ fn user_status_expiry_countdown_and_self_state_expiration() {
         clear_after: 0,
         pause: true,
         expiration: None,
+        source: StatusSource::Manual,
     };
     assert!(!s.is_expired_at(1_000));
     assert!(!s.is_expired());
@@ -218,4 +220,63 @@ fn focus_preset_out_of_bounds_falls_back_safely() {
     assert_eq!(state.focus_preset, super::FOCUS_UNTIL_OFF);
     assert_eq!(state.focus_until, Some(i64::MAX));
     assert!(state.focused());
+}
+
+#[test]
+fn status_source_inference_and_automatic_huddle_hydration() {
+    let profile = slackless_core::types::Profile {
+        huddle_state: Some("in_a_huddle".to_owned()),
+        ..Default::default()
+    };
+    let huddle = UserStatus::from_profile(&profile).expect("huddle synthesizes automatic status");
+    assert_eq!(huddle.text, "In a huddle");
+    assert_eq!(huddle.source, StatusSource::Huddle);
+    assert!(huddle.source.is_automatic());
+    assert_eq!(huddle.source.badge_label(), Some("Automatic · In a huddle"));
+
+    let cal = slackless_core::types::Profile {
+        status_emoji: Some(":calendar:".to_owned()),
+        status_text: Some("In a meeting".to_owned()),
+        ..Default::default()
+    };
+    let cal_status = UserStatus::from_profile(&cal).expect("calendar status");
+    assert_eq!(cal_status.source, StatusSource::Calendar);
+    assert!(cal_status.source.is_automatic());
+    assert_eq!(
+        cal_status.source.badge_label(),
+        Some("Automatic · Calendar")
+    );
+
+    let custom = slackless_core::types::Profile {
+        status_emoji: Some(":coffee:".to_owned()),
+        status_text: Some("Grabbing coffee".to_owned()),
+        ..Default::default()
+    };
+    let manual = UserStatus::from_profile(&custom).expect("manual status");
+    assert_eq!(manual.source, StatusSource::Manual);
+    assert!(!manual.source.is_automatic());
+    assert_eq!(manual.source.badge_label(), None);
+
+    let zoom = slackless_core::types::Profile {
+        status_emoji: Some(":video_camera:".to_owned()),
+        status_text: Some("In a Zoom meeting".to_owned()),
+        ..Default::default()
+    };
+    let app_status = UserStatus::from_profile(&zoom).expect("app status");
+    assert_eq!(app_status.source, StatusSource::App);
+    assert_eq!(app_status.source.badge_label(), Some("Automatic · App"));
+
+    let mut state = SelfState::default();
+    state.scheduled_statuses.push(ScheduledStatus {
+        emoji: "spiral_calendar_pad".to_owned(),
+        text: "Standup".to_owned(),
+        starts_at: 1_000,
+        clear_after: 1,
+        pause: false,
+    });
+    let activated = state
+        .activate_due_scheduled_at(2_000, 0)
+        .expect("scheduled status activates");
+    assert_eq!(activated.source, StatusSource::Scheduled);
+    assert!(activated.source.is_automatic());
 }

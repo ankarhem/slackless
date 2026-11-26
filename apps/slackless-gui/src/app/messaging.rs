@@ -744,11 +744,238 @@ impl App {
         self.drafts
             .update(cx, |drafts, cx| drafts.record_sent(entry, cx));
     }
+}
 
+/// One candidate target when disambiguating a duplicate slash command (`F-COLLAB-686`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SlashCandidate {
+    pub app_id: Option<String>,
+    pub provider_label: String,
+    pub usage: String,
+    pub description: String,
+    pub is_builtin: bool,
+}
+
+/// Collect all distinct command targets (built-in + workspace apps) matching `invocation.name`
+/// for duplicate slash-command disambiguation (`F-COLLAB-686`).
+pub(crate) fn matching_slash_candidates(
+    invocation: &Invocation,
+    app_commands: &[slackless_core::api::AppCommand],
+) -> Vec<SlashCandidate> {
+    let mut out = Vec::new();
+    if let Some(builtin) = invocation.command {
+        out.push(SlashCandidate {
+            app_id: None,
+            provider_label: "Slackless Built-in".to_owned(),
+            usage: builtin.usage.to_owned(),
+            description: builtin.description.to_owned(),
+            is_builtin: true,
+        });
+    }
+    let mut seen = std::collections::HashSet::new();
+    for cmd in app_commands {
+        if !cmd.name.eq_ignore_ascii_case(&invocation.name) {
+            continue;
+        }
+        let key = (
+            cmd.app_id.clone().unwrap_or_default(),
+            cmd.app_name
+                .clone()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        let provider_label = cmd
+            .app_name
+            .clone()
+            .or_else(|| cmd.app_id.as_ref().map(|id| format!("App ({id})")))
+            .unwrap_or_else(|| "Workspace app".to_owned());
+        out.push(SlashCandidate {
+            app_id: cmd.app_id.clone(),
+            provider_label,
+            usage: cmd.usage.clone(),
+            description: cmd.description.clone(),
+            is_builtin: false,
+        });
+    }
+    out
+}
+
+/// Minimum member count that triggers Slack's `@channel`/`@here`/`@everyone` confirmation dialog.
+pub(crate) const BROADCAST_WARN_THRESHOLD: usize = 6;
+/// Enterprise Grid large-channel broadcast limit threshold (`F-COLLAB-1248`).
+pub(crate) const ENTERPRISE_BROADCAST_LIMIT: usize = 10_000;
+
+/// Permission & large-channel evaluation for a `@channel` / `@here` / `@everyone` mention
+/// (`F-COLLAB-1248`, `F-COLLAB-1249`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BroadcastGuard {
+    pub title: String,
+    pub body: String,
+    pub member_count: usize,
+    pub is_large_enterprise: bool,
+    pub is_restricted: bool,
+    pub restriction_note: Option<String>,
+}
+
+/// Inspect channel properties for restricted `@channel`/`@here`/`@everyone` permissions
+/// (`F-COLLAB-1249`).
+pub(crate) fn is_broadcast_restricted(conversation: &Conversation) -> bool {
+    let prop = |key: &str| -> Option<&serde_json::Value> {
+        conversation
+            .properties
+            .as_ref()
+            .and_then(|p| p.extra.get(key))
+            .or_else(|| {
+                conversation
+                    .extra
+                    .get("properties")
+                    .and_then(|p| p.get(key))
+            })
+    };
+    let at_channel_restricted = prop("at_channel_restricted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let can_broadcast_false =
+        prop("can_broadcast").and_then(serde_json::Value::as_bool) == Some(false);
+    let broadcast_restricted_to = prop("broadcast_restricted_to").is_some_and(|v| !v.is_null());
+    let posting_restricted_to = prop("posting_restricted_to").is_some_and(|v| !v.is_null());
+    at_channel_restricted
+        || can_broadcast_false
+        || broadcast_restricted_to
+        || posting_restricted_to
+        || conversation.is_org_mandatory
+}
+
+/// Human-readable `@channel / @here` permission line for Channel Details -> About -> Permissions
+/// (`F-COLLAB-1248`, `F-COLLAB-1249`).
+pub(crate) fn mention_permission_summary(
+    conversation: &Conversation,
+    member_count: usize,
+) -> String {
+    if conversation.is_archived {
+        return "@channel / @here mentions are disabled in archived channels.".to_owned();
+    }
+    if is_broadcast_restricted(conversation) {
+        return "Broadcast mentions (@channel / @here / @everyone) are restricted to Channel Managers & Workspace Admins.".to_owned();
+    }
+    if member_count >= ENTERPRISE_BROADCAST_LIMIT {
+        return format!(
+            "Large channel ({member_count} members) \u{b7} @channel / @here mentions require confirmation and may be restricted by Enterprise policy."
+        );
+    }
+    if conversation.is_general {
+        return "Default channel \u{b7} @everyone and @channel notify all workspace members (confirmation shown).".to_owned();
+    }
+    "Everyone in this channel can use @channel and @here mentions.".to_owned()
+}
+
+/// Short badge shown on `@channel`/`@here`/`@everyone` rows in the composer's `@` autocomplete
+/// (`F-COLLAB-1248`, `F-COLLAB-1249`).
+pub(crate) fn broadcast_autocomplete_hint(
+    conversation: &Conversation,
+    member_count: usize,
+) -> Option<String> {
+    if is_broadcast_restricted(conversation) {
+        return Some("Restricted".to_owned());
+    }
+    if member_count >= ENTERPRISE_BROADCAST_LIMIT {
+        return Some(format!("{member_count} members \u{b7} Limit"));
+    }
+    if member_count >= BROADCAST_WARN_THRESHOLD {
+        return Some(format!("{member_count} members"));
+    }
+    None
+}
+
+/// Evaluate whether sending `range` in `conversation` requires a confirmation / restricted-mention
+/// warning dialog (`F-COLLAB-1248`, `F-COLLAB-1249`). Returns `None` when no guard is needed.
+pub(crate) fn evaluate_broadcast_guard(
+    range: &BroadcastRange,
+    conversation: &Conversation,
+    member_count: usize,
+    current_user: Option<&slackless_core::types::User>,
+) -> Option<BroadcastGuard> {
+    let is_channel = matches!(
+        conversation.kind(),
+        ConversationKind::PublicChannel | ConversationKind::PrivateChannel
+    );
+    if !is_channel {
+        return None;
+    }
+    let restricted_channel = is_broadcast_restricted(conversation);
+    let is_large_enterprise = member_count >= ENTERPRISE_BROADCAST_LIMIT;
+    let is_admin_or_owner = current_user.is_some_and(|u| u.is_admin || u.is_owner);
+    let restricted_for_user = (restricted_channel || is_large_enterprise) && !is_admin_or_owner;
+
+    if member_count < BROADCAST_WARN_THRESHOLD && !restricted_channel {
+        return None;
+    }
+    let channel_name = conversation
+        .name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(conversation.id.as_str());
+    let title = match range {
+        BroadcastRange::Here => format!("Notify active members in #{channel_name}?"),
+        BroadcastRange::Everyone => format!("Notify everyone in #{channel_name}?"),
+        _ => format!("Notify everyone in #{channel_name}?"),
+    };
+    let count_phrase = if member_count > 0 {
+        format!(
+            "{member_count} {}",
+            if member_count == 1 {
+                "person"
+            } else {
+                "people"
+            }
+        )
+    } else {
+        "everyone".to_owned()
+    };
+    let body = format!(
+        "By using @{range}, you\u{2019}re about to notify {count_phrase} in #{channel_name}. Are you sure you want to continue?"
+    );
+    let restriction_note = if is_large_enterprise {
+        Some(if is_admin_or_owner {
+            format!(
+                "Large Enterprise channel ({member_count} members): broadcast mentions reach the entire channel."
+            )
+        } else {
+            format!(
+                "Enterprise large-channel mention limit ({member_count} members): @{range} is restricted to Workspace Admins and Channel Managers. Slack may block or suppress this notification."
+            )
+        })
+    } else if restricted_channel {
+        Some(if is_admin_or_owner {
+            "Restricted mention permissions are active in this channel; you can notify as a Workspace Admin.".to_owned()
+        } else {
+            format!(
+                "Restricted mentions: only Workspace Admins or Channel Managers can notify @{range} in #{channel_name}. Slack may block or suppress this notification."
+            )
+        })
+    } else {
+        None
+    };
+
+    Some(BroadcastGuard {
+        title,
+        body,
+        member_count,
+        is_large_enterprise,
+        is_restricted: restricted_for_user || restricted_channel,
+        restriction_note,
+    })
+}
+
+impl App {
     /// Dispatch a slash command typed in the main composer, or in the reply composer of
     /// `thread`. Live mode hands `/giphy` and commands slackless does not know to Slack
-    /// (`chat.command`; the result arrives on the websocket). Fixture mode runs the ones that
-    /// only touch local state (/shrug, /away, /status) and logs the rest with a toast.
+    /// (`chat.command`; the result arrives on the websocket). When multiple apps (or a built-in
+    /// and an app) register the same `/command` and the user did not already pick one in
+    /// autocomplete, opens the disambiguation picker dialog (`F-COLLAB-686`).
     pub(super) fn run_slash(
         &mut self,
         invocation: &Invocation,
@@ -756,9 +983,24 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let remote = invocation
-            .command
-            .is_none_or(|command| command.kind == SlashKind::Giphy);
+        if invocation.app_id.is_none() && !invocation.force_builtin {
+            let candidates = matching_slash_candidates(invocation, &self.fixtures.app_commands);
+            if candidates.len() > 1 {
+                self.open_slash_disambiguation_dialog(
+                    invocation.clone(),
+                    candidates,
+                    thread,
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
+        let remote = !invocation.force_builtin
+            && (invocation.app_id.is_some()
+                || invocation
+                    .command
+                    .is_none_or(|command| command.kind == SlashKind::Giphy));
         if remote && !self.fixtures.sample {
             let (channel, thread_ts) = match thread {
                 Some((channel, thread_ts)) => (channel, Some(thread_ts)),
@@ -769,16 +1011,57 @@ impl App {
                 command: format!("/{}", invocation.name),
                 args: invocation.args.clone(),
                 thread_ts,
+                app_id: invocation.app_id.clone(),
             });
             return;
         }
+        // In fixture mode, if an explicit workspace app command matches, surface a clean preview.
+        if remote && self.fixtures.sample {
+            let matched_app = self
+                .fixtures
+                .app_commands
+                .iter()
+                .find(|c| {
+                    c.name.eq_ignore_ascii_case(&invocation.name)
+                        && (invocation.app_id.is_none() || c.app_id == invocation.app_id)
+                })
+                .cloned();
+            if let Some(app_cmd) = matched_app {
+                let via = invocation
+                    .app_name
+                    .as_deref()
+                    .or(app_cmd.app_name.as_deref())
+                    .unwrap_or("App");
+                let summary = if invocation.args.is_empty() {
+                    format!("Ran /{} via {via}.", invocation.name)
+                } else {
+                    format!("Ran /{} {} via {via}.", invocation.name, invocation.args)
+                };
+                let (channel, thread_ts) = match thread {
+                    Some((channel, thread_ts)) => (channel, Some(thread_ts)),
+                    None => (self.channel.clone(), None),
+                };
+                let mut eph = self
+                    .fixtures
+                    .local_message(&channel, summary.clone(), thread_ts);
+                eph.user = None;
+                eph.username = Some(via.to_owned());
+                eph.is_ephemeral = true;
+                self.messages
+                    .update(cx, |list, cx| list.append(channel, eph, cx));
+                notify(
+                    &format!("/{} ({via})", invocation.name),
+                    summary,
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
         let Some(command) = invocation.command else {
-            notify(
-                "Unknown command",
-                format!("/{} is not a valid command.", invocation.name),
-                window,
-                cx,
-            );
+            let (title, detail) =
+                crate::slash::format_command_error(&invocation.name, "unknown_command");
+            notify(&title, detail, window, cx);
             return;
         };
         match command.kind {
@@ -984,57 +1267,253 @@ impl App {
         });
     }
 
+    /// Open the duplicate slash-command disambiguation picker dialog (`F-COLLAB-686`) when
+    /// multiple apps (or a built-in + an app) share `/<name>`.
+    pub(super) fn open_slash_disambiguation_dialog(
+        &self,
+        invocation: Invocation,
+        candidates: Vec<SlashCandidate>,
+        thread: Option<(ChannelId, Ts)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cmd_name = invocation.name.clone();
+        let args_preview = invocation.args.clone();
+        let this = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            let (muted, border, hover) = (theme.muted_foreground, theme.border, theme.accent);
+            let subtitle = if args_preview.is_empty() {
+                format!("Multiple apps provide /{cmd_name}. Choose which one should run it:")
+            } else {
+                format!(
+                    "Multiple apps provide /{cmd_name} ({args_preview}). Choose which one should run it:"
+                )
+            };
+            let rows: Vec<_> = candidates
+                .iter()
+                .enumerate()
+                .map(|(ix, cand)| {
+                    let this_pick = this.clone();
+                    let inv = invocation.clone();
+                    let thread_c = thread.clone();
+                    let cand_c = cand.clone();
+                    h_flex()
+                        .id(("slash-disambig-row", ix))
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .p_2p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .cursor_pointer()
+                        .hover(move |el| el.bg(hover))
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .flex_1()
+                                .gap_0p5()
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(cand.provider_label.clone()),
+                                        )
+                                        .when(!cand.usage.is_empty(), |row| {
+                                            row.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child(cand.usage.clone()),
+                                            )
+                                        }),
+                                )
+                                .when(!cand.description.is_empty(), |col| {
+                                    col.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child(cand.description.clone()),
+                                    )
+                                }),
+                        )
+                        .child(
+                            preferences::form_button(
+                                Button::new(("slash-disambig-run", ix))
+                                    .primary()
+                                    .label("Run"),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                let chosen = if cand_c.is_builtin {
+                                    inv.clone().with_builtin()
+                                } else {
+                                    inv.clone().with_app(
+                                        cand_c.app_id.clone(),
+                                        Some(cand_c.provider_label.clone()),
+                                    )
+                                };
+                                let _ = this_pick.update(cx, |app, cx| {
+                                    app.run_slash(&chosen, thread_c.clone(), window, cx);
+                                });
+                            }),
+                        )
+                })
+                .collect();
+            dialog
+                .title(format!("Choose app for /{cmd_name}"))
+                .w(px(480.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(div().text_sm().text_color(muted).child(subtitle))
+                        .child(v_flex().gap_2().children(rows))
+                        .child(
+                            h_flex().justify_end().pt_1().child(
+                                preferences::form_button(
+                                    Button::new("slash-disambig-cancel")
+                                        .outline()
+                                        .label("Cancel"),
+                                    cx,
+                                )
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                            ),
+                        ),
+                )
+        });
+    }
+
     fn send_after_secret_check(
         &mut self,
         content: MessageContent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        const BROADCAST_WARN_THRESHOLD: usize = 6;
-        if let Some(range) = broadcast_kind(&content) {
-            let conv = self.fixtures.conversation(&self.channel);
-            let is_channel = conv.is_some_and(|c| {
-                matches!(
-                    c.kind(),
-                    ConversationKind::PublicChannel | ConversationKind::PrivateChannel
-                )
-            });
+        if let Some(range) = broadcast_kind(&content)
+            && let Some(conv) = self.fixtures.conversation(&self.channel)
+        {
             let members = self
                 .ws
                 .member_counts
                 .get(&self.channel)
                 .map(|&n| n as usize)
-                .or_else(|| conv.and_then(|c| c.num_members.map(|n| n as usize)))
-                .or_else(|| conv.map(|c| c.members.len()))
-                .unwrap_or(0);
-            if is_channel && members >= BROADCAST_WARN_THRESHOLD {
-                let channel_name = conv
-                    .and_then(|c| c.name.clone())
-                    .unwrap_or_else(|| self.channel.to_string());
-                let title = match range {
-                    BroadcastRange::Here => format!("Notify active members in #{channel_name}?"),
-                    _ => format!("Notify everyone in #{channel_name}?"),
-                };
-                let body = format!(
-                    "By using @{range}, you\u{2019}re about to notify {members} people in #{channel_name}. Are you sure you want to continue?"
-                );
+                .or_else(|| conv.num_members.map(|n| n as usize))
+                .unwrap_or(conv.members.len());
+            let me = self.fixtures.user(&self.fixtures.self_user);
+            if let Some(guard) = evaluate_broadcast_guard(&range, conv, members, me) {
                 let this = cx.weak_entity();
                 let send_content = content.clone();
                 let cancel_text = content.text.clone();
                 window.open_dialog(cx, move |dialog, _, cx| {
-                    let muted = cx.theme().muted_foreground;
+                    let theme = cx.theme();
+                    let (muted, warning, border, card_bg) = (
+                        theme.muted_foreground,
+                        theme.warning,
+                        theme.border,
+                        theme.secondary.opacity(0.4),
+                    );
                     let this_cancel = this.clone();
                     let this_send = this.clone();
                     let send_content = send_content.clone();
                     let cancel_text = cancel_text.clone();
-                    dialog.title(title.clone()).w(px(460.)).child(
+                    let count_badge = if guard.is_large_enterprise {
+                        format!(
+                            "{} members \u{b7} Large Enterprise channel",
+                            guard.member_count
+                        )
+                    } else if guard.member_count > 0 {
+                        format!(
+                            "{} {}",
+                            guard.member_count,
+                            if guard.member_count == 1 {
+                                "member"
+                            } else {
+                                "members"
+                            }
+                        )
+                    } else {
+                        "Channel broadcast".to_owned()
+                    };
+                    dialog.title(guard.title.clone()).w(px(480.)).child(
                         v_flex()
-                            .gap_4()
-                            .child(div().text_color(muted).child(body.clone()))
+                            .gap_3()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_sm()
+                                            .border_1()
+                                            .border_color(border)
+                                            .bg(card_bg)
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(
+                                                Icon::new(IconName::Users)
+                                                    .size(px(12.))
+                                                    .text_color(muted),
+                                            )
+                                            .child(count_badge),
+                                    )
+                                    .when(guard.is_restricted, |row| {
+                                        row.child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .border_1()
+                                                .border_color(warning.opacity(0.45))
+                                                .bg(warning.opacity(0.14))
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(warning)
+                                                .child(
+                                                    Icon::new(IconName::TriangleAlert)
+                                                        .size(px(12.))
+                                                        .text_color(warning),
+                                                )
+                                                .child("Restricted mention"),
+                                        )
+                                    }),
+                            )
+                            .child(div().text_sm().text_color(muted).child(guard.body.clone()))
+                            .when_some(guard.restriction_note.clone(), |col, note| {
+                                col.child(
+                                    h_flex()
+                                        .items_start()
+                                        .gap_2()
+                                        .p_2p5()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(warning.opacity(0.4))
+                                        .bg(warning.opacity(0.1))
+                                        .text_xs()
+                                        .child(
+                                            Icon::new(IconName::TriangleAlert)
+                                                .size(px(14.))
+                                                .text_color(warning),
+                                        )
+                                        .child(div().flex_1().min_w_0().child(note)),
+                                )
+                            })
                             .child(
                                 h_flex()
                                     .gap_2()
                                     .justify_end()
+                                    .pt_1()
                                     .child(
                                         preferences::form_button(
                                             Button::new("broadcast-cancel")
@@ -1055,7 +1534,15 @@ impl App {
                                     )
                                     .child(
                                         preferences::form_button(
-                                            Button::new("broadcast-send").primary().label("Send"),
+                                            if guard.is_restricted {
+                                                Button::new("broadcast-send")
+                                                    .danger()
+                                                    .label("Send anyway")
+                                            } else {
+                                                Button::new("broadcast-send")
+                                                    .primary()
+                                                    .label("Send")
+                                            },
                                             cx,
                                         )
                                         .on_click(

@@ -308,6 +308,9 @@ impl ChannelDetails {
     fn render_about_tab(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let conversation = self.conversation().cloned().unwrap_or_default();
         let is_channel = !conversation.is_im && !conversation.is_mpim;
+        // `#general` can be renamed by workspace admins (`F-COLLAB-1236`), though it still
+        // cannot be archived or deleted (`can_manage`).
+        let can_rename = is_channel;
         let can_manage = is_channel && !conversation.is_general;
 
         let cards = v_flex()
@@ -315,7 +318,7 @@ impl ChannelDetails {
             .px(px(PAD))
             .py_4()
             .gap_2()
-            .child(self.render_name_card(&conversation, can_manage, cx))
+            .child(self.render_name_card(&conversation, can_rename, cx))
             .child(self.field_card(
                 "Topic",
                 EditField::Topic,
@@ -343,12 +346,12 @@ impl ChannelDetails {
             .child(cards)
     }
 
-    /// Channel name card: editable on channels other than #general, with Slack's privacy note on
-    /// private channels.
+    /// Channel name card: editable on all channels including `#general` (`F-COLLAB-1236`), with
+    /// Slack's privacy note on private / shared / default channels.
     fn render_name_card(
         &self,
         conversation: &Conversation,
-        can_manage: bool,
+        can_rename: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = cx.theme();
@@ -366,6 +369,14 @@ impl ChannelDetails {
 
         if let Some(draft) = editing_name {
             return card("Channel name", None, border)
+                .when(conversation.is_general, |col| {
+                    col.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_foreground)
+                            .child("Renaming the default workspace channel updates it for all members (requires admin permission)."),
+                    )
+                })
                 .child(crate::preferences::text_input_box(&draft, false, cx))
                 .child(
                     h_flex()
@@ -391,7 +402,7 @@ impl ChannelDetails {
                 );
         }
 
-        let edit_name = can_manage.then(|| {
+        let edit_name = can_rename.then(|| {
             Button::new("details-edit-Name")
                 .ghost()
                 .with_size(Size::XSmall)
@@ -400,6 +411,14 @@ impl ChannelDetails {
                 .into_any_element()
         });
         let mut c = card("Channel name", edit_name, border);
+        if conversation.is_general {
+            c = c.child(
+                div()
+                    .text_xs()
+                    .text_color(muted_foreground)
+                    .child("Default workspace channel \u{b7} Admins can rename it (cannot be archived or deleted)"),
+            );
+        }
         if conversation.is_private {
             let privacy_note = if conversation.is_external_connect() {
                 "Private · Shared with external organizations"
@@ -494,6 +513,12 @@ impl ChannelDetails {
         } else {
             "Everyone in this channel can post."
         };
+        let member_count = if self.members.is_empty() {
+            conversation.num_members.unwrap_or(0) as usize
+        } else {
+            self.rows.len()
+        };
+        let mention_policy = crate::app::mention_permission_summary(conversation, member_count);
         let managers_line = if manager_names.is_empty() {
             "Workspace Admins & Owners".to_owned()
         } else {
@@ -517,6 +542,12 @@ impl ChannelDetails {
                     .text_xs()
                     .text_color(muted_foreground)
                     .child(posting_policy),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted_foreground)
+                    .child(mention_policy),
             )
             .child(
                 div()

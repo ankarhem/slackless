@@ -107,6 +107,8 @@ pub struct EmojiPicker {
     jumped: Option<Category>,
     /// Cell under the pointer, previewed in the footer.
     hovered: Option<EmojiChoice>,
+    /// True when picking emoji inside a Slack Connect (`is_ext_shared`) channel (`F-COLLAB-878`).
+    external_channel: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -201,9 +203,18 @@ impl EmojiPicker {
                 grid: UniformListScrollHandle::new(),
                 jumped: None,
                 hovered: None,
+                external_channel: false,
                 _subscriptions: subscriptions,
             }
         })
+    }
+
+    /// Mark whether the picker is opened for an externally shared Slack Connect channel (`F-COLLAB-878`).
+    pub fn set_external_channel(&mut self, external: bool, cx: &mut Context<Self>) {
+        if self.external_channel != external {
+            self.external_channel = external;
+            cx.notify();
+        }
     }
 
     /// Reset to the top of the grid with an empty, focused search on `tab`.
@@ -793,6 +804,24 @@ impl Render for EmojiPicker {
             .child(preview)
             .child(skin);
 
+        let external_notice = self.external_channel.then(|| {
+            h_flex()
+                .mx_4()
+                .mt_2()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(footer_bg)
+                .items_center()
+                .gap_1p5()
+                .text_xs()
+                .text_color(muted)
+                .child(Icon::new(IconName::Globe).size(px(12.)).text_color(muted))
+                .child("Slack Connect \u{b7} Custom workspace emoji are visible to external people here")
+        });
+
         v_flex()
             .id("emoji-picker")
             .occlude()
@@ -807,6 +836,7 @@ impl Render for EmojiPicker {
             .children(top_tabs)
             .child(tabs)
             .child(search)
+            .children(external_notice)
             .child(grid)
             .child(footer)
     }

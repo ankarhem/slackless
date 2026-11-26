@@ -132,9 +132,62 @@ impl App {
             _ => Vec::new(),
         };
         let bar = self.connect_bar(cx);
-        self.composer
-            .update(cx, |composer, cx| composer.set_context_bar(bar, cx));
+        let ext_file_notice = self.external_file_sharing_notice();
+        let broadcast_hint = self.open_channel_broadcast_hint();
+        self.composer.update(cx, |composer, cx| {
+            composer.set_context_bar(bar, cx);
+            composer.set_external_file_notice(ext_file_notice.clone(), cx);
+            composer.set_broadcast_hint(broadcast_hint, cx);
+        });
         self.sync_thread_bar(cx);
+    }
+
+    /// Slack Connect external file-sharing notice shown when files are staged in an
+    /// externally shared channel (`F-COLLAB-879`).
+    pub(in crate::app) fn external_file_sharing_notice(&self) -> Option<SharedString> {
+        let conversation = self.fixtures.conversation(&self.channel)?;
+        if !conversation.is_ext_shared {
+            return None;
+        }
+        let mut names: Vec<String> = self
+            .fixtures
+            .shared_teams(conversation)
+            .into_iter()
+            .map(|t| t.name.clone())
+            .collect();
+        if names.is_empty() {
+            names = self
+                .connect_orgs
+                .iter()
+                .map(|org| org.team.name.clone())
+                .collect();
+        }
+        let target = match names.as_slice() {
+            [] => "external organizations".to_owned(),
+            [one] => one.clone(),
+            [a, b] => format!("{a} and {b}"),
+            many => format!("{} external organizations", many.len()),
+        };
+        Some(
+            format!(
+                "Slack Connect \u{b7} Files added here will be shared externally with {target}"
+            )
+            .into(),
+        )
+    }
+
+    /// Autocomplete badge for `@channel`/`@here`/`@everyone` in the open conversation
+    /// (`F-COLLAB-1248`, `F-COLLAB-1249`).
+    pub(in crate::app) fn open_channel_broadcast_hint(&self) -> Option<SharedString> {
+        let conv = self.fixtures.conversation(&self.channel)?;
+        let members = self
+            .ws
+            .member_counts
+            .get(&self.channel)
+            .map(|&n| n as usize)
+            .or_else(|| conv.num_members.map(|n| n as usize))
+            .unwrap_or(conv.members.len());
+        crate::app::broadcast_autocomplete_hint(conv, members).map(SharedString::from)
     }
 
     /// Slack shows the channel's Slack Connect bar over the thread's reply box too.

@@ -131,17 +131,36 @@ pub(in crate::methods) struct AppCommandsWire {
 }
 
 pub(in crate::methods) fn parse_app_commands(wire: AppCommandsWire) -> Vec<AppCommand> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen_names = std::collections::HashSet::new();
+    let mut seen_attributed = std::collections::HashSet::new();
     let mut out = Vec::new();
     for cmd in wire.commands {
         let name = cmd.name.trim().trim_start_matches('/').to_lowercase();
-        if name.is_empty() || !seen.insert(name.clone()) {
+        if name.is_empty() {
             continue;
         }
+        let app_id = cmd.app.filter(|s| !s.is_empty());
         let app_name = cmd
             .app_name
             .filter(|s| !s.is_empty())
             .or_else(|| cmd.service_name.filter(|s| !s.is_empty()));
+        // Preserve duplicate `/command` registrations across distinct apps (`F-COLLAB-686`),
+        // while deduplicating identical app attributions and unattributed duplicate rows.
+        if app_id.is_none() && app_name.is_none() {
+            if !seen_names.insert(name.clone()) {
+                continue;
+            }
+        } else {
+            let dedup_key = (
+                name.clone(),
+                app_id.clone().unwrap_or_default(),
+                app_name.clone().unwrap_or_default().to_ascii_lowercase(),
+            );
+            if !seen_attributed.insert(dedup_key) {
+                continue;
+            }
+            seen_names.insert(name.clone());
+        }
         let description = if !cmd.desc.trim().is_empty() {
             cmd.desc.trim().to_owned()
         } else if let Some(alias) = cmd.alias_of.filter(|s| !s.is_empty()) {
@@ -154,10 +173,113 @@ pub(in crate::methods) fn parse_app_commands(wire: AppCommandsWire) -> Vec<AppCo
             usage: cmd.usage.trim().to_owned(),
             description,
             app_name,
-            app_id: cmd.app.filter(|s| !s.is_empty()),
+            app_id,
         });
     }
     out
+}
+
+/// Optional immediate response payload returned by `chat.command` (`F-COLLAB-684`).
+/// Most slash commands reply asynchronously over the websocket, so both fields default to `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct CommandResponse {
+    /// `"in_channel"` or `"ephemeral"`, when returned inline.
+    #[serde(default)]
+    pub response_type: Option<String>,
+    /// Immediate response text, if any.
+    #[serde(default, alias = "response")]
+    pub text: Option<String>,
+}
+
+/// Workspace custom/standard profile field metadata from `team.profile.get`, including
+/// SCIM / admin lock indicators (`F-SHELL-005`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TeamProfileField {
+    pub id: String,
+    pub label: String,
+    pub field_name: Option<String>,
+    pub is_hidden: bool,
+    pub is_locked: bool,
+    pub lock_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(in crate::methods) struct TeamProfileFieldWire {
+    pub(in crate::methods) id: String,
+    #[serde(default)]
+    pub(in crate::methods) label: String,
+    #[serde(default)]
+    pub(in crate::methods) field_name: Option<String>,
+    #[serde(default)]
+    pub(in crate::methods) is_hidden: bool,
+    #[serde(default)]
+    pub(in crate::methods) is_scim: bool,
+    #[serde(default)]
+    pub(in crate::methods) is_locked: bool,
+    #[serde(default)]
+    pub(in crate::methods) options: Option<Value>,
+    #[serde(default)]
+    pub(in crate::methods) permissions: Option<Value>,
+}
+
+#[derive(Deserialize, Default)]
+pub(in crate::methods) struct TeamProfileDefWire {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub(in crate::methods) fields: Vec<TeamProfileFieldWire>,
+}
+
+#[derive(Deserialize, Default)]
+pub(in crate::methods) struct TeamProfileWire {
+    #[serde(default)]
+    pub(in crate::methods) profile: TeamProfileDefWire,
+}
+
+pub(in crate::methods) fn parse_team_profile_fields(
+    wire: TeamProfileWire,
+) -> Vec<TeamProfileField> {
+    wire.profile
+        .fields
+        .into_iter()
+        .map(|f| {
+            let opt_scim = f
+                .options
+                .as_ref()
+                .and_then(|o| o.get("is_scim").and_then(Value::as_bool))
+                .unwrap_or(false);
+            let opt_protected = f
+                .options
+                .as_ref()
+                .and_then(|o| o.get("is_protected").and_then(Value::as_bool))
+                .unwrap_or(false);
+            let perm_scim = f
+                .permissions
+                .as_ref()
+                .and_then(|p| p.get("scim").and_then(Value::as_bool))
+                .unwrap_or(false);
+            let perm_ui_locked = f
+                .permissions
+                .as_ref()
+                .and_then(|p| p.get("ui").and_then(Value::as_bool))
+                == Some(false);
+            let is_scim = f.is_scim || opt_scim || perm_scim;
+            let is_locked = f.is_locked || is_scim || opt_protected || perm_ui_locked;
+            let lock_reason = if is_scim {
+                Some("Managed by SCIM / identity provider".to_owned())
+            } else if is_locked {
+                Some("Locked by workspace admin".to_owned())
+            } else {
+                None
+            };
+            TeamProfileField {
+                id: f.id,
+                label: f.label,
+                field_name: f.field_name.filter(|s| !s.trim().is_empty()),
+                is_hidden: f.is_hidden,
+                is_locked,
+                lock_reason,
+            }
+        })
+        .collect()
 }
 
 /// Structured outcome of `views.submit` (`F-COLLAB-605..612`).

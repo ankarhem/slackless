@@ -140,6 +140,23 @@ pub trait MessagingBackend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<()>> + Send {
         async { Ok(()) }
     }
+    /// Run a slash command with optional `app_id` disambiguation (`F-COLLAB-686`) and inline
+    /// response parsing (`F-COLLAB-684`). Defaults to delegating to [`Self::run_command`].
+    fn run_command_for_app(
+        &self,
+        channel: ChannelId,
+        command: String,
+        args: String,
+        thread_ts: Option<Ts>,
+        team: TeamId,
+        _app_id: Option<String>,
+    ) -> impl Future<Output = api::Result<api::CommandResponse>> + Send {
+        async move {
+            self.run_command(channel, command, args, thread_ts, team)
+                .await?;
+            Ok(api::CommandResponse::default())
+        }
+    }
     /// Dispatch a Block Kit interaction (`blocks.actions`).
     fn block_action(
         &self,
@@ -502,6 +519,23 @@ pub trait UsersBackend: Clone + Send + Sync + 'static {
         &self,
     ) -> impl Future<Output = api::Result<HashMap<String, String>>> + Send {
         async { Ok(HashMap::new()) }
+    }
+    /// Fetch full workspace profile field definitions including SCIM / admin lock metadata
+    /// (`F-SHELL-005`). Defaults to projecting [`Self::team_profile_fields`] as unlocked fields.
+    fn team_profile_field_defs(
+        &self,
+    ) -> impl Future<Output = api::Result<Vec<api::TeamProfileField>>> + Send {
+        async move {
+            let map = self.team_profile_fields().await?;
+            Ok(map
+                .into_iter()
+                .map(|(id, label)| api::TeamProfileField {
+                    id,
+                    label,
+                    ..Default::default()
+                })
+                .collect())
+        }
     }
     /// Upload a new profile photo (`users.setPhoto`, `F-SHELL-004`).
     fn users_set_photo(

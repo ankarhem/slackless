@@ -23,6 +23,11 @@ pub(super) struct SlashEntry {
     pub usage: String,
     pub description: String,
     pub app_name: Option<String>,
+    pub app_id: Option<String>,
+    /// True when multiple apps (or a built-in + an app) register the same `/name` (`F-COLLAB-686`).
+    pub is_duplicate: bool,
+    /// True for a Slackless built-in command.
+    pub is_builtin: bool,
 }
 
 pub(super) enum Entry {
@@ -78,38 +83,56 @@ impl Menu {
     }
 
     /// Whether the highlighted row is the slash command already typed in full, which Enter
-    /// sends instead of completing.
+    /// sends instead of completing. When multiple apps share that command name (`is_duplicate`),
+    /// returns `false` so Enter explicitly picks the highlighted app entry (`F-COLLAB-686`).
     pub fn is_typed_command(&self, typed: &str) -> bool {
         matches!(
             self.entries.get(self.selected),
-            Some(Entry::Slash(command)) if slash::typing(typed).is_some_and(|t| t.eq_ignore_ascii_case(&command.name))
+            Some(Entry::Slash(command))
+                if !command.is_duplicate
+                    && slash::typing(typed).is_some_and(|t| t.eq_ignore_ascii_case(&command.name))
         )
     }
 }
 
 /// Built-in commands merged with the workspace's `client.appCommands`, prefix matches ahead of
-/// substring matches and deduplicated by name.
+/// substring matches. Duplicate command names across distinct apps (or built-in + app) are all
+/// preserved and flagged with `is_duplicate = true` so the user can disambiguate (`F-COLLAB-686`).
 fn slash_commands(fixtures: &Fixtures, query: &str) -> Vec<Entry> {
     let query = query.to_lowercase();
-    let mut seen = std::collections::HashSet::new();
-    let mut found: Vec<(u8, String, SlashEntry)> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+    let mut found: Vec<(u8, String, u8, String, SlashEntry)> = Vec::new();
     for cmd in &slash::BUILTINS {
         if let Some(score) = rank(cmd.name, &query) {
-            seen.insert(cmd.name.to_owned());
+            seen.insert((cmd.name.to_owned(), String::new(), String::new()));
             found.push((
                 score,
                 cmd.name.to_owned(),
+                0,
+                String::new(),
                 SlashEntry {
                     name: cmd.name.to_owned(),
                     usage: cmd.usage.to_owned(),
                     description: cmd.description.to_owned(),
                     app_name: None,
+                    app_id: None,
+                    is_duplicate: false,
+                    is_builtin: true,
                 },
             ));
         }
     }
     for cmd in &fixtures.app_commands {
-        if seen.contains(&cmd.name) {
+        let dedup_key = (
+            cmd.name.clone(),
+            cmd.app_id.clone().unwrap_or_default(),
+            cmd.app_name
+                .clone()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+        );
+        if !seen.insert(dedup_key) {
             continue;
         }
         let score = [Some(cmd.name.as_str()), cmd.app_name.as_deref()]
@@ -118,24 +141,38 @@ fn slash_commands(fixtures: &Fixtures, query: &str) -> Vec<Entry> {
             .filter_map(|field| rank(field, &query))
             .min();
         if let Some(score) = score {
-            seen.insert(cmd.name.clone());
+            let app_sort = cmd.app_name.clone().unwrap_or_default().to_lowercase();
             found.push((
                 score,
                 cmd.name.clone(),
+                1,
+                app_sort,
                 SlashEntry {
                     name: cmd.name.clone(),
                     usage: cmd.usage.clone(),
                     description: cmd.description.clone(),
                     app_name: cmd.app_name.clone(),
+                    app_id: cmd.app_id.clone(),
+                    is_duplicate: false,
+                    is_builtin: false,
                 },
             ));
         }
     }
-    found.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    // Count how many distinct providers share each command name across built-ins + workspace apps.
+    let mut name_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (_, name, _, _, _) in &found {
+        *name_counts.entry(name.clone()).or_insert(0) += 1;
+    }
+    for (_, name, _, _, entry) in &mut found {
+        entry.is_duplicate = name_counts.get(name).copied().unwrap_or(0) > 1;
+    }
+    found.sort_unstable_by(|a, b| (a.0, &a.1, a.2, &a.3).cmp(&(b.0, &b.1, b.2, &b.3)));
     found.truncate(LIMIT);
     found
         .into_iter()
-        .map(|(_, _, entry)| Entry::Slash(entry))
+        .map(|(_, _, _, _, entry)| Entry::Slash(entry))
         .collect()
 }
 
@@ -271,7 +308,15 @@ impl Composer {
                 self.editor
                     .insert_atom(menu.range, Atom::Emoji(name.into()), &text);
             }
-            Entry::Slash(command) => self.editor.replace_all(&format!("/{} ", command.name)),
+            Entry::Slash(command) => {
+                self.selected_slash_target = Some(super::SelectedSlashTarget {
+                    name: command.name.clone(),
+                    app_id: command.app_id,
+                    app_name: command.app_name,
+                    is_builtin: command.is_builtin,
+                });
+                self.editor.replace_all(&format!("/{} ", command.name));
+            }
         }
         self.push(window, cx);
         self.focus_input(window, cx);
@@ -346,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_commands_prefers_builtins_dedups_and_caps_at_limit() {
+    fn slash_commands_preserves_duplicates_marks_them_and_caps_at_limit() {
         let mut fixtures = crate::fixtures::load();
         fixtures.app_commands = vec![
             AppCommand {
@@ -354,37 +399,63 @@ mod tests {
                 usage: "[custom]".into(),
                 description: "App duplicate of builtin".into(),
                 app_name: Some("DupApp".into()),
-                app_id: None,
+                app_id: Some("A0DUP".into()),
             },
             AppCommand {
                 name: "deploy".into(),
                 usage: "<env>".into(),
                 description: "Deploy service".into(),
                 app_name: Some("ReleaseBot".into()),
-                app_id: None,
+                app_id: Some("A0REL".into()),
             },
             AppCommand {
                 name: "deploy".into(),
                 usage: "<dup>".into(),
                 description: "Duplicate app command".into(),
                 app_name: Some("OtherBot".into()),
-                app_id: None,
+                app_id: Some("A0OTH".into()),
             },
         ];
 
-        // Builtin `shrug` wins over app command with same name.
+        // Builtin `shrug` sorts ahead of app duplicate, and BOTH are preserved & flagged duplicate (`F-COLLAB-686`).
         let shrug = slash_commands(&fixtures, "shrug");
-        assert_eq!(shrug.len(), 1);
-        match &shrug[0] {
-            Entry::Slash(entry) => assert_eq!(entry.app_name, None),
-            _ => panic!("expected Slash entry"),
+        assert_eq!(shrug.len(), 2);
+        match (&shrug[0], &shrug[1]) {
+            (Entry::Slash(first), Entry::Slash(second)) => {
+                assert!(first.is_builtin);
+                assert!(first.is_duplicate);
+                assert_eq!(first.app_name, None);
+                assert!(!second.is_builtin);
+                assert!(second.is_duplicate);
+                assert_eq!(second.app_name.as_deref(), Some("DupApp"));
+            }
+            _ => panic!("expected Slash entries"),
         }
 
-        // App commands match by `app_name` and dedup by `name`.
+        // Duplicate `/deploy` entries from distinct apps are both surfaced with `is_duplicate = true`.
+        let deploys = slash_commands(&fixtures, "deploy");
+        assert_eq!(deploys.len(), 2);
+        for entry in &deploys {
+            match entry {
+                Entry::Slash(s) => {
+                    assert_eq!(s.name, "deploy");
+                    assert!(s.is_duplicate);
+                }
+                _ => panic!("expected Slash entry"),
+            }
+        }
+        // Typing `/deploy` in full does NOT auto-submit while duplicates exist; Enter picks the highlighted app.
+        let dup_menu = Menu::at_caret(&editor_with("/deploy"), &fixtures).expect("deploy menu");
+        assert!(!dup_menu.is_typed_command("/deploy"));
+
+        // App commands match by `app_name`.
         let by_app = slash_commands(&fixtures, "releasebot");
         assert_eq!(by_app.len(), 1);
         match &by_app[0] {
-            Entry::Slash(entry) => assert_eq!(entry.name, "deploy"),
+            Entry::Slash(entry) => {
+                assert_eq!(entry.name, "deploy");
+                assert_eq!(entry.app_id.as_deref(), Some("A0REL"));
+            }
             _ => panic!("expected Slash entry"),
         }
 

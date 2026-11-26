@@ -232,6 +232,19 @@ impl Render for UserMenu {
                 Some(status) => boxel
                     .child(status.glyph())
                     .child(div().flex_1().truncate().child(status.text.clone()))
+                    .when_some(status.source.short_label(), |row, tag| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .px_1()
+                                .py(px(1.))
+                                .rounded_sm()
+                                .bg(border.opacity(0.6))
+                                .text_size(px(10.))
+                                .text_color(muted)
+                                .child(tag),
+                        )
+                    })
                     .child(
                         div()
                             .id("menu-status-clear")

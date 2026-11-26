@@ -443,6 +443,16 @@ pub(super) enum ActiveClipRecorder {
     },
 }
 
+/// App/built-in target chosen from the `/` autocomplete menu when disambiguating duplicate
+/// slash command names (`F-COLLAB-686`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SelectedSlashTarget {
+    pub name: String,
+    pub app_id: Option<String>,
+    pub app_name: Option<String>,
+    pub is_builtin: bool,
+}
+
 pub struct Composer {
     /// The textarea the draft is typed in.
     input: Entity<TextareaState>,
@@ -451,6 +461,14 @@ pub struct Composer {
     fixtures: Arc<Fixtures>,
     /// The completion menu open at the caret.
     menu: Option<Menu>,
+    /// Explicit slash-command target picked from autocomplete (`F-COLLAB-686`).
+    selected_slash_target: Option<SelectedSlashTarget>,
+    /// Optional broadcast permission/size badge shown on `@channel`/`@here`/`@everyone` rows
+    /// (`F-COLLAB-1248`, `F-COLLAB-1249`).
+    broadcast_hint: Option<SharedString>,
+    /// Optional Slack Connect external-sharing warning shown when files are staged in an
+    /// externally shared channel (`F-COLLAB-879`).
+    external_file_notice: Option<SharedString>,
     /// Where Esc closed the menu: it stays closed while the same trigger is being typed.
     dismissed: Option<usize>,
     /// The URL field of the link prompt, shown while `link_open`.
@@ -587,6 +605,9 @@ impl Composer {
                 editor: Editor::default(),
                 fixtures,
                 menu: None,
+                selected_slash_target: None,
+                broadcast_hint: None,
+                external_file_notice: None,
                 dismissed: None,
                 link_input,
                 link_open: false,
@@ -653,6 +674,28 @@ impl Composer {
     pub fn set_context_bar(&mut self, bar: Option<ContextBar>, cx: &mut Context<Self>) {
         self.context_bar = bar;
         cx.notify();
+    }
+
+    /// Update the broadcast mention hint shown on `@channel`/`@here`/`@everyone` autocomplete
+    /// rows for the open conversation (`F-COLLAB-1248`, `F-COLLAB-1249`).
+    pub fn set_broadcast_hint(&mut self, hint: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.broadcast_hint != hint {
+            self.broadcast_hint = hint;
+            cx.notify();
+        }
+    }
+
+    /// Update the Slack Connect external file-sharing notice shown when files are staged in
+    /// an externally shared channel (`F-COLLAB-879`).
+    pub fn set_external_file_notice(
+        &mut self,
+        notice: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.external_file_notice != notice {
+            self.external_file_notice = notice;
+            cx.notify();
+        }
     }
 
     /// Prompt with `placeholder` while empty ("Message #general"); applied on the next frame.

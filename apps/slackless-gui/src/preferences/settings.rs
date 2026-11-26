@@ -349,6 +349,10 @@ pub struct Settings {
     pub proxy_url: String,
     /// Capture redacted HTTP request/response diagnostics in memory (`F-SHELL-158`).
     pub net_log_enabled: bool,
+    /// Opt into beta / pre-release GitHub Releases builds (`F-SHELL-164`).
+    pub beta_updates: bool,
+    /// Display pronouns on your profile by default (`F-SHELL-010`).
+    pub show_pronouns: bool,
     // Privacy & archive ("beyond Slack" local features)
     /// Show locally preserved deleted messages inline as muted ghost tombstones.
     pub show_deleted_messages: bool,
@@ -491,6 +495,8 @@ impl Default for Settings {
             ask_download_location: false,
             proxy_url: String::new(),
             net_log_enabled: false,
+            beta_updates: false,
+            show_pronouns: true,
             show_deleted_messages: false,
             stealth_mode: false,
             strip_tracking_params: true,
@@ -572,6 +578,15 @@ impl Settings {
             || lower.starts_with("urgent ")
             || text.contains('\u{1F6A8}')
             || lower.contains(":rotating_light:")
+    }
+
+    /// Active GitHub Releases update channel (`F-SHELL-164`).
+    pub fn update_channel(&self) -> slackless_core::domain::updater::UpdateChannel {
+        if self.beta_updates {
+            slackless_core::domain::updater::UpdateChannel::Beta
+        } else {
+            slackless_core::domain::updater::UpdateChannel::Stable
+        }
     }
 
     /// Active huddle transcription provider (`SlackBuiltIn` by default; local models opt-in).

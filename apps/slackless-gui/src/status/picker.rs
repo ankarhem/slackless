@@ -16,7 +16,9 @@ use gpui_kit::gpui::{
 use crate::emoji::glyph as emoji_glyph;
 use crate::messages::clock;
 
-use super::{CLEAR_AFTER, EMOJI_CHOICES, PauseLength, SUGGESTED, ScheduledStatus, UserStatus};
+use super::{
+    CLEAR_AFTER, EMOJI_CHOICES, PauseLength, SUGGESTED, ScheduledStatus, StatusSource, UserStatus,
+};
 
 pub enum StatusEvent {
     /// The status to set; `None` clears it.
@@ -47,6 +49,8 @@ pub struct StatusPicker {
     recent: Vec<(String, String, usize)>,
     /// Upcoming scheduled statuses shown for management (`F-SHELL-019`).
     scheduled: Vec<ScheduledStatus>,
+    /// Origin of the currently loaded status (automatic vs manual; `F-SHELL-020`).
+    source: StatusSource,
     emoji_open: bool,
     clear_open: bool,
     _subscriptions: Vec<Subscription>,
@@ -85,6 +89,7 @@ impl StatusPicker {
                 presets: Vec::new(),
                 recent: Vec::new(),
                 scheduled: Vec::new(),
+                source: StatusSource::Manual,
                 emoji_open: false,
                 clear_open: false,
                 _subscriptions: subscriptions,
@@ -133,19 +138,27 @@ impl StatusPicker {
     }
 
     fn load(&mut self, status: Option<&UserStatus>, window: &mut Window, cx: &mut Context<Self>) {
-        let (emoji, text, clear_after, pause) = match status {
+        let (emoji, text, clear_after, pause, source) = match status {
             Some(status) => (
                 status.emoji.clone(),
                 status.text.clone(),
                 status.clear_after,
                 status.pause,
+                status.source,
             ),
-            None => (EMOJI_CHOICES[0].to_owned(), String::new(), 0, false),
+            None => (
+                EMOJI_CHOICES[0].to_owned(),
+                String::new(),
+                0,
+                false,
+                StatusSource::Manual,
+            ),
         };
         self.emoji = emoji;
         self.emoji_set = status.is_some();
         self.clear_after = clear_after;
         self.pause = pause;
+        self.source = source;
         self.has_text = !text.is_empty();
         self.emoji_open = false;
         self.clear_open = false;
@@ -163,6 +176,7 @@ impl StatusPicker {
                 clear_after: self.clear_after,
                 pause: self.pause,
                 expiration: None,
+                source: StatusSource::Manual,
             };
             s.expiration = s.clears_at();
             self.recent.retain(|(_, t, _)| t != &text);
@@ -189,6 +203,7 @@ impl StatusPicker {
                 clear_after,
                 pause: false,
                 expiration: None,
+                source: StatusSource::Manual,
             }),
             window,
             cx,
@@ -631,14 +646,55 @@ impl Render for StatusPicker {
                 }))
         });
 
+        let auto_source_cue = self.source.badge_label().map(|label| {
+            h_flex()
+                .items_center()
+                .gap_2()
+                .px_2p5()
+                .py_1p5()
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(hover.opacity(0.45))
+                .text_xs()
+                .text_color(muted)
+                .child(
+                    Icon::new(IconName::Sparkles)
+                        .size(px(13.))
+                        .text_color(muted),
+                )
+                .child(div().flex_1().min_w_0().child(format!(
+                    "{label} \u{b7} Editing replaces this automatic status with a manual one"
+                )))
+        });
+
+        let visibility_cue = {
+            let ws = if self.workspace.is_empty() {
+                "your workspace".to_owned()
+            } else {
+                self.workspace.to_string()
+            };
+            h_flex()
+                .items_center()
+                .gap_1p5()
+                .text_xs()
+                .text_color(muted)
+                .child(Icon::new(IconName::Globe).size(px(12.)).text_color(muted))
+                .child(format!(
+                    "Visible to everyone in {ws} and connected Slack Connect channels"
+                ))
+        };
+
         v_flex()
             .w_full()
             .gap_3()
             .child(field)
+            .children(auto_source_cue)
             .children(emoji_grid)
             .children(suggestions)
             .children(details)
             .children(upcoming)
+            .child(visibility_cue)
             .child(footer)
     }
 }

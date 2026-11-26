@@ -10,11 +10,11 @@ use std::path::PathBuf;
 use std::process::Command;
 
 pub use slackless_core::domain::updater::{
-    RELEASES_REPO, ReleaseInfo, current_app_bundle, dir_in_path, is_newer_version,
+    RELEASES_REPO, ReleaseInfo, UpdateChannel, current_app_bundle, dir_in_path, is_newer_version,
 };
 use slackless_core::domain::updater::{
-    cli_candidate_dirs, fetch_latest_release_for_blocking, install_cli_symlink_at, is_dev_version,
-    resolve_cli_link_path,
+    cli_candidate_dirs, fetch_latest_release_for_channel_blocking, install_cli_symlink_at,
+    is_dev_version, resolve_cli_link_path,
 };
 #[cfg(target_os = "macos")]
 use slackless_core::domain::updater::{
@@ -153,11 +153,12 @@ pub fn installed_version() -> String {
     CURRENT_VERSION.to_owned()
 }
 
-/// Query GitHub Releases for the latest macOS arm64 release via pure-Rust `reqwest`.
-/// Returns `Ok(Some(info))` if a newer version is available, `Ok(None)` if already up to date.
-pub fn check_for_update() -> Result<Option<ReleaseInfo>, String> {
+/// Query GitHub Releases for the latest macOS arm64 release on `channel` (`Stable` or `Beta`,
+/// `F-SHELL-164`) via pure-Rust `reqwest`. Returns `Ok(Some(info))` if a newer version is
+/// available, `Ok(None)` if already up to date.
+pub fn check_for_update_on(channel: UpdateChannel) -> Result<Option<ReleaseInfo>, String> {
     let ua = format!("Slackless/{CURRENT_VERSION}");
-    let Some(info) = fetch_latest_release_for_blocking(RELEASES_REPO, &ua)? else {
+    let Some(info) = fetch_latest_release_for_channel_blocking(RELEASES_REPO, channel, &ua)? else {
         return Ok(None);
     };
     let current = installed_version();
@@ -165,6 +166,12 @@ pub fn check_for_update() -> Result<Option<ReleaseInfo>, String> {
         return Ok(None);
     }
     Ok(Some(info))
+}
+
+/// Query GitHub Releases for the latest stable macOS arm64 release via pure-Rust `reqwest`.
+#[allow(dead_code)]
+pub fn check_for_update() -> Result<Option<ReleaseInfo>, String> {
+    check_for_update_on(UpdateChannel::Stable)
 }
 
 /// Download `release` via pure-Rust `reqwest`, verify its SHA-256 checksum in pure Rust (`sha2`),

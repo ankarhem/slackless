@@ -90,8 +90,20 @@ impl Composer {
             cx.emit(ComposerEvent::Submit(content(&doc)));
             return;
         }
+        let selected_slash = self.selected_slash_target.take();
         match slash::parse(doc.text()) {
-            Some(invocation) => cx.emit(ComposerEvent::SlashCommand(invocation)),
+            Some(mut invocation) => {
+                if let Some(target) = selected_slash
+                    && target.name.eq_ignore_ascii_case(&invocation.name)
+                {
+                    if target.is_builtin {
+                        invocation = invocation.with_builtin();
+                    } else {
+                        invocation = invocation.with_app(target.app_id, target.app_name);
+                    }
+                }
+                cx.emit(ComposerEvent::SlashCommand(invocation));
+            }
             None => cx.emit(ComposerEvent::Submit(content(&doc))),
         }
     }

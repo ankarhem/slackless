@@ -16,6 +16,33 @@ pub const RELEASES_REPO: &str = "ankarhem/slackless";
 pub const LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/ankarhem/slackless/releases/latest";
 
+/// GitHub REST endpoint for listing Slackless releases (used by the Beta channel).
+pub const RELEASES_LIST_API: &str =
+    "https://api.github.com/repos/ankarhem/slackless/releases?per_page=20";
+
+/// Release channel for the Slackless auto-updater (`F-SHELL-164`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UpdateChannel {
+    /// Only published, non-prerelease GitHub Releases (`/releases/latest`).
+    #[default]
+    Stable,
+    /// Latest non-draft GitHub Release, including beta / pre-release builds (`/releases`).
+    Beta,
+}
+
+impl UpdateChannel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
+
+    pub const fn is_beta(self) -> bool {
+        matches!(self, Self::Beta)
+    }
+}
+
 const DEFAULT_USER_AGENT: &str = concat!("Slackless/", env!("CARGO_PKG_VERSION"));
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
@@ -31,6 +58,8 @@ pub struct ReleaseInfo {
     pub sha256_url: Option<String>,
     /// Concise bullet highlights parsed from the GitHub Release body.
     pub notes: Vec<String>,
+    /// True when this release is marked as a GitHub pre-release (Beta channel, `F-SHELL-164`).
+    pub is_prerelease: bool,
 }
 
 #[derive(Deserialize)]
@@ -81,9 +110,71 @@ pub fn parse_version(raw: &str) -> Option<(u32, u32, u32, u32)> {
     }
 }
 
-/// Returns `true` if `latest` is strictly newer than `current`.
+/// Comparable version tuple supporting optional pre-release rank (e.g. `-alpha.1`, `-beta.2`,
+/// `-rc.1`). Stable builds sort strictly higher than pre-releases sharing the same base version.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ComparableVersion {
+    base: (u32, u32, u32, u32),
+    /// `true` for stable releases, `false` for pre-releases (`false < true`).
+    is_stable: bool,
+    /// Pre-release stage (`alpha` < `beta` < `rc` < other).
+    pre_stage: u8,
+    /// Trailing numeric counter inside the pre-release tag (e.g. `beta.2` -> `2`).
+    pre_num: u32,
+}
+
+fn parse_prerelease_tag(tag: &str) -> Option<(u8, u32)> {
+    let lower = tag.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    let (stage, rest) = if let Some(r) = lower.strip_prefix("alpha") {
+        (1, r)
+    } else if let Some(r) = lower.strip_prefix("beta") {
+        (2, r)
+    } else if let Some(r) = lower.strip_prefix("rc") {
+        (3, r)
+    } else {
+        let r = lower.strip_prefix("pre")?;
+        (2, r)
+    };
+    let rest = rest.trim_start_matches(['.', '-']);
+    let num = if rest.is_empty() {
+        0
+    } else {
+        rest.parse::<u32>().ok()?
+    };
+    Some((stage, num))
+}
+
+fn parse_comparable_version(raw: &str) -> Option<ComparableVersion> {
+    if let Some(base) = parse_version(raw) {
+        return Some(ComparableVersion {
+            base,
+            is_stable: true,
+            pre_stage: u8::MAX,
+            pre_num: u32::MAX,
+        });
+    }
+    let s = raw.trim().trim_start_matches('v');
+    let (lhs, pre) = s.rsplit_once('-')?;
+    let (pre_stage, pre_num) = parse_prerelease_tag(pre)?;
+    let base = parse_version(lhs)?;
+    Some(ComparableVersion {
+        base,
+        is_stable: false,
+        pre_stage,
+        pre_num,
+    })
+}
+
+/// Returns `true` if `latest` is strictly newer than `current` (supporting both stable and
+/// pre-release tags such as `2026.11.25-01-beta.2` or `v1.2.3-rc.1`).
 pub fn is_newer_version(latest: &str, current: &str) -> bool {
-    match (parse_version(latest), parse_version(current)) {
+    match (
+        parse_comparable_version(latest),
+        parse_comparable_version(current),
+    ) {
         (Some(l), Some(c)) => l > c,
         _ => {
             let l = latest.trim();
@@ -137,12 +228,8 @@ pub fn parse_release_highlights(body: &str) -> Vec<String> {
     out
 }
 
-/// Parse a GitHub Releases JSON payload into [`ReleaseInfo`]. Draft and prerelease payloads return
-/// `Ok(None)` so neither CLI nor GUI accidentally installs an unpublished build.
-pub fn parse_github_release(payload: &[u8]) -> Result<Option<ReleaseInfo>, String> {
-    let rel: GhRelease =
-        serde_json::from_slice(payload).map_err(|e| format!("invalid GitHub release JSON: {e}"))?;
-    if rel.draft || rel.prerelease {
+fn release_from_gh(rel: GhRelease, channel: UpdateChannel) -> Result<Option<ReleaseInfo>, String> {
+    if rel.draft || (rel.prerelease && !channel.is_beta()) {
         return Ok(None);
     }
     let expected_name = format!("Slackless-{}-macos-arm64.app.tar.gz", rel.tag_name);
@@ -176,7 +263,54 @@ pub fn parse_github_release(payload: &[u8]) -> Result<Option<ReleaseInfo>, Strin
         download_url: asset.browser_download_url.clone(),
         sha256_url,
         notes,
+        is_prerelease: rel.prerelease,
     }))
+}
+
+/// Parse a GitHub Releases JSON payload into [`ReleaseInfo`] for `channel`.
+/// Draft payloads always return `Ok(None)`; pre-release payloads return `Ok(None)` on
+/// [`UpdateChannel::Stable`] and `Ok(Some(_))` on [`UpdateChannel::Beta`].
+pub fn parse_github_release_for_channel(
+    payload: &[u8],
+    channel: UpdateChannel,
+) -> Result<Option<ReleaseInfo>, String> {
+    let rel: GhRelease =
+        serde_json::from_slice(payload).map_err(|e| format!("invalid GitHub release JSON: {e}"))?;
+    release_from_gh(rel, channel)
+}
+
+/// Parse a GitHub Releases JSON payload into [`ReleaseInfo`]. Draft and prerelease payloads return
+/// `Ok(None)` so neither CLI nor GUI accidentally installs an unpublished build.
+pub fn parse_github_release(payload: &[u8]) -> Result<Option<ReleaseInfo>, String> {
+    parse_github_release_for_channel(payload, UpdateChannel::Stable)
+}
+
+/// Parse a GitHub `/releases` array payload, selecting the newest non-draft release matching
+/// `channel` (including pre-releases when [`UpdateChannel::Beta`] is selected, skipping drafts
+/// and releases lacking a macOS arm64 archive).
+pub fn parse_github_releases_list(
+    payload: &[u8],
+    channel: UpdateChannel,
+) -> Result<Option<ReleaseInfo>, String> {
+    let releases: Vec<GhRelease> = serde_json::from_slice(payload)
+        .map_err(|e| format!("invalid GitHub releases list JSON: {e}"))?;
+    let mut best: Option<ReleaseInfo> = None;
+    for rel in releases {
+        if rel.draft || (rel.prerelease && !channel.is_beta()) {
+            continue;
+        }
+        let Ok(Some(info)) = release_from_gh(rel, channel) else {
+            continue;
+        };
+        let replace = match &best {
+            None => true,
+            Some(prev) => is_newer_version(&info.version, &prev.version),
+        };
+        if replace {
+            best = Some(info);
+        }
+    }
+    Ok(best)
 }
 
 fn encode_lower_hex(bytes: &[u8]) -> String {
@@ -229,8 +363,10 @@ fn build_updater_client(user_agent: &str, timeout: Duration) -> Result<reqwest::
         .map_err(|e| format!("failed to build updater HTTP client: {e}"))
 }
 
-async fn fetch_release_from_url(
+async fn fetch_release_from_url_for_channel(
     url: &str,
+    channel: UpdateChannel,
+    is_list: bool,
     user_agent: &str,
 ) -> Result<Option<ReleaseInfo>, String> {
     let client = build_updater_client(user_agent, METADATA_TIMEOUT)?;
@@ -251,7 +387,30 @@ async fn fetch_release_from_url(
         .bytes()
         .await
         .map_err(|e| format!("failed reading GitHub Releases response: {e}"))?;
-    parse_github_release(&bytes)
+    if is_list {
+        parse_github_releases_list(&bytes, channel)
+    } else {
+        parse_github_release_for_channel(&bytes, channel)
+    }
+}
+
+/// Query GitHub Releases for `repo` on `channel` (`Stable` -> `/releases/latest`, `Beta` ->
+/// `/releases?per_page=20` including pre-releases; `F-SHELL-164`).
+pub async fn fetch_latest_release_for_channel(
+    repo: &str,
+    channel: UpdateChannel,
+    user_agent: &str,
+) -> Result<Option<ReleaseInfo>, String> {
+    match channel {
+        UpdateChannel::Stable => {
+            let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+            fetch_release_from_url_for_channel(&url, channel, false, user_agent).await
+        }
+        UpdateChannel::Beta => {
+            let url = format!("https://api.github.com/repos/{repo}/releases?per_page=20");
+            fetch_release_from_url_for_channel(&url, channel, true, user_agent).await
+        }
+    }
 }
 
 /// Query GitHub Releases for `repo` (e.g. `"ankarhem/slackless"`) over HTTPS using `reqwest`
@@ -261,8 +420,7 @@ pub async fn fetch_latest_release_for(
     repo: &str,
     user_agent: &str,
 ) -> Result<Option<ReleaseInfo>, String> {
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    fetch_release_from_url(&url, user_agent).await
+    fetch_latest_release_for_channel(repo, UpdateChannel::Stable, user_agent).await
 }
 
 fn block_on_updater<F: std::future::Future>(fut: F) -> Result<F::Output, String> {
@@ -276,19 +434,36 @@ fn block_on_updater<F: std::future::Future>(fut: F) -> Result<F::Output, String>
     Ok(rt.block_on(fut))
 }
 
+/// Blocking wrapper around [`fetch_latest_release_for_channel`] for non-Tokio callers (e.g. GPUI
+/// background executor threads).
+pub fn fetch_latest_release_for_channel_blocking(
+    repo: &str,
+    channel: UpdateChannel,
+    user_agent: &str,
+) -> Result<Option<ReleaseInfo>, String> {
+    block_on_updater(fetch_latest_release_for_channel(repo, channel, user_agent))?
+}
+
 /// Blocking wrapper around [`fetch_latest_release_for`] for non-Tokio callers (e.g. GPUI
 /// background executor threads), running `reqwest` on a lightweight temporary Tokio runtime.
 pub fn fetch_latest_release_for_blocking(
     repo: &str,
     user_agent: &str,
 ) -> Result<Option<ReleaseInfo>, String> {
-    block_on_updater(fetch_latest_release_for(repo, user_agent))?
+    fetch_latest_release_for_channel_blocking(repo, UpdateChannel::Stable, user_agent)
+}
+
+/// Query GitHub Releases for the official Slackless repository on `channel` (`F-SHELL-164`).
+pub async fn fetch_latest_release_on(
+    channel: UpdateChannel,
+) -> Result<Option<ReleaseInfo>, String> {
+    fetch_latest_release_for_channel(RELEASES_REPO, channel, DEFAULT_USER_AGENT).await
 }
 
 /// Query GitHub Releases over HTTPS (using `reqwest` with workspace proxy support and timeouts)
 /// for the latest non-draft, non-prerelease official Slackless release.
 pub async fn fetch_latest_release() -> Result<Option<ReleaseInfo>, String> {
-    fetch_latest_release_for(RELEASES_REPO, DEFAULT_USER_AGENT).await
+    fetch_latest_release_on(UpdateChannel::Stable).await
 }
 
 /// Stream `url` directly to `dest` via `reqwest` (15s connect / 300s request timeout), returning
@@ -850,6 +1025,7 @@ mod tests {
             download_url: format!("http://{addr}/asset.tar.gz"),
             sha256_url: Some(format!("http://{addr}/SHA256SUMS.txt")),
             notes: Vec::new(),
+            is_prerelease: false,
         };
 
         let verified = download_and_verify_release(&release, &stage, "Slackless-Test/1.0")
@@ -929,6 +1105,7 @@ mod tests {
             download_url: format!("http://{addr}/asset.tar.gz"),
             sha256_url: Some(format!("http://{addr}/SHA256SUMS.txt")),
             notes: Vec::new(),
+            is_prerelease: false,
         };
 
         // Run from a plain OS thread with no Tokio runtime context.
@@ -945,5 +1122,113 @@ mod tests {
 
         let _ = server_thread.join();
         let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn beta_channel_parses_prereleases_and_compares_versions_accurately() {
+        assert_eq!(UpdateChannel::Stable.as_str(), "stable");
+        assert_eq!(UpdateChannel::Beta.as_str(), "beta");
+        assert!(!UpdateChannel::Stable.is_beta());
+        assert!(UpdateChannel::Beta.is_beta());
+
+        // Pre-release version comparisons (`F-SHELL-164`).
+        assert!(is_newer_version("2026.11.26-01-beta.1", "2026.11.25-02"));
+        assert!(is_newer_version(
+            "2026.11.26-01-beta.2",
+            "2026.11.26-01-beta.1"
+        ));
+        assert!(is_newer_version(
+            "2026.11.26-01-rc.1",
+            "2026.11.26-01-beta.9"
+        ));
+        assert!(is_newer_version("2026.11.26-01", "2026.11.26-01-rc.1"));
+        assert!(!is_newer_version("2026.11.26-01-beta.1", "2026.11.26-01"));
+        assert!(!is_newer_version(
+            "2026.11.26-01-beta.1",
+            "2026.11.26-01-beta.2"
+        ));
+
+        let list = json!([
+            {
+                "tag_name": "2026.11.27-01-beta.1",
+                "html_url": "https://example.com/draft",
+                "draft": true,
+                "prerelease": true,
+                "assets": [
+                    {
+                        "name": "Slackless-2026.11.27-01-beta.1-macos-arm64.app.tar.gz",
+                        "browser_download_url": "https://example.com/draft.tar.gz"
+                    }
+                ]
+            },
+            {
+                "tag_name": "2026.11.26-01-beta.2",
+                "html_url": "https://example.com/beta2",
+                "body": "- Beta preview feature",
+                "draft": false,
+                "prerelease": true,
+                "assets": [
+                    {
+                        "name": "Slackless-2026.11.26-01-beta.2-macos-arm64.app.tar.gz",
+                        "browser_download_url": "https://example.com/beta2.tar.gz"
+                    },
+                    {
+                        "name": "SHA256SUMS.txt",
+                        "browser_download_url": "https://example.com/beta2-sums.txt"
+                    }
+                ]
+            },
+            {
+                "tag_name": "2026.11.25-02",
+                "html_url": "https://example.com/stable",
+                "body": "- Stable release",
+                "draft": false,
+                "prerelease": false,
+                "assets": [
+                    {
+                        "name": "Slackless-2026.11.25-02-macos-arm64.app.tar.gz",
+                        "browser_download_url": "https://example.com/stable.tar.gz"
+                    }
+                ]
+            }
+        ])
+        .to_string();
+
+        let stable = parse_github_releases_list(list.as_bytes(), UpdateChannel::Stable)
+            .expect("valid list")
+            .expect("stable release");
+        assert_eq!(stable.version, "2026.11.25-02");
+        assert!(!stable.is_prerelease);
+
+        let beta = parse_github_releases_list(list.as_bytes(), UpdateChannel::Beta)
+            .expect("valid list")
+            .expect("beta release");
+        assert_eq!(beta.version, "2026.11.26-01-beta.2");
+        assert!(beta.is_prerelease);
+        assert_eq!(beta.notes, vec!["Beta preview feature"]);
+
+        // If a newer stable release exists than the newest prerelease, Beta picks the newer stable.
+        let stable_newer = json!([
+            {
+                "tag_name": "2026.11.26-01-beta.1",
+                "html_url": "https://example.com/beta",
+                "draft": false,
+                "prerelease": true,
+                "assets": [{ "name": "Slackless-2026.11.26-01-beta.1-macos-arm64.app.tar.gz", "browser_download_url": "https://example.com/b.tar.gz" }]
+            },
+            {
+                "tag_name": "2026.11.26-01",
+                "html_url": "https://example.com/stable",
+                "draft": false,
+                "prerelease": false,
+                "assets": [{ "name": "Slackless-2026.11.26-01-macos-arm64.app.tar.gz", "browser_download_url": "https://example.com/s.tar.gz" }]
+            }
+        ])
+        .to_string();
+        let chosen = parse_github_releases_list(stable_newer.as_bytes(), UpdateChannel::Beta)
+            .expect("valid")
+            .expect("release");
+        assert_eq!(chosen.version, "2026.11.26-01");
+        assert!(!chosen.is_prerelease);
     }
 }

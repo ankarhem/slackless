@@ -86,8 +86,78 @@ impl PauseLength {
     }
 }
 
+/// How an active custom status was set (`F-SHELL-020`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StatusSource {
+    #[default]
+    Manual,
+    FocusMode,
+    Calendar,
+    Huddle,
+    Scheduled,
+    App,
+}
+
+impl StatusSource {
+    /// Descriptive label for automatic status sources shown in Status Picker & Profile (`F-SHELL-020`).
+    pub const fn badge_label(self) -> Option<&'static str> {
+        match self {
+            Self::Manual => None,
+            Self::FocusMode => Some("Automatic \u{b7} Focus mode"),
+            Self::Calendar => Some("Automatic \u{b7} Calendar"),
+            Self::Huddle => Some("Automatic \u{b7} In a huddle"),
+            Self::Scheduled => Some("Automatic \u{b7} Scheduled"),
+            Self::App => Some("Automatic \u{b7} App"),
+        }
+    }
+
+    /// Compact badge shown inside narrow menus.
+    pub const fn short_label(self) -> Option<&'static str> {
+        match self {
+            Self::Manual => None,
+            Self::FocusMode => Some("Focus"),
+            Self::Calendar => Some("Calendar"),
+            Self::Huddle => Some("Huddle"),
+            Self::Scheduled => Some("Scheduled"),
+            Self::App => Some("Auto"),
+        }
+    }
+
+    pub const fn is_automatic(self) -> bool {
+        !matches!(self, Self::Manual)
+    }
+}
+
+/// Infer an automatic status source from a Slack [`Profile`] (`F-SHELL-020`).
+pub fn infer_profile_status_source(
+    profile: &slackless_core::types::Profile,
+    emoji: &str,
+    text: &str,
+) -> StatusSource {
+    if profile.huddle_state.as_deref() == Some("in_a_huddle") {
+        return StatusSource::Huddle;
+    }
+    if text.eq_ignore_ascii_case("In focus mode") && emoji == "telescope" {
+        return StatusSource::FocusMode;
+    }
+    if text.eq_ignore_ascii_case("In a meeting")
+        && matches!(emoji, "spiral_calendar_pad" | "calendar" | "date")
+    {
+        return StatusSource::Calendar;
+    }
+    if text.eq_ignore_ascii_case("In a huddle") && emoji == "headphones" {
+        return StatusSource::Huddle;
+    }
+    if matches!(emoji, "slack_call" | "video_camera" | "phone")
+        && (text.eq_ignore_ascii_case("On a call") || text.to_ascii_lowercase().contains("zoom"))
+    {
+        return StatusSource::App;
+    }
+    StatusSource::Manual
+}
+
 /// A custom status: emoji shortcode (no colons), text, and when it clears.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct UserStatus {
     pub emoji: String,
     pub text: String,
@@ -97,6 +167,8 @@ pub struct UserStatus {
     pub pause: bool,
     /// Concrete unix expiration timestamp (seconds), when set or synced from Slack.
     pub expiration: Option<i64>,
+    /// Origin of this status (manual vs automatic Calendar / Focus / Huddle / Scheduled; `F-SHELL-020`).
+    pub source: StatusSource,
 }
 
 impl UserStatus {
@@ -104,7 +176,8 @@ impl UserStatus {
         emoji_glyph(self.emoji.as_str()).unwrap_or("\u{1F4AC}")
     }
 
-    /// Hydrate a [`UserStatus`] from a Slack [`Profile`], dropping expired or empty ones.
+    /// Hydrate a [`UserStatus`] from a Slack [`Profile`], dropping expired or empty ones and
+    /// surfacing automatic huddle status when `huddle_state == "in_a_huddle"` (`F-SHELL-020`).
     pub fn from_profile(profile: &slackless_core::types::Profile) -> Option<Self> {
         let text = profile.status_text.as_deref().unwrap_or_default().trim();
         let emoji = profile
@@ -114,22 +187,38 @@ impl UserStatus {
             .trim()
             .trim_matches(':');
         if text.is_empty() && emoji.is_empty() {
+            if profile.huddle_state.as_deref() == Some("in_a_huddle") {
+                let exp = profile.huddle_state_expiration_ts.filter(|&ts| ts > 0);
+                if exp.is_none_or(|ts| ts > now_secs()) {
+                    return Some(Self {
+                        emoji: "headphones".to_owned(),
+                        text: "In a huddle".to_owned(),
+                        clear_after: 0,
+                        pause: false,
+                        expiration: exp,
+                        source: StatusSource::Huddle,
+                    });
+                }
+            }
             return None;
         }
         let expiration = profile.status_expiration.filter(|&ts| ts > 0);
         if expiration.is_some_and(|ts| ts <= now_secs()) {
             return None;
         }
+        let resolved_emoji = if emoji.is_empty() {
+            EMOJI_CHOICES[0].to_owned()
+        } else {
+            emoji.to_owned()
+        };
+        let source = infer_profile_status_source(profile, &resolved_emoji, text);
         Some(Self {
-            emoji: if emoji.is_empty() {
-                EMOJI_CHOICES[0].to_owned()
-            } else {
-                emoji.to_owned()
-            },
+            emoji: resolved_emoji,
             text: text.to_owned(),
             clear_after: 0,
             pause: false,
             expiration,
+            source,
         })
     }
 
@@ -246,6 +335,7 @@ fn focus_status() -> UserStatus {
         clear_after: 0,
         pause: false,
         expiration: None,
+        source: StatusSource::FocusMode,
     }
 }
 
@@ -292,6 +382,7 @@ impl SelfState {
             clear_after: sched.clear_after,
             pause: sched.pause,
             expiration: None,
+            source: StatusSource::Scheduled,
         };
         status.expiration = status.clears_at_from(now, offset);
         self.set_status(Some(status.clone()));

@@ -48,10 +48,30 @@ impl SlackApi {
         thread_ts: Option<&Ts>,
         team: &TeamId,
     ) -> Result<()> {
+        let _ = self
+            .chat_command_for_app(channel, command, args, thread_ts, team, None)
+            .await?;
+        Ok(())
+    }
+
+    /// `chat.command` with optional `app_id` disambiguation (`F-COLLAB-686`) and parsed optional
+    /// inline response (`F-COLLAB-684`).
+    pub async fn chat_command_for_app(
+        &self,
+        channel: &ChannelId,
+        command: &str,
+        args: &str,
+        thread_ts: Option<&Ts>,
+        team: &TeamId,
+        app_id: Option<&str>,
+    ) -> Result<CommandResponse> {
         let mut params = vec![
             ("command", command.to_owned()),
             ("disp", command.to_owned()),
         ];
+        if let Some(app_id) = app_id.filter(|s| !s.trim().is_empty()) {
+            params.push(("app_id", app_id.to_owned()));
+        }
         if !args.is_empty() {
             let blocks: [Block; 1] = [RichTextBlock::plain_text(args.to_owned()).into()];
             params.push(("blocks", serde_json::to_string(&blocks)?));
@@ -66,7 +86,10 @@ impl SlackApi {
             ("_x_reason", REASON_COMMAND.to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ]);
-        self.call_ok(method::CHAT_COMMAND, params).await
+        Ok(self
+            .call::<CommandResponse>(method::CHAT_COMMAND, params)
+            .await?
+            .data)
     }
 
     /// `blocks.actions`: a Block Kit interaction dispatched to the app (`bot`, `app_id`) that
@@ -393,32 +416,21 @@ impl SlackApi {
 
     /// `team.profile.get`: workspace custom profile field definitions (`id` -> `label`).
     pub async fn team_profile_get(&self) -> Result<HashMap<String, String>> {
-        #[derive(Deserialize)]
-        struct FieldDef {
-            id: String,
-            #[serde(default)]
-            label: String,
-        }
-        #[derive(Deserialize)]
-        struct ProfileDef {
-            #[serde(default, deserialize_with = "lenient_vec")]
-            fields: Vec<FieldDef>,
-        }
-        #[derive(Deserialize)]
-        struct Wire {
-            profile: ProfileDef,
-        }
-        let wire = self
-            .call::<Wire>(method::TEAM_PROFILE_GET, Vec::new())
-            .await?
-            .data;
-        Ok(wire
-            .profile
-            .fields
+        let fields = self.team_profile_get_detailed().await?;
+        Ok(fields
             .into_iter()
             .filter(|f| !f.label.is_empty())
             .map(|f| (f.id, f.label))
             .collect())
+    }
+
+    /// `team.profile.get`: full field definitions including SCIM / admin lock flags (`F-SHELL-005`).
+    pub async fn team_profile_get_detailed(&self) -> Result<Vec<TeamProfileField>> {
+        let wire = self
+            .call::<TeamProfileWire>(method::TEAM_PROFILE_GET, Vec::new())
+            .await?
+            .data;
+        Ok(parse_team_profile_fields(wire))
     }
 
     /// `dnd.info`: one user's do-not-disturb schedule and snooze state. Read-only.

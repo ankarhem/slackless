@@ -186,6 +186,8 @@ struct FakeState {
     fail_block_suggestions: bool,
     /// Additional command group hooks & call logs.
     run_command_error: Option<String>,
+    run_command_calls: Vec<(ChannelId, String, String, Option<String>)>,
+    run_command_response: api::CommandResponse,
     block_action_calls: Vec<(BotId, String, TeamId)>,
     rename_channel_calls: Vec<(ChannelId, String)>,
     archive_calls: Vec<ChannelId>,
@@ -196,6 +198,7 @@ struct FakeState {
     profile_update_response: Option<crate::types::Profile>,
     user_profile_response: Option<crate::types::Profile>,
     team_profile_fields_response: HashMap<String, String>,
+    team_profile_field_defs_response: Option<Vec<api::TeamProfileField>>,
     gif_featured_calls: usize,
     gif_search_calls: Vec<String>,
     edge_search_calls: Vec<(TeamId, String)>,
@@ -783,16 +786,37 @@ impl crate::backend::MessagingBackend for FakeBackend {
 
     async fn run_command(
         &self,
-        _channel: ChannelId,
-        _command: String,
-        _args: String,
+        channel: ChannelId,
+        command: String,
+        args: String,
         _thread_ts: Option<Ts>,
         _team: TeamId,
     ) -> api::Result<()> {
-        if let Some(err) = self.state.lock().unwrap().run_command_error.clone() {
+        let mut state = self.state.lock().unwrap();
+        state.run_command_calls.push((channel, command, args, None));
+        if let Some(err) = state.run_command_error.clone() {
             return Err(ApiError::Slack(err));
         }
         Ok(())
+    }
+
+    async fn run_command_for_app(
+        &self,
+        channel: ChannelId,
+        command: String,
+        args: String,
+        _thread_ts: Option<Ts>,
+        _team: TeamId,
+        app_id: Option<String>,
+    ) -> api::Result<api::CommandResponse> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .run_command_calls
+            .push((channel, command, args, app_id));
+        if let Some(err) = state.run_command_error.clone() {
+            return Err(ApiError::Slack(err));
+        }
+        Ok(state.run_command_response.clone())
     }
 
     async fn block_action(
@@ -1402,6 +1426,25 @@ impl crate::backend::UsersBackend for FakeBackend {
             .unwrap()
             .team_profile_fields_response
             .clone())
+    }
+
+    async fn team_profile_field_defs(&self) -> api::Result<Vec<api::TeamProfileField>> {
+        let state = self.state.lock().unwrap();
+        if let Some(defs) = state.team_profile_field_defs_response.clone() {
+            return Ok(defs);
+        }
+        Ok(state
+            .team_profile_fields_response
+            .iter()
+            .map(|(id, label)| api::TeamProfileField {
+                id: id.clone(),
+                label: label.clone(),
+                field_name: None,
+                is_hidden: false,
+                is_locked: false,
+                lock_reason: None,
+            })
+            .collect())
     }
 
     async fn set_notification_pref(
@@ -5608,6 +5651,7 @@ async fn command_groups_slash_block_mark_all_close_and_channel_admin() {
         command: "/nope".into(),
         args: "".into(),
         thread_ts: None,
+        app_id: None,
     }))
     .await;
     assert_eq!(
@@ -5826,12 +5870,14 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
         user,
         pronouns,
         mut fields,
+        locked_fields,
     } = next(&mut rx).await
     else {
         panic!("expected UserProfileLoaded");
     };
     assert_eq!(user, UserId::from("U2"));
     assert_eq!(pronouns, None);
+    assert!(locked_fields.is_empty());
     fields.sort();
     assert_eq!(
         fields,
@@ -7310,4 +7356,146 @@ async fn workspace_backfill_commands_report_progress_and_honor_pause_resume() {
         saw_ch_complete,
         "BackfillChannel after PauseBackfill must clear stale pause and complete"
     );
+}
+
+#[tokio::test]
+async fn run_command_threads_app_id_and_emits_inline_response_or_failure() {
+    let ws = TeamId::from("T1");
+    let ch = ChannelId::from("C1");
+    let (store, events, mut rx) = fake_core_parts();
+    let fake = FakeBackend::default();
+    fake.state.lock().expect("state").run_command_response = api::CommandResponse {
+        response_type: Some("in_channel".to_owned()),
+        text: Some("Deployment started".to_owned()),
+    };
+
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    core.handle(Command::Messaging(MessagingCommand::RunCommand {
+        channel: ch.clone(),
+        command: "/deploy".to_owned(),
+        args: "prod".to_owned(),
+        thread_ts: None,
+        app_id: Some("A9DEPLOY".to_owned()),
+    }))
+    .await;
+
+    let ev = next(&mut rx).await;
+    match ev {
+        Event::CommandResponse {
+            channel,
+            command,
+            response_type,
+            text,
+            ..
+        } => {
+            assert_eq!(channel, ch);
+            assert_eq!(command, "/deploy");
+            assert_eq!(response_type.as_deref(), Some("in_channel"));
+            assert_eq!(text, "Deployment started");
+        }
+        other => panic!("expected CommandResponse, got {other:?}"),
+    }
+    let calls = fake.state.lock().expect("state").run_command_calls.clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].3.as_deref(), Some("A9DEPLOY"));
+
+    // Error path emits Event::CommandFailed with the underlying error.
+    fake.state.lock().expect("state").run_command_error = Some("dispatch_failed".to_owned());
+    core.handle(Command::Messaging(MessagingCommand::RunCommand {
+        channel: ch.clone(),
+        command: "/deploy".to_owned(),
+        args: "staging".to_owned(),
+        thread_ts: None,
+        app_id: Some("A9DEPLOY".to_owned()),
+    }))
+    .await;
+    let ev = next(&mut rx).await;
+    match ev {
+        Event::CommandFailed { command, error } => {
+            assert_eq!(command, "/deploy");
+            assert!(
+                error.contains("dispatch_failed"),
+                "unexpected error: {error}"
+            );
+        }
+        other => panic!("expected CommandFailed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn fetch_user_profile_surfaces_scim_and_admin_locked_fields() {
+    let ws = TeamId::from("T1");
+    let uid = UserId::from("U1");
+    let (store, events, mut rx) = fake_core_parts();
+    let fake = FakeBackend::default();
+    {
+        let mut st = fake.state.lock().expect("state");
+        let profile = crate::types::Profile {
+            pronouns: Some("they/them".to_owned()),
+            fields: Some(serde_json::json!({
+                "Xf1": { "value": "Platform" },
+                "Xf2": { "value": "Stockholm" }
+            })),
+            ..Default::default()
+        };
+        st.user_profile_response = Some(profile);
+        st.team_profile_field_defs_response = Some(vec![
+            api::TeamProfileField {
+                id: "Xf1".to_owned(),
+                label: "Department".to_owned(),
+                field_name: Some("department".to_owned()),
+                is_hidden: false,
+                is_locked: true,
+                lock_reason: Some("Managed by SCIM / identity provider".to_owned()),
+            },
+            api::TeamProfileField {
+                id: "Xf2".to_owned(),
+                label: "Office".to_owned(),
+                field_name: None,
+                is_hidden: false,
+                is_locked: false,
+                lock_reason: None,
+            },
+        ]);
+    }
+
+    let mut core = Core::new(fake, Arc::clone(&store), ws, events, test_media_tx()).await;
+
+    core.handle(Command::Workspace(WorkspaceCommand::FetchUserProfile(
+        uid.clone(),
+    )))
+    .await;
+    let ev = next(&mut rx).await;
+    match ev {
+        Event::UserProfileLoaded {
+            user,
+            pronouns,
+            fields,
+            locked_fields,
+        } => {
+            assert_eq!(user, uid);
+            assert_eq!(pronouns.as_deref(), Some("they/them"));
+            assert_eq!(fields.len(), 2);
+            assert!(
+                locked_fields.contains(&(
+                    "Department".to_owned(),
+                    "Managed by SCIM / identity provider".to_owned()
+                )),
+                "missing Department lock in {locked_fields:?}"
+            );
+            assert!(
+                !locked_fields.iter().any(|(k, _)| k == "Office"),
+                "unlocked Office field must not be reported locked"
+            );
+        }
+        other => panic!("expected UserProfileLoaded, got {other:?}"),
+    }
 }

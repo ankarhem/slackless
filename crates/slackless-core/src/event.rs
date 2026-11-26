@@ -174,8 +174,16 @@ pub enum Event {
         scheduled_message_id: String,
         post_at: u64,
     },
-    /// Slack refused a `MessagingCommand::RunCommand`.
+    /// Slack refused or timed out a `MessagingCommand::RunCommand` (`F-COLLAB-685`).
     CommandFailed { command: String, error: String },
+    /// Immediate inline response returned by `chat.command` (`F-COLLAB-684`).
+    CommandResponse {
+        channel: ChannelId,
+        command: String,
+        response_type: Option<String>,
+        text: String,
+        thread_ts: Option<Ts>,
+    },
     /// One or more files finished uploading and sharing into `channel`.
     FilesUploaded { channel: ChannelId, count: usize },
     /// Active `@handle` user groups from `usergroups.list`.
@@ -215,11 +223,14 @@ pub enum Event {
     },
     /// Low-frequency huddle control, lifecycle, invite, and data-channel events.
     Huddle(HuddleEvent),
-    /// Hydrated custom profile fields and pronouns for `user`.
+    /// Hydrated custom profile fields, pronouns, and SCIM/admin lock flags for `user`
+    /// (`F-SHELL-005`).
     UserProfileLoaded {
         user: UserId,
         pronouns: Option<String>,
         fields: Vec<(String, String)>,
+        /// Locked profile field identifiers/labels mapped to their lock reason.
+        locked_fields: Vec<(String, String)>,
     },
     /// An app opened an interactive Block Kit modal (`view_opened`).
     ModalOpened(serde_json::Value),

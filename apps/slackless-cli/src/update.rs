@@ -11,7 +11,7 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use slackless_core::domain::updater::{self, ReleaseInfo, is_newer_version};
+use slackless_core::domain::updater::{self, ReleaseInfo, UpdateChannel, is_newer_version};
 
 use crate::output;
 use crate::{CLI_VERSION, Ctx, fail};
@@ -203,26 +203,35 @@ async fn download_and_install(
     anyhow::bail!("self-update installation is currently supported on macOS only")
 }
 
-/// `slackless update [--check] [--force] [--restart]`.
+/// `slackless update [--check] [--force] [--restart] [--beta]`.
 pub async fn run_update(
     ctx: &Ctx,
     check_only: bool,
     force: bool,
     restart: bool,
+    beta: bool,
 ) -> Result<ExitCode> {
-    let release = match updater::fetch_latest_release().await {
+    let channel = if beta {
+        UpdateChannel::Beta
+    } else {
+        UpdateChannel::Stable
+    };
+    let release = match updater::fetch_latest_release_on(channel).await {
         Ok(Some(r)) => r,
         Ok(None) => {
+            let label = if beta { "beta or stable" } else { "stable" };
             let human = format!(
-                "No published stable release found (Slackless {} is up to date).\n",
+                "No published {label} release found (Slackless {} is up to date).\n",
                 CLI_VERSION
             );
             output::emit(
                 ctx.json,
                 &serde_json::json!({
                     "ok": true,
+                    "channel": channel.as_str(),
                     "current": CLI_VERSION,
                     "latest": serde_json::Value::Null,
+                    "prerelease": false,
                     "update_available": false,
                     "updated": false,
                 }),
@@ -233,22 +242,38 @@ pub async fn run_update(
         Err(err) => return Ok(fail(ctx, "update_check_failed", &err)),
     };
     let available = is_newer_version(&release.version, CLI_VERSION);
+    let pre_tag = if release.is_prerelease {
+        " (beta/pre-release)"
+    } else {
+        ""
+    };
 
     if check_only || (!available && !force) {
         let human = if available {
+            let cmd = if beta {
+                "slackless update --beta"
+            } else {
+                "slackless update"
+            };
             format!(
-                "Update available: {} -> {}\nRelease notes: {}\nRun `slackless update` to install.\n",
+                "Update available: {} -> {}{pre_tag}\nRelease notes: {}\nRun `{cmd}` to install.\n",
                 CLI_VERSION, release.version, release.html_url
             )
         } else {
-            format!("Slackless {} is up to date.\n", CLI_VERSION)
+            format!(
+                "Slackless {} is up to date ({} channel).\n",
+                CLI_VERSION,
+                channel.as_str()
+            )
         };
         output::emit(
             ctx.json,
             &serde_json::json!({
                 "ok": true,
+                "channel": channel.as_str(),
                 "current": CLI_VERSION,
                 "latest": release.version,
+                "prerelease": release.is_prerelease,
                 "update_available": available,
                 "updated": false,
                 "release_url": release.html_url,
@@ -260,7 +285,7 @@ pub async fn run_update(
 
     if !ctx.json {
         eprintln!(
-            "Downloading Slackless {} (currently {})...",
+            "Downloading Slackless {}{pre_tag} (currently {})...",
             release.version, CLI_VERSION
         );
     }
@@ -270,7 +295,7 @@ pub async fn run_update(
     };
 
     let mut human = format!(
-        "Updated Slackless {} -> {} at {}\n",
+        "Updated Slackless {} -> {}{pre_tag} at {}\n",
         CLI_VERSION,
         release.version,
         app_path.display()
@@ -287,8 +312,10 @@ pub async fn run_update(
         ctx.json,
         &serde_json::json!({
             "ok": true,
+            "channel": channel.as_str(),
             "current": CLI_VERSION,
             "latest": release.version,
+            "prerelease": release.is_prerelease,
             "update_available": available,
             "updated": true,
             "restarted": restart,
@@ -357,6 +384,31 @@ mod tests {
             find_sha256_entry(&sums, "Slackless-2026.11.24-03-macos-arm64.app.tar.gz"),
             Some(hash_upper.to_ascii_lowercase())
         );
+    }
+
+    #[test]
+    fn cli_parses_update_beta_flag() {
+        use clap::Parser as _;
+        let parsed = crate::cli::Cli::try_parse_from(["slackless", "update", "--check", "--beta"])
+            .expect("parse update --beta");
+        match parsed.command {
+            crate::cli::Commands::Update(args) => {
+                assert!(args.check);
+                assert!(args.beta);
+                assert!(!args.force);
+                assert!(!args.restart);
+            }
+            _ => panic!("expected Update subcommand"),
+        }
+
+        let stable =
+            crate::cli::Cli::try_parse_from(["slackless", "update"]).expect("parse default update");
+        match stable.command {
+            crate::cli::Commands::Update(args) => {
+                assert!(!args.beta);
+            }
+            _ => panic!("expected Update subcommand"),
+        }
     }
 
     #[cfg(target_os = "macos")]

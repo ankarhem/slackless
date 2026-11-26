@@ -66,19 +66,75 @@ impl<B: Backend> Core<B> {
         command: String,
         args: String,
         thread_ts: Option<Ts>,
+        app_id: Option<String>,
     ) {
+        /// Maximum time to wait for Slack's `chat.command` dispatch before surfacing a clear
+        /// timeout failure (`F-COLLAB-685`).
+        const SLASH_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
         let ctx = self.ctx();
         self.spawn("chat.command", async move {
-            let ran = ctx
-                .backend
-                .run_command(channel, command.clone(), args, thread_ts, ctx.workspace)
-                .await;
+            let fut = ctx.backend.run_command_for_app(
+                channel.clone(),
+                command.clone(),
+                args,
+                thread_ts.clone(),
+                ctx.workspace,
+                app_id,
+            );
+            let ran = match tokio::time::timeout(SLASH_COMMAND_TIMEOUT, fut).await {
+                Ok(res) => res,
+                Err(_) => {
+                    ctx.events.emit(Event::CommandFailed {
+                        command,
+                        error: "command_timeout".to_owned(),
+                    });
+                    return Ok(());
+                }
+            };
             match ran {
+                Ok(resp) => {
+                    if let Some(text) = resp
+                        .text
+                        .map(|t| t.trim().to_owned())
+                        .filter(|t| !t.is_empty())
+                    {
+                        ctx.events.emit(Event::CommandResponse {
+                            channel,
+                            command,
+                            response_type: resp.response_type,
+                            text,
+                            thread_ts,
+                        });
+                    }
+                    Ok(())
+                }
                 Err(ApiError::Slack(error)) => {
                     ctx.events.emit(Event::CommandFailed { command, error });
                     Ok(())
                 }
-                ran => Ok(ran?),
+                Err(ApiError::Http(err)) if err.is_timeout() => {
+                    ctx.events.emit(Event::CommandFailed {
+                        command,
+                        error: "command_timeout".to_owned(),
+                    });
+                    Ok(())
+                }
+                Err(ApiError::RateLimited { .. }) => {
+                    ctx.events.emit(Event::CommandFailed {
+                        command,
+                        error: "rate_limited".to_owned(),
+                    });
+                    Ok(())
+                }
+                Err(err) if err.is_auth_expired() => Err(err.into()),
+                Err(err) => {
+                    ctx.events.emit(Event::CommandFailed {
+                        command,
+                        error: err.to_string(),
+                    });
+                    Ok(())
+                }
             }
         });
     }

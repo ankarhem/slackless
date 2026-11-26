@@ -569,6 +569,110 @@ fn parses_client_app_commands_wire_payload() {
 }
 
 #[test]
+fn parse_app_commands_preserves_duplicates_across_distinct_apps() {
+    let wire: AppCommandsWire = serde_json::from_value(serde_json::json!({
+        "commands": [
+            {
+                "name": "/deploy",
+                "app": "A0RELEASE",
+                "app_name": "ReleaseBot",
+                "desc": "Deploy via ReleaseBot",
+                "usage": "<env>"
+            },
+            {
+                "name": "/deploy",
+                "app": "A0DEPLOYHQ",
+                "app_name": "DeployHQ",
+                "desc": "Deploy via DeployHQ",
+                "usage": "<service>"
+            },
+            {
+                "name": "/deploy",
+                "app": "A0RELEASE",
+                "app_name": "ReleaseBot",
+                "desc": "Exact duplicate ignored"
+            }
+        ]
+    }))
+    .expect("valid app commands json");
+    let parsed = parse_app_commands(wire);
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].app_name.as_deref(), Some("ReleaseBot"));
+    assert_eq!(parsed[0].app_id.as_deref(), Some("A0RELEASE"));
+    assert_eq!(parsed[1].app_name.as_deref(), Some("DeployHQ"));
+    assert_eq!(parsed[1].app_id.as_deref(), Some("A0DEPLOYHQ"));
+}
+
+#[test]
+fn parses_team_profile_fields_with_scim_and_admin_lock_flags() {
+    let wire: TeamProfileWire = serde_json::from_value(serde_json::json!({
+        "profile": {
+            "fields": [
+                {
+                    "id": "Xf01",
+                    "label": "Title",
+                    "field_name": "title",
+                    "options": { "is_scim": true }
+                },
+                {
+                    "id": "Xf02",
+                    "label": "Department",
+                    "permissions": { "ui": false }
+                },
+                {
+                    "id": "Xf03",
+                    "label": "Pronouns",
+                    "field_name": "pronouns",
+                    "is_locked": false
+                },
+                {
+                    "id": "Xf04",
+                    "label": "Phone",
+                    "field_name": "phone",
+                    "options": { "is_protected": true }
+                }
+            ]
+        }
+    }))
+    .expect("valid team profile wire");
+    let fields = parse_team_profile_fields(wire);
+    assert_eq!(fields.len(), 4);
+    assert!(fields[0].is_locked);
+    assert!(
+        fields[0]
+            .lock_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("SCIM"))
+    );
+    assert!(fields[1].is_locked);
+    assert!(
+        fields[1]
+            .lock_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("admin"))
+    );
+    assert!(!fields[2].is_locked);
+    assert_eq!(fields[2].lock_reason, None);
+    assert!(fields[3].is_locked);
+}
+
+#[test]
+fn parses_chat_command_inline_response() {
+    let empty: CommandResponse =
+        serde_json::from_value(serde_json::json!({})).expect("empty response");
+    assert_eq!(empty.response_type, None);
+    assert_eq!(empty.text, None);
+
+    let inline: CommandResponse = serde_json::from_value(serde_json::json!({
+        "response_type": "in_channel",
+        "text": "Deployed v1.2.3 to prod"
+    }))
+    .expect("inline response");
+    assert_eq!(inline.response_type.as_deref(), Some("in_channel"));
+    assert_eq!(inline.text.as_deref(), Some("Deployed v1.2.3 to prod"));
+}
+
+#[test]
 fn parses_search_modules_messages_and_files_and_sparse_profile_update() {
     let msg_wire: SearchModulesMessagesWire = serde_json::from_value(serde_json::json!({
         "pagination": { "total_count": 42, "page": 1, "page_count": 3 },

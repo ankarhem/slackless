@@ -2,6 +2,85 @@
 
 use super::super::*;
 
+/// Inspect SCIM / admin profile field lock flags from both `team.profile.get` metadata
+/// (`loaded_locks`) and `user.extra` (`is_scim_managed`, `scim_locked_fields`, `locked_fields`)
+/// so Profile Edit renders read-only lock indicators instead of failing silently (`F-SHELL-005`).
+pub(crate) fn detect_locked_profile_fields(
+    user: Option<&slackless_core::types::User>,
+    loaded_locks: &[(String, String)],
+) -> HashMap<String, String> {
+    let mut locked = HashMap::new();
+    for (key, reason) in loaded_locks {
+        let norm = key.trim().to_ascii_lowercase();
+        if !norm.is_empty() {
+            locked.entry(norm).or_insert_with(|| reason.clone());
+        }
+    }
+    if let Some(user) = user {
+        let scim_reason = "Managed by SCIM / identity provider".to_owned();
+        if user
+            .extra
+            .get("is_scim_managed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            for key in ["display_name", "title", "phone"] {
+                locked
+                    .entry(key.to_owned())
+                    .or_insert_with(|| scim_reason.clone());
+            }
+        }
+        for array_key in ["scim_locked_fields", "locked_fields"] {
+            if let Some(arr) = user
+                .extra
+                .get(array_key)
+                .and_then(serde_json::Value::as_array)
+            {
+                let reason = if array_key == "scim_locked_fields" {
+                    scim_reason.clone()
+                } else {
+                    "Locked by workspace admin".to_owned()
+                };
+                for item in arr.iter().filter_map(serde_json::Value::as_str) {
+                    let norm = item.trim().to_ascii_lowercase();
+                    if !norm.is_empty() {
+                        locked.entry(norm).or_insert_with(|| reason.clone());
+                    }
+                }
+            }
+        }
+        if let Some(fields) = user
+            .profile
+            .fields
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+        {
+            for (id, entry) in fields {
+                let is_locked = entry
+                    .get("is_locked")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                    || entry
+                        .get("is_protected")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                if is_locked {
+                    let reason = "Locked by workspace admin".to_owned();
+                    locked
+                        .entry(id.to_ascii_lowercase())
+                        .or_insert_with(|| reason.clone());
+                    if let Some(label) = entry.get("label").and_then(serde_json::Value::as_str) {
+                        locked
+                            .entry(label.trim().to_ascii_lowercase())
+                            .or_insert(reason);
+                    }
+                }
+            }
+        }
+    }
+    locked
+}
+
 impl App {
     /// Sync the signed-in user's custom status (or clear it with `None`) to Slack via
     /// `users.profile.set`.
@@ -50,6 +129,13 @@ impl App {
             .profile
             .read(cx)
             .loaded_profile(&self.fixtures.self_user);
+        let loaded_locks = self
+            .profile
+            .read(cx)
+            .loaded_locked_fields(&self.fixtures.self_user);
+        let locked_map = detect_locked_profile_fields(me.as_ref(), &loaded_locks);
+        let initial_show_pronouns = self.preferences.read(cx).settings().show_pronouns;
+        let show_pronouns_state = Rc::new(Cell::new(initial_show_pronouns));
         let initial_pronouns = loaded_pronouns
             .or_else(|| me.as_ref().and_then(|u| u.profile.pronouns.clone()))
             .or_else(|| {
@@ -65,63 +151,154 @@ impl App {
             let mut s = TextareaState::new(window, cx)
                 .placeholder("Display name")
                 .auto_grow(1, 1);
-            s.set_value(initial_display, window, cx);
+            s.set_value(initial_display.clone(), window, cx);
             s
         });
         let title_in = cx.new(|cx| {
             let mut s = TextareaState::new(window, cx)
                 .placeholder("What I do (e.g. Developer)")
                 .auto_grow(1, 1);
-            s.set_value(initial_title, window, cx);
+            s.set_value(initial_title.clone(), window, cx);
             s
         });
         let phone_in = cx.new(|cx| {
             let mut s = TextareaState::new(window, cx)
                 .placeholder("Phone number")
                 .auto_grow(1, 1);
-            s.set_value(initial_phone, window, cx);
+            s.set_value(initial_phone.clone(), window, cx);
             s
         });
         let pronouns_in = cx.new(|cx| {
             let mut s = TextareaState::new(window, cx)
                 .placeholder("Pronouns (optional)")
                 .auto_grow(1, 1);
-            s.set_value(initial_pronouns, window, cx);
+            s.set_value(initial_pronouns.clone(), window, cx);
             s
         });
         let tz_in = cx.new(|cx| {
             let mut s = TextareaState::new(window, cx)
                 .placeholder("Time zone (e.g. Europe/Stockholm)")
                 .auto_grow(1, 1);
-            s.set_value(initial_tz, window, cx);
+            s.set_value(initial_tz.clone(), window, cx);
             s
         });
 
         let this = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
             let theme = cx.theme();
-            let (muted, border) = (theme.muted_foreground, theme.border);
-            let field = |label: &'static str, state: &Entity<TextareaState>| {
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(muted)
-                            .child(label),
-                    )
-                    .child(preferences::text_input_box(state, false, cx))
+            let (muted, border, card_bg) = (
+                theme.muted_foreground,
+                theme.border,
+                theme.secondary.opacity(0.45),
+            );
+            let lock_reason = |keys: &[&str]| -> Option<String> {
+                keys.iter().find_map(|k| locked_map.get(*k).cloned())
+            };
+            let display_lock = lock_reason(&["display_name", "display name"]);
+            let title_lock = lock_reason(&["title"]);
+            let phone_lock = lock_reason(&["phone"]);
+            let pronouns_lock = lock_reason(&["pronouns"]);
+            let tz_lock = lock_reason(&["tz", "time zone", "timezone"]);
+
+            let field = |label: &'static str,
+                         state: &Entity<TextareaState>,
+                         current_val: &str,
+                         lock: Option<&str>| {
+                if let Some(reason) = lock {
+                    let shown = if current_val.trim().is_empty() {
+                        "(Managed by organization)".to_owned()
+                    } else {
+                        current_val.to_owned()
+                    };
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(muted)
+                                        .child(label),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .px_1p5()
+                                        .py(px(1.))
+                                        .rounded_sm()
+                                        .bg(card_bg)
+                                        .text_size(px(10.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(muted)
+                                        .child(
+                                            Icon::new(IconName::Lock)
+                                                .size(px(10.))
+                                                .text_color(muted),
+                                        )
+                                        .child("Locked"),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .px_2p5()
+                                .py_1p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(border)
+                                .bg(card_bg)
+                                .text_sm()
+                                .text_color(muted)
+                                .child(shown),
+                        )
+                        .child(div().text_xs().text_color(muted).child(reason.to_owned()))
+                } else {
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(muted)
+                                .child(label),
+                        )
+                        .child(preferences::text_input_box(state, false, cx))
+                }
+            };
+            let show_pronouns_val = show_pronouns_state.get();
+            let show_pronouns_toggle = {
+                let flag = show_pronouns_state.clone();
+                gpui_kit::component::checkbox::Checkbox::new("profile-show-pronouns")
+                    .label("Display pronouns on my profile")
+                    .checked(show_pronouns_val)
+                    .on_click(move |checked, window, _| {
+                        flag.set(*checked);
+                        window.refresh();
+                    })
             };
             let this_save = this.clone();
-            let (d_save, t_save, p_save, pr_save, tz_save, fields_save) = (
+            let (d_save, t_save, p_save, pr_save, tz_save, fields_save, locks_save) = (
                 display_in.clone(),
                 title_in.clone(),
                 phone_in.clone(),
                 pronouns_in.clone(),
                 tz_in.clone(),
                 loaded_fields.clone(),
+                loaded_locks.clone(),
             );
+            let (d_locked, t_locked, p_locked, pr_locked, tz_locked) = (
+                display_lock.is_some(),
+                title_lock.is_some(),
+                phone_lock.is_some(),
+                pronouns_lock.is_some(),
+                tz_lock.is_some(),
+            );
+            let show_pronouns_save = show_pronouns_state.clone();
             let this_photo = this.clone();
             dialog.title("Edit your profile").w(px(460.)).child(
                 v_flex()
@@ -226,11 +403,46 @@ impl App {
                                 }),
                             ),
                     )
-                    .child(field("Display name", &display_in))
-                    .child(field("Title", &title_in))
-                    .child(field("Phone", &phone_in))
-                    .child(field("Pronouns", &pronouns_in))
-                    .child(field("Time zone", &tz_in))
+                    .child(field(
+                        "Display name",
+                        &display_in,
+                        &initial_display,
+                        display_lock.as_deref(),
+                    ))
+                    .child(field(
+                        "Title",
+                        &title_in,
+                        &initial_title,
+                        title_lock.as_deref(),
+                    ))
+                    .child(field(
+                        "Phone",
+                        &phone_in,
+                        &initial_phone,
+                        phone_lock.as_deref(),
+                    ))
+                    .child(
+                        v_flex()
+                            .gap_1p5()
+                            .child(field(
+                                "Pronouns",
+                                &pronouns_in,
+                                &initial_pronouns,
+                                pronouns_lock.as_deref(),
+                            ))
+                            .child(show_pronouns_toggle)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(if show_pronouns_val {
+                                        "Visible on your profile by default."
+                                    } else {
+                                        "Hidden from teammates on your profile preview."
+                                    }),
+                            ),
+                    )
+                    .child(field("Time zone", &tz_in, &initial_tz, tz_lock.as_deref()))
                     .child(
                         h_flex()
                             .justify_end()
@@ -253,28 +465,55 @@ impl App {
                                 .on_click(move |_, window, cx| {
                                     let pronouns_val = pr_save.read(cx).value().trim().to_owned();
                                     let tz_val = tz_save.read(cx).value().trim().to_owned();
+                                    let show_pr = show_pronouns_save.get();
                                     let update = slackless_core::api::ProfileUpdate {
-                                        display_name: Some(
-                                            d_save.read(cx).value().trim().to_owned(),
-                                        ),
-                                        title: Some(t_save.read(cx).value().trim().to_owned()),
-                                        phone: Some(p_save.read(cx).value().trim().to_owned()),
-                                        pronouns: Some(pronouns_val.clone()),
-                                        tz: (!tz_val.is_empty()).then_some(tz_val),
+                                        display_name: (!d_locked)
+                                            .then(|| d_save.read(cx).value().trim().to_owned()),
+                                        title: (!t_locked)
+                                            .then(|| t_save.read(cx).value().trim().to_owned()),
+                                        phone: (!p_locked)
+                                            .then(|| p_save.read(cx).value().trim().to_owned()),
+                                        pronouns: (!pr_locked).then(|| {
+                                            if show_pr {
+                                                pronouns_val.clone()
+                                            } else {
+                                                String::new()
+                                            }
+                                        }),
+                                        tz: (!tz_locked && !tz_val.is_empty()).then_some(tz_val),
                                         ..Default::default()
                                     };
                                     if let Some(app) = this_save.upgrade() {
                                         app.update(cx, |app, cx| {
                                             let me_id = app.fixtures.self_user.clone();
                                             app.profile.update(cx, |profile, cx| {
+                                                profile.set_show_pronouns(show_pr, cx);
                                                 profile.set_user_profile(
                                                     me_id,
                                                     (!pronouns_val.is_empty())
                                                         .then_some(pronouns_val),
                                                     fields_save.clone(),
+                                                    locks_save.clone(),
                                                     cx,
                                                 );
                                             });
+                                            let mut settings =
+                                                app.preferences.read(cx).settings().clone();
+                                            if settings.show_pronouns != show_pr {
+                                                settings.show_pronouns = show_pr;
+                                                app.preferences.update(cx, |prefs, cx| {
+                                                    prefs.load_settings(
+                                                        settings.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                                if let Some(write) =
+                                                    app.bridge.remember_settings(&settings)
+                                                {
+                                                    cx.background_executor().spawn(write).detach();
+                                                }
+                                            }
                                             if !app.fixtures.sample {
                                                 app.bridge.send(WorkspaceCommand::UpdateProfile {
                                                     update,

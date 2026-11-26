@@ -123,6 +123,89 @@ pub struct Invocation {
     pub name: String,
     /// Everything after the name, trimmed.
     pub args: String,
+    /// Explicitly chosen Slack app ID when multiple apps register the same `/name` (`F-COLLAB-686`).
+    pub app_id: Option<String>,
+    /// Display name of the chosen app for feedback/toasts (`F-COLLAB-686`).
+    pub app_name: Option<String>,
+    /// True when the user explicitly selected the built-in command over an app duplicate.
+    pub force_builtin: bool,
+}
+
+impl Invocation {
+    /// Attach an explicit app choice from autocomplete or the disambiguation picker.
+    pub fn with_app(mut self, app_id: Option<String>, app_name: Option<String>) -> Self {
+        self.app_id = app_id;
+        self.app_name = app_name;
+        self.force_builtin = false;
+        self
+    }
+
+    /// Force dispatching as the built-in command when an app also registers the same name.
+    pub fn with_builtin(mut self) -> Self {
+        self.app_id = None;
+        self.app_name = None;
+        self.force_builtin = true;
+        self
+    }
+}
+
+/// Format a user-friendly `(title, detail)` pair for a failed or timed-out slash command
+/// (`F-COLLAB-684`, `F-COLLAB-685`).
+pub fn format_command_error(command: &str, error: &str) -> (String, String) {
+    let cmd = if command.starts_with('/') {
+        command.to_owned()
+    } else {
+        format!("/{command}")
+    };
+    let lower = error.trim().to_ascii_lowercase();
+    if lower == "unknown_command" || lower == "invalid_command" {
+        (
+            "Unknown command".to_owned(),
+            format!("{cmd} is not a valid command in this workspace."),
+        )
+    } else if lower == "timeout"
+        || lower == "command_timeout"
+        || lower == "operation_timeout"
+        || lower == "dispatch_failed"
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+    {
+        (
+            format!("{cmd} timed out"),
+            format!(
+                "{cmd} failed because the app did not respond in time ({}). Try running it again in a moment.",
+                error.trim()
+            ),
+        )
+    } else if lower == "not_in_channel" || lower == "channel_not_found" {
+        (
+            format!("{cmd} unavailable here"),
+            format!(
+                "{cmd} cannot be run in this conversation ({}).",
+                error.trim()
+            ),
+        )
+    } else if lower == "cannot_run_in_thread" || lower == "cant_use_in_thread" {
+        (
+            format!("{cmd} not supported in threads"),
+            format!("{cmd} can only be run in the main channel, not inside a thread."),
+        )
+    } else if lower == "restricted_action" || lower == "not_allowed" {
+        (
+            "Command restricted".to_owned(),
+            format!("Your workspace permissions do not allow running {cmd} here."),
+        )
+    } else if lower == "rate_limited" {
+        (
+            format!("{cmd} rate limited"),
+            format!("Too many requests for {cmd}. Wait a few seconds and try again."),
+        )
+    } else {
+        (
+            format!("{cmd} failed"),
+            format!("Slack could not run {cmd} ({}).", error.trim()),
+        )
+    }
 }
 
 /// The name being typed when the draft is a bare `/prefix` (no whitespace yet): the
@@ -149,6 +232,9 @@ pub fn parse(text: &str) -> Option<Invocation> {
         command: BUILTINS.iter().find(|c| c.name == name),
         name,
         args: args.trim().to_owned(),
+        app_id: None,
+        app_name: None,
+        force_builtin: false,
     })
 }
 
@@ -180,6 +266,39 @@ mod tests {
         assert!(parse("/usr/local/bin").is_none());
         assert!(parse("plain text").is_none());
         assert!(parse(" /away").is_none());
+    }
+
+    #[test]
+    fn invocation_app_and_builtin_builders_and_error_formatting() {
+        let inv = parse("/deploy prod")
+            .expect("valid")
+            .with_app(Some("A01".into()), Some("ReleaseBot".into()));
+        assert_eq!(inv.app_id.as_deref(), Some("A01"));
+        assert_eq!(inv.app_name.as_deref(), Some("ReleaseBot"));
+        assert!(!inv.force_builtin);
+
+        let builtin = parse("/shrug ok").expect("valid").with_builtin();
+        assert!(builtin.force_builtin);
+        assert_eq!(builtin.app_id, None);
+
+        let (t, d) = format_command_error("/deploy", "dispatch_failed");
+        assert!(t.contains("timed out"));
+        assert!(d.contains("did not respond in time"));
+
+        let (t, d) = format_command_error("deploy", "operation_timeout");
+        assert!(t.contains("/deploy timed out"));
+        assert!(d.contains("operation_timeout"));
+
+        let (t, d) = format_command_error("/nope", "unknown_command");
+        assert_eq!(t, "Unknown command");
+        assert!(d.contains("/nope"));
+
+        let (t, d) = format_command_error("/jira", "cannot_run_in_thread");
+        assert!(t.contains("threads"));
+        assert!(d.contains("main channel"));
+
+        let (t, _) = format_command_error("/admin", "restricted_action");
+        assert_eq!(t, "Command restricted");
     }
 
     #[test]

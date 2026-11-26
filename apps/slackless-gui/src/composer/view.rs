@@ -353,6 +353,29 @@ impl Render for Composer {
             .then(|| self.formatting_toolbar(focused, band, cx));
         let clip_bar = self.clip_recording_bar(cx);
         let attachments = self.attachments_strip(cx);
+        let external_file_cue = (!self.attachments.is_empty())
+            .then(|| self.external_file_notice.clone())
+            .flatten()
+            .map(|notice| {
+                let theme = cx.theme();
+                h_flex()
+                    .mx_2()
+                    .mb_1()
+                    .px_2p5()
+                    .py_1()
+                    .rounded_md()
+                    .bg(crate::theme::connect_bar(cx))
+                    .items_center()
+                    .gap_1p5()
+                    .text_xs()
+                    .text_color(theme.foreground)
+                    .child(
+                        Icon::new(IconName::Building2)
+                            .size(px(13.))
+                            .text_color(theme.muted_foreground),
+                    )
+                    .child(notice)
+            });
         let upload_warning = self.upload_warning.clone().map(|msg| {
             let danger = cx.theme().danger;
             h_flex()
@@ -577,6 +600,7 @@ impl Render for Composer {
                             .children(private_prompt),
                     )
                     .children(attachments)
+                    .children(external_file_cue)
                     .children(upload_warning)
                     .children(also_send)
                     .child(actions),

@@ -122,16 +122,25 @@ pub fn reaction_chips(
 /// Slack's reaction tooltip text (`getTip`): who reacted, then "reacted with :name:". One
 /// reactor reads "You (click to remove)" for yourself on a pill that toggles; several are
 /// listed "A, B, and you", ending in "others" when Slack sent only some of the reactors.
+/// External Slack Connect reactors carry their org name and unrecognized non-Unicode shortcodes
+/// are annotated as external workspace emoji (`F-COLLAB-878`).
 fn reaction_tip(
     reaction: &Reaction,
     fixtures: &Fixtures,
     removable: bool,
 ) -> (SharedString, SharedString) {
     let me = &fixtures.self_user;
+    let display_reactor = |user: &UserId| -> String {
+        let base = fixtures.user_name(user);
+        match fixtures.external_team(user) {
+            Some(team) if !team.name.is_empty() => format!("{base} ({})", team.name),
+            _ => base.to_owned(),
+        }
+    };
     let who = match reaction.users.as_slice() {
         [only] if only == me && removable => "You (click to remove)".to_owned(),
         [only] if only == me => "You".to_owned(),
-        [only] => fixtures.user_name(only).to_owned(),
+        [only] => display_reactor(only),
         users => {
             let mut names: Vec<String> = users
                 .iter()
@@ -139,7 +148,7 @@ fn reaction_tip(
                 .map(|(ix, user)| match user == me {
                     true if ix == 0 => "You".to_owned(),
                     true => "you".to_owned(),
-                    false => fixtures.user_name(user).to_owned(),
+                    false => display_reactor(user),
                 })
                 .collect();
             if reaction.count as usize > users.len() {
@@ -153,10 +162,17 @@ fn reaction_tip(
             }
         }
     };
-    (
-        who.into(),
-        format!("reacted with :{}:", reaction.name).into(),
-    )
+    let is_external_emoji =
+        emoji::glyph(&reaction.name).is_none() && fixtures.custom_emoji(&reaction.name).is_none();
+    let what = if is_external_emoji {
+        format!(
+            "reacted with :{}: · External workspace emoji",
+            reaction.name
+        )
+    } else {
+        format!("reacted with :{}:", reaction.name)
+    };
+    (who.into(), what.into())
 }
 
 /// Slack's reaction tooltip (`.c-reaction__tip`): the emoji large on a white 36px tile, then
@@ -256,5 +272,56 @@ pub fn add_reaction(message: &mut Message, me: &UserId, name: &str) -> bool {
             });
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use slackless_core::types::{Reaction, Team, TeamId, User, UserId};
+
+    use super::reaction_tip;
+
+    #[test]
+    fn reaction_tip_annotates_external_reactors_and_external_workspace_emoji() {
+        let mut fixtures = crate::fixtures::load();
+        let ext_team_id = TeamId::from("T9PARTNER");
+        fixtures.teams.push(Team {
+            id: ext_team_id.clone(),
+            name: "PartnerCo".to_owned(),
+            domain: "partnerco".to_owned(),
+            ..Default::default()
+        });
+        let ext_user_id = UserId::from("U9EXT");
+        let ext_user = User {
+            id: ext_user_id.clone(),
+            name: "ext_pat".to_owned(),
+            real_name: Some("Pat External".to_owned()),
+            team_id: Some(ext_team_id),
+            ..Default::default()
+        };
+        fixtures.users.push(ext_user);
+
+        // External reactor + unknown custom shortcode -> annotated as external workspace emoji.
+        let reaction = Reaction {
+            name: "partner_party".to_owned(),
+            count: 1,
+            users: vec![ext_user_id.clone()],
+        };
+        let (who, what) = reaction_tip(&reaction, &fixtures, true);
+        assert_eq!(who.as_ref(), "Pat External (PartnerCo)");
+        assert!(
+            what.contains("External workspace emoji"),
+            "unexpected tooltip subtitle: {what}"
+        );
+
+        // Standard Unicode emoji from external reactor should NOT be marked external emoji.
+        let unicode_reaction = Reaction {
+            name: "thumbsup".to_owned(),
+            count: 1,
+            users: vec![ext_user_id],
+        };
+        let (who2, what2) = reaction_tip(&unicode_reaction, &fixtures, true);
+        assert_eq!(who2.as_ref(), "Pat External (PartnerCo)");
+        assert_eq!(what2.as_ref(), "reacted with :thumbsup:");
     }
 }

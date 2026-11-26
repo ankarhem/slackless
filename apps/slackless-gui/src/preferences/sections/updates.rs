@@ -45,11 +45,19 @@ impl Preferences {
                 ),
             ),
             UpdateState::Available(rel) => {
-                let ver = rel.version.clone();
+                let ver = if rel.is_prerelease {
+                    format!("{} · Beta", rel.version)
+                } else {
+                    rel.version.clone()
+                };
                 let notes_url = rel.html_url.clone();
                 (
                     primary,
-                    "Update available".to_owned(),
+                    if rel.is_prerelease {
+                        "Beta update available".to_owned()
+                    } else {
+                        "Update available".to_owned()
+                    },
                     Some(SharedString::from(ver)),
                     format!("Currently running {current}."),
                     false,
@@ -76,7 +84,11 @@ impl Preferences {
                 success,
                 "Up to date".to_owned(),
                 Some(SharedString::from(current)),
-                "You have the latest release of Slackless.".to_owned(),
+                if self.settings.beta_updates {
+                    "You have the latest beta / stable release of Slackless.".to_owned()
+                } else {
+                    "You have the latest release of Slackless.".to_owned()
+                },
                 false,
                 h_flex().gap_1p5().child(
                     self.btn(
@@ -186,7 +198,14 @@ impl Preferences {
         .filter(|rel| !rel.notes.is_empty())
         .map(|rel| (rel.version.clone(), rel.notes.clone()));
 
-        let body = if let Some((ver, notes)) = release_notes {
+        let beta_toggle = self.checkbox(
+            "adv-upd-beta",
+            "Receive beta / pre-release updates",
+            |s| &mut s.beta_updates,
+            cx,
+        );
+        let mut body = v_flex().gap_2().child(card).child(beta_toggle);
+        if let Some((ver, notes)) = release_notes {
             let theme = cx.theme();
             let (border, card_bg, fg, muted) = (
                 theme.border,
@@ -194,7 +213,7 @@ impl Preferences {
                 theme.foreground,
                 theme.muted_foreground,
             );
-            v_flex().gap_2().child(card).child(
+            body = body.child(
                 v_flex()
                     .gap_1()
                     .px_3p5()
@@ -219,10 +238,8 @@ impl Preferences {
                             .child(div().flex_none().child("\u{2022}"))
                             .child(div().flex_1().min_w_0().child(item))
                     })),
-            )
-        } else {
-            v_flex().child(card)
-        };
+            );
+        }
         self.group(
             "Software updates",
             Some("Checks for new releases on startup or when requested; updates both Slackless.app and the CLI together."),

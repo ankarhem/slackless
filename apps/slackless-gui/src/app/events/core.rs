@@ -23,12 +23,6 @@ impl App {
                 error = %error,
                 "Slack rejected the saved session; sign in again with `slackless-gui --sign-in`"
             ),
-            Event::CommandFailed { command, error } if error == "unknown_command" => notify(
-                "Unknown command",
-                format!("{command} is not a valid command."),
-                window,
-                cx,
-            ),
             Event::CommandFailed { command, error }
                 if command == "subscriptions.thread.getView" =>
             {
@@ -38,7 +32,38 @@ impl App {
                 tracing::warn!(command = %command, error = %error, "thread view command failed");
             }
             Event::CommandFailed { command, error } => {
-                notify(command, format!("Slack refused it ({error})."), window, cx)
+                let (title, detail) = crate::slash::format_command_error(command, error);
+                notify(&title, detail.clone(), window, cx);
+                // Mirror Slack's inline dismissible ephemeral error response (`F-COLLAB-685`).
+                let channel = self.channel.clone();
+                let mut eph = self.fixtures.local_message(&channel, detail, None);
+                eph.user = None;
+                eph.username = Some("Slackbot".to_owned());
+                eph.is_ephemeral = true;
+                self.messages
+                    .update(cx, |list, cx| list.append(channel, eph, cx));
+            }
+            Event::CommandResponse {
+                channel,
+                command,
+                response_type,
+                text,
+                thread_ts,
+            } => {
+                // Render inline `chat.command` response (`F-COLLAB-684`): `"in_channel"` stays
+                // visible as a channel post; `"ephemeral"` (or default) shows the dismissible
+                // "Only visible to you" banner.
+                let is_ephemeral = !response_type
+                    .as_deref()
+                    .is_some_and(|rt| rt.eq_ignore_ascii_case("in_channel"));
+                let mut msg = self
+                    .fixtures
+                    .local_message(channel, text.clone(), thread_ts.clone());
+                msg.user = None;
+                msg.username = Some(command.clone());
+                msg.is_ephemeral = is_ephemeral;
+                self.messages
+                    .update(cx, |list, cx| list.append(channel.clone(), msg, cx));
             }
             Event::Typing {
                 channel,
@@ -293,9 +318,16 @@ impl App {
                 user,
                 pronouns,
                 fields,
+                locked_fields,
             } => {
                 self.profile.update(cx, |profile, cx| {
-                    profile.set_user_profile(user.clone(), pronouns.clone(), fields.clone(), cx);
+                    profile.set_user_profile(
+                        user.clone(),
+                        pronouns.clone(),
+                        fields.clone(),
+                        locked_fields.clone(),
+                        cx,
+                    );
                 });
             }
             Event::ModalOpened(view) => self.open_block_modal(view.clone(), window, cx),
@@ -1020,6 +1052,7 @@ pub(crate) fn user_facing_error_title(error: &str) -> Option<&'static str> {
             "Could not cancel scheduled message",
         ),
         ("chat.postMessage:", "Could not send message"),
+        ("chat.command:", "Slash command failed"),
         ("chat.update:", "Could not edit message"),
         ("chat.delete:", "Could not delete message"),
         ("reactions.add:", "Could not add reaction"),
@@ -1058,6 +1091,13 @@ pub(crate) fn user_facing_error_title(error: &str) -> Option<&'static str> {
         ("dnd.setSnooze:", "Could not pause notifications"),
         ("rooms.join:", "Could not join huddle"),
     ];
+    if error.starts_with("chat.postMessage:")
+        && (error.contains("at_channel_restricted")
+            || error.contains("restricted_action")
+            || error.contains("too_many_mentions"))
+    {
+        return Some("Channel mention restricted");
+    }
     PREFIXES
         .iter()
         .find_map(|(prefix, title)| error.starts_with(prefix).then_some(*title))

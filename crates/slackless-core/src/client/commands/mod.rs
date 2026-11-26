@@ -141,7 +141,8 @@ impl<B: Backend> Core<B> {
                 command,
                 args,
                 thread_ts,
-            } => self.run_command(channel, command, args, thread_ts),
+                app_id,
+            } => self.run_command(channel, command, args, thread_ts, app_id),
             MessagingCommand::RetryOfflineMutation(id) => self.retry_offline_mutation(id).await,
             MessagingCommand::DiscardOfflineMutation(id) => {
                 self.discard_offline_mutation(id).await;

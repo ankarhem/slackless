@@ -328,6 +328,25 @@ pub(super) fn transcript_row(
                 if message.files.len() == 1 { "" } else { "s" }
             )));
         }
+        if !message.files.is_empty()
+            && let Some(ext_label) = external_file_sharing_label(fixtures, &store.channel, message)
+        {
+            let theme = cx.theme();
+            body = body.child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .pt_0p5()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(
+                        Icon::new(IconName::Globe)
+                            .size(px(11.))
+                            .text_color(theme.muted_foreground),
+                    )
+                    .child(ext_label),
+            );
+        }
         body = body.children(actions::reaction_chips(
             &key,
             &message.reactions,
@@ -952,6 +971,96 @@ fn external_app_chip(team: &slackless_core::types::Team, cx: &App) -> Div {
         .child(team.name.clone())
 }
 
+/// External file sharing cue (`F-COLLAB-879`) rendered beneath attachments in Slack Connect
+/// channels or on files uploaded by an external organization member.
+pub(crate) fn external_file_sharing_label(
+    fixtures: &Fixtures,
+    channel: &ChannelId,
+    message: &Message,
+) -> Option<String> {
+    if message.files.is_empty() {
+        return None;
+    }
+    if let Some(team) = message
+        .user
+        .as_ref()
+        .and_then(|u| fixtures.external_team(u))
+    {
+        return Some(format!("External file · {}", team.name));
+    }
+    if fixtures
+        .conversation(channel)
+        .is_some_and(|c| c.is_ext_shared)
+    {
+        return Some("Shared with external organizations".to_owned());
+    }
+    None
+}
+
+/// Author badge classification for message headers (`F-COLLAB-494`, `F-COLLAB-495`, `F-COLLAB-632`):
+/// - `App`: message authored directly by a bot or app user.
+/// - `ViaApp(name)`: message posted by an app on behalf of a human user (e.g., `/giphy`, workflow).
+/// - `None`: standard human message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AuthorBadge {
+    None,
+    App,
+    ViaApp(String),
+}
+
+pub(crate) fn classify_author_badge(message: &Message, fixtures: &Fixtures) -> AuthorBadge {
+    let user = message.user.as_ref().and_then(|id| fixtures.user(id));
+    let is_bot_user = user.is_some_and(|u| u.is_bot || u.is_app_user);
+    if is_bot_user || matches!(message.subtype, Some(MessageSubtype::BotMessage)) {
+        return AuthorBadge::App;
+    }
+    if message.bot_id.is_some() && user.is_none() {
+        return AuthorBadge::App;
+    }
+    let via_app_id = message.bot_id.is_some()
+        || message.bot_profile.is_some()
+        || message.extra.get("app_id").is_some();
+    if via_app_id && user.is_some() {
+        let app_name = message
+            .bot_profile
+            .as_ref()
+            .map(|p| p.name.clone())
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                message
+                    .bot_id
+                    .as_ref()
+                    .and_then(|id| fixtures.bot_profile(id))
+                    .map(|p| p.name)
+                    .filter(|name| !name.trim().is_empty())
+            })
+            .unwrap_or_else(|| "App".to_owned());
+        return AuthorBadge::ViaApp(app_name);
+    }
+    AuthorBadge::None
+}
+
+/// Compact "via <App>" chip rendered beside a human author when an app posted on their behalf
+/// (`F-COLLAB-495`, `F-COLLAB-632`).
+fn via_app_chip(app_name: &str, cx: &App) -> Div {
+    let theme = cx.theme();
+    h_flex()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .h(px(16.))
+        .px_1p5()
+        .rounded(px(3.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary.opacity(0.65))
+        .text_size(px(10.))
+        .line_height(px(12.))
+        .text_color(theme.muted_foreground)
+        .child(div().font_weight(FontWeight::BOLD).child("APP"))
+        .child(format!("via {app_name}"))
+}
+
 fn message_header(
     message: &Message,
     author: &str,
@@ -981,12 +1090,8 @@ fn message_header(
         .map(|code| code.trim_matches(':'))
         .filter(|code| !code.is_empty())
         .map(|code| crate::emoji::emoji_element(code, fixtures, px(14.)));
-    let is_app_post = message.bot_id.is_some()
-        && message
-            .user
-            .as_ref()
-            .and_then(|user| fixtures.user(user))
-            .is_none_or(|user| user.is_bot);
+    let badge = classify_author_badge(message, fixtures);
+    let is_app_post = matches!(badge, AuthorBadge::App);
     let external_bot_team = is_app_post
         .then(|| fixtures.external_bot_team(message))
         .flatten();
@@ -1005,9 +1110,14 @@ fn message_header(
                     message.user.as_ref(),
                     handler,
                 ))
-                // An app's own post; a person's post made through an app (`/giphy`) keeps
-                // their name unbadged, as in Slack.
                 .when(is_app_post, |name| name.child(app_badge(cx)))
+                .when_some(
+                    match badge {
+                        AuthorBadge::ViaApp(app_name) => Some(app_name),
+                        _ => None,
+                    },
+                    |name, app_name| name.child(via_app_chip(&app_name, cx)),
+                )
                 .when_some(external_bot_team, |name, team| {
                     name.child(external_app_chip(team, cx))
                 })

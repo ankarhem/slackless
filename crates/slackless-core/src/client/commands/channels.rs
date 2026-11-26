@@ -545,23 +545,66 @@ impl<B: Backend> Core<B> {
     pub(super) fn fetch_user_profile(&self, user: UserId) {
         let ctx = self.ctx();
         self.spawn("users.profile.get", async move {
-            let (profile, labels) = tokio::join!(
+            let (profile, field_defs) = tokio::join!(
                 ctx.backend.user_profile(user.clone()),
-                ctx.backend.team_profile_fields(),
+                ctx.backend.team_profile_field_defs(),
             );
             let profile = profile?;
-            let labels = match labels {
-                Ok(labels) => labels,
+            let field_defs = match field_defs {
+                Ok(defs) => defs,
                 Err(e) if e.is_auth_expired() => return Err(e.into()),
                 Err(e) => {
                     tracing::debug!(%e, "team.profile.get failed");
-                    HashMap::new()
+                    Vec::new()
                 }
             };
+            let labels: HashMap<String, String> = field_defs
+                .iter()
+                .filter(|f| !f.label.is_empty())
+                .map(|f| (f.id.clone(), f.label.clone()))
+                .collect();
+            let mut locked_fields: Vec<(String, String)> = Vec::new();
+            for def in &field_defs {
+                if def.is_locked {
+                    let reason = def
+                        .lock_reason
+                        .clone()
+                        .unwrap_or_else(|| "Locked by workspace admin".to_owned());
+                    if let Some(name) = def.field_name.as_deref() {
+                        locked_fields.push((name.to_ascii_lowercase(), reason.clone()));
+                    }
+                    if !def.label.is_empty() {
+                        locked_fields.push((def.label.clone(), reason.clone()));
+                    }
+                    locked_fields.push((def.id.clone(), reason));
+                }
+            }
             let pronouns = profile.pronouns.clone().filter(|p| !p.trim().is_empty());
             let mut fields = Vec::new();
             if let Some(map) = profile.fields.as_ref().and_then(|v| v.as_object()) {
                 for (id, entry) in map {
+                    let label = entry
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .or_else(|| labels.get(id).cloned())
+                        .unwrap_or_else(|| id.clone());
+                    let entry_locked = entry
+                        .get("is_locked")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                        || entry
+                            .get("is_protected")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                    if entry_locked {
+                        let reason = "Locked by workspace admin".to_owned();
+                        if !locked_fields.iter().any(|(k, _)| k == &label || k == id) {
+                            locked_fields.push((label.clone(), reason.clone()));
+                            locked_fields.push((id.clone(), reason));
+                        }
+                    }
                     let val = entry
                         .get("value")
                         .and_then(|v| v.as_str())
@@ -570,13 +613,6 @@ impl<B: Backend> Core<B> {
                     if val.is_empty() {
                         continue;
                     }
-                    let label = entry
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned)
-                        .or_else(|| labels.get(id).cloned())
-                        .unwrap_or_else(|| id.clone());
                     fields.push((label, val.to_owned()));
                 }
             }
@@ -584,6 +620,7 @@ impl<B: Backend> Core<B> {
                 user,
                 pronouns,
                 fields,
+                locked_fields,
             });
             Ok(())
         });
