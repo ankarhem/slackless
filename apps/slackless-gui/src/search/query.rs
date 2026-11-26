@@ -9,10 +9,10 @@ use slackless_core::SharedStore;
 use slackless_core::api::SearchSort as ApiSearchSort;
 use slackless_core::search::{
     WorkspaceSearchTarget, discover_local_archives, search_across_stores, search_disk_archives,
-    search_huddle_transcripts_across_stores,
+    search_huddle_transcripts_across_stores, search_huddle_transcripts_in_disk_archives,
 };
 use slackless_core::store::{SearchFilters, SearchQuery, SearchSort, Store};
-use slackless_core::types::{Conversation, ConversationKind, User};
+use slackless_core::types::{Conversation, ConversationKind, TeamId, User};
 
 use super::state::{RESULT_LIMIT, SearchEvent, SearchScope, SearchSource, SearchTab, SearchView};
 use crate::fixtures::Fixtures;
@@ -136,45 +136,60 @@ impl SearchView {
                     let mut msgs_res = search_across_stores(&targets, &parsed, sort, RESULT_LIMIT)
                         .map(|r| r.hits)
                         .map_err(|e| e.to_string());
+                    let mut trs = search_huddle_transcripts_across_stores(
+                        &targets,
+                        &query,
+                        None,
+                        RESULT_LIMIT,
+                    );
                     // In live cross-workspace search, also pick up any additional stored `.sqlite`
                     // archives on disk that are not currently mounted as active/parked bridges.
-                    if scope == SearchScope::AllWorkspaces
-                        && !is_sample
-                        && let Ok(ref mut hits) = msgs_res
-                    {
+                    if scope == SearchScope::AllWorkspaces && !is_sample {
                         let mounted: HashSet<_> =
                             targets.iter().map(|t| t.workspace.clone()).collect();
                         let extra: Vec<_> = discover_local_archives()
                             .into_iter()
                             .filter(|(ws, _)| !mounted.contains(ws))
                             .collect();
-                        if !extra.is_empty()
-                            && let Ok(disk_res) =
-                                search_disk_archives(&extra, &parsed, sort, RESULT_LIMIT)
-                        {
-                            hits.extend(disk_res.hits);
-                            match sort {
-                                SearchSort::Recent => {
-                                    hits.sort_by(|a, b| b.message.ts.cmp(&a.message.ts));
+                        if !extra.is_empty() {
+                            if let Ok(ref mut hits) = msgs_res
+                                && let Ok(disk_res) =
+                                    search_disk_archives(&extra, &parsed, sort, RESULT_LIMIT)
+                            {
+                                hits.extend(disk_res.hits);
+                                match sort {
+                                    SearchSort::Recent => {
+                                        hits.sort_by(|a, b| b.message.ts.cmp(&a.message.ts));
+                                    }
+                                    SearchSort::Relevant => {
+                                        hits.sort_by(|a, b| {
+                                            let ra = a.rank.unwrap_or(f64::INFINITY);
+                                            let rb = b.rank.unwrap_or(f64::INFINITY);
+                                            ra.total_cmp(&rb)
+                                                .then_with(|| b.message.ts.cmp(&a.message.ts))
+                                        });
+                                    }
                                 }
-                                SearchSort::Relevant => {
-                                    hits.sort_by(|a, b| {
-                                        let ra = a.rank.unwrap_or(f64::INFINITY);
-                                        let rb = b.rank.unwrap_or(f64::INFINITY);
-                                        ra.total_cmp(&rb)
-                                            .then_with(|| b.message.ts.cmp(&a.message.ts))
-                                    });
-                                }
+                                hits.truncate(RESULT_LIMIT);
                             }
-                            hits.truncate(RESULT_LIMIT);
+                            let disk_trs = search_huddle_transcripts_in_disk_archives(
+                                &extra,
+                                &query,
+                                None,
+                                RESULT_LIMIT,
+                            );
+                            if !disk_trs.is_empty() {
+                                trs.extend(disk_trs);
+                                trs.sort_by(|a, b| {
+                                    b.segment
+                                        .at_ms
+                                        .cmp(&a.segment.at_ms)
+                                        .then_with(|| b.segment.id.cmp(&a.segment.id))
+                                });
+                                trs.truncate(RESULT_LIMIT);
+                            }
                         }
                     }
-                    let trs = search_huddle_transcripts_across_stores(
-                        &targets,
-                        &query,
-                        None,
-                        RESULT_LIMIT,
-                    );
                     (msgs_res, trs)
                 })
                 .await;
@@ -345,14 +360,23 @@ impl SearchView {
     }
 }
 
-/// Fixture mode's archive: an in-memory store holding the fixture workspace (users,
+/// Fixture mode's archive: an in-memory store holding the first fixture workspace (users,
 /// conversations, history and thread replies), searched exactly like a synced archive.
 pub fn fixture_archive(fixtures: &Fixtures) -> Option<SharedStore> {
     let workspace = fixtures.workspaces.first()?.id.clone();
+    fixture_archive_for(fixtures, &workspace)
+}
+
+/// Fixture mode's archive seeded explicitly under `workspace` (used for workspace index > 0 and
+/// cross-workspace sample search so each workspace's messages live under its own `TeamId`).
+pub fn fixture_archive_for(fixtures: &Fixtures, workspace: &TeamId) -> Option<SharedStore> {
     let seed = || -> slackless_core::store::Result<Store> {
         let mut store = Store::open_in_memory()?;
+        if let Some(team) = fixtures.workspaces.iter().find(|t| t.id == *workspace) {
+            store.upsert_team(workspace, team)?;
+        }
         for user in &fixtures.users {
-            store.upsert_user(&workspace, user)?;
+            store.upsert_user(workspace, user)?;
         }
         for conversation in fixtures
             .channels
@@ -360,7 +384,7 @@ pub fn fixture_archive(fixtures: &Fixtures) -> Option<SharedStore> {
             .chain(&fixtures.dms)
             .chain(&fixtures.directory)
         {
-            store.upsert_conversation(&workspace, conversation)?;
+            store.upsert_conversation(workspace, conversation)?;
         }
         let replies = fixtures
             .threads
@@ -368,11 +392,11 @@ pub fn fixture_archive(fixtures: &Fixtures) -> Option<SharedStore> {
             .map(|((channel, _), replies)| (channel, replies));
         for (channel, history) in fixtures.messages.iter().chain(replies) {
             for message in history {
-                store.upsert_message(&workspace, channel, message)?;
+                store.upsert_message(workspace, channel, message)?;
             }
         }
         for (file_id, text) in &fixtures.file_transcripts {
-            store.upsert_file_transcript(&workspace, file_id, "local", text)?;
+            store.upsert_file_transcript(workspace, file_id, "local", text)?;
         }
         Ok(store)
     };

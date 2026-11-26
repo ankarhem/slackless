@@ -187,6 +187,56 @@ pub struct ExportedHuddleTranscriptDoc {
     pub segments: Vec<ExportedHuddleSegment>,
 }
 
+/// Read up to `limit` newest matching messages from `channel`, ordered oldest first.
+///
+/// Paginates backwards via `before` when `include_deleted` is false so deleted tombstones at the
+/// tail of a channel never starve `limit`.
+fn read_channel_messages_window(
+    store: &Store,
+    workspace: &TeamId,
+    channel: &ChannelId,
+    limit: usize,
+    include_deleted: bool,
+) -> StoreResult<Vec<StoredMessage>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    if include_deleted {
+        return store.channel_history(workspace, channel, None, limit);
+    }
+
+    let page_size = limit.clamp(64, 500);
+    let mut collected: Vec<StoredMessage> = Vec::with_capacity(limit.min(512));
+    let mut before: Option<Ts> = None;
+
+    'pages: loop {
+        let page = store.channel_history(workspace, channel, before.as_ref(), page_size)?;
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
+        let oldest_ts = page[0].message.ts.clone();
+
+        for msg in page.into_iter().rev() {
+            if msg.deleted {
+                continue;
+            }
+            collected.push(msg);
+            if collected.len() >= limit {
+                break 'pages;
+            }
+        }
+
+        if page_len < page_size || before.as_ref() == Some(&oldest_ts) {
+            break;
+        }
+        before = Some(oldest_ts);
+    }
+
+    collected.reverse();
+    Ok(collected)
+}
+
 /// Export a channel's locally stored messages to Markdown or JSON.
 pub fn export_channel(
     store: &Store,
@@ -209,12 +259,10 @@ pub fn export_channel(
         HashMap::new()
     };
 
-    let raw = store.channel_history(workspace, channel, None, opts.limit)?;
+    let raw =
+        read_channel_messages_window(store, workspace, channel, opts.limit, opts.include_deleted)?;
     let mut messages = Vec::with_capacity(raw.len());
     for stored in raw {
-        if !opts.include_deleted && stored.deleted {
-            continue;
-        }
         let mut row =
             build_exported_message(&stored, &users, &transcripts, opts.include_transcripts);
         if opts.include_threads && stored.message.reply_count.unwrap_or(0) > 0 {
@@ -986,5 +1034,55 @@ mod tests {
         assert_eq!(parsed_ht["kind"], "huddle_transcript");
         assert_eq!(parsed_ht["call_id"], "R_CALL1");
         assert_eq!(parsed_ht["count"], 1);
+    }
+
+    #[test]
+    fn export_channel_paginates_past_deleted_tombstones_to_honor_limit() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ws = TeamId::from("T1");
+        let ch = ChannelId::from("C_TOMB");
+        let msgs: Vec<Message> = (0..10)
+            .map(|i| Message {
+                ts: Ts::from(format!("{}.000000", 1_700_005_000 + i)),
+                text: format!("entry-{i}"),
+                ..Default::default()
+            })
+            .collect();
+        store.upsert_messages(&ws, &ch, &msgs).unwrap();
+        for i in 5..10 {
+            store
+                .record_deletion(
+                    &ws,
+                    &ch,
+                    &Ts::from(format!("{}.000000", 1_700_005_000 + i)),
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+
+        // Excluding deleted with limit=3 must return entry-2, entry-3, entry-4 (not 0 rows!).
+        let artifact = export_channel(
+            &store,
+            &ws,
+            &ch,
+            &ExportOptions {
+                format: ExportFormat::Json,
+                limit: 3,
+                include_deleted: false,
+                include_threads: false,
+                include_transcripts: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(artifact.item_count, 3);
+        let doc: serde_json::Value = serde_json::from_str(&artifact.content).unwrap();
+        let texts: Vec<&str> = doc["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, vec!["entry-2", "entry-3", "entry-4"]);
     }
 }

@@ -682,6 +682,10 @@ impl<B: Backend> Core<B> {
         if let Some(prev) = self.backfills.remove(&channel) {
             prev.abort();
         }
+        // Clear any stale paused state when explicitly starting a single-channel backfill.
+        if self.backfill.control.is_paused() {
+            let _ = self.backfill.control.resume();
+        }
         let backfill = self.backfill.clone();
         let store = Arc::clone(&self.store);
         let ws = self.workspace.clone();

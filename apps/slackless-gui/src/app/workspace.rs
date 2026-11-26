@@ -15,6 +15,14 @@ pub(super) fn build_workspace(
     let messages = MessageList::new(fixtures.clone(), channel.clone(), window, cx);
     let thread = ThreadPanel::new(fixtures.clone(), window, cx);
     let results = SearchView::new(fixtures.clone(), archive, cx);
+    if let Some(team) = fixtures
+        .workspaces
+        .get(index)
+        .or_else(|| fixtures.workspaces.first())
+    {
+        let ws_id = team.id.clone();
+        results.update(cx, |view, cx| view.set_workspace(ws_id, cx));
+    }
     let browser = ChannelBrowser::new(fixtures.clone(), window, cx);
     let huddle_map: HashMap<ChannelId, Vec<slackless_core::types::UserId>> =
         huddle_state::fixture_huddle(fixtures)

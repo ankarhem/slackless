@@ -369,6 +369,66 @@ pub fn search_huddle_transcripts_across_stores(
     out
 }
 
+/// Search huddle transcripts across on-disk `<team_id>.sqlite` archive files, newest first.
+pub fn search_huddle_transcripts_in_disk_archives(
+    archives: &[(TeamId, PathBuf)],
+    query: &str,
+    lang: Option<&str>,
+    limit: usize,
+) -> Vec<UnifiedTranscriptHit> {
+    if limit == 0 || archives.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut seen: HashSet<(TeamId, i64)> = HashSet::new();
+    for (ws, path) in archives {
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(store) = open_archive_ro(path) else {
+            continue;
+        };
+        let mut workspaces = store.list_workspaces().unwrap_or_default();
+        if workspaces.is_empty() {
+            workspaces.push(ws.clone());
+        }
+        for inner_ws in &workspaces {
+            let Ok(meta) = load_workspace_meta(&store, inner_ws, None) else {
+                continue;
+            };
+            let Ok(segments) = store.search_huddle_transcripts(inner_ws, query, None, lang, limit)
+            else {
+                continue;
+            };
+            for segment in segments {
+                if !seen.insert((inner_ws.clone(), segment.id)) {
+                    continue;
+                }
+                let channel_name = meta.channels.get(segment.channel.as_str()).cloned();
+                let speaker_name = segment
+                    .speaker_id
+                    .as_ref()
+                    .and_then(|u| meta.users.get(u.as_str()).cloned());
+                out.push(UnifiedTranscriptHit {
+                    workspace: inner_ws.clone(),
+                    workspace_name: meta.name.clone(),
+                    channel_name,
+                    speaker_name,
+                    segment,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        b.segment
+            .at_ms
+            .cmp(&a.segment.at_ms)
+            .then_with(|| b.segment.id.cmp(&a.segment.id))
+    });
+    out.truncate(limit);
+    out
+}
+
 struct WorkspaceMeta {
     name: Option<String>,
     channels: HashMap<String, String>,
@@ -628,18 +688,31 @@ fn match_excerpt(body: &str, terms: &[String]) -> Option<String> {
     if collapsed.is_empty() {
         return None;
     }
-    let lowered = collapsed.to_lowercase();
-    let matched_term = terms
+    let chars: Vec<char> = collapsed.chars().collect();
+    // Map each UTF-8 byte offset of `lowered` back to its source char index in `chars` so
+    // Unicode case-folding that changes byte or char counts (e.g. `İ` -> `i\u{307}`, `ẞ` -> `ß`)
+    // never slices on an invalid UTF-8 byte boundary or misaligns the excerpt window.
+    let mut lowered = String::with_capacity(collapsed.len());
+    let mut byte_to_char_ix: Vec<usize> = Vec::with_capacity(collapsed.len());
+    for (ci, ch) in chars.iter().enumerate() {
+        for lc in ch.to_lowercase() {
+            lowered.push(lc);
+            byte_to_char_ix.resize(lowered.len(), ci);
+        }
+    }
+    let matched_pos = terms
         .iter()
         .map(|t| t.trim_end_matches('*').to_lowercase())
         .filter(|t| !t.is_empty())
-        .find(|t| lowered.contains(t.as_str()))?;
-    let chars: Vec<char> = collapsed.chars().collect();
+        .find_map(|t| lowered.find(t.as_str()))?;
     if chars.len() <= 120 {
         return Some(collapsed);
     }
-    let pos_byte = lowered.find(&matched_term).unwrap_or(0);
-    let char_pos = collapsed[..pos_byte.min(collapsed.len())].chars().count();
+    let char_pos = byte_to_char_ix
+        .get(matched_pos)
+        .copied()
+        .unwrap_or(0)
+        .min(chars.len());
     let start = char_pos.saturating_sub(36);
     let end = (start + 120).min(chars.len());
     let slice: String = chars[start..end].iter().collect();
@@ -920,5 +993,27 @@ mod tests {
         assert_eq!(res.hits[1].workspace_name.as_deref(), Some("Alpha"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn match_excerpt_handles_expanding_unicode_case_folding_without_panicking() {
+        // `İ` (U+0130, 2 UTF-8 bytes -> `i\u{307}`, 3 UTF-8 bytes) and `ẞ` (3 bytes -> `ß`, 2 bytes)
+        // shift byte offsets between `collapsed` and `lowered` across a >120-char body.
+        let prefix = "İstanbul Straße ".repeat(12);
+        let suffix = " åäö monitoring tail".repeat(8);
+        let body = format!("{prefix}zephyrprobe rollout verified{suffix}");
+        assert!(body.chars().count() > 120);
+
+        let excerpt = match_excerpt(&body, &["zephyrprobe".to_owned()])
+            .expect("must extract excerpt around match");
+        assert!(excerpt.contains("zephyrprobe"));
+        assert!(excerpt.starts_with('…'));
+        assert!(excerpt.ends_with('…'));
+
+        // Also match a term containing `İ` directly.
+        let dotted = format!("{}İSTANBUL_CANARY{}", "ÅÄÖ ".repeat(40), " end".repeat(20));
+        let ex2 = match_excerpt(&dotted, &["i\u{307}stanbul_canary".to_owned()])
+            .expect("must match folded Turkish dotted I");
+        assert!(ex2.contains("İSTANBUL_CANARY"));
     }
 }

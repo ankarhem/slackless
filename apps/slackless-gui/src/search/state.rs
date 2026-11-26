@@ -223,9 +223,30 @@ impl SearchView {
         self.include_deleted = include;
     }
 
+    /// Point this view at the active workspace's `TeamId` (especially when workspace index > 0).
+    pub fn set_workspace(&mut self, workspace: TeamId, cx: &mut Context<Self>) {
+        if self.workspace != workspace {
+            self.workspace = workspace;
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn active_workspace_for_test(&self) -> TeamId {
+        self.workspace.clone()
+    }
+
+    #[cfg(test)]
+    pub fn local_hits_for_test(&self) -> &[UnifiedSearchHit] {
+        &self.local_results
+    }
+
     /// Live refresh: the query and its results stay; names come from `fixtures`.
+    /// Preserves `self.workspace` once initialized so workspace index > 0 is never clobbered.
     pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
-        if let Some(team) = fixtures.workspaces.first() {
+        if self.workspace.as_str().is_empty()
+            && let Some(team) = fixtures.workspaces.first()
+        {
             self.workspace = team.id.clone();
         }
         self.fixtures = fixtures;

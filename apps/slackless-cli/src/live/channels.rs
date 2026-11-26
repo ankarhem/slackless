@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use slackless_core::api::{
     ApiError, ClientCounts, ConversationCounts, HistoryOpts, ListOpts, Page, SlackApi,
 };
@@ -281,6 +281,11 @@ fn record_synced_page(
     }
 }
 
+enum BackfillStepError {
+    Api(ApiError),
+    Store(anyhow::Error),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn backfill_one_channel(
     api: &SlackApi,
@@ -292,7 +297,7 @@ async fn backfill_one_channel(
     max_pages: usize,
     page_size: u32,
     spans: &mut HashMap<ChannelId, Synced>,
-) -> std::result::Result<ArchiveBackfillChannelSummary, ApiError> {
+) -> std::result::Result<ArchiveBackfillChannelSummary, BackfillStepError> {
     let opts = HistoryOpts {
         limit: Some(clamp_backfill_page_size(page_size)),
         ..Default::default()
@@ -319,20 +324,24 @@ async fn backfill_one_channel(
                     waits += 1;
                     tokio::time::sleep(retry_after.max(Duration::from_secs(1))).await;
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(BackfillStepError::Api(err)),
             }
         };
         pages_fetched += 1;
         let next = next_backfill_cursor(cursor.as_deref(), page.next_cursor);
         let page_done = next.is_none();
         if !page.items.is_empty() {
-            let _ = archive
+            archive
                 .store_mut()
-                .upsert_messages(workspace, channel, &page.items);
+                .upsert_messages(workspace, channel, &page.items)
+                .with_context(|| format!("storing history page for {channel}"))
+                .map_err(BackfillStepError::Store)?;
             messages_stored += page.items.len();
         }
         record_synced_page(spans, channel, &page.items, page_done);
-        let _ = write_synced_spans(archive.store_mut(), workspace, spans);
+        write_synced_spans(archive.store_mut(), workspace, spans)
+            .with_context(|| format!("persisting backfill progress for {workspace}"))
+            .map_err(BackfillStepError::Store)?;
 
         if include_threads {
             let thread_roots: Vec<Ts> = page
@@ -363,6 +372,9 @@ async fn backfill_one_channel(
                                 reply_waits += 1;
                                 tokio::time::sleep(retry_after.max(Duration::from_secs(1))).await;
                             }
+                            Err(err) if err.is_auth_expired() => {
+                                return Err(BackfillStepError::Api(err));
+                            }
                             Err(_) => {
                                 break Page {
                                     items: Vec::new(),
@@ -375,11 +387,13 @@ async fn backfill_one_channel(
                         got_any = true;
                         let reply_count =
                             reply_page.items.iter().filter(|m| m.ts != root_ts).count();
-                        let _ = archive.store_mut().upsert_messages(
-                            workspace,
-                            channel,
-                            &reply_page.items,
-                        );
+                        archive
+                            .store_mut()
+                            .upsert_messages(workspace, channel, &reply_page.items)
+                            .with_context(|| {
+                                format!("storing thread replies for {channel} ({root_ts})")
+                            })
+                            .map_err(BackfillStepError::Store)?;
                         replies_stored += reply_count;
                     }
                     match next_backfill_cursor(reply_cursor.as_deref(), reply_page.next_cursor) {
@@ -450,7 +464,8 @@ pub async fn run_backfill(
     .await
     {
         Ok(summary) => summary,
-        Err(err) => return Ok(api_fail(ctx, &err)),
+        Err(BackfillStepError::Api(err)) => return Ok(api_fail(ctx, &err)),
+        Err(BackfillStepError::Store(err)) => return Err(err),
     };
 
     let (json, human) = format_backfill_output(
@@ -528,9 +543,10 @@ pub async fn run_archive_backfill(
                 }
             }
             if !convs.is_empty() {
-                let _ = archive
+                archive
                     .store_mut()
-                    .upsert_conversations(&session.workspace, &convs);
+                    .upsert_conversations(&session.workspace, &convs)
+                    .with_context(|| format!("storing conversations for {}", session.workspace))?;
                 stored = convs
                     .into_iter()
                     .filter(|c| (c.is_member || c.is_im || c.is_mpim) && !c.is_archived)
@@ -560,7 +576,8 @@ pub async fn run_archive_backfill(
         .await
         {
             Ok(summary) => summaries.push(summary),
-            Err(err) => return Ok(api_fail(ctx, &err)),
+            Err(BackfillStepError::Api(err)) => return Ok(api_fail(ctx, &err)),
+            Err(BackfillStepError::Store(err)) => return Err(err),
         }
     }
 

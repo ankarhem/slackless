@@ -284,7 +284,9 @@ use crate::new_message::{NewMessageEvent, NewMessageView};
 use crate::pins;
 use crate::preferences::{self, AppearanceMode, Preferences, PreferencesEvent, Section};
 use crate::profile::{ProfileEvent, ProfilePanel};
-use crate::search::{SearchEvent, SearchView, SearchWorkspaceSource, fixture_archive};
+use crate::search::{
+    SearchEvent, SearchView, SearchWorkspaceSource, fixture_archive, fixture_archive_for,
+};
 use crate::search_menu::{SEARCH_PLACEHOLDER, SearchMenu, SearchMenuEvent, Snapshot};
 use crate::shortcuts::shortcuts_view;
 use crate::sidebar::{NavItem, Sidebar, SidebarEvent, WorkspaceBadge};

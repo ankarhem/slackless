@@ -406,10 +406,13 @@ impl<B: Backend> Backfill<B> {
     /// When an earlier walk already covered a span, only the gap above it is fetched, then the
     /// walk jumps below that span's oldest message and continues to the beginning.
     ///
-    /// Implicit conversation-open backfills update internal progress state quietly (visible via
-    /// `QueryBackfillProgress`) without flooding `Event::BackfillProgress` listeners.
+    /// Implicit conversation-open backfills stay independent of explicit archive backfill pause
+    /// state and run status so pausing a workspace backfill never freezes normal sidebar channel
+    /// loading, and opening a channel never clobbers an active workspace backfill's status.
     pub async fn run(self, channel: ChannelId) {
-        self.run_inner(channel, None, false, false).await;
+        if let Err(e) = self.walk(&channel, None, false, false).await {
+            self.events.report(&format!("backfill {channel}"), e);
+        }
     }
 
     /// Explicit archive backfill for a single channel, optionally walking `conversations.replies`
@@ -421,17 +424,6 @@ impl<B: Backend> Backfill<B> {
         channel_name: Option<String>,
         include_threads: bool,
     ) {
-        self.run_inner(channel, channel_name, include_threads, true)
-            .await;
-    }
-
-    async fn run_inner(
-        self,
-        channel: ChannelId,
-        channel_name: Option<String>,
-        include_threads: bool,
-        emit_progress: bool,
-    ) {
         let _ = self
             .control
             .update_channel(&channel, channel_name.as_deref(), |c| {
@@ -439,24 +431,15 @@ impl<B: Backend> Backfill<B> {
                 c.last_error = None;
             });
         let snap = self.control.set_active_channel(Some(channel.clone()));
-        if emit_progress {
-            self.events.emit(Event::BackfillProgress(snap));
-        }
+        self.events.emit(Event::BackfillProgress(snap));
 
         match self
-            .walk(
-                &channel,
-                channel_name.as_deref(),
-                include_threads,
-                emit_progress,
-            )
+            .walk(&channel, channel_name.as_deref(), include_threads, true)
             .await
         {
             Ok(()) => {
                 let done = self.control.finish_run(false);
-                if emit_progress {
-                    self.events.emit(Event::BackfillProgress(done));
-                }
+                self.events.emit(Event::BackfillProgress(done));
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -467,9 +450,7 @@ impl<B: Backend> Backfill<B> {
                         c.last_error = Some(msg);
                     });
                 let done = self.control.finish_run(true);
-                if emit_progress {
-                    self.events.emit(Event::BackfillProgress(done));
-                }
+                self.events.emit(Event::BackfillProgress(done));
                 self.events.report(&format!("backfill {channel}"), e);
             }
         }
@@ -547,7 +528,7 @@ impl<B: Backend> Backfill<B> {
         channel: &ChannelId,
         channel_name: Option<&str>,
         include_threads: bool,
-        emit_progress: bool,
+        explicit: bool,
     ) -> Result<(), CoreError> {
         let mut catching_up = self.lock().get(channel).cloned();
         let mut catch_up_newest: Option<Ts> = None;
@@ -555,14 +536,18 @@ impl<B: Backend> Backfill<B> {
         let mut cursor: Option<String> = None;
         let mut first = true;
         loop {
-            self.control
-                .wait_if_paused(&self.events, Some(channel), emit_progress)
-                .await;
+            if explicit {
+                self.control
+                    .wait_if_paused(&self.events, Some(channel), true)
+                    .await;
+            }
             if !std::mem::take(&mut first) {
                 tokio::time::sleep(self.page_delay).await;
-                self.control
-                    .wait_if_paused(&self.events, Some(channel), emit_progress)
-                    .await;
+                if explicit {
+                    self.control
+                        .wait_if_paused(&self.events, Some(channel), true)
+                        .await;
+                }
             }
             let page = self.fetch(channel, &latest, &cursor).await?;
             let next = page
@@ -594,13 +579,17 @@ impl<B: Backend> Backfill<B> {
             let mut page_threads = 0u64;
             let mut page_replies = 0u64;
             for thread_ts in thread_roots {
-                self.control
-                    .wait_if_paused(&self.events, Some(channel), emit_progress)
-                    .await;
+                if explicit {
+                    self.control
+                        .wait_if_paused(&self.events, Some(channel), true)
+                        .await;
+                }
                 tokio::time::sleep(self.page_delay).await;
-                self.control
-                    .wait_if_paused(&self.events, Some(channel), emit_progress)
-                    .await;
+                if explicit {
+                    self.control
+                        .wait_if_paused(&self.events, Some(channel), true)
+                        .await;
+                }
                 let stored_replies = self
                     .fetch_thread_counted(channel.clone(), thread_ts)
                     .await?;
@@ -611,18 +600,18 @@ impl<B: Backend> Backfill<B> {
             if let Some(prior) = &catching_up {
                 catch_up_newest = catch_up_newest.or(newest);
                 if !overlaps && next.is_some() {
-                    let progress = self.control.update_channel(channel, channel_name, |c| {
-                        c.pages_fetched += 1;
-                        c.messages_stored += page_count;
-                        c.threads_fetched += page_threads;
-                        c.replies_stored += page_replies;
-                        if let Some(n) = &catch_up_newest
-                            && c.newest_ts.as_ref().is_none_or(|cur| n > cur)
-                        {
-                            c.newest_ts = Some(n.clone());
-                        }
-                    });
-                    if emit_progress {
+                    if explicit {
+                        let progress = self.control.update_channel(channel, channel_name, |c| {
+                            c.pages_fetched += 1;
+                            c.messages_stored += page_count;
+                            c.threads_fetched += page_threads;
+                            c.replies_stored += page_replies;
+                            if let Some(n) = &catch_up_newest
+                                && c.newest_ts.as_ref().is_none_or(|cur| n > cur)
+                            {
+                                c.newest_ts = Some(n.clone());
+                            }
+                        });
                         self.events.emit(Event::BackfillProgress(progress));
                     }
                     cursor = next;
@@ -637,19 +626,19 @@ impl<B: Backend> Backfill<B> {
                 catching_up = None;
                 self.lock().insert(channel.clone(), span.clone());
                 self.persist_synced().await;
-                let progress = self.control.update_channel(channel, channel_name, |c| {
-                    c.pages_fetched += 1;
-                    c.messages_stored += page_count;
-                    c.threads_fetched += page_threads;
-                    c.replies_stored += page_replies;
-                    c.newest_ts = Some(span.newest.clone());
-                    c.oldest_ts = Some(span.oldest.clone());
-                    c.complete = span.complete;
-                    if span.complete {
-                        c.status = BackfillStatus::Complete;
-                    }
-                });
-                if emit_progress {
+                if explicit {
+                    let progress = self.control.update_channel(channel, channel_name, |c| {
+                        c.pages_fetched += 1;
+                        c.messages_stored += page_count;
+                        c.threads_fetched += page_threads;
+                        c.replies_stored += page_replies;
+                        c.newest_ts = Some(span.newest.clone());
+                        c.oldest_ts = Some(span.oldest.clone());
+                        c.complete = span.complete;
+                        if span.complete {
+                            c.status = BackfillStatus::Complete;
+                        }
+                    });
                     self.events.emit(Event::BackfillProgress(progress));
                 }
                 if span.complete {
@@ -687,22 +676,22 @@ impl<B: Backend> Backfill<B> {
                 synced.get(channel).cloned()
             };
             self.persist_synced().await;
-            let progress = self.control.update_channel(channel, channel_name, |c| {
-                c.pages_fetched += 1;
-                c.messages_stored += page_count;
-                c.threads_fetched += page_threads;
-                c.replies_stored += page_replies;
-                if let Some(span) = &span_snapshot {
-                    c.newest_ts = Some(span.newest.clone());
-                    c.oldest_ts = Some(span.oldest.clone());
-                    c.complete = span.complete;
-                }
-                if next.is_none() {
-                    c.complete = true;
-                    c.status = BackfillStatus::Complete;
-                }
-            });
-            if emit_progress {
+            if explicit {
+                let progress = self.control.update_channel(channel, channel_name, |c| {
+                    c.pages_fetched += 1;
+                    c.messages_stored += page_count;
+                    c.threads_fetched += page_threads;
+                    c.replies_stored += page_replies;
+                    if let Some(span) = &span_snapshot {
+                        c.newest_ts = Some(span.newest.clone());
+                        c.oldest_ts = Some(span.oldest.clone());
+                        c.complete = span.complete;
+                    }
+                    if next.is_none() {
+                        c.complete = true;
+                        c.status = BackfillStatus::Complete;
+                    }
+                });
                 self.events.emit(Event::BackfillProgress(progress));
             }
             match next {
@@ -1288,5 +1277,28 @@ mod tests {
         assert!(!snap.paused);
         assert_eq!(snap.completed_channels, 1);
         assert_eq!(stored_ts(&bf.store).len(), 6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn implicit_channel_run_ignores_pause_and_does_not_clobber_active_workspace_backfill() {
+        let fake = FakeBackend::with_history(1..=4);
+        let (bf, _rx) = backfill(&fake);
+        let control = bf.control.clone();
+        control.set_active_channel(Some(ChannelId::from("C_WS")));
+        control.pause();
+        assert_eq!(control.snapshot().status, BackfillStatus::Paused);
+        assert_eq!(
+            control.snapshot().active_channel,
+            Some(ChannelId::from("C_WS"))
+        );
+
+        // Implicit sidebar open (`Backfill::run`) must still complete without hanging on pause
+        // and must leave the workspace backfill's active channel & paused status untouched.
+        bf.clone().run(ChannelId::from("C1")).await;
+        assert_eq!(stored_ts(&bf.store).len(), 4);
+        let snap = control.snapshot();
+        assert_eq!(snap.status, BackfillStatus::Paused);
+        assert!(snap.paused);
+        assert_eq!(snap.active_channel, Some(ChannelId::from("C_WS")));
     }
 }

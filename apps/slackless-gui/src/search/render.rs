@@ -97,7 +97,7 @@ impl SearchView {
         let tab_btn = |id: &'static str, label: &'static str, active: bool| {
             div()
                 .id(id)
-                .h_full()
+                .h(px(32.))
                 .flex()
                 .items_center()
                 .px_1()
@@ -149,13 +149,16 @@ impl SearchView {
             )
             .child(
                 h_flex()
-                    .h(px(36.))
+                    .min_h(px(36.))
                     .px_4()
-                    .gap_4()
+                    .py_1()
+                    .flex_wrap()
+                    .gap_x_4()
+                    .gap_y_1p5()
                     .items_center()
                     .child(
                         h_flex()
-                            .h_full()
+                            .items_center()
                             .gap_4()
                             .child(
                                 tab_btn(

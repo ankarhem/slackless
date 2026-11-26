@@ -6897,4 +6897,37 @@ async fn workspace_backfill_commands_report_progress_and_honor_pause_resume() {
         .thread_replies(&ws, &c1, &Ts::from("1700000100.000100"))
         .unwrap();
     assert_eq!(replies.len(), 2);
+
+    // 4. Pausing then issuing an explicit BackfillChannel clears stale paused state and completes.
+    core.handle(Command::Workspace(WorkspaceCommand::PauseBackfill))
+        .await;
+    let Event::BackfillProgress(paused_again) = next(&mut rx).await else {
+        panic!("expected BackfillProgress on second pause");
+    };
+    assert!(paused_again.paused);
+
+    core.handle(Command::Workspace(WorkspaceCommand::BackfillChannel {
+        channel: c2.clone(),
+        include_threads: false,
+    }))
+    .await;
+    let mut saw_ch_complete = false;
+    for _ in 0..32 {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Ok(Event::BackfillProgress(p)))
+                if !p.paused
+                    && p.status == BackfillStatus::Complete
+                    && p.channels.iter().any(|c| c.channel == c2 && c.complete) =>
+            {
+                saw_ch_complete = true;
+                break;
+            }
+            Ok(Ok(_)) => {}
+            other => panic!("unexpected event waiting for single-channel backfill: {other:?}"),
+        }
+    }
+    assert!(
+        saw_ch_complete,
+        "BackfillChannel after PauseBackfill must clear stale pause and complete"
+    );
 }

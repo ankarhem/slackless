@@ -73,7 +73,7 @@ pub use search::{
     SearchHitKind, UnifiedSearchHit, UnifiedSearchResults, UnifiedTranscriptHit,
     WorkspaceSearchTarget, discover_disk_archives, discover_local_archives, search_across_stores,
     search_all_local_workspaces, search_disk_archives, search_huddle_transcripts_across_stores,
-    search_single_store_all_workspaces,
+    search_huddle_transcripts_in_disk_archives, search_single_store_all_workspaces,
 };
 
 /// Transcribe a local video or audio file with `preferred` (or any ready local provider), store

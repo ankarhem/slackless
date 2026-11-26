@@ -503,7 +503,7 @@ impl App {
                 } else {
                     Arc::new(fixtures::workspace(idx))
                 };
-                if let Some(store) = fixture_archive(&fx) {
+                if let Some(store) = fixture_archive_for(&fx, &team.id) {
                     sources.push(SearchWorkspaceSource {
                         team_id: team.id.clone(),
                         name: team.name.clone(),
@@ -841,7 +841,11 @@ impl App {
                     } else {
                         let fixtures = Arc::new(fixtures::workspace(index));
                         let channel = first_conversation(&fixtures);
-                        let archive = fixture_archive(&fixtures);
+                        let archive = fixtures
+                            .workspaces
+                            .get(index)
+                            .or_else(|| fixtures.workspaces.first())
+                            .and_then(|t| fixture_archive_for(&fixtures, &t.id));
                         (fixtures, channel, archive, false)
                     };
                 let views = build_workspace(&fixtures, index, archive, &channel, window, cx);
@@ -925,6 +929,16 @@ impl App {
             });
         }
         // New thread panels / profile panes pick up Enter-to-send and the self state.
+        let active_team = self
+            .bridge
+            .team_id()
+            .cloned()
+            .or_else(|| self.fixtures.workspaces.get(index).map(|t| t.id.clone()))
+            .or_else(|| self.fixtures.workspaces.first().map(|t| t.id.clone()));
+        if let Some(ws_id) = active_team {
+            self.results
+                .update(cx, |view, cx| view.set_workspace(ws_id, cx));
+        }
         let bf_progress = self.ws.backfill_progress.clone();
         self.preferences.update(cx, |prefs, cx| {
             prefs.set_backfill_progress(bf_progress, cx);

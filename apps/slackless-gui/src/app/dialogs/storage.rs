@@ -327,17 +327,6 @@ impl App {
     /// Gather SQLite & media cache metrics for the active workspace off the UI thread and push
     /// them into `Preferences -> Advanced -> Local storage & maintenance`.
     pub(in crate::app) fn refresh_storage_stats(&self, cx: &mut Context<Self>) {
-        fn dir_bytes(dir: &std::path::Path) -> u64 {
-            std::fs::read_dir(dir)
-                .ok()
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|e| e.metadata().ok())
-                .filter(|m| m.is_file())
-                .map(|m| m.len())
-                .sum()
-        }
         let Some((store, team)) = self
             .bridge
             .read_store_clone()
@@ -351,24 +340,40 @@ impl App {
         cx.spawn(async move |_, cx| {
             let info = cx
                 .background_executor()
-                .spawn(async move {
-                    let stats = store.lock().ok()?.stats(&team).ok()?;
-                    let media_cache_bytes = dir_bytes(
-                        &std::env::temp_dir().join("slackless-media"),
-                    )
-                    .saturating_add(dir_bytes(&std::env::temp_dir().join("slackless-audio")));
-                    Some(crate::preferences::StorageInfo {
-                        messages: stats.messages,
-                        revisions: stats.revisions,
-                        conversations: stats.conversations,
-                        users: stats.users,
-                        offline_queued: stats.offline_queued,
-                        db_bytes: stats.db_bytes(),
-                        media_cache_bytes,
-                    })
-                })
+                .spawn(async move { collect_storage_info(&store, &team) })
                 .await;
             let _ = prefs.update(cx, |prefs, cx| prefs.set_storage_stats(info, cx));
+        })
+        .detach();
+    }
+
+    /// Gather SQLite & media cache metrics off the UI thread, push them to `Preferences`, and
+    /// refresh `window` so an open Storage modal dialog repaints immediately on load.
+    pub(in crate::app) fn refresh_storage_stats_in(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((store, team)) = self
+            .bridge
+            .read_store_clone()
+            .zip(self.bridge.team_id().cloned())
+        else {
+            self.preferences
+                .update(cx, |prefs, cx| prefs.set_storage_stats(None, cx));
+            window.refresh();
+            return;
+        };
+        let prefs = self.preferences.downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            let info = cx
+                .background_executor()
+                .spawn(async move { collect_storage_info(&store, &team) })
+                .await;
+            let _ = cx.update(|window, cx| {
+                let _ = prefs.update(cx, |prefs, cx| prefs.set_storage_stats(info, cx));
+                window.refresh();
+            });
         })
         .detach();
     }
@@ -410,7 +415,7 @@ impl App {
                 .await;
             let _ = this.update_in(cx, |app, window, cx| match outcome {
                 Ok(saved) => {
-                    app.refresh_storage_stats(cx);
+                    app.refresh_storage_stats_in(window, cx);
                     let msg = if saved > 0 {
                         format!("Reclaimed {} KiB and optimized FTS5 indexes.", saved / 1024)
                     } else {
@@ -455,7 +460,7 @@ impl App {
                 })
                 .await;
             let _ = this.update_in(cx, |app, window, cx| {
-                app.refresh_storage_stats(cx);
+                app.refresh_storage_stats_in(window, cx);
                 let msg = if removed > 0 {
                     format!(
                         "Removed {} KiB of cached media files.",
@@ -792,7 +797,13 @@ impl App {
                 .bridge
                 .team_id()
                 .cloned()
-                .or_else(|| self.fixtures.workspaces.first().map(|t| t.id.clone()))
+                .or_else(|| {
+                    self.fixtures
+                        .workspaces
+                        .get(self.workspace)
+                        .or_else(|| self.fixtures.workspaces.first())
+                        .map(|t| t.id.clone())
+                })
                 .unwrap_or_default();
             let ws_name = self
                 .fixtures
@@ -1399,7 +1410,7 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.refresh_storage_stats(cx);
+        self.refresh_storage_stats_in(window, cx);
         if !self.fixtures.sample && self.bridge.store().is_some() {
             self.bridge.send(WorkspaceCommand::QueryBackfillProgress);
         }
@@ -1812,6 +1823,7 @@ impl App {
         let suggested = format!("{stem}-export.{}", fmt.extension());
         let start_dir = self.default_export_dir(cx);
         let fixtures = self.fixtures.clone();
+        let workspace_index = self.workspace;
         let store = self.bridge.read_store_clone();
         let team = self.bridge.team_id().cloned();
         let include_deleted = self.preferences.read(cx).settings().show_deleted_messages;
@@ -1838,7 +1850,12 @@ impl App {
                             .map_err(std::io::Error::other)?;
                         (artifact.item_count, artifact.content)
                     } else {
-                        let doc = build_fixture_channel_export(&fixtures, &channel, &label);
+                        let doc = build_fixture_channel_export(
+                            &fixtures,
+                            workspace_index,
+                            &channel,
+                            &label,
+                        );
                         let content = match fmt {
                             slackless_core::export::ExportFormat::Markdown => {
                                 slackless_core::export::render_messages_markdown(&doc)
@@ -1887,6 +1904,7 @@ impl App {
         let suggested = format!("{stem}-thread-{ts_slug}.{}", fmt.extension());
         let start_dir = self.default_export_dir(cx);
         let fixtures = self.fixtures.clone();
+        let workspace_index = self.workspace;
         let store = self.bridge.read_store_clone();
         let team = self.bridge.team_id().cloned();
         let include_deleted = self.preferences.read(cx).settings().show_deleted_messages;
@@ -1915,8 +1933,13 @@ impl App {
                         .map_err(std::io::Error::other)?;
                         (artifact.item_count, artifact.content)
                     } else {
-                        let doc =
-                            build_fixture_thread_export(&fixtures, &channel, &label, &thread_ts);
+                        let doc = build_fixture_thread_export(
+                            &fixtures,
+                            workspace_index,
+                            &channel,
+                            &label,
+                            &thread_ts,
+                        );
                         let content = match fmt {
                             slackless_core::export::ExportFormat::Markdown => {
                                 slackless_core::export::render_messages_markdown(&doc)
@@ -1965,19 +1988,49 @@ impl StoreExportExt for slackless_core::store::Store {
     }
 }
 
-fn build_fixture_channel_export(
+fn collect_storage_info(
+    store: &SharedStore,
+    team: &slackless_core::types::TeamId,
+) -> Option<crate::preferences::StorageInfo> {
+    fn dir_bytes(dir: &std::path::Path) -> u64 {
+        std::fs::read_dir(dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum()
+    }
+    let stats = store.lock().ok()?.stats(team).ok()?;
+    let media_cache_bytes = dir_bytes(&std::env::temp_dir().join("slackless-media"))
+        .saturating_add(dir_bytes(&std::env::temp_dir().join("slackless-audio")));
+    Some(crate::preferences::StorageInfo {
+        messages: stats.messages,
+        revisions: stats.revisions,
+        conversations: stats.conversations,
+        users: stats.users,
+        offline_queued: stats.offline_queued,
+        db_bytes: stats.db_bytes(),
+        media_cache_bytes,
+    })
+}
+
+pub(in crate::app) fn build_fixture_channel_export(
     fixtures: &Fixtures,
+    workspace_index: usize,
     channel: &ChannelId,
     label: &str,
 ) -> slackless_core::export::ExportedMessagesDoc {
-    let ws = fixtures
+    let active_ws = fixtures
         .workspaces
-        .first()
+        .get(workspace_index)
+        .or_else(|| fixtures.workspaces.first());
+    let ws = active_ws
         .map(|t| t.id.as_str().to_owned())
         .unwrap_or_default();
-    let ws_name = fixtures
-        .workspaces
-        .first()
+    let ws_name = active_ws
         .map(|t| t.name.clone())
         .filter(|n| !n.trim().is_empty());
     let mut users = HashMap::new();
@@ -2034,27 +2087,28 @@ fn build_fixture_channel_export(
     }
 }
 
-fn build_fixture_thread_export(
+pub(in crate::app) fn build_fixture_thread_export(
     fixtures: &Fixtures,
+    workspace_index: usize,
     channel: &ChannelId,
     label: &str,
     thread_ts: &Ts,
 ) -> slackless_core::export::ExportedMessagesDoc {
-    let ws = fixtures
+    let active_ws = fixtures
         .workspaces
-        .first()
+        .get(workspace_index)
+        .or_else(|| fixtures.workspaces.first());
+    let ws = active_ws
         .map(|t| t.id.as_str().to_owned())
         .unwrap_or_default();
-    let ws_name = fixtures
-        .workspaces
-        .first()
+    let ws_name = active_ws
         .map(|t| t.name.clone())
         .filter(|n| !n.trim().is_empty());
     let mut users = HashMap::new();
     for u in &fixtures.users {
         users.insert(u.id.clone(), fixtures.name_of(u).to_owned());
     }
-    let transcripts = HashMap::new();
+    let transcripts = &fixtures.file_transcripts;
     let mut raw: Vec<Message> = Vec::new();
     if let Some(root) = fixtures
         .messages
@@ -2078,7 +2132,7 @@ fn build_fixture_thread_export(
                 message: msg,
                 deleted: false,
             };
-            slackless_core::export::build_exported_message(&stored, &users, &transcripts, true)
+            slackless_core::export::build_exported_message(&stored, &users, transcripts, true)
         })
         .collect();
     slackless_core::export::ExportedMessagesDoc {
