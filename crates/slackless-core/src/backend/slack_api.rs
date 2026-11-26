@@ -18,6 +18,9 @@ use super::{
     MessagingBackend, THREADS_PAGE_LIMIT, UsersBackend, WorkspaceBackend,
 };
 
+// Every trait method is forwarded below: a method added to a `*Backend` trait with a default
+// body must get its `SlackApi` impl, or these `deny` attributes fail clippy.
+#[deny(clippy::missing_trait_methods)]
 impl WorkspaceBackend for SlackApi {
     async fn user_boot(&self) -> api::Result<UserBoot> {
         self.client_user_boot().await
@@ -51,6 +54,7 @@ impl WorkspaceBackend for SlackApi {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 impl ChannelsBackend for SlackApi {
     async fn conversation_info(&self, channel: ChannelId) -> api::Result<Conversation> {
         self.conversations_info(&channel).await
@@ -146,6 +150,7 @@ impl ChannelsBackend for SlackApi {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 impl MessagingBackend for SlackApi {
     async fn history_page(
         &self,
@@ -381,6 +386,7 @@ impl MessagingBackend for SlackApi {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 impl UsersBackend for SlackApi {
     async fn user_info(&self, user: UserId) -> api::Result<User> {
         self.users_info(&user).await
@@ -481,6 +487,7 @@ impl UsersBackend for SlackApi {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 impl FilesBackend for SlackApi {
     async fn files(&self, filter: FilesFilter) -> api::Result<Vec<File>> {
         helpers::files(self, filter).await
@@ -536,6 +543,7 @@ impl FilesBackend for SlackApi {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 impl CollabBackend for SlackApi {
     async fn edge_search(
         &self,
@@ -764,6 +772,7 @@ impl CollabBackend for SlackApi {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 impl HuddleBackend for SlackApi {
     async fn rooms_join(&self, channel: ChannelId) -> api::Result<api::RoomJoinResponse> {
         SlackApi::rooms_join(self, &channel, None, None).await
