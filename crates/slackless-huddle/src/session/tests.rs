@@ -560,8 +560,10 @@ mod state_machine {
         SdkStreamMediaType, SdkSubscribeAckFrame, SdkTrackMapping, sdk_signal_frame,
     };
     use crate::session::connected::SessionRuntime;
-    use crate::session::controls::handle_control;
-    use crate::session::io::{MediaDevices, RtcController, SignalSink};
+    use crate::session::controls::{apply_background_done, handle_control};
+    use crate::session::io::{
+        AudioSwitch, BackgroundDone, MediaDevices, RtcController, SignalSink,
+    };
     use crate::session::signaling_handlers::handle_signal_frame;
     use crate::session::video_rx::VideoRoutingTable;
     use crate::video::VideoFrame;
@@ -652,12 +654,20 @@ mod state_machine {
         }
     }
 
+    /// Scripted audio restarts, shared with the device switches [`FakeMedia`] hands out (a failed
+    /// switch drops the engine, so the script cannot live in it).
+    #[derive(Default)]
+    struct FakeAudioScript {
+        /// Outcomes for successive restart attempts (`true` = ok, `false` = err).
+        results: VecDeque<bool>,
+        /// Input device of every restart attempt, in order.
+        starts: Vec<Option<String>>,
+    }
+
     struct FakeMedia {
         /// Token representing the active inbound audio stream (`Some(id)` while running).
         running_audio: Option<u64>,
-        /// Scripted outcomes for successive `start_audio_recoverable` calls (`true` = ok, `false` = err).
-        audio_start_results: VecDeque<bool>,
-        audio_starts: Vec<(Option<String>, Option<String>)>,
+        audio_script: Arc<Mutex<FakeAudioScript>>,
         camera_active: bool,
         camera_blur: bool,
         camera_compact: bool,
@@ -671,8 +681,7 @@ mod state_machine {
         fn default() -> Self {
             Self {
                 running_audio: Some(1),
-                audio_start_results: VecDeque::new(),
-                audio_starts: Vec::new(),
+                audio_script: Arc::default(),
                 camera_active: false,
                 camera_blur: false,
                 camera_compact: false,
@@ -684,32 +693,63 @@ mod state_machine {
         }
     }
 
+    impl FakeMedia {
+        fn audio_starts(&self) -> Vec<Option<String>> {
+            self.audio_script.lock().unwrap().starts.clone()
+        }
+    }
+
     impl MediaDevices for FakeMedia {
         type InboundAudio = u64;
+        /// The running inbound stream token.
+        type Audio = u64;
+        type Camera = ();
+        /// Loopback device feeding the share's audio.
+        type ScreenShare = Option<String>;
 
-        fn stop_audio(&mut self) -> Option<u64> {
-            self.running_audio.take()
+        fn stop_audio(&mut self) {
+            self.running_audio = None;
         }
 
-        fn start_audio_recoverable(
+        fn switch_audio(
             &mut self,
-            config: &HuddleAudioConfig,
-            _shared: AudioSharedState,
-            _outbound_opus_tx: mpsc::UnboundedSender<bytes::Bytes>,
-            inbound_rx: u64,
-        ) -> std::result::Result<(), (HuddleError, u64)> {
-            self.audio_starts
-                .push((config.input_device.clone(), config.output_device.clone()));
-            let ok = self.audio_start_results.pop_front().unwrap_or(true);
-            if ok {
-                self.running_audio = Some(inbound_rx);
-                Ok(())
-            } else {
-                Err((
-                    HuddleError::Audio("device unavailable".to_owned()),
-                    inbound_rx,
-                ))
-            }
+            new: HuddleAudioConfig,
+            prev: HuddleAudioConfig,
+            parked: Option<u64>,
+        ) -> Pin<Box<dyn Future<Output = AudioSwitch<u64, u64>> + Send>> {
+            // Stopping the engine hands back its inbound stream.
+            let inbound = self.running_audio.take().or(parked);
+            let script = Arc::clone(&self.audio_script);
+            Box::pin(async move {
+                let Some(inbound) = inbound else {
+                    return AudioSwitch::Failed {
+                        err: HuddleError::Audio("inbound audio stream lost".into()),
+                        revert_err: None,
+                        inbound: None,
+                    };
+                };
+                let mut script = script.lock().unwrap();
+                script.starts.push(new.input_device);
+                if script.results.pop_front().unwrap_or(true) {
+                    return AudioSwitch::Switched(inbound);
+                }
+                script.starts.push(prev.input_device);
+                if script.results.pop_front().unwrap_or(true) {
+                    return AudioSwitch::Reverted {
+                        audio: inbound,
+                        err: HuddleError::Audio("device unavailable".to_owned()),
+                    };
+                }
+                AudioSwitch::Failed {
+                    err: HuddleError::Audio("device unavailable".to_owned()),
+                    revert_err: Some(HuddleError::Audio("previous device unavailable".to_owned())),
+                    inbound: Some(inbound),
+                }
+            })
+        }
+
+        fn install_audio(&mut self, audio: u64) {
+            self.running_audio = Some(audio);
         }
 
         fn start_camera(
@@ -719,20 +759,23 @@ mod state_machine {
             compact: bool,
             _outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
             _local_cam_tx: mpsc::UnboundedSender<VideoFrame>,
-        ) -> crate::Result<()> {
+        ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send>> {
             if self.fail_camera {
-                return Err(HuddleError::Video("camera permission denied".into()));
+                return Box::pin(async {
+                    Err(HuddleError::Video("camera permission denied".into()))
+                });
             }
             self.camera_active = true;
             self.camera_blur = blur;
             self.camera_compact = compact;
-            Ok(())
+            Box::pin(async { Ok(()) })
         }
 
-        fn stop_camera(&mut self) -> bool {
-            let was = self.camera_active;
+        fn install_camera(&mut self, _camera: ()) {}
+
+        fn stop_camera(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             self.camera_active = false;
-            was
+            Box::pin(async {})
         }
 
         fn set_camera_blur(&mut self, blur: bool) {
@@ -751,32 +794,57 @@ mod state_machine {
 
         fn set_camera_target_bitrate(&mut self, _bps: u32) {}
 
-        fn start_screen_share<'a>(
-            &'a mut self,
+        fn start_screen_share(
+            &mut self,
             _creds: HuddleCredentials,
             source_id: String,
             share_audio: bool,
             _local_screen_tx: mpsc::UnboundedSender<VideoFrame>,
             _perf: Arc<HuddlePerfCounters>,
-        ) -> Pin<Box<dyn Future<Output = crate::Result<Option<String>>> + Send + 'a>> {
-            Box::pin(async move {
-                if self.fail_screen_share {
-                    return Err(HuddleError::Video("screen capture denied".into()));
-                }
-                self.screen_share_active = Some(source_id);
-                Ok(share_audio.then(|| "System Audio Tap".to_owned()))
-            })
+        ) -> Pin<Box<dyn Future<Output = crate::Result<Self::ScreenShare>> + Send>> {
+            if self.fail_screen_share {
+                return Box::pin(async { Err(HuddleError::Video("screen capture denied".into())) });
+            }
+            self.screen_share_active = Some(source_id);
+            Box::pin(async move { Ok(share_audio.then(|| "System Audio Tap".to_owned())) })
         }
 
-        fn stop_screen_share<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-            Box::pin(async move {
-                self.screen_share_active = None;
-            })
+        fn screen_share_loopback(share: &Self::ScreenShare) -> Option<String> {
+            share.clone()
+        }
+
+        fn install_screen_share(&mut self, _share: Option<String>) {}
+
+        fn stop_screen_share(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            self.screen_share_active = None;
+            Box::pin(async {})
         }
 
         fn set_jukebox(&mut self, output_device: Option<String>, song_key: Option<&str>) {
             self.jukebox_history
                 .push((output_device, song_key.map(ToOwned::to_owned)));
+        }
+    }
+
+    /// Let device operations spawned by `handle_control` report back and apply their results
+    /// (an audio switch may chain straight into another one).
+    async fn settle_background(
+        rt: &mut SessionRuntime<'_, FakeMedia>,
+        bg_rx: &mut mpsc::UnboundedReceiver<BackgroundDone<FakeMedia>>,
+        config: &mut HuddleAudioConfig,
+        snap: &mut HuddleSessionSnapshot,
+        rtc: &FakeRtc,
+        sig: &mut FakeSignal,
+    ) {
+        loop {
+            tokio::task::yield_now().await;
+            match bg_rx.try_recv() {
+                Ok(done) => apply_background_done(done, config, snap, rtc, sig, rt).await,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    unreachable!("runtime holds a sender")
+                }
+            }
         }
     }
 
@@ -801,12 +869,15 @@ mod state_machine {
         creds: &'a HuddleCredentials,
         updates: &'a mpsc::UnboundedSender<HuddleUpdate>,
         media: FakeMedia,
-    ) -> SessionRuntime<'a, FakeMedia> {
-        let (outbound_opus_tx, _opus_rx) = mpsc::unbounded_channel();
+    ) -> (
+        SessionRuntime<'a, FakeMedia>,
+        mpsc::UnboundedReceiver<BackgroundDone<FakeMedia>>,
+    ) {
         let (outbound_h264_tx, _h264_rx) = mpsc::unbounded_channel();
         let (local_cam_tx, _cam_rx) = mpsc::unbounded_channel();
         let (local_screen_tx, _scr_rx) = mpsc::unbounded_channel();
-        SessionRuntime {
+        let (bg_done_tx, bg_done_rx) = mpsc::unbounded_channel();
+        let rt = SessionRuntime {
             creds,
             updates,
             wants_compressed: false,
@@ -814,6 +885,8 @@ mod state_machine {
             self_content_attendee: format!("{}#content", creds.attendee_id),
             media,
             parked_inbound_audio: None,
+            audio_switch_in_flight: false,
+            camera_gen: 0,
             shared: AudioSharedState::from_config(&HuddleAudioConfig::default()),
             remote_sources: Vec::new(),
             active_remote_tiles: HashSet::new(),
@@ -828,11 +901,12 @@ mod state_machine {
             vdec_clear: Arc::new(AtomicBool::new(false)),
             vdec_shutdown: Arc::new(AtomicBool::new(false)),
             perf: Arc::new(HuddlePerfCounters::default()),
-            outbound_opus_tx,
             outbound_h264_tx,
             local_cam_tx,
             local_screen_tx,
-        }
+            bg_done_tx,
+        };
+        (rt, bg_done_rx)
     }
 
     fn drain_updates(rx: &mut mpsc::UnboundedReceiver<HuddleUpdate>) -> Vec<HuddleUpdate> {
@@ -846,15 +920,18 @@ mod state_machine {
     #[tokio::test]
     async fn audio_device_hotswap_reverts_on_failure_and_recovers_parked_rx_on_double_failure() {
         let creds = test_creds();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut media = FakeMedia::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let media = FakeMedia::default();
         // 1) Switch to BrokenMic fails, revert to Default succeeds.
         // 2) Switch to BadMic2 fails AND revert to Default also fails -> inbound rx parked!
         // 3) Subsequent switch to UsbMic succeeds using the parked inbound rx!
         media
-            .audio_start_results
+            .audio_script
+            .lock()
+            .unwrap()
+            .results
             .extend([false, true, false, false, true]);
-        let mut rt = make_runtime(&creds, &tx, media);
+        let (mut rt, mut bg_rx) = make_runtime(&creds, &tx, media);
         let mut config = HuddleAudioConfig {
             input_device: Some("Built-in Mic".into()),
             output_device: Some("Built-in Speakers".into()),
@@ -882,6 +959,7 @@ mod state_machine {
         )
         .await;
         assert!(exit.is_none());
+        settle_background(&mut rt, &mut bg_rx, &mut config, &mut snap, &rtc, &mut sig).await;
         assert_eq!(config.input_device.as_deref(), Some("Built-in Mic"));
         assert_eq!(snap.input_device.as_deref(), Some("Built-in Mic"));
         assert!(
@@ -906,8 +984,9 @@ mod state_machine {
             &mut rt,
         )
         .await;
+        settle_background(&mut rt, &mut bg_rx, &mut config, &mut snap, &rtc, &mut sig).await;
         assert_eq!(config.input_device.as_deref(), Some("Built-in Mic"));
-        assert!(rt.media.running_audio.is_none());
+        assert_eq!(rt.media.running_audio, None);
         assert_eq!(
             rt.parked_inbound_audio,
             Some(1),
@@ -927,19 +1006,85 @@ mod state_machine {
             &mut rt,
         )
         .await;
+        settle_background(&mut rt, &mut bg_rx, &mut config, &mut snap, &rtc, &mut sig).await;
         assert_eq!(config.input_device.as_deref(), Some("USB Mic"));
         assert_eq!(snap.output_device.as_deref(), Some("Headphones"));
         assert!(snap.error.is_none(), "error must clear after recovery");
         assert_eq!(rt.media.running_audio, Some(1));
         assert!(rt.parked_inbound_audio.is_none());
-        assert_eq!(drain_updates(&mut rx).len(), 3);
+        assert_eq!(
+            rt.media
+                .audio_starts()
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
+            [
+                Some("BrokenMic"),
+                Some("Built-in Mic"),
+                Some("BadMic2"),
+                Some("Built-in Mic"),
+                Some("USB Mic"),
+            ]
+        );
+    }
+
+    /// A device change requested while an earlier switch still owns the hardware is applied as
+    /// soon as that switch reports back, ending on the requested devices.
+    #[tokio::test]
+    async fn audio_device_switch_requested_during_a_switch_is_chained() {
+        let creds = test_creds();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (mut rt, mut bg_rx) = make_runtime(&creds, &tx, FakeMedia::default());
+        let mut config = HuddleAudioConfig::default();
+        let mut snap = HuddleSessionSnapshot::default();
+        let rtc = FakeRtc::default();
+        let mut sig = FakeSignal::default();
+
+        handle_control(
+            Some(HuddleControl::SetAudioDevices {
+                input: Some("First".into()),
+                output: None,
+            }),
+            &mut config,
+            &mut snap,
+            &rtc,
+            &mut sig,
+            &mut rt,
+        )
+        .await;
+        // The first switch owns the audio hardware until it reports back.
+        handle_control(
+            Some(HuddleControl::SetAudioDevices {
+                input: Some("Second".into()),
+                output: None,
+            }),
+            &mut config,
+            &mut snap,
+            &rtc,
+            &mut sig,
+            &mut rt,
+        )
+        .await;
+        settle_background(&mut rt, &mut bg_rx, &mut config, &mut snap, &rtc, &mut sig).await;
+
+        assert_eq!(config.input_device.as_deref(), Some("Second"));
+        assert_eq!(snap.input_device.as_deref(), Some("Second"));
+        assert_eq!(rt.media.running_audio, Some(1));
+        assert_eq!(
+            rt.media
+                .audio_starts()
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
+            [Some("First"), Some("Second")]
+        );
     }
 
     #[tokio::test]
     async fn index_suback_audio_only_and_late_joiner_screenshare_protocol_flow() {
         let creds = test_creds();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut rt = make_runtime(&creds, &tx, FakeMedia::default());
+        let (mut rt, mut bg_rx) = make_runtime(&creds, &tx, FakeMedia::default());
         let mut config = HuddleAudioConfig::default();
         let mut snap = HuddleSessionSnapshot::default();
         let rtc = FakeRtc::default();
@@ -959,6 +1104,7 @@ mod state_machine {
             &mut rt,
         )
         .await;
+        settle_background(&mut rt, &mut bg_rx, &mut config, &mut snap, &rtc, &mut sig).await;
         assert!(snap.video);
         assert!(rt.media.camera_active);
         assert!(rt.media.camera_blur);
@@ -980,6 +1126,7 @@ mod state_machine {
             &mut rt,
         )
         .await;
+        settle_background(&mut rt, &mut bg_rx, &mut config, &mut snap, &rtc, &mut sig).await;
         assert!(snap.sharing);
         assert_eq!(snap.share_source_id.as_deref(), Some("monitor:1"));
         assert_eq!(
@@ -1157,7 +1304,7 @@ mod state_machine {
     {
         let creds = test_creds();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut rt = make_runtime(&creds, &tx, FakeMedia::default());
+        let (mut rt, _bg_rx) = make_runtime(&creds, &tx, FakeMedia::default());
         let mut config = HuddleAudioConfig::default();
         let mut snap = HuddleSessionSnapshot::default();
         let rtc = FakeRtc::default();
@@ -1330,7 +1477,7 @@ mod state_machine {
             fail_screen_share: true,
             ..Default::default()
         };
-        let mut rt = make_runtime(&creds, &tx, media);
+        let (mut rt, mut bg_rx) = make_runtime(&creds, &tx, media);
         let mut config = HuddleAudioConfig::default();
         let mut snap = HuddleSessionSnapshot::default();
         let rtc = FakeRtc::default();
@@ -1377,6 +1524,7 @@ mod state_machine {
             &mut rt,
         )
         .await;
+        settle_background(&mut rt, &mut bg_rx, &mut config, &mut snap, &rtc, &mut sig).await;
         assert!(!snap.video);
         assert!(snap.error.as_deref().unwrap().contains("camera"));
 
@@ -1392,6 +1540,7 @@ mod state_machine {
             &mut rt,
         )
         .await;
+        settle_background(&mut rt, &mut bg_rx, &mut config, &mut snap, &rtc, &mut sig).await;
         assert!(!snap.sharing);
         assert!(snap.share_source_id.is_none());
         assert!(snap.error.as_deref().unwrap().contains("screen capture"));
@@ -1412,6 +1561,7 @@ mod state_machine {
             &mut rt,
         )
         .await;
+        settle_background(&mut rt, &mut bg_rx, &mut config, &mut snap, &rtc, &mut sig).await;
         assert!(snap.video && !rt.media.camera_blur);
         handle_control(
             Some(HuddleControl::SetBlurBackground(true)),
@@ -1436,6 +1586,7 @@ mod state_machine {
             &mut rt,
         )
         .await;
+        settle_background(&mut rt, &mut bg_rx, &mut config, &mut snap, &rtc, &mut sig).await;
         assert!(snap.sharing && rt.media.camera_compact);
 
         let _ = drain_updates(&mut rx);
@@ -1715,7 +1866,7 @@ mod state_machine {
 
         let creds = test_creds();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut rt = make_runtime(&creds, &tx, FakeMedia::default());
+        let (mut rt, _bg_rx) = make_runtime(&creds, &tx, FakeMedia::default());
         let mut config = HuddleAudioConfig::default();
         let mut snap = HuddleSessionSnapshot::default();
         let mut rtc = FakeRtc::default();
@@ -1965,8 +2116,8 @@ mod handshake_and_connected_loop_tests {
     use super::super::connected::run_connected_loop_with;
     use super::super::handshake::perform_handshake_with;
     use super::super::io::{
-        BoxFuture, MediaDevices, RtcController, RtcSession, SessionFactory, SignalSession,
-        SignalSink, VideoTrackOut,
+        AudioSwitch, BoxFuture, MediaDevices, RtcController, RtcSession, SessionFactory,
+        SignalSession, SignalSink, VideoTrackOut,
     };
     use super::super::supervisor::LoopExit;
     use crate::audio::AudioSharedState;
@@ -1990,8 +2141,13 @@ mod handshake_and_connected_loop_tests {
         leave_and_close_count: AtomicU32,
         peer_close_count: AtomicU32,
         audio_stop_count: AtomicU32,
+        audio_restarts: AtomicU32,
         camera_stop_count: AtomicU32,
+        camera_installs: AtomicU32,
         screen_stop_count: AtomicU32,
+        screen_share_installs: AtomicU32,
+        /// Fired when the client answers a server PING.
+        pong_sent: tokio::sync::Notify,
         jukebox_calls: Mutex<Vec<(Option<String>, Option<String>)>>,
         opus_written: Mutex<Vec<bytes::Bytes>>,
         h264_written: Mutex<Vec<Vec<u8>>>,
@@ -2022,7 +2178,14 @@ mod handshake_and_connected_loop_tests {
         }
 
         fn reply_ping_if_needed<'a>(&'a mut self, pp: &'a SdkPingPongFrame) -> BoxFuture<'a, bool> {
-            Box::pin(async move { pp.r#type == Some(SdkPingPongType::Ping as i32) })
+            Box::pin(async move {
+                if pp.r#type == Some(SdkPingPongType::Ping as i32) {
+                    self.log.pong_sent.notify_one();
+                    true
+                } else {
+                    false
+                }
+            })
         }
     }
 
@@ -2110,9 +2273,9 @@ mod handshake_and_connected_loop_tests {
         fail_offer: bool,
         fail_set_remote_answer: bool,
         cam_fb_tx_slot: Arc<Mutex<Option<mpsc::UnboundedSender<VideoSenderFeedback>>>>,
-        packets_sent: AtomicU64,
+        packets_sent: Arc<AtomicU64>,
         packets_received: AtomicU64,
-        bytes_sent: AtomicU64,
+        bytes_sent: Arc<AtomicU64>,
         bytes_received: AtomicU64,
     }
 
@@ -2218,10 +2381,25 @@ mod handshake_and_connected_loop_tests {
         }
     }
 
+    /// Blocks a mocked device restart until the test releases it, standing in for an OS device
+    /// (or a Chime handshake) that takes seconds.
+    struct RestartGate {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl RestartGate {
+        fn block(self) {
+            let _ = self.entered.map(|tx| tx.send(()));
+            let _ = self.release.recv();
+        }
+    }
+
     struct MockMedia {
         log: Arc<MockLog>,
         running_audio: bool,
         camera_active: bool,
+        restart_gate: Option<RestartGate>,
         outbound_h264_tx_slot: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
         local_cam_tx_slot: Arc<Mutex<Option<mpsc::UnboundedSender<VideoFrame>>>>,
         local_screen_tx_slot: Arc<Mutex<Option<mpsc::UnboundedSender<VideoFrame>>>>,
@@ -2229,26 +2407,44 @@ mod handshake_and_connected_loop_tests {
 
     impl MediaDevices for MockMedia {
         type InboundAudio = ();
+        type Audio = ();
+        type Camera = ();
+        type ScreenShare = ();
 
-        fn stop_audio(&mut self) -> Option<()> {
+        fn stop_audio(&mut self) {
             if self.running_audio {
                 self.running_audio = false;
                 self.log.audio_stop_count.fetch_add(1, Ordering::SeqCst);
-                Some(())
-            } else {
-                None
             }
         }
 
-        fn start_audio_recoverable(
+        fn switch_audio(
             &mut self,
-            _config: &HuddleAudioConfig,
-            _shared: AudioSharedState,
-            _outbound_opus_tx: mpsc::UnboundedSender<bytes::Bytes>,
-            _inbound_rx: (),
-        ) -> std::result::Result<(), (HuddleError, ())> {
+            _new: HuddleAudioConfig,
+            _prev: HuddleAudioConfig,
+            _parked: Option<()>,
+        ) -> BoxFuture<'static, AudioSwitch<(), ()>> {
+            self.stop_audio();
+            let gate = self.restart_gate.take();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    if let Some(gate) = gate {
+                        gate.block();
+                    }
+                    AudioSwitch::Switched(())
+                })
+                .await
+                .unwrap_or_else(|e| AudioSwitch::Failed {
+                    err: HuddleError::Audio(format!("mock audio switch panicked: {e}")),
+                    revert_err: None,
+                    inbound: None,
+                })
+            })
+        }
+
+        fn install_audio(&mut self, _audio: ()) {
             self.running_audio = true;
-            Ok(())
+            self.log.audio_restarts.fetch_add(1, Ordering::SeqCst);
         }
 
         fn start_camera(
@@ -2258,18 +2454,37 @@ mod handshake_and_connected_loop_tests {
             _compact: bool,
             outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
             local_cam_tx: mpsc::UnboundedSender<VideoFrame>,
-        ) -> Result<()> {
-            self.camera_active = true;
-            *self.outbound_h264_tx_slot.lock().unwrap() = Some(outbound_h264_tx);
-            *self.local_cam_tx_slot.lock().unwrap() = Some(local_cam_tx);
-            Ok(())
+        ) -> BoxFuture<'static, Result<()>> {
+            let gate = self.restart_gate.take();
+            let h264_slot = Arc::clone(&self.outbound_h264_tx_slot);
+            let cam_slot = Arc::clone(&self.local_cam_tx_slot);
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    if let Some(gate) = gate {
+                        gate.block();
+                    }
+                    *h264_slot.lock().unwrap() = Some(outbound_h264_tx);
+                    *cam_slot.lock().unwrap() = Some(local_cam_tx);
+                })
+                .await
+                .map_err(|e| HuddleError::Video(format!("mock camera start panicked: {e}")))
+            })
         }
 
-        fn stop_camera(&mut self) -> bool {
-            let was = self.camera_active;
+        fn install_camera(&mut self, _camera: ()) {
+            self.camera_active = true;
+            self.log.camera_installs.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn stop_camera(&mut self) -> BoxFuture<'static, ()> {
+            let was_active = self.camera_active;
             self.camera_active = false;
-            self.log.camera_stop_count.fetch_add(1, Ordering::SeqCst);
-            was
+            let log = Arc::clone(&self.log);
+            Box::pin(async move {
+                if was_active {
+                    log.camera_stop_count.fetch_add(1, Ordering::SeqCst);
+                }
+            })
         }
 
         fn set_camera_blur(&mut self, _blur: bool) {}
@@ -2284,23 +2499,42 @@ mod handshake_and_connected_loop_tests {
             self.log.target_bitrates.lock().unwrap().push(bps);
         }
 
-        fn start_screen_share<'a>(
-            &'a mut self,
+        fn start_screen_share(
+            &mut self,
             _creds: HuddleCredentials,
             _source_id: String,
             _share_audio: bool,
             local_screen_tx: mpsc::UnboundedSender<VideoFrame>,
             _perf: Arc<HuddlePerfCounters>,
-        ) -> BoxFuture<'a, Result<Option<String>>> {
+        ) -> BoxFuture<'static, Result<()>> {
+            let gate = self.restart_gate.take();
+            let slot = Arc::clone(&self.local_screen_tx_slot);
             Box::pin(async move {
-                *self.local_screen_tx_slot.lock().unwrap() = Some(local_screen_tx);
-                Ok(None)
+                tokio::task::spawn_blocking(move || {
+                    if let Some(gate) = gate {
+                        gate.block();
+                    }
+                    *slot.lock().unwrap() = Some(local_screen_tx);
+                })
+                .await
+                .map_err(|e| HuddleError::Video(format!("mock screen share panicked: {e}")))
             })
         }
 
-        fn stop_screen_share<'a>(&'a mut self) -> BoxFuture<'a, ()> {
+        fn screen_share_loopback(_: &()) -> Option<String> {
+            None
+        }
+
+        fn install_screen_share(&mut self, _share: ()) {
+            self.log
+                .screen_share_installs
+                .fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn stop_screen_share(&mut self) -> BoxFuture<'static, ()> {
+            let log = Arc::clone(&self.log);
             Box::pin(async move {
-                self.log.screen_stop_count.fetch_add(1, Ordering::SeqCst);
+                log.screen_stop_count.fetch_add(1, Ordering::SeqCst);
             })
         }
 
@@ -2331,6 +2565,8 @@ mod handshake_and_connected_loop_tests {
         fail_offer: bool,
         fail_set_remote_answer: bool,
         audio_script: AudioStartScript,
+        /// When set, the first audio / camera / screen-share restart blocks on it.
+        restart_gate: Option<RestartGate>,
         inbound_signal_rx: Option<mpsc::UnboundedReceiver<Result<Option<SdkSignalFrame>>>>,
         // Captured channel handles for driving the connected loop from tests:
         pc_state_tx: Arc<Mutex<Option<mpsc::UnboundedSender<RTCPeerConnectionState>>>>,
@@ -2382,6 +2618,7 @@ mod handshake_and_connected_loop_tests {
                 fail_offer: false,
                 fail_set_remote_answer: false,
                 audio_script: AudioStartScript::Ok,
+                restart_gate: None,
                 inbound_signal_rx: Some(sig_rx),
                 pc_state_tx: Arc::new(Mutex::new(None)),
                 outbound_opus_tx: Arc::new(Mutex::new(None)),
@@ -2435,26 +2672,22 @@ mod handshake_and_connected_loop_tests {
             let cam_slot = Arc::clone(&self.local_cam_tx);
             let scr_slot = Arc::clone(&self.local_screen_tx);
             let script = std::mem::replace(&mut self.audio_script, AudioStartScript::Ok);
+            let gate = self.restart_gate.take();
             tokio::spawn(async move {
+                let media = |log| MockMedia {
+                    log,
+                    running_audio: true,
+                    camera_active: false,
+                    restart_gate: gate,
+                    outbound_h264_tx_slot: h264_slot,
+                    local_cam_tx_slot: cam_slot,
+                    local_screen_tx_slot: scr_slot,
+                };
                 match script {
-                    AudioStartScript::Ok => Ok(MockMedia {
-                        log,
-                        running_audio: true,
-                        camera_active: false,
-                        outbound_h264_tx_slot: h264_slot,
-                        local_cam_tx_slot: cam_slot,
-                        local_screen_tx_slot: scr_slot,
-                    }),
+                    AudioStartScript::Ok => Ok(media(log)),
                     AudioStartScript::DelayedOk(d) => {
                         tokio::time::sleep(d).await;
-                        Ok(MockMedia {
-                            log,
-                            running_audio: true,
-                            camera_active: false,
-                            outbound_h264_tx_slot: h264_slot,
-                            local_cam_tx_slot: cam_slot,
-                            local_screen_tx_slot: scr_slot,
-                        })
+                        Ok(media(log))
                     }
                     AudioStartScript::Err(msg) => Err(HuddleError::Audio(msg)),
                     AudioStartScript::Panic => panic!("simulated audio startup panic"),
@@ -2481,9 +2714,9 @@ mod handshake_and_connected_loop_tests {
                     fail_offer: self.fail_offer,
                     fail_set_remote_answer: self.fail_set_remote_answer,
                     cam_fb_tx_slot: Arc::clone(&self.cam_fb_tx),
-                    packets_sent: AtomicU64::new(0),
+                    packets_sent: Arc::new(AtomicU64::new(0)),
                     packets_received: AtomicU64::new(0),
-                    bytes_sent: AtomicU64::new(0),
+                    bytes_sent: Arc::new(AtomicU64::new(0)),
                     bytes_received: AtomicU64::new(0),
                 })
             })
@@ -2780,14 +3013,10 @@ mod handshake_and_connected_loop_tests {
                 share_audio: false,
             })
             .unwrap();
-        for _ in 0..30 {
-            if local_cam_slot.lock().unwrap().is_some()
-                && local_screen_slot.lock().unwrap().is_some()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        wait_until("camera and screen-share slots", || {
+            local_cam_slot.lock().unwrap().is_some() && local_screen_slot.lock().unwrap().is_some()
+        })
+        .await;
         let dummy_frame = || VideoFrame {
             width: 2,
             height: 2,
@@ -2969,6 +3198,135 @@ mod handshake_and_connected_loop_tests {
             u,
             HuddleUpdate::State(s) if s.phase == HuddlePhase::Leaving
         )));
+    }
+
+    /// Await a condition driven by another task or thread, bounded by real time (the test clock
+    /// may be paused, so tokio timeouts must not be used for it).
+    async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Device restarts and the `#content` handshake block on the OS/network for seconds; the
+    /// event loop must keep answering server PINGs and applying controls meanwhile, and apply the
+    /// result once it lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connected_loop_keeps_answering_pings_and_controls_during_blocking_device_work() {
+        type SlowControl = (HuddleControl, &'static str, fn(&MockLog) -> u32);
+        let slow_controls: [SlowControl; 3] = [
+            (
+                HuddleControl::SetAudioDevices {
+                    input: Some("Slow Mic".into()),
+                    output: Some("Slow Speakers".into()),
+                },
+                "audio device switch",
+                |log: &MockLog| log.audio_restarts.load(Ordering::SeqCst),
+            ),
+            (
+                HuddleControl::SetCamera {
+                    enabled: true,
+                    device_index: Some(1),
+                    blur: false,
+                },
+                "camera start",
+                |log: &MockLog| log.camera_installs.load(Ordering::SeqCst),
+            ),
+            (
+                HuddleControl::SetScreenShare {
+                    source_id: Some("monitor:1".into()),
+                    share_audio: false,
+                },
+                "screen share start",
+                |log: &MockLog| log.screen_share_installs.load(Ordering::SeqCst),
+            ),
+        ];
+        for (ctrl, what, installs) in slow_controls {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (mut factory, sig_tx, log) = MockFactory::ok_default();
+            factory.rtc_initial_state = RTCPeerConnectionState::Connected;
+            factory.restart_gate = Some(RestartGate {
+                entered: Some(entered_tx),
+                release: release_rx,
+            });
+            let pc_state_slot = Arc::clone(&factory.pc_state_tx);
+            let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+            let (upd_tx, mut upd_rx) = mpsc::unbounded_channel();
+            let c = creds();
+            let loop_task = tokio::spawn(async move {
+                let mut config = HuddleAudioConfig::default();
+                let mut snap = HuddleSessionSnapshot::default();
+                let mut pending = VecDeque::new();
+                run_connected_loop_with(
+                    &mut factory,
+                    &c,
+                    &mut config,
+                    &mut snap,
+                    &mut ctrl_rx,
+                    &mut pending,
+                    &upd_tx,
+                    false,
+                )
+                .await
+            });
+            wait_until("handshake", || pc_state_slot.lock().unwrap().is_some()).await;
+
+            ctrl_tx.send(ctrl.clone()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), entered_rx)
+                .await
+                .expect("device work started")
+                .unwrap();
+            sig_tx
+                .send(Ok(Some(SdkSignalFrame {
+                    r#type: Some(sdk_signal_frame::Type::PingPong as i32),
+                    ping_pong: Some(SdkPingPongFrame {
+                        r#type: Some(SdkPingPongType::Ping as i32),
+                        ping_id: Some(7),
+                    }),
+                    ..Default::default()
+                })))
+                .unwrap();
+            ctrl_tx.send(HuddleControl::SetMuted(true)).unwrap();
+            let pong = tokio::time::timeout(Duration::from_secs(5), log.pong_sent.notified()).await;
+            let muted = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(u) = upd_rx.recv().await {
+                    if matches!(u, HuddleUpdate::State(ref s) if s.muted) {
+                        return true;
+                    }
+                }
+                false
+            })
+            .await;
+            release_tx.send(()).unwrap();
+            assert!(
+                pong.is_ok(),
+                "server PING must be answered while the {what} is in flight"
+            );
+            assert!(
+                muted.unwrap_or_else(|_| panic!("event loop stalled during the {what}")),
+                "SetMuted must apply while the {what} is in flight"
+            );
+            // Released: the device work completes and its result is installed.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while installs(&log) == 0 {
+                    let Some(_u) = upd_rx.recv().await else {
+                        panic!("updates channel closed before the {what} landed");
+                    };
+                }
+            })
+            .await
+            .expect("device work result installed");
+
+            ctrl_tx.send(HuddleControl::Leave).unwrap();
+            let exit = loop_task.await.unwrap();
+            assert!(matches!(exit, LoopExit::LeftCleanly), "{what}");
+        }
     }
 
     #[tokio::test]

@@ -7,11 +7,11 @@ use slackless_types::UserId;
 use tokio::sync::mpsc;
 use webrtc::peer_connection::RTCPeerConnectionState;
 
-use super::controls::handle_control;
+use super::controls::{apply_background_done, handle_control};
 use super::handshake::perform_handshake_with;
 use super::io::{
-    LiveMediaDevices, LiveSessionFactory, MediaDevices, RtcSession, SessionFactory, SignalSession,
-    SignalSink, VideoTrackOut,
+    BackgroundDone, LiveMediaDevices, LiveSessionFactory, MediaDevices, RtcSession, SessionFactory,
+    SignalSession, SignalSink, VideoTrackOut,
 };
 use super::signaling_handlers::{
     apply_audio_stream_info, apply_index_frame, content_share_source_type, handle_signal_frame,
@@ -43,6 +43,11 @@ pub(super) struct SessionRuntime<'a, M: MediaDevices = LiveMediaDevices> {
     /// Preserved inbound audio stream if an audio hot-swap fails to restart both the new and
     /// previous devices, so a subsequent `SetAudioDevices` can recover session audio cleanly.
     pub(super) parked_inbound_audio: Option<M::InboundAudio>,
+    /// An audio device switch owns the audio hardware until its result lands on `bg_done_tx`;
+    /// `SetAudioDevices` arriving meanwhile only updates the config and is chained afterwards.
+    pub(super) audio_switch_in_flight: bool,
+    /// Generation of the latest camera request; results of older starts are dropped on arrival.
+    pub(super) camera_gen: u64,
     pub(super) shared: AudioSharedState,
     pub(super) remote_sources: Vec<(String, RemoteVideoSource)>,
     pub(super) active_remote_tiles: HashSet<VideoTileKey>,
@@ -58,10 +63,10 @@ pub(super) struct SessionRuntime<'a, M: MediaDevices = LiveMediaDevices> {
     /// Set at teardown so decoder workers drop their backlog instead of decoding it.
     pub(super) vdec_shutdown: Arc<AtomicBool>,
     pub(super) perf: Arc<HuddlePerfCounters>,
-    pub(super) outbound_opus_tx: mpsc::UnboundedSender<bytes::Bytes>,
     pub(super) outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
     pub(super) local_cam_tx: mpsc::UnboundedSender<VideoFrame>,
     pub(super) local_screen_tx: mpsc::UnboundedSender<VideoFrame>,
+    pub(super) bg_done_tx: mpsc::UnboundedSender<BackgroundDone<M>>,
 }
 
 /// Announce desktop draw capability + content source details on official `"data-channel"`
@@ -238,6 +243,7 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
         *guard = Some(Arc::new(tap));
     }
 
+    let (bg_done_tx, mut bg_done_rx) = mpsc::unbounded_channel::<BackgroundDone<F::Media>>();
     let mut state = SessionRuntime {
         creds,
         updates,
@@ -246,6 +252,8 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
         self_content_attendee,
         media: hs.media,
         parked_inbound_audio: None,
+        audio_switch_in_flight: false,
+        camera_gen: 0,
         shared: hs.shared,
         remote_sources: Vec::new(),
         active_remote_tiles: HashSet::new(),
@@ -260,10 +268,10 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
         vdec_clear,
         vdec_shutdown,
         perf,
-        outbound_opus_tx: hs.outbound_opus_tx,
         outbound_h264_tx: hs.outbound_h264_tx,
         local_cam_tx: hs.local_cam_tx,
         local_screen_tx: hs.local_screen_tx,
+        bg_done_tx,
     };
 
     // Apply any AUDIO_STREAM_ID_INFO and INDEX frames captured during the initial handshake.
@@ -373,6 +381,9 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
                     }
                     _ => {}
                 }
+            }
+            Some(done) = bg_done_rx.recv() => {
+                apply_background_done(done, config, snap, &peer, &mut signal, &mut state).await;
             }
             frame_res = signal.next_frame() => {
                 match frame_res {
@@ -513,8 +524,9 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
 
     // 7. Clean teardown: stop captures, content share, music, send Chime LEAVE, close peer & WS.
     tracing::info!("tearing down huddle session cleanly");
-    state.media.stop_camera();
-    state.media.stop_screen_share().await;
+    let camera_stop = state.media.stop_camera();
+    let share_stop = state.media.stop_screen_share();
+    tokio::join!(camera_stop, share_stop);
     state.media.set_jukebox(None, None);
     snap.packets_sent = peer.total_packets_sent();
     snap.packets_received = peer.total_packets_received();

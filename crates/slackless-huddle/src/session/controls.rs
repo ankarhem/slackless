@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::connected::{SessionRuntime, announce_screen_share_capabilities};
-use super::io::{MediaDevices, RtcController, SignalSink};
+use super::io::{AudioSwitch, BackgroundDone, MediaDevices, RtcController, SignalSink};
 use super::supervisor::LoopExit;
 use crate::peer_message::{
     SLACK_DATA_CHANNEL_TOPIC, build_capabilities_message, build_draw_message,
@@ -15,8 +15,196 @@ use crate::signaling::{
 };
 use crate::video::VideoTileKey;
 use crate::{
-    HuddleAudioConfig, HuddleControl, HuddleDataEvent, HuddleSessionSnapshot, HuddleUpdate,
+    HuddleAudioConfig, HuddleControl, HuddleDataEvent, HuddleSessionSnapshot, HuddleUpdate, Result,
 };
+
+impl<M: MediaDevices> SessionRuntime<'_, M> {
+    /// Stop whatever audio is running and restart it on `new` (falling back to `prev`) off the
+    /// event loop, so pings and controls keep being handled while the OS opens the devices. A
+    /// switch already in flight owns the hardware; newer devices are applied once it reports back.
+    pub(super) fn start_audio_switch(&mut self, new: HuddleAudioConfig, prev: HuddleAudioConfig) {
+        if self.audio_switch_in_flight {
+            return;
+        }
+        self.audio_switch_in_flight = true;
+        let parked = self.parked_inbound_audio.take();
+        let switch = self.media.switch_audio(new.clone(), prev.clone(), parked);
+        let done_tx = self.bg_done_tx.clone();
+        tokio::spawn(async move {
+            let outcome = switch.await;
+            let _ = done_tx.send(BackgroundDone::AudioSwitch { new, prev, outcome });
+        });
+    }
+
+    /// Start the camera off the event loop; the result reports back tagged with its request
+    /// `generation` so a superseded start is dropped when it lands.
+    pub(super) fn start_camera(
+        &mut self,
+        generation: u64,
+        device_index: Option<usize>,
+        blur: bool,
+        compact: bool,
+    ) {
+        let start = self.media.start_camera(
+            device_index,
+            blur,
+            compact,
+            self.outbound_h264_tx.clone(),
+            self.local_cam_tx.clone(),
+        );
+        let done_tx = self.bg_done_tx.clone();
+        tokio::spawn(async move {
+            let result = start.await;
+            let _ = done_tx.send(BackgroundDone::CameraStart { generation, result });
+        });
+    }
+}
+
+/// Apply the outcome of a device operation that ran off the event loop.
+pub(super) async fn apply_background_done<R: RtcController, S: SignalSink, M: MediaDevices>(
+    done: BackgroundDone<M>,
+    config: &mut HuddleAudioConfig,
+    snap: &mut HuddleSessionSnapshot,
+    peer: &R,
+    signal: &mut S,
+    state: &mut SessionRuntime<'_, M>,
+) {
+    match done {
+        BackgroundDone::AudioSwitch { new, prev, outcome } => {
+            state.audio_switch_in_flight = false;
+            // A request that arrived meanwhile has already moved `config` on; it is chained below.
+            let superseded = config.input_device != new.input_device
+                || config.output_device != new.output_device;
+            let running = match outcome {
+                AudioSwitch::Switched(audio) => {
+                    state.media.install_audio(audio);
+                    snap.error = None;
+                    new
+                }
+                AudioSwitch::Reverted { audio, err } => {
+                    tracing::error!(%err, "failed to switch huddle audio devices; reverted");
+                    state.media.install_audio(audio);
+                    snap.error = Some(err.to_string());
+                    prev
+                }
+                AudioSwitch::Failed {
+                    err,
+                    revert_err,
+                    inbound,
+                } => {
+                    tracing::error!(%err, "failed to switch huddle audio devices");
+                    if let Some(revert_err) = revert_err {
+                        tracing::error!(
+                            %revert_err,
+                            "failed to revert huddle audio devices; preserving inbound stream for retry"
+                        );
+                    }
+                    state.parked_inbound_audio = inbound;
+                    snap.error = Some(err.to_string());
+                    prev
+                }
+            };
+            if !superseded {
+                config.input_device = running.input_device.clone();
+                config.output_device = running.output_device.clone();
+            }
+            snap.input_device = running.input_device.clone();
+            snap.output_device = running.output_device.clone();
+            if config.input_device != running.input_device
+                || config.output_device != running.output_device
+            {
+                state.start_audio_switch(config.clone(), running);
+            }
+            let _ = state
+                .updates
+                .send(HuddleUpdate::State(Box::new(snap.clone())));
+        }
+        BackgroundDone::CameraStart { generation, result } => {
+            if generation != state.camera_gen {
+                return; // superseded: dropping the result stops that capture
+            }
+            match result {
+                Ok(camera) => {
+                    state.media.install_camera(camera);
+                    // Settings changed while the start was in flight win over its start arguments.
+                    state.media.set_camera_blur(config.blur_background);
+                    state.media.set_camera_compact(snap.sharing);
+                    snap.video = true;
+                    snap.error = None;
+                    send_camera_subscription(config, peer, signal, state, true).await;
+                }
+                Err(err) => {
+                    snap.video = false;
+                    snap.error = Some(err.to_string());
+                }
+            }
+            let _ = state
+                .updates
+                .send(HuddleUpdate::State(Box::new(snap.clone())));
+        }
+    }
+}
+
+/// Apply a finished `#content` share start to the snapshot and announce it to late joiners.
+async fn apply_screen_share_start<S: SignalSink, M: MediaDevices>(
+    result: Result<M::ScreenShare>,
+    source_id: &str,
+    snap: &mut HuddleSessionSnapshot,
+    signal: &mut S,
+    state: &mut SessionRuntime<'_, M>,
+) {
+    match result {
+        Ok(share) => {
+            snap.screen_audio_device = M::screen_share_loopback(&share);
+            state.media.install_screen_share(share);
+            snap.sharing = true;
+            snap.share_source_id = Some(source_id.to_owned());
+            snap.error = None;
+            state.media.set_camera_compact(true);
+            announce_screen_share_capabilities(&state.creds.attendee_id, signal, source_id).await;
+        }
+        Err(err) => {
+            tracing::error!(source_id, %err, "failed to start screen share session");
+            snap.sharing = false;
+            snap.share_source_id = None;
+            snap.error = Some(err.to_string());
+        }
+    }
+}
+
+/// Renegotiate the `SUBSCRIBE` so Chime knows whether our camera video track is live.
+async fn send_camera_subscription<R: RtcController, S: SignalSink, M: MediaDevices>(
+    config: &HuddleAudioConfig,
+    peer: &R,
+    signal: &mut S,
+    state: &mut SessionRuntime<'_, M>,
+    video: bool,
+) {
+    let offer = match peer.create_gathered_offer().await {
+        Ok(offer) => offer,
+        Err(err) => {
+            tracing::warn!(%err, video, "failed to create the camera SUBSCRIBE offer");
+            return;
+        }
+    };
+    let frame = match build_subscribe_frame(
+        state.creds,
+        &offer,
+        state.wants_compressed,
+        config.muted,
+        video,
+        &state.remote_sources,
+    ) {
+        Ok(frame) => frame,
+        Err(err) => {
+            tracing::warn!(%err, video, "failed to build the camera SUBSCRIBE frame");
+            return;
+        }
+    };
+    if let Err(err) = signal.send_frame(&frame).await {
+        tracing::warn!(%err, video, "failed to send the camera SUBSCRIBE");
+    }
+}
 
 pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevices>(
     ctrl: Option<HuddleControl>,
@@ -53,48 +241,12 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
                 .send(HuddleUpdate::State(Box::new(snap.clone())));
         }
         Some(HuddleControl::SetAudioDevices { input, output }) => {
-            let prev_input = config.input_device.clone();
-            let prev_output = config.output_device.clone();
+            let prev = config.clone();
             config.input_device = input.clone();
             config.output_device = output.clone();
             snap.input_device = input;
             snap.output_device = output;
-            let inbound_rx = state
-                .media
-                .stop_audio()
-                .or_else(|| state.parked_inbound_audio.take());
-            if let Some(rx) = inbound_rx {
-                match state.media.start_audio_recoverable(
-                    config,
-                    state.shared.clone(),
-                    state.outbound_opus_tx.clone(),
-                    rx,
-                ) {
-                    Ok(()) => {
-                        snap.error = None;
-                    }
-                    Err((err, recovered_rx)) => {
-                        tracing::error!(%err, "failed to switch huddle audio devices; reverting");
-                        snap.error = Some(err.to_string());
-                        config.input_device = prev_input.clone();
-                        config.output_device = prev_output.clone();
-                        snap.input_device = prev_input;
-                        snap.output_device = prev_output;
-                        if let Err((revert_err, parked_rx)) = state.media.start_audio_recoverable(
-                            config,
-                            state.shared.clone(),
-                            state.outbound_opus_tx.clone(),
-                            recovered_rx,
-                        ) {
-                            tracing::error!(
-                                %revert_err,
-                                "failed to revert huddle audio devices; preserving rx for retry"
-                            );
-                            state.parked_inbound_audio = Some(parked_rx);
-                        }
-                    }
-                }
-            }
+            state.start_audio_switch(config.clone(), prev);
             let _ = state
                 .updates
                 .send(HuddleUpdate::State(Box::new(snap.clone())));
@@ -107,55 +259,18 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
             config.camera_device = device_index;
             config.blur_background = blur;
             snap.blur_background = blur;
+            state.camera_gen += 1;
             if enabled {
-                match state.media.start_camera(
-                    device_index,
-                    blur,
-                    snap.sharing,
-                    state.outbound_h264_tx.clone(),
-                    state.local_cam_tx.clone(),
-                ) {
-                    Ok(()) => {
-                        snap.video = true;
-                        snap.error = None;
-                        if let Ok(offer) = peer.create_gathered_offer().await
-                            && let Ok(f) = build_subscribe_frame(
-                                state.creds,
-                                &offer,
-                                state.wants_compressed,
-                                config.muted,
-                                true,
-                                &state.remote_sources,
-                            )
-                            && let Err(err) = signal.send_frame(&f).await
-                        {
-                            tracing::warn!(%err, "failed to send camera-on SUBSCRIBE");
-                        }
-                    }
-                    Err(err) => {
-                        snap.video = false;
-                        snap.error = Some(err.to_string());
-                    }
-                }
+                state.start_camera(state.camera_gen, device_index, blur, snap.sharing);
             } else {
-                state.media.stop_camera();
-                snap.video = false;
-                let _ = state
-                    .updates
-                    .send(HuddleUpdate::VideoTileClosed(VideoTileKey::LocalCamera));
-                if let Ok(offer) = peer.create_gathered_offer().await
-                    && let Ok(f) = build_subscribe_frame(
-                        state.creds,
-                        &offer,
-                        state.wants_compressed,
-                        config.muted,
-                        false,
-                        &state.remote_sources,
-                    )
-                    && let Err(err) = signal.send_frame(&f).await
-                {
-                    tracing::warn!(%err, "failed to send camera-off SUBSCRIBE");
+                tokio::spawn(state.media.stop_camera());
+                if snap.video {
+                    snap.video = false;
+                    let _ = state
+                        .updates
+                        .send(HuddleUpdate::VideoTileClosed(VideoTileKey::LocalCamera));
                 }
+                send_camera_subscription(config, peer, signal, state, false).await;
             }
             let _ = state
                 .updates
@@ -173,45 +288,19 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
             source_id,
             share_audio,
         }) => {
-            state.media.stop_screen_share().await;
             if let Some(src_id) = source_id {
                 // Native `#content` second Chime session — runs simultaneously with camera!
-                match state
-                    .media
-                    .start_screen_share(
-                        state.creds.clone(),
-                        src_id.clone(),
-                        share_audio,
-                        state.local_screen_tx.clone(),
-                        Arc::clone(&state.perf),
-                    )
-                    .await
-                {
-                    Ok(loopback_device) => {
-                        snap.screen_audio_device = loopback_device;
-                        snap.sharing = true;
-                        snap.share_source_id = Some(src_id.clone());
-                        snap.error = None;
-                        state.media.set_camera_compact(true);
-                        announce_screen_share_capabilities(
-                            &state.creds.attendee_id,
-                            signal,
-                            &src_id,
-                        )
-                        .await;
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            source_id = %src_id,
-                            %err,
-                            "failed to start screen share session"
-                        );
-                        snap.sharing = false;
-                        snap.share_source_id = None;
-                        snap.error = Some(err.to_string());
-                    }
-                }
+                let start = state.media.start_screen_share(
+                    state.creds.clone(),
+                    src_id.clone(),
+                    share_audio,
+                    state.local_screen_tx.clone(),
+                    Arc::clone(&state.perf),
+                );
+                let result = start.await;
+                apply_screen_share_start(result, &src_id, snap, signal, state).await;
             } else {
+                tokio::spawn(state.media.stop_screen_share());
                 snap.sharing = false;
                 snap.share_source_id = None;
                 state.media.set_camera_compact(false);
@@ -359,7 +448,9 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
             snap.audio_only = audio_only;
             state.vdec_audio_only.store(audio_only, Ordering::Relaxed);
             if audio_only {
-                if state.media.stop_camera() {
+                state.camera_gen += 1;
+                tokio::spawn(state.media.stop_camera());
+                if snap.video {
                     snap.video = false;
                     let _ = state
                         .updates

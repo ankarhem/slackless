@@ -31,7 +31,6 @@ pub(super) struct HandshakeResult<S = ChimeSignalClient, R = ChimeRtcPeer, M = L
     pub(super) last_sdp_answer: Option<String>,
     pub(super) pending_index: Option<SdkIndexFrame>,
     pub(super) pending_audio_info: Vec<SdkAudioStreamIdInfoFrame>,
-    pub(super) outbound_opus_tx: mpsc::UnboundedSender<bytes::Bytes>,
     pub(super) outbound_opus_rx: mpsc::UnboundedReceiver<bytes::Bytes>,
     pub(super) inbound_video_rx: mpsc::UnboundedReceiver<InboundVideoPacket>,
     pub(super) outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
@@ -207,7 +206,7 @@ pub(super) async fn perform_handshake_with<F: SessionFactory>(
     let audio_guard = AudioStartGuard::new(factory.spawn_audio_start(
         config.clone(),
         shared.clone(),
-        outbound_opus_tx.clone(),
+        outbound_opus_tx,
         inbound_opus_rx,
     ));
 
@@ -325,7 +324,6 @@ pub(super) async fn perform_handshake_with<F: SessionFactory>(
         last_sdp_answer,
         pending_index,
         pending_audio_info,
-        outbound_opus_tx,
         outbound_opus_rx,
         inbound_video_rx,
         outbound_h264_tx,

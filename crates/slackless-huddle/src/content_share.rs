@@ -431,7 +431,8 @@ impl ContentShareSession {
             }
 
             running.store(false, Ordering::Relaxed);
-            drop(capture);
+            // `ScreenCapture` teardown waits on ScreenCaptureKit (up to 1.5 s): keep it off the executor.
+            let _ = tokio::task::spawn_blocking(move || drop(capture)).await;
             sig.send_leave_and_close(Duration::from_millis(300)).await;
             rtc.close().await;
             let _ = done_tx.send(());
