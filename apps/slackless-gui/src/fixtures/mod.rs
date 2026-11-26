@@ -487,6 +487,17 @@ mod tests {
             Some("Klarna")
         );
         assert!(!fixtures.is_external_user(&fixtures.self_user));
+        // The rail lists every workspace in its own order: whichever tile comes first, people
+        // are measured against the snapshot's own team.
+        let mut railed = fixtures.with_counts(HashMap::new());
+        railed.workspaces.rotate_left(1);
+        railed.users.push(User {
+            id: UserId::from("U0MATE"),
+            team_id: Some("T0ACME".into()),
+            ..Default::default()
+        });
+        assert!(!railed.is_external_user(&UserId::from("U0MATE")));
+        assert!(railed.is_external_user(&UserId::from("U0KLA1")));
 
         let partner_msgs = fixtures
             .messages
