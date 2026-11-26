@@ -15,7 +15,7 @@
 //!
 //! ## Secret storage
 //!
-//! Keychain reads and writes go through Apple's `/usr/bin/security` tool (see `store.rs`), so
+//! Keychain reads and writes go through Apple's `/usr/bin/security` tool (see `keychain.rs`), so
 //! rebuilt binaries never re-trigger a Keychain password prompt.
 //!
 //! This crate reads only slackless's **own** webview session; it never reads or decrypts
@@ -32,6 +32,7 @@ pub use slackless_types as types;
 
 mod embedded;
 mod error;
+mod keychain;
 mod private_file;
 mod secrets;
 mod session;

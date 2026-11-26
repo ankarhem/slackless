@@ -1,60 +1,26 @@
-//! Named secret storage backed by the macOS login Keychain (`/usr/bin/security`) with a
-//! private (`0600`) JSON file fallback for non-macOS platforms and deterministic tests.
+//! Named secret storage backed by the macOS login Keychain ([`crate::keychain`]) with a private
+//! (`0600`) JSON file fallback for non-macOS platforms and deterministic tests.
 //!
 //! Used for BYO-key credentials such as the AI summary provider API key so secrets never live
 //! in plaintext preference files or appear on process command lines.
 
 use std::collections::BTreeMap;
-#[cfg(target_os = "macos")]
-use std::io::Write as _;
 use std::path::PathBuf;
-#[cfg(target_os = "macos")]
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use crate::error::{AuthError, Result};
+use crate::keychain::{KeychainBackend, SecurityKeychain, validate_account};
 use crate::private_file::replace_private_file;
 
 /// Account identifier used for the local/BYO-key AI summary provider API key.
 pub const AI_SUMMARY_API_KEY_ACCOUNT: &str = "ai-summary-api-key";
-
-#[cfg(target_os = "macos")]
-const KEYCHAIN_SERVICE: &str = "slackless";
-#[cfg(target_os = "macos")]
-const SECURITY: &str = "/usr/bin/security";
-#[cfg(any(test, target_os = "macos"))]
-const ITEM_NOT_FOUND: i32 = 44;
-
-/// Seam over the OS Keychain for deterministic unit tests.
-pub(crate) trait SecretKeychainBackend: std::fmt::Debug + Send + Sync {
-    fn set(&self, account: &str, value: &str) -> Result<()>;
-    fn get(&self, account: &str) -> Result<Option<String>>;
-    fn delete(&self, account: &str) -> Result<()>;
-}
-
-#[derive(Debug)]
-struct OsSecretKeychain;
-
-impl SecretKeychainBackend for OsSecretKeychain {
-    fn set(&self, account: &str, value: &str) -> Result<()> {
-        keychain_secret_set(account, value)
-    }
-
-    fn get(&self, account: &str) -> Result<Option<String>> {
-        keychain_secret_get(account)
-    }
-
-    fn delete(&self, account: &str) -> Result<()> {
-        keychain_secret_delete(account)
-    }
-}
 
 /// Persistent named secret store (macOS Keychain when enabled, else `0600` JSON file).
 #[derive(Debug, Clone)]
 pub struct SecretStore {
     path: PathBuf,
     use_keychain: bool,
-    keychain: Arc<dyn SecretKeychainBackend>,
+    keychain: Arc<dyn KeychainBackend>,
 }
 
 impl SecretStore {
@@ -65,21 +31,22 @@ impl SecretStore {
         Ok(Self {
             path: dir.join("slackless").join("secrets.json"),
             use_keychain: cfg!(target_os = "macos"),
-            keychain: Arc::new(OsSecretKeychain),
+            keychain: Arc::new(SecurityKeychain),
         })
     }
 
     /// File-only store at `path` with Keychain disabled (for non-macOS and tests).
-    pub fn with_path(path: impl Into<PathBuf>) -> Self {
+    #[cfg(test)]
+    fn with_path(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
             use_keychain: false,
-            keychain: Arc::new(OsSecretKeychain),
+            keychain: Arc::new(SecurityKeychain),
         }
     }
 
     #[cfg(test)]
-    fn with_keychain(path: impl Into<PathBuf>, keychain: Arc<dyn SecretKeychainBackend>) -> Self {
+    fn with_keychain(path: impl Into<PathBuf>, keychain: Arc<dyn KeychainBackend>) -> Self {
         Self {
             path: path.into(),
             use_keychain: true,
@@ -95,7 +62,10 @@ impl SecretStore {
             return self.delete(account);
         }
         if self.use_keychain {
-            self.keychain.set(account, trimmed)
+            self.keychain.set(
+                account,
+                &encode_envelope(trimmed).expect("one string always serializes"),
+            )
         } else {
             let mut map = self.read_file_map()?;
             map.insert(account.to_owned(), trimmed.to_owned());
@@ -106,17 +76,13 @@ impl SecretStore {
     /// Read the secret stored under `account`, if any.
     pub fn get(&self, account: &str) -> Result<Option<String>> {
         let account = validate_account(account)?;
-        if self.use_keychain {
-            if let Some(val) = self.keychain.get(account)? {
-                return Ok(Some(val));
-            }
-            // Also check file fallback in case a key was stored before Keychain was enabled.
-            let map = self.read_file_map()?;
-            Ok(map.get(account).cloned())
-        } else {
-            let map = self.read_file_map()?;
-            Ok(map.get(account).cloned())
+        if self.use_keychain
+            && let Some(blob) = self.keychain.get(account)?
+        {
+            return Ok(Some(decode_envelope(&blob)?));
         }
+        // Also check the file: a key stored before Keychain was enabled, or the file-only mode.
+        Ok(self.read_file_map()?.remove(account))
     }
 
     /// Returns `true` when a non-empty secret is stored under `account`.
@@ -158,152 +124,29 @@ impl SecretStore {
     }
 }
 
-/// Validate a Keychain account identifier so it stays one bare token on a `security` command.
-fn validate_account(account: &str) -> Result<&str> {
-    if !account.is_empty()
-        && account.len() <= 64
-        && !account.starts_with('-')
-        && account
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
-        Ok(account)
-    } else {
-        Err(AuthError::Keychain(format!(
-            "invalid secret account name {account:?}"
-        )))
-    }
-}
-
-#[cfg(target_os = "macos")]
+/// A named secret as its Keychain blob stores it: `{"value":...}` (the shape earlier builds
+/// wrote, kept so existing items keep reading).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SecretEnvelope {
     value: String,
 }
 
-#[cfg(target_os = "macos")]
-fn keychain_secret_set(account: &str, value: &str) -> Result<()> {
-    let account = validate_account(account)?;
-    let blob = serde_json::to_vec(&SecretEnvelope {
+fn encode_envelope(value: &str) -> Result<String> {
+    Ok(serde_json::to_string(&SecretEnvelope {
         value: value.to_owned(),
-    })?;
-    let hex: String = blob.iter().map(|b| format!("{b:02x}")).collect();
-    let command = format!("add-generic-password -U -s {KEYCHAIN_SERVICE} -a {account} -X {hex}\n");
-    let mut child = Command::new(SECURITY)
-        .arg("-i")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(command.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
-    let errors = String::from_utf8_lossy(&output.stderr);
-    let detail = errors.trim();
-    if !output.status.success() || !detail.is_empty() {
-        let msg = if detail.is_empty() {
-            format!(
-                "add-generic-password failed (exit {:?})",
-                output.status.code()
-            )
-        } else {
-            detail.to_owned()
-        };
-        return Err(AuthError::Keychain(msg));
-    }
-    Ok(())
+    })?)
 }
 
-#[cfg(target_os = "macos")]
-fn keychain_secret_get(account: &str) -> Result<Option<String>> {
-    let account = validate_account(account)?;
-    let output = Command::new(SECURITY)
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a"])
-        .arg(account)
-        .arg("-w")
-        .output()?;
-    match output.status.code() {
-        Some(0) => {
-            let env: SecretEnvelope = serde_json::from_slice(output.stdout.trim_ascii_end())?;
-            Ok(Some(env.value))
-        }
-        Some(ITEM_NOT_FOUND) => Ok(None),
-        _ => Err(AuthError::Keychain(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        )),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_secret_delete(account: &str) -> Result<()> {
-    let account = validate_account(account)?;
-    let output = Command::new(SECURITY)
-        .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a"])
-        .arg(account)
-        .output()?;
-    match output.status.code() {
-        Some(0) | Some(ITEM_NOT_FOUND) => Ok(()),
-        other => {
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            if detail.is_empty() {
-                Err(AuthError::Keychain(format!(
-                    "delete-generic-password failed (exit {other:?})"
-                )))
-            } else {
-                Err(AuthError::Keychain(detail))
-            }
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn keychain_secret_set(_account: &str, _value: &str) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn keychain_secret_get(_account: &str) -> Result<Option<String>> {
-    Ok(None)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn keychain_secret_delete(_account: &str) -> Result<()> {
-    Ok(())
+fn decode_envelope(blob: &str) -> Result<String> {
+    Ok(serde_json::from_str::<SecretEnvelope>(blob)?.value)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::Arc;
 
     use super::*;
-
-    #[derive(Debug, Default)]
-    struct MockKeychain(Mutex<BTreeMap<String, String>>);
-
-    impl SecretKeychainBackend for MockKeychain {
-        fn set(&self, account: &str, value: &str) -> Result<()> {
-            self.0
-                .lock()
-                .expect("mock keychain lock")
-                .insert(account.to_owned(), value.to_owned());
-            Ok(())
-        }
-
-        fn get(&self, account: &str) -> Result<Option<String>> {
-            Ok(self
-                .0
-                .lock()
-                .expect("mock keychain lock")
-                .get(account)
-                .cloned())
-        }
-
-        fn delete(&self, account: &str) -> Result<()> {
-            self.0.lock().expect("mock keychain lock").remove(account);
-            Ok(())
-        }
-    }
+    use crate::keychain::MockKeychain;
 
     #[test]
     fn file_store_round_trip_and_delete() {
@@ -341,7 +184,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("secrets.json");
         let kc = Arc::new(MockKeychain::default());
-        let store = SecretStore::with_keychain(&path, kc);
+        let store = SecretStore::with_keychain(&path, kc.clone());
 
         store
             .set(AI_SUMMARY_API_KEY_ACCOUNT, "sk-live-secret")
@@ -351,17 +194,15 @@ mod tests {
             store.get(AI_SUMMARY_API_KEY_ACCOUNT).expect("get"),
             Some("sk-live-secret".to_owned())
         );
+        assert_eq!(
+            kc.ops(),
+            vec![
+                "set:ai-summary-api-key".to_owned(),
+                "get:ai-summary-api-key".to_owned()
+            ]
+        );
 
         store.delete(AI_SUMMARY_API_KEY_ACCOUNT).expect("delete");
         assert_eq!(store.get(AI_SUMMARY_API_KEY_ACCOUNT).expect("get"), None);
-    }
-
-    #[test]
-    fn rejects_unsafe_account_names() {
-        assert!(validate_account("").is_err());
-        assert!(validate_account("-w").is_err());
-        assert!(validate_account("bad account").is_err());
-        assert!(validate_account("bad;rm -rf").is_err());
-        assert!(validate_account("ai-summary-api-key").is_ok());
     }
 }

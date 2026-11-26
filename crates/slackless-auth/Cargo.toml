@@ -46,6 +46,9 @@ webview = [
     "dep:objc2-web-kit",
     "dep:block2",
 ]
+# `SessionStore::with_path`, so another crate's tests can seed a file-only session store for a
+# process they launch. Never enabled outside test builds.
+test-support = []
 
 [lints]
 workspace = true

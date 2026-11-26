@@ -23,6 +23,8 @@ schemars = "1"
 wiremock = "0.6"
 # The deterministic hash embedder the semantic-search test indexes with.
 slackless-core = { workspace = true, features = ["test-support"] }
+# `SessionStore::with_path`, so the end-to-end tests can seed the session file the binary reads.
+slackless-auth = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
