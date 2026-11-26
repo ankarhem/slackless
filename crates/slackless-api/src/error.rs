@@ -30,9 +30,9 @@ pub enum ApiError {
     /// A non-2xx HTTP status whose body was not a Slack JSON envelope.
     #[error("unexpected http status {status}: {body}")]
     Status { status: u16, body: String },
-    /// A response body was larger than the client buffers (announced or streamed).
+    /// A response body was larger than the client accepts (announced or streamed).
     #[error("response body exceeds the {limit}-byte limit")]
-    BodyTooLarge { limit: usize },
+    BodyTooLarge { limit: u64 },
     /// A file URL answered with an HTML page (Slack's sign-in redirect) instead of the file.
     #[error("file download was not authorized (got an html page)")]
     FileAuthRejected,
@@ -51,6 +51,17 @@ pub enum ApiError {
     /// The workspace returned a legacy non-Chime huddle backend (Screenhero) instead of `free_willy`.
     #[error("unsupported huddle backend: {0}")]
     UnsupportedHuddleBackend(String),
+}
+
+/// Errors from streaming a response body into a file ([`crate::AssetClient::download_to_path`]).
+#[derive(Debug, Error)]
+pub enum DownloadError {
+    /// The request failed or its body was refused (status, transport, size cap).
+    #[error(transparent)]
+    Api(#[from] ApiError),
+    /// The body could not be written to disk.
+    #[error("could not write the download: {0}")]
+    Write(#[source] std::io::Error),
 }
 
 impl ApiError {

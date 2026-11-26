@@ -9,7 +9,8 @@ slackless-types.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tracing.workspace = true
 futures.workspace = true
 # `rustls-no-provider` keeps the rustls TLS stack (and the platform verifier) without pulling
 # aws-lc-sys; `install_default_crypto_provider` installs the `ring` provider reqwest then needs.

@@ -23,7 +23,7 @@ pub use client::{
     net_log_enabled, net_log_export_json, net_log_snapshot, proxy_url, set_net_log_enabled,
     set_proxy_url,
 };
-pub use error::ApiError;
+pub use error::{ApiError, DownloadError};
 pub use methods::{
     ActionContainer, ActivityEntry, ActivityFeed, ActivityItem, ActivityKind, ActivityReaction,
     AppCommand, AppHomeResponse, AuthTest, BlockSuggestionsRequest, BookmarksList, CallInfo,
