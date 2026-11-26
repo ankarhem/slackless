@@ -25,6 +25,10 @@ serde_json.workspace = true
 regex.workspace = true
 url.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+# Both already in the tree (via reqwest and via rusqlite): the media fetcher's shared buffers
+# and its LRU.
+bytes = "1"
+hashlink = "0.12"
 sha2 = "0.10"
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24"] }
 

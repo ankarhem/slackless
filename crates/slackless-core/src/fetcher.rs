@@ -4,12 +4,14 @@
 //! instant without unbounded RAM growth.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use bytes::Bytes;
+use hashlink::LruCache;
 use tokio::runtime::Handle;
 
 use crate::api::{AssetClient, MAX_FILE_BYTES, SlackApi};
@@ -134,64 +136,50 @@ fn prune_disk_cache_if_needed(dir: &Path, cap: u64) {
     }
 }
 
-#[derive(Default)]
+/// Fetched bodies, least recently used evicted first once `max_bytes` in total or the cache's
+/// entry capacity is reached. A hit hands out the cached buffer, not a copy.
 struct ByteLru {
-    entries: HashMap<String, Vec<u8>>,
-    order: VecDeque<String>,
+    entries: LruCache<String, Bytes>,
     total_bytes: usize,
     max_bytes: usize,
-    max_entries: usize,
 }
 
 impl ByteLru {
     fn new(max_bytes: usize, max_entries: usize) -> Self {
         Self {
-            entries: HashMap::new(),
-            order: VecDeque::new(),
+            entries: LruCache::new(max_entries),
             total_bytes: 0,
             max_bytes,
-            max_entries,
         }
     }
 
-    fn get(&mut self, key: &str) -> Option<Vec<u8>> {
-        let data = self.entries.get(key)?.clone();
-        if let Some(pos) = self.order.iter().position(|k| k == key) {
-            self.order.remove(pos);
-        }
-        self.order.push_back(key.to_owned());
-        Some(data)
+    fn get(&mut self, key: &str) -> Option<Bytes> {
+        self.entries.get(key).cloned()
     }
 
-    fn insert(&mut self, key: String, data: Vec<u8>) {
+    fn insert(&mut self, key: String, data: Bytes) {
         if data.len() > self.max_bytes {
             return;
         }
         if let Some(old) = self.entries.remove(&key) {
             self.total_bytes = self.total_bytes.saturating_sub(old.len());
-            if let Some(pos) = self.order.iter().position(|k| k == &key) {
-                self.order.remove(pos);
-            }
         }
-        while (self.total_bytes + data.len() > self.max_bytes
-            || self.entries.len() >= self.max_entries)
-            && !self.order.is_empty()
+        // Evict here rather than in `LruCache::insert`, which drops entries without their size.
+        while self.total_bytes + data.len() > self.max_bytes
+            || self.entries.len() >= self.entries.capacity()
         {
-            if let Some(oldest) = self.order.pop_front()
-                && let Some(evicted) = self.entries.remove(&oldest)
-            {
-                self.total_bytes = self.total_bytes.saturating_sub(evicted.len());
-            }
+            let Some((_, evicted)) = self.entries.remove_lru() else {
+                break;
+            };
+            self.total_bytes = self.total_bytes.saturating_sub(evicted.len());
         }
         self.total_bytes += data.len();
-        self.order.push_back(key.clone());
         self.entries.insert(key, data);
     }
 }
 
-type InFlightMap = HashMap<String, tokio::sync::broadcast::Sender<Result<Vec<u8>, String>>>;
-type FetchFuture =
-    std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'static>>;
+type InFlightMap = HashMap<String, tokio::sync::broadcast::Sender<Result<Bytes, String>>>;
+type FetchFuture = std::pin::Pin<Box<dyn Future<Output = Result<Bytes, String>> + Send + 'static>>;
 
 /// Cheap to clone; hand one to whatever loads remote images.
 #[derive(Clone)]
@@ -279,7 +267,7 @@ impl Fetcher {
     pub fn get(
         &self,
         url: String,
-    ) -> impl Future<Output = Result<Vec<u8>, String>> + Send + 'static + use<> {
+    ) -> impl Future<Output = Result<Bytes, String>> + Send + 'static + use<> {
         {
             let mut guard = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(hit) = guard.get(&url) {
@@ -327,6 +315,7 @@ impl Fetcher {
                     if let Ok(Some(bytes)) =
                         tokio::task::spawn_blocking(move || read_disk_cache(&dir_r, &url_r)).await
                     {
+                        let bytes = Bytes::from(bytes);
                         if bytes.len() <= MAX_SINGLE_ENTRY_BYTES {
                             cache
                                 .lock()
@@ -337,12 +326,12 @@ impl Fetcher {
                     }
                 }
                 let result = match files {
-                    Some(api) => api
-                        .download_file(&url)
+                    Some(api) => api.download_file(&url).await.map_err(|e| e.to_string()),
+                    None => assets
+                        .get(&url)
                         .await
-                        .map(|bytes| bytes.to_vec())
+                        .map(Bytes::from)
                         .map_err(|e| e.to_string()),
-                    None => assets.get(&url).await.map_err(|e| e.to_string()),
                 };
                 if let Ok(ref bytes) = result
                     && bytes.len() <= MAX_SINGLE_ENTRY_BYTES
@@ -364,7 +353,12 @@ impl Fetcher {
             }
             .await;
             drop(guard);
-            if let Some(tx) = leader_tx {
+            // Followers subscribe only while the URL is in flight, so after `drop(guard)` the
+            // receiver count can only fall: with nobody waiting, skip the clone entirely. A
+            // follower giving up in between only makes `send` report that nobody listened.
+            if let Some(tx) = leader_tx
+                && tx.receiver_count() > 0
+            {
                 let _ = tx.send(outcome.clone());
             }
             outcome
@@ -504,14 +498,14 @@ mod tests {
     #[test]
     fn byte_lru_evicts_least_recently_used_under_byte_cap() {
         let mut lru = ByteLru::new(10, 4);
-        lru.insert("a".into(), vec![1; 4]);
-        lru.insert("b".into(), vec![2; 4]);
+        lru.insert("a".into(), vec![1; 4].into());
+        lru.insert("b".into(), vec![2; 4].into());
         // Touch "a" so "b" becomes least recently used.
-        assert_eq!(lru.get("a"), Some(vec![1; 4]));
-        lru.insert("c".into(), vec![3; 4]);
+        assert_eq!(lru.get("a"), Some(vec![1; 4].into()));
+        lru.insert("c".into(), vec![3; 4].into());
         assert_eq!(lru.get("b"), None);
-        assert_eq!(lru.get("a"), Some(vec![1; 4]));
-        assert_eq!(lru.get("c"), Some(vec![3; 4]));
+        assert_eq!(lru.get("a"), Some(vec![1; 4].into()));
+        assert_eq!(lru.get("c"), Some(vec![3; 4].into()));
         assert_eq!(lru.total_bytes, 8);
     }
 
@@ -519,31 +513,30 @@ mod tests {
     fn byte_lru_entry_count_eviction_oversize_skip_and_overwrite_accounting() {
         // Entry-count eviction even when total bytes are well under max_bytes.
         let mut lru = ByteLru::new(1024, 2);
-        lru.insert("a".into(), vec![1; 3]);
-        lru.insert("b".into(), vec![2; 4]);
-        lru.insert("c".into(), vec![3; 5]);
+        lru.insert("a".into(), vec![1; 3].into());
+        lru.insert("b".into(), vec![2; 4].into());
+        lru.insert("c".into(), vec![3; 5].into());
         assert_eq!(lru.entries.len(), 2);
         assert_eq!(lru.get("a"), None);
-        assert_eq!(lru.get("b"), Some(vec![2; 4]));
-        assert_eq!(lru.get("c"), Some(vec![3; 5]));
+        assert_eq!(lru.get("b"), Some(vec![2; 4].into()));
+        assert_eq!(lru.get("c"), Some(vec![3; 5].into()));
         assert_eq!(lru.total_bytes, 9);
 
         // Oversize entry (> max_bytes) is skipped without evicting existing entries.
         let mut small = ByteLru::new(10, 4);
-        small.insert("keep".into(), vec![9; 4]);
-        small.insert("too_big".into(), vec![7; 11]);
+        small.insert("keep".into(), vec![9; 4].into());
+        small.insert("too_big".into(), vec![7; 11].into());
         assert_eq!(small.get("too_big"), None);
-        assert_eq!(small.get("keep"), Some(vec![9; 4]));
+        assert_eq!(small.get("keep"), Some(vec![9; 4].into()));
         assert_eq!(small.total_bytes, 4);
 
-        // Overwriting an existing key updates total_bytes and order cleanly.
-        small.insert("keep".into(), vec![8; 7]);
+        // Overwriting an existing key updates total_bytes cleanly.
+        small.insert("keep".into(), vec![8; 7].into());
         assert_eq!(small.total_bytes, 7);
         assert_eq!(small.entries.len(), 1);
-        assert_eq!(small.order.len(), 1);
-        small.insert("keep".into(), vec![6; 2]);
+        small.insert("keep".into(), vec![6; 2].into());
         assert_eq!(small.total_bytes, 2);
-        assert_eq!(small.get("keep"), Some(vec![6; 2]));
+        assert_eq!(small.get("keep"), Some(vec![6; 2].into()));
     }
 
     #[test]
@@ -600,7 +593,7 @@ mod tests {
         let private_url_seeded = format!("{private_prefix}seeded.png");
         write_disk_cache(&dir, &private_url_seeded, b"stale-disk-data");
         let got = fetcher.get(private_url_seeded.clone()).await.unwrap();
-        assert_eq!(got, b"private-live-bytes");
+        assert_eq!(got, &b"private-live-bytes"[..]);
         assert!(
             saw_cookie.load(Ordering::SeqCst),
             "private file download must go through signed-in SlackApi"
@@ -614,14 +607,14 @@ mod tests {
         // Unseeded private URL must NEVER be written to disk cache.
         let private_url_fresh = format!("{private_prefix}fresh.png");
         let got2 = fetcher.get(private_url_fresh.clone()).await.unwrap();
-        assert_eq!(got2, b"private-live-bytes");
+        assert_eq!(got2, &b"private-live-bytes"[..]);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(read_disk_cache(&dir, &private_url_fresh), None);
 
         // Public URL DOES write to disk cache and serves cold-start hits without network.
         let public_url = format!("{}/public/avatar.png", srv.base_url);
         let got_pub = fetcher.get(public_url.clone()).await.unwrap();
-        assert_eq!(got_pub, b"public-avatar-bytes");
+        assert_eq!(got_pub, &b"public-avatar-bytes"[..]);
         // Wait for async spawn_blocking disk write.
         for _ in 0..20 {
             if read_disk_cache(&dir, &public_url).is_some() {
@@ -642,7 +635,7 @@ mod tests {
             private_prefix,
         );
         let from_disk = cold_fetcher.get(public_url).await.unwrap();
-        assert_eq!(from_disk, b"public-avatar-bytes");
+        assert_eq!(from_disk, &b"public-avatar-bytes"[..]);
         assert_eq!(
             srv.hits.load(Ordering::SeqCst),
             hits_before,
@@ -675,8 +668,12 @@ mod tests {
         let futs: Vec<_> = (0..5).map(|_| fetcher.get(ok_url.clone())).collect();
         let results = futures::future::join_all(futs).await;
         assert_eq!(srv.hits.load(Ordering::SeqCst), 1);
-        for res in results {
-            assert_eq!(res.unwrap(), b"ok:/avatar.png");
+        // ...and one buffer: followers and later cache hits share the leader's bytes, not copies.
+        let cached = fetcher.get(ok_url.clone()).await.unwrap();
+        let bodies: Vec<_> = results.into_iter().map(Result::unwrap).collect();
+        for body in bodies.iter().chain([&cached]) {
+            assert_eq!(&body[..], b"ok:/avatar.png");
+            assert_eq!(body.as_ptr(), cached.as_ptr(), "a copy per caller");
         }
 
         // 2. Concurrent error coalescing: 4 callers -> 1 HTTP request, all receive Err.
@@ -691,7 +688,7 @@ mod tests {
         // 3. Recovery: after failure, retry is NOT poisoned and succeeds once server recovers.
         fail_flag.store(false, Ordering::SeqCst);
         let recovered = fetcher.get(err_url).await.unwrap();
-        assert_eq!(recovered, b"ok:/flaky");
+        assert_eq!(recovered, &b"ok:/flaky"[..]);
         assert_eq!(srv.hits.load(Ordering::SeqCst), 3);
 
         let _ = std::fs::remove_dir_all(&dir);

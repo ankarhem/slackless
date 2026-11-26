@@ -9803,9 +9803,11 @@ dependencies = [
 name = "slackless-core"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "dirs 7.0.0",
  "futures",
  "futures-util",
+ "hashlink",
  "html5ever 0.27.0",
  "markup5ever_rcdom",
  "ort",

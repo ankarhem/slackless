@@ -31,7 +31,8 @@ pub fn fetch(
     url: String,
     cx: &App,
 ) -> Option<impl Future<Output = Result<Vec<u8>, String>> + Send + 'static + use<>> {
-    Some(cx.try_global::<Downloader>()?.0.get(url))
+    let body = cx.try_global::<Downloader>()?.0.get(url);
+    Some(async move { body.await.map(Vec::from) })
 }
 
 /// Status of one file download initiated in this session.
