@@ -86,7 +86,13 @@ See [`skill/SKILL.md`](skill/SKILL.md) for the full command reference and `--jso
 
 ### MCP Server (`slackless mcp`)
 
-`slackless mcp` runs a lightweight JSON-RPC 2.0 stdio Model Context Protocol server exposing offline archive search/reads (`list_workspaces`, `list_channels`, `search_messages`, `read_channel`, `read_thread`, `get_transcript`) and live write actions (`send_message`, `reply_thread`, `add_reaction`). Configure it in any MCP client (Claude Desktop, Claude Code, Cursor):
+`slackless mcp` runs a lightweight JSON-RPC 2.0 stdio Model Context Protocol server exposing:
+
+- **Tools (12):** offline archive search/reads (`list_workspaces`, `list_channels`, `search_messages`, `read_channel`, `read_thread`, `get_transcript`, `list_transcripts`, `export_conversation`, `get_catchup_summary`) and live write actions (`send_message`, `reply_thread`, `add_reaction`).
+- **Resources (`resources/list`, `resources/templates/list`, `resources/read`):** static `slackless://workspaces` plus templates for `slackless://workspace/{workspace}/channels`, `.../channel/{channel}`, `.../thread/{channel}/{ts}`, and `.../transcript/{file_id}`.
+- **Prompts (`prompts/list`, `prompts/get`):** `catch_up`, `summarize_thread`, `summarize_channel`, `find_decisions`, and `search_transcripts` pre-populated with bounded local SQLite context.
+
+Configure it in any MCP client (Claude Desktop, Claude Code, Cursor):
 
 ```json
 {

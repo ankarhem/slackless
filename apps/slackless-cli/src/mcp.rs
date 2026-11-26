@@ -1,9 +1,12 @@
 //! Lightweight JSON-RPC 2.0 stdio Model Context Protocol (MCP) server (`slackless mcp`).
 //!
 //! Exposes offline SQLite archive queries (`list_workspaces`, `list_channels`,
-//! `search_messages`, `read_channel`, `read_thread`, `get_transcript`) and live Slack write/read
-//! actions (`send_message`, `reply_thread`, `add_reaction`, plus `live: true` on `read_channel`
-//! and `read_thread`) with zero extra protocol dependencies.
+//! `search_messages`, `read_channel`, `read_thread`, `get_transcript`, `list_transcripts`,
+//! `export_conversation`, `get_catchup_summary`), live Slack write/read actions
+//! (`send_message`, `reply_thread`, `add_reaction`, plus `live: true` on `read_channel`
+//! and `read_thread`), MCP resources (`slackless://...`), and reusable MCP prompts
+//! (`catch_up`, `summarize_thread`, `summarize_channel`, `find_decisions`,
+//! `search_transcripts`) with zero extra protocol dependencies.
 //!
 //! Stdout is reserved strictly for newline-delimited JSON-RPC 2.0 responses; no human logs or
 //! prompts are ever written there.
@@ -16,11 +19,19 @@ use std::process::ExitCode;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use slackless_core::NotifyLevel;
 use slackless_core::api::{HistoryOpts, MessageContent, SlackApi};
 use slackless_core::auth::{Session, SessionStore};
-use slackless_core::store::{SearchQuery, SearchSort, Store, StoredMessage};
+use slackless_core::domain::mrkdwn::mrkdwn_to_plain;
+use slackless_core::export::{
+    ExportFormat, ExportOptions, export_channel, export_file_transcript, export_huddle_transcript,
+    export_thread, format_utc_timestamp,
+};
+use slackless_core::store::{
+    Has, SearchQuery, SearchSort, Store, StoredFileTranscript, StoredMessage,
+};
 use slackless_core::types::time::now_epoch_secs;
-use slackless_core::types::{ChannelId, FileId, Message, TeamId, Ts};
+use slackless_core::types::{ChannelId, FileId, Message, TeamId, TranscriptCue, Ts};
 
 use crate::CLI_VERSION;
 use crate::archive::{self, Archive};
@@ -38,6 +49,8 @@ const ERR_PARSE: i64 = -32700;
 const ERR_INVALID_REQUEST: i64 = -32600;
 const ERR_METHOD_NOT_FOUND: i64 = -32601;
 const ERR_INVALID_PARAMS: i64 = -32602;
+const ERR_INTERNAL: i64 = -32603;
+const ERR_RESOURCE_NOT_FOUND: i64 = -32002;
 
 const DEFAULT_CHANNEL_LIST_LIMIT: usize = 200;
 const MAX_CHANNEL_LIST_LIMIT: usize = 1000;
@@ -47,6 +60,16 @@ const DEFAULT_READ_LIMIT: usize = 50;
 const MAX_READ_LIMIT: usize = 200;
 const DEFAULT_THREAD_LIMIT: usize = 200;
 const MAX_THREAD_LIMIT: usize = 999;
+const DEFAULT_EXPORT_LIMIT: usize = 500;
+const MAX_EXPORT_LIMIT: usize = 5_000;
+const DEFAULT_TRANSCRIPT_LIST_LIMIT: usize = 50;
+const MAX_TRANSCRIPT_LIST_LIMIT: usize = 200;
+const DEFAULT_CATCHUP_HOURS: usize = 24;
+const MAX_CATCHUP_HOURS: usize = 720;
+const DEFAULT_CATCHUP_LIMIT: usize = 20;
+const MAX_CATCHUP_LIMIT: usize = 100;
+const MAX_PROMPT_CONTEXT_CHARS: usize = 16_000;
+const MAX_EXCERPT_CHARS: usize = 200;
 
 /// Entrypoint for `slackless mcp`.
 pub async fn run_mcp(default_workspace: Option<&str>) -> Result<ExitCode> {
@@ -81,6 +104,20 @@ impl RpcError {
     fn invalid_params(message: impl Into<String>) -> Self {
         Self {
             code: ERR_INVALID_PARAMS,
+            message: message.into(),
+        }
+    }
+
+    fn resource_not_found(message: impl Into<String>) -> Self {
+        Self {
+            code: ERR_RESOURCE_NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            code: ERR_INTERNAL,
             message: message.into(),
         }
     }
@@ -157,6 +194,112 @@ struct ChannelEntry {
     topic: Option<String>,
     user: Option<String>,
     user_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TranscriptListItem {
+    kind: &'static str,
+    workspace: String,
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_root_ts: Option<String>,
+    updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ended_at_ms: Option<i64>,
+    duration_secs: Option<f64>,
+    cue_count: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    languages: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uri: Option<String>,
+    excerpt: String,
+}
+
+#[derive(Serialize)]
+struct CatchupChannelEntry {
+    workspace: String,
+    channel: String,
+    label: String,
+    message_count: u64,
+    author_count: u64,
+    unread_count: u32,
+    is_unread: bool,
+    muted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_author: Option<String>,
+    latest_text: String,
+}
+
+#[derive(Serialize)]
+struct CatchupMentionEntry {
+    workspace: String,
+    channel: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_name: Option<String>,
+    ts: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_name: Option<String>,
+    excerpt: String,
+}
+
+#[derive(Serialize)]
+struct CatchupThreadEntry {
+    workspace: String,
+    channel: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_name: Option<String>,
+    thread_ts: String,
+    reply_count: u32,
+    latest_activity_ts: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author: Option<String>,
+    root_excerpt: String,
+}
+
+struct CatchupSummaryData {
+    since_hours: usize,
+    cutoff_secs: i64,
+    all_workspaces: bool,
+    workspaces: Vec<String>,
+    total_messages: u64,
+    channels: Vec<CatchupChannelEntry>,
+    mentions: Vec<CatchupMentionEntry>,
+    active_threads: Vec<CatchupThreadEntry>,
+    new_transcripts: Vec<TranscriptListItem>,
+}
+
+enum ResourceUri {
+    Workspaces,
+    WorkspaceChannels {
+        workspace: TeamId,
+    },
+    Channel {
+        workspace: TeamId,
+        channel: String,
+    },
+    Thread {
+        workspace: TeamId,
+        channel: String,
+        thread_ts: Ts,
+    },
+    Transcript {
+        workspace: TeamId,
+        file_id: FileId,
+    },
 }
 
 impl McpServer {
@@ -301,6 +444,26 @@ impl McpServer {
                 Ok(result) => Some(jsonrpc_ok(req_id, result)),
                 Err(err) => Some(jsonrpc_error(req_id, err.code, err.message)),
             },
+            "resources/list" => Some(jsonrpc_ok(
+                req_id,
+                json!({ "resources": resource_definitions() }),
+            )),
+            "resources/templates/list" => Some(jsonrpc_ok(
+                req_id,
+                json!({ "resourceTemplates": resource_template_definitions() }),
+            )),
+            "resources/read" => match self.handle_resources_read(&params) {
+                Ok(result) => Some(jsonrpc_ok(req_id, result)),
+                Err(err) => Some(jsonrpc_error(req_id, err.code, err.message)),
+            },
+            "prompts/list" => Some(jsonrpc_ok(
+                req_id,
+                json!({ "prompts": prompt_definitions() }),
+            )),
+            "prompts/get" => match self.handle_prompts_get(&params) {
+                Ok(result) => Some(jsonrpc_ok(req_id, result)),
+                Err(err) => Some(jsonrpc_error(req_id, err.code, err.message)),
+            },
             _ => Some(jsonrpc_error(
                 req_id,
                 ERR_METHOD_NOT_FOUND,
@@ -339,6 +502,9 @@ impl McpServer {
             "read_channel" => Ok(self.tool_read_channel(&args).await),
             "read_thread" => Ok(self.tool_read_thread(&args).await),
             "get_transcript" => Ok(self.tool_get_transcript(&args)),
+            "list_transcripts" => Ok(self.tool_list_transcripts(&args)),
+            "export_conversation" => Ok(self.tool_export_conversation(&args)),
+            "get_catchup_summary" => Ok(self.tool_get_catchup_summary(&args)),
             "send_message" => Ok(self.tool_send_message(&args).await),
             "reply_thread" => Ok(self.tool_reply_thread(&args).await),
             "add_reaction" => Ok(self.tool_add_reaction(&args).await),
@@ -475,11 +641,67 @@ impl McpServer {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Tool implementations
-    // -------------------------------------------------------------------------
+    fn workspace_candidates(
+        &self,
+        explicit: Option<&str>,
+    ) -> std::result::Result<Vec<TeamId>, String> {
+        if let Some(ws) = explicit {
+            return Ok(vec![TeamId::from(ws)]);
+        }
+        let mut list = Vec::new();
+        let mut seen = HashSet::new();
+        if let Some(default_ws) = self.resolve_workspace(None)?
+            && seen.insert(default_ws.clone())
+        {
+            list.push(default_ws);
+        }
+        for ws in self.all_workspace_ids() {
+            if seen.insert(ws.clone()) {
+                list.push(ws);
+            }
+        }
+        Ok(list)
+    }
 
-    fn tool_list_workspaces(&self) -> Value {
+    fn resolve_scope_workspaces(
+        &self,
+        workspace_arg: Option<&str>,
+        all_workspaces_arg: Option<bool>,
+    ) -> std::result::Result<(bool, Vec<TeamId>), (&'static str, String)> {
+        if workspace_arg.is_some() && all_workspaces_arg == Some(true) {
+            return Err((
+                "invalid_args",
+                "cannot specify both `workspace` and `all_workspaces: true`".to_owned(),
+            ));
+        }
+        if let Some(ws) = workspace_arg {
+            validate_workspace_id(ws).map_err(|m| ("invalid_args", m))?;
+            return Ok((false, vec![TeamId::from(ws)]));
+        }
+        match all_workspaces_arg {
+            Some(true) => Ok((true, self.all_workspace_ids())),
+            Some(false) => match self
+                .resolve_workspace(None)
+                .map_err(|m| ("invalid_args", m))?
+            {
+                Some(ws) => Ok((false, vec![ws])),
+                None => Err((
+                    "no_workspace",
+                    "no workspace resolved; pass `workspace` or set `all_workspaces: true`"
+                        .to_owned(),
+                )),
+            },
+            None => match self
+                .resolve_workspace(None)
+                .map_err(|m| ("invalid_args", m))?
+            {
+                Some(ws) => Ok((false, vec![ws])),
+                None => Ok((true, self.all_workspace_ids())),
+            },
+        }
+    }
+
+    fn list_workspaces_payload(&self) -> Value {
         let sessions = self.load_sessions();
         let mut by_id: HashMap<TeamId, Session> = HashMap::new();
         for s in sessions {
@@ -539,11 +761,108 @@ impl McpServer {
             })
             .collect();
 
-        tool_ok(&json!({
+        json!({
             "default_workspace": default_workspace,
             "count": workspaces.len(),
             "workspaces": workspaces,
+        })
+    }
+
+    fn list_channels_payload(
+        &self,
+        workspace: &TeamId,
+        kind: &str,
+        filter: Option<&str>,
+        include_archived: bool,
+        limit: usize,
+    ) -> std::result::Result<Value, String> {
+        let Some(archive) = self.open_archive(workspace)? else {
+            return Ok(json!({
+                "workspace": workspace.as_str(),
+                "kind": kind,
+                "archive_exists": false,
+                "count": 0,
+                "channels": [],
+            }));
+        };
+
+        let user_names = archive
+            .user_display_map(workspace)
+            .map_err(|err| format!("loading users: {err}"))?;
+
+        let mut rows = Vec::new();
+        if matches!(kind, "all" | "channels") {
+            rows.extend(
+                archive
+                    .channels(workspace)
+                    .map_err(|err| format!("listing channels: {err}"))?,
+            );
+        }
+        if matches!(kind, "all" | "dms") {
+            rows.extend(
+                archive
+                    .dms(workspace)
+                    .map_err(|err| format!("listing DMs: {err}"))?,
+            );
+        }
+
+        let needle = filter.filter(|s| !s.is_empty());
+        let mut entries: Vec<ChannelEntry> = Vec::new();
+        for row in &rows {
+            if !include_archived && row.is_archived {
+                continue;
+            }
+            let user_name = row.user.as_ref().and_then(|u| user_names.get(u).cloned());
+            let label = if row.kind == "im" {
+                user_name
+                    .as_deref()
+                    .map(|u| format!("@{u}"))
+                    .unwrap_or_else(|| row.label())
+            } else {
+                row.label()
+            };
+            if let Some(q) = needle {
+                let matches_field = |s: &str| s.to_ascii_lowercase().contains(q);
+                let hit = matches_field(row.id.as_str())
+                    || matches_field(&label)
+                    || row.name.as_deref().is_some_and(matches_field)
+                    || row.topic.as_deref().is_some_and(matches_field)
+                    || row.user.as_ref().is_some_and(|u| matches_field(u.as_str()))
+                    || user_name.as_deref().is_some_and(matches_field);
+                if !hit {
+                    continue;
+                }
+            }
+            entries.push(ChannelEntry {
+                id: row.id.as_str().to_owned(),
+                name: row.name.clone(),
+                label,
+                kind: row.kind.clone(),
+                is_archived: row.is_archived,
+                is_member: row.is_member,
+                topic: row.topic.clone(),
+                user: row.user.as_ref().map(|u| u.as_str().to_owned()),
+                user_name,
+            });
+        }
+        let total_matched = entries.len();
+        entries.truncate(limit);
+
+        Ok(json!({
+            "workspace": workspace.as_str(),
+            "kind": kind,
+            "count": entries.len(),
+            "total_matched": total_matched,
+            "channels": entries,
         }))
+    }
+
+    // -------------------------------------------------------------------------
+    // Tool implementations
+    // -------------------------------------------------------------------------
+
+    fn tool_list_workspaces(&self) -> Value {
+        tool_ok(&self.list_workspaces_payload())
     }
 
     fn tool_list_channels(&self, args: &Map<String, Value>) -> Value {
@@ -591,88 +910,16 @@ impl McpServer {
             }
             Err(msg) => return tool_err("invalid_args", msg),
         };
-        let archive = match self.open_archive(&workspace) {
-            Ok(a) => a,
-            Err(msg) => return tool_err("store_error", msg),
-        };
-        let Some(archive) = archive else {
-            return tool_ok(&json!({
-                "workspace": workspace.as_str(),
-                "kind": kind,
-                "archive_exists": false,
-                "count": 0,
-                "channels": [],
-            }));
-        };
-
-        let user_names = match archive.user_display_map(&workspace) {
-            Ok(map) => map,
-            Err(err) => return tool_err("store_error", format!("loading users: {err}")),
-        };
-
-        let mut rows = Vec::new();
-        if matches!(kind.as_str(), "all" | "channels") {
-            match archive.channels(&workspace) {
-                Ok(ch) => rows.extend(ch),
-                Err(err) => return tool_err("store_error", format!("listing channels: {err}")),
-            }
+        match self.list_channels_payload(
+            &workspace,
+            &kind,
+            filter.as_deref(),
+            include_archived,
+            limit,
+        ) {
+            Ok(payload) => tool_ok(&payload),
+            Err(msg) => tool_err("store_error", msg),
         }
-        if matches!(kind.as_str(), "all" | "dms") {
-            match archive.dms(&workspace) {
-                Ok(dms) => rows.extend(dms),
-                Err(err) => return tool_err("store_error", format!("listing DMs: {err}")),
-            }
-        }
-
-        let needle = filter.as_deref().filter(|s| !s.is_empty());
-        let mut entries: Vec<ChannelEntry> = Vec::new();
-        for row in &rows {
-            if !include_archived && row.is_archived {
-                continue;
-            }
-            let user_name = row.user.as_ref().and_then(|u| user_names.get(u).cloned());
-            let label = if row.kind == "im" {
-                user_name
-                    .as_deref()
-                    .map(|u| format!("@{u}"))
-                    .unwrap_or_else(|| row.label())
-            } else {
-                row.label()
-            };
-            if let Some(q) = needle {
-                let matches_field = |s: &str| s.to_ascii_lowercase().contains(q);
-                let hit = matches_field(row.id.as_str())
-                    || matches_field(&label)
-                    || row.name.as_deref().is_some_and(matches_field)
-                    || row.topic.as_deref().is_some_and(matches_field)
-                    || row.user.as_ref().is_some_and(|u| matches_field(u.as_str()))
-                    || user_name.as_deref().is_some_and(matches_field);
-                if !hit {
-                    continue;
-                }
-            }
-            entries.push(ChannelEntry {
-                id: row.id.as_str().to_owned(),
-                name: row.name.clone(),
-                label,
-                kind: row.kind.clone(),
-                is_archived: row.is_archived,
-                is_member: row.is_member,
-                topic: row.topic.clone(),
-                user: row.user.as_ref().map(|u| u.as_str().to_owned()),
-                user_name,
-            });
-        }
-        let total_matched = entries.len();
-        entries.truncate(limit);
-
-        tool_ok(&json!({
-            "workspace": workspace.as_str(),
-            "kind": kind,
-            "count": entries.len(),
-            "total_matched": total_matched,
-            "channels": entries,
-        }))
     }
 
     fn tool_search_messages(&self, args: &Map<String, Value>) -> Value {
@@ -1159,26 +1406,9 @@ impl McpServer {
             Err(msg) => return tool_err("invalid_args", msg),
         };
 
-        let candidates: Vec<TeamId> = if let Some(ws) = workspace_arg {
-            vec![TeamId::from(ws)]
-        } else {
-            let mut list = Vec::new();
-            let mut seen = HashSet::new();
-            let default_ws = match self.resolve_workspace(None) {
-                Ok(ws) => ws,
-                Err(msg) => return tool_err("invalid_args", msg),
-            };
-            if let Some(default_ws) = default_ws
-                && seen.insert(default_ws.clone())
-            {
-                list.push(default_ws);
-            }
-            for ws in self.all_workspace_ids() {
-                if seen.insert(ws.clone()) {
-                    list.push(ws);
-                }
-            }
-            list
+        let candidates = match self.workspace_candidates(workspace_arg.as_deref()) {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
         };
 
         if candidates.is_empty() {
@@ -1197,13 +1427,7 @@ impl McpServer {
             };
             match archive.store().file_transcript(ws, &fid) {
                 Ok(Some(transcript)) => {
-                    return tool_ok(&json!({
-                        "workspace": ws.as_str(),
-                        "file_id": transcript.file_id.as_str(),
-                        "source": transcript.source,
-                        "text": transcript.text,
-                        "updated_at": transcript.updated_at,
-                    }));
+                    return tool_ok(&file_transcript_payload(ws, &transcript));
                 }
                 Ok(None) => continue,
                 Err(err) => {
@@ -1216,6 +1440,787 @@ impl McpServer {
             "transcript_not_found",
             format!("no stored transcript found for file_id '{file_id}'"),
         )
+    }
+
+    fn collect_transcripts(
+        &self,
+        workspaces: &[TeamId],
+        kind: &str,
+        channel_filter: Option<&str>,
+        since_secs: Option<i64>,
+        limit: usize,
+    ) -> std::result::Result<Vec<TranscriptListItem>, String> {
+        let mut items: Vec<TranscriptListItem> = Vec::new();
+        for ws in workspaces {
+            let Some(archive) = self.open_archive(ws)? else {
+                continue;
+            };
+            let resolved_channel_id = match channel_filter {
+                Some(ch_arg) => {
+                    let resolved = archive
+                        .resolve_channel(ws, ch_arg)
+                        .map_err(|err| format!("resolving channel '{ch_arg}' in {ws}: {err}"))?;
+                    Some(
+                        resolved
+                            .as_ref()
+                            .map_or_else(|| raw_channel_id(ch_arg), |row| row.id.clone()),
+                    )
+                }
+                None => None,
+            };
+
+            if matches!(kind, "all" | "file") {
+                let allowed_files: Option<HashSet<FileId>> =
+                    if let Some(ch_id) = resolved_channel_id.as_ref() {
+                        let mut q = SearchQuery::default();
+                        q.filters.in_channels.push(ch_id.as_str().to_owned());
+                        q.filters.has.push(Has::File);
+                        let msgs = archive
+                            .store()
+                            .search_sorted(ws, &q, SearchSort::Recent, 500)
+                            .map_err(|err| {
+                                format!("listing files in channel {ch_id} of {ws}: {err}")
+                            })?;
+                        let mut set = HashSet::new();
+                        for msg in msgs {
+                            for f in msg.message.files {
+                                if !f.id.as_str().is_empty() {
+                                    set.insert(f.id);
+                                }
+                            }
+                        }
+                        Some(set)
+                    } else {
+                        None
+                    };
+
+                let all_files = archive
+                    .store()
+                    .all_file_transcripts(ws)
+                    .map_err(|err| format!("listing file transcripts for {ws}: {err}"))?;
+                for file_id in all_files.keys() {
+                    if let Some(allowed) = allowed_files.as_ref()
+                        && !allowed.contains(file_id)
+                    {
+                        continue;
+                    }
+                    let Some(tr) = archive
+                        .store()
+                        .file_transcript(ws, file_id)
+                        .map_err(|err| format!("reading file transcript {file_id}: {err}"))?
+                    else {
+                        continue;
+                    };
+                    if let Some(cutoff) = since_secs
+                        && tr.updated_at < cutoff
+                    {
+                        continue;
+                    }
+                    let duration_secs = transcript_duration_secs(&tr.cues);
+                    let cue_count = tr.cues.len() as u64;
+                    let uri = format!(
+                        "slackless://workspace/{}/transcript/{}",
+                        ws.as_str(),
+                        tr.file_id.as_str()
+                    );
+                    items.push(TranscriptListItem {
+                        kind: "file",
+                        workspace: ws.as_str().to_owned(),
+                        id: tr.file_id.as_str().to_owned(),
+                        source: Some(tr.source),
+                        channel: None,
+                        channel_name: None,
+                        thread_root_ts: None,
+                        updated_at: tr.updated_at,
+                        started_at_ms: None,
+                        ended_at_ms: None,
+                        duration_secs,
+                        cue_count,
+                        languages: Vec::new(),
+                        uri: Some(uri),
+                        excerpt: collapse_excerpt(&tr.text, MAX_EXCERPT_CHARS),
+                    });
+                }
+            }
+
+            if matches!(kind, "all" | "huddle") {
+                let channel_names = archive.channel_names(ws).unwrap_or_default();
+                let sessions = archive
+                    .store()
+                    .list_huddle_transcript_sessions(
+                        ws,
+                        resolved_channel_id.as_ref(),
+                        limit.max(50),
+                    )
+                    .map_err(|err| format!("listing huddle transcripts for {ws}: {err}"))?;
+                for session in sessions {
+                    let ended_secs = session.ended_at_ms.div_euclid(1_000);
+                    if let Some(cutoff) = since_secs
+                        && ended_secs < cutoff
+                    {
+                        continue;
+                    }
+                    let duration_secs = Some(
+                        ((session.ended_at_ms - session.started_at_ms).max(0) as f64) / 1000.0,
+                    );
+                    let ch_name = channel_names.get(session.channel.as_str()).cloned();
+                    items.push(TranscriptListItem {
+                        kind: "huddle",
+                        workspace: ws.as_str().to_owned(),
+                        id: session.call_id,
+                        source: None,
+                        channel: Some(session.channel.as_str().to_owned()),
+                        channel_name: ch_name,
+                        thread_root_ts: session.thread_root_ts.map(|t| t.as_str().to_owned()),
+                        updated_at: ended_secs,
+                        started_at_ms: Some(session.started_at_ms),
+                        ended_at_ms: Some(session.ended_at_ms),
+                        duration_secs,
+                        cue_count: session.segment_count,
+                        languages: session.languages,
+                        uri: None,
+                        excerpt: collapse_excerpt(&session.preview, MAX_EXCERPT_CHARS),
+                    });
+                }
+            }
+        }
+
+        items.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.workspace.cmp(&b.workspace))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        items.truncate(limit);
+        Ok(items)
+    }
+
+    fn tool_list_transcripts(&self, args: &Map<String, Value>) -> Value {
+        let workspace_arg = match opt_workspace(args) {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let all_workspaces_arg = match opt_bool_optional(args, "all_workspaces") {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let kind = match opt_str(args, "kind") {
+            Ok(Some(k)) => k.trim().to_ascii_lowercase(),
+            Ok(None) => "all".to_owned(),
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        if !matches!(kind.as_str(), "all" | "file" | "huddle") {
+            return tool_err(
+                "invalid_args",
+                format!("invalid `kind` '{kind}': expected \"all\", \"file\", or \"huddle\""),
+            );
+        }
+        let channel_arg = match opt_non_empty_str(args, "channel") {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let limit = match opt_usize(
+            args,
+            "limit",
+            DEFAULT_TRANSCRIPT_LIST_LIMIT,
+            1,
+            MAX_TRANSCRIPT_LIST_LIMIT,
+        ) {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+
+        let (all_workspaces, workspaces) =
+            match self.resolve_scope_workspaces(workspace_arg.as_deref(), all_workspaces_arg) {
+                Ok(v) => v,
+                Err((code, msg)) => return tool_err(code, msg),
+            };
+
+        let transcripts =
+            match self.collect_transcripts(&workspaces, &kind, channel_arg.as_deref(), None, limit)
+            {
+                Ok(items) => items,
+                Err(msg) => return tool_err("store_error", msg),
+            };
+
+        let file_count = transcripts.iter().filter(|t| t.kind == "file").count();
+        let huddle_count = transcripts.iter().filter(|t| t.kind == "huddle").count();
+        let searched: Vec<&str> = workspaces.iter().map(TeamId::as_str).collect();
+
+        tool_ok(&json!({
+            "all_workspaces": all_workspaces,
+            "workspaces_searched": searched,
+            "kind": kind,
+            "count": transcripts.len(),
+            "file_count": file_count,
+            "huddle_count": huddle_count,
+            "transcripts": transcripts,
+        }))
+    }
+
+    fn tool_export_conversation(&self, args: &Map<String, Value>) -> Value {
+        let workspace_arg = match opt_workspace(args) {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let channel_arg = match opt_non_empty_str(args, "channel") {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let thread_ts_arg = match opt_non_empty_str(args, "thread_ts") {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let file_id_arg = match opt_non_empty_str(args, "file_id") {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let huddle_id_arg = match opt_non_empty_str(args, "huddle_id") {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let format_raw = match opt_str(args, "format") {
+            Ok(Some(s)) => s.trim().to_ascii_lowercase(),
+            Ok(None) => "md".to_owned(),
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let (export_fmt, fmt_label) = match format_raw.as_str() {
+            "md" | "markdown" => (ExportFormat::Markdown, "md"),
+            "json" => (ExportFormat::Json, "json"),
+            other => {
+                return tool_err(
+                    "invalid_args",
+                    format!("invalid `format` '{other}': expected \"md\" or \"json\""),
+                );
+            }
+        };
+        let include_threads = match opt_bool(args, "include_threads", false) {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let include_deleted = match opt_bool(args, "include_deleted", false) {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let include_transcripts = match opt_bool(args, "include_transcripts", true) {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let limit = match opt_usize(args, "limit", DEFAULT_EXPORT_LIMIT, 1, MAX_EXPORT_LIMIT) {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+
+        if thread_ts_arg.is_some() && channel_arg.is_none() {
+            return tool_err("invalid_args", "`thread_ts` requires `channel`");
+        }
+        let target_count = usize::from(channel_arg.is_some())
+            + usize::from(file_id_arg.is_some())
+            + usize::from(huddle_id_arg.is_some());
+        if target_count == 0 {
+            return tool_err(
+                "invalid_args",
+                "provide exactly one export target: `channel` (optionally with `thread_ts`), `file_id`, or `huddle_id`",
+            );
+        }
+        if target_count > 1 {
+            return tool_err(
+                "invalid_args",
+                "`channel`, `file_id`, and `huddle_id` are mutually exclusive",
+            );
+        }
+
+        if let Some(file_id) = file_id_arg {
+            let candidates = match self.workspace_candidates(workspace_arg.as_deref()) {
+                Ok(v) => v,
+                Err(msg) => return tool_err("invalid_args", msg),
+            };
+            if candidates.is_empty() {
+                return tool_err(
+                    "no_workspace",
+                    "no local archive workspaces found; pass `workspace` or sync the desktop app first",
+                );
+            }
+            let fid = FileId::from(file_id.as_str());
+            for ws in &candidates {
+                let archive = match self.open_archive(ws) {
+                    Ok(Some(a)) => a,
+                    Ok(None) => continue,
+                    Err(msg) => return tool_err("store_error", msg),
+                };
+                match export_file_transcript(archive.store(), ws, &fid, export_fmt) {
+                    Ok(Some(artifact)) => {
+                        return tool_ok(&json!({
+                            "workspace": ws.as_str(),
+                            "target": "file_transcript",
+                            "file_id": file_id,
+                            "format": fmt_label,
+                            "title": artifact.title,
+                            "suggested_filename": artifact.suggested_filename,
+                            "item_count": artifact.item_count,
+                            "content": artifact.content,
+                        }));
+                    }
+                    Ok(None) => continue,
+                    Err(err) => {
+                        return tool_err(
+                            "store_error",
+                            format!("exporting file transcript '{file_id}': {err}"),
+                        );
+                    }
+                }
+            }
+            return tool_err(
+                "not_found",
+                format!("no stored file transcript found for file_id '{file_id}'"),
+            );
+        }
+
+        if let Some(huddle_id) = huddle_id_arg {
+            let candidates = match self.workspace_candidates(workspace_arg.as_deref()) {
+                Ok(v) => v,
+                Err(msg) => return tool_err("invalid_args", msg),
+            };
+            if candidates.is_empty() {
+                return tool_err(
+                    "no_workspace",
+                    "no local archive workspaces found; pass `workspace` or sync the desktop app first",
+                );
+            }
+            for ws in &candidates {
+                let archive = match self.open_archive(ws) {
+                    Ok(Some(a)) => a,
+                    Ok(None) => continue,
+                    Err(msg) => return tool_err("store_error", msg),
+                };
+                match export_huddle_transcript(archive.store(), ws, &huddle_id, export_fmt) {
+                    Ok(Some(artifact)) => {
+                        return tool_ok(&json!({
+                            "workspace": ws.as_str(),
+                            "target": "huddle_transcript",
+                            "huddle_id": huddle_id,
+                            "format": fmt_label,
+                            "title": artifact.title,
+                            "suggested_filename": artifact.suggested_filename,
+                            "item_count": artifact.item_count,
+                            "content": artifact.content,
+                        }));
+                    }
+                    Ok(None) => continue,
+                    Err(err) => {
+                        return tool_err(
+                            "store_error",
+                            format!("exporting huddle transcript '{huddle_id}': {err}"),
+                        );
+                    }
+                }
+            }
+            return tool_err(
+                "not_found",
+                format!("no stored huddle transcript found for huddle_id '{huddle_id}'"),
+            );
+        }
+
+        let channel_arg = channel_arg.expect("checked channel_arg.is_some()");
+        let workspace = match self.resolve_workspace(workspace_arg.as_deref()) {
+            Ok(Some(ws)) => ws,
+            Ok(None) => {
+                return tool_err(
+                    "no_workspace",
+                    "no workspace resolved; pass `workspace` (call `list_workspaces` to see available team IDs)",
+                );
+            }
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let archive = match self.open_archive(&workspace) {
+            Ok(a) => a,
+            Err(msg) => return tool_err("store_error", msg),
+        };
+        let export_opts = ExportOptions {
+            format: export_fmt,
+            limit,
+            include_deleted,
+            include_threads,
+            include_transcripts,
+        };
+
+        let (channel_id, artifact) = match archive.as_ref() {
+            Some(archive) => {
+                let resolved = match archive.resolve_channel(&workspace, &channel_arg) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        return tool_err("store_error", format!("resolving channel: {err}"));
+                    }
+                };
+                let channel_id = resolved
+                    .as_ref()
+                    .map_or_else(|| raw_channel_id(&channel_arg), |row| row.id.clone());
+                let artifact = match thread_ts_arg.as_deref() {
+                    Some(ts) => export_thread(
+                        archive.store(),
+                        &workspace,
+                        &channel_id,
+                        &Ts::from(ts),
+                        &export_opts,
+                    ),
+                    None => export_channel(archive.store(), &workspace, &channel_id, &export_opts),
+                };
+                match artifact {
+                    Ok(a) => (channel_id, a),
+                    Err(err) => {
+                        return tool_err("store_error", format!("exporting archive: {err}"));
+                    }
+                }
+            }
+            None => {
+                let channel_id = raw_channel_id(&channel_arg);
+                let fallback = match Store::open_in_memory() {
+                    Ok(s) => s,
+                    Err(err) => {
+                        return tool_err("store_error", format!("opening fallback store: {err}"));
+                    }
+                };
+                let artifact = match thread_ts_arg.as_deref() {
+                    Some(ts) => export_thread(
+                        &fallback,
+                        &workspace,
+                        &channel_id,
+                        &Ts::from(ts),
+                        &export_opts,
+                    ),
+                    None => export_channel(&fallback, &workspace, &channel_id, &export_opts),
+                };
+                match artifact {
+                    Ok(a) => (channel_id, a),
+                    Err(err) => {
+                        return tool_err("store_error", format!("exporting archive: {err}"));
+                    }
+                }
+            }
+        };
+
+        let target_kind = if thread_ts_arg.is_some() {
+            "thread"
+        } else {
+            "channel"
+        };
+
+        tool_ok(&json!({
+            "workspace": workspace.as_str(),
+            "target": target_kind,
+            "channel": channel_id.as_str(),
+            "thread_ts": thread_ts_arg,
+            "format": fmt_label,
+            "title": artifact.title,
+            "suggested_filename": artifact.suggested_filename,
+            "item_count": artifact.item_count,
+            "content": artifact.content,
+        }))
+    }
+
+    fn collect_catchup_summary(
+        &self,
+        all_workspaces: bool,
+        workspaces: &[TeamId],
+        since_hours: usize,
+        limit: usize,
+        explicit_user_id: Option<&str>,
+    ) -> std::result::Result<CatchupSummaryData, String> {
+        let now = now_epoch_secs();
+        let cutoff_secs = now.saturating_sub((since_hours as i64).saturating_mul(3_600));
+
+        let session_users: HashMap<TeamId, String> = self
+            .load_sessions()
+            .into_iter()
+            .filter(|s| !s.user_id.as_str().is_empty())
+            .map(|s| (s.team_id, s.user_id.as_str().to_owned()))
+            .collect();
+
+        let mut total_messages: u64 = 0;
+        let mut channels: Vec<CatchupChannelEntry> = Vec::new();
+        let mut mentions: Vec<CatchupMentionEntry> = Vec::new();
+        let mut active_threads: Vec<CatchupThreadEntry> = Vec::new();
+
+        for ws in workspaces {
+            let Some(archive) = self.open_archive(ws)? else {
+                continue;
+            };
+
+            let user_names = archive.user_display_map(ws).unwrap_or_default();
+            let channel_names = archive.channel_names(ws).unwrap_or_default();
+            let notify = archive.notify_levels(ws).unwrap_or_default();
+
+            // 1. Active & unread channels in the window.
+            let conv_map: HashMap<ChannelId, slackless_core::types::Conversation> = archive
+                .store()
+                .conversations(ws)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| (c.id.clone(), c))
+                .collect();
+            let digest_rows = archive
+                .digest_since(ws, cutoff_secs, limit)
+                .map_err(|err| format!("building digest for {ws}: {err}"))?;
+            let mut seen_channels: HashSet<ChannelId> = HashSet::new();
+            for row in digest_rows {
+                total_messages = total_messages.saturating_add(row.message_count);
+                let ch_id = ChannelId::from(row.channel.as_str());
+                seen_channels.insert(ch_id.clone());
+                let conv = conv_map.get(&ch_id);
+                let unread_count = conv
+                    .and_then(|c| c.unread_count_display.or(c.unread_count))
+                    .unwrap_or(0);
+                let newer_than_read = conv
+                    .and_then(|c| c.last_read.as_ref())
+                    .is_some_and(|lr| Ts::from(row.latest_ts.as_str()) > *lr);
+                let is_unread = unread_count > 0 || newer_than_read;
+                let muted = notify.get(&ch_id) == Some(&NotifyLevel::Muted);
+                channels.push(CatchupChannelEntry {
+                    workspace: ws.as_str().to_owned(),
+                    channel: row.channel,
+                    label: row.label,
+                    message_count: row.message_count,
+                    author_count: row.author_count,
+                    unread_count,
+                    is_unread,
+                    muted,
+                    latest_ts: Some(row.latest_ts),
+                    latest_author: row.latest_author,
+                    latest_text: row.latest_text,
+                });
+            }
+            // Include unread conversations that had unread_count > 0 locally even without messages
+            // in the time-window digest.
+            for (ch_id, conv) in &conv_map {
+                if seen_channels.contains(ch_id) || conv.is_archived {
+                    continue;
+                }
+                let unread_count = conv.unread_count_display.or(conv.unread_count).unwrap_or(0);
+                if unread_count == 0 {
+                    continue;
+                }
+                let label = if let Some(name) = conv.name.as_deref() {
+                    format!("#{name}")
+                } else if conv.is_im {
+                    conv.user
+                        .as_ref()
+                        .and_then(|u| user_names.get(u))
+                        .map(|n| format!("@{n}"))
+                        .unwrap_or_else(|| ch_id.as_str().to_owned())
+                } else {
+                    ch_id.as_str().to_owned()
+                };
+                let muted = notify.get(ch_id) == Some(&NotifyLevel::Muted);
+                let latest_ts = conv.latest.as_ref().map(|l| l.ts().as_str().to_owned());
+                channels.push(CatchupChannelEntry {
+                    workspace: ws.as_str().to_owned(),
+                    channel: ch_id.as_str().to_owned(),
+                    label,
+                    message_count: 0,
+                    author_count: 0,
+                    unread_count,
+                    is_unread: true,
+                    muted,
+                    latest_ts,
+                    latest_author: None,
+                    latest_text: String::new(),
+                });
+            }
+
+            // 2. Direct mentions of the workspace user within the window.
+            let mention_uid = explicit_user_id
+                .map(str::to_owned)
+                .or_else(|| session_users.get(ws).cloned());
+            if let Some(uid) = mention_uid {
+                let mut q = SearchQuery::default();
+                q.filters.includes_user = Some(uid);
+                q.filters.include_deleted = false;
+                let hits = archive
+                    .store()
+                    .search_sorted(ws, &q, SearchSort::Recent, limit.saturating_mul(2))
+                    .map_err(|err| format!("searching mentions for {ws}: {err}"))?;
+                for stored in hits {
+                    if stored.message.ts.secs().is_none_or(|s| s < cutoff_secs) {
+                        continue;
+                    }
+                    let ch_name = channel_names.get(stored.channel.as_str()).cloned();
+                    let u_name = stored
+                        .message
+                        .user
+                        .as_ref()
+                        .and_then(|u| user_names.get(u).cloned());
+                    let plain = mrkdwn_to_plain(&stored.message.text);
+                    let body = if plain.trim().is_empty() {
+                        &stored.message.text
+                    } else {
+                        &plain
+                    };
+                    mentions.push(CatchupMentionEntry {
+                        workspace: ws.as_str().to_owned(),
+                        channel: stored.channel.as_str().to_owned(),
+                        channel_name: ch_name,
+                        ts: stored.message.ts.as_str().to_owned(),
+                        thread_ts: stored
+                            .message
+                            .thread_ts
+                            .as_ref()
+                            .map(|t| t.as_str().to_owned()),
+                        user: stored.message.user.as_ref().map(|u| u.as_str().to_owned()),
+                        user_name: u_name,
+                        excerpt: collapse_excerpt(body, MAX_EXCERPT_CHARS),
+                    });
+                }
+            }
+
+            // 3. Active threads in the window.
+            let thread_roots = archive
+                .store()
+                .recent_threads(ws, None, limit.saturating_mul(3).max(50))
+                .map_err(|err| format!("loading active threads for {ws}: {err}"))?;
+            for root in thread_roots {
+                let latest_activity = if let Some(lr) = root.message.latest_reply.clone() {
+                    lr
+                } else {
+                    archive
+                        .store()
+                        .thread_replies(ws, &root.channel, &root.message.ts)
+                        .ok()
+                        .and_then(|replies| {
+                            replies
+                                .into_iter()
+                                .rev()
+                                .find(|m| !m.deleted)
+                                .map(|m| m.message.ts)
+                        })
+                        .unwrap_or_else(|| root.message.ts.clone())
+                };
+                let active_in_window = latest_activity.secs().is_some_and(|s| s >= cutoff_secs)
+                    || root.message.ts.secs().is_some_and(|s| s >= cutoff_secs);
+                if !active_in_window {
+                    continue;
+                }
+                let ch_name = channel_names.get(root.channel.as_str()).cloned();
+                let author = root
+                    .message
+                    .user
+                    .as_ref()
+                    .and_then(|u| user_names.get(u).cloned())
+                    .or_else(|| root.message.user.as_ref().map(|u| u.as_str().to_owned()));
+                let plain = mrkdwn_to_plain(&root.message.text);
+                let body = if plain.trim().is_empty() {
+                    &root.message.text
+                } else {
+                    &plain
+                };
+                active_threads.push(CatchupThreadEntry {
+                    workspace: ws.as_str().to_owned(),
+                    channel: root.channel.as_str().to_owned(),
+                    channel_name: ch_name,
+                    thread_ts: root.message.ts.as_str().to_owned(),
+                    reply_count: root.message.reply_count.unwrap_or(0),
+                    latest_activity_ts: latest_activity.as_str().to_owned(),
+                    author,
+                    root_excerpt: collapse_excerpt(body, MAX_EXCERPT_CHARS),
+                });
+            }
+        }
+
+        // 4. New file and huddle transcripts in the window.
+        let new_transcripts =
+            self.collect_transcripts(workspaces, "all", None, Some(cutoff_secs), limit)?;
+
+        channels.sort_by(|a, b| {
+            b.is_unread
+                .cmp(&a.is_unread)
+                .then_with(|| b.message_count.cmp(&a.message_count))
+                .then_with(|| b.latest_ts.cmp(&a.latest_ts))
+        });
+        channels.truncate(limit);
+
+        mentions.sort_by(|a, b| b.ts.cmp(&a.ts));
+        mentions.truncate(limit);
+
+        active_threads.sort_by(|a, b| b.latest_activity_ts.cmp(&a.latest_activity_ts));
+        active_threads.truncate(limit);
+
+        Ok(CatchupSummaryData {
+            since_hours,
+            cutoff_secs,
+            all_workspaces,
+            workspaces: workspaces.iter().map(|w| w.as_str().to_owned()).collect(),
+            total_messages,
+            channels,
+            mentions,
+            active_threads,
+            new_transcripts,
+        })
+    }
+
+    fn tool_get_catchup_summary(&self, args: &Map<String, Value>) -> Value {
+        let workspace_arg = match opt_workspace(args) {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let all_workspaces_arg = match opt_bool_optional(args, "all_workspaces") {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let since_hours = match opt_usize(
+            args,
+            "since_hours",
+            DEFAULT_CATCHUP_HOURS,
+            1,
+            MAX_CATCHUP_HOURS,
+        ) {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let limit = match opt_usize(args, "limit", DEFAULT_CATCHUP_LIMIT, 1, MAX_CATCHUP_LIMIT) {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+        let user_id_arg = match opt_non_empty_str(args, "user_id") {
+            Ok(v) => v,
+            Err(msg) => return tool_err("invalid_args", msg),
+        };
+
+        let (all_workspaces, workspaces) =
+            match self.resolve_scope_workspaces(workspace_arg.as_deref(), all_workspaces_arg) {
+                Ok(v) => v,
+                Err((code, msg)) => return tool_err(code, msg),
+            };
+
+        let data = match self.collect_catchup_summary(
+            all_workspaces,
+            &workspaces,
+            since_hours,
+            limit,
+            user_id_arg.as_deref(),
+        ) {
+            Ok(d) => d,
+            Err(msg) => return tool_err("store_error", msg),
+        };
+
+        let unread_channels = data.channels.iter().filter(|c| c.is_unread).count();
+
+        tool_ok(&json!({
+            "since_hours": data.since_hours,
+            "cutoff_secs": data.cutoff_secs,
+            "all_workspaces": data.all_workspaces,
+            "workspaces": data.workspaces,
+            "totals": {
+                "messages": data.total_messages,
+                "active_channels": data.channels.len(),
+                "unread_channels": unread_channels,
+                "mentions": data.mentions.len(),
+                "active_threads": data.active_threads.len(),
+                "new_transcripts": data.new_transcripts.len(),
+            },
+            "channels": data.channels,
+            "mentions": data.mentions,
+            "active_threads": data.active_threads,
+            "new_transcripts": data.new_transcripts,
+        }))
     }
 
     async fn tool_send_message(&self, args: &Map<String, Value>) -> Value {
@@ -1373,6 +2378,755 @@ impl McpServer {
             }
         }
     }
+
+    // -------------------------------------------------------------------------
+    // MCP Resources (`resources/read`)
+    // -------------------------------------------------------------------------
+
+    fn handle_resources_read(
+        &self,
+        params: &Map<String, Value>,
+    ) -> std::result::Result<Value, RpcError> {
+        let Some(uri) = params
+            .get("uri")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Err(RpcError::invalid_params(
+                "resources/read requires a non-empty string `uri`",
+            ));
+        };
+
+        let parsed = parse_resource_uri(uri)?;
+        let payload = match parsed {
+            ResourceUri::Workspaces => self.list_workspaces_payload(),
+            ResourceUri::WorkspaceChannels { workspace } => self
+                .list_channels_payload(&workspace, "all", None, true, DEFAULT_CHANNEL_LIST_LIMIT)
+                .map_err(RpcError::internal)?,
+            ResourceUri::Channel { workspace, channel } => {
+                self.read_channel_resource(&workspace, &channel)?
+            }
+            ResourceUri::Thread {
+                workspace,
+                channel,
+                thread_ts,
+            } => self.read_thread_resource(&workspace, &channel, &thread_ts)?,
+            ResourceUri::Transcript { workspace, file_id } => {
+                let archive = self.open_archive(&workspace).map_err(RpcError::internal)?;
+                let Some(archive) = archive else {
+                    return Err(RpcError::resource_not_found(format!(
+                        "no local archive for workspace '{workspace}'; transcript '{file_id}' not found"
+                    )));
+                };
+                let transcript = archive
+                    .store()
+                    .file_transcript(&workspace, &file_id)
+                    .map_err(|err| RpcError::internal(format!("reading transcript: {err}")))?;
+                let Some(transcript) = transcript else {
+                    return Err(RpcError::resource_not_found(format!(
+                        "no stored transcript found for file_id '{file_id}' in workspace '{workspace}'"
+                    )));
+                };
+                file_transcript_payload(&workspace, &transcript)
+            }
+        };
+
+        let text = serde_json::to_string_pretty(&payload)
+            .map_err(|err| RpcError::internal(format!("serializing resource payload: {err}")))?;
+        Ok(json!({
+            "contents": [
+                {
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": text,
+                }
+            ]
+        }))
+    }
+
+    fn read_channel_resource(
+        &self,
+        workspace: &TeamId,
+        channel_arg: &str,
+    ) -> std::result::Result<Value, RpcError> {
+        let archive = self.open_archive(workspace).map_err(RpcError::internal)?;
+        let (resolved, channel_id, stored_messages, user_names) = match archive.as_ref() {
+            Some(archive) => {
+                let resolved = archive
+                    .resolve_channel(workspace, channel_arg)
+                    .map_err(|err| RpcError::internal(format!("resolving channel: {err}")))?;
+                let channel_id = resolved
+                    .as_ref()
+                    .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
+                let msgs = read_channel_window(
+                    archive.store(),
+                    workspace,
+                    &channel_id,
+                    None,
+                    DEFAULT_READ_LIMIT,
+                    None,
+                    false,
+                )
+                .map_err(|err| RpcError::internal(format!("reading channel: {err}")))?;
+                let user_names = archive.user_display_map(workspace).unwrap_or_default();
+                (resolved, channel_id, msgs, user_names)
+            }
+            None => (
+                None,
+                raw_channel_id(channel_arg),
+                Vec::new(),
+                HashMap::new(),
+            ),
+        };
+        let channel_row = match resolved {
+            Some(row) => Some(row),
+            None => archive
+                .as_ref()
+                .and_then(|a| a.conversation_by_id(workspace, &channel_id).ok().flatten()),
+        };
+        let ch_label = channel_row.as_ref().map(|r| r.label());
+        let messages: Vec<McpMessage> = stored_messages
+            .iter()
+            .map(|msg| McpMessage::from_stored(msg, &user_names, ch_label.clone(), None))
+            .collect();
+        let channel_json = match channel_row {
+            Some(row) => json!({
+                "id": channel_id.as_str(),
+                "name": row.name,
+                "kind": row.kind,
+                "user": row.user.as_ref().map(|u| u.as_str()),
+            }),
+            None => json!({ "id": channel_id.as_str() }),
+        };
+        Ok(json!({
+            "workspace": workspace.as_str(),
+            "channel": channel_json,
+            "count": messages.len(),
+            "messages": messages,
+        }))
+    }
+
+    fn read_thread_resource(
+        &self,
+        workspace: &TeamId,
+        channel_arg: &str,
+        thread_ts: &Ts,
+    ) -> std::result::Result<Value, RpcError> {
+        let archive = self.open_archive(workspace).map_err(RpcError::internal)?;
+        let (label, channel_id, mut stored_messages, user_names) = match archive.as_ref() {
+            Some(archive) => {
+                let resolved = archive
+                    .resolve_channel(workspace, channel_arg)
+                    .map_err(|err| RpcError::internal(format!("resolving channel: {err}")))?;
+                let channel_id = resolved
+                    .as_ref()
+                    .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
+                let msgs = archive
+                    .store()
+                    .thread_replies(workspace, &channel_id, thread_ts)
+                    .map_err(|err| RpcError::internal(format!("reading thread: {err}")))?;
+                let user_names = archive.user_display_map(workspace).unwrap_or_default();
+                (resolved.map(|r| r.label()), channel_id, msgs, user_names)
+            }
+            None => (
+                None,
+                raw_channel_id(channel_arg),
+                Vec::new(),
+                HashMap::new(),
+            ),
+        };
+        stored_messages.truncate(DEFAULT_THREAD_LIMIT);
+        let messages: Vec<McpMessage> = stored_messages
+            .iter()
+            .map(|msg| McpMessage::from_stored(msg, &user_names, label.clone(), None))
+            .collect();
+        Ok(json!({
+            "workspace": workspace.as_str(),
+            "channel": channel_id.as_str(),
+            "thread_ts": thread_ts.as_str(),
+            "count": messages.len(),
+            "messages": messages,
+        }))
+    }
+
+    // -------------------------------------------------------------------------
+    // MCP Prompts (`prompts/get`)
+    // -------------------------------------------------------------------------
+
+    fn handle_prompts_get(
+        &self,
+        params: &Map<String, Value>,
+    ) -> std::result::Result<Value, RpcError> {
+        let Some(name) = params
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            return Err(RpcError::invalid_params(
+                "prompts/get requires a non-empty string `name`",
+            ));
+        };
+        let args = match params.get("arguments") {
+            None | Some(Value::Null) => Map::new(),
+            Some(Value::Object(map)) => map.clone(),
+            Some(_) => {
+                return Err(RpcError::invalid_params(
+                    "prompts/get `arguments` must be a JSON object",
+                ));
+            }
+        };
+
+        match name {
+            "catch_up" => self.prompt_catch_up(&args),
+            "summarize_thread" => self.prompt_summarize_thread(&args),
+            "summarize_channel" => self.prompt_summarize_channel(&args),
+            "find_decisions" => self.prompt_find_decisions(&args),
+            "search_transcripts" => self.prompt_search_transcripts(&args),
+            _ => Err(RpcError::invalid_params(format!("unknown prompt: {name}"))),
+        }
+    }
+
+    fn prompt_catch_up(&self, args: &Map<String, Value>) -> std::result::Result<Value, RpcError> {
+        let workspace_arg = prompt_opt_workspace(args)?;
+        let since_hours = prompt_opt_usize(
+            args,
+            "since_hours",
+            DEFAULT_CATCHUP_HOURS,
+            1,
+            MAX_CATCHUP_HOURS,
+        )?;
+        let (all_workspaces, workspaces) = self
+            .resolve_scope_workspaces(workspace_arg.as_deref(), None)
+            .map_err(|(_, msg)| RpcError::invalid_params(msg))?;
+
+        let data = self
+            .collect_catchup_summary(all_workspaces, &workspaces, since_hours, 15, None)
+            .map_err(RpcError::internal)?;
+
+        let mut context = format!(
+            "## Local Slack Activity (last {}h)\nWorkspaces: {}\nTotal messages: {}\n\n",
+            data.since_hours,
+            if data.workspaces.is_empty() {
+                "(none)".to_owned()
+            } else {
+                data.workspaces.join(", ")
+            },
+            data.total_messages
+        );
+
+        context.push_str("### Active & Unread Channels\n");
+        if data.channels.is_empty() {
+            context.push_str("_No recent channel activity in this window._\n");
+        } else {
+            for ch in &data.channels {
+                let unread_tag = if ch.is_unread {
+                    if ch.unread_count > 0 {
+                        format!(" [UNREAD: {}]", ch.unread_count)
+                    } else {
+                        " [UNREAD]".to_owned()
+                    }
+                } else {
+                    String::new()
+                };
+                let muted_tag = if ch.muted { " [muted]" } else { "" };
+                let who = ch.latest_author.as_deref().unwrap_or("unknown");
+                context.push_str(&format!(
+                    "- [{}] {} ({} msgs, {} people){unread_tag}{muted_tag}: {who}: {}\n",
+                    ch.workspace, ch.label, ch.message_count, ch.author_count, ch.latest_text
+                ));
+            }
+        }
+
+        context.push_str("\n### Direct Mentions\n");
+        if data.mentions.is_empty() {
+            context.push_str("_No direct mentions found in this window._\n");
+        } else {
+            for m in &data.mentions {
+                let ch = m.channel_name.as_deref().unwrap_or(&m.channel);
+                let who = m
+                    .user_name
+                    .as_deref()
+                    .or(m.user.as_deref())
+                    .unwrap_or("unknown");
+                context.push_str(&format!(
+                    "- [{}] {} `{}` **{who}**: {}\n",
+                    m.workspace, ch, m.ts, m.excerpt
+                ));
+            }
+        }
+
+        context.push_str("\n### Active Threads\n");
+        if data.active_threads.is_empty() {
+            context.push_str("_No active threads in this window._\n");
+        } else {
+            for t in &data.active_threads {
+                let ch = t.channel_name.as_deref().unwrap_or(&t.channel);
+                let who = t.author.as_deref().unwrap_or("unknown");
+                context.push_str(&format!(
+                    "- [{}] {} `{}` ({} replies) **{who}**: {}\n",
+                    t.workspace, ch, t.thread_ts, t.reply_count, t.root_excerpt
+                ));
+            }
+        }
+
+        context.push_str("\n### New Audio/Video & Huddle Transcripts\n");
+        if data.new_transcripts.is_empty() {
+            context.push_str("_No new transcripts in this window._\n");
+        } else {
+            for tr in &data.new_transcripts {
+                let dur = tr
+                    .duration_secs
+                    .map(|d| format!(", {d:.0}s"))
+                    .unwrap_or_default();
+                context.push_str(&format!(
+                    "- [{}] ({}) `{}` ({} cues{dur}): {}\n",
+                    tr.workspace, tr.kind, tr.id, tr.cue_count, tr.excerpt
+                ));
+            }
+        }
+
+        let bounded = bound_prompt_context(&context, MAX_PROMPT_CONTEXT_CHARS);
+        let text = format!(
+            "Prepare a concise executive Slack catch-up briefing from the local archive snapshot below.\n\
+             Group your response into:\n\
+             1. Urgent mentions & items needing my reply\n\
+             2. Key channel highlights\n\
+             3. Active threads worth following up on\n\
+             4. Notable takeaways from new audio/video or huddle transcripts\n\n\
+             {bounded}"
+        );
+
+        Ok(prompt_result(
+            "Summarize recent Slack activity, mentions, active threads, and new transcripts.",
+            text,
+        ))
+    }
+
+    fn prompt_summarize_thread(
+        &self,
+        args: &Map<String, Value>,
+    ) -> std::result::Result<Value, RpcError> {
+        let channel_arg = prompt_req_str(args, "channel")?;
+        let thread_ts_arg = prompt_req_str(args, "thread_ts")?;
+        let workspace_arg = prompt_opt_workspace(args)?;
+
+        let workspace = self
+            .resolve_workspace(workspace_arg.as_deref())
+            .map_err(RpcError::invalid_params)?
+            .ok_or_else(|| {
+                RpcError::invalid_params(
+                    "no workspace resolved; pass `workspace` in prompt arguments",
+                )
+            })?;
+
+        let archive = self.open_archive(&workspace).map_err(RpcError::internal)?;
+        let (label, channel_id, messages, user_names) = match archive.as_ref() {
+            Some(archive) => {
+                let resolved = archive
+                    .resolve_channel(&workspace, &channel_arg)
+                    .map_err(|err| RpcError::internal(format!("resolving channel: {err}")))?;
+                let channel_id = resolved
+                    .as_ref()
+                    .map_or_else(|| raw_channel_id(&channel_arg), |r| r.id.clone());
+                let label = resolved
+                    .as_ref()
+                    .map(|r| r.label())
+                    .unwrap_or_else(|| channel_id.as_str().to_owned());
+                let mut msgs = archive
+                    .store()
+                    .thread_replies(&workspace, &channel_id, &Ts::from(thread_ts_arg.as_str()))
+                    .map_err(|err| RpcError::internal(format!("reading thread: {err}")))?;
+                msgs.retain(|m| !m.deleted);
+                msgs.truncate(100);
+                let users = archive.user_display_map(&workspace).unwrap_or_default();
+                (label, channel_id, msgs, users)
+            }
+            None => {
+                let channel_id = raw_channel_id(&channel_arg);
+                (
+                    channel_id.as_str().to_owned(),
+                    channel_id,
+                    Vec::new(),
+                    HashMap::new(),
+                )
+            }
+        };
+
+        let mut context = format!(
+            "## Thread Context\nWorkspace: `{}` · Channel: {} (`{}`) · Thread: `{}` · Messages: {}\n\n",
+            workspace.as_str(),
+            label,
+            channel_id.as_str(),
+            thread_ts_arg,
+            messages.len()
+        );
+        if messages.is_empty() {
+            context.push_str("_No archived messages found for this thread._\n");
+        } else {
+            for msg in &messages {
+                context.push_str(&format_prompt_message(msg, &user_names, None));
+            }
+        }
+
+        let bounded = bound_prompt_context(&context, MAX_PROMPT_CONTEXT_CHARS);
+        let text = format!(
+            "Summarize the Slack thread below. Provide:\n\
+             1. One-sentence TL;DR\n\
+             2. Key points raised (with speaker attribution)\n\
+             3. Decisions reached\n\
+             4. Action items with owners\n\
+             5. Open questions or blockers\n\n\
+             {bounded}"
+        );
+
+        Ok(prompt_result(
+            "Summarize a Slack thread with decisions, action items, and open questions.",
+            text,
+        ))
+    }
+
+    fn prompt_summarize_channel(
+        &self,
+        args: &Map<String, Value>,
+    ) -> std::result::Result<Value, RpcError> {
+        let channel_arg = prompt_req_str(args, "channel")?;
+        let workspace_arg = prompt_opt_workspace(args)?;
+        let since = prompt_opt_str(args, "since")?;
+        let cutoff_secs = match since.as_deref() {
+            Some(spec) => {
+                Some(parse_since_cutoff(spec, now_epoch_secs()).map_err(RpcError::invalid_params)?)
+            }
+            None => None,
+        };
+        let limit = prompt_opt_usize(args, "limit", DEFAULT_READ_LIMIT, 1, 100)?;
+
+        let workspace = self
+            .resolve_workspace(workspace_arg.as_deref())
+            .map_err(RpcError::invalid_params)?
+            .ok_or_else(|| {
+                RpcError::invalid_params(
+                    "no workspace resolved; pass `workspace` in prompt arguments",
+                )
+            })?;
+
+        let archive = self.open_archive(&workspace).map_err(RpcError::internal)?;
+        let (label, channel_id, messages, user_names) = match archive.as_ref() {
+            Some(archive) => {
+                let resolved = archive
+                    .resolve_channel(&workspace, &channel_arg)
+                    .map_err(|err| RpcError::internal(format!("resolving channel: {err}")))?;
+                let channel_id = resolved
+                    .as_ref()
+                    .map_or_else(|| raw_channel_id(&channel_arg), |r| r.id.clone());
+                let label = resolved
+                    .as_ref()
+                    .map(|r| r.label())
+                    .unwrap_or_else(|| channel_id.as_str().to_owned());
+                let msgs = read_channel_window(
+                    archive.store(),
+                    &workspace,
+                    &channel_id,
+                    None,
+                    limit,
+                    cutoff_secs,
+                    false,
+                )
+                .map_err(|err| RpcError::internal(format!("reading channel: {err}")))?;
+                let users = archive.user_display_map(&workspace).unwrap_or_default();
+                (label, channel_id, msgs, users)
+            }
+            None => {
+                let channel_id = raw_channel_id(&channel_arg);
+                (
+                    channel_id.as_str().to_owned(),
+                    channel_id,
+                    Vec::new(),
+                    HashMap::new(),
+                )
+            }
+        };
+
+        let window_desc = since.as_deref().unwrap_or("recent");
+        let mut context = format!(
+            "## Channel Context\nWorkspace: `{}` · Channel: {} (`{}`) · Window: {} · Messages: {}\n\n",
+            workspace.as_str(),
+            label,
+            channel_id.as_str(),
+            window_desc,
+            messages.len()
+        );
+        if messages.is_empty() {
+            context.push_str("_No archived messages found for this channel window._\n");
+        } else {
+            for msg in &messages {
+                context.push_str(&format_prompt_message(msg, &user_names, None));
+            }
+        }
+
+        let bounded = bound_prompt_context(&context, MAX_PROMPT_CONTEXT_CHARS);
+        let text = format!(
+            "Summarize the recent discussions in {} below. Highlight:\n\
+             1. Main topics and updates\n\
+             2. Decisions or consensus reached\n\
+             3. Active threads or blockers that need attention\n\
+             4. Follow-up actions and owners\n\n\
+             {bounded}",
+            label
+        );
+
+        Ok(prompt_result(
+            "Summarize recent discussions, themes, and blockers in a Slack channel.",
+            text,
+        ))
+    }
+
+    fn prompt_find_decisions(
+        &self,
+        args: &Map<String, Value>,
+    ) -> std::result::Result<Value, RpcError> {
+        let channel_arg = prompt_opt_str(args, "channel")?;
+        let query_arg = prompt_opt_str(args, "query")?;
+        let since_arg = prompt_opt_str(args, "since")?;
+        let workspace_arg = prompt_opt_workspace(args)?;
+
+        let cutoff_secs = match since_arg.as_deref() {
+            Some(spec) => {
+                Some(parse_since_cutoff(spec, now_epoch_secs()).map_err(RpcError::invalid_params)?)
+            }
+            None => None,
+        };
+
+        let mut context = String::from("## Candidate Messages for Decision Extraction\n");
+        let mut collected = 0usize;
+
+        if let Some(ch_arg) = channel_arg.as_deref()
+            && query_arg.is_none()
+        {
+            let workspace = self
+                .resolve_workspace(workspace_arg.as_deref())
+                .map_err(RpcError::invalid_params)?
+                .ok_or_else(|| {
+                    RpcError::invalid_params(
+                        "no workspace resolved; pass `workspace` in prompt arguments",
+                    )
+                })?;
+            if let Some(archive) = self.open_archive(&workspace).map_err(RpcError::internal)? {
+                let resolved = archive
+                    .resolve_channel(&workspace, ch_arg)
+                    .map_err(|err| RpcError::internal(format!("resolving channel: {err}")))?;
+                let ch_id = resolved
+                    .as_ref()
+                    .map_or_else(|| raw_channel_id(ch_arg), |r| r.id.clone());
+                let label = resolved
+                    .as_ref()
+                    .map(|r| r.label())
+                    .unwrap_or_else(|| ch_id.as_str().to_owned());
+                let msgs = read_channel_window(
+                    archive.store(),
+                    &workspace,
+                    &ch_id,
+                    None,
+                    80,
+                    cutoff_secs,
+                    false,
+                )
+                .map_err(|err| RpcError::internal(format!("reading channel: {err}")))?;
+                let users = archive.user_display_map(&workspace).unwrap_or_default();
+                context.push_str(&format!(
+                    "Scope: workspace `{}` · channel {} (`{}`)\n\n",
+                    workspace.as_str(),
+                    label,
+                    ch_id.as_str()
+                ));
+                for msg in &msgs {
+                    context.push_str(&format_prompt_message(msg, &users, Some(&label)));
+                    collected += 1;
+                }
+            }
+        } else {
+            let effective_query = match (query_arg.as_deref(), channel_arg.as_deref()) {
+                (Some(q), Some(ch)) => format!("{q} in:{ch}"),
+                (Some(q), None) => q.to_owned(),
+                (None, _) => "decided".to_owned(),
+            };
+            let parsed = SearchQuery::parse(&effective_query);
+            let (_, workspaces) = self
+                .resolve_scope_workspaces(workspace_arg.as_deref(), None)
+                .map_err(|(_, msg)| RpcError::invalid_params(msg))?;
+            context.push_str(&format!("Query: `{effective_query}`\n\n"));
+            for ws in &workspaces {
+                let Some(archive) = self.open_archive(ws).map_err(RpcError::internal)? else {
+                    continue;
+                };
+                let hits = archive
+                    .store()
+                    .search_sorted(ws, &parsed, SearchSort::Recent, 40)
+                    .map_err(|err| RpcError::internal(format!("searching {ws}: {err}")))?;
+                if hits.is_empty() {
+                    continue;
+                }
+                let users = archive.user_display_map(ws).unwrap_or_default();
+                let ch_names = archive.channel_names(ws).unwrap_or_default();
+                for msg in &hits {
+                    if let Some(cutoff) = cutoff_secs
+                        && msg.message.ts.secs().is_none_or(|s| s < cutoff)
+                    {
+                        continue;
+                    }
+                    let ch_label = ch_names
+                        .get(msg.channel.as_str())
+                        .map(String::as_str)
+                        .unwrap_or(msg.channel.as_str());
+                    context.push_str(&format!(
+                        "[{}] {}",
+                        ws.as_str(),
+                        format_prompt_message(msg, &users, Some(ch_label))
+                    ));
+                    collected += 1;
+                    if collected >= 50 {
+                        break;
+                    }
+                }
+                if collected >= 50 {
+                    break;
+                }
+            }
+        }
+
+        if collected == 0 {
+            context.push_str("_No matching archived messages found._\n");
+        }
+
+        let bounded = bound_prompt_context(&context, MAX_PROMPT_CONTEXT_CHARS);
+        let text = format!(
+            "Analyze the Slack messages below and extract every concrete or tentative decision.\n\
+             For each decision, provide:\n\
+             - **Decision:** concise statement\n\
+             - **Status:** Decided / Tentative / Deferred\n\
+             - **Owner / Approver:** who decided or owns execution\n\
+             - **Rationale & Citation:** brief reason plus channel and `ts`\n\
+             - **Open Questions:** any unresolved caveats\n\n\
+             {bounded}"
+        );
+
+        Ok(prompt_result(
+            "Extract decisions, owners, rationale, and open questions from archived Slack context.",
+            text,
+        ))
+    }
+
+    fn prompt_search_transcripts(
+        &self,
+        args: &Map<String, Value>,
+    ) -> std::result::Result<Value, RpcError> {
+        let query = prompt_req_str(args, "query")?;
+        let workspace_arg = prompt_opt_workspace(args)?;
+
+        let (_, workspaces) = self
+            .resolve_scope_workspaces(workspace_arg.as_deref(), None)
+            .map_err(|(_, msg)| RpcError::invalid_params(msg))?;
+
+        let parsed = SearchQuery::parse(&query);
+        let mut context = format!("## Transcript Matches for `{query}`\n\n");
+        let mut file_hits = 0usize;
+        let mut huddle_hits = 0usize;
+
+        context.push_str("### Audio/Video File Transcripts\n");
+        for ws in &workspaces {
+            let Some(archive) = self.open_archive(ws).map_err(RpcError::internal)? else {
+                continue;
+            };
+            let matches = archive
+                .store()
+                .search_file_transcripts(Some(ws), &parsed, 15)
+                .map_err(|err| RpcError::internal(format!("searching file transcripts: {err}")))?;
+            for entry in matches {
+                let dur = transcript_duration_secs(&entry.transcript.cues)
+                    .map(|d| format!(" · {d:.0}s"))
+                    .unwrap_or_default();
+                let ch_part = entry
+                    .channel
+                    .as_ref()
+                    .map(|c| format!(" · channel `{}`", c.as_str()))
+                    .unwrap_or_default();
+                let body = collapse_excerpt(&entry.transcript.text, 800);
+                context.push_str(&format!(
+                    "- [{}] file `{}` (`{}`{dur}{ch_part}): {body}\n",
+                    ws.as_str(),
+                    entry.transcript.file_id.as_str(),
+                    entry.transcript.source
+                ));
+                file_hits += 1;
+                if file_hits >= 15 {
+                    break;
+                }
+            }
+            if file_hits >= 15 {
+                break;
+            }
+        }
+        if file_hits == 0 {
+            context.push_str("_No matching audio/video file transcripts._\n");
+        }
+
+        context.push_str("\n### Huddle Transcripts\n");
+        for ws in &workspaces {
+            let Some(archive) = self.open_archive(ws).map_err(RpcError::internal)? else {
+                continue;
+            };
+            let users = archive.user_display_map(ws).unwrap_or_default();
+            let ch_names = archive.channel_names(ws).unwrap_or_default();
+            let segments = archive
+                .store()
+                .search_huddle_transcripts(ws, &query, None, None, 25)
+                .map_err(|err| {
+                    RpcError::internal(format!("searching huddle transcripts: {err}"))
+                })?;
+            for seg in segments {
+                let ch = ch_names
+                    .get(seg.channel.as_str())
+                    .map(String::as_str)
+                    .unwrap_or(seg.channel.as_str());
+                let speaker = seg
+                    .speaker_id
+                    .as_ref()
+                    .and_then(|u| users.get(u).map(String::as_str))
+                    .or_else(|| seg.speaker_id.as_ref().map(|u| u.as_str()))
+                    .unwrap_or("Speaker");
+                let stamp = format_utc_timestamp(seg.at_ms.div_euclid(1_000));
+                context.push_str(&format!(
+                    "- [{}] huddle `{}` in {} ({stamp}) **{speaker}**: {}\n",
+                    ws.as_str(),
+                    seg.call_id,
+                    ch,
+                    seg.text
+                ));
+                huddle_hits += 1;
+                if huddle_hits >= 25 {
+                    break;
+                }
+            }
+            if huddle_hits >= 25 {
+                break;
+            }
+        }
+        if huddle_hits == 0 {
+            context.push_str("_No matching huddle transcript segments._\n");
+        }
+
+        let bounded = bound_prompt_context(&context, MAX_PROMPT_CONTEXT_CHARS);
+        let text = format!(
+            "Synthesize what was said about `{query}` across the stored audio/video clip and huddle transcripts below.\n\
+             Cite specific `file_id`s or huddle `call_id`s, speakers, and timestamps, and note any action items or open questions.\n\n\
+             {bounded}"
+        );
+
+        Ok(prompt_result(
+            "Search and synthesize audio/video and huddle transcripts for a topic.",
+            text,
+        ))
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1398,13 +3152,20 @@ fn handle_initialize(params: &Map<String, Value>) -> Value {
         "capabilities": {
             "tools": {
                 "listChanged": false
+            },
+            "resources": {
+                "subscribe": false,
+                "listChanged": false
+            },
+            "prompts": {
+                "listChanged": false
             }
         },
         "serverInfo": {
             "name": "slackless",
             "version": CLI_VERSION
         },
-        "instructions": "Query local Slack SQLite archives offline (workspaces, channels, FTS5 search including audio/video file transcripts, channel history, threads, transcripts) and perform live Slack writes (send, reply, react) using stored slackless sessions."
+        "instructions": "Query local Slack SQLite archives offline (workspaces, channels, FTS5 search including audio/video file transcripts, channel history, threads, transcripts, Markdown/JSON exports, and catch-up digests), read MCP resources (`slackless://...`), invoke built-in prompts (`catch_up`, `summarize_thread`, `summarize_channel`, `find_decisions`, `search_transcripts`), and perform live Slack writes (send, reply, react) using stored slackless sessions."
     })
 }
 
@@ -1637,6 +3398,322 @@ fn opt_usize(
     }
 }
 
+fn opt_non_empty_str(
+    args: &Map<String, Value>,
+    key: &str,
+) -> std::result::Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Err(format!("`{key}` must be a non-empty string when provided"))
+            } else {
+                Ok(Some(trimmed.to_owned()))
+            }
+        }
+        Some(_) => Err(format!("`{key}` must be a string")),
+    }
+}
+
+fn prompt_req_str(args: &Map<String, Value>, key: &str) -> std::result::Result<String, RpcError> {
+    req_str(args, key).map_err(RpcError::invalid_params)
+}
+
+fn prompt_opt_str(
+    args: &Map<String, Value>,
+    key: &str,
+) -> std::result::Result<Option<String>, RpcError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_owned()))
+            }
+        }
+        Some(_) => Err(RpcError::invalid_params(format!(
+            "`{key}` must be a string"
+        ))),
+    }
+}
+
+fn prompt_opt_workspace(
+    args: &Map<String, Value>,
+) -> std::result::Result<Option<String>, RpcError> {
+    opt_workspace(args).map_err(RpcError::invalid_params)
+}
+
+fn prompt_opt_usize(
+    args: &Map<String, Value>,
+    key: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> std::result::Result<usize, RpcError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Number(n)) => {
+            let Some(val) = n.as_u64() else {
+                return Err(RpcError::invalid_params(format!(
+                    "`{key}` must be a positive integer"
+                )));
+            };
+            Ok(usize::try_from(val).unwrap_or(max).clamp(min, max))
+        }
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(default);
+            }
+            let val: u64 = trimmed.parse().map_err(|_| {
+                RpcError::invalid_params(format!("`{key}` must be a positive integer"))
+            })?;
+            Ok(usize::try_from(val).unwrap_or(max).clamp(min, max))
+        }
+        Some(_) => Err(RpcError::invalid_params(format!(
+            "`{key}` must be a positive integer"
+        ))),
+    }
+}
+
+fn file_transcript_payload(workspace: &TeamId, transcript: &StoredFileTranscript) -> Value {
+    let duration_secs = transcript_duration_secs(&transcript.cues);
+    json!({
+        "workspace": workspace.as_str(),
+        "file_id": transcript.file_id.as_str(),
+        "source": transcript.source,
+        "text": transcript.text,
+        "updated_at": transcript.updated_at,
+        "cue_count": transcript.cues.len(),
+        "duration_secs": duration_secs,
+        "cues": transcript.cues,
+    })
+}
+
+fn transcript_duration_secs(cues: &[TranscriptCue]) -> Option<f64> {
+    let mut max_secs: Option<f64> = None;
+    for cue in cues {
+        let candidate = if cue.end_secs.is_finite() && cue.end_secs >= 0.0 {
+            Some(cue.end_secs)
+        } else if cue.start_secs.is_finite() && cue.start_secs >= 0.0 {
+            Some(cue.start_secs)
+        } else {
+            None
+        };
+        if let Some(secs) = candidate {
+            max_secs = Some(max_secs.map_or(secs, |prev| prev.max(secs)));
+        }
+    }
+    max_secs
+}
+
+fn collapse_excerpt(text: &str, max_chars: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if max_chars == 0 {
+        return String::new();
+    }
+    if collapsed.chars().count() > max_chars {
+        let mut out: String = collapsed
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect();
+        out.push('…');
+        out
+    } else {
+        collapsed
+    }
+}
+
+fn bound_prompt_context(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let suffix = "\n\n... [context truncated to stay within prompt budget]";
+    let keep = max_chars.saturating_sub(suffix.chars().count());
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str(suffix);
+    out
+}
+
+fn format_prompt_message(
+    stored: &StoredMessage,
+    user_names: &HashMap<slackless_core::types::UserId, String>,
+    channel_label: Option<&str>,
+) -> String {
+    let msg = &stored.message;
+    let author = msg
+        .user
+        .as_ref()
+        .and_then(|u| user_names.get(u).map(String::as_str))
+        .or_else(|| msg.bot_profile.as_ref().map(|b| b.name.as_str()))
+        .or(msg.username.as_deref())
+        .or_else(|| msg.user.as_ref().map(|u| u.as_str()))
+        .or_else(|| msg.bot_id.as_ref().map(|b| b.as_str()))
+        .unwrap_or("unknown");
+    let stamp = msg
+        .ts
+        .secs()
+        .map(format_utc_timestamp)
+        .unwrap_or_else(|| msg.ts.as_str().to_owned());
+    let ch_prefix = channel_label
+        .map(|label| format!("{label} · "))
+        .unwrap_or_default();
+    let plain = mrkdwn_to_plain(&msg.text);
+    let body = if plain.trim().is_empty() {
+        collapse_excerpt(&msg.text, 600)
+    } else {
+        collapse_excerpt(&plain, 600)
+    };
+    let replies = msg
+        .reply_count
+        .filter(|&n| n > 0)
+        .map(|n| format!(" ({n} replies)"))
+        .unwrap_or_default();
+    let files = if msg.files.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<&str> = msg
+            .files
+            .iter()
+            .map(|f| {
+                f.name
+                    .as_deref()
+                    .or(f.title.as_deref())
+                    .unwrap_or(f.id.as_str())
+            })
+            .collect();
+        format!(" [files: {}]", names.join(", "))
+    };
+    format!(
+        "- {ch_prefix}**{author}** ({stamp} · `{}`){replies}: {body}{files}\n",
+        msg.ts.as_str()
+    )
+}
+
+fn prompt_result(description: &str, text: String) -> Value {
+    json!({
+        "description": description,
+        "messages": [
+            {
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": text,
+                }
+            }
+        ]
+    })
+}
+
+fn percent_decode_segment(raw: &str) -> std::result::Result<String, String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err(format!("invalid percent-encoding in URI segment '{raw}'"));
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            match (hi, lo) {
+                (Some(h), Some(l)) => {
+                    out.push(((h << 4) | l) as u8);
+                    i += 3;
+                }
+                _ => {
+                    return Err(format!("invalid percent-encoding in URI segment '{raw}'"));
+                }
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let decoded =
+        String::from_utf8(out).map_err(|_| format!("invalid UTF-8 in URI segment '{raw}'"))?;
+    if decoded.is_empty()
+        || decoded.contains('/')
+        || decoded.contains('\\')
+        || decoded.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
+        return Err(format!("unsafe or empty URI segment '{raw}'"));
+    }
+    Ok(decoded)
+}
+
+fn parse_resource_uri(uri: &str) -> std::result::Result<ResourceUri, RpcError> {
+    if uri.bytes().any(|b| b < 0x20 || b == 0x7f) || uri.contains('\\') {
+        return Err(RpcError::invalid_params(format!(
+            "invalid resource URI '{uri}'"
+        )));
+    }
+    let Some(rest) = uri.strip_prefix("slackless://") else {
+        return Err(RpcError::invalid_params(format!(
+            "unsupported URI scheme in '{uri}': expected slackless://"
+        )));
+    };
+    if rest.contains('?') || rest.contains('#') {
+        return Err(RpcError::invalid_params(format!(
+            "unexpected query or fragment in resource URI '{uri}'"
+        )));
+    }
+    if rest == "workspaces" {
+        return Ok(ResourceUri::Workspaces);
+    }
+
+    let segments: Vec<&str> = rest.split('/').collect();
+    if segments
+        .iter()
+        .any(|s| s.is_empty() || *s == "." || *s == "..")
+    {
+        return Err(RpcError::invalid_params(format!(
+            "invalid path segment in resource URI '{uri}'"
+        )));
+    }
+
+    match segments.as_slice() {
+        ["workspace", ws_raw, "channels"] => {
+            let ws = validate_workspace_id(ws_raw).map_err(RpcError::invalid_params)?;
+            Ok(ResourceUri::WorkspaceChannels {
+                workspace: TeamId::from(ws),
+            })
+        }
+        ["workspace", ws_raw, "channel", ch_raw] => {
+            let ws = validate_workspace_id(ws_raw).map_err(RpcError::invalid_params)?;
+            let channel = percent_decode_segment(ch_raw).map_err(RpcError::invalid_params)?;
+            Ok(ResourceUri::Channel {
+                workspace: TeamId::from(ws),
+                channel,
+            })
+        }
+        ["workspace", ws_raw, "thread", ch_raw, ts_raw] => {
+            let ws = validate_workspace_id(ws_raw).map_err(RpcError::invalid_params)?;
+            let channel = percent_decode_segment(ch_raw).map_err(RpcError::invalid_params)?;
+            let ts = percent_decode_segment(ts_raw).map_err(RpcError::invalid_params)?;
+            Ok(ResourceUri::Thread {
+                workspace: TeamId::from(ws),
+                channel,
+                thread_ts: Ts::from(ts),
+            })
+        }
+        ["workspace", ws_raw, "transcript", file_raw] => {
+            let ws = validate_workspace_id(ws_raw).map_err(RpcError::invalid_params)?;
+            let file_id = percent_decode_segment(file_raw).map_err(RpcError::invalid_params)?;
+            Ok(ResourceUri::Transcript {
+                workspace: TeamId::from(ws),
+                file_id: FileId::from(file_id),
+            })
+        }
+        _ => Err(RpcError::invalid_params(format!(
+            "unknown or malformed resource URI '{uri}'"
+        ))),
+    }
+}
+
 fn tool_definitions() -> Value {
     json!([
         {
@@ -1820,7 +3897,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "get_transcript",
-            "description": "Fetch a stored audio/video file transcript from the local SQLite archive by Slack `file_id`.",
+            "description": "Fetch a stored audio/video file transcript (including timed cues and duration when available) from the local SQLite archive by Slack `file_id`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1834,6 +3911,141 @@ fn tool_definitions() -> Value {
                     }
                 },
                 "required": ["file_id"]
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "list_transcripts",
+            "description": "List stored audio/video file transcripts and huddle transcript sessions for one or all workspaces with excerpts, durations, and timed cue counts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Optional workspace team ID."
+                    },
+                    "all_workspaces": {
+                        "type": "boolean",
+                        "description": "List transcripts across every locally archived workspace."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["all", "file", "huddle"],
+                        "description": "Transcript kinds to return (default: \"all\")."
+                    },
+                    "channel": {
+                        "type": "string",
+                        "description": "Optional channel ID, #name, or @handle to filter transcripts."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "Maximum transcripts to return (default: 50)."
+                    }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "export_conversation",
+            "description": "Export a locally archived channel, thread, audio/video file transcript, or huddle transcript as Markdown or JSON returned directly as tool content (no filesystem writes).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Optional workspace team ID."
+                    },
+                    "channel": {
+                        "type": "string",
+                        "description": "Channel ID, #name, or @handle (for channel or thread export)."
+                    },
+                    "thread_ts": {
+                        "type": "string",
+                        "description": "Optional thread root `ts` (requires `channel`) to export a single thread."
+                    },
+                    "file_id": {
+                        "type": "string",
+                        "description": "Slack file ID to export a stored audio/video transcript (mutually exclusive with `channel` and `huddle_id`)."
+                    },
+                    "huddle_id": {
+                        "type": "string",
+                        "description": "Huddle call ID to export a stored huddle transcript (mutually exclusive with `channel` and `file_id`)."
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["md", "json"],
+                        "description": "Output format: \"md\" (Markdown, default) or \"json\"."
+                    },
+                    "include_threads": {
+                        "type": "boolean",
+                        "description": "When exporting a channel, nest stored thread replies under thread roots (default: false)."
+                    },
+                    "include_deleted": {
+                        "type": "boolean",
+                        "description": "Include locally preserved deleted message tombstones (default: false)."
+                    },
+                    "include_transcripts": {
+                        "type": "boolean",
+                        "description": "Include stored/inline audio/video transcripts attached to exported messages (default: true)."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5000,
+                        "description": "Maximum top-level channel messages to export (default: 500)."
+                    }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "get_catchup_summary",
+            "description": "Build a local SQLite catch-up digest of recent activity (unread/recent channels, direct mentions, active threads, and new transcripts) over a `since_hours` window across one or all workspaces.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Optional workspace team ID."
+                    },
+                    "all_workspaces": {
+                        "type": "boolean",
+                        "description": "Aggregate catch-up activity across every locally archived workspace."
+                    },
+                    "since_hours": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 720,
+                        "description": "Lookback window in hours (default: 24, max: 720)."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Maximum items per section (channels, mentions, active_threads, new_transcripts; default: 20)."
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Optional Slack user ID (e.g. U0123ABC) to detect direct `<@USER>` mentions for. Defaults to the signed-in session's user ID per workspace."
+                    }
+                }
             },
             "annotations": {
                 "readOnlyHint": true,
@@ -1945,6 +4157,161 @@ fn tool_definitions() -> Value {
                 "idempotentHint": true,
                 "openWorldHint": true
             }
+        }
+    ])
+}
+
+fn resource_definitions() -> Value {
+    json!([
+        {
+            "uri": "slackless://workspaces",
+            "name": "workspaces",
+            "title": "Slack Workspaces",
+            "description": "All stored Slack workspaces (signed-in sessions and local SQLite archives) with message counts.",
+            "mimeType": "application/json"
+        }
+    ])
+}
+
+fn resource_template_definitions() -> Value {
+    json!([
+        {
+            "uriTemplate": "slackless://workspace/{workspace}/channels",
+            "name": "workspace_channels",
+            "title": "Workspace Channels & DMs",
+            "description": "Channels and direct messages archived locally for a workspace.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": "slackless://workspace/{workspace}/channel/{channel}",
+            "name": "channel_messages",
+            "title": "Channel Recent Messages",
+            "description": "Recent locally archived messages from a channel or DM (accepts channel ID, name, or @handle).",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": "slackless://workspace/{workspace}/thread/{channel}/{ts}",
+            "name": "thread_messages",
+            "title": "Thread Conversation",
+            "description": "Root message and replies for a thread from the local SQLite archive.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": "slackless://workspace/{workspace}/transcript/{file_id}",
+            "name": "file_transcript",
+            "title": "Audio/Video File Transcript",
+            "description": "Stored audio/video file transcript and timed cues from the local SQLite archive.",
+            "mimeType": "application/json"
+        }
+    ])
+}
+
+fn prompt_definitions() -> Value {
+    json!([
+        {
+            "name": "catch_up",
+            "description": "Summarize recent Slack activity, direct mentions, active threads, and new transcripts over a lookback window.",
+            "arguments": [
+                {
+                    "name": "workspace",
+                    "description": "Optional workspace team ID (defaults to default workspace or all workspaces).",
+                    "required": false
+                },
+                {
+                    "name": "since_hours",
+                    "description": "Lookback window in hours (default: 24, max: 720).",
+                    "required": false
+                }
+            ]
+        },
+        {
+            "name": "summarize_thread",
+            "description": "Summarize a Slack thread with key takeaways, decisions, action items, and open questions.",
+            "arguments": [
+                {
+                    "name": "channel",
+                    "description": "Channel ID, #name, or @handle.",
+                    "required": true
+                },
+                {
+                    "name": "thread_ts",
+                    "description": "Timestamp (`ts`) of the thread root message.",
+                    "required": true
+                },
+                {
+                    "name": "workspace",
+                    "description": "Optional workspace team ID.",
+                    "required": false
+                }
+            ]
+        },
+        {
+            "name": "summarize_channel",
+            "description": "Summarize recent discussions, themes, and blockers in a Slack channel or DM.",
+            "arguments": [
+                {
+                    "name": "channel",
+                    "description": "Channel ID, #name, or @handle.",
+                    "required": true
+                },
+                {
+                    "name": "since",
+                    "description": "Optional lookback cutoff (e.g. \"24h\", \"7d\", \"YYYY-MM-DD\", or unix epoch seconds).",
+                    "required": false
+                },
+                {
+                    "name": "limit",
+                    "description": "Maximum messages to include (default: 50, max: 100).",
+                    "required": false
+                },
+                {
+                    "name": "workspace",
+                    "description": "Optional workspace team ID.",
+                    "required": false
+                }
+            ]
+        },
+        {
+            "name": "find_decisions",
+            "description": "Extract concrete or tentative decisions, owners, rationale, and open questions from a channel or query.",
+            "arguments": [
+                {
+                    "name": "channel",
+                    "description": "Optional channel ID, #name, or @handle to focus on.",
+                    "required": false
+                },
+                {
+                    "name": "query",
+                    "description": "Optional topic keywords or Slack search modifiers.",
+                    "required": false
+                },
+                {
+                    "name": "since",
+                    "description": "Optional lower time bound (e.g. \"7d\", \"2026-01-01\").",
+                    "required": false
+                },
+                {
+                    "name": "workspace",
+                    "description": "Optional workspace team ID.",
+                    "required": false
+                }
+            ]
+        },
+        {
+            "name": "search_transcripts",
+            "description": "Search and synthesize stored audio/video file transcripts and huddle transcripts for a topic.",
+            "arguments": [
+                {
+                    "name": "query",
+                    "description": "Keywords or topic to search across stored audio/video and huddle transcripts.",
+                    "required": true
+                },
+                {
+                    "name": "workspace",
+                    "description": "Optional workspace team ID.",
+                    "required": false
+                }
+            ]
         }
     ])
 }
@@ -2260,6 +4627,8 @@ mod tests {
         assert_eq!(lines[0]["result"]["protocolVersion"], "2024-11-05");
         assert_eq!(lines[0]["result"]["serverInfo"]["name"], "slackless");
         assert!(lines[0]["result"]["capabilities"]["tools"].is_object());
+        assert!(lines[0]["result"]["capabilities"]["resources"].is_object());
+        assert!(lines[0]["result"]["capabilities"]["prompts"].is_object());
 
         // 2. ping
         assert_eq!(lines[1]["id"], 2);
@@ -2278,6 +4647,9 @@ mod tests {
                 "read_channel",
                 "read_thread",
                 "get_transcript",
+                "list_transcripts",
+                "export_conversation",
+                "get_catchup_summary",
                 "send_message",
                 "reply_thread",
                 "add_reaction",
@@ -2389,7 +4761,7 @@ mod tests {
 
         // Method not found (-32601).
         let r = server
-            .handle_line(r#"{"jsonrpc":"2.0","id":"abc","method":"resources/list"}"#)
+            .handle_line(r#"{"jsonrpc":"2.0","id":"abc","method":"unknown/method"}"#)
             .await
             .expect("method not found response");
         assert_eq!(r["error"]["code"], ERR_METHOD_NOT_FOUND);
@@ -2745,6 +5117,9 @@ mod tests {
             json!({"name": "read_channel", "arguments": {"channel": "#eng", "workspace": "../../etc"}}),
             json!({"name": "read_thread", "arguments": {"channel": "#eng", "thread_ts": "1.0", "workspace": "../secret_outside"}}),
             json!({"name": "get_transcript", "arguments": {"file_id": "F_SECRET", "workspace": "../secret_outside"}}),
+            json!({"name": "list_transcripts", "arguments": {"workspace": "../secret_outside"}}),
+            json!({"name": "export_conversation", "arguments": {"channel": "#eng", "workspace": "../secret_outside"}}),
+            json!({"name": "get_catchup_summary", "arguments": {"workspace": "../secret_outside"}}),
             json!({"name": "send_message", "arguments": {"channel": "#eng", "text": "hi", "workspace": "../secret_outside"}}),
             json!({"name": "reply_thread", "arguments": {"channel": "#eng", "thread_ts": "1.0", "text": "hi", "workspace": r"T1\..\T2"}}),
             json!({"name": "add_reaction", "arguments": {"channel": "#eng", "ts": "1.0", "emoji": "tada", "workspace": "/tmp/foo"}}),
@@ -2870,5 +5245,924 @@ mod tests {
             .filter_map(|m| m["workspace"].as_str())
             .collect();
         assert_eq!(ws_order, vec!["T1", "T2", "T1", "T2"]);
+    }
+
+    #[tokio::test]
+    async fn v2_export_conversation_and_list_transcripts_over_stdio() {
+        use slackless_core::store::NewHuddleTranscriptSegment;
+
+        let dir = TempDir::new("v2-export-transcripts");
+        seed_multi_workspace_stores(&dir);
+
+        // Enrich T1 with timed file cues and a huddle transcript session; add a file transcript in T2.
+        {
+            let t1 = TeamId::from("T1");
+            let mut s1 = Store::open(dir.path().join("T1.sqlite")).expect("open T1");
+            let cues = vec![
+                TranscriptCue {
+                    start_secs: 0.0,
+                    end_secs: 4.5,
+                    text: "Zero downtime canary migration".into(),
+                },
+                TranscriptCue {
+                    start_secs: 4.5,
+                    end_secs: 12.25,
+                    text: "succeeded across eu-north.".into(),
+                },
+            ];
+            s1.upsert_file_transcript_with_cues(
+                &t1,
+                &FileId::from("F_CLIP1"),
+                "parakeet-v3",
+                "Zero downtime canary migration succeeded across eu-north.",
+                &cues,
+            )
+            .expect("upsert timed file transcript");
+
+            s1.insert_huddle_transcript_segment(
+                &t1,
+                &NewHuddleTranscriptSegment {
+                    channel: &ChannelId::from("C_ENG"),
+                    call_id: "R_HUDDLE1",
+                    thread_root_ts: Some(&Ts::from("1700000200.000100")),
+                    speaker_id: Some(&UserId::from("U1")),
+                    lang: Some("en-US"),
+                    source: "chime",
+                    text: "Let us finalize the rollout checklist.",
+                    at_ms: 1_700_000_600_000,
+                },
+            )
+            .expect("insert huddle seg 1");
+            s1.insert_huddle_transcript_segment(
+                &t1,
+                &NewHuddleTranscriptSegment {
+                    channel: &ChannelId::from("C_ENG"),
+                    call_id: "R_HUDDLE1",
+                    thread_root_ts: Some(&Ts::from("1700000200.000100")),
+                    speaker_id: Some(&UserId::from("U2")),
+                    lang: Some("sv-SE"),
+                    source: "chime",
+                    text: "Vi skeppar i eftermiddag.",
+                    at_ms: 1_700_000_645_500,
+                },
+            )
+            .expect("insert huddle seg 2");
+        }
+        {
+            let t2 = TeamId::from("T2");
+            let mut s2 = Store::open(dir.path().join("T2.sqlite")).expect("open T2");
+            s2.upsert_file_transcript(
+                &t2,
+                &FileId::from("F_T2"),
+                "whisper-local",
+                "Secondary workspace ops walkthrough.",
+            )
+            .expect("upsert T2 transcript");
+        }
+
+        let sessions = vec![Session::new(
+            "https://acme.slack.com/",
+            "T1",
+            "xoxc-test",
+            "xoxd-test",
+            "U1",
+        )];
+        let mut server = McpServer::for_test(dir.path().to_path_buf(), sessions, None);
+
+        let requests = [
+            // 1. export channel Markdown with nested thread replies, excluding deleted
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "export_conversation",
+                    "arguments": {
+                        "channel": "#eng",
+                        "format": "md",
+                        "include_threads": true,
+                        "include_deleted": false,
+                        "limit": 10
+                    }
+                }
+            }),
+            // 2. export channel JSON with deleted included
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "export_conversation",
+                    "arguments": {
+                        "channel": "C_ENG",
+                        "format": "json",
+                        "include_deleted": true
+                    }
+                }
+            }),
+            // 3. export thread Markdown
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "export_conversation",
+                    "arguments": {
+                        "channel": "#eng",
+                        "thread_ts": "1700000200.000100",
+                        "format": "md"
+                    }
+                }
+            }),
+            // 4. export file transcript JSON (cross-workspace lookup for T2's F_T2)
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "export_conversation",
+                    "arguments": {
+                        "file_id": "F_T2",
+                        "format": "json"
+                    }
+                }
+            }),
+            // 5. export huddle transcript Markdown
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "export_conversation",
+                    "arguments": {
+                        "huddle_id": "R_HUDDLE1",
+                        "format": "md"
+                    }
+                }
+            }),
+            // 6. list_transcripts across all workspaces
+            json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_transcripts",
+                    "arguments": { "all_workspaces": true }
+                }
+            }),
+            // 7. list_transcripts filtered to kind="huddle" and channel="#eng"
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_transcripts",
+                    "arguments": { "workspace": "T1", "kind": "huddle", "channel": "#eng" }
+                }
+            }),
+            // 8. export error: thread_ts without channel
+            json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "export_conversation",
+                    "arguments": { "thread_ts": "1700000200.000100" }
+                }
+            }),
+            // 9. export error: mutually exclusive targets
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "export_conversation",
+                    "arguments": { "channel": "#eng", "file_id": "F_CLIP1" }
+                }
+            }),
+            // 10. export error: missing huddle_id
+            json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "export_conversation",
+                    "arguments": { "huddle_id": "R_MISSING" }
+                }
+            }),
+        ];
+
+        let mut input = String::new();
+        for req in &requests {
+            input.push_str(&serde_json::to_string(req).expect("serialize req"));
+            input.push('\n');
+        }
+        let mut output = Vec::new();
+        server
+            .serve_io(Cursor::new(input), &mut output)
+            .await
+            .expect("serve_io");
+        let lines: Vec<Value> = String::from_utf8(output)
+            .expect("utf8")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json line"))
+            .collect();
+        assert_eq!(lines.len(), 10);
+
+        // 1. channel Markdown export includes thread replies and file transcript, excludes deleted
+        let (err, p) = parse_tool_payload(&lines[0]);
+        assert!(!err, "unexpected error: {p}");
+        assert_eq!(p["target"], "channel");
+        assert_eq!(p["format"], "md");
+        assert_eq!(p["item_count"], 2);
+        let md = p["content"].as_str().expect("md content");
+        assert!(md.contains("# #eng"));
+        assert!(md.contains("Thread replies (1)"));
+        assert!(md.contains("Looks solid, shipping today"));
+        assert!(md.contains("eu-north"));
+        assert!(!md.contains("Temporary scratch note"));
+
+        // 2. channel JSON export with include_deleted=true includes tombstone
+        let (err, p) = parse_tool_payload(&lines[1]);
+        assert!(!err);
+        assert_eq!(p["format"], "json");
+        assert_eq!(p["item_count"], 3);
+        let exported_doc: Value =
+            serde_json::from_str(p["content"].as_str().expect("json content"))
+                .expect("valid exported json");
+        assert_eq!(exported_doc["kind"], "channel");
+        assert_eq!(exported_doc["count"], 3);
+
+        // 3. thread Markdown export
+        let (err, p) = parse_tool_payload(&lines[2]);
+        assert!(!err);
+        assert_eq!(p["target"], "thread");
+        assert_eq!(p["item_count"], 2);
+        let md = p["content"].as_str().expect("thread md");
+        assert!(md.contains("Thread in #eng"));
+        assert!(md.contains("Looks solid, shipping today"));
+
+        // 4. file transcript JSON export across workspaces
+        let (err, p) = parse_tool_payload(&lines[3]);
+        assert!(!err);
+        assert_eq!(p["workspace"], "T2");
+        assert_eq!(p["target"], "file_transcript");
+        assert_eq!(p["file_id"], "F_T2");
+        let exported_doc: Value =
+            serde_json::from_str(p["content"].as_str().expect("file json")).expect("valid json");
+        assert_eq!(exported_doc["kind"], "file_transcript");
+        assert!(
+            exported_doc["text"]
+                .as_str()
+                .expect("text")
+                .contains("walkthrough")
+        );
+
+        // 5. huddle transcript Markdown export
+        let (err, p) = parse_tool_payload(&lines[4]);
+        assert!(!err);
+        assert_eq!(p["target"], "huddle_transcript");
+        assert_eq!(p["item_count"], 2);
+        let md = p["content"].as_str().expect("huddle md");
+        assert!(md.contains("Huddle Transcript"));
+        assert!(md.contains("Ana"));
+        assert!(md.contains("Bob"));
+        assert!(md.contains("Vi skeppar i eftermiddag."));
+
+        // 6. list_transcripts across all workspaces returns 2 files + 1 huddle
+        let (err, p) = parse_tool_payload(&lines[5]);
+        assert!(!err);
+        assert_eq!(p["all_workspaces"], true);
+        assert_eq!(p["count"], 3);
+        assert_eq!(p["file_count"], 2);
+        assert_eq!(p["huddle_count"], 1);
+        let items = p["transcripts"].as_array().expect("transcripts array");
+        let f_clip = items
+            .iter()
+            .find(|t| t["id"] == "F_CLIP1")
+            .expect("F_CLIP1 entry");
+        assert_eq!(f_clip["cue_count"], 2);
+        assert_eq!(f_clip["duration_secs"], 12.25);
+        assert_eq!(f_clip["uri"], "slackless://workspace/T1/transcript/F_CLIP1");
+        let huddle = items
+            .iter()
+            .find(|t| t["id"] == "R_HUDDLE1")
+            .expect("R_HUDDLE1 entry");
+        assert_eq!(huddle["kind"], "huddle");
+        assert_eq!(huddle["cue_count"], 2);
+        assert_eq!(huddle["duration_secs"], 45.5);
+        assert_eq!(huddle["channel_name"], "#eng");
+        assert_eq!(huddle["languages"], json!(["en", "sv"]));
+
+        // 7. filtered huddle transcripts
+        let (err, p) = parse_tool_payload(&lines[6]);
+        assert!(!err);
+        assert_eq!(p["count"], 1);
+        assert_eq!(p["transcripts"][0]["id"], "R_HUDDLE1");
+
+        // 8-10. error handling
+        let (err, p) = parse_tool_payload(&lines[7]);
+        assert!(err);
+        assert_eq!(p["error"], "invalid_args");
+
+        let (err, p) = parse_tool_payload(&lines[8]);
+        assert!(err);
+        assert_eq!(p["error"], "invalid_args");
+
+        let (err, p) = parse_tool_payload(&lines[9]);
+        assert!(err);
+        assert_eq!(p["error"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn v2_get_catchup_summary_aggregates_windowed_activity() {
+        use slackless_core::store::NewHuddleTranscriptSegment;
+
+        let dir = TempDir::new("v2-catchup");
+        let now = now_epoch_secs();
+        let recent_1 = now - 600;
+        let recent_2 = now - 300;
+        let old_secs = now - (100 * 3_600);
+
+        let t1 = TeamId::from("T1");
+        let mut s1 = Store::open(dir.path().join("T1.sqlite")).expect("open T1");
+        s1.upsert_users(
+            &t1,
+            &[
+                User {
+                    id: UserId::from("U1"),
+                    name: "ana".into(),
+                    profile: Profile {
+                        display_name: Some("Ana".into()),
+                        ..Profile::default()
+                    },
+                    ..User::default()
+                },
+                User {
+                    id: UserId::from("U2"),
+                    name: "bob".into(),
+                    profile: Profile {
+                        display_name: Some("Bob".into()),
+                        ..Profile::default()
+                    },
+                    ..User::default()
+                },
+            ],
+        )
+        .expect("users");
+        s1.upsert_conversations(
+            &t1,
+            &[
+                Conversation {
+                    id: ChannelId::from("C_ENG"),
+                    name: Some("eng".into()),
+                    is_channel: true,
+                    is_member: true,
+                    unread_count_display: Some(2),
+                    last_read: Some(Ts::from(format!("{}.000000", now - 3_600))),
+                    ..Conversation::default()
+                },
+                Conversation {
+                    id: ChannelId::from("C_NOISE"),
+                    name: Some("noise".into()),
+                    is_channel: true,
+                    is_member: true,
+                    ..Conversation::default()
+                },
+            ],
+        )
+        .expect("convs");
+        s1.replace_prefs(
+            &t1,
+            &json!({
+                "all_notifications_prefs": json!({
+                    "channels": { "C_NOISE": { "muted": true } }
+                }).to_string()
+            }),
+        )
+        .expect("prefs");
+
+        // Recent mention + active thread root + reply, plus an old message outside window.
+        let thread_root_ts = format!("{recent_1}.000100");
+        let thread_reply_ts = format!("{recent_2}.000200");
+        s1.upsert_messages(
+            &t1,
+            &ChannelId::from("C_ENG"),
+            &[
+                Message {
+                    ts: Ts::from(format!("{old_secs}.000000")),
+                    user: Some(UserId::from("U2")),
+                    text: "Ancient message mentioning <@U1>".into(),
+                    ..Message::default()
+                },
+                Message {
+                    ts: Ts::from(thread_root_ts.clone()),
+                    user: Some(UserId::from("U2")),
+                    text: "Hey <@U1> can you review the release plan?".into(),
+                    reply_count: Some(1),
+                    latest_reply: Some(Ts::from(thread_reply_ts.clone())),
+                    ..Message::default()
+                },
+                Message {
+                    ts: Ts::from(thread_reply_ts),
+                    thread_ts: Some(Ts::from(thread_root_ts.clone())),
+                    user: Some(UserId::from("U1")),
+                    text: "Looking now!".into(),
+                    ..Message::default()
+                },
+            ],
+        )
+        .expect("upsert C_ENG");
+        s1.upsert_message(
+            &t1,
+            &ChannelId::from("C_NOISE"),
+            &Message {
+                ts: Ts::from(format!("{recent_1}.000000")),
+                user: Some(UserId::from("U2")),
+                text: "Muted alert ping".into(),
+                ..Message::default()
+            },
+        )
+        .expect("upsert C_NOISE");
+        s1.upsert_file_transcript(
+            &t1,
+            &FileId::from("F_NEW"),
+            "parakeet-v3",
+            "Fresh architecture review recording.",
+        )
+        .expect("file transcript");
+        s1.insert_huddle_transcript_segment(
+            &t1,
+            &NewHuddleTranscriptSegment {
+                channel: &ChannelId::from("C_ENG"),
+                call_id: "R_OLD",
+                thread_root_ts: None,
+                speaker_id: Some(&UserId::from("U2")),
+                lang: Some("en"),
+                source: "chime",
+                text: "Old huddle outside window",
+                at_ms: old_secs * 1_000,
+            },
+        )
+        .expect("old huddle");
+        s1.insert_huddle_transcript_segment(
+            &t1,
+            &NewHuddleTranscriptSegment {
+                channel: &ChannelId::from("C_ENG"),
+                call_id: "R_NEW",
+                thread_root_ts: None,
+                speaker_id: Some(&UserId::from("U2")),
+                lang: Some("en"),
+                source: "chime",
+                text: "New huddle inside window",
+                at_ms: recent_2 * 1_000,
+            },
+        )
+        .expect("new huddle");
+        drop(s1);
+
+        let sessions = vec![Session::new(
+            "https://acme.slack.com/",
+            "T1",
+            "xoxc-test",
+            "xoxd-test",
+            "U1",
+        )];
+        let mut server = McpServer::for_test(dir.path().to_path_buf(), sessions, None);
+
+        let resp = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_catchup_summary","arguments":{"since_hours":24}}}"#,
+            )
+            .await
+            .expect("catchup response");
+        let (is_err, p) = parse_tool_payload(&resp);
+        assert!(!is_err, "unexpected error: {p}");
+        assert_eq!(p["since_hours"], 24);
+        assert_eq!(p["totals"]["active_channels"], 2);
+        assert_eq!(p["totals"]["unread_channels"], 1);
+        assert_eq!(p["totals"]["mentions"], 1);
+        assert_eq!(p["totals"]["active_threads"], 1);
+        assert_eq!(p["totals"]["new_transcripts"], 2);
+
+        // Unread channel #eng sorts first; muted #noise is marked muted.
+        let channels = p["channels"].as_array().expect("channels");
+        assert_eq!(channels[0]["channel"], "C_ENG");
+        assert_eq!(channels[0]["is_unread"], true);
+        assert_eq!(channels[0]["unread_count"], 2);
+        assert_eq!(channels[1]["channel"], "C_NOISE");
+        assert_eq!(channels[1]["muted"], true);
+
+        // Mention excludes the 100h-old message.
+        let mentions = p["mentions"].as_array().expect("mentions");
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0]["ts"], thread_root_ts);
+        assert_eq!(mentions[0]["user_name"], "Bob");
+
+        // Active threads & new transcripts exclude old huddle R_OLD.
+        assert_eq!(p["active_threads"][0]["thread_ts"], thread_root_ts);
+        let tr_ids: Vec<&str> = p["new_transcripts"]
+            .as_array()
+            .expect("new_transcripts")
+            .iter()
+            .filter_map(|t| t["id"].as_str())
+            .collect();
+        assert!(tr_ids.contains(&"F_NEW"));
+        assert!(tr_ids.contains(&"R_NEW"));
+        assert!(!tr_ids.contains(&"R_OLD"));
+    }
+
+    #[tokio::test]
+    async fn v2_resources_list_templates_read_and_traversal_rejection() {
+        let parent = TempDir::new("v2-resources");
+        let archive_dir = parent.path().join("archives");
+        std::fs::create_dir_all(&archive_dir).expect("create archives dir");
+
+        // Seed T1 and T2 inside archive_dir.
+        let t1 = TeamId::from("T1");
+        let mut s1 = Store::open(archive_dir.join("T1.sqlite")).expect("open T1");
+        s1.upsert_users(
+            &t1,
+            &[User {
+                id: UserId::from("U1"),
+                name: "ana".into(),
+                profile: Profile {
+                    display_name: Some("Ana".into()),
+                    ..Profile::default()
+                },
+                ..User::default()
+            }],
+        )
+        .expect("users");
+        s1.upsert_conversations(
+            &t1,
+            &[Conversation {
+                id: ChannelId::from("C_ENG"),
+                name: Some("eng".into()),
+                is_channel: true,
+                is_member: true,
+                ..Conversation::default()
+            }],
+        )
+        .expect("convs");
+        s1.upsert_messages(
+            &t1,
+            &ChannelId::from("C_ENG"),
+            &[
+                Message {
+                    ts: Ts::from("1700000200.000100"),
+                    user: Some(UserId::from("U1")),
+                    text: "Root message".into(),
+                    reply_count: Some(1),
+                    ..Message::default()
+                },
+                Message {
+                    ts: Ts::from("1700000250.000200"),
+                    thread_ts: Some(Ts::from("1700000200.000100")),
+                    user: Some(UserId::from("U1")),
+                    text: "Thread reply".into(),
+                    ..Message::default()
+                },
+            ],
+        )
+        .expect("messages");
+        s1.upsert_file_transcript(
+            &t1,
+            &FileId::from("F_CLIP1"),
+            "parakeet-v3",
+            "Resource transcript body.",
+        )
+        .expect("transcript");
+        drop(s1);
+
+        // Place a secret archive OUTSIDE archive_dir to prove traversal URIs cannot reach it.
+        let outside_ws = TeamId::from("secret_outside");
+        let mut outside =
+            Store::open(parent.path().join("secret_outside.sqlite")).expect("outside");
+        outside
+            .upsert_file_transcript(
+                &outside_ws,
+                &FileId::from("F_SECRET"),
+                "local",
+                "do not leak",
+            )
+            .expect("outside transcript");
+        drop(outside);
+
+        let mut server = McpServer::for_test(archive_dir, Vec::new(), Some("T1".into()));
+
+        // resources/list
+        let r = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"resources/list"}"#)
+            .await
+            .expect("resources/list");
+        let resources = r["result"]["resources"]
+            .as_array()
+            .expect("resources array");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0]["uri"], "slackless://workspaces");
+
+        // resources/templates/list
+        let r = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"resources/templates/list"}"#)
+            .await
+            .expect("templates/list");
+        let templates: Vec<&str> = r["result"]["resourceTemplates"]
+            .as_array()
+            .expect("templates array")
+            .iter()
+            .filter_map(|t| t["uriTemplate"].as_str())
+            .collect();
+        assert_eq!(
+            templates,
+            vec![
+                "slackless://workspace/{workspace}/channels",
+                "slackless://workspace/{workspace}/channel/{channel}",
+                "slackless://workspace/{workspace}/thread/{channel}/{ts}",
+                "slackless://workspace/{workspace}/transcript/{file_id}",
+            ]
+        );
+
+        // resources/read: workspaces
+        let r = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"slackless://workspaces"}}"#)
+            .await
+            .expect("read workspaces");
+        let body: Value =
+            serde_json::from_str(r["result"]["contents"][0]["text"].as_str().expect("text"))
+                .expect("json");
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["workspaces"][0]["team_id"], "T1");
+
+        // resources/read: channels
+        let r = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"slackless://workspace/T1/channels"}}"#)
+            .await
+            .expect("read channels");
+        let body: Value =
+            serde_json::from_str(r["result"]["contents"][0]["text"].as_str().expect("text"))
+                .expect("json");
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["channels"][0]["id"], "C_ENG");
+
+        // resources/read: channel (both raw ID and percent-encoded #eng)
+        for uri in [
+            "slackless://workspace/T1/channel/C_ENG",
+            "slackless://workspace/T1/channel/%23eng",
+        ] {
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "resources/read",
+                "params": { "uri": uri }
+            });
+            let r = server
+                .handle_line(&serde_json::to_string(&req).expect("ser"))
+                .await
+                .expect("read channel");
+            let body: Value =
+                serde_json::from_str(r["result"]["contents"][0]["text"].as_str().expect("text"))
+                    .expect("json");
+            assert_eq!(body["channel"]["id"], "C_ENG");
+            assert_eq!(body["count"], 1);
+        }
+
+        // resources/read: thread
+        let r = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"slackless://workspace/T1/thread/C_ENG/1700000200.000100"}}"#)
+            .await
+            .expect("read thread");
+        let body: Value =
+            serde_json::from_str(r["result"]["contents"][0]["text"].as_str().expect("text"))
+                .expect("json");
+        assert_eq!(body["count"], 2);
+        assert_eq!(body["messages"][1]["text"], "Thread reply");
+
+        // resources/read: transcript
+        let r = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":"slackless://workspace/T1/transcript/F_CLIP1"}}"#)
+            .await
+            .expect("read transcript");
+        let body: Value =
+            serde_json::from_str(r["result"]["contents"][0]["text"].as_str().expect("text"))
+                .expect("json");
+        assert_eq!(body["file_id"], "F_CLIP1");
+        assert_eq!(body["text"], "Resource transcript body.");
+
+        // Missing transcript -> ERR_RESOURCE_NOT_FOUND (-32002)
+        let r = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":8,"method":"resources/read","params":{"uri":"slackless://workspace/T1/transcript/F_NOPE"}}"#)
+            .await
+            .expect("missing transcript");
+        assert_eq!(r["error"]["code"], ERR_RESOURCE_NOT_FOUND);
+
+        // Traversal and malformed URIs -> strictly ERR_INVALID_PARAMS (-32602)
+        for bad_uri in [
+            "slackless://workspace/../secret_outside/transcript/F_SECRET",
+            "slackless://workspace/..%2Fsecret_outside/transcript/F_SECRET",
+            "slackless://workspace/%2e%2e/channels",
+            "slackless://workspace/secret_outside.sqlite/channels",
+            r"slackless://workspace/T1\..\secret_outside/channels",
+            "slackless://workspace/T1/channel/foo%2Fbar",
+            "slackless://workspace/T1/channel/%ZZ",
+            "slackless://workspace/T1/channel/",
+            "slackless://workspace/T1/channels?foo=bar",
+            "slackless://workspace/T1/channels#frag",
+            "file:///etc/passwd",
+            "https://example.com/slackless",
+            "slackless://unknown/path",
+        ] {
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "resources/read",
+                "params": { "uri": bad_uri }
+            });
+            let r = server
+                .handle_line(&serde_json::to_string(&req).expect("ser"))
+                .await
+                .expect("bad uri response");
+            assert_eq!(
+                r["error"]["code"], ERR_INVALID_PARAMS,
+                "expected ERR_INVALID_PARAMS for URI {bad_uri:?}, got {r}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_prompts_list_get_and_context_bounding() {
+        use slackless_core::store::NewHuddleTranscriptSegment;
+
+        let dir = TempDir::new("v2-prompts");
+        seed_multi_workspace_stores(&dir);
+
+        // Add a decision message, a huddle transcript, and a huge channel to test prompt bounding.
+        {
+            let t1 = TeamId::from("T1");
+            let mut s1 = Store::open(dir.path().join("T1.sqlite")).expect("open T1");
+            s1.upsert_conversations(
+                &t1,
+                &[Conversation {
+                    id: ChannelId::from("C_HUGE"),
+                    name: Some("huge".into()),
+                    is_channel: true,
+                    is_member: true,
+                    ..Conversation::default()
+                }],
+            )
+            .expect("huge conv");
+            s1.upsert_message(
+                &t1,
+                &ChannelId::from("C_ENG"),
+                &Message {
+                    ts: Ts::from(format!("{}.000000", now_epoch_secs() - 120)),
+                    user: Some(UserId::from("U1")),
+                    text: "We decided to ship the eu-north canary on Friday.".into(),
+                    ..Message::default()
+                },
+            )
+            .expect("decision msg");
+            s1.insert_huddle_transcript_segment(
+                &t1,
+                &NewHuddleTranscriptSegment {
+                    channel: &ChannelId::from("C_ENG"),
+                    call_id: "R_PROMPT1",
+                    thread_root_ts: None,
+                    speaker_id: Some(&UserId::from("U2")),
+                    lang: Some("en"),
+                    source: "chime",
+                    text: "The eu-north failover drill passed in 14 seconds.",
+                    at_ms: (now_epoch_secs() - 60) * 1_000,
+                },
+            )
+            .expect("huddle seg");
+
+            let big_body = "x".repeat(550);
+            let huge_msgs: Vec<Message> = (0..80)
+                .map(|i| Message {
+                    ts: Ts::from(format!("{}.000000", 1_700_001_000 + i)),
+                    user: Some(UserId::from("U1")),
+                    text: format!("entry-{i:02} {big_body}"),
+                    ..Message::default()
+                })
+                .collect();
+            s1.upsert_messages(&t1, &ChannelId::from("C_HUGE"), &huge_msgs)
+                .expect("huge msgs");
+        }
+
+        let sessions = vec![Session::new(
+            "https://acme.slack.com/",
+            "T1",
+            "xoxc-test",
+            "xoxd-test",
+            "U1",
+        )];
+        let mut server = McpServer::for_test(dir.path().to_path_buf(), sessions, None);
+
+        // prompts/list
+        let r = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"prompts/list"}"#)
+            .await
+            .expect("prompts/list");
+        let prompt_names: Vec<&str> = r["result"]["prompts"]
+            .as_array()
+            .expect("prompts array")
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert_eq!(
+            prompt_names,
+            vec![
+                "catch_up",
+                "summarize_thread",
+                "summarize_channel",
+                "find_decisions",
+                "search_transcripts",
+            ]
+        );
+
+        // 1. catch_up
+        let r = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":2,"method":"prompts/get","params":{"name":"catch_up","arguments":{"since_hours":"24"}}}"#,
+            )
+            .await
+            .expect("catch_up");
+        let text = r["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .expect("catch_up text");
+        assert_eq!(r["result"]["messages"][0]["role"], "user");
+        assert!(text.contains("#eng"));
+        assert!(text.contains("R_PROMPT1"));
+
+        // 2. summarize_thread
+        let r = server
+            .handle_line(
+                r##"{"jsonrpc":"2.0","id":3,"method":"prompts/get","params":{"name":"summarize_thread","arguments":{"channel":"#eng","thread_ts":"1700000200.000100"}}}"##,
+            )
+            .await
+            .expect("summarize_thread");
+        let text = r["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .expect("thread prompt text");
+        assert!(text.contains("Watch the rollout demo clip"));
+        assert!(text.contains("Looks solid, shipping today"));
+
+        // 3. summarize_channel (including context truncation on huge channel)
+        let r = server
+            .handle_line(
+                r##"{"jsonrpc":"2.0","id":4,"method":"prompts/get","params":{"name":"summarize_channel","arguments":{"channel":"#huge","limit":"80"}}}"##,
+            )
+            .await
+            .expect("summarize_channel huge");
+        let text = r["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .expect("huge prompt text");
+        assert!(text.contains("context truncated to stay within prompt budget"));
+        assert!(text.chars().count() < MAX_PROMPT_CONTEXT_CHARS + 512);
+
+        // 4. find_decisions
+        let r = server
+            .handle_line(
+                r##"{"jsonrpc":"2.0","id":5,"method":"prompts/get","params":{"name":"find_decisions","arguments":{"query":"decided","channel":"#eng"}}}"##,
+            )
+            .await
+            .expect("find_decisions");
+        let text = r["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .expect("decisions prompt text");
+        assert!(text.contains("ship the eu-north canary on Friday"));
+
+        // 5. search_transcripts (hits both file transcript F_CLIP1 and huddle R_PROMPT1)
+        let r = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":6,"method":"prompts/get","params":{"name":"search_transcripts","arguments":{"query":"eu-north"}}}"#,
+            )
+            .await
+            .expect("search_transcripts");
+        let text = r["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .expect("search_transcripts prompt text");
+        assert!(text.contains("F_CLIP1"));
+        assert!(text.contains("R_PROMPT1"));
+        assert!(text.contains("failover drill passed in 14 seconds"));
+
+        // Error cases -> ERR_INVALID_PARAMS (-32602)
+        for bad_req in [
+            json!({"jsonrpc":"2.0","id":10,"method":"prompts/get","params":{"name":"unknown_prompt"}}),
+            json!({"jsonrpc":"2.0","id":11,"method":"prompts/get","params":{"name":"summarize_thread","arguments":{"channel":"#eng"}}}),
+            json!({"jsonrpc":"2.0","id":12,"method":"prompts/get","params":{"name":"search_transcripts","arguments":{}}}),
+            json!({"jsonrpc":"2.0","id":13,"method":"prompts/get","params":{"name":"catch_up","arguments":{"workspace":"../secret"}}}),
+            json!({"jsonrpc":"2.0","id":14,"method":"prompts/get","params":{"name":"catch_up","arguments":"bad"}}),
+        ] {
+            let r = server
+                .handle_line(&serde_json::to_string(&bad_req).expect("ser"))
+                .await
+                .expect("bad prompt response");
+            assert_eq!(
+                r["error"]["code"], ERR_INVALID_PARAMS,
+                "expected ERR_INVALID_PARAMS for {bad_req}, got {r}"
+            );
+        }
     }
 }
