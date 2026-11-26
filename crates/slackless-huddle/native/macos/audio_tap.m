@@ -124,7 +124,29 @@ SlacklessAudioTap *slackless_audio_tap_start(
                 slackless_write_err(err_buf, err_buf_len, "CATapDescription unavailable");
                 return NULL;
             }
-            CATapDescription *desc = [[tapCls alloc] initStereoGlobalTapButExcludeProcesses:@[]];
+            // Exclude our own process so the tap never captures our playback of remote voices,
+            // chimes and jukebox (otherwise every remote hears the room echoed back after the SFU
+            // round trip). The exclusion list holds audio process *object* IDs, so translate our PID
+            // through the system object first; the header notes an unknown PID yields
+            // `kAudioObjectUnknown` rather than an error.
+            AudioObjectID self_process = kAudioObjectUnknown;
+            pid_t pid = getpid();
+            UInt32 self_size = (UInt32)sizeof(self_process);
+            AudioObjectPropertyAddress translate_pid = {
+                kAudioHardwarePropertyTranslatePIDToProcessObject,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain,
+            };
+            OSStatus tr = AudioObjectGetPropertyData(
+                kAudioObjectSystemObject, &translate_pid, (UInt32)sizeof(pid), &pid, &self_size, &self_process);
+            if (tr != noErr || self_process == kAudioObjectUnknown) {
+                NSLog(@"slackless: could not resolve own audio process object (OSStatus %d, id %u); "
+                      @"the system audio tap will include our own playback",
+                      (int)tr,
+                      (unsigned)self_process);
+            }
+            NSArray *excluded = self_process != kAudioObjectUnknown ? @[ @(self_process) ] : @[];
+            CATapDescription *desc = [[tapCls alloc] initStereoGlobalTapButExcludeProcesses:excluded];
             if (!desc) {
                 slackless_write_err(err_buf, err_buf_len, "failed to initialize CATapDescription");
                 return NULL;
