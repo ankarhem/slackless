@@ -521,7 +521,7 @@ impl CoreBridge {
     /// frame-0 seeding (bounded to `INITIAL_HISTORY_LIMIT` so cold launch stays sub-millisecond).
     /// Locally preserved deleted messages are always included (tagged with [`DELETED_EXTRA_KEY`])
     /// so the UI can render either a minimal clickable row or the expanded message.
-    pub fn history_sync(&self, channel: &ChannelId, _include_deleted: bool) -> Vec<Message> {
+    pub fn history_sync(&self, channel: &ChannelId) -> Vec<Message> {
         let Some(session) = self.session.as_ref() else {
             return Vec::new();
         };
@@ -573,7 +573,6 @@ impl CoreBridge {
         &self,
         channel: ChannelId,
         before: Option<Ts>,
-        _include_deleted: bool,
     ) -> Option<impl Future<Output = Vec<Message>> + Send + 'static + use<>> {
         let team = self.session.as_ref()?.team_id.clone();
         let store = self.background_store()?.clone();
@@ -639,7 +638,6 @@ impl CoreBridge {
         &self,
         channel: ChannelId,
         thread_ts: Ts,
-        _include_deleted: bool,
     ) -> Option<impl Future<Output = Vec<Message>> + Send + 'static> {
         let team = self.session.as_ref()?.team_id.clone();
         let store = self.background_store()?.clone();
@@ -1162,7 +1160,7 @@ mod tests {
         let bridge = CoreBridge::offline();
         assert!(bridge.store().is_none());
         assert!(bridge.snapshot(&HashMap::new()).is_none());
-        assert!(bridge.history(ChannelId::from("C1"), None, false).is_none());
+        assert!(bridge.history(ChannelId::from("C1"), None).is_none());
         assert!(bridge.settings().is_none());
         assert!(bridge.drafts().is_none());
         assert!(bridge.section_prefs().is_none());
@@ -1232,7 +1230,7 @@ mod tests {
             )
         });
         held_rx.recv().unwrap();
-        let history = bridge.history_sync(&channel, false);
+        let history = bridge.history_sync(&channel);
         drop(done_tx);
 
         assert!(

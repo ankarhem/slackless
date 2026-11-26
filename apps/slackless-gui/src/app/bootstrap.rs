@@ -758,12 +758,7 @@ fn wire_feature_view_subscriptions(
                         channel: channel.clone(),
                         thread_ts: thread_ts.clone(),
                     });
-                    let include_deleted =
-                        this.preferences.read(cx).settings().show_deleted_messages;
-                    if let Some(read) =
-                        this.bridge
-                            .thread(channel.clone(), thread_ts.clone(), include_deleted)
-                    {
+                    if let Some(read) = this.bridge.thread(channel.clone(), thread_ts.clone()) {
                         let (ch, ts) = (channel.clone(), thread_ts.clone());
                         cx.spawn(async move |this, cx| {
                             let msgs = cx.background_executor().spawn(read).await;
@@ -1531,8 +1526,7 @@ fn hydrate_initial_channel(app: &Entity<App>, window: &mut Window, cx: &mut gpui
         // Cold-launch frame-0 preload: read the initial channel's newest viewport page
         // synchronously (80 msgs on the read-only WAL connection, <1ms) so frame 0 renders
         // immediately without a redundant second SQLite read right after.
-        let include_deleted = app.preferences.read(cx).settings().show_deleted_messages;
-        let initial_history = app.bridge.history_sync(&channel, include_deleted);
+        let initial_history = app.bridge.history_sync(&channel);
         if !initial_history.is_empty() {
             app.resolve_named_users(&initial_history);
             let newest = initial_history.last().map(|m| m.ts.clone());

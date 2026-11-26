@@ -337,8 +337,7 @@ impl App {
     }
 
     pub(in crate::app) fn load_history(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
-        let include_deleted = self.preferences.read(cx).settings().show_deleted_messages;
-        let Some(read) = self.bridge.history(channel.clone(), None, include_deleted) else {
+        let Some(read) = self.bridge.history(channel.clone(), None) else {
             return;
         };
         self.history_generation += 1;
@@ -394,11 +393,7 @@ impl App {
         if self.ws.history_complete.contains(channel) {
             return;
         }
-        let include_deleted = self.preferences.read(cx).settings().show_deleted_messages;
-        let Some(read) = self
-            .bridge
-            .history(channel.clone(), Some(before), include_deleted)
-        else {
+        let Some(read) = self.bridge.history(channel.clone(), Some(before)) else {
             return;
         };
         let generation = self.history_generation;
@@ -445,9 +440,7 @@ impl App {
                         return None;
                     }
                     let before = app.messages.read(cx).oldest_loaded(cx)?;
-                    let include_deleted = app.preferences.read(cx).settings().show_deleted_messages;
-                    app.bridge
-                        .history(channel.clone(), Some(before), include_deleted)
+                    app.bridge.history(channel.clone(), Some(before))
                 });
                 let Ok(Some(read)) = read else {
                     break;
@@ -490,11 +483,7 @@ impl App {
         thread_ts: &Ts,
         cx: &mut Context<Self>,
     ) {
-        let include_deleted = self.preferences.read(cx).settings().show_deleted_messages;
-        let Some(read) = self
-            .bridge
-            .thread(channel.clone(), thread_ts.clone(), include_deleted)
-        else {
+        let Some(read) = self.bridge.thread(channel.clone(), thread_ts.clone()) else {
             return;
         };
         self.thread_generation += 1;
