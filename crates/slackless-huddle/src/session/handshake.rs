@@ -6,23 +6,20 @@ use tokio::sync::mpsc;
 use webrtc::peer_connection::RTCPeerConnectionState;
 
 use super::io::{
-    LiveMediaDevices, LiveSessionFactory, MediaDevices, RtcController, RtcSession, SessionFactory,
-    SignalSession, SignalSink,
+    MediaDevices, RtcController, RtcSession, SessionFactory, SignalSession, SignalSink,
 };
 use super::supervisor::{LoopExit, classify_handshake_err};
 use crate::audio::AudioSharedState;
 use crate::backend::platform_backend;
 use crate::proto::{SdkAudioStreamIdInfoFrame, SdkIndexFrame};
-use crate::rtc::{ChimeRtcPeer, InboundVideoPacket, VideoSenderFeedback};
-use crate::signaling::{
-    ChimeSignalClient, build_join_frame, build_subscribe_frame, decode_sdp_answer_with_prev,
-};
+use crate::rtc::{InboundVideoPacket, VideoSenderFeedback};
+use crate::signaling::{build_join_frame, build_subscribe_frame, decode_sdp_answer_with_prev};
 use crate::video::VideoFrame;
 use crate::{HuddleAudioConfig, HuddleCredentials, HuddleError, HuddleSessionSnapshot, Result};
 
 const HANDSHAKE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub(super) struct HandshakeResult<S = ChimeSignalClient, R = ChimeRtcPeer, M = LiveMediaDevices> {
+pub(super) struct HandshakeResult<S, R, M> {
     pub(super) signal: S,
     pub(super) peer: R,
     pub(super) media: M,
@@ -101,17 +98,6 @@ impl<M: MediaDevices + Send + 'static> Drop for AudioStartGuard<M> {
             });
         }
     }
-}
-
-#[allow(dead_code)]
-pub(super) async fn perform_handshake(
-    creds: &HuddleCredentials,
-    config: &HuddleAudioConfig,
-    snap: &HuddleSessionSnapshot,
-    is_reconnect: bool,
-) -> std::result::Result<HandshakeResult, LoopExit> {
-    let mut factory = LiveSessionFactory;
-    perform_handshake_with(&mut factory, creds, config, snap, is_reconnect).await
 }
 
 pub(super) async fn perform_handshake_with<F: SessionFactory>(
