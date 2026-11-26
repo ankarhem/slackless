@@ -30,7 +30,7 @@ pub use methods::{
     CallParticipant, CanvasAccessLevel, CanvasCommentReply, CanvasCommentThread, CanvasCreated,
     CanvasEditOp, CanvasMeta, ChannelBookmark, ChimeAttendee, ChimeCapabilities, ChimeJoinData,
     ChimeMediaPlacement, ChimeMeeting, ClientCounts, CloudDraft, CommandResponse,
-    ConversationCounts, ConversationView, DeletedFile, EdgeSearchResults, FileCollection,
+    ConversationCounts, DeletedFile, EdgeSearchResults, FileCollection,
     FilesFilter, GifItem, HistoryOpts, HuddleCanvasRef, ListAccessDeleteResult, ListAccessLevel,
     ListCellInput, ListCellInputValue, ListMeta, ListOpts, MessageContent, PinnedItem, PinsList,
     PostedMessage, ProfileUpdate, RemoteFilePage, RemoteMessageHit, RemoteMessagePage,

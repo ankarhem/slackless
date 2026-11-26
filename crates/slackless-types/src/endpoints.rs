@@ -91,7 +91,6 @@ pub mod method {
     pub const CONVERSATIONS_SET_TOPIC: &str = "conversations.setTopic";
     pub const CONVERSATIONS_TEAM_CONNECTIONS: &str = "conversations.teamConnections";
     pub const CONVERSATIONS_UNARCHIVE: &str = "conversations.unarchive";
-    pub const CONVERSATIONS_VIEW: &str = "conversations.view";
     pub const DND_END_DND: &str = "dnd.endDnd";
     pub const DND_END_SNOOZE: &str = "dnd.endSnooze";
     pub const DND_INFO: &str = "dnd.info";

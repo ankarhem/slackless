@@ -1,6 +1,6 @@
 //! Frame codec: incoming text frames -> [`SlackEvent`], outgoing commands -> JSON text.
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use slackless_types::{ChannelId, SlackEvent, Ts, UserId};
 
 /// `type` strings of the frames this client sends.
@@ -8,7 +8,6 @@ pub mod frame_type {
     pub const PING: &str = "ping";
     pub const TICKLE: &str = "tickle";
     pub const PRESENCE_SUB: &str = "presence_sub";
-    pub const PRESENCE_QUERY: &str = "presence_query";
     pub const USER_TYPING: &str = "user_typing";
 }
 
@@ -49,15 +48,11 @@ pub enum Outgoing {
     Tickle(TickleReason),
     /// Subscribe to presence for these users (replaces the previous subscription).
     PresenceSub(Vec<UserId>),
-    /// One-shot presence lookup. Name from the task brief; payload shape not verified live.
-    PresenceQuery(Vec<UserId>),
     /// Typing indicator in a channel or thread.
     UserTyping {
         channel: ChannelId,
         thread_ts: Option<Ts>,
     },
-    /// Any other JSON object, sent as-is (plus `id`) for frames Slack adds later.
-    Raw(Map<String, Value>),
 }
 
 impl Outgoing {
@@ -69,7 +64,6 @@ impl Outgoing {
                 json!({ "type": frame_type::TICKLE, "reason": reason.as_str() })
             }
             Self::PresenceSub(ids) => json!({ "type": frame_type::PRESENCE_SUB, "ids": ids }),
-            Self::PresenceQuery(ids) => json!({ "type": frame_type::PRESENCE_QUERY, "ids": ids }),
             Self::UserTyping { channel, thread_ts } => {
                 let mut v = json!({ "type": frame_type::USER_TYPING, "channel": channel });
                 if let Some(ts) = thread_ts {
@@ -77,7 +71,6 @@ impl Outgoing {
                 }
                 v
             }
-            Self::Raw(map) => Value::Object(map.clone()),
         };
         obj["id"] = json!(id);
         obj.to_string()

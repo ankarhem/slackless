@@ -123,22 +123,6 @@ impl SlackApi {
         Ok(self.call(method::CLIENT_COUNTS, params).await?.data)
     }
 
-    /// `conversations.view`: channel metadata plus the newest `count` messages in one call.
-    pub async fn conversations_view(
-        &self,
-        channel: &ChannelId,
-        count: Option<u32>,
-    ) -> Result<ConversationView> {
-        let mut params = vec![
-            ("channel", channel.to_string()),
-            ("canonical_avatars", "true".to_owned()),
-        ];
-        if let Some(count) = count {
-            params.push(("count", count.to_string()));
-        }
-        Ok(self.call(method::CONVERSATIONS_VIEW, params).await?.data)
-    }
-
     /// One page of `conversations.history`, newest first. Pass the previous page's
     /// `next_cursor` to continue; see [`paginate`] to walk them all.
     pub async fn conversations_history(
@@ -313,13 +297,6 @@ impl SlackApi {
     /// Every page of `users.conversations`.
     pub async fn users_conversations_all(&self, opts: &ListOpts) -> Result<Vec<Conversation>> {
         paginate(|cursor| self.users_conversations(opts, cursor))
-            .try_collect()
-            .await
-    }
-
-    /// Every page of `conversations.list`.
-    pub async fn conversations_list_all(&self, opts: &ListOpts) -> Result<Vec<Conversation>> {
-        paginate(|cursor| self.conversations_list(opts, cursor))
             .try_collect()
             .await
     }

@@ -82,10 +82,6 @@ impl RtmClient {
         self.send(Outgoing::PresenceSub(ids))
     }
 
-    pub fn presence_query(&self, ids: Vec<UserId>) -> Result<(), RtmError> {
-        self.send(Outgoing::PresenceQuery(ids))
-    }
-
     pub fn tickle(&self, reason: TickleReason) -> Result<(), RtmError> {
         self.send(Outgoing::Tickle(reason))
     }

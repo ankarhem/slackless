@@ -14,7 +14,7 @@ mod search;
 mod tests;
 mod transcripts;
 
-pub use archive::{ALL_CONVERSATION_KINDS, ConversationSummary, DigestChannel, UserSummary};
+pub use archive::{ConversationSummary, DigestChannel, UserSummary};
 pub use catchup::RecentFileTranscript;
 pub use file_transcripts::{
     StoredFileTranscript, WorkspaceFileTranscript, extract_inline_file_body,

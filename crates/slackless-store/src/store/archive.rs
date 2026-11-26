@@ -2,9 +2,6 @@
 
 use super::*;
 
-/// Conversation `kind` column values, as the store writes them.
-pub const ALL_CONVERSATION_KINDS: &[&str] = &["public_channel", "private_channel", "im", "mpim"];
-
 /// Summary metadata for one stored conversation (channel, private group, DM, or group DM).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationSummary {

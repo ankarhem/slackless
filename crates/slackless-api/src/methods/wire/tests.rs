@@ -93,19 +93,6 @@ fn client_counts_lenient_numbers_booleans_and_corrupt_entries() {
 
 #[test]
 fn channels_sections_pins_bookmarks_and_roles_tolerate_drift() {
-    // ConversationView with nulls & corrupt user.
-    let view: ConversationView = serde_json::from_value(json!({
-        "channel": null,
-        "messages": null,
-        "users": [{ "id": "U1", "name": "alice" }, 42],
-        "emojis": "not-a-map"
-    }))
-    .expect("conversation view parses");
-    assert!(view.channel.is_none());
-    assert!(view.messages.is_empty());
-    assert_eq!(view.users.len(), 1);
-    assert!(view.emojis.is_empty());
-
     // Channel sections wire + merge_section deduplication across pages.
     let sec_wire: ChannelSectionsWire = serde_json::from_value(json!({
         "cursor": null,

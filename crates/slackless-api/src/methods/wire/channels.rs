@@ -1,15 +1,13 @@
 //! Conversation listing, DM tabs, channel sections, pins, bookmarks, and role assignments.
 
-use std::collections::HashMap;
-
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::client::Params;
-use crate::de::{lenient_vec, null_default, or_default};
+use crate::de::{lenient_vec, or_default};
 use crate::types::{
     ChannelId, ChannelSection, Conversation, ConversationKind, File, Latest, Message, SectionKind,
-    Ts, User, UserId,
+    Ts, UserId,
 };
 
 /// Filters for `conversations.list`.
@@ -20,22 +18,6 @@ pub struct ListOpts {
     pub exclude_archived: bool,
     /// Page size (Slack max 999, default 100).
     pub limit: Option<u32>,
-}
-
-/// `conversations.view`: channel + first page of history + side-loaded users/emoji.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-pub struct ConversationView {
-    #[serde(default, deserialize_with = "or_default")]
-    pub channel: Option<Conversation>,
-    #[serde(default, deserialize_with = "null_default")]
-    pub messages: Vec<Message>,
-    #[serde(default, deserialize_with = "lenient_vec")]
-    pub users: Vec<User>,
-    /// Custom emoji name -> URL or `alias:<name>`.
-    #[serde(default, deserialize_with = "or_default")]
-    pub emojis: HashMap<String, String>,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
 }
 
 /// `users.channelSections.create`.

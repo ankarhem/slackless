@@ -31,13 +31,12 @@ pub use semantic::{
     l2_normalize, rrf_score,
 };
 pub use store::{
-    ALL_CONVERSATION_KINDS, ConversationSummary, DigestChannel, HuddleTranscriptSegment,
-    HuddleTranscriptSession, IntegrityMode, IntegrityReport, MemberCounts,
-    NewHuddleTranscriptSegment, NewOutboxItem, OutboxItem, OutboxKind, OutboxStatus,
-    RecentFileTranscript, Revision, StorageBreakdown, Store, StoreFileInfo, StoreStats,
-    StoredFileTranscript, StoredMessage, UserSummary, WorkspaceFileTranscript,
-    WorkspaceHuddleTranscriptSegment, WorkspaceStoredMessage, extract_inline_file_body,
-    extract_inline_file_transcript,
+    ConversationSummary, DigestChannel, HuddleTranscriptSegment, HuddleTranscriptSession,
+    IntegrityMode, IntegrityReport, MemberCounts, NewHuddleTranscriptSegment, NewOutboxItem,
+    OutboxItem, OutboxKind, OutboxStatus, RecentFileTranscript, Revision, StorageBreakdown, Store,
+    StoreFileInfo, StoreStats, StoredFileTranscript, StoredMessage, UserSummary,
+    WorkspaceFileTranscript, WorkspaceHuddleTranscriptSegment, WorkspaceStoredMessage,
+    extract_inline_file_body, extract_inline_file_transcript,
 };
 
 /// Store errors.

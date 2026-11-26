@@ -102,11 +102,6 @@ impl SessionStore {
         }
     }
 
-    /// Enables or disables mirroring secrets into the macOS Keychain. No effect off macOS.
-    pub fn set_use_keychain(&mut self, enabled: bool) {
-        self.use_keychain = enabled && cfg!(target_os = "macos");
-    }
-
     /// The backing file path.
     pub fn path(&self) -> &Path {
         &self.path
