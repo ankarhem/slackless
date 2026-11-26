@@ -750,7 +750,7 @@ JSON output:
 slackless watch [--channel CHANNEL] [--count N]
 ```
 
-Stream live Slack `message`, `reaction_added`, and `thread_marked` events over the realtime websocket. Under `--json`, emits one JSON object per line (NDJSON). Pass `--count N` to exit cleanly after `N` matching events.
+Stream live Slack `message`, `reaction_added`, and `thread_marked` events over the realtime websocket. Under `--json`, emits one JSON object per line (NDJSON). Pass `--count N` (`N` ≥ 1) to exit cleanly after `N` matching events.
 
 NDJSON shapes:
 

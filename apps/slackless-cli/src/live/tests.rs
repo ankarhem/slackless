@@ -353,10 +353,9 @@ fn format_watch_event_handles_messages_reactions_threads_filters_and_ignored() {
     // watch_reached_limit boundary checks.
     assert!(!watch_reached_limit(None, 0));
     assert!(!watch_reached_limit(None, 100));
-    assert!(watch_reached_limit(Some(0), 0));
-    assert!(!watch_reached_limit(Some(3), 2));
-    assert!(watch_reached_limit(Some(3), 3));
-    assert!(watch_reached_limit(Some(3), 4));
+    assert!(!watch_reached_limit(std::num::NonZeroUsize::new(3), 2));
+    assert!(watch_reached_limit(std::num::NonZeroUsize::new(3), 3));
+    assert!(watch_reached_limit(std::num::NonZeroUsize::new(3), 4));
 }
 
 #[test]

@@ -596,6 +596,8 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
     assert!(Cli::try_parse_from(["slackless", "export", "#eng", "--format", "xml"]).is_err());
     assert!(Cli::try_parse_from(["slackless", "transcribe"]).is_err());
     assert!(Cli::try_parse_from(["slackless", "bogus-cmd"]).is_err());
+    // `--count 0` would still wait for, and print, one event.
+    assert!(Cli::try_parse_from(["slackless", "watch", "--count", "0"]).is_err());
 }
 
 #[test]

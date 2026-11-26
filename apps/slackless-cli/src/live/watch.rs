@@ -1,5 +1,6 @@
 //! `watch`: live RTM event stream filtering, formatting, and local store mirroring.
 
+use std::num::NonZeroUsize;
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -14,8 +15,8 @@ use crate::{Ctx, fail};
 
 use super::session::resolve_channel_with;
 
-pub(crate) fn watch_reached_limit(count: Option<usize>, emitted: usize) -> bool {
-    count.is_some_and(|max| emitted >= max)
+pub(crate) fn watch_reached_limit(count: Option<NonZeroUsize>, emitted: usize) -> bool {
+    count.is_some_and(|max| emitted >= max.get())
 }
 
 /// `watch [--channel <ch>] [--count N]`: stream live Slack events over the RTM websocket,
@@ -24,7 +25,7 @@ pub async fn run_watch(
     ctx: &Ctx,
     flag: Option<&str>,
     channel_arg: Option<&str>,
-    count: Option<usize>,
+    count: Option<NonZeroUsize>,
 ) -> Result<ExitCode> {
     let session = match resolve_session_from(flag, ctx.sessions()) {
         Ok(session) => session,

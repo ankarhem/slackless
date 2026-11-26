@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -500,9 +501,9 @@ pub(crate) struct WatchArgs {
     /// Optional channel id, #name, or @handle to filter events to.
     #[arg(long, value_name = "CHANNEL")]
     pub(crate) channel: Option<String>,
-    /// Stop after emitting N matching events.
+    /// Stop after emitting N (at least 1) matching events.
     #[arg(long, value_name = "N")]
-    pub(crate) count: Option<usize>,
+    pub(crate) count: Option<NonZeroUsize>,
 }
 
 #[derive(Args)]
