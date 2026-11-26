@@ -615,7 +615,8 @@ impl App {
     }
 
     /// Open a modal dialog showing every locally recorded revision of `(channel, ts)` from
-    /// SQLite's immutable append-only `message_revision` log.
+    /// SQLite's immutable append-only `message_revision` log, read off the UI thread: the read
+    /// may wait behind a background one, the UI does not.
     pub(in crate::app) fn open_revision_history(
         &self,
         channel: ChannelId,
@@ -623,44 +624,45 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let fixtures = self.fixtures.clone();
-        let revisions: Vec<(String, bool, String)> = if let (Some(store), Some(team)) =
-            (self.bridge.read_store_clone(), self.bridge.team_id())
-        {
-            store
-                .lock()
-                .ok()
-                .and_then(|s| s.revisions(team, &channel, &ts).ok())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|rev| {
-                    let stamp = if rev.edit_ts.is_empty() {
-                        format!("Original · {}", rev.message.ts)
-                    } else if rev.deleted {
-                        format!("Deleted · {}", rev.edit_ts)
-                    } else {
-                        format!("Edited · {}", rev.edit_ts)
-                    };
-                    let text = crate::messages::plain_text(&rev.message.text, &*fixtures);
-                    (stamp, rev.deleted, text)
-                })
-                .collect()
-        } else {
-            fixtures
-                .messages
-                .get(&channel)
+        let subtitle = format!("{} · {}", self.label(&channel), ts);
+        let (Some(store), Some(team)) = (
+            self.bridge.read_store_clone(),
+            self.bridge.team_id().cloned(),
+        ) else {
+            let revisions = (self.fixtures.messages.get(&channel))
                 .and_then(|list| list.iter().find(|m| m.ts == ts))
                 .map(|m| {
-                    vec![(
-                        format!("Original · {}", m.ts),
-                        false,
-                        crate::messages::plain_text(&m.text, &*fixtures),
-                    )]
+                    let text = crate::messages::plain_text(&m.text, &*self.fixtures);
+                    vec![(format!("Original · {}", m.ts), false, text)]
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            self.open_revision_history_with(subtitle, revisions, window, cx);
+            return;
         };
-        let subtitle = format!("{} · {}", self.label(&channel), ts);
-        self.open_revision_history_with(subtitle, revisions, window, cx);
+        let read = cx
+            .background_executor()
+            .spawn(async move { store.lock().ok()?.revisions(&team, &channel, &ts).ok() });
+        cx.spawn_in(window, async move |this, cx| {
+            let revisions = read.await.unwrap_or_default();
+            let _ = this.update_in(cx, |app, window, cx| {
+                let revisions = revisions
+                    .into_iter()
+                    .map(|rev| {
+                        let stamp = if rev.edit_ts.is_empty() {
+                            format!("Original · {}", rev.message.ts)
+                        } else if rev.deleted {
+                            format!("Deleted · {}", rev.edit_ts)
+                        } else {
+                            format!("Edited · {}", rev.edit_ts)
+                        };
+                        let text = crate::messages::plain_text(&rev.message.text, &*app.fixtures);
+                        (stamp, rev.deleted, text)
+                    })
+                    .collect();
+                app.open_revision_history_with(subtitle, revisions, window, cx);
+            });
+        })
+        .detach();
     }
 
     pub(in crate::app) fn open_revision_history_with(
@@ -842,29 +844,36 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let segments: Vec<slackless_core::store::HuddleTranscriptSegment> =
-            if let (Some(store), Some(team)) =
-                (self.bridge.read_store_clone(), self.bridge.team_id())
-            {
-                store
-                    .lock()
-                    .ok()
-                    .and_then(|s| s.huddle_transcript_for_call(team, &call_id).ok())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-        self.open_huddle_transcript_with(
-            HuddleTranscriptOpen {
-                call_id,
-                channel,
-                segments,
-                highlight_segment_id,
-                highlight_query,
-            },
-            window,
-            cx,
-        );
+        let mut open = HuddleTranscriptOpen {
+            call_id,
+            channel,
+            segments: Vec::new(),
+            highlight_segment_id,
+            highlight_query,
+        };
+        let (Some(store), Some(team)) = (
+            self.bridge.read_store_clone(),
+            self.bridge.team_id().cloned(),
+        ) else {
+            self.open_huddle_transcript_with(open, window, cx);
+            return;
+        };
+        // Read off the UI thread, which never waits behind a background read.
+        let call_id = open.call_id.clone();
+        let read = cx.background_executor().spawn(async move {
+            store
+                .lock()
+                .ok()?
+                .huddle_transcript_for_call(&team, &call_id)
+                .ok()
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            open.segments = read.await.unwrap_or_default();
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.open_huddle_transcript_with(open, window, cx);
+            });
+        })
+        .detach();
     }
 
     pub(in crate::app) fn open_huddle_transcript_with(

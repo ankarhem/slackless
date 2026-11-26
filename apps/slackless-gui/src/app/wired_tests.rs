@@ -1045,6 +1045,43 @@ fn wired_count_changes_redraw_only_the_views_that_show_counts(cx: &mut gpui::Tes
 }
 
 #[gpui::test]
+fn wired_history_dialogs_read_the_archive_off_the_ui_thread(cx: &mut gpui::TestAppContext) {
+    let people = [user("U0ME", "me")];
+    let (bridge, _core) =
+        cx.update(|cx| make_wired_workspace("T0REV", "Rev Co", &[("C0GEN", "gen")], &people, cx));
+    let fx = bridge.snapshot(&HashMap::new()).expect("snapshot");
+    let (root, app, cx) = mount_wired(fx, vec![bridge], cx);
+    let general = ChannelId::from("C0GEN");
+    for (what, transcript) in [("edit history", false), ("huddle transcript", true)] {
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                if transcript {
+                    let call = "R0CALL".to_owned();
+                    app.open_huddle_transcript(call, general.clone(), None, None, window, cx);
+                } else {
+                    let ts = Ts::from("1700000001.000100");
+                    app.open_revision_history(general.clone(), ts, window, cx);
+                }
+            });
+            assert!(
+                !window.has_active_dialog(cx),
+                "{what}: no archive read on the UI thread"
+            );
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(
+                window.has_active_dialog(cx),
+                "{what}: opens once its read lands"
+            );
+            window.close_dialog(cx);
+        });
+        cx.run_until_parked();
+    }
+    drop(root);
+}
+
+#[gpui::test]
 fn wired_pending_dm_delivers_only_to_the_dm_it_was_addressed_to(cx: &mut gpui::TestAppContext) {
     let people = [
         user("U0ME", "me"),
