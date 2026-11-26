@@ -11,6 +11,7 @@ mod archive;
 mod cli;
 mod commands;
 mod live;
+mod mcp;
 mod output;
 mod session;
 #[cfg(test)]
@@ -236,6 +237,7 @@ async fn dispatch(
             force,
             restart,
         } => update::run_update(ctx, check, force, restart).await,
+        Commands::Mcp => mcp::run_mcp(flag).await,
         Commands::Auth { command } => dispatch_auth(ctx, flag, *command),
     }
 }

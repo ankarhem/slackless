@@ -404,6 +404,8 @@ pub(crate) enum Commands {
         #[arg(long)]
         restart: bool,
     },
+    /// Run a JSON-RPC 2.0 stdio Model Context Protocol (MCP) server for AI agents.
+    Mcp,
     /// Account and session management.
     Auth {
         #[command(subcommand)]
