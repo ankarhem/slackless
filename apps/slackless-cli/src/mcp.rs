@@ -8,7 +8,7 @@
 //! Stdout is reserved strictly for newline-delimited JSON-RPC 2.0 responses; no human logs or
 //! prompts are ever written there.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -50,7 +50,11 @@ const MAX_THREAD_LIMIT: usize = 999;
 
 /// Entrypoint for `slackless mcp`.
 pub async fn run_mcp(default_workspace: Option<&str>) -> Result<ExitCode> {
-    let mut server = McpServer::new(default_workspace.map(str::to_owned));
+    let validated_default = match default_workspace.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(ws) => Some(validate_workspace_id(ws).map_err(|msg| anyhow::anyhow!("{msg}"))?),
+        None => None,
+    };
+    let mut server = McpServer::new(validated_default);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     server.serve_io(stdin.lock(), stdout.lock()).await?;
@@ -356,6 +360,9 @@ impl McpServer {
     }
 
     fn archive_path_for(&self, team_id: &TeamId) -> Option<PathBuf> {
+        if !is_valid_workspace_id(team_id.as_str()) {
+            return None;
+        }
         match &self.archive_dir {
             Some(dir) => Some(dir.join(format!("{}.sqlite", team_id.as_str()))),
             None => archive::store_path(team_id),
@@ -373,26 +380,46 @@ impl McpServer {
         let mut seen = HashSet::new();
         let mut ids = Vec::new();
         for s in self.load_sessions() {
-            if seen.insert(s.team_id.clone()) {
+            if is_valid_workspace_id(s.team_id.as_str()) && seen.insert(s.team_id.clone()) {
                 ids.push(s.team_id);
             }
         }
         for tid in self.stored_team_ids() {
-            if seen.insert(tid.clone()) {
+            if is_valid_workspace_id(tid.as_str()) && seen.insert(tid.clone()) {
                 ids.push(tid);
             }
         }
         ids
     }
 
-    fn resolve_workspace(&self, explicit: Option<&str>) -> Option<TeamId> {
-        let flag = explicit
+    fn effective_workspace_flag<'a>(
+        &'a self,
+        explicit: Option<&'a str>,
+    ) -> std::result::Result<Option<&'a str>, String> {
+        if let Some(ws) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+            validate_workspace_id(ws)?;
+            return Ok(Some(ws));
+        }
+        if let Some(ws) = self
+            .default_workspace
+            .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .or(self.default_workspace.as_deref());
+        {
+            validate_workspace_id(ws)?;
+            return Ok(Some(ws));
+        }
+        Ok(None)
+    }
+
+    fn resolve_workspace(
+        &self,
+        explicit: Option<&str>,
+    ) -> std::result::Result<Option<TeamId>, String> {
+        let flag = self.effective_workspace_flag(explicit)?;
         let sessions = self.load_sessions();
         let archive_ids = self.stored_team_ids();
-        resolve_workspace_from(flag, &sessions, &archive_ids)
+        Ok(resolve_workspace_from(flag, &sessions, &archive_ids))
     }
 
     fn open_archive(&self, team_id: &TeamId) -> std::result::Result<Option<Archive>, String> {
@@ -422,10 +449,9 @@ impl McpServer {
         &self,
         explicit_workspace: Option<&str>,
     ) -> std::result::Result<(SlackApi, TeamId), (&'static str, String)> {
-        let flag = explicit_workspace
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .or(self.default_workspace.as_deref());
+        let flag = self
+            .effective_workspace_flag(explicit_workspace)
+            .map_err(|msg| ("invalid_args", msg))?;
         let sessions = self.load_sessions();
         let session = resolve_session_from(flag, &sessions)
             .map_err(|not_signed_in| ("not_signed_in", not_signed_in.to_string()))?;
@@ -461,7 +487,11 @@ impl McpServer {
         }
 
         let ids = self.all_workspace_ids();
-        let default_workspace = self.resolve_workspace(None).map(|t| t.as_str().to_owned());
+        let default_workspace = self
+            .resolve_workspace(None)
+            .ok()
+            .flatten()
+            .map(|t| t.as_str().to_owned());
 
         let workspaces: Vec<WorkspaceEntry> = ids
             .into_iter()
@@ -517,7 +547,7 @@ impl McpServer {
     }
 
     fn tool_list_channels(&self, args: &Map<String, Value>) -> Value {
-        let workspace_arg = match opt_str(args, "workspace") {
+        let workspace_arg = match opt_workspace(args) {
             Ok(v) => v,
             Err(msg) => return tool_err("invalid_args", msg),
         };
@@ -551,11 +581,15 @@ impl McpServer {
             Err(msg) => return tool_err("invalid_args", msg),
         };
 
-        let Some(workspace) = self.resolve_workspace(workspace_arg.as_deref()) else {
-            return tool_err(
-                "no_workspace",
-                "no workspace resolved; pass `workspace` (call `list_workspaces` to see available team IDs)",
-            );
+        let workspace = match self.resolve_workspace(workspace_arg.as_deref()) {
+            Ok(Some(ws)) => ws,
+            Ok(None) => {
+                return tool_err(
+                    "no_workspace",
+                    "no workspace resolved; pass `workspace` (call `list_workspaces` to see available team IDs)",
+                );
+            }
+            Err(msg) => return tool_err("invalid_args", msg),
         };
         let archive = match self.open_archive(&workspace) {
             Ok(a) => a,
@@ -646,8 +680,8 @@ impl McpServer {
             Ok(q) => q,
             Err(msg) => return tool_err("invalid_args", msg),
         };
-        let workspace_arg = match opt_str(args, "workspace") {
-            Ok(v) => v.filter(|s| !s.trim().is_empty()),
+        let workspace_arg = match opt_workspace(args) {
+            Ok(v) => v,
             Err(msg) => return tool_err("invalid_args", msg),
         };
         let all_workspaces_arg = match opt_bool_optional(args, "all_workspaces") {
@@ -691,12 +725,15 @@ impl McpServer {
             (Some(_), _) => false,
             (None, Some(true)) => true,
             (None, Some(false)) => false,
-            (None, None) => self.resolve_workspace(None).is_none(),
+            (None, None) => match self.resolve_workspace(None) {
+                Ok(ws) => ws.is_none(),
+                Err(msg) => return tool_err("invalid_args", msg),
+            },
         };
 
         if search_all {
             let team_ids = self.all_workspace_ids();
-            let mut hits: Vec<(i64, String, McpMessage)> = Vec::new();
+            let mut per_workspace: Vec<Vec<(i64, String, McpMessage)>> = Vec::new();
             for ws in &team_ids {
                 let archive = match self.open_archive(ws) {
                     Ok(Some(a)) => a,
@@ -717,6 +754,7 @@ impl McpServer {
                 }
                 let names = archive.channel_names(ws).unwrap_or_default();
                 let user_names = archive.user_display_map(ws).unwrap_or_default();
+                let mut ws_hits = Vec::with_capacity(messages.len());
                 for msg in &messages {
                     let ch_name = names.get(msg.channel.as_str()).cloned();
                     let ts_secs = msg.message.ts.secs().unwrap_or(0);
@@ -727,14 +765,26 @@ impl McpServer {
                         ch_name,
                         Some(ws.as_str().to_owned()),
                     );
-                    hits.push((ts_secs, ts_raw, mcp_msg));
+                    ws_hits.push((ts_secs, ts_raw, mcp_msg));
                 }
+                per_workspace.push(ws_hits);
             }
-            if sort == SearchSort::Recent {
-                hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-            }
-            hits.truncate(limit);
-            let messages: Vec<McpMessage> = hits.into_iter().map(|(_, _, m)| m).collect();
+            let messages: Vec<McpMessage> = match sort {
+                SearchSort::Recent => {
+                    let mut all_hits: Vec<(i64, String, McpMessage)> =
+                        per_workspace.into_iter().flatten().collect();
+                    all_hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+                    all_hits.truncate(limit);
+                    all_hits.into_iter().map(|(_, _, m)| m).collect()
+                }
+                SearchSort::Relevant => {
+                    let lists: Vec<Vec<McpMessage>> = per_workspace
+                        .into_iter()
+                        .map(|hits| hits.into_iter().map(|(_, _, m)| m).collect())
+                        .collect();
+                    interleave_round_robin(lists, limit)
+                }
+            };
             let searched: Vec<&str> = team_ids.iter().map(TeamId::as_str).collect();
             return tool_ok(&json!({
                 "query": query,
@@ -746,11 +796,15 @@ impl McpServer {
             }));
         }
 
-        let Some(workspace) = self.resolve_workspace(workspace_arg.as_deref()) else {
-            return tool_err(
-                "no_workspace",
-                "no workspace resolved; pass `workspace` or set `all_workspaces: true`",
-            );
+        let workspace = match self.resolve_workspace(workspace_arg.as_deref()) {
+            Ok(Some(ws)) => ws,
+            Ok(None) => {
+                return tool_err(
+                    "no_workspace",
+                    "no workspace resolved; pass `workspace` or set `all_workspaces: true`",
+                );
+            }
+            Err(msg) => return tool_err("invalid_args", msg),
         };
         let archive = match self.open_archive(&workspace) {
             Ok(a) => a,
@@ -797,7 +851,7 @@ impl McpServer {
             Ok(v) => v,
             Err(msg) => return tool_err("invalid_args", msg),
         };
-        let workspace_arg = match opt_str(args, "workspace") {
+        let workspace_arg = match opt_workspace(args) {
             Ok(v) => v,
             Err(msg) => return tool_err("invalid_args", msg),
         };
@@ -882,11 +936,15 @@ impl McpServer {
             }));
         }
 
-        let Some(workspace) = self.resolve_workspace(workspace_arg.as_deref()) else {
-            return tool_err(
-                "no_workspace",
-                "no workspace resolved; pass `workspace` (call `list_workspaces` to see available team IDs)",
-            );
+        let workspace = match self.resolve_workspace(workspace_arg.as_deref()) {
+            Ok(Some(ws)) => ws,
+            Ok(None) => {
+                return tool_err(
+                    "no_workspace",
+                    "no workspace resolved; pass `workspace` (call `list_workspaces` to see available team IDs)",
+                );
+            }
+            Err(msg) => return tool_err("invalid_args", msg),
         };
         let archive = match self.open_archive(&workspace) {
             Ok(a) => a,
@@ -965,7 +1023,7 @@ impl McpServer {
             Ok(v) => v,
             Err(msg) => return tool_err("invalid_args", msg),
         };
-        let workspace_arg = match opt_str(args, "workspace") {
+        let workspace_arg = match opt_workspace(args) {
             Ok(v) => v,
             Err(msg) => return tool_err("invalid_args", msg),
         };
@@ -1033,11 +1091,15 @@ impl McpServer {
             }));
         }
 
-        let Some(workspace) = self.resolve_workspace(workspace_arg.as_deref()) else {
-            return tool_err(
-                "no_workspace",
-                "no workspace resolved; pass `workspace` (call `list_workspaces` to see available team IDs)",
-            );
+        let workspace = match self.resolve_workspace(workspace_arg.as_deref()) {
+            Ok(Some(ws)) => ws,
+            Ok(None) => {
+                return tool_err(
+                    "no_workspace",
+                    "no workspace resolved; pass `workspace` (call `list_workspaces` to see available team IDs)",
+                );
+            }
+            Err(msg) => return tool_err("invalid_args", msg),
         };
         let archive = match self.open_archive(&workspace) {
             Ok(a) => a,
@@ -1092,8 +1154,8 @@ impl McpServer {
             Ok(v) => v,
             Err(msg) => return tool_err("invalid_args", msg),
         };
-        let workspace_arg = match opt_str(args, "workspace") {
-            Ok(v) => v.filter(|s| !s.trim().is_empty()),
+        let workspace_arg = match opt_workspace(args) {
+            Ok(v) => v,
             Err(msg) => return tool_err("invalid_args", msg),
         };
 
@@ -1102,7 +1164,11 @@ impl McpServer {
         } else {
             let mut list = Vec::new();
             let mut seen = HashSet::new();
-            if let Some(default_ws) = self.resolve_workspace(None)
+            let default_ws = match self.resolve_workspace(None) {
+                Ok(ws) => ws,
+                Err(msg) => return tool_err("invalid_args", msg),
+            };
+            if let Some(default_ws) = default_ws
                 && seen.insert(default_ws.clone())
             {
                 list.push(default_ws);
@@ -1161,7 +1227,7 @@ impl McpServer {
             Ok(v) => v,
             Err(msg) => return tool_err("invalid_args", msg),
         };
-        let workspace_arg = match opt_str(args, "workspace") {
+        let workspace_arg = match opt_workspace(args) {
             Ok(v) => v,
             Err(msg) => return tool_err("invalid_args", msg),
         };
@@ -1217,7 +1283,7 @@ impl McpServer {
             Ok(v) => v,
             Err(msg) => return tool_err("invalid_args", msg),
         };
-        let workspace_arg = match opt_str(args, "workspace") {
+        let workspace_arg = match opt_workspace(args) {
             Ok(v) => v,
             Err(msg) => return tool_err("invalid_args", msg),
         };
@@ -1276,7 +1342,7 @@ impl McpServer {
             Ok(v) => v,
             Err(msg) => return tool_err("invalid_args", msg),
         };
-        let workspace_arg = match opt_str(args, "workspace") {
+        let workspace_arg = match opt_workspace(args) {
             Ok(v) => v,
             Err(msg) => return tool_err("invalid_args", msg),
         };
@@ -1457,6 +1523,62 @@ fn read_channel_window(
 
     collected.reverse();
     Ok(collected)
+}
+
+fn is_valid_workspace_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn validate_workspace_id(raw: &str) -> std::result::Result<String, String> {
+    let trimmed = raw.trim();
+    if is_valid_workspace_id(trimmed) {
+        Ok(trimmed.to_owned())
+    } else {
+        Err(format!(
+            "invalid `workspace` '{trimmed}': must contain only ASCII letters, digits, '_', or '-'"
+        ))
+    }
+}
+
+fn opt_workspace(args: &Map<String, Value>) -> std::result::Result<Option<String>, String> {
+    match opt_str(args, "workspace")? {
+        Some(s) if !s.trim().is_empty() => validate_workspace_id(&s).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Round-robin interleave per-workspace ranked hit lists up to `limit` so an early workspace
+/// with `>= limit` hits cannot starve later workspaces when sorting by local BM25 relevance.
+fn interleave_round_robin<T>(lists: Vec<Vec<T>>, limit: usize) -> Vec<T> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut queues: Vec<VecDeque<T>> = lists
+        .into_iter()
+        .filter(|list| !list.is_empty())
+        .map(VecDeque::from)
+        .collect();
+    let mut out = Vec::with_capacity(limit);
+    while out.len() < limit {
+        let mut progressed = false;
+        for queue in &mut queues {
+            if let Some(item) = queue.pop_front() {
+                out.push(item);
+                progressed = true;
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    out
 }
 
 fn req_str(args: &Map<String, Value>, key: &str) -> std::result::Result<String, String> {
@@ -2569,5 +2691,184 @@ mod tests {
             .expect("parse mcp with workspace");
         assert!(matches!(cli.command, crate::cli::Commands::Mcp));
         assert_eq!(cli.workspace.as_deref(), Some("T1"));
+    }
+
+    #[tokio::test]
+    async fn workspace_validation_blocks_path_traversal() {
+        let parent = TempDir::new("traversal-parent");
+        let archive_dir = parent.path().join("archives");
+        std::fs::create_dir_all(&archive_dir).expect("create archives dir");
+
+        // Place a real SQLite archive OUTSIDE `archive_dir` that a traversal payload targets.
+        let outside_ws = TeamId::from("secret_outside");
+        let outside_db = parent.path().join("secret_outside.sqlite");
+        let mut outside_store = Store::open(&outside_db).expect("open outside store");
+        outside_store
+            .upsert_file_transcript(
+                &outside_ws,
+                &FileId::from("F_SECRET"),
+                "local",
+                "top secret",
+            )
+            .expect("upsert outside transcript");
+        drop(outside_store);
+
+        let mut server = McpServer::for_test(archive_dir.clone(), Vec::new(), None);
+
+        // Defense-in-depth: `archive_path_for` refuses unsafe IDs directly.
+        for bad in [
+            "../secret_outside",
+            "../../etc/passwd",
+            "/tmp/secret_outside",
+            "T1/../T2",
+            r"T1\..\T2",
+            "..",
+            ".",
+            "T1.sqlite",
+            "T1 space",
+        ] {
+            assert!(
+                server.archive_path_for(&TeamId::from(bad)).is_none(),
+                "archive_path_for must reject unsafe team id {bad:?}"
+            );
+        }
+        assert!(
+            server
+                .archive_path_for(&TeamId::from("T0123_ABC-1"))
+                .is_some()
+        );
+
+        // Every tool that accepts `workspace` rejects traversal inputs with `invalid_args`.
+        let calls = [
+            json!({"name": "list_channels", "arguments": {"workspace": "../secret_outside"}}),
+            json!({"name": "search_messages", "arguments": {"query": "secret", "workspace": "/tmp/foo"}}),
+            json!({"name": "read_channel", "arguments": {"channel": "#eng", "workspace": "../../etc"}}),
+            json!({"name": "read_thread", "arguments": {"channel": "#eng", "thread_ts": "1.0", "workspace": "../secret_outside"}}),
+            json!({"name": "get_transcript", "arguments": {"file_id": "F_SECRET", "workspace": "../secret_outside"}}),
+            json!({"name": "send_message", "arguments": {"channel": "#eng", "text": "hi", "workspace": "../secret_outside"}}),
+            json!({"name": "reply_thread", "arguments": {"channel": "#eng", "thread_ts": "1.0", "text": "hi", "workspace": r"T1\..\T2"}}),
+            json!({"name": "add_reaction", "arguments": {"channel": "#eng", "ts": "1.0", "emoji": "tada", "workspace": "/tmp/foo"}}),
+        ];
+        for (idx, params) in calls.into_iter().enumerate() {
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": idx + 1,
+                "method": "tools/call",
+                "params": params,
+            });
+            let resp = server
+                .handle_line(&serde_json::to_string(&req).expect("serialize req"))
+                .await
+                .expect("tool response");
+            let (is_err, payload) = parse_tool_payload(&resp);
+            assert!(is_err, "expected error for call #{idx}");
+            assert_eq!(
+                payload["error"], "invalid_args",
+                "expected invalid_args for call #{idx}: {payload}"
+            );
+        }
+
+        // Invalid `default_workspace` on the server itself is also rejected.
+        let mut bad_default =
+            McpServer::for_test(archive_dir, Vec::new(), Some("../secret_outside".into()));
+        let resp = bad_default
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"get_transcript","arguments":{"file_id":"F_SECRET"}}}"#,
+            )
+            .await
+            .expect("bad default response");
+        let (is_err, payload) = parse_tool_payload(&resp);
+        assert!(is_err);
+        assert_eq!(payload["error"], "invalid_args");
+    }
+
+    #[tokio::test]
+    async fn cross_workspace_relevant_search_interleaves_without_starving_later_workspaces() {
+        let dir = TempDir::new("relevant-interleave");
+
+        // Workspace T1 has 3 matching messages (>= limit).
+        let t1 = TeamId::from("T1");
+        let mut s1 = Store::open(dir.path().join("T1.sqlite")).expect("open T1");
+        s1.upsert_messages(
+            &t1,
+            &ChannelId::from("C1"),
+            &[
+                Message {
+                    ts: Ts::from("1700000100.000000"),
+                    text: "aurora deploy aurora aurora".into(),
+                    ..Message::default()
+                },
+                Message {
+                    ts: Ts::from("1700000200.000000"),
+                    text: "aurora staging check".into(),
+                    ..Message::default()
+                },
+                Message {
+                    ts: Ts::from("1700000300.000000"),
+                    text: "aurora notes".into(),
+                    ..Message::default()
+                },
+            ],
+        )
+        .expect("upsert T1");
+
+        // Workspace T2 has 2 matching messages.
+        let t2 = TeamId::from("T2");
+        let mut s2 = Store::open(dir.path().join("T2.sqlite")).expect("open T2");
+        s2.upsert_messages(
+            &t2,
+            &ChannelId::from("C2"),
+            &[
+                Message {
+                    ts: Ts::from("1700000400.000000"),
+                    text: "aurora production aurora".into(),
+                    ..Message::default()
+                },
+                Message {
+                    ts: Ts::from("1700000500.000000"),
+                    text: "aurora follow-up".into(),
+                    ..Message::default()
+                },
+            ],
+        )
+        .expect("upsert T2");
+
+        let mut server = McpServer::for_test(dir.path().to_path_buf(), Vec::new(), None);
+
+        // With `limit: 2`, round-robin interleaving ensures T1 and T2 each get their top hit.
+        let r = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_messages","arguments":{"query":"aurora","all_workspaces":true,"sort":"relevant","limit":2}}}"#,
+            )
+            .await
+            .expect("relevant search limit=2");
+        let (is_err, payload) = parse_tool_payload(&r);
+        assert!(!is_err);
+        assert_eq!(payload["count"], 2);
+        let ws_order: Vec<&str> = payload["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .filter_map(|m| m["workspace"].as_str())
+            .collect();
+        assert_eq!(ws_order, vec!["T1", "T2"]);
+
+        // With `limit: 4`, round-robin yields T1, T2, T1, T2.
+        let r = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_messages","arguments":{"query":"aurora","all_workspaces":true,"sort":"relevant","limit":4}}}"#,
+            )
+            .await
+            .expect("relevant search limit=4");
+        let (is_err, payload) = parse_tool_payload(&r);
+        assert!(!is_err);
+        assert_eq!(payload["count"], 4);
+        let ws_order: Vec<&str> = payload["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .filter_map(|m| m["workspace"].as_str())
+            .collect();
+        assert_eq!(ws_order, vec!["T1", "T2", "T1", "T2"]);
     }
 }
