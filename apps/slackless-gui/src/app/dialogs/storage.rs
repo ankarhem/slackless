@@ -257,14 +257,17 @@ impl App {
         });
     }
 
-    /// Confirm and clear local SQLite message cache (`Preferences -> Advanced -> Clear local cache`).
+    /// Confirm clearing the re-fetchable caches (`Preferences -> Advanced -> Clear local cache`):
+    /// the media, audio and avatar/emoji caches, never the workspace archives.
     pub(in crate::app) fn confirm_reset_cache(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let this = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, cx| {
             let muted = cx.theme().muted_foreground;
+            let this_clear = this.clone();
             dialog
                 .title("Clear local cache?")
                 .w(px(420.))
@@ -272,7 +275,7 @@ impl App {
                     v_flex()
                         .gap_4()
                         .child(div().text_color(muted).child(
-                            "Removes cached search & message data from disk (your signed-in sessions stay intact). Relaunch slackless to re-sync fresh history.",
+                            "Removes the downloaded media, audio and avatar/emoji caches from disk; anything still needed is downloaded again. Your message history, search index and signed-in sessions stay intact.",
                         ))
                         .child(
                             h_flex()
@@ -294,31 +297,12 @@ impl App {
                                             .label("Clear cache"),
                                         cx,
                                     )
-                                    .on_click(|_, window, cx| {
-                                            window.close_dialog(cx);
-                                            if let Some(dir) = crate::bridge::store_dir()
-                                                && let Ok(entries) = std::fs::read_dir(&dir) {
-                                                    for entry in entries.flatten() {
-                                                        let path = entry.path();
-                                                        let name = path
-                                                            .file_name()
-                                                            .and_then(|n| n.to_str())
-                                                            .unwrap_or_default();
-                                                        if name.ends_with(".sqlite")
-                                                            || name.ends_with(".sqlite-wal")
-                                                            || name.ends_with(".sqlite-shm")
-                                                        {
-                                                            let _ = std::fs::remove_file(path);
-                                                        }
-                                                    }
-                                                }
-                                            notify(
-                                                "Cache cleared",
-                                                "Restart slackless to re-sync from Slack.".to_owned(),
-                                                window,
-                                                cx,
-                                            );
-                                        }),
+                                    .on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        let _ = this_clear.update(cx, |app, cx| {
+                                            app.clear_media_caches("Cache cleared", window, cx);
+                                        });
+                                    }),
                                 ),
                         ),
                 )
@@ -432,47 +416,32 @@ impl App {
         .detach();
     }
 
-    /// Prune temporary downloaded media cache files (`slackless-media` + `slackless-audio`) off
-    /// the UI thread, then refresh storage metrics and show a toast notification.
-    pub(in crate::app) fn prune_media_cache(&self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Empty every re-fetchable media cache (`slackless_core::maintenance::default_media_cache_dirs`)
+    /// off the UI thread, refresh the storage metrics and toast `title` with the bytes removed.
+    pub(in crate::app) fn clear_media_caches(
+        &self,
+        title: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn_in(window, async move |this, cx| {
             let removed = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut removed = 0u64;
-                    let mut dirs: Vec<std::path::PathBuf> = ["slackless-media", "slackless-audio"]
-                        .into_iter()
-                        .map(|folder| std::env::temp_dir().join(folder))
-                        .collect();
-                    if let Some(cache) = slackless_core::Fetcher::disk_cache_dir() {
-                        dirs.push(cache);
-                    }
-                    for dir in dirs {
-                        if let Ok(entries) = std::fs::read_dir(&dir) {
-                            for entry in entries.flatten() {
-                                if let Ok(meta) = entry.metadata()
-                                    && meta.is_file()
-                                    && std::fs::remove_file(entry.path()).is_ok()
-                                {
-                                    removed = removed.saturating_add(meta.len());
-                                }
-                            }
-                        }
-                    }
-                    removed
+                    remove_cached_files(&slackless_core::maintenance::default_media_cache_dirs())
                 })
                 .await;
             let _ = this.update_in(cx, |app, window, cx| {
                 app.refresh_storage_stats_in(window, cx);
                 let msg = if removed > 0 {
                     format!(
-                        "Removed {} KiB of cached media files.",
+                        "Removed {} KiB of cached media and avatars.",
                         (removed / 1024).max(1)
                     )
                 } else {
-                    "Media cache was already clean.".to_owned()
+                    "The caches were already empty.".to_owned()
                 };
-                notify("Media cache pruned", msg, window, cx);
+                notify(title, msg, window, cx);
             });
         })
         .detach();
@@ -533,7 +502,7 @@ impl App {
                             (
                                 "Integrity problems found",
                                 format!(
-                                    "{} — back up the archive, then clear the local cache to re-sync.",
+                                    "{} — back up the archive, then restore it from an earlier backup.",
                                     report.summary()
                                 ),
                             )
@@ -2216,7 +2185,9 @@ impl App {
                             )
                             .on_click(move |_, window, cx| {
                                 let _ = this_prune
-                                    .update(cx, |app, cx| app.prune_media_cache(window, cx));
+                                    .update(cx, |app, cx| {
+                                        app.clear_media_caches("Media cache pruned", window, cx);
+                                    });
                             }),
                         )
                         .child(
@@ -2789,6 +2760,24 @@ pub(in crate::app) fn build_fixture_thread_export(
     }
 }
 
+/// Delete every regular file directly inside each of `dirs`, returning the bytes removed. Only
+/// re-fetchable cache directories may be passed: the workspace archives live in the data
+/// directory, which this must never see. Blocking filesystem work: run it off the UI thread.
+fn remove_cached_files(dirs: &[std::path::PathBuf]) -> u64 {
+    let mut removed = 0;
+    for dir in dirs {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_file() && std::fs::remove_file(entry.path()).is_ok() {
+                removed += meta.len();
+            }
+        }
+    }
+    removed
+}
+
 /// Fold accented Latin characters (including Swedish `å`/`ä`/`ö`) to ASCII lowercase for
 /// diacritic-insensitive search-term highlighting inside transcript lines.
 fn fold_search_char(c: char) -> char {
@@ -2874,4 +2863,55 @@ fn render_highlighted_transcript_line(
         runs.push(make_run(text.len() - cursor, None));
     }
     gpui::StyledText::new(text.to_owned()).with_runs(runs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remove_cached_files;
+
+    #[test]
+    fn remove_cached_files_clears_cache_dirs_and_never_archives() {
+        let root =
+            std::env::temp_dir().join(format!("slackless-clear-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("Application Support/slackless");
+        let media = root.join("slackless-media");
+        let avatars = root.join("Caches/slackless/media");
+        for dir in [&data, &media, &avatars, &avatars.join("nested")] {
+            std::fs::create_dir_all(dir).expect("create dir");
+        }
+        let archives = [
+            "T1.sqlite",
+            "T1.sqlite-wal",
+            "T1.sqlite-shm",
+            "semantic_index.sqlite",
+        ]
+        .map(|name| data.join(name));
+        for path in &archives {
+            std::fs::write(path, b"archive").expect("write archive");
+        }
+        let caches = [
+            media.join("clip.mp4"),
+            avatars.join("avatar.bin"),
+            avatars.join("nested/other.bin"),
+        ];
+        for path in &caches {
+            std::fs::write(path, b"cached").expect("write cache");
+        }
+
+        let removed = remove_cached_files(&[media.clone(), avatars.clone()]);
+
+        assert_eq!(removed, 2 * 6, "only the two top-level cache files go");
+        for path in &caches[..2] {
+            assert!(!path.exists(), "{path:?} must be removed");
+        }
+        assert!(
+            caches[2].is_file(),
+            "a cache directory's subfolders are not ours"
+        );
+        for path in &archives {
+            assert!(path.is_file(), "{path:?} is an archive and must survive");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

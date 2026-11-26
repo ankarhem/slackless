@@ -1076,11 +1076,6 @@ fn open_store(session: &Session) -> Option<(Store, Option<SharedStore>)> {
     }
 }
 
-/// Directory holding per-workspace SQLite stores.
-pub fn store_dir() -> Option<PathBuf> {
-    slackless_core::paths::app_data_dir()
-}
-
 /// The durable store lives under the platform's application-data directory, one database per
 /// workspace (the store location stays a front-end decision, per slackless-core's docs).
 fn default_store_path(team_id: &TeamId) -> Option<PathBuf> {
