@@ -1187,93 +1187,21 @@ const SPLIT_WINDOW_SAMPLES: usize = TARGET_RATE / 10;
 /// Hop size for silence boundary scan (50 ms @ 16 kHz).
 const SPLIT_HOP_SAMPLES: usize = TARGET_RATE / 20;
 
-/// Decode a RIFF WAVE byte buffer (16-bit signed PCM or 32-bit IEEE float, any channel count and
-/// sample rate) into 16 kHz mono `f32` samples in `[-1.0, 1.0]`.
+/// Decode a RIFF WAVE byte buffer (integer PCM of any depth or 32-bit IEEE float, any channel
+/// count and sample rate) into 16 kHz mono `f32` samples in `[-1.0, 1.0]`.
 fn decode_wav_bytes_to_16k_mono(bytes: &[u8]) -> std::result::Result<Vec<f32>, String> {
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return Err("not a RIFF WAVE file".to_owned());
-    }
-
-    let mut audio_format: Option<u16> = None;
-    let mut channels: u16 = 0;
-    let mut sample_rate: u32 = 0;
-    let mut bits_per_sample: u16 = 0;
-    let mut data_slice: Option<&[u8]> = None;
-
-    let mut pos = 12usize;
-    while pos + 8 <= bytes.len() {
-        let id = &bytes[pos..pos + 4];
-        let chunk_size = u32::from_le_bytes([
-            bytes[pos + 4],
-            bytes[pos + 5],
-            bytes[pos + 6],
-            bytes[pos + 7],
-        ]) as usize;
-        pos += 8;
-        let payload_end = pos.saturating_add(chunk_size).min(bytes.len());
-        let payload = &bytes[pos..payload_end];
-
-        if id == b"fmt " && payload.len() >= 16 {
-            audio_format = Some(u16::from_le_bytes([payload[0], payload[1]]));
-            channels = u16::from_le_bytes([payload[2], payload[3]]);
-            sample_rate = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-            bits_per_sample = u16::from_le_bytes([payload[14], payload[15]]);
-        } else if id == b"data" {
-            data_slice = Some(payload);
+    let reader = hound::WavReader::new(bytes).map_err(|e| format!("unreadable WAV: {e}"))?;
+    let spec = reader.spec();
+    let mono = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let scale = 2f32.powi(1 - i32::from(spec.bits_per_sample));
+            downmix_wav(reader, |s: i32| s as f32 * scale)
         }
-
-        // RIFF chunks are word-aligned (padded by 1 byte if odd).
-        let padded = chunk_size.saturating_add(chunk_size & 1);
-        pos = pos.saturating_add(padded);
-    }
-
-    let fmt = audio_format.ok_or_else(|| "WAV missing fmt chunk".to_owned())?;
-    let data = data_slice.ok_or_else(|| "WAV missing data chunk".to_owned())?;
-    if channels == 0 || sample_rate == 0 {
-        return Err("WAV has invalid channel count or sample rate".to_owned());
-    }
-
-    let ch = channels as usize;
-    let mono: Vec<f32> = match (fmt, bits_per_sample) {
-        (1, 16) => {
-            let frame_bytes = ch * 2;
-            let frame_count = data.len() / frame_bytes;
-            let mut out = Vec::with_capacity(frame_count);
-            for frame in data.chunks_exact(frame_bytes) {
-                let mut sum = 0.0f32;
-                for c in 0..ch {
-                    let s = i16::from_le_bytes([frame[c * 2], frame[c * 2 + 1]]);
-                    sum += f32::from(s) / 32_768.0;
-                }
-                out.push((sum / ch as f32).clamp(-1.0, 1.0));
-            }
-            out
-        }
-        (3, 32) => {
-            let frame_bytes = ch * 4;
-            let frame_count = data.len() / frame_bytes;
-            let mut out = Vec::with_capacity(frame_count);
-            for frame in data.chunks_exact(frame_bytes) {
-                let mut sum = 0.0f32;
-                for c in 0..ch {
-                    let s = f32::from_le_bytes([
-                        frame[c * 4],
-                        frame[c * 4 + 1],
-                        frame[c * 4 + 2],
-                        frame[c * 4 + 3],
-                    ]);
-                    sum += if s.is_finite() { s } else { 0.0 };
-                }
-                out.push((sum / ch as f32).clamp(-1.0, 1.0));
-            }
-            out
-        }
-        _ => {
-            return Err(format!(
-                "unsupported WAV encoding (format={fmt}, bits={bits_per_sample})"
-            ));
+        hound::SampleFormat::Float => {
+            downmix_wav(reader, |s: f32| if s.is_finite() { s } else { 0.0 })
         }
     };
+    let sample_rate = spec.sample_rate;
 
     let mut resampled = if sample_rate == TARGET_RATE as u32 {
         mono
@@ -1291,6 +1219,31 @@ fn decode_wav_bytes_to_16k_mono(bytes: &[u8]) -> std::result::Result<Vec<f32>, S
         resampled.truncate(MAX_OFFLINE_AUDIO_SAMPLES);
     }
     Ok(resampled)
+}
+
+/// Average each interleaved frame of `reader`'s samples into one mono sample. A truncated data
+/// chunk ends the audio early rather than failing the whole file.
+fn downmix_wav<S: hound::Sample>(
+    mut reader: hound::WavReader<&[u8]>,
+    to_f32: impl Fn(S) -> f32,
+) -> Vec<f32> {
+    let channels = usize::from(reader.spec().channels);
+    let mut mono = Vec::with_capacity(reader.duration() as usize);
+    let mut sum = 0.0f32;
+    for (i, sample) in reader.samples::<S>().enumerate() {
+        match sample {
+            Ok(s) => sum += to_f32(s),
+            Err(err) => {
+                tracing::warn!(%err, "WAV data ends early; decoding the readable part");
+                break;
+            }
+        }
+        if (i + 1) % channels == 0 {
+            mono.push((sum / channels as f32).clamp(-1.0, 1.0));
+            sum = 0.0;
+        }
+    }
+    mono
 }
 
 #[cfg(target_os = "macos")]
@@ -1825,6 +1778,23 @@ mod tests {
         // 3) Pure-Rust WAV fallback decoder matches on 44.1 kHz stereo directly.
         let fallback_44k = decode_wav_bytes_to_16k_mono(&wav_44k).expect("pure-Rust WAV decode");
         assert_eq!(fallback_44k.len(), 16_000);
+
+        // 4) ...and reads 24-bit PCM (written as WAVE_FORMAT_EXTENSIBLE) at the same scale.
+        let spec_24 = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 24,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut wav_24 = std::io::Cursor::new(Vec::new());
+        let mut writer = hound::WavWriter::new(&mut wav_24, spec_24).unwrap();
+        for &s in &pcm_16k {
+            writer.write_sample(i32::from(s) << 8).unwrap();
+        }
+        writer.finalize().unwrap();
+        let decoded_24 = decode_wav_bytes_to_16k_mono(wav_24.get_ref()).expect("24-bit WAV decode");
+        assert_eq!(decoded_24.len(), pcm_16k.len());
+        assert!((decoded_24[100] - f32::from(pcm_16k[100]) / 32_768.0).abs() < 1e-6);
         let missing = dir.join(format!("slackless-extract-missing-{pid}.wav"));
         assert!(extract_audio_16k_mono(&missing).is_err());
     }

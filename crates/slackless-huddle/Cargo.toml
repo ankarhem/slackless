@@ -33,6 +33,8 @@ neteq = { version = "1.0.2", default-features = false }
 # onto the rustfft 6.4 transcribe-rs already links, unlike 1.x+ which adds four more crates.
 rubato = "0.16.2"
 sonora = "0.3"
+# WAV encode/decode; already linked through transcribe-rs.
+hound = "3.5"
 url = "2.5"
 openh264 = "0.9"
 rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
