@@ -247,3 +247,44 @@ fn corrupted_out_of_bounds_settings_indices_never_panic() {
     let _ = corrupted.notifications_allowed_now();
     let _ = corrupted.transcription_provider();
 }
+
+#[gpui::test]
+fn integrity_status_is_isolated_per_workspace(cx: &mut gpui::TestAppContext) {
+    use slackless_core::store::{IntegrityMode, IntegrityReport};
+    use slackless_core::types::TeamId;
+
+    let (_, cx) = cx.add_window_view(|_, _| gpui::Empty);
+    let prefs = cx.update(Preferences::new);
+    let t1 = TeamId::from("T_WS_A");
+    let t2 = TeamId::from("T_WS_B");
+    let ok_report = IntegrityReport {
+        ok: true,
+        mode: IntegrityMode::Quick,
+        problems: Vec::new(),
+        elapsed_ms: 4,
+    };
+
+    prefs.update(cx, |p, cx| {
+        assert_eq!(p.integrity_status(None), (None, false));
+        assert_eq!(p.integrity_status(Some(&t1)), (None, false));
+        assert_eq!(p.integrity_status(Some(&t2)), (None, false));
+
+        // Running & completing a check for T_WS_A must never bleed into T_WS_B.
+        p.set_integrity_status(t1.clone(), None, true, cx);
+        assert_eq!(p.integrity_status(Some(&t1)), (None, true));
+        assert_eq!(p.integrity_status(Some(&t2)), (None, false));
+
+        p.set_integrity_status(t1.clone(), Some(ok_report.clone()), false, cx);
+        assert_eq!(
+            p.integrity_status(Some(&t1)),
+            (Some(ok_report.clone()), false)
+        );
+        assert_eq!(p.integrity_status(Some(&t2)), (None, false));
+
+        // A failed check on T_WS_A clears only T_WS_A's report.
+        p.set_integrity_status(t2.clone(), Some(ok_report.clone()), false, cx);
+        p.set_integrity_status(t1.clone(), None, false, cx);
+        assert_eq!(p.integrity_status(Some(&t1)), (None, false));
+        assert_eq!(p.integrity_status(Some(&t2)), (Some(ok_report), false));
+    });
+}

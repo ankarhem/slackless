@@ -484,10 +484,11 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(store) = self
+        let Some((store, team)) = self
             .bridge
             .read_store_clone()
             .or_else(|| self.bridge.store().cloned())
+            .zip(self.bridge.team_id().cloned())
         else {
             notify(
                 "No local database",
@@ -497,14 +498,16 @@ impl App {
             );
             return;
         };
-        if self.preferences.read(cx).integrity_status().1 {
+        if self.preferences.read(cx).integrity_status(Some(&team)).1 {
             return;
         }
-        self.preferences
-            .update(cx, |p, cx| p.set_integrity_status(None, true, cx));
+        let team_for_start = team.clone();
+        self.preferences.update(cx, |p, cx| {
+            p.set_integrity_status(team_for_start, None, true, cx)
+        });
         window.refresh();
         let prefs = self.preferences.downgrade();
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let outcome: Result<slackless_core::store::IntegrityReport, String> = cx
                 .background_executor()
                 .spawn(async move {
@@ -515,6 +518,9 @@ impl App {
                 })
                 .await;
             let _ = cx.update(|window, cx| {
+                let still_active = this
+                    .read_with(cx, |app, _| app.bridge.team_id() == Some(&team))
+                    .unwrap_or(false);
                 match outcome {
                     Ok(report) => {
                         let (title, msg) = if report.ok {
@@ -532,13 +538,19 @@ impl App {
                             )
                         };
                         let _ = prefs.update(cx, |p, cx| {
-                            p.set_integrity_status(Some(report), false, cx);
+                            p.set_integrity_status(team, Some(report), false, cx);
                         });
-                        notify(title, msg, window, cx);
+                        if still_active {
+                            notify(title, msg, window, cx);
+                        }
                     }
                     Err(err) => {
-                        let _ = prefs.update(cx, |p, cx| p.set_integrity_status(None, false, cx));
-                        notify("Integrity check failed", err, window, cx);
+                        let _ = prefs.update(cx, |p, cx| {
+                            p.set_integrity_status(team, None, false, cx);
+                        });
+                        if still_active {
+                            notify("Integrity check failed", err, window, cx);
+                        }
                     }
                 }
                 window.refresh();
@@ -1655,10 +1667,11 @@ impl App {
                         let archives = slackless_core::search::discover_local_archives();
                         let mut idx =
                             slackless_core::semantic_index::open_default_semantic_index()?;
-                        slackless_core::semantic_index::index_disk_archives(
+                        slackless_core::semantic_index::index_disk_archives_paced(
                             &archives,
                             &mut idx,
                             embedder.as_ref(),
+                            slackless_core::semantic_index::IndexPacing::BACKGROUND,
                             |_| {},
                         )
                     })();
@@ -1718,7 +1731,7 @@ impl App {
                 let prefs = a.preferences.read(cx);
                 let stats = prefs.storage_stats_snapshot();
                 let sem_snapshot = prefs.semantic_snapshot();
-                let integrity = prefs.integrity_status();
+                let integrity = prefs.integrity_status(a.bridge.team_id());
                 let policy = (
                     prefs.settings().media_cache_max_mb,
                     prefs.settings().media_cache_max_days,

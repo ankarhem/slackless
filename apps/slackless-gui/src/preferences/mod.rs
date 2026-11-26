@@ -128,10 +128,13 @@ pub struct Preferences {
     pub(super) semantic_indexing: bool,
     pub(super) semantic_status_note: Option<String>,
     pub(super) semantic_snapshot: Option<SemanticStorageSnapshot>,
-    /// Result of the most recent "Verify integrity" run for the active workspace archive.
-    pub(super) integrity_report: Option<slackless_core::store::IntegrityReport>,
-    /// Whether a "Verify integrity" run is in flight.
-    pub(super) integrity_running: bool,
+    /// Result of the most recent "Verify integrity" run, keyed by workspace `TeamId`.
+    pub(super) integrity_reports: std::collections::HashMap<
+        slackless_core::types::TeamId,
+        slackless_core::store::IntegrityReport,
+    >,
+    /// Workspaces with an in-flight "Verify integrity" run.
+    pub(super) integrity_running: std::collections::HashSet<slackless_core::types::TeamId>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -308,8 +311,8 @@ impl Preferences {
                 semantic_indexing: false,
                 semantic_status_note: None,
                 semantic_snapshot: None,
-                integrity_report: None,
-                integrity_running: false,
+                integrity_reports: std::collections::HashMap::new(),
+                integrity_running: std::collections::HashSet::new(),
                 _subscriptions: subscriptions,
             }
         })
@@ -355,22 +358,44 @@ impl Preferences {
         .detach();
     }
 
-    /// Latest SQLite integrity check result and whether a check is currently running.
-    pub fn integrity_status(&self) -> (Option<slackless_core::store::IntegrityReport>, bool) {
-        (self.integrity_report.clone(), self.integrity_running)
+    /// Latest SQLite integrity check result and whether a check is currently running for `team`.
+    pub fn integrity_status(
+        &self,
+        team: Option<&slackless_core::types::TeamId>,
+    ) -> (Option<slackless_core::store::IntegrityReport>, bool) {
+        let Some(team) = team else {
+            return (None, false);
+        };
+        (
+            self.integrity_reports.get(team).cloned(),
+            self.integrity_running.contains(team),
+        )
     }
 
-    /// Mark an integrity check as started (`report == None`) or record its result.
+    /// Mark an integrity check for `team` as started (`running == true`) or record its completion.
     pub fn set_integrity_status(
         &mut self,
+        team: slackless_core::types::TeamId,
         report: Option<slackless_core::store::IntegrityReport>,
         running: bool,
         cx: &mut Context<Self>,
     ) {
-        if report.is_some() || !running {
-            self.integrity_report = report;
+        if running {
+            self.integrity_running.insert(team.clone());
+            if let Some(report) = report {
+                self.integrity_reports.insert(team, report);
+            }
+        } else {
+            self.integrity_running.remove(&team);
+            match report {
+                Some(report) => {
+                    self.integrity_reports.insert(team, report);
+                }
+                None => {
+                    self.integrity_reports.remove(&team);
+                }
+            }
         }
-        self.integrity_running = running;
         cx.notify();
     }
 
