@@ -990,42 +990,6 @@ fn huddles_and_calls_wire_handle_missing_null_and_partial_payloads() {
 
 #[test]
 fn users_usergroups_search_and_edge_search_tolerate_drift() {
-    // SearchMessages with nulls, stringified numbers/bools, and corrupt matches.
-    let sm: SearchMessages = serde_json::from_value(json!({
-        "total": "12",
-        "matches": [
-            {
-                "channel": { "id": "C1", "is_private": "true", "is_mpim": 1, "extra_ch": 1 },
-                "ts": "1700.1",
-                "text": "found it",
-                "blocks": null,
-                "attachments": "bad",
-                "files": null,
-                "extra_hit": "yes"
-            },
-            "corrupt-match"
-        ],
-        "pagination": {
-            "page": "2",
-            "page_count": "5",
-            "per_page": "20",
-            "total_count": "100",
-            "next_cursor": null
-        }
-    }))
-    .expect("search.messages parses");
-    assert_eq!(sm.total, 12);
-    assert_eq!(sm.matches.len(), 1);
-    assert!(sm.matches[0].channel.is_private);
-    assert!(sm.matches[0].channel.is_mpim);
-    assert!(sm.matches[0].extra.contains_key("extra_hit"));
-    let pag = sm.pagination.expect("pagination present");
-    assert_eq!(
-        (pag.page, pag.page_count, pag.per_page, pag.total_count),
-        (2, 5, 20, 100)
-    );
-    assert_eq!(pag.next_cursor, None);
-
     // SearchModulesMessages skips empty channel id, normalizes empty name -> None, clamps page 0 -> 1.
     let mod_msgs: SearchModulesMessagesWire = serde_json::from_value(json!({
         "pagination": { "total_count": 1, "page": 0, "page_count": 1 },

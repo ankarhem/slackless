@@ -5,8 +5,7 @@ use std::collections::HashMap;
 use crate::api::{
     self, ActionContainer, ActivityEntry, ActivityFeed, BlockSuggestionsRequest, ChannelBookmark,
     ClientCounts, FilesFilter, MessageContent, Page, PinnedItem, PostedMessage, ScheduledMessage,
-    ScheduledMessageCreated, SearchMessages, SearchOpts, SectionCreated, SlackApi, ThreadsView,
-    UploadFile, UserBoot,
+    ScheduledMessageCreated, SectionCreated, SlackApi, ThreadsView, UploadFile, UserBoot,
 };
 use crate::types::{
     BotId, BotProfile, ChannelId, ChannelSection, Conversation, DndStatus, File, Message, Team,
@@ -443,15 +442,6 @@ impl UsersBackend for SlackApi {
     async fn end_dnd_snooze(&self) -> api::Result<DndStatus> {
         self.dnd_end_snooze().await
     }
-    async fn dnd_end_dnd(&self) -> api::Result<()> {
-        SlackApi::dnd_end_dnd(self).await
-    }
-    async fn dnd_team_info(
-        &self,
-        users: Vec<UserId>,
-    ) -> api::Result<HashMap<UserId, slackless_types::DndStatus>> {
-        SlackApi::dnd_team_info(self, &users).await
-    }
     async fn create_usergroup(
         &self,
         name: String,
@@ -547,9 +537,6 @@ impl FilesBackend for SlackApi {
 }
 
 impl CollabBackend for SlackApi {
-    async fn search(&self, query: String) -> api::Result<SearchMessages> {
-        self.search_messages(&query, &SearchOpts::default()).await
-    }
     async fn edge_search(
         &self,
         team_id: TeamId,
@@ -749,9 +736,6 @@ impl CollabBackend for SlackApi {
         trigger_id: String,
     ) -> api::Result<api::WorkflowTriggerInfo> {
         self.workflows_triggers_info(&trigger_id).await
-    }
-    async fn views_get(&self, view_id: String) -> api::Result<serde_json::Value> {
-        SlackApi::views_get(self, &view_id).await
     }
     async fn views_submit(
         &self,

@@ -8,7 +8,6 @@
 use crate::api;
 use crate::huddle;
 use crate::rtm::ConnectionState;
-use crate::store::StoredMessage;
 use crate::types::{BotId, ChannelId, File, Message, Presence, Ts, UserId, UsergroupId};
 
 /// Bounded capacity of the dedicated high-frequency huddle media lane.
@@ -125,18 +124,6 @@ pub enum Event {
     },
     /// A user's notifications are paused (snooze or their do-not-disturb window).
     DndPaused { user: UserId, paused: bool },
-    /// Batch DND status results from `dnd.teamInfo` (`F-SHELL-035`).
-    TeamDndLoaded(std::collections::HashMap<UserId, bool>),
-    /// Local store matches for a `CollabCommand::Search`, newest first.
-    SearchResults {
-        query: String,
-        messages: Vec<StoredMessage>,
-    },
-    /// Slack's `search.messages` results for a `CollabCommand::Search`.
-    RemoteSearchResults {
-        query: String,
-        results: Box<api::SearchMessages>,
-    },
     /// The followed threads of `MessagingCommand::FetchThreads`.
     ThreadsView(Box<api::ThreadsView>),
     /// The answer to `MessagingCommand::FetchActivity`.
@@ -187,8 +174,6 @@ pub enum Event {
         text: String,
         thread_ts: Option<Ts>,
     },
-    /// One or more files finished uploading and sharing into `channel`.
-    FilesUploaded { channel: ChannelId, count: usize },
     /// Active `@handle` user groups from `usergroups.list`.
     Usergroups(Vec<crate::types::Usergroup>),
     /// Member user IDs of a `@handle` user group (`usergroups.users.list` / `usergroups.users.update`).

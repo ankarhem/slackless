@@ -224,7 +224,6 @@ impl<B: Backend> Core<B> {
 
     fn handle_collab(&mut self, command: CollabCommand) {
         match command {
-            CollabCommand::Search(query) => self.search(query),
             CollabCommand::QuickSwitchSearch { query } => self.quick_switch_search(query),
             CollabCommand::SearchRemoteMessages { query, sort, page } => {
                 self.search_remote_messages(query, sort, page);
@@ -374,7 +373,6 @@ impl<B: Backend> Core<B> {
                 value,
                 container,
             }),
-            CollabCommand::GetModalView { view_id } => self.get_modal_view(view_id),
             CollabCommand::SubmitModal {
                 view_id,
                 hash,
@@ -438,8 +436,6 @@ impl<B: Backend> Core<B> {
             }
             WorkspaceCommand::SetDndSnooze { minutes } => self.set_dnd_snooze(minutes),
             WorkspaceCommand::EndDndSnooze => self.end_dnd_snooze(),
-            WorkspaceCommand::EndDnd => self.end_dnd(),
-            WorkspaceCommand::LoadTeamDnd(users) => self.load_team_dnd(users),
             WorkspaceCommand::SetGlobalNotificationPref { name, value, sync } => {
                 self.set_global_notification_pref(name, value, sync);
             }

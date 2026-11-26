@@ -462,30 +462,6 @@ impl<B: Backend> Core<B> {
         });
     }
 
-    pub(super) fn end_dnd(&self) {
-        let ctx = self.ctx();
-        self.spawn("dnd.endDnd", async move {
-            ctx.backend.dnd_end_dnd().await?;
-            ctx.events
-                .emit(Event::SelfDndUpdated(slackless_types::DndStatus::default()));
-            Ok(())
-        });
-    }
-
-    pub(super) fn load_team_dnd(&self, users: Vec<UserId>) {
-        let ctx = self.ctx();
-        self.spawn("dnd.teamInfo", async move {
-            let map = ctx.backend.dnd_team_info(users).await?;
-            let now = now_secs();
-            let paused = map
-                .into_iter()
-                .map(|(uid, status)| (uid, status.paused(now)))
-                .collect();
-            ctx.events.emit(Event::TeamDndLoaded(paused));
-            Ok(())
-        });
-    }
-
     pub(super) fn update_profile(&self, update: ProfileUpdate) {
         let ctx = self.ctx();
         let self_user_id = Arc::clone(&self.self_user_id);

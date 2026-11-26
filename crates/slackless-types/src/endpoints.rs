@@ -91,11 +91,9 @@ pub mod method {
     pub const CONVERSATIONS_SET_TOPIC: &str = "conversations.setTopic";
     pub const CONVERSATIONS_TEAM_CONNECTIONS: &str = "conversations.teamConnections";
     pub const CONVERSATIONS_UNARCHIVE: &str = "conversations.unarchive";
-    pub const DND_END_DND: &str = "dnd.endDnd";
     pub const DND_END_SNOOZE: &str = "dnd.endSnooze";
     pub const DND_INFO: &str = "dnd.info";
     pub const DND_SET_SNOOZE: &str = "dnd.setSnooze";
-    pub const DND_TEAM_INFO: &str = "dnd.teamInfo";
     pub const DRAFTS_CREATE: &str = "drafts.create";
     pub const DRAFTS_DELETE: &str = "drafts.delete";
     pub const DRAFTS_LIST: &str = "drafts.list";
@@ -151,7 +149,6 @@ pub mod method {
     pub const SAVED_LIST: &str = "saved.list";
     pub const SAVED_UPDATE: &str = "saved.update";
     pub const SCREENHERO_ROOMS_RENAME: &str = "screenhero.rooms.rename";
-    pub const SEARCH_MESSAGES: &str = "search.messages";
     pub const SEARCH_MODULES_FILES: &str = "search.modules.files";
     pub const SEARCH_MODULES_MESSAGES: &str = "search.modules.messages";
     pub const SLACK_LISTS_ACCESS_DELETE: &str = "slackLists.access.delete";
@@ -186,7 +183,6 @@ pub mod method {
     pub const USERS_PROFILE_SET: &str = "users.profile.set";
     pub const USERS_SET_PHOTO: &str = "users.setPhoto";
     pub const VIEWS_CLOSE: &str = "views.close";
-    pub const VIEWS_GET: &str = "views.get";
     pub const VIEWS_SUBMIT: &str = "views.submit";
     pub const WORKFLOWS_TRIGGERS_INFO: &str = "workflows.triggers.info";
     pub const WORKFLOWS_TRIGGERS_TRIP: &str = "workflows.triggers.trip";

@@ -22,24 +22,6 @@ pub(super) struct BlockSuggestionsParams {
 }
 
 impl<B: Backend> Core<B> {
-    pub(super) fn search(&self, query: String) {
-        let ctx = self.ctx();
-        self.spawn("search", async move {
-            let parsed = SearchQuery::parse(&query);
-            let ws = ctx.workspace.clone();
-            let messages =
-                with_store(&ctx.store, move |s| s.search(&ws, &parsed, SEARCH_LIMIT)).await?;
-            ctx.events.emit(Event::SearchResults {
-                query: query.clone(),
-                messages,
-            });
-            let results = Box::new(ctx.backend.search(query.clone()).await?);
-            ctx.events
-                .emit(Event::RemoteSearchResults { query, results });
-            Ok(())
-        });
-    }
-
     pub(super) fn quick_switch_search(&self, query: String) {
         let ctx = self.ctx();
         self.spawn("edgeapi.search", async move {
@@ -143,14 +125,9 @@ impl<B: Backend> Core<B> {
     ) {
         let ctx = self.ctx();
         self.spawn("files.upload", async move {
-            let uploaded = ctx
-                .backend
-                .upload_files(channel.clone(), thread_ts, content, files)
+            ctx.backend
+                .upload_files(channel, thread_ts, content, files)
                 .await?;
-            ctx.events.emit(Event::FilesUploaded {
-                channel,
-                count: uploaded.len(),
-            });
             Ok(())
         });
     }
@@ -785,17 +762,6 @@ impl<B: Backend> Core<B> {
             };
             ctx.events
                 .emit(Event::WorkflowTriggerInfoLoaded { trigger_id, info });
-            Ok(())
-        });
-    }
-
-    pub(super) fn get_modal_view(&self, view_id: String) {
-        let ctx = self.ctx();
-        self.spawn("views.get", async move {
-            let view = ctx.backend.views_get(view_id).await?;
-            if view.is_object() {
-                ctx.events.emit(Event::ModalUpdated(view));
-            }
             Ok(())
         });
     }

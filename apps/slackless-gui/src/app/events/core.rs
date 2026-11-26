@@ -113,12 +113,6 @@ impl App {
                 self.ws.peer_dnd_paused.insert(user.clone(), *paused);
                 cx.notify();
             }
-            Event::TeamDndLoaded(paused_map) => {
-                self.ws
-                    .peer_dnd_paused
-                    .extend(paused_map.iter().map(|(u, p)| (u.clone(), *p)));
-                cx.notify();
-            }
             Event::ThreadsView(view) => {
                 let total_unread = view.total_unread_replies;
                 self.threads

@@ -1913,43 +1913,6 @@ async fn messages_list_chunks_into_batches_of_eight_channels() {
 }
 
 #[tokio::test]
-async fn dnd_team_info_chunks_by_fifty_and_skips_empty_input() {
-    let (server, api) = setup().await;
-    Mock::given(method("POST"))
-        .and(path("/api/dnd.teamInfo"))
-        .respond_with(|req: &Request| {
-            let pairs = form(req);
-            let csv = field(&pairs, "users").unwrap();
-            let mut users = serde_json::Map::new();
-            for u in csv.split(',') {
-                users.insert(u.to_owned(), json!({ "dnd_enabled": true }));
-            }
-            ResponseTemplate::new(200).set_body_json(json!({ "ok": true, "users": users }))
-        })
-        .expect(3)
-        .mount(&server)
-        .await;
-
-    // Empty input must make zero HTTP requests.
-    assert!(api.dnd_team_info(&[]).await.unwrap().is_empty());
-    assert!(server.received_requests().await.unwrap().is_empty());
-
-    let ids: Vec<UserId> = (0..105).map(|i| UserId::from(format!("U{i}"))).collect();
-    let res = api.dnd_team_info(&ids).await.unwrap();
-    assert_eq!(res.len(), 105);
-
-    let requests = server.received_requests().await.unwrap();
-    let batch_counts: Vec<usize> = requests
-        .iter()
-        .map(|r| {
-            let pairs = form(r);
-            field(&pairs, "users").unwrap().split(',').count()
-        })
-        .collect();
-    assert_eq!(batch_counts, vec![50, 50, 5]);
-}
-
-#[tokio::test]
 async fn edge_channels_and_users_search_use_edge_base_and_mark_membership() {
     use slackless_api::types::TeamId;
 
@@ -2914,20 +2877,6 @@ async fn modal_views_workflows_and_calls_info_endpoints() {
             api.views_submit("V_UPD", None, &json!({})).await.unwrap(),
             ViewSubmitResponse::Update(v) if v["hash"] == "h2"
         ));
-
-        Mock::given(method("POST"))
-            .and(path("/api/views.get"))
-            .and(body_string_contains("view_id=V_GET1"))
-            .and(body_string_contains("_x_reason=fetchView"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "ok": true,
-                "view": { "id": "V_GET1", "type": "modal" }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let fetched = api.views_get("V_GET1").await.unwrap();
-        assert_eq!(fetched["id"], "V_GET1");
 
         Mock::given(method("POST"))
             .and(path("/api/views.close"))

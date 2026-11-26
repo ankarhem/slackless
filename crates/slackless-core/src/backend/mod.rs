@@ -12,7 +12,7 @@ use crate::api::SlackApi;
 use crate::api::{
     self, ActionContainer, ActivityEntry, ActivityFeed, BlockSuggestionsRequest, ChannelBookmark,
     ClientCounts, FilesFilter, MessageContent, Page, PinnedItem, PostedMessage, ScheduledMessage,
-    ScheduledMessageCreated, SearchMessages, SectionCreated, ThreadsView, UploadFile, UserBoot,
+    ScheduledMessageCreated, SectionCreated, ThreadsView, UploadFile, UserBoot,
 };
 use crate::types::{
     BotId, BotProfile, ChannelId, ChannelSection, Conversation, DndStatus, File, Message, Team,
@@ -578,17 +578,6 @@ pub trait UsersBackend: Clone + Send + Sync + 'static {
     fn set_dnd_snooze(&self, minutes: u32) -> impl Future<Output = api::Result<DndStatus>> + Send;
     /// End the signed-in user's active notification snooze (`dnd.endSnooze`).
     fn end_dnd_snooze(&self) -> impl Future<Output = api::Result<DndStatus>> + Send;
-    /// End active DND session (`dnd.endDnd`, `F-SHELL-034`).
-    fn dnd_end_dnd(&self) -> impl Future<Output = api::Result<()>> + Send {
-        async { Ok(()) }
-    }
-    /// Batch DND status lookup (`dnd.teamInfo`, `F-SHELL-035`).
-    fn dnd_team_info(
-        &self,
-        _users: Vec<UserId>,
-    ) -> impl Future<Output = api::Result<HashMap<UserId, slackless_types::DndStatus>>> + Send {
-        async { Ok(HashMap::new()) }
-    }
     /// Create a `@handle` user group (`usergroups.create`).
     fn create_usergroup(
         &self,
@@ -715,7 +704,6 @@ pub trait FilesBackend: Clone + Send + Sync + 'static {
 
 /// Search, GIFs, Canvases, Lists, App Home, Workflows, Modals, and Block Suggestions calls.
 pub trait CollabBackend: Clone + Send + Sync + 'static {
-    fn search(&self, query: String) -> impl Future<Output = api::Result<SearchMessages>> + Send;
     /// Fast remote typeahead (`edgeapi` `users/search` + `channels/search`) for Cmd+K.
     fn edge_search(
         &self,
@@ -1016,13 +1004,6 @@ pub trait CollabBackend: Clone + Send + Sync + 'static {
                 ..Default::default()
             })
         }
-    }
-    /// Fetch the latest modal view payload (`views.get`).
-    fn views_get(
-        &self,
-        _view_id: String,
-    ) -> impl Future<Output = api::Result<serde_json::Value>> + Send {
-        async { Ok(serde_json::Value::Null) }
     }
     /// Submit a Block Kit modal view (`views.submit`).
     fn views_submit(

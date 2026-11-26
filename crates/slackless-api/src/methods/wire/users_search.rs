@@ -1,112 +1,19 @@
-//! Users, profile updates, custom emoji, `search.messages`, `search.modules.*`, and Edge search.
+//! Users, profile updates, custom emoji, `search.modules.*`, and Edge search.
 
 use std::collections::HashMap;
 
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
-use crate::de::{lenient_bool, lenient_u32, lenient_vec, or_default};
-use crate::types::{
-    Attachment, Block, ChannelId, Conversation, File, Message, TeamId, Ts, User, UserId,
-};
+use crate::de::{lenient_vec, or_default};
+use crate::types::{ChannelId, Conversation, File, Message, User};
 
-/// `sort` for `search.messages`.
+/// `sort` for `search.modules.*`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SearchSort {
     #[default]
     Score,
     Timestamp,
-}
-
-/// Options for `search.messages`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SearchOpts {
-    /// Results per page (max 100).
-    pub count: Option<u32>,
-    /// 1-based page (max 100). Ignored by Slack when `cursor` is set.
-    pub page: Option<u32>,
-    /// `*` for the first cursor page, then `pagination.next_cursor`.
-    pub cursor: Option<String>,
-    pub sort: SearchSort,
-    /// Ascending instead of descending.
-    pub ascending: bool,
-    /// Wrap hits in U+E000 / U+E001.
-    pub highlight: bool,
-}
-
-/// `search.messages` `messages` object.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-pub struct SearchMessages {
-    #[serde(default, deserialize_with = "lenient_u32")]
-    pub total: u32,
-    #[serde(default, deserialize_with = "lenient_vec")]
-    pub matches: Vec<SearchMatch>,
-    #[serde(default, deserialize_with = "or_default")]
-    pub pagination: Option<SearchPagination>,
-}
-
-/// One `search.messages` hit. `channel` is an object here, unlike in [`Message`].
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-pub struct SearchMatch {
-    #[serde(default, deserialize_with = "or_default")]
-    pub channel: SearchChannel,
-    #[serde(default)]
-    pub ts: Ts,
-    #[serde(default, deserialize_with = "or_default")]
-    pub text: String,
-    #[serde(default, deserialize_with = "or_default")]
-    pub user: Option<UserId>,
-    #[serde(default, deserialize_with = "or_default")]
-    pub username: Option<String>,
-    #[serde(default, deserialize_with = "or_default")]
-    pub team: Option<TeamId>,
-    #[serde(default, deserialize_with = "or_default")]
-    pub permalink: Option<String>,
-    #[serde(default, deserialize_with = "or_default")]
-    pub iid: Option<String>,
-    /// `message`, `im`, `group`, ...
-    #[serde(rename = "type", default, deserialize_with = "or_default")]
-    pub kind: Option<String>,
-    #[serde(default, deserialize_with = "or_default")]
-    pub blocks: Vec<Block>,
-    #[serde(default, deserialize_with = "or_default")]
-    pub attachments: Vec<Attachment>,
-    #[serde(default, deserialize_with = "or_default")]
-    pub files: Vec<File>,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
-}
-
-/// `search.messages` match `channel`.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-pub struct SearchChannel {
-    #[serde(default)]
-    pub id: ChannelId,
-    /// For IM hits, the other user's id.
-    #[serde(default, deserialize_with = "or_default")]
-    pub name: Option<String>,
-    #[serde(default, deserialize_with = "lenient_bool")]
-    pub is_private: bool,
-    #[serde(default, deserialize_with = "lenient_bool")]
-    pub is_mpim: bool,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
-}
-
-/// `search.messages` `pagination`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-pub struct SearchPagination {
-    #[serde(default, deserialize_with = "lenient_u32")]
-    pub page: u32,
-    #[serde(default, deserialize_with = "lenient_u32")]
-    pub page_count: u32,
-    #[serde(default, deserialize_with = "lenient_u32")]
-    pub per_page: u32,
-    #[serde(default, deserialize_with = "lenient_u32")]
-    pub total_count: u32,
-    /// Empty/absent on the last cursor page.
-    #[serde(default, deserialize_with = "or_default")]
-    pub next_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,12 +25,6 @@ pub(in crate::methods) struct UserWire {
 pub(in crate::methods) struct MembersWire {
     #[serde(default, deserialize_with = "lenient_vec")]
     pub(in crate::methods) members: Vec<User>,
-}
-
-#[derive(Deserialize)]
-pub(in crate::methods) struct SearchWire {
-    #[serde(default, deserialize_with = "or_default")]
-    pub(in crate::methods) messages: SearchMessages,
 }
 
 #[derive(Deserialize)]

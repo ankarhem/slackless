@@ -320,8 +320,6 @@ pub enum ChannelCommand {
 /// Search, files, canvases, Slack Lists, app home, workflows, and Block Kit interactions/modals.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CollabCommand {
-    /// Search with Slack's modifier syntax: local store results first, then Slack's.
-    Search(String),
     /// Fast remote typeahead for Cmd+K Quick Switcher (`edgeapi`).
     QuickSwitchSearch { query: String },
     /// Opt-in remote Slack message search (`search.modules.messages`).
@@ -494,8 +492,6 @@ pub enum CollabCommand {
         value: String,
         container: api::ActionContainer,
     },
-    /// Fetch a Block Kit modal view by ID (`views.get`).
-    GetModalView { view_id: String },
     /// Submit an interactive Block Kit modal (`views.submit`).
     SubmitModal {
         view_id: String,
@@ -588,7 +584,6 @@ pub enum HuddleControlCommand {
     SetStickyEmoji(Option<String>),
     SendDraw(huddle::HuddleDrawMessage),
     SetJukebox(Option<String>),
-    MutePeer(String),
     SetAudioOnly(bool),
 }
 
@@ -632,7 +627,6 @@ impl From<HuddleControlCommand> for huddle::HuddleControl {
             HuddleControlCommand::SetStickyEmoji(emoji) => Self::SetStickyEmoji(emoji),
             HuddleControlCommand::SendDraw(draw) => Self::SendDraw(draw),
             HuddleControlCommand::SetJukebox(song) => Self::SetJukebox(song),
-            HuddleControlCommand::MutePeer(peer_id) => Self::MutePeer(peer_id),
             HuddleControlCommand::SetAudioOnly(enabled) => Self::SetAudioOnly(enabled),
         }
     }
@@ -673,10 +667,6 @@ pub enum WorkspaceCommand {
     SetDndSnooze { minutes: u32 },
     /// Resume the signed-in user's notifications immediately (`dnd.endSnooze`).
     EndDndSnooze,
-    /// End the signed-in user's active DND session (`dnd.endDnd`, `F-SHELL-034`).
-    EndDnd,
-    /// Batch-fetch DND status for a list of users (`dnd.teamInfo`, `F-SHELL-035`).
-    LoadTeamDnd(Vec<UserId>),
     /// Write a global notification preference (`users.prefs.setNotifications` with `global=true`).
     SetGlobalNotificationPref {
         name: String,

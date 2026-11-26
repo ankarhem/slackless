@@ -180,17 +180,6 @@ impl SlackApi {
         Ok(options)
     }
 
-    /// `views.get`: fetch the latest Block Kit modal view JSON by `view_id` (`F-COLLAB-600`).
-    pub async fn views_get(&self, view_id: &str) -> Result<Value> {
-        let params = vec![
-            ("view_id", view_id.to_owned()),
-            ("_x_reason", "fetchView".to_owned()),
-            ("_x_mode", MODE_ONLINE.to_owned()),
-        ];
-        let raw: Value = self.call(method::VIEWS_GET, params).await?.data;
-        Ok(raw.get("view").cloned().unwrap_or(raw))
-    }
-
     /// `views.submit`: submit a Block Kit modal view's `state.values` back to the app
     /// (`F-COLLAB-605..612`), returning the parsed `response_action` (`push`, `update`, `clear`,
     /// `errors`, or default close).
@@ -471,37 +460,6 @@ impl SlackApi {
         Ok(self.call(method::DND_END_SNOOZE, Vec::new()).await?.data)
     }
 
-    /// `dnd.endDnd`: end the signed-in user's active do-not-disturb session (`F-SHELL-034`).
-    pub async fn dnd_end_dnd(&self) -> Result<()> {
-        self.call_ok(method::DND_END_DND, Vec::new()).await
-    }
-
-    /// `dnd.teamInfo`: batch DND status lookup for up to 50 users per request (`F-SHELL-035`).
-    pub async fn dnd_team_info(&self, users: &[UserId]) -> Result<HashMap<UserId, DndStatus>> {
-        #[derive(Deserialize, Default)]
-        struct DndTeamWire {
-            #[serde(default)]
-            users: HashMap<UserId, DndStatus>,
-        }
-        let mut out = HashMap::new();
-        for chunk in users.chunks(50) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let csv = chunk
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
-            let wire: DndTeamWire = self
-                .call(method::DND_TEAM_INFO, vec![("users", csv)])
-                .await?
-                .data;
-            out.extend(wire.users);
-        }
-        Ok(out)
-    }
-
     /// `users.getPresence`: one user's current presence. Read-only.
     pub async fn users_get_presence(&self, user: &UserId) -> Result<UserPresence> {
         let params = vec![("user", user.to_string())];
@@ -767,41 +725,6 @@ impl SlackApi {
         }
         self.call_ok(method::USERS_CHANNEL_SECTIONS_CHANNELS_BULK_UPDATE, params)
             .await
-    }
-
-    /// `search.messages` with Slack's query modifier syntax (`in:`, `from:`, `before:`, ...).
-    pub async fn search_messages(&self, query: &str, opts: &SearchOpts) -> Result<SearchMessages> {
-        let mut params = vec![
-            ("query", query.to_owned()),
-            (
-                "sort",
-                match opts.sort {
-                    SearchSort::Score => "score",
-                    SearchSort::Timestamp => "timestamp",
-                }
-                .to_owned(),
-            ),
-            (
-                "sort_dir",
-                if opts.ascending { "asc" } else { "desc" }.to_owned(),
-            ),
-        ];
-        if let Some(count) = opts.count {
-            params.push(("count", count.to_string()));
-        }
-        if let Some(page) = opts.page {
-            params.push(("page", page.to_string()));
-        }
-        if let Some(cursor) = &opts.cursor {
-            params.push(("cursor", cursor.clone()));
-        }
-        if opts.highlight {
-            params.push(("highlight", "true".to_owned()));
-        }
-        let resp = self
-            .call::<SearchWire>(method::SEARCH_MESSAGES, params)
-            .await?;
-        Ok(resp.data.messages)
     }
 
     /// `emoji.list`: custom emoji name -> image URL or `alias:<name>`.

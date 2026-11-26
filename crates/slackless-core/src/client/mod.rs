@@ -30,7 +30,7 @@ use crate::fetcher::Fetcher;
 use crate::rtm::ConnectionState;
 use crate::rtm::{ConnectParams, RtmClient, RtmConfig, RtmEvent};
 use crate::runtime::shared_runtime;
-use crate::store::{SearchQuery, Store, StoreError};
+use crate::store::{Store, StoreError};
 use crate::types::event::MessageEvent;
 use crate::types::time::now_epoch_secs;
 use crate::types::{
@@ -100,9 +100,6 @@ pub type EventReceiver = UnboundedReceiver<Event>;
 pub type HuddleMediaSender = mpsc::Sender<HuddleMediaEvent>;
 /// Bounded receiver for high-frequency [`HuddleMediaEvent`]s emitted by active native huddles.
 pub type HuddleMediaReceiver = mpsc::Receiver<HuddleMediaEvent>;
-
-/// Local search results returned per [`CollabCommand::Search`].
-const SEARCH_LIMIT: usize = 200;
 
 /// The orchestrator entry point.
 pub struct Client;

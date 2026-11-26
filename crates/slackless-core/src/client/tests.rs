@@ -4,7 +4,7 @@ use std::time::Duration;
 use super::*;
 use crate::api::{
     self, ChannelBookmark, ClientCounts, FilesFilter, MessageContent, Page, PinnedItem,
-    PostedMessage, SearchMessages, UserBoot,
+    PostedMessage, UserBoot,
 };
 use crate::rtm::ConnectionState;
 use crate::types::{
@@ -1658,13 +1658,6 @@ impl crate::backend::CollabBackend for FakeBackend {
         Ok(vec![("Option A".to_owned(), "a".to_owned())])
     }
 
-    async fn search(&self, _: String) -> api::Result<SearchMessages> {
-        Ok(SearchMessages {
-            total: 7,
-            ..Default::default()
-        })
-    }
-
     async fn edge_search(
         &self,
         team_id: TeamId,
@@ -2449,16 +2442,6 @@ async fn commands_update_the_store_and_report_back() {
         .channel_history(&TeamId::from("T1"), &c1(), None, 10)
         .unwrap();
     assert_eq!(history[0].message.text, "hi there");
-
-    core.handle(Command::Collab(CollabCommand::Search("there".into())))
-        .await;
-    let Event::SearchResults { query, messages } = next(&mut rx).await else {
-        panic!("expected local results first");
-    };
-    assert_eq!((query.as_str(), messages.len()), ("there", 1));
-    assert!(
-        matches!(next(&mut rx).await, Event::RemoteSearchResults { results, .. } if results.total == 7)
-    );
 
     core.handle(Command::Messaging(MessagingCommand::MarkRead {
         channel: c1(),
@@ -3895,44 +3878,6 @@ async fn open_group_dm_stores_mpim_conversation() {
         .expect("the group DM lands in the store");
     assert!(stored.is_mpim);
     assert_eq!(stored.members, vec![UserId::from("U2"), UserId::from("U3")]);
-}
-
-#[tokio::test]
-async fn upload_files_calls_backend_and_emits_uploaded_count() {
-    let (store, events, mut rx) = fake_core_parts();
-    let mut core = Core::new(
-        FakeBackend::default(),
-        Arc::clone(&store),
-        TeamId::from("T1"),
-        events,
-        test_media_tx(),
-    )
-    .await;
-
-    core.handle(Command::Collab(CollabCommand::UploadFiles {
-        channel: ChannelId::from("C1"),
-        thread_ts: None,
-        content: Some(MessageContent::plain("attached")),
-        files: vec![
-            api::UploadFile {
-                filename: "a.png".into(),
-                bytes: vec![1, 2, 3].into(),
-            },
-            api::UploadFile {
-                filename: "b.txt".into(),
-                bytes: vec![4, 5].into(),
-            },
-        ],
-    }))
-    .await;
-
-    assert_eq!(
-        next(&mut rx).await,
-        Event::FilesUploaded {
-            channel: ChannelId::from("C1"),
-            count: 2,
-        }
-    );
 }
 
 #[tokio::test]
@@ -8768,7 +8713,7 @@ async fn channels_tabs_dnd_presence_profile_usergroups_and_sign_out_commands() {
     }))
     .await;
 
-    // Global notif pref, DND end/team, presence active/away, user pref, photo, usergroups, profile, sign out.
+    // Global notif pref, presence active/away, user pref, photo, usergroups, profile, sign out.
     core.handle(Command::Workspace(
         WorkspaceCommand::SetGlobalNotificationPref {
             name: "highlight_words".into(),
@@ -8776,12 +8721,6 @@ async fn channels_tabs_dnd_presence_profile_usergroups_and_sign_out_commands() {
             sync: true,
         },
     ))
-    .await;
-    core.handle(Command::Workspace(WorkspaceCommand::EndDnd))
-        .await;
-    core.handle(Command::Workspace(WorkspaceCommand::LoadTeamDnd(vec![
-        u1.clone(),
-    ])))
     .await;
     core.handle(Command::Workspace(WorkspaceCommand::SetPresence {
         away: true,
@@ -8830,13 +8769,10 @@ async fn channels_tabs_dnd_presence_profile_usergroups_and_sign_out_commands() {
     .await;
 
     let mut saw_profile = false;
-    let mut saw_team_dnd = false;
     let mut saw_away = false;
     let mut saw_active = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline
-        && !(saw_profile && saw_team_dnd && saw_away && saw_active)
-    {
+    while tokio::time::Instant::now() < deadline && !(saw_profile && saw_away && saw_active) {
         match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
             Ok(Ok(Event::UserProfileLoaded {
                 pronouns,
@@ -8850,7 +8786,6 @@ async fn channels_tabs_dnd_presence_profile_usergroups_and_sign_out_commands() {
                 assert!(locked_fields.iter().any(|(k, _)| k == "Title"));
                 saw_profile = true;
             }
-            Ok(Ok(Event::TeamDndLoaded(_))) => saw_team_dnd = true,
             Ok(Ok(Event::Presence {
                 presence: Presence::Away,
                 ..
@@ -8863,7 +8798,7 @@ async fn channels_tabs_dnd_presence_profile_usergroups_and_sign_out_commands() {
             _ => break,
         }
     }
-    assert!(saw_profile && saw_team_dnd && saw_away && saw_active);
+    assert!(saw_profile && saw_away && saw_active);
     core.shutdown().await;
 }
 
