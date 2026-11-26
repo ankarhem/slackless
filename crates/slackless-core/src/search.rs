@@ -683,6 +683,25 @@ pub(crate) fn match_excerpt(body: &str, terms: &[String]) -> Option<String> {
     if collapsed.is_empty() {
         return None;
     }
+    let find_match = |lowered: &str| {
+        terms
+            .iter()
+            .map(|t| t.trim_end_matches('*').to_lowercase())
+            .filter(|t| !t.is_empty())
+            .find_map(|t| lowered.find(t.as_str()))
+    };
+    // ASCII text lowercases one byte per char, so byte offsets are char offsets and the fold
+    // map below is not needed.
+    if collapsed.is_ascii() {
+        let matched_pos = find_match(&collapsed.to_ascii_lowercase())?;
+        let total = collapsed.len();
+        if total <= 120 {
+            return Some(collapsed);
+        }
+        let start = matched_pos.saturating_sub(36);
+        let end = (start + 120).min(total);
+        return Some(windowed_excerpt(&collapsed[start..end], start, end, total));
+    }
     let chars: Vec<char> = collapsed.chars().collect();
     // Map each UTF-8 byte offset of `lowered` back to its source char index in `chars` so
     // Unicode case-folding that changes byte or char counts (e.g. `İ` -> `i\u{307}`, `ẞ` -> `ß`)
@@ -695,11 +714,7 @@ pub(crate) fn match_excerpt(body: &str, terms: &[String]) -> Option<String> {
             byte_to_char_ix.resize(lowered.len(), ci);
         }
     }
-    let matched_pos = terms
-        .iter()
-        .map(|t| t.trim_end_matches('*').to_lowercase())
-        .filter(|t| !t.is_empty())
-        .find_map(|t| lowered.find(t.as_str()))?;
+    let matched_pos = find_match(&lowered)?;
     if chars.len() <= 120 {
         return Some(collapsed);
     }
@@ -711,15 +726,20 @@ pub(crate) fn match_excerpt(body: &str, terms: &[String]) -> Option<String> {
     let start = char_pos.saturating_sub(36);
     let end = (start + 120).min(chars.len());
     let slice: String = chars[start..end].iter().collect();
+    Some(windowed_excerpt(&slice, start, end, chars.len()))
+}
+
+/// The `start..end` window of a `total`-char text, trimmed, with an ellipsis at every cut end.
+fn windowed_excerpt(slice: &str, start: usize, end: usize, total: usize) -> String {
     let mut out = String::new();
     if start > 0 {
         out.push('…');
     }
     out.push_str(slice.trim());
-    if end < chars.len() {
+    if end < total {
         out.push('…');
     }
-    Some(out)
+    out
 }
 
 /// Collapse whitespace and cap `text` at `max_chars` characters, ending a cut with an ellipsis.
@@ -1029,7 +1049,29 @@ mod tests {
     }
 
     #[test]
-    fn match_excerpt_handles_expanding_unicode_case_folding_without_panicking() {
+    fn match_excerpt_windows_around_the_first_match_in_ascii_and_folding_text() {
+        let filler = "lorem ipsum dolor sit amet ".repeat(8);
+        let term = ["zephyrprobe".to_owned()];
+        // Short ASCII bodies come back whole, whitespace collapsed.
+        assert_eq!(
+            match_excerpt("  ship   zephyrprobe  today ", &term).as_deref(),
+            Some("ship zephyrprobe today")
+        );
+        // A long ASCII body is cut to a window around the match, with an ellipsis at each cut.
+        let mid = format!("{filler}zephyrprobe rollout verified{filler}");
+        let excerpt = match_excerpt(&mid, &term).expect("must extract excerpt around match");
+        assert!(excerpt.contains("zephyrprobe"));
+        assert!(excerpt.starts_with('…'));
+        assert!(excerpt.ends_with('…'));
+        assert!(excerpt.chars().count() <= 122);
+        // A match near the start keeps the beginning; a miss is `None`.
+        let early = format!("zephyrprobe {filler}{filler}");
+        let excerpt = match_excerpt(&early, &term).expect("match at the start");
+        assert!(excerpt.starts_with("zephyrprobe"));
+        assert!(excerpt.ends_with('…'));
+        assert_eq!(match_excerpt(&early, &["absent".to_owned()]), None);
+        assert_eq!(match_excerpt("   ", &term), None);
+
         // `İ` (U+0130, 2 UTF-8 bytes -> `i\u{307}`, 3 UTF-8 bytes) and `ẞ` (3 bytes -> `ß`, 2 bytes)
         // shift byte offsets between `collapsed` and `lowered` across a >120-char body.
         let prefix = "İstanbul Straße ".repeat(12);
@@ -1037,8 +1079,7 @@ mod tests {
         let body = format!("{prefix}zephyrprobe rollout verified{suffix}");
         assert!(body.chars().count() > 120);
 
-        let excerpt = match_excerpt(&body, &["zephyrprobe".to_owned()])
-            .expect("must extract excerpt around match");
+        let excerpt = match_excerpt(&body, &term).expect("must extract excerpt around match");
         assert!(excerpt.contains("zephyrprobe"));
         assert!(excerpt.starts_with('…'));
         assert!(excerpt.ends_with('…'));
