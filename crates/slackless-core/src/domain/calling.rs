@@ -163,6 +163,7 @@ pub fn sample_calling_apps() -> Vec<CallingApp> {
 pub fn detect_calling_apps(app_commands: &[AppCommand], bot_names: &[&str]) -> Vec<CallingApp> {
     let mut apps = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_commands = std::collections::HashSet::new();
 
     // 1. Match known calling providers from installed slash commands first (most accurate).
     for cmd in app_commands {
@@ -170,28 +171,30 @@ pub fn detect_calling_apps(app_commands: &[AppCommand], bot_names: &[&str]) -> V
         if let Some(provider) = KNOWN_PROVIDERS
             .iter()
             .find(|p| p.commands.contains(&name.as_str()))
-            && seen_ids.insert(provider.id.to_owned())
         {
-            apps.push(CallingApp {
-                id: provider.id.to_owned(),
-                name: cmd
-                    .app_name
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(provider.name)
-                    .to_owned(),
-                command: format!("/{name}"),
-                app_id: cmd.app_id.clone(),
-                supports_audio_only: provider.supports_audio_only,
-                logout_command: provider.logout_command.map(str::to_owned),
-            });
+            seen_commands.insert(name.clone());
+            if seen_ids.insert(provider.id.to_owned()) {
+                apps.push(CallingApp {
+                    id: provider.id.to_owned(),
+                    name: cmd
+                        .app_name
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(provider.name)
+                        .to_owned(),
+                    command: format!("/{name}"),
+                    app_id: cmd.app_id.clone(),
+                    supports_audio_only: provider.supports_audio_only,
+                    logout_command: provider.logout_command.map(str::to_owned),
+                });
+            }
         }
     }
 
     // 2. Match any additional installed app command whose description clearly advertises calling.
     for cmd in app_commands {
         let name = cmd.name.trim().trim_start_matches('/').to_ascii_lowercase();
-        if name.is_empty() || seen_ids.contains(&name) {
+        if name.is_empty() || seen_ids.contains(&name) || seen_commands.contains(&name) {
             continue;
         }
         let desc = cmd.description.to_ascii_lowercase();
@@ -202,6 +205,7 @@ pub fn detect_calling_apps(app_commands: &[AppCommand], bot_names: &[&str]) -> V
             || desc.contains("video meeting")
             || name == "call";
         if looks_like_call && seen_ids.insert(name.clone()) {
+            seen_commands.insert(name.clone());
             apps.push(CallingApp {
                 id: name.clone(),
                 name: cmd
@@ -266,9 +270,17 @@ pub fn call_provider_for_url(url: &str) -> Option<&'static str> {
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     let path = parsed.path().to_ascii_lowercase();
 
-    if scheme == "zoommtg"
-        || scheme == "zoomus"
-        || host == "zoom.us"
+    if scheme == "zoommtg" || scheme == "zoomus" {
+        return Some("Zoom");
+    }
+    if scheme == "msteams" {
+        return Some("Microsoft Teams");
+    }
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+
+    if host == "zoom.us"
         || host.ends_with(".zoom.us")
         || host == "zoom.com"
         || host.ends_with(".zoom.com")
@@ -278,9 +290,8 @@ pub fn call_provider_for_url(url: &str) -> Option<&'static str> {
     if host == "meet.google.com" {
         return Some("Google Meet");
     }
-    if scheme == "msteams"
-        || ((host == "teams.microsoft.com" || host == "teams.live.com")
-            && (path.contains("/meetup-join/") || path.contains("/meet/")))
+    if (host == "teams.microsoft.com" || host == "teams.live.com")
+        && (path.contains("/meetup-join/") || path.contains("/meet/"))
     {
         return Some("Microsoft Teams");
     }
@@ -332,14 +343,15 @@ mod tests {
             cmd(
                 "teams-calls",
                 Some("Microsoft Teams Calls"),
-                "Start a Teams meeting",
+                "Start a video call in Microsoft Teams",
             ),
+            cmd("gmeet", Some("Google Meet"), "Start a video meeting"),
             cmd("customcall", Some("Acme Call"), "Start a video call"),
             cmd("giphy", Some("Giphy"), "Post a random gif"),
         ];
         let detected = detect_calling_apps(&commands, &["Zoom", "Google Meet", "Linear"]);
         let ids: Vec<&str> = detected.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, vec!["zoom", "teams", "customcall", "meet"]);
+        assert_eq!(ids, vec!["zoom", "teams", "meet", "customcall"]);
         assert_eq!(
             detected[1].logout_command.as_deref(),
             Some("/teams-calls logout")
@@ -386,6 +398,14 @@ mod tests {
         assert_eq!(
             call_provider_for_url("https://acme.webex.com/meet/alice"),
             Some("Cisco Webex")
+        );
+        assert_eq!(
+            call_provider_for_url("javascript://zoom.us/j/123456789"),
+            None
+        );
+        assert_eq!(
+            call_provider_for_url("file://meet.google.com/abc-defg-hij"),
+            None
         );
         assert_eq!(call_provider_for_url("https://example.com/docs"), None);
     }

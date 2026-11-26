@@ -2721,6 +2721,25 @@ async fn modal_views_workflows_and_calls_info_endpoints() {
 
         Mock::given(method("POST"))
             .and(path("/api/views.submit"))
+            .and(body_string_contains("view_id=V_AUTH_ERR"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": false,
+                "error": "invalid_auth"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let auth_err = api
+            .views_submit("V_AUTH_ERR", None, &json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            auth_err.is_auth_expired(),
+            "views.submit invalid_auth must classify as AuthExpired, got {auth_err:?}"
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/api/views.submit"))
             .and(body_string_contains("view_id=V_CLEAR"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "ok": true,

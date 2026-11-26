@@ -2187,8 +2187,8 @@ fn modal_stack_lifecycle_inline_errors_suggestions_workflows_and_calling_apps(
 
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
+            use gpui::WeakEntity;
             use slackless_core::api::ViewSubmitResponse;
-            use slackless_core::domain::calling::CallMode;
 
             // 1. Open root modal V1 -> map server inline errors -> push V2 -> update V2 ->
             //    deliver modal external_select suggestions -> pop back to V1 -> push V3 -> clear all.
@@ -2275,7 +2275,15 @@ fn modal_stack_lifecycle_inline_errors_suggestions_workflows_and_calling_apps(
                 Some("h2-updated")
             );
 
-            // Async blocks.suggestions in modal populates V2's BlockKitState.
+            // Async blocks.suggestions in modal populates V2's BlockKitState (and ignores
+            // prefix-colliding keys like modal-V20/...).
+            app.modal_stack.update(cx, |stack, cx| {
+                stack.set_suggestions(
+                    "modal-V20/b_issue/a_issue",
+                    vec![("Wrong".to_owned(), "W".to_owned())],
+                    cx,
+                );
+            });
             app.request_modal_suggestions(
                 slackless_core::types::BotId::from("B1"),
                 "A1".to_owned(),
@@ -2311,7 +2319,7 @@ fn modal_stack_lifecycle_inline_errors_suggestions_workflows_and_calling_apps(
             app.handle_modal_submit_result("V3", Ok(ViewSubmitResponse::Clear), window, cx);
             assert_eq!(app.modal_stack.read(cx).depth(), 0);
 
-            // 2. Workflow details dialog opens cleanly and folds WorkflowTriggerInfoLoaded.
+            // 2. Workflow details dialog opens cleanly and releases its entity when closed.
             app.open_workflow_details(
                 crate::blockkit::WorkflowDetailsRequest {
                     trigger_id: Some("Ft0DEPLOY".to_owned()),
@@ -2321,8 +2329,29 @@ fn modal_stack_lifecycle_inline_errors_suggestions_workflows_and_calling_apps(
                 window,
                 cx,
             );
-            assert!(app.workflow_details.is_some());
+            assert!(
+                app.workflow_details
+                    .as_ref()
+                    .and_then(WeakEntity::upgrade)
+                    .is_some(),
+                "open WorkflowDetailsView dialog must be alive"
+            );
             window.close_dialog(cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            use gpui::WeakEntity;
+            use slackless_core::domain::calling::CallMode;
+
+            assert!(
+                app.workflow_details
+                    .as_ref()
+                    .and_then(WeakEntity::upgrade)
+                    .is_none(),
+                "closing WorkflowDetailsView dialog must release the entity"
+            );
 
             // 3. Third-party calling apps catalog + launcher dialog + launch flow.
             let calling_apps = app.calling_apps();

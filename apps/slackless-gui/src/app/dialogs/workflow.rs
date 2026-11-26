@@ -632,17 +632,27 @@ impl App {
             ..req
         };
         let view = WorkflowDetailsView::new(cx.entity().downgrade(), req, self.fixtures.sample, cx);
-        self.workflow_details = Some(view.clone());
+        self.workflow_details = Some(view.downgrade());
         if !self.fixtures.sample
             && let Some(tid) = trigger_id
         {
             self.bridge
                 .send(CollabCommand::FetchWorkflowTriggerInfo { trigger_id: tid });
         }
+        let view_id = view.entity_id();
+        let app_close = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, _| {
+            let app_close = app_close.clone();
             dialog
                 .title("Workflow details")
                 .w(px(480.))
+                .on_close(move |_, _, cx| {
+                    let _ = app_close.update(cx, |app, _| {
+                        if app.workflow_details.as_ref().map(|w| w.entity_id()) == Some(view_id) {
+                            app.workflow_details = None;
+                        }
+                    });
+                })
                 .child(view.clone())
         });
     }

@@ -183,6 +183,7 @@ struct FakeState {
     app_commands: Vec<api::AppCommand>,
     fail_activity_feed: bool,
     fail_messages_list: bool,
+    fail_block_suggestions: bool,
     /// Additional command group hooks & call logs.
     run_command_error: Option<String>,
     block_action_calls: Vec<(BotId, String, TeamId)>,
@@ -1546,6 +1547,16 @@ impl crate::backend::FilesBackend for FakeBackend {
 }
 
 impl crate::backend::CollabBackend for FakeBackend {
+    async fn block_suggestions(
+        &self,
+        _req: api::BlockSuggestionsRequest<'_>,
+    ) -> api::Result<Vec<(String, String)>> {
+        if self.state.lock().unwrap().fail_block_suggestions {
+            return Err(ApiError::Slack("suggestions_failed".into()));
+        }
+        Ok(vec![("Option A".to_owned(), "a".to_owned())])
+    }
+
     async fn search(&self, _: String) -> api::Result<SearchMessages> {
         Ok(SearchMessages {
             total: 7,
@@ -6794,5 +6805,44 @@ async fn usergroup_disable_enable_and_users_commands_update_state_and_emit_event
     assert_eq!(
         state.usergroup_users_update_calls,
         vec![(ug_id, updated_members)]
+    );
+}
+
+#[tokio::test]
+async fn block_suggestions_error_still_emits_empty_event_to_clear_loading() {
+    let fake = FakeBackend::default();
+    fake.state.lock().unwrap().fail_block_suggestions = true;
+    let (store, events, mut rx) = fake_core_parts();
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
+    core.handle(Command::Collab(CollabCommand::BlockSuggestions {
+        key: "modal-V1/b_ext/a_ext".to_owned(),
+        bot: BotId::from("B1"),
+        app_id: "A1".to_owned(),
+        team: TeamId::from("T1"),
+        action_id: "a_ext".to_owned(),
+        block_id: "b_ext".to_owned(),
+        value: "eng".to_owned(),
+        container: api::ActionContainer {
+            channel: ChannelId::from("C1"),
+            message_ts: Ts::default(),
+            attachment_id: None,
+            is_ephemeral: false,
+            view_id: Some("V1".to_owned()),
+        },
+    }))
+    .await;
+    assert_eq!(
+        next(&mut rx).await,
+        Event::BlockSuggestions {
+            key: "modal-V1/b_ext/a_ext".to_owned(),
+            options: Vec::new(),
+        }
     );
 }

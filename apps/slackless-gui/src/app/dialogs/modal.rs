@@ -493,7 +493,10 @@ impl AppModalStack {
     ) {
         let mut updated = false;
         for frame in &self.frames {
-            if key.starts_with(frame.ts.as_str()) {
+            if key
+                .strip_prefix(frame.ts.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+            {
                 frame.kit.update(cx, |kit, cx| {
                     kit.set_suggestions(key.to_owned(), options.clone());
                     cx.notify();

@@ -725,12 +725,24 @@ impl<B: Backend> Core<B> {
                 value: &params.value,
                 container: &params.container,
             };
-            let options = ctx.backend.block_suggestions(req).await?;
-            ctx.events.emit(Event::BlockSuggestions {
-                key: params.key,
-                options,
-            });
-            Ok(())
+            match ctx.backend.block_suggestions(req).await {
+                Ok(options) => {
+                    ctx.events.emit(Event::BlockSuggestions {
+                        key: params.key,
+                        options,
+                    });
+                    Ok(())
+                }
+                Err(err) => {
+                    // Always emit an empty suggestions result so UI loading state clears and
+                    // users can retry instead of remaining permanently disabled.
+                    ctx.events.emit(Event::BlockSuggestions {
+                        key: params.key,
+                        options: Vec::new(),
+                    });
+                    Err(err.into())
+                }
+            }
         });
     }
 

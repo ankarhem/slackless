@@ -191,7 +191,10 @@ pub(in crate::blockkit) fn text_input(
         .and_then(|kit| kit.read(cx).inputs.get(key).cloned())
     {
         let value = input.read(cx).value();
-        let block_id = block["block_id"].as_str().unwrap_or_default();
+        let block_id = block["block_id"]
+            .as_str()
+            .or_else(|| key.split('/').nth(1))
+            .unwrap_or_default();
         let has_block_error = kcx
             .kit
             .and_then(|kit| kit.read(cx).block_error(block_id))

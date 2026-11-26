@@ -221,7 +221,7 @@ pub(in crate::methods) fn parse_view_submit_response(
             .and_then(Value::as_str)
             .unwrap_or("unknown_error")
             .to_owned();
-        return Err(crate::ApiError::Slack(code));
+        return Err(crate::ApiError::from_slack_error(code));
     }
     match response_action {
         "clear" => Ok(ViewSubmitResponse::Clear),

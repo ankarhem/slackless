@@ -395,9 +395,15 @@ impl App {
                 notify("Workflow started", detail, window, cx);
             }
             Event::WorkflowTriggerInfoLoaded { trigger_id, info } => {
-                if let Some(view) = self.workflow_details.clone() {
+                if let Some(view) = self
+                    .workflow_details
+                    .as_ref()
+                    .and_then(gpui_kit::gpui::WeakEntity::upgrade)
+                {
                     let mapped = info.as_ref().map(|b| (**b).clone()).map_err(Clone::clone);
                     view.update(cx, |v, cx| v.apply_loaded(trigger_id, mapped, cx));
+                } else {
+                    self.workflow_details = None;
                 }
             }
             Event::CallInfoLoaded { call_id, call } => match call {

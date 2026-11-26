@@ -752,7 +752,10 @@ pub struct App {
     /// Multi-view app modal stack (`view_opened` / `view_updated` / `view_closed` / `views.submit`).
     modal_stack: Entity<dialogs::modal::AppModalStack>,
     /// Currently open Workflow Details dialog (`workflows.triggers.info`), if any.
-    workflow_details: Option<Entity<dialogs::workflow::WorkflowDetailsView>>,
+    /// Held weakly so the dialog layer owns its lifetime and closing the dialog by
+    /// any path (Close button, Run button, Escape, backdrop, or `close_dialog`)
+    /// releases the entity automatically.
+    workflow_details: Option<gpui_kit::gpui::WeakEntity<dialogs::workflow::WorkflowDetailsView>>,
     /// Fixture mode: link bookmarks added through the add-link dialog, per channel.
     fixture_bookmarks: HashMap<ChannelId, Vec<bookmarks::Bookmark>>,
     /// Dock badge + native notifications + menu-bar status item (`slackless-platform`).
