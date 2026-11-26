@@ -352,6 +352,40 @@ pub struct InboundVideoPacket {
     pub marker: bool,
 }
 
+/// Monotonic RTP packet/byte totals, recorded by the track tasks and read by the session loop,
+/// which also takes per-second deltas from them for Chime's `CLIENT_METRIC`.
+#[derive(Default)]
+struct TrafficCounters {
+    packets: AtomicU64,
+    bytes: AtomicU64,
+    reported_packets: AtomicU64,
+    reported_bytes: AtomicU64,
+}
+
+impl TrafficCounters {
+    fn record(&self, bytes: usize) {
+        self.packets.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn packets(&self) -> u64 {
+        self.packets.load(Ordering::Relaxed)
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Packets and bytes recorded since the previous call.
+    fn take_delta(&self) -> (u64, u64) {
+        let (packets, bytes) = (self.packets(), self.bytes());
+        (
+            packets.saturating_sub(self.reported_packets.swap(packets, Ordering::Relaxed)),
+            bytes.saturating_sub(self.reported_bytes.swap(bytes, Ordering::Relaxed)),
+        )
+    }
+}
+
 struct ChimePeerHandler {
     pc: Arc<OnceLock<Weak<dyn PeerConnection>>>,
     inbound_opus_tx: mpsc::UnboundedSender<InboundAudioPacket>,
@@ -361,10 +395,7 @@ struct ChimePeerHandler {
     gather_complete_tx: watch::Sender<u64>,
     relay_candidate_tx: watch::Sender<u64>,
     remote_tracks: Arc<StdMutex<HashMap<u32, Arc<dyn TrackRemote>>>>,
-    packets_received: Arc<AtomicU64>,
-    bytes_received: Arc<AtomicU64>,
-    total_packets_received: Arc<AtomicU64>,
-    total_bytes_received: Arc<AtomicU64>,
+    received: Arc<TrafficCounters>,
 }
 
 async fn resolve_track_mid(
@@ -420,10 +451,7 @@ impl PeerConnectionEventHandler for ChimePeerHandler {
         let video_tx = self.inbound_video_tx.clone();
         let pc_cell = Arc::clone(&self.pc);
         let remote_tracks = Arc::clone(&self.remote_tracks);
-        let rx_pkts = Arc::clone(&self.packets_received);
-        let rx_bytes = Arc::clone(&self.bytes_received);
-        let rx_total = Arc::clone(&self.total_packets_received);
-        let rx_total_bytes = Arc::clone(&self.total_bytes_received);
+        let received = Arc::clone(&self.received);
 
         tokio::spawn(async move {
             match track.kind().await {
@@ -432,11 +460,7 @@ impl PeerConnectionEventHandler for ChimePeerHandler {
                         match evt {
                             TrackRemoteEvent::OnRtpPacket(rtp) => {
                                 if !rtp.payload.is_empty() {
-                                    rx_pkts.fetch_add(1, Ordering::Relaxed);
-                                    rx_total.fetch_add(1, Ordering::Relaxed);
-                                    let len = rtp.payload.len() as u64;
-                                    rx_bytes.fetch_add(len, Ordering::Relaxed);
-                                    rx_total_bytes.fetch_add(len, Ordering::Relaxed);
+                                    received.record(rtp.payload.len());
                                 }
                                 // Keep polling when nobody listens (the `#content` peer, session
                                 // teardown): an unpolled track backs up the driver, which then
@@ -551,11 +575,7 @@ impl PeerConnectionEventHandler for ChimePeerHandler {
                                         "received first RTP video packet"
                                     );
                                 }
-                                rx_pkts.fetch_add(1, Ordering::Relaxed);
-                                rx_total.fetch_add(1, Ordering::Relaxed);
-                                let len = rtp.payload.len() as u64;
-                                rx_bytes.fetch_add(len, Ordering::Relaxed);
-                                rx_total_bytes.fetch_add(len, Ordering::Relaxed);
+                                received.record(rtp.payload.len());
                                 // As for audio: keep the track drained even without a consumer.
                                 if video_tx.is_closed() {
                                     continue;
@@ -603,14 +623,8 @@ pub struct ChimeRtcPeer {
     gather_complete_tx: watch::Sender<u64>,
     relay_candidate_tx: watch::Sender<u64>,
     remote_tracks: Arc<StdMutex<HashMap<u32, Arc<dyn TrackRemote>>>>,
-    packets_sent: Arc<AtomicU64>,
-    bytes_sent: Arc<AtomicU64>,
-    packets_received: Arc<AtomicU64>,
-    bytes_received: Arc<AtomicU64>,
-    total_packets_sent: Arc<AtomicU64>,
-    total_packets_received: Arc<AtomicU64>,
-    total_bytes_sent: Arc<AtomicU64>,
-    total_bytes_received: Arc<AtomicU64>,
+    sent: Arc<TrafficCounters>,
+    received: Arc<TrafficCounters>,
 }
 
 fn non_zero_random_ssrc() -> u32 {
@@ -658,10 +672,7 @@ impl ChimeRtcPeer {
         let (relay_candidate_tx, _) = watch::channel(0u64);
         let remote_tracks: Arc<StdMutex<HashMap<u32, Arc<dyn TrackRemote>>>> =
             Arc::new(StdMutex::new(HashMap::new()));
-        let packets_received = Arc::new(AtomicU64::new(0));
-        let bytes_received = Arc::new(AtomicU64::new(0));
-        let total_packets_received = Arc::new(AtomicU64::new(0));
-        let total_bytes_received = Arc::new(AtomicU64::new(0));
+        let received = Arc::new(TrafficCounters::default());
 
         let handler = Arc::new(ChimePeerHandler {
             pc: Arc::clone(&pc_cell),
@@ -672,10 +683,7 @@ impl ChimeRtcPeer {
             gather_complete_tx: gather_complete_tx.clone(),
             relay_candidate_tx: relay_candidate_tx.clone(),
             remote_tracks: Arc::clone(&remote_tracks),
-            packets_received: Arc::clone(&packets_received),
-            bytes_received: Arc::clone(&bytes_received),
-            total_packets_received: Arc::clone(&total_packets_received),
-            total_bytes_received: Arc::clone(&total_bytes_received),
+            received: Arc::clone(&received),
         });
 
         let pc: Arc<dyn PeerConnection> = Arc::new(
@@ -772,14 +780,8 @@ impl ChimeRtcPeer {
             gather_complete_tx,
             relay_candidate_tx,
             remote_tracks,
-            packets_sent: Arc::new(AtomicU64::new(0)),
-            bytes_sent: Arc::new(AtomicU64::new(0)),
-            packets_received,
-            bytes_received,
-            total_packets_sent: Arc::new(AtomicU64::new(0)),
-            total_packets_received,
-            total_bytes_sent: Arc::new(AtomicU64::new(0)),
-            total_bytes_received,
+            sent: Arc::default(),
+            received,
         })
     }
 
@@ -974,10 +976,7 @@ impl ChimeRtcPeer {
             video_track: Arc::clone(&self.video_track),
             video_ssrc: self.video_ssrc,
             video_payload_type: Arc::clone(&self.video_payload_type),
-            packets_sent: Arc::clone(&self.packets_sent),
-            bytes_sent: Arc::clone(&self.bytes_sent),
-            total_packets_sent: Arc::clone(&self.total_packets_sent),
-            total_bytes_sent: Arc::clone(&self.total_bytes_sent),
+            sent: Arc::clone(&self.sent),
         }
     }
 
@@ -988,10 +987,7 @@ impl ChimeRtcPeer {
             audio_track: Arc::clone(&self.audio_track),
             audio_ssrc: self.audio_ssrc,
             audio_payload_type: Arc::clone(&self.audio_payload_type),
-            packets_sent: Arc::clone(&self.packets_sent),
-            bytes_sent: Arc::clone(&self.bytes_sent),
-            total_packets_sent: Arc::clone(&self.total_packets_sent),
-            total_bytes_sent: Arc::clone(&self.total_bytes_sent),
+            sent: Arc::clone(&self.sent),
         }
     }
 
@@ -1010,34 +1006,32 @@ impl ChimeRtcPeer {
     }
 
     pub fn total_packets_sent(&self) -> u64 {
-        self.total_packets_sent.load(Ordering::Relaxed)
+        self.sent.packets()
     }
 
     pub fn total_packets_received(&self) -> u64 {
-        self.total_packets_received.load(Ordering::Relaxed)
+        self.received.packets()
     }
 
     pub fn total_bytes_sent(&self) -> u64 {
-        self.total_bytes_sent.load(Ordering::Relaxed)
+        self.sent.bytes()
     }
 
     pub fn total_bytes_received(&self) -> u64 {
-        self.total_bytes_received.load(Ordering::Relaxed)
+        self.received.bytes()
     }
 
-    /// Sample and reset 1-second delta counters for Chime's `CLIENT_METRIC` frame.
+    /// Traffic since the previous call, for Chime's once-a-second `CLIENT_METRIC` frame.
     pub fn take_metrics_snapshot(&self, local_rms: f32) -> ClientMetricsSnapshot {
-        let tx_pkts = self.packets_sent.swap(0, Ordering::Relaxed) as f64;
-        let tx_bytes = self.bytes_sent.swap(0, Ordering::Relaxed) as f64;
-        let rx_pkts = self.packets_received.swap(0, Ordering::Relaxed) as f64;
-        let rx_bytes = self.bytes_received.swap(0, Ordering::Relaxed) as f64;
+        let (tx_pkts, tx_bytes) = self.sent.take_delta();
+        let (rx_pkts, rx_bytes) = self.received.take_delta();
         ClientMetricsSnapshot {
             stun_rtt_ms: 25.0,
-            mic_pps: tx_pkts,
-            mic_bitrate_bps: tx_bytes * 8.0,
+            mic_pps: tx_pkts as f64,
+            mic_bitrate_bps: tx_bytes as f64 * 8.0,
             mic_audio_level: (local_rms as f64 * 32767.0).clamp(0.0, 32767.0),
-            spk_pps: rx_pkts,
-            spk_bitrate_bps: rx_bytes * 8.0,
+            spk_pps: rx_pkts as f64,
+            spk_bitrate_bps: rx_bytes as f64 * 8.0,
         }
     }
 
@@ -1053,15 +1047,12 @@ pub struct VideoTrackSender {
     video_track: Arc<TrackLocalStaticSample>,
     video_ssrc: u32,
     video_payload_type: Arc<AtomicU8>,
-    packets_sent: Arc<AtomicU64>,
-    bytes_sent: Arc<AtomicU64>,
-    total_packets_sent: Arc<AtomicU64>,
-    total_bytes_sent: Arc<AtomicU64>,
+    sent: Arc<TrafficCounters>,
 }
 
 impl VideoTrackSender {
     pub async fn write_h264_frame(&self, annex_b: Vec<u8>, duration: Duration) -> Result<()> {
-        let len = annex_b.len() as u64;
+        let len = annex_b.len();
         let sample = Sample {
             data: Bytes::from(annex_b),
             duration,
@@ -1076,10 +1067,7 @@ impl VideoTrackSender {
             )
             .await
             .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
-        self.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.total_packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.bytes_sent.fetch_add(len, Ordering::Relaxed);
-        self.total_bytes_sent.fetch_add(len, Ordering::Relaxed);
+        self.sent.record(len);
         Ok(())
     }
 }
@@ -1091,16 +1079,13 @@ pub struct OpusTrackSender {
     audio_track: Arc<TrackLocalStaticSample>,
     audio_ssrc: u32,
     audio_payload_type: Arc<AtomicU8>,
-    packets_sent: Arc<AtomicU64>,
-    bytes_sent: Arc<AtomicU64>,
-    total_packets_sent: Arc<AtomicU64>,
-    total_bytes_sent: Arc<AtomicU64>,
+    sent: Arc<TrafficCounters>,
 }
 
 impl OpusTrackSender {
     /// Write one encoded 20ms Opus packet onto the local track (zero-copy `Bytes`).
     pub async fn write_opus_frame(&self, opus_bytes: Bytes) -> Result<()> {
-        let len = opus_bytes.len() as u64;
+        let len = opus_bytes.len();
         let sample = Sample {
             data: opus_bytes,
             duration: Duration::from_millis(20),
@@ -1115,10 +1100,7 @@ impl OpusTrackSender {
             )
             .await
             .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
-        self.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.total_packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.bytes_sent.fetch_add(len, Ordering::Relaxed);
-        self.total_bytes_sent.fetch_add(len, Ordering::Relaxed);
+        self.sent.record(len);
         Ok(())
     }
 }
@@ -1321,10 +1303,12 @@ mod tests {
         let peer = ChimeRtcPeer::new(&udp_turn, a_tx, v_tx, s_tx)
             .await
             .expect("peer with UDP TURN builds");
-        peer.packets_sent.store(50, Ordering::Relaxed);
-        peer.bytes_sent.store(4_000, Ordering::Relaxed);
-        peer.packets_received.store(40, Ordering::Relaxed);
-        peer.bytes_received.store(3_000, Ordering::Relaxed);
+        for _ in 0..50 {
+            peer.sent.record(80);
+        }
+        for _ in 0..40 {
+            peer.received.record(75);
+        }
 
         let snap1 = peer.take_metrics_snapshot(0.5);
         assert_eq!(snap1.mic_pps, 50.0);
@@ -1333,11 +1317,21 @@ mod tests {
         assert_eq!(snap1.spk_bitrate_bps, 24_000.0);
         assert!((snap1.mic_audio_level - 16_383.5).abs() < 1.0);
 
-        // Second call sees zeroed delta counters and clamped RMS bounds.
+        // Second call reports only the traffic since the first, with clamped RMS bounds, while
+        // the session totals keep counting.
+        peer.received.record(100);
         let snap2 = peer.take_metrics_snapshot(2.0);
         assert_eq!(snap2.mic_pps, 0.0);
-        assert_eq!(snap2.spk_pps, 0.0);
+        assert_eq!((snap2.spk_pps, snap2.spk_bitrate_bps), (1.0, 800.0));
         assert_eq!(snap2.mic_audio_level, 32_767.0);
+        assert_eq!(
+            (peer.total_packets_sent(), peer.total_bytes_sent()),
+            (50, 4_000)
+        );
+        assert_eq!(
+            (peer.total_packets_received(), peer.total_bytes_received()),
+            (41, 3_100)
+        );
 
         let snap3 = peer.take_metrics_snapshot(-0.5);
         assert_eq!(snap3.mic_audio_level, 0.0);
