@@ -965,18 +965,18 @@ impl App {
             )
         })
         .on_action(cx.listener(|this, switch: &SwitchWorkspace, window, cx| {
-            this.switch_workspace(switch.0, window, cx)
+            this.switch_workspace_at(switch.0, window, cx)
         }))
         .on_action(cx.listener(|this, tab: &SelectConversationTab, _, cx| {
             this.select_conversation_tab(tab.0, cx)
         }))
-        .on_action(cx.listener(|this, _: &NextWorkspace, window, cx| {
-            let count = this.parked.len().max(1);
-            this.switch_workspace((this.workspace + 1) % count, window, cx)
-        }))
+        .on_action(
+            cx.listener(|this, _: &NextWorkspace, window, cx| {
+                this.step_workspace(true, window, cx)
+            }),
+        )
         .on_action(cx.listener(|this, _: &PreviousWorkspace, window, cx| {
-            let count = this.parked.len().max(1);
-            this.switch_workspace((this.workspace + count - 1) % count, window, cx)
+            this.step_workspace(false, window, cx)
         }))
         .on_action(
             cx.listener(|this, _: &NewMessage, window, cx| this.open_compose("", window, cx)),
@@ -990,7 +990,11 @@ impl App {
             this.open_profile(this.fixtures.self_user.clone(), cx)
         }))
         .on_action(cx.listener(|this, open: &OpenRecent, _, cx| this.select(open.0.clone(), cx)))
-        .on_action(cx.listener(|this, sign_out: &SignOut, _, cx| this.sign_out(sign_out.0, cx)))
+        .on_action(cx.listener(|this, sign_out: &SignOut, _, cx| {
+            if let Some(&ix) = this.rail.get(sign_out.0) {
+                this.sign_out(ix, cx);
+            }
+        }))
         .on_action(cx.listener(|this, _: &PreviousConversation, _, cx| {
             this.step_conversation(false, false, cx)
         }))

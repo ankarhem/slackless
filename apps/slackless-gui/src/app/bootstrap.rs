@@ -698,9 +698,7 @@ fn wire_feature_view_subscriptions(
                             channel: channel.clone(),
                             ts: ts.clone(),
                         });
-                    } else if let Some(bridge) =
-                        this.parked_bridges.get(*workspace).and_then(Option::as_ref)
-                    {
+                    } else if let Some(bridge) = this.workspace_bridge(*workspace) {
                         bridge.send(MessagingCommand::DeleteSavedItem {
                             channel: channel.clone(),
                             ts: ts.clone(),
@@ -720,20 +718,12 @@ fn wire_feature_view_subscriptions(
                         mark: *mark,
                         date_due: *date_due,
                     };
-                    if *workspace == this.workspace {
-                        this.bridge.send(cmd);
-                    } else if let Some(bridge) =
-                        this.parked_bridges.get(*workspace).and_then(Option::as_ref)
-                    {
+                    if let Some(bridge) = this.workspace_bridge(*workspace) {
                         bridge.send(cmd);
                     }
                 }
                 LaterEvent::ClearCompleted { workspace } => {
-                    if *workspace == this.workspace {
-                        this.bridge.send(MessagingCommand::ClearCompletedSaved);
-                    } else if let Some(bridge) =
-                        this.parked_bridges.get(*workspace).and_then(Option::as_ref)
-                    {
+                    if let Some(bridge) = this.workspace_bridge(*workspace) {
                         bridge.send(MessagingCommand::ClearCompletedSaved);
                     }
                 }
@@ -1398,7 +1388,7 @@ fn install_os_and_lifecycle_hooks(app: &Entity<App>, window: &mut Window, cx: &m
             if let Some(t) = app.bridge.shutdown_task() {
                 tasks.push(t);
             }
-            for parked in app.parked_bridges.iter().flatten() {
+            for parked in app.slots.iter().filter_map(|slot| slot.bridge.as_ref()) {
                 if let Some(t) = parked.shutdown_task() {
                     tasks.push(t);
                 }
@@ -1455,7 +1445,7 @@ fn install_os_and_lifecycle_hooks(app: &Entity<App>, window: &mut Window, cx: &m
                             cx.activate(true);
                             window.activate_window();
                             let _ = status_app.update(cx, |app, cx| {
-                                app.switch_workspace(ix, window, cx);
+                                app.switch_workspace_at(ix, window, cx);
                             });
                         });
                     }
@@ -1605,18 +1595,24 @@ impl App {
         }
         let app = cx.new(|cx| {
             let mut bridge = bridges.remove(0);
-            let live_teams = fixtures.workspaces.clone();
-            let ws_count = live_teams.len().max(1);
-            let mut parked_bridges: Vec<Option<CoreBridge>> = Vec::with_capacity(ws_count);
-            parked_bridges.push(None);
-            for extra in bridges {
-                parked_bridges.push(Some(extra));
-            }
-            while parked_bridges.len() < ws_count {
-                parked_bridges.push(None);
-            }
-            let bg_counts = vec![HashMap::new(); ws_count];
-            let bg_activity_unread = vec![0; ws_count];
+            // Slot 0 is shown (its bridge is `bridge`); every other workspace keeps its own
+            // bridge in its slot. A snapshot without teams still gets one slot.
+            let mut background = bridges.into_iter();
+            let teams = if fixtures.workspaces.is_empty() {
+                vec![Team::default()]
+            } else {
+                fixtures.workspaces.clone()
+            };
+            let mut slots: Vec<WorkspaceSlot> = (teams.into_iter().enumerate())
+                .map(|(ix, team)| WorkspaceSlot {
+                    team,
+                    bridge: if ix == 0 { None } else { background.next() },
+                    parked: None,
+                    state: WorkspaceState::default(),
+                    activity_unread: 0,
+                })
+                .collect();
+            let rail = (0..slots.len()).collect();
             // Read all workspace `local_state` keys once (1 SQLite query instead of ~10).
             let local = bridge.all_local();
             // Like Slack, reopen the conversation that was open last; a fresh store falls back
@@ -1628,7 +1624,7 @@ impl App {
             let archive = bridge
                 .read_store_clone()
                 .or_else(|| fixture_archive(&fixtures));
-            let views = build_workspace(&fixtures, 0, archive, &channel, window, cx);
+            let views = build_workspace(&fixtures, &slots[0].team, archive, &channel, window, cx);
             let workspace_subscriptions = subscribe_workspace(&views, window, cx);
             let WorkspaceViews {
                 sidebar,
@@ -1763,9 +1759,9 @@ impl App {
             subscriptions.extend(wire_feature_view_subscriptions(&feature_views, window, cx));
             // Subscribe to every background workspace's EventHub (and dedicated HuddleMediaHub)
             // so unread/mention badges, team metadata, and active huddle media stay live across
-            // workspace switches.
-            for (ws_ix, slot) in parked_bridges.iter_mut().enumerate().skip(1) {
-                if let Some(bg_bridge) = slot.as_mut() {
+            // workspace switches. Each names its workspace by slot, which a reorder never moves.
+            for (ws_ix, slot) in slots.iter_mut().enumerate() {
+                if let Some(bg_bridge) = slot.bridge.as_mut() {
                     subscriptions.push(bg_bridge.subscribe_in(
                         window,
                         cx,
@@ -1805,7 +1801,6 @@ impl App {
                 bridge.send(ChannelCommand::OpenConversation(channel.clone()));
             }
             demo(&results, window, cx);
-            let parked = fixtures.workspaces.iter().map(|_| None).collect();
             // The fixture-derived feed lights the rail tile before any live fetch lands.
             let unread = feature_views.activity.read(cx).unread_count();
             let saved_section_prefs = bridge.section_prefs();
@@ -1849,12 +1844,9 @@ impl App {
             App {
                 fixtures,
                 bridge,
-                parked_bridges,
-                live_teams,
-                bg_counts,
-                bg_activity_unread,
+                slots,
+                rail,
                 workspace: 0,
-                parked,
                 ws: WorkspaceState {
                     chosen,
                     bots: cached_bots,

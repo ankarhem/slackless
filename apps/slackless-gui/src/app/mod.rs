@@ -586,14 +586,29 @@ pub(super) struct WorkspaceState {
     pub(super) backfill_progress: Option<slackless_core::WorkspaceBackfillProgress>,
 }
 
-/// A workspace that is not shown: its fixtures, open conversation, views, subscriptions,
-/// and per-workspace live state.
+/// A visited workspace that is not shown: its fixtures, open conversation, views and
+/// subscriptions.
 struct Parked {
     fixtures: Arc<Fixtures>,
     channel: ChannelId,
     views: WorkspaceViews,
     subscriptions: Vec<Subscription>,
+}
+
+/// One workspace at the slot it keeps for the whole run: drafts, Later items, notification
+/// tags and core subscriptions name a workspace by its slot, never by its place on the rail.
+/// While the workspace is shown its bridge and state live in [`App::bridge`] and [`App::ws`].
+struct WorkspaceSlot {
+    /// Name, domain and icon, refreshed from the store's `team.info` record.
+    team: Team,
+    /// The live core while another workspace is shown (`None` for sample workspaces).
+    bridge: Option<CoreBridge>,
+    /// The views, once visited, while another workspace is shown.
+    parked: Option<Parked>,
+    /// The live state (counts, presence, connection, ...) while another workspace is shown.
     state: WorkspaceState,
+    /// The Activity feed's unread count while another workspace is shown.
+    activity_unread: u32,
 }
 
 /// How long a live reload waits for more events, so a burst (boot hydration) reads the store
@@ -706,24 +721,14 @@ pub struct App {
     /// The shown workspace's fixtures.
     fixtures: Arc<Fixtures>,
     bridge: CoreBridge,
-    /// Per workspace index: the live bridge for every other signed-in workspace (`None` for the
-    /// shown workspace or fixture workspaces).
-    parked_bridges: Vec<Option<CoreBridge>>,
-    /// Every signed-in workspace's Team record (name, domain, icon) kept in sync across live
-    /// refreshes so the workspace rail stays complete when `reload_live` rebuilds a single
-    /// workspace's snapshot.
-    live_teams: Vec<Team>,
-    /// Per workspace index: latest `client.counts` for background workspaces so their rail
-    /// tiles show live unread/mention badges even before they are visited.
-    bg_counts: Vec<HashMap<ChannelId, ConversationCounts>>,
-    /// Per workspace index: latest Activity feed unread count for background workspaces.
-    bg_activity_unread: Vec<u32>,
-    /// Index of the shown workspace in `fixtures.workspaces`.
+    /// Every workspace, by slot (at least one).
+    slots: Vec<WorkspaceSlot>,
+    /// The rail's order, top to bottom, as slots: the tiles, Cmd+1…9, the menus and the menu
+    /// bar item list workspaces in this order, and the snapshots' `workspaces` follow it.
+    rail: Vec<usize>,
+    /// Slot of the shown workspace.
     workspace: usize,
-    /// Per workspace index: the parked state of a workspace visited before (`None` for the
-    /// shown one and never-visited ones).
-    parked: Vec<Option<Parked>>,
-    /// Active workspace's per-workspace live state (swapped atomically with `Parked.state`).
+    /// Active workspace's per-workspace live state (swapped with its slot's on a switch).
     ws: WorkspaceState,
     channel: ChannelId,
     sidebar: Entity<Sidebar>,

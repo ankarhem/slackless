@@ -481,12 +481,7 @@ impl App {
             UserMenuEvent::OpenAccount => {
                 self.user_menu_open = false;
                 // Slack opens the workspace's account settings in the browser.
-                let domain = self
-                    .fixtures
-                    .workspaces
-                    .get(self.workspace)
-                    .map(|team| team.domain.as_str())
-                    .unwrap_or_default();
+                let domain = self.team().domain.as_str();
                 let url = if domain.is_empty() {
                     "https://slack.com/account/settings".to_owned()
                 } else {
@@ -510,16 +505,14 @@ impl App {
         self.push_self_state(cx);
     }
 
-    /// Sign out of the workspace at `index`: revokes the token server-side (`auth.revoke`,
+    /// Sign out of the workspace in slot `index`: revokes the token server-side (`auth.revoke`,
     /// `F-CORE-009`), removes the stored session (Keychain included), and quits so the next
     /// launch runs the sign-in helper.
     pub(super) fn sign_out(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index == self.workspace {
-            self.bridge.send(WorkspaceCommand::SignOut);
-        } else if let Some(Some(bridge)) = self.parked_bridges.get(index) {
+        if let Some(bridge) = self.workspace_bridge(index) {
             bridge.send(WorkspaceCommand::SignOut);
         }
-        if let Some(team) = self.fixtures.workspaces.get(index)
+        if let Some(team) = self.slots.get(index).map(|slot| &slot.team)
             && let Err(e) =
                 slackless_auth::SessionStore::new().and_then(|store| store.remove(&team.id))
         {
@@ -564,7 +557,7 @@ impl App {
     pub(super) fn open_status_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_hover_card(cx);
         let status = self.self_state.status.clone();
-        let workspace = SharedString::from(self.fixtures.workspaces[self.workspace].name.clone());
+        let workspace = SharedString::from(self.team().name.clone());
         let presets = self.fixtures.status_presets.clone();
         let scheduled = self.self_state.scheduled_statuses.clone();
         self.status_picker.update(cx, |picker, cx| {
@@ -861,12 +854,7 @@ impl App {
 
     /// Active workspace team ID fallback for Block Kit actions/suggestions.
     pub(super) fn workspace_team_id(&self) -> TeamId {
-        self.fixtures
-            .workspaces
-            .get(self.workspace)
-            .or_else(|| self.fixtures.workspaces.first())
-            .map(|t| t.id.clone())
-            .unwrap_or_else(|| TeamId::from("T0"))
+        self.team().id.clone()
     }
 }
 

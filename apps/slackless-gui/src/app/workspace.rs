@@ -2,10 +2,11 @@
 
 use super::*;
 
-/// Build the views of workspace `index` from its fixtures, opened on `channel`.
+/// Build the views of `team`'s workspace from its fixtures, opened on `channel` (the rail
+/// highlights its tile once it is shown: [`App::sync_rail`]).
 pub(super) fn build_workspace(
     fixtures: &Arc<Fixtures>,
-    index: usize,
+    team: &Team,
     archive: Option<SharedStore>,
     channel: &ChannelId,
     window: &mut Window,
@@ -15,24 +16,15 @@ pub(super) fn build_workspace(
     let messages = MessageList::new(fixtures.clone(), channel.clone(), window, cx);
     let thread = ThreadPanel::new(fixtures.clone(), window, cx);
     let results = SearchView::new(fixtures.clone(), archive, cx);
-    if let Some(team) = fixtures
-        .workspaces
-        .get(index)
-        .or_else(|| fixtures.workspaces.first())
-    {
-        let ws_id = team.id.clone();
-        results.update(cx, |view, cx| view.set_workspace(ws_id, cx));
-    }
+    let ws_id = team.id.clone();
+    results.update(cx, |view, cx| view.set_workspace(ws_id, cx));
     let browser = ChannelBrowser::new(fixtures.clone(), window, cx);
     let huddle_map: HashMap<ChannelId, Vec<slackless_core::types::UserId>> =
         huddle_state::fixture_huddle(fixtures)
             .map(|h| (h.channel, h.participants))
             .into_iter()
             .collect();
-    sidebar.update(cx, |sidebar, cx| {
-        sidebar.set_huddles(huddle_map, cx);
-        sidebar.set_workspace(index, cx);
-    });
+    sidebar.update(cx, |sidebar, cx| sidebar.set_huddles(huddle_map, cx));
     let profile = ProfilePanel::new(fixtures.clone(), cx);
     let switcher = QuickSwitcher::new(fixtures.clone(), window, cx);
     WorkspaceViews {
@@ -61,9 +53,11 @@ pub(super) fn subscribe_workspace(
                 SidebarEvent::SelectConversation(channel) => this.select(channel.clone(), cx),
                 SidebarEvent::BrowseChannels => this.open_browser(window, cx),
                 SidebarEvent::CreateChannel => this.open_create_channel(window, cx),
-                SidebarEvent::SwitchWorkspace(index) => this.switch_workspace(*index, window, cx),
+                SidebarEvent::SwitchWorkspace(position) => {
+                    this.switch_workspace_at(*position, window, cx);
+                }
                 SidebarEvent::ReorderWorkspace { from, to } => {
-                    this.reorder_workspace(*from, *to, window, cx)
+                    this.reorder_workspace(*from, *to, cx);
                 }
                 SidebarEvent::OpenInNewWindow(channel) => {
                     this.pop_out_conversation(channel.clone(), window, cx)

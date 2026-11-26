@@ -708,7 +708,7 @@ impl App {
             // Live mode: keep cached rows visible while refreshing from SQLite.
             self.huddles
                 .update(cx, |view, cx| view.begin_live_load(fixtures, cx));
-            let team = self.fixtures.workspaces[self.workspace].id.clone();
+            let team = self.team().id.clone();
             cx.spawn(async move |this, cx| {
                 let huddles = cx
                     .background_executor()

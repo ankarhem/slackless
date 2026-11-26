@@ -155,47 +155,23 @@ impl App {
         cx.notify();
     }
 
-    /// Reorder workspace tile `from` to `to` in the switcher rail and persist (`F-CORE-003`).
-    pub(super) fn reorder_workspace(
-        &mut self,
-        from: usize,
-        to: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let len = self.live_teams.len();
+    /// Swap rail tiles `from` and `to` and persist the order (`F-CORE-003`). Only the rail's
+    /// order changes: every workspace keeps its slot, so its events, drafts and Later items
+    /// stay its own.
+    pub(super) fn reorder_workspace(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let len = self.rail.len();
         if from == to || from >= len || to >= len {
             return;
         }
-        self.live_teams.swap(from, to);
-        if from < self.parked.len() && to < self.parked.len() {
-            self.parked.swap(from, to);
-        }
-        if from < self.parked_bridges.len() && to < self.parked_bridges.len() {
-            self.parked_bridges.swap(from, to);
-        }
-        if from < self.bg_counts.len() && to < self.bg_counts.len() {
-            self.bg_counts.swap(from, to);
-        }
-        if from < self.bg_activity_unread.len() && to < self.bg_activity_unread.len() {
-            self.bg_activity_unread.swap(from, to);
-        }
-        if self.workspace == from {
-            self.workspace = to;
-        } else if self.workspace == to {
-            self.workspace = from;
-        }
-        self.sidebar
-            .update(cx, |s, cx| s.set_workspace(self.workspace, cx));
-        let order: Vec<String> = self
-            .live_teams
-            .iter()
-            .map(|t| t.id.as_str().to_owned())
+        self.rail.swap(from, to);
+        let order: Vec<String> = (self.rail.iter())
+            .map(|&ix| self.slots[ix].team.id.as_str().to_owned())
             .collect();
         if let Some(write) = self.bridge.remember_workspace_order(&order) {
             cx.background_executor().spawn(write).detach();
         }
-        self.reload_live(window, cx);
+        self.sync_rail(cx);
+        self.sync_badge(cx);
         self.update_menus(cx);
     }
 
@@ -357,12 +333,11 @@ impl App {
 
     /// A link to `channel` like Slack's "Copy link": the workspace's archive URL.
     pub(super) fn conversation_link(&self, channel: &ChannelId) -> String {
-        match self.fixtures.workspaces.first() {
-            Some(team) if !team.domain.is_empty() => {
-                format!("https://{}.slack.com/archives/{channel}", team.domain)
-            }
-            Some(team) => format!("https://app.slack.com/client/{}/{channel}", team.id),
-            None => format!("https://app.slack.com/client/{channel}"),
+        let team = self.team();
+        if team.domain.is_empty() {
+            format!("https://app.slack.com/client/{}/{channel}", team.id)
+        } else {
+            format!("https://{}.slack.com/archives/{channel}", team.domain)
         }
     }
 
@@ -440,27 +415,12 @@ impl App {
         }
     }
 
-    /// Resolve the workspace switcher index for `team_id` (matching live teams or fixture workspaces).
+    /// The slot of the workspace `team_id` names.
     pub(in crate::app) fn workspace_index_for(
         &self,
         team_id: &slackless_core::types::TeamId,
     ) -> Option<usize> {
-        if !self.fixtures.sample {
-            self.live_teams
-                .iter()
-                .position(|t| t.id == *team_id)
-                .or_else(|| {
-                    self.fixtures
-                        .workspaces
-                        .iter()
-                        .position(|t| t.id == *team_id)
-                })
-        } else {
-            self.fixtures
-                .workspaces
-                .iter()
-                .position(|t| t.id == *team_id)
-        }
+        self.slots.iter().position(|slot| slot.team.id == *team_id)
     }
 
     /// Build the list of all mounted workspace archives (active + parked live workspaces, or all
@@ -472,23 +432,12 @@ impl App {
     fn sync_search_workspace_sources_inner(&self, refresh: bool, cx: &mut Context<Self>) {
         let mut sources: Vec<SearchWorkspaceSource> = Vec::new();
         if !self.fixtures.sample {
-            let count = self.live_teams.len().max(1);
-            for idx in 0..count {
-                let team = self
-                    .live_teams
-                    .get(idx)
-                    .or_else(|| self.fixtures.workspaces.get(idx));
-                let bridge = if idx == self.workspace {
-                    Some(&self.bridge)
-                } else {
-                    self.parked_bridges.get(idx).and_then(Option::as_ref)
-                };
-                if let Some(bridge) = bridge
+            for (idx, slot) in self.slots.iter().enumerate() {
+                if let Some(bridge) = self.workspace_bridge(idx)
                     && let (Some(store), Some(tid)) =
                         (bridge.read_store_clone(), bridge.team_id().cloned())
                 {
-                    let name = team
-                        .map(|t| t.name.clone())
+                    let name = Some(slot.team.name.clone())
                         .filter(|n| !n.trim().is_empty())
                         .unwrap_or_else(|| tid.to_string());
                     sources.push(SearchWorkspaceSource {
@@ -499,16 +448,11 @@ impl App {
                 }
             }
         } else {
-            let count = self.fixtures.workspaces.len();
-            for idx in 0..count {
-                let team = &self.fixtures.workspaces[idx];
-                let fx = if idx == self.workspace {
-                    self.fixtures.clone()
-                } else if let Some(parked) = self.parked.get(idx).and_then(Option::as_ref) {
-                    parked.fixtures.clone()
-                } else {
-                    Arc::new(fixtures::workspace(idx))
-                };
+            for (idx, slot) in self.slots.iter().enumerate() {
+                let team = &slot.team;
+                let fx = self
+                    .workspace_fixtures(idx)
+                    .unwrap_or_else(|| Arc::new(fixtures::workspace(idx)));
                 if let Some(store) = fixture_archive_for(&fx, &team.id) {
                     sources.push(SearchWorkspaceSource {
                         team_id: team.id.clone(),
@@ -797,16 +741,102 @@ impl App {
         }
     }
 
-    /// Show workspace `index`: park the current workspace's views (and live bridge/state) and
-    /// bring back the target's (built from its live bridge or sample fixtures on the first
-    /// visit). Drafts carry over through the store.
+    /// The shown workspace's team.
+    pub(super) fn team(&self) -> &Team {
+        &self.slots[self.workspace].team
+    }
+
+    /// Every workspace's team in rail order: what the rail, the menus and the menu bar item
+    /// list.
+    pub(super) fn rail_teams(&self) -> Vec<Team> {
+        (self.rail.iter())
+            .map(|&ix| self.slots[ix].team.clone())
+            .collect()
+    }
+
+    /// Where slot `ix` sits on the rail.
+    pub(super) fn rail_position(&self, ix: usize) -> usize {
+        self.rail
+            .iter()
+            .position(|&slot| slot == ix)
+            .unwrap_or_default()
+    }
+
+    /// The live bridge of the workspace in slot `ix` (the shown one's is `self.bridge`).
+    pub(super) fn workspace_bridge(&self, ix: usize) -> Option<&CoreBridge> {
+        if ix == self.workspace {
+            Some(&self.bridge)
+        } else {
+            self.slots.get(ix)?.bridge.as_ref()
+        }
+    }
+
+    /// The snapshot of the workspace in slot `ix`: the shown one's, or a visited one's parked
+    /// snapshot (`None` before a first visit).
+    pub(super) fn workspace_fixtures(&self, ix: usize) -> Option<Arc<Fixtures>> {
+        if ix == self.workspace {
+            return Some(self.fixtures.clone());
+        }
+        let parked = self.slots.get(ix)?.parked.as_ref()?;
+        Some(parked.fixtures.clone())
+    }
+
+    /// Show the workspace at rail position `position` (a tile, Cmd+1…9, the menus).
+    pub(super) fn switch_workspace_at(
+        &mut self,
+        position: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(&ix) = self.rail.get(position) {
+            self.switch_workspace(ix, window, cx);
+        }
+    }
+
+    /// Show the next (or previous) workspace down the rail, wrapping (`Cmd+}` / `Cmd+{`).
+    pub(super) fn step_workspace(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let len = self.rail.len();
+        let position = self.rail_position(self.workspace);
+        let next = if forward {
+            (position + 1) % len
+        } else {
+            (position + len - 1) % len
+        };
+        self.switch_workspace_at(next, window, cx);
+    }
+
+    /// Show the rail in its current order with the shown workspace's tile active. The rail
+    /// lists the shown snapshot's `workspaces`, so a snapshot taken before the last reorder or
+    /// team refresh (or a sample workspace's own list) takes the current order first.
+    pub(super) fn sync_rail(&mut self, cx: &mut Context<Self>) {
+        let teams = self.rail_teams();
+        if self.fixtures.workspaces != teams {
+            let mut fixtures = self.fixtures.with_counts(self.fixtures.counts.clone());
+            fixtures.workspaces = teams;
+            let fixtures = Arc::new(fixtures);
+            self.sync_all_views_fixtures(fixtures.clone(), cx);
+            self.fixtures = fixtures;
+        }
+        let position = self.rail_position(self.workspace);
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_workspace(position, cx));
+    }
+
+    /// Show the workspace in slot `index`: park the current workspace's views (and live
+    /// bridge/state) and bring back the target's (built from its live bridge or sample
+    /// fixtures on the first visit). Drafts carry over through the store.
     pub(super) fn switch_workspace(
         &mut self,
         index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if index == self.workspace || index >= self.parked.len() {
+        if index == self.workspace || index >= self.slots.len() {
             return;
         }
         // Stop any active inline video / PiP dock, full-screen viewer, PDF render cache, or
@@ -822,25 +852,21 @@ impl App {
         self.bridge
             .send(ChannelCommand::CloseConversation(self.channel.clone()));
         // Swap live bridges when target workspace has its own `CoreBridge`.
-        let swapped_bridge = self.parked_bridges.get_mut(index).and_then(Option::take);
-        if let Some(incoming_bridge) = swapped_bridge {
+        if let Some(incoming_bridge) = self.slots[index].bridge.take() {
             let outgoing_bridge = mem::replace(&mut self.bridge, incoming_bridge);
-            if let Some(slot) = self.parked_bridges.get_mut(self.workspace) {
-                *slot = Some(outgoing_bridge);
-            }
+            self.slots[self.workspace].bridge = Some(outgoing_bridge);
             self.bridge.activate_media(cx);
         }
-        let incoming = match self.parked[index].take() {
+        // The state kept while in the background (counts, presence, connection, ...) carries on.
+        let mut state = mem::take(&mut self.slots[index].state);
+        let incoming = match self.slots[index].parked.take() {
             Some(parked) => parked,
             None => {
-                let bg_counts = self.bg_counts.get(index).cloned().unwrap_or_default();
                 // Live: the workspace paints at once from a placeholder while its snapshot is
                 // read off the UI thread, as the incoming state's pending reload.
                 let (fixtures, channel, archive, chosen, reload) =
-                    if let Some(mut snap) = self.bridge.placeholder(&bg_counts) {
-                        if !self.live_teams.is_empty() {
-                            snap.workspaces = self.live_teams.clone();
-                        }
+                    if let Some(mut snap) = self.bridge.placeholder(&state.counts) {
+                        snap.workspaces = self.rail_teams();
                         // The conversation last open here opens at once; the snapshot confirms
                         // it when it lands, else the first conversation opens instead.
                         let restored = self.bridge.last_conversation();
@@ -867,14 +893,17 @@ impl App {
                     } else {
                         let fixtures = Arc::new(fixtures::workspace(index));
                         let channel = first_conversation(&fixtures);
-                        let archive = fixtures
-                            .workspaces
-                            .get(index)
-                            .or_else(|| fixtures.workspaces.first())
-                            .and_then(|t| fixture_archive_for(&fixtures, &t.id));
+                        let archive = fixture_archive_for(&fixtures, &self.slots[index].team.id);
                         (fixtures, channel, archive, false, None)
                     };
-                let views = build_workspace(&fixtures, index, archive, &channel, window, cx);
+                let views = build_workspace(
+                    &fixtures,
+                    &self.slots[index].team,
+                    archive,
+                    &channel,
+                    window,
+                    cx,
+                );
                 if let Some(prefs) = self.bridge.section_prefs() {
                     views
                         .sidebar
@@ -887,18 +916,14 @@ impl App {
                         .update(cx, |panel, cx| panel.set_outbox(initial_outbox.clone(), cx));
                 }
                 let subscriptions = subscribe_workspace(&views, window, cx);
+                state.chosen = chosen;
+                state.outbox = initial_outbox;
+                state.reload = reload;
                 Parked {
                     fixtures,
                     channel,
                     views,
                     subscriptions,
-                    state: WorkspaceState {
-                        counts: bg_counts,
-                        chosen,
-                        outbox: initial_outbox,
-                        reload,
-                        ..Default::default()
-                    },
                 }
             }
         };
@@ -907,9 +932,11 @@ impl App {
             channel: mem::replace(&mut self.channel, incoming.channel),
             views: self.swap_views(incoming.views),
             subscriptions: mem::replace(&mut self.workspace_subscriptions, incoming.subscriptions),
-            state: mem::replace(&mut self.ws, incoming.state),
         };
-        self.parked[self.workspace] = Some(outgoing);
+        let outgoing_state = mem::replace(&mut self.ws, state);
+        let left = &mut self.slots[self.workspace];
+        left.parked = Some(outgoing);
+        left.state = outgoing_state;
         self.workspace = index;
         // The outgoing workspace's read in flight is dropped (its reload stays pending in its
         // parked state); the incoming one's pending reload resumes.
@@ -939,6 +966,7 @@ impl App {
         // Keep every shared view (Activity, Unreads, Huddles, Directory, Compose, Details,
         // SearchMenu, Files, Tools, Composer, HuddleDock) synced with the active workspace.
         self.sync_all_views_fixtures(fixtures, cx);
+        self.sync_rail(cx);
         self.sync_saved(cx);
         self.sync_later_count(cx);
         self.tab = ConversationTab::Messages;
@@ -972,16 +1000,10 @@ impl App {
             });
         }
         // New thread panels / profile panes pick up Enter-to-send and the self state.
-        let active_team = self
-            .bridge
-            .team_id()
-            .cloned()
-            .or_else(|| self.fixtures.workspaces.get(index).map(|t| t.id.clone()))
-            .or_else(|| self.fixtures.workspaces.first().map(|t| t.id.clone()));
-        if let Some(ws_id) = active_team {
-            self.results
-                .update(cx, |view, cx| view.set_workspace(ws_id, cx));
-        }
+        let active_team =
+            (self.bridge.team_id().cloned()).unwrap_or_else(|| self.team().id.clone());
+        self.results
+            .update(cx, |view, cx| view.set_workspace(active_team, cx));
         let bf_progress = self.ws.backfill_progress.clone();
         self.preferences.update(cx, |prefs, cx| {
             prefs.set_backfill_progress(bf_progress, cx);
@@ -1093,7 +1115,7 @@ impl App {
         let Some(store) = self.bridge.read_store_clone() else {
             return;
         };
-        let team = self.fixtures.workspaces[self.workspace].id.clone();
+        let team = self.team().id.clone();
         let me = self.fixtures.self_user.clone();
         cx.spawn(async move |this, cx| {
             let cards = cx
@@ -1139,11 +1161,7 @@ impl App {
         use slackless_core::catchup::WorkspaceCatchUpTarget;
 
         let mut targets = Vec::new();
-        let total_workspaces = if !self.fixtures.sample {
-            self.live_teams.len().max(1)
-        } else {
-            self.fixtures.workspaces.len().max(1)
-        };
+        let total_workspaces = self.slots.len();
         let indices: Vec<usize> = if all_workspaces {
             (0..total_workspaces).collect()
         } else {
@@ -1152,22 +1170,12 @@ impl App {
 
         if !self.fixtures.sample {
             for idx in indices {
-                let team = self
-                    .live_teams
-                    .get(idx)
-                    .or_else(|| self.fixtures.workspaces.get(idx));
-                let bridge = if idx == self.workspace {
-                    Some(&self.bridge)
-                } else {
-                    self.parked_bridges.get(idx).and_then(Option::as_ref)
-                };
-                if let Some(bridge) = bridge
+                if let Some(bridge) = self.workspace_bridge(idx)
                     && let (Some(store), Some(tid)) =
                         (bridge.read_store_clone(), bridge.team_id().cloned())
                 {
-                    let name = team
-                        .map(|t| t.name.clone())
-                        .filter(|n| !n.trim().is_empty());
+                    let name =
+                        Some(self.slots[idx].team.name.clone()).filter(|n| !n.trim().is_empty());
                     targets.push(WorkspaceCatchUpTarget {
                         workspace: tid,
                         workspace_name: name,
@@ -1178,16 +1186,10 @@ impl App {
             }
         } else {
             for idx in indices {
-                let Some(team) = self.fixtures.workspaces.get(idx) else {
-                    continue;
-                };
-                let fx = if idx == self.workspace {
-                    self.fixtures.clone()
-                } else if let Some(parked) = self.parked.get(idx).and_then(Option::as_ref) {
-                    parked.fixtures.clone()
-                } else {
-                    Arc::new(fixtures::workspace(idx))
-                };
+                let team = &self.slots[idx].team;
+                let fx = self
+                    .workspace_fixtures(idx)
+                    .unwrap_or_else(|| Arc::new(fixtures::workspace(idx)));
                 if let Some(store) = fixture_archive_for(&fx, &team.id) {
                     targets.push(WorkspaceCatchUpTarget {
                         workspace: team.id.clone(),
@@ -1255,10 +1257,8 @@ impl App {
                 writes.push(write);
             }
             if all_workspaces {
-                for slot in &self.parked_bridges {
-                    if let Some(bg) = slot.as_ref()
-                        && let Some(write) = bg.record_catchup_visit(now_secs)
-                    {
+                for bg in self.slots.iter().filter_map(|slot| slot.bridge.as_ref()) {
+                    if let Some(write) = bg.record_catchup_visit(now_secs) {
                         writes.push(write);
                     }
                 }
@@ -1379,7 +1379,7 @@ impl App {
                 .update(cx, |view, cx| view.show_local(fixtures, groups, cx));
             return;
         };
-        let team = self.fixtures.workspaces[self.workspace].id.clone();
+        let team = self.team().id.clone();
         let Some(generation) = self.unreads_refresh.request(&team) else {
             return;
         };
@@ -1514,13 +1514,7 @@ impl App {
 
     /// Open Slack workspace administration in the default browser.
     pub(super) fn open_admin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let domain = self
-            .fixtures
-            .workspaces
-            .get(self.workspace)
-            .or_else(|| self.fixtures.workspaces.first())
-            .map(|t| t.domain.as_str())
-            .filter(|d| !d.is_empty());
+        let domain = Some(self.team().domain.as_str()).filter(|d| !d.is_empty());
         if let Some(domain) = domain {
             cx.open_url(&format!("https://{domain}.slack.com/admin"));
         } else {

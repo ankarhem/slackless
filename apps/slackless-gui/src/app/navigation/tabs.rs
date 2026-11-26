@@ -159,15 +159,14 @@ impl App {
 
     /// The canvas document's permalink in Slack's web client.
     pub(in crate::app) fn canvas_link(&self, canvas_id: &str) -> String {
-        match self.fixtures.workspaces.first() {
-            Some(team) if !team.domain.is_empty() => format!(
+        let team = self.team();
+        if team.domain.is_empty() {
+            format!("https://app.slack.com/client/{}/{}", team.id, self.channel)
+        } else {
+            format!(
                 "https://{}.slack.com/docs/{}/{}",
                 team.domain, team.id, canvas_id
-            ),
-            Some(team) => {
-                format!("https://app.slack.com/client/{}/{}", team.id, self.channel)
-            }
-            None => format!("https://app.slack.com/client/{}", self.channel),
+            )
         }
     }
 
@@ -411,44 +410,13 @@ impl App {
 
     /// Format the live cross-workspace unread & mention summary (`F-SHELL-278`).
     pub(in crate::app) fn cross_workspace_summary_text(&self, cx: &gpui::App) -> String {
-        let ws_count = self
-            .live_teams
-            .len()
-            .max(self.fixtures.workspaces.len())
-            .max(1);
-        let mut entries = Vec::with_capacity(ws_count);
-        for ix in 0..ws_count {
-            let badge = if ix == self.workspace {
-                let sidebar = self.sidebar.read(cx);
-                WorkspaceBadge {
-                    mentions: sidebar.badge_count(),
-                    has_unreads: sidebar.has_any_unreads(),
-                }
-            } else if let Some(parked) = self.parked.get(ix).and_then(Option::as_ref) {
-                if !parked.state.counts.is_empty() {
-                    let activity = self.bg_activity_unread.get(ix).copied().unwrap_or(0);
-                    workspace_badge_from_counts(&parked.state.counts, activity)
-                } else {
-                    let sidebar = parked.views.sidebar.read(cx);
-                    WorkspaceBadge {
-                        mentions: sidebar.badge_count(),
-                        has_unreads: sidebar.has_any_unreads(),
-                    }
-                }
-            } else if let Some(counts) = self.bg_counts.get(ix).filter(|c| !c.is_empty()) {
-                let activity = self.bg_activity_unread.get(ix).copied().unwrap_or(0);
-                workspace_badge_from_counts(counts, activity)
-            } else {
-                WorkspaceBadge::default()
-            };
-            let name = self
-                .live_teams
-                .get(ix)
-                .or_else(|| self.fixtures.workspaces.get(ix))
-                .map(|t| t.name.clone())
-                .unwrap_or_else(|| format!("Workspace {}", ix + 1));
-            entries.push((name, badge.mentions, badge.has_unreads));
-        }
+        let entries: Vec<_> = (self.rail.iter())
+            .map(|&ix| {
+                let badge = self.workspace_badge(ix, cx);
+                let name = self.slots[ix].team.name.clone();
+                (name, badge.mentions, badge.has_unreads)
+            })
+            .collect();
         crate::preferences::format_cross_workspace_summary(&entries)
     }
 

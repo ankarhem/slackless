@@ -1996,14 +1996,10 @@ fn message_posted_typing_cleanup_thread_reply_rules_and_multi_workspace_sync_bad
             assert_eq!(dm_counts.dm_count, 1);
             assert_eq!(dm_counts.mention_count, 1);
 
-            // 4. Multi-workspace sync_badge aggregates active + bg_counts + bg_activity_unread.
-            if app.bg_counts.len() < 2 {
-                app.bg_counts.resize_with(2, HashMap::new);
-            }
-            if app.bg_activity_unread.len() < 2 {
-                app.bg_activity_unread.resize(2, 0);
-            }
-            app.bg_counts[1].insert(
+            // 4. Multi-workspace sync_badge aggregates the active workspace with the background
+            // ones' counts and Activity unreads.
+            assert!(app.slots.len() >= 2, "the sample has several workspaces");
+            app.slots[1].state.counts.insert(
                 ChannelId::from("C_BG"),
                 ConversationCounts {
                     id: ChannelId::from("C_BG"),
@@ -2012,7 +2008,7 @@ fn message_posted_typing_cleanup_thread_reply_rules_and_multi_workspace_sync_bad
                     ..Default::default()
                 },
             );
-            app.bg_activity_unread[1] = 2;
+            app.slots[1].activity_unread = 2;
 
             app.sync_badge(cx);
             // Active sidebar has 1 unread DM (count=1) + bg workspace has 3 mentions + 2 activity = 6.
@@ -2020,8 +2016,8 @@ fn message_posted_typing_cleanup_thread_reply_rules_and_multi_workspace_sync_bad
             assert_eq!(app.badge_label, Some(Some("6".to_owned())));
 
             // Clearing mentions while leaving channel unread + badge_on_unreads = true shows bullet.
-            app.bg_counts[1].clear();
-            app.bg_activity_unread[1] = 0;
+            app.slots[1].state.counts.clear();
+            app.slots[1].activity_unread = 0;
             app.mark_read(&dm, Ts::from("1700000120.000100"), cx);
             app.preferences.update(cx, |p, cx| {
                 let mut s = p.settings().clone();
@@ -2264,7 +2260,7 @@ fn deep_links_permalinks_workspace_switch_focus_leave_and_hover_card_lifecycle(
             app.select(ChannelId::from("C0DESIGN"), cx);
             app.composer
                 .update(cx, |c, cx| c.load_draft("ws0 draft", cx));
-            assert!(app.parked.len() >= 2, "fixture has multiple workspaces");
+            assert!(app.slots.len() >= 2, "fixture has multiple workspaces");
             app.switch_workspace(1, window, cx);
             assert_eq!(app.workspace, 1);
             assert_eq!(app.composer.read(cx).text(), "");
@@ -2852,7 +2848,7 @@ fn cross_workspace_search_jump_storage_backfill_progress_and_export_engine(
                 });
             let ch_doc = super::dialogs::storage::build_fixture_channel_export(
                 &fx1_export,
-                1,
+                &fx1_export.workspaces[1],
                 &export_ch,
                 "#ch",
             );
@@ -2863,7 +2859,7 @@ fn cross_workspace_search_jump_storage_backfill_progress_and_export_engine(
             );
             let th_doc = super::dialogs::storage::build_fixture_thread_export(
                 &fx1_export,
-                1,
+                &fx1_export.workspaces[1],
                 &export_ch,
                 "#ch",
                 &root_ts,

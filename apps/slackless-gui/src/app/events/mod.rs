@@ -103,11 +103,7 @@ impl App {
         items: &[slackless_core::api::SavedItem],
         cx: &mut Context<Self>,
     ) {
-        let fixtures = if workspace == self.workspace {
-            self.fixtures.clone()
-        } else if let Some(parked) = self.parked.get(workspace).and_then(Option::as_ref) {
-            parked.fixtures.clone()
-        } else {
+        let Some(fixtures) = self.workspace_fixtures(workspace) else {
             return;
         };
         let mapped: Vec<crate::later::LaterItem> = items
@@ -204,12 +200,8 @@ impl App {
             let name = label.strip_prefix("# ").unwrap_or(&label);
             parts.push(format!("{name} ({kind})"));
         }
-        if let Some(team) = self
-            .fixtures
-            .workspaces
-            .get(self.workspace)
-            .filter(|team| !team.name.is_empty())
-        {
+        let team = self.team();
+        if !team.name.is_empty() {
             parts.push(team.name.clone());
         }
         match self.badge {
@@ -245,56 +237,43 @@ impl App {
         }
     }
 
+    /// The rail badge of the workspace in slot `ix`: the shown sidebar's; else its live counts;
+    /// else (sample) its parked sidebar's.
+    pub(super) fn workspace_badge(&self, ix: usize, cx: &gpui::App) -> WorkspaceBadge {
+        let sidebar_badge = |sidebar: &Entity<Sidebar>| {
+            let sidebar = sidebar.read(cx);
+            WorkspaceBadge {
+                mentions: sidebar.badge_count(),
+                has_unreads: sidebar.has_any_unreads(),
+            }
+        };
+        if ix == self.workspace {
+            return sidebar_badge(&self.sidebar);
+        }
+        let Some(slot) = self.slots.get(ix) else {
+            return WorkspaceBadge::default();
+        };
+        if !slot.state.counts.is_empty() {
+            return workspace_badge_from_counts(&slot.state.counts, slot.activity_unread);
+        }
+        (slot.parked.as_ref())
+            .map_or_else(WorkspaceBadge::default, |p| sidebar_badge(&p.views.sidebar))
+    }
+
     /// Hand the total unread count (across every workspace) to the dock badge, and push
     /// per-workspace badges to the workspace switcher rail (`F-CORE-006`).
     pub(super) fn sync_badge(&mut self, cx: &mut Context<Self>) {
-        let ws_count = self
-            .live_teams
-            .len()
-            .max(self.fixtures.workspaces.len())
-            .max(1);
-        let mut badges = Vec::with_capacity(ws_count);
+        let mut badges = Vec::with_capacity(self.rail.len());
+        let mut status_workspaces = Vec::with_capacity(self.rail.len());
         let mut total_dock: u32 = 0;
-        for ix in 0..ws_count {
-            let badge = if ix == self.workspace {
-                let sidebar = self.sidebar.read(cx);
-                let mentions = sidebar.badge_count();
-                let has_unreads = sidebar.has_any_unreads();
-                WorkspaceBadge {
-                    mentions,
-                    has_unreads,
-                }
-            } else if let Some(parked) = self.parked.get(ix).and_then(Option::as_ref) {
-                if !parked.state.counts.is_empty() {
-                    let activity = self.bg_activity_unread.get(ix).copied().unwrap_or(0);
-                    workspace_badge_from_counts(&parked.state.counts, activity)
-                } else {
-                    let sidebar = parked.views.sidebar.read(cx);
-                    WorkspaceBadge {
-                        mentions: sidebar.badge_count(),
-                        has_unreads: sidebar.has_any_unreads(),
-                    }
-                }
-            } else if let Some(counts) = self.bg_counts.get(ix).filter(|c| !c.is_empty()) {
-                let activity = self.bg_activity_unread.get(ix).copied().unwrap_or(0);
-                workspace_badge_from_counts(counts, activity)
-            } else {
-                WorkspaceBadge::default()
-            };
-            total_dock = total_dock.saturating_add(badge.mentions);
-            badges.push(badge);
-        }
         let mut any_unreads = false;
-        let mut status_workspaces = Vec::with_capacity(ws_count);
-        for (ix, badge) in badges.iter().enumerate() {
+        for &ix in &self.rail {
+            let badge = self.workspace_badge(ix, cx);
+            total_dock = total_dock.saturating_add(badge.mentions);
             any_unreads |= badge.has_unreads;
-            let name = self
-                .fixtures
-                .workspaces
-                .get(ix)
-                .map(|t| t.name.clone())
-                .unwrap_or_else(|| format!("Workspace {}", ix + 1));
+            let name = self.slots[ix].team.name.clone();
             status_workspaces.push((name, badge.mentions, badge.has_unreads));
+            badges.push(badge);
         }
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_workspace_badges(badges, cx));

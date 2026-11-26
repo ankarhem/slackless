@@ -302,14 +302,8 @@ impl App {
                     self.select_tab(target_tab, cx);
                     return true;
                 }
-                if !self.fixtures.sample
-                    && let Some(resolved_team) = team_id.or_else(|| {
-                        self.fixtures
-                            .workspaces
-                            .get(self.workspace)
-                            .map(|t| t.id.to_string())
-                    })
-                {
+                if !self.fixtures.sample {
+                    let resolved_team = team_id.unwrap_or_else(|| self.team().id.to_string());
                     self.bridge.send(CollabCommand::OpenAppHome {
                         app_id,
                         team_id: resolved_team,
@@ -333,16 +327,8 @@ impl App {
         cx: &mut Context<Self>,
     ) -> bool {
         if let Some(tid) = team_id {
-            let idx = self
-                .live_teams
-                .iter()
-                .position(|t| t.id.as_str().eq_ignore_ascii_case(tid))
-                .or_else(|| {
-                    self.fixtures
-                        .workspaces
-                        .iter()
-                        .position(|t| t.id.as_str().eq_ignore_ascii_case(tid))
-                });
+            let idx = (self.slots.iter())
+                .position(|slot| slot.team.id.as_str().eq_ignore_ascii_case(tid));
             if let Some(ix) = idx {
                 if ix != self.workspace {
                     self.switch_workspace(ix, window, cx);
@@ -358,15 +344,9 @@ impl App {
             return false;
         }
         if let Some(domain) = workspace_domain {
-            let idx =
-                self.live_teams
-                    .iter()
-                    .position(|t| !t.domain.is_empty() && t.domain.eq_ignore_ascii_case(domain))
-                    .or_else(|| {
-                        self.fixtures.workspaces.iter().position(|t| {
-                            !t.domain.is_empty() && t.domain.eq_ignore_ascii_case(domain)
-                        })
-                    });
+            let idx = self.slots.iter().position(|slot| {
+                !slot.team.domain.is_empty() && slot.team.domain.eq_ignore_ascii_case(domain)
+            });
             if let Some(ix) = idx {
                 if ix != self.workspace {
                     self.switch_workspace(ix, window, cx);

@@ -472,6 +472,7 @@ fn wired_confirmed_send_stays_on_the_channel_it_was_submitted_to(cx: &mut gpui::
         !sent_to(&core.drain_commands(), &big),
         "a canceled send sends nothing"
     );
+
     drop(root);
 }
 
@@ -498,6 +499,17 @@ fn wired_multi_workspace_event_isolation_and_switching(cx: &mut gpui::TestAppCon
     });
     let mut fx = b1.snapshot(&HashMap::new()).expect("ws1 snapshot");
     fx.workspaces = vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()];
+    // T0TWO already holds a draft of its own, restored on its first visit.
+    let seed = b2
+        .remember_drafts(&[SavedDraft {
+            channel: ChannelId::from("C0TWO"),
+            label: "two-chan".into(),
+            text: "two's own draft".into(),
+            at: 1,
+        }])
+        .expect("a live bridge persists drafts");
+    cx.executor().spawn(seed).detach();
+    cx.run_until_parked();
     let (root, app, cx) = mount_wired(fx, vec![b1, b2], cx);
     let _ = c1.drain_commands();
     let _ = c2.drain_commands();
@@ -553,6 +565,116 @@ fn wired_multi_workspace_event_isolation_and_switching(cx: &mut gpui::TestAppCon
                 .conversation(&ChannelId::from("C0TWO"))
                 .is_some(),
             "switching to workspace 1 must load its channels"
+        );
+    });
+
+    // Back on T0ONE a draft is typed, then T0TWO's tile is moved to the top of the rail.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.switch_workspace(0, window, cx);
+            app.composer
+                .update(cx, |c, cx| c.load_draft("typed before the move", cx));
+            app.save_draft(cx);
+            app.sidebar.update(cx, |_, cx| {
+                cx.emit(SidebarEvent::ReorderWorkspace { from: 0, to: 1 });
+            });
+        });
+    });
+    cx.run_until_parked();
+
+    // Moving a tile changes no workspace's identity: T0TWO's counts stay out of T0ONE...
+    let two_counts = slackless_core::api::ClientCounts {
+        channels: vec![ConversationCounts {
+            id: ChannelId::from("C0TWO"),
+            has_unreads: true,
+            mention_count: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    cx.update(|_, cx| c2.emit(Event::Counts(Box::new(two_counts)), cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert!(
+            !app.read(cx)
+                .ws
+                .counts
+                .contains_key(&ChannelId::from("C0TWO")),
+            "a background workspace's counts must not reach the shown one after a reorder"
+        );
+    });
+
+    // ...T0ONE's own events keep refreshing its open conversation...
+    let live = Message {
+        ts: Ts::from("1700002000.000100"),
+        user: Some(UserId::from("U0PEER")),
+        text: "Still live after the move".into(),
+        ..Default::default()
+    };
+    c1.store()
+        .lock()
+        .expect("store1 lock")
+        .upsert_message(&TeamId::from("T0ONE"), &ChannelId::from("C0ONE"), &live)
+        .expect("upsert ws1");
+    cx.update(|_, cx| {
+        c1.emit(
+            Event::StoreChanged {
+                channel: ChannelId::from("C0ONE"),
+            },
+            cx,
+        );
+        c1.emit(
+            Event::MessagePosted {
+                channel: ChannelId::from("C0ONE"),
+                message: Box::new(live),
+            },
+            cx,
+        );
+    });
+    cx.executor().advance_clock(RELOAD_DEBOUNCE);
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        assert_eq!(
+            app.read(cx)
+                .messages
+                .read(cx)
+                .last_message_text_for_test(cx)
+                .as_deref(),
+            Some("Still live after the move"),
+            "the shown workspace keeps its live updates after a reorder"
+        );
+    });
+
+    // ...and T0ONE's drafts persist into T0ONE's store, without T0TWO's.
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.composer
+                .update(cx, |c, cx| c.load_draft("typed after the move", cx));
+            app.save_draft(cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let stored: Vec<String> = (app.read(cx).bridge.drafts().unwrap_or_default())
+            .into_iter()
+            .map(|draft| draft.text)
+            .collect();
+        assert_eq!(
+            stored,
+            ["typed after the move"],
+            "T0ONE's store keeps exactly T0ONE's drafts"
+        );
+    });
+
+    // Cmd+1 opens the rail's first tile, now T0TWO.
+    cx.dispatch_action(SwitchWorkspace(0));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(
+            app.read(cx).bridge.team_id(),
+            Some(&TeamId::from("T0TWO")),
+            "Cmd+1 follows the rail's order"
         );
     });
     drop(root);

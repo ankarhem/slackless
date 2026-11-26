@@ -125,15 +125,12 @@ impl App {
                     return;
                 }
                 app.ws.reload = None;
-                // Keep the full multi-workspace rail intact while updating this workspace's team info.
-                if let Some(own) = snapshot.workspaces.first().cloned()
-                    && let Some(slot) = app.live_teams.get_mut(app.workspace)
-                {
-                    *slot = own;
+                // This workspace's stored team record refreshes its slot; the rail keeps every
+                // workspace, in its order.
+                if let Some(own) = snapshot.workspaces.first().cloned() {
+                    app.slots[app.workspace].team = own;
                 }
-                if !app.live_teams.is_empty() {
-                    snapshot.workspaces = app.live_teams.clone();
-                }
+                snapshot.workspaces = app.rail_teams();
                 // The store's cached bot profiles join the map every snapshot shares (a first
                 // visit's state starts it empty); profiles resolved this session stay.
                 let cached = mem::take(

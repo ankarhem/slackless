@@ -925,18 +925,7 @@ impl App {
         });
 
         let export_doc = {
-            let ws = self
-                .bridge
-                .team_id()
-                .cloned()
-                .or_else(|| {
-                    self.fixtures
-                        .workspaces
-                        .get(self.workspace)
-                        .or_else(|| self.fixtures.workspaces.first())
-                        .map(|t| t.id.clone())
-                })
-                .unwrap_or_default();
+            let ws = (self.bridge.team_id().cloned()).unwrap_or_else(|| self.team().id.clone());
             let ws_name = self
                 .fixtures
                 .workspaces
@@ -2431,7 +2420,7 @@ impl App {
         let suggested = format!("{stem}-export.{}", fmt.extension());
         let start_dir = self.default_export_dir(cx);
         let fixtures = self.fixtures.clone();
-        let workspace_index = self.workspace;
+        let shown_team = self.team().clone();
         let store = self.bridge.read_store_clone();
         let team = self.bridge.team_id().cloned();
         let include_deleted = self.preferences.read(cx).settings().show_deleted_messages;
@@ -2458,12 +2447,8 @@ impl App {
                             .map_err(std::io::Error::other)?;
                         (artifact.item_count, artifact.content)
                     } else {
-                        let doc = build_fixture_channel_export(
-                            &fixtures,
-                            workspace_index,
-                            &channel,
-                            &label,
-                        );
+                        let doc =
+                            build_fixture_channel_export(&fixtures, &shown_team, &channel, &label);
                         let content = match fmt {
                             slackless_core::export::ExportFormat::Markdown => {
                                 slackless_core::export::render_messages_markdown(&doc)
@@ -2512,7 +2497,7 @@ impl App {
         let suggested = format!("{stem}-thread-{ts_slug}.{}", fmt.extension());
         let start_dir = self.default_export_dir(cx);
         let fixtures = self.fixtures.clone();
-        let workspace_index = self.workspace;
+        let shown_team = self.team().clone();
         let store = self.bridge.read_store_clone();
         let team = self.bridge.team_id().cloned();
         let include_deleted = self.preferences.read(cx).settings().show_deleted_messages;
@@ -2543,7 +2528,7 @@ impl App {
                     } else {
                         let doc = build_fixture_thread_export(
                             &fixtures,
-                            workspace_index,
+                            &shown_team,
                             &channel,
                             &label,
                             &thread_ts,
@@ -2630,20 +2615,12 @@ fn collect_storage_info(
 
 pub(in crate::app) fn build_fixture_channel_export(
     fixtures: &Fixtures,
-    workspace_index: usize,
+    team: &Team,
     channel: &ChannelId,
     label: &str,
 ) -> slackless_core::export::ExportedMessagesDoc {
-    let active_ws = fixtures
-        .workspaces
-        .get(workspace_index)
-        .or_else(|| fixtures.workspaces.first());
-    let ws = active_ws
-        .map(|t| t.id.as_str().to_owned())
-        .unwrap_or_default();
-    let ws_name = active_ws
-        .map(|t| t.name.clone())
-        .filter(|n| !n.trim().is_empty());
+    let ws = team.id.as_str().to_owned();
+    let ws_name = Some(team.name.clone()).filter(|n| !n.trim().is_empty());
     let mut users = HashMap::new();
     for u in &fixtures.users {
         users.insert(u.id.clone(), fixtures.name_of(u).to_owned());
@@ -2700,21 +2677,13 @@ pub(in crate::app) fn build_fixture_channel_export(
 
 pub(in crate::app) fn build_fixture_thread_export(
     fixtures: &Fixtures,
-    workspace_index: usize,
+    team: &Team,
     channel: &ChannelId,
     label: &str,
     thread_ts: &Ts,
 ) -> slackless_core::export::ExportedMessagesDoc {
-    let active_ws = fixtures
-        .workspaces
-        .get(workspace_index)
-        .or_else(|| fixtures.workspaces.first());
-    let ws = active_ws
-        .map(|t| t.id.as_str().to_owned())
-        .unwrap_or_default();
-    let ws_name = active_ws
-        .map(|t| t.name.clone())
-        .filter(|n| !n.trim().is_empty());
+    let ws = team.id.as_str().to_owned();
+    let ws_name = Some(team.name.clone()).filter(|n| !n.trim().is_empty());
     let mut users = HashMap::new();
     for u in &fixtures.users {
         users.insert(u.id.clone(), fixtures.name_of(u).to_owned());
