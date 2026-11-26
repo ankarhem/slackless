@@ -565,6 +565,10 @@ impl<B: Backend> Core<B> {
                     }
                 }
             }
+            load(
+                "legacy offline sends",
+                commands::migrate_legacy_offline_sends(s, &ws_init).map(|_| ()),
+            );
             let offline = load("offline_queue", s.list_offline(&ws_init));
             // Rows left `sending` by an unclean exit stay invisible to every flush until recovered.
             if let Err(err) = s.reset_outbox_sending_to_pending(&ws_init) {

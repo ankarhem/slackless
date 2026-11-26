@@ -5050,45 +5050,11 @@ async fn drafts_sync_lifecycle_concurrency_delete_failure_and_fetch_reconciliati
 }
 
 #[tokio::test]
-async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_corrupt_row() {
-    // 1. QueuedMutation::summary UTF-8 truncation and variants.
-    let long_utf8 = "🎉".repeat(55);
-    let m_long = QueuedMutation::SendMessage {
-        channel: c1(),
-        content: MessageContent::plain(long_utf8),
-        thread_ts: None,
-        broadcast: false,
-    };
-    let s_long = m_long.summary();
-    assert!(s_long.ends_with("…\""));
-    assert_eq!(s_long.chars().filter(|&c| c == '🎉').count(), 48);
+async fn offline_queue_edge_cases_discard_mark_read_and_corrupt_row() {
+    use crate::store::OutboxKind;
 
-    let m_empty = QueuedMutation::SendMessage {
-        channel: c1(),
-        content: MessageContent::plain("   "),
-        thread_ts: None,
-        broadcast: false,
-    };
-    assert_eq!(m_empty.summary(), "Message");
-    assert_eq!(
-        QueuedMutation::RemoveReaction {
-            channel: c1(),
-            ts: Ts::from("1.0"),
-            name: "wave".into(),
-        }
-        .summary(),
-        "Remove reaction :wave:"
-    );
-    assert_eq!(
-        QueuedMutation::MarkRead {
-            channel: c1(),
-            ts: Ts::from("1.0"),
-        }
-        .summary(),
-        "Mark read (C1)"
-    );
-
-    // 2. Corrupt JSON row in SQLite `offline_queue` is skipped cleanly on Core::new while valid rows load.
+    // 1. A corrupt `offline_queue` row is skipped on Core::new, and a legacy queued reaction
+    //    (queued before the outbox existed) moves into the outbox as a pending item.
     let fake = FakeBackend::default();
     fake.state.lock().unwrap().mark_read_ok = true;
     let (store, events, mut rx) = fake_core_parts();
@@ -5105,13 +5071,10 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
         .unwrap();
         s.enqueue_offline(&TeamId::from("T1"), "{not-valid-json")
             .unwrap();
-        let valid_payload = serde_json::to_string(&QueuedMutation::RemoveReaction {
-            channel: c1(),
-            ts: Ts::from("5.0"),
-            name: "eyes".into(),
-        })
-        .unwrap();
-        s.enqueue_offline(&TeamId::from("T1"), &valid_payload)
+        let legacy_reaction = serde_json::json!({
+            "RemoveReaction": { "channel": "C1", "ts": "5.0", "name": "eyes" }
+        });
+        s.enqueue_offline(&TeamId::from("T1"), &legacy_reaction.to_string())
             .unwrap();
     }
     let mut core = Core::new(
@@ -5122,7 +5085,23 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
         test_media_tx(),
     )
     .await;
-    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
+    let migrated = match next(&mut rx).await {
+        Event::OutboxUpdated(items) => items,
+        other => panic!("expected the legacy reaction in the outbox, got {other:?}"),
+    };
+    assert_eq!(migrated.len(), 1);
+    assert_eq!(migrated[0].kind, OutboxKind::ReactionRemove);
+    assert!(core.offline_queue.is_empty());
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .list_offline(&TeamId::from("T1"))
+            .unwrap()
+            .len(),
+        1,
+        "only the corrupt row stays in the offline queue"
+    );
 
     // Go offline: queue MarkRead and a SendMessage, then discard the SendMessage while offline.
     core.on_rtm(RtmEvent::State(ConnectionState::Disconnected {
@@ -5136,7 +5115,7 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
         ts: Ts::from("99.0"),
     }))
     .await;
-    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(2));
+    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
 
     core.handle(Command::Messaging(MessagingCommand::SendMessage {
         channel: c1(),
@@ -5147,8 +5126,9 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
     .await;
     let discard_id = match next(&mut rx).await {
         Event::OutboxUpdated(items) => {
-            assert_eq!(items.len(), 1);
-            items[0].id
+            // Queued behind the migrated reaction.
+            assert_eq!(items.len(), 2);
+            items[1].id
         }
         other => panic!("expected OutboxUpdated, got {other:?}"),
     };
@@ -5156,24 +5136,34 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
         discard_id,
     )))
     .await;
-    assert_eq!(next(&mut rx).await, Event::OutboxUpdated(Vec::new()));
+    match next(&mut rx).await {
+        Event::OutboxUpdated(items) => assert_eq!(items, migrated),
+        other => panic!("expected OutboxUpdated, got {other:?}"),
+    }
 
-    // RetryOfflineMutation while offline does NOT fire a network call immediately.
+    // RetryOfflineMutation while offline only re-queues: no network call.
     let mark_id = core.offline_queue.back().unwrap().0;
     core.handle(Command::Messaging(MessagingCommand::RetryOfflineMutation(
         mark_id,
     )))
     .await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(fake.state.lock().unwrap().mark_calls.is_empty());
 
-    // Reconnect: flushes RemoveReaction + MarkRead (and updates SQLite conv.last_read to 99.0!).
+    // Reconnect: the outbox flush delivers the migrated RemoveReaction and the queue flushes
+    // MarkRead (and updates SQLite conv.last_read to 99.0!).
     core.on_rtm(RtmEvent::State(ConnectionState::Connected {
         fast_reconnect: false,
     }))
     .await;
     assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(0));
-    assert!(matches!(next(&mut rx).await, Event::Connection(_)));
+    let (mut connected, mut outbox_drained) = (false, false);
+    while !(connected && outbox_drained) {
+        match next(&mut rx).await {
+            Event::Connection(_) => connected = true,
+            Event::OutboxUpdated(items) => outbox_drained = items.is_empty(),
+            other => panic!("unexpected event during reconnect flush: {other:?}"),
+        }
+    }
     wait_until("offline queue flush updates store last_read", || {
         store
             .lock()
@@ -5209,7 +5199,13 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
         reason: "down2".into(),
     }))
     .await;
-    assert!(matches!(next(&mut rx).await, Event::Connection(_)));
+    loop {
+        match next(&mut rx).await {
+            Event::Connection(_) => break,
+            Event::OutboxUpdated(_) => {}
+            other => panic!("unexpected event while disconnecting: {other:?}"),
+        }
+    }
     core.handle(Command::Messaging(MessagingCommand::SendMessage {
         channel: c1(),
         content: MessageContent::plain("will fail"),
@@ -8360,46 +8356,7 @@ async fn huddle_join_success_controls_leave_and_stale_generation_guard() {
 
 #[tokio::test]
 async fn offline_outbox_and_legacy_queue_edge_cases_reach_full_coverage() {
-    use crate::client::QueuedMutation;
     use crate::store::{NewOutboxItem, OutboxKind, OutboxStatus};
-
-    // 1. QueuedMutation::summary across all variants.
-    assert_eq!(
-        QueuedMutation::SendMessage {
-            channel: c1(),
-            content: MessageContent::plain("hi"),
-            thread_ts: None,
-            broadcast: false,
-        }
-        .summary(),
-        "Message \"hi\""
-    );
-    assert_eq!(
-        QueuedMutation::AddReaction {
-            channel: c1(),
-            ts: Ts::from("1.0"),
-            name: "fire".into(),
-        }
-        .summary(),
-        "Reaction :fire:"
-    );
-    assert_eq!(
-        QueuedMutation::RemoveReaction {
-            channel: c1(),
-            ts: Ts::from("1.0"),
-            name: "fire".into(),
-        }
-        .summary(),
-        "Remove reaction :fire:"
-    );
-    assert_eq!(
-        QueuedMutation::MarkRead {
-            channel: c1(),
-            ts: Ts::from("1.0"),
-        }
-        .summary(),
-        "Mark read (C1)"
-    );
 
     let fake = FakeBackend::default();
     fake.state.lock().unwrap().mark_read_ok = true;
@@ -8569,35 +8526,13 @@ async fn offline_outbox_and_legacy_queue_edge_cases_reach_full_coverage() {
             .all(|i| i.status == OutboxStatus::Failed)
     );
 
-    // 4. Legacy offline queue: retry while offline, discard, and retry while online (SendMessage + AddReaction + failure).
-    fake.state.lock().unwrap().post_message_error = None;
-    fake.state.lock().unwrap().add_reaction_error = Some(FakeSendError::Slack("reaction_failed"));
-    let legacy_msg = serde_json::to_string(&QueuedMutation::SendMessage {
-        channel: c1(),
-        content: MessageContent::plain("legacy msg"),
-        thread_ts: None,
-        broadcast: false,
-    })
-    .unwrap();
-    let legacy_rxn = serde_json::to_string(&QueuedMutation::AddReaction {
-        channel: c1(),
-        ts: Ts::from("1.0"),
-        name: "tada".into(),
-    })
-    .unwrap();
-    let legacy_disc = serde_json::to_string(&QueuedMutation::MarkRead {
-        channel: c1(),
-        ts: Ts::from("2.0"),
-    })
-    .unwrap();
-    let (id_msg, id_rxn, id_disc) = {
-        let mut s = store.lock().unwrap();
-        (
-            s.enqueue_offline(&ws, &legacy_msg).unwrap(),
-            s.enqueue_offline(&ws, &legacy_rxn).unwrap(),
-            s.enqueue_offline(&ws, &legacy_disc).unwrap(),
-        )
-    };
+    // 4. A read marker queued the legacy way retries while offline and is discarded from there.
+    let legacy_disc = serde_json::json!({ "MarkRead": { "channel": "C1", "ts": "2.0" } });
+    let id_disc = store
+        .lock()
+        .unwrap()
+        .enqueue_offline(&ws, &legacy_disc.to_string())
+        .unwrap();
     core.is_offline = true;
     core.handle(Command::Messaging(MessagingCommand::RetryOfflineMutation(
         id_disc,
@@ -8609,30 +8544,73 @@ async fn offline_outbox_and_legacy_queue_edge_cases_reach_full_coverage() {
     ))
     .await;
     assert!(core.offline_queue.is_empty());
+    core.shutdown().await;
+}
 
-    core.is_offline = false;
-    core.handle(Command::Messaging(MessagingCommand::RetryOfflineMutation(
-        id_msg,
-    )))
-    .await;
-    core.handle(Command::Messaging(MessagingCommand::RetryOfflineMutation(
-        id_rxn,
-    )))
-    .await;
-    let mut saw_offline_failed = false;
-    for _ in 0..8 {
-        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
-            Ok(Ok(Event::OfflineMutationFailed(f))) if f.id == id_rxn => {
-                saw_offline_failed = true;
-                break;
-            }
-            Ok(Ok(_)) => {}
-            _ => break,
+#[tokio::test]
+async fn legacy_offline_sends_move_into_the_outbox_at_startup() {
+    use crate::store::{OutboxKind, OutboxStatus};
+
+    let fake = FakeBackend::default();
+    fake.state.lock().unwrap().mark_read_ok = true;
+    let (store, events, mut rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+    let legacy =
+        |kind: &str, body: serde_json::Value| serde_json::json!({ kind: body }).to_string();
+    {
+        let mut s = store.lock().unwrap();
+        for payload in [
+            legacy(
+                "SendMessage",
+                serde_json::json!({
+                    "channel": "C1",
+                    "content": MessageContent::plain("legacy msg"),
+                    "thread_ts": null,
+                    "broadcast": false
+                }),
+            ),
+            legacy(
+                "AddReaction",
+                serde_json::json!({ "channel": "C1", "ts": "1.0", "name": "tada" }),
+            ),
+            legacy(
+                "MarkRead",
+                serde_json::json!({ "channel": "C1", "ts": "2.0" }),
+            ),
+            "{not-valid-json".to_owned(),
+        ] {
+            s.enqueue_offline(&ws, &payload).unwrap();
         }
     }
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    // The read marker stays queued (the corrupt row is left alone); the send and the reaction
+    // are pending outbox items in queue order.
+    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
+    let items = match next(&mut rx).await {
+        Event::OutboxUpdated(items) => items,
+        other => panic!("expected the migrated sends in the outbox, got {other:?}"),
+    };
+    let kinds: Vec<OutboxKind> = items.iter().map(|item| item.kind).collect();
+    assert_eq!(kinds, [OutboxKind::Message, OutboxKind::ReactionAdd]);
     assert!(
-        saw_offline_failed,
-        "expected OfflineMutationFailed for id_rxn"
+        items
+            .iter()
+            .all(|item| item.status == OutboxStatus::Pending)
+    );
+    assert_eq!(core.offline_queue.len(), 1);
+    let remaining = store.lock().unwrap().list_offline(&ws).unwrap();
+    assert_eq!(
+        remaining.len(),
+        2,
+        "the read marker and the corrupt row: {remaining:?}"
     );
     core.shutdown().await;
 }

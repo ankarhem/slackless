@@ -171,29 +171,11 @@ pub(super) async fn park_transient_send<B: Backend>(
     Ok(item)
 }
 
-/// Serializable offline mutation stored in SQLite `offline_queue` until flushed on reconnect.
+/// Read marker persisted in SQLite `offline_queue` until flushed on reconnect (sends and
+/// reactions queue in the outbox instead; see [`migrate_legacy_offline_sends`]).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(in crate::client) enum QueuedMutation {
-    SendMessage {
-        channel: ChannelId,
-        content: crate::api::MessageContent,
-        thread_ts: Option<Ts>,
-        broadcast: bool,
-    },
-    AddReaction {
-        channel: ChannelId,
-        ts: Ts,
-        name: String,
-    },
-    RemoveReaction {
-        channel: ChannelId,
-        ts: Ts,
-        name: String,
-    },
-    MarkRead {
-        channel: ChannelId,
-        ts: Ts,
-    },
+    MarkRead { channel: ChannelId, ts: Ts },
 }
 
 impl QueuedMutation {
@@ -210,24 +192,90 @@ impl QueuedMutation {
         }
     }
 
-    pub(in crate::client) fn summary(&self) -> String {
+    fn summary(&self) -> String {
         match self {
-            Self::SendMessage { content, .. } => {
-                let text = content.text.trim();
-                let preview: String = text.chars().take(48).collect();
-                if text.chars().count() > 48 {
-                    format!("Message \"{preview}…\"")
-                } else if preview.is_empty() {
-                    "Message".to_owned()
-                } else {
-                    format!("Message \"{preview}\"")
-                }
-            }
-            Self::AddReaction { name, .. } => format!("Reaction :{name}:"),
-            Self::RemoveReaction { name, .. } => format!("Remove reaction :{name}:"),
             Self::MarkRead { channel, .. } => format!("Mark read ({channel})"),
         }
     }
+}
+
+/// The `offline_queue` rows written before the outbox existed (sends and reactions, which the
+/// outbox now holds); shape only, for the one-time move at startup.
+#[derive(serde::Deserialize)]
+enum LegacyQueuedSend {
+    SendMessage {
+        channel: ChannelId,
+        content: crate::api::MessageContent,
+        thread_ts: Option<Ts>,
+        broadcast: bool,
+    },
+    AddReaction {
+        channel: ChannelId,
+        ts: Ts,
+        name: String,
+    },
+    RemoveReaction {
+        channel: ChannelId,
+        ts: Ts,
+        name: String,
+    },
+}
+
+impl LegacyQueuedSend {
+    fn command(self) -> Command {
+        Command::Messaging(match self {
+            Self::SendMessage {
+                channel,
+                content,
+                thread_ts,
+                broadcast,
+            } => MessagingCommand::SendMessage {
+                channel,
+                content,
+                thread_ts,
+                broadcast,
+            },
+            Self::AddReaction { channel, ts, name } => {
+                MessagingCommand::AddReaction { channel, ts, name }
+            }
+            Self::RemoveReaction { channel, ts, name } => {
+                MessagingCommand::RemoveReaction { channel, ts, name }
+            }
+        })
+    }
+}
+
+/// Moves `workspace`'s legacy queued sends and reactions into the outbox in queue order (each
+/// with its own `client_msg_id`) and deletes their `offline_queue` rows. Read markers stay. A row
+/// that is neither a legacy send nor valid JSON is left alone. Returns how many rows moved.
+pub(in crate::client) fn migrate_legacy_offline_sends(
+    store: &mut Store,
+    workspace: &TeamId,
+) -> crate::store::Result<usize> {
+    let mut moved = 0;
+    for (id, payload) in store.list_offline(workspace)? {
+        let Ok(legacy) = serde_json::from_str::<LegacyQueuedSend>(&payload) else {
+            continue;
+        };
+        let Some((channel, thread_ts, payload)) = outbox_entry_from_command(&legacy.command())
+        else {
+            continue;
+        };
+        let payload_json = payload.encode();
+        store.enqueue_outbox(
+            workspace,
+            &NewOutboxItem {
+                channel_id: &channel,
+                thread_ts: thread_ts.as_ref(),
+                kind: payload.kind(),
+                payload_json: &payload_json,
+                last_error: None,
+            },
+        )?;
+        store.delete_offline(id)?;
+        moved += 1;
+    }
+    Ok(moved)
 }
 
 /// Extract a durable V13 outbox payload from send/reply/reaction commands.
@@ -718,44 +766,26 @@ impl<B: Backend> Core<B> {
         stealth_mode: &AtomicBool,
         mutation: QueuedMutation,
     ) -> Result<(), CoreError> {
-        match mutation {
-            QueuedMutation::SendMessage {
-                channel,
-                content,
-                thread_ts,
-                broadcast,
-            } => {
-                // Legacy rows only: sends now queue in the outbox, which keeps a `client_msg_id`.
-                post_message_and_store(ctx, channel, content, thread_ts, broadcast, None).await?;
-            }
-            QueuedMutation::AddReaction { channel, ts, name } => {
-                ctx.backend.add_reaction(channel, ts, name).await?;
-            }
-            QueuedMutation::RemoveReaction { channel, ts, name } => {
-                ctx.backend.remove_reaction(channel, ts, name).await?;
-            }
-            QueuedMutation::MarkRead { channel, ts } => {
-                // Never leak read receipts if Stealth Mode was enabled while queued.
-                if stealth_mode.load(Ordering::Relaxed) {
-                    tracing::debug!(%channel, "suppressing queued MarkRead under Stealth Mode");
-                    return Ok(());
-                }
-                // A newer cursor already in the store (another device read further while this one
-                // was offline) wins: replaying this older mark would make the conversation unread
-                // again everywhere.
-                let ws = ctx.workspace.clone();
-                let target = channel.clone();
-                let stored = with_store(&ctx.store, move |s| s.conversation(&ws, &target)).await?;
-                if stored
-                    .and_then(|conv| conv.last_read)
-                    .is_some_and(|last_read| last_read > ts)
-                {
-                    tracing::debug!(%channel, %ts, "skipping stale queued MarkRead");
-                    return Ok(());
-                }
-                mark_read_and_store(ctx, channel, ts).await?;
-            }
+        let QueuedMutation::MarkRead { channel, ts } = mutation;
+        // Never leak read receipts if Stealth Mode was enabled while queued.
+        if stealth_mode.load(Ordering::Relaxed) {
+            tracing::debug!(%channel, "suppressing queued MarkRead under Stealth Mode");
+            return Ok(());
         }
+        // A newer cursor already in the store (another device read further while this one was
+        // offline) wins: replaying this older mark would make the conversation unread again
+        // everywhere.
+        let ws = ctx.workspace.clone();
+        let target = channel.clone();
+        let stored = with_store(&ctx.store, move |s| s.conversation(&ws, &target)).await?;
+        if stored
+            .and_then(|conv| conv.last_read)
+            .is_some_and(|last_read| last_read > ts)
+        {
+            tracing::debug!(%channel, %ts, "skipping stale queued MarkRead");
+            return Ok(());
+        }
+        mark_read_and_store(ctx, channel, ts).await?;
         Ok(())
     }
 }
