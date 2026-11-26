@@ -13,6 +13,14 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Popped-out windows follow their conversation in whichever workspace it lives.
+        if let Event::StoreChanged { channel } = event
+            && let Some(team) = self
+                .workspace_bridge(ws_index)
+                .and_then(CoreBridge::team_id)
+        {
+            crate::popout::store_changed(team, channel, cx);
+        }
         // A huddle belongs to the workspace running it, whichever one is shown.
         if let Event::Huddle(huddle) = event {
             self.on_huddle_core_event(ws_index, huddle, window, cx);

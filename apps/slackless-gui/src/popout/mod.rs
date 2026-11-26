@@ -7,17 +7,16 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::input::TextareaState;
 use gpui_kit::component::{ActiveTheme as _, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Bounds, Context, DisplayId, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Pixels, Point, Render, ScrollHandle, SharedString, Styled as _,
-    Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div, point, px,
-    size,
+    App, AppContext as _, Bounds, Context, DisplayId, Entity, EventEmitter, Global,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render, ScrollHandle,
+    SharedString, Styled as _, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds,
+    WindowOptions, div, point, px, size,
 };
 use gpui_kit::open_window;
 use slackless_core::types::{ChannelId, Message, TeamId, Ts};
@@ -106,6 +105,46 @@ pub enum PopoutKind {
 
 /// Callback that forwards commands (`SendMessage`, etc.) to the workspace's live `CoreBridge`.
 pub type CommandForward = Arc<dyn Fn(Command) + Send + Sync>;
+
+/// A conversation whose stored messages changed (the core's `StoreChanged`) in workspace
+/// `team`: the popped-out windows showing it reload.
+struct StoreChange {
+    team: TeamId,
+    channel: ChannelId,
+}
+
+/// Where [`StoreChange`]s reach the popped-out windows.
+struct StoreChanges;
+
+impl EventEmitter<StoreChange> for StoreChanges {}
+
+struct StoreChangesHub(Entity<StoreChanges>);
+
+impl Global for StoreChangesHub {}
+
+/// Tell the popped-out windows that `channel`'s stored messages in workspace `team` changed
+/// (nothing to do before the first one opens).
+pub fn store_changed(team: &TeamId, channel: &ChannelId, cx: &mut App) {
+    let Some(hub) = cx.try_global::<StoreChangesHub>().map(|hub| hub.0.clone()) else {
+        return;
+    };
+    hub.update(cx, |_, cx| {
+        cx.emit(StoreChange {
+            team: team.clone(),
+            channel: channel.clone(),
+        });
+    });
+}
+
+/// The [`StoreChanges`] hub, made when the first popped-out window subscribes.
+fn store_changes(cx: &mut App) -> Entity<StoreChanges> {
+    if let Some(hub) = cx.try_global::<StoreChangesHub>() {
+        return hub.0.clone();
+    }
+    let hub = cx.new(|_| StoreChanges);
+    cx.set_global(StoreChangesHub(hub.clone()));
+    hub
+}
 
 static CASCADE_STEP: AtomicUsize = AtomicUsize::new(0);
 
@@ -208,10 +247,9 @@ pub struct PopoutWindow {
     activity_rows: Vec<PopoutActivityRow>,
     later_items: Vec<LaterItem>,
     files_items: Vec<(String, String, Option<String>)>,
-    huddle_state: Option<HuddleViewState>,
+    huddle_state: Option<Rc<HuddleViewState>>,
     huddle_video: Option<WeakEntity<HuddleVideoStore>>,
     _huddle_popout_guard: Option<HuddlePopoutGuard>,
-    last_store_revision: u64,
     reload_gen: u64,
     huddle_popover: Option<HuddlePopover>,
     huddle_share_tab: HuddleShareTab,
@@ -444,7 +482,7 @@ impl PopoutWindow {
                         }
                         this.huddle_state = Some(st);
                         // Audio levels alone notify ~8x/s: only a new channel or thread root
-                        // changes the query (new replies arrive through the revision poll).
+                        // changes the query (new replies arrive as its channel's store changes).
                         if (channel_changed || root_changed)
                             && this.huddle_drawer == Some(HuddleDrawer::Thread)
                         {
@@ -457,34 +495,17 @@ impl PopoutWindow {
             }
             PopoutKind::Canvas { .. } => {}
         }
-        // Lightweight fallback refresh from the shared SQLite store for secondary windows:
-        // checks an O(1) atomic revision first so idle windows do zero SQLite queries and zero
-        // repaints.
-        if store.is_some() && (has_composer || is_huddle) {
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor().timer(Duration::from_secs(1)).await;
-                    let rev = slackless_core::store::Store::message_revision();
-                    let keep = this
-                        .update(cx, |win, cx| {
-                            if rev == win.last_store_revision {
-                                return;
-                            }
-                            if matches!(&win.kind, PopoutKind::Huddle { .. })
-                                && win.huddle_drawer != Some(HuddleDrawer::Thread)
-                            {
-                                return;
-                            }
-                            win.last_store_revision = rev;
-                            win.reload_from_store(cx);
-                        })
-                        .is_ok();
-                    if !keep {
-                        break;
+        // Reload when the core stores a change to what this window shows, in its workspace.
+        if let Some(team) = team.clone().filter(|_| store.is_some() && interactive) {
+            let hub = store_changes(cx);
+            subscriptions.push(cx.subscribe(
+                &hub,
+                move |this: &mut Self, _, change: &StoreChange, cx| {
+                    if change.team == team && this.shows(&change.channel) {
+                        this.reload_from_store(cx);
                     }
-                }
-            })
-            .detach();
+                },
+            ));
         }
         let scroll = ScrollHandle::new();
         if !initial.is_empty() {
@@ -506,7 +527,6 @@ impl PopoutWindow {
             huddle_state,
             huddle_video,
             _huddle_popout_guard: huddle_popout_guard,
-            last_store_revision: slackless_core::store::Store::message_revision(),
             reload_gen: 0,
             huddle_popover: None,
             huddle_share_tab: HuddleShareTab::Screen,
@@ -546,6 +566,24 @@ impl PopoutWindow {
             win.reload_from_store(cx);
         }
         win
+    }
+
+    /// Whether this window shows `channel`'s stored messages: its conversation or thread, or
+    /// the huddle's thread while that drawer is open.
+    fn shows(&self, channel: &ChannelId) -> bool {
+        match &self.kind {
+            PopoutKind::Conversation { channel: own, .. }
+            | PopoutKind::Thread { channel: own, .. } => own == channel,
+            PopoutKind::Huddle { .. } => {
+                self.huddle_drawer == Some(HuddleDrawer::Thread)
+                    && (self.huddle_state.as_ref())
+                        .is_some_and(|state| state.session.channel == *channel)
+            }
+            PopoutKind::Activity { .. }
+            | PopoutKind::Later { .. }
+            | PopoutKind::Canvas { .. }
+            | PopoutKind::Files { .. } => false,
+        }
     }
 }
 

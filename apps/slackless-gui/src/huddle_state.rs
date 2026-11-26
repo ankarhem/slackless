@@ -6,6 +6,7 @@
 //! camera/screen updates never trigger main-window repaints.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,7 +65,8 @@ fn now_ms() -> u64 {
 }
 
 /// Snapshot consumed by `PopoutKind::Huddle` and `HuddleFloatingPanel` so secondary windows stay
-/// in lock-step with [`HuddleState`]. Live video frames live in a separate [`HuddleVideoStore`]
+/// in lock-step with [`HuddleState`]; shared, so a popped-out window's render reuses the copy its
+/// observer took on the last change. Live video frames live in a separate [`HuddleVideoStore`]
 /// entity so high-frequency video updates never repaint the main window.
 #[derive(Clone)]
 pub struct HuddleViewState {
@@ -1113,8 +1115,8 @@ impl HuddleState {
         }
     }
 
-    pub fn view_state(&self) -> HuddleViewState {
-        HuddleViewState {
+    pub fn view_state(&self) -> Rc<HuddleViewState> {
+        Rc::new(HuddleViewState {
             session: self.session.clone(),
             participants: self.participants.clone(),
             levels: self.levels.clone(),
@@ -1128,7 +1130,7 @@ impl HuddleState {
             draw_mode: self.draw_mode,
             draw_hue: self.draw_hue,
             captions: self.captions.clone(),
-        }
+        })
     }
 }
 

@@ -541,6 +541,78 @@ fn huddle_popout_thread_drawer_skips_store_queries_on_unrelated_huddle_notifies(
 }
 
 #[gpui::test]
+fn popout_reloads_when_its_own_conversation_changes(cx: &mut TestAppContext) {
+    let fixtures = Arc::new(crate::fixtures::load());
+    let (team, general) = (TeamId::from("T1"), ChannelId::from("C0GENERAL"));
+    let store: SharedStore = Arc::new(Mutex::new(
+        slackless_core::store::Store::open_in_memory().unwrap(),
+    ));
+    let send: CommandForward = Arc::new(|_| {});
+    let on_jump: JumpHandler = Rc::new(|_, _, _, _| {});
+    cx.update(gpui_kit::init);
+    let mut popout_slot: Option<Entity<PopoutWindow>> = None;
+    let win_handle = cx.add_window(|window, cx| {
+        let list = MessageList::new(fixtures.clone(), general.clone(), window, cx);
+        let win = cx.new(|cx| {
+            PopoutWindow::new(
+                PopoutRequest {
+                    kind: PopoutKind::Conversation {
+                        channel: general.clone(),
+                        source: list.downgrade(),
+                        on_jump,
+                    },
+                    title: "# general".to_owned(),
+                    fixtures: fixtures.clone(),
+                    store: Some(store.clone()),
+                    team: Some(team.clone()),
+                    send,
+                    later_sync: None,
+                    display_id: None,
+                },
+                window,
+                cx,
+            )
+        });
+        popout_slot = Some(win.clone());
+        gpui_kit::component::Root::new(win, window, cx)
+    });
+    let popout = popout_slot.unwrap();
+    let mut vcx = gpui_kit::VisualTestContext::from_window(win_handle.into(), cx);
+    vcx.run_until_parked();
+    let fresh = Message {
+        ts: Ts::from("1700000001.000100"),
+        text: "fresh".to_owned(),
+        ..Default::default()
+    };
+    (store.lock().unwrap())
+        .upsert_message(&team, &general, &fresh)
+        .unwrap();
+
+    // Writes to other conversations (another channel, another workspace's) leave it as it is.
+    let elsewhere = [
+        (team.clone(), ChannelId::from("C0RANDOM")),
+        (TeamId::from("T2"), general.clone()),
+    ];
+    for (team, channel) in elsewhere {
+        vcx.update(|_, cx| super::store_changed(&team, &channel, cx));
+        vcx.run_until_parked();
+        let shown = vcx.read(|cx| popout.read(cx).messages.len());
+        assert_eq!(shown, 0, "{channel} in {team} is another window's");
+    }
+    vcx.update(|_, cx| super::store_changed(&team, &general, cx));
+    vcx.run_until_parked();
+    let texts: Vec<String> = vcx.read(|cx| {
+        let win = popout.read(cx);
+        win.messages.iter().map(|m| m.text.clone()).collect()
+    });
+    assert_eq!(
+        texts,
+        ["fresh"],
+        "a write to its own conversation shows at once"
+    );
+}
+
+#[gpui::test]
 fn popout_mark_unread_edit_mrkdwn_refresh_edits_and_readonly_skips_composer(
     cx: &mut TestAppContext,
 ) {
