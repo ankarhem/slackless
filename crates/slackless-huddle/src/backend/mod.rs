@@ -146,6 +146,9 @@ pub trait HwAudioDuplexHandle: Send {
     fn set_processing(&self, enable_aec_ns: bool, enable_agc: bool);
 }
 
+/// Receives each local preview frame a capture produces, on the capture's own thread.
+pub type VideoFrameSink = Arc<dyn Fn(VideoFrame) + Send + Sync>;
+
 /// Callback invoked by an OS-native hardware audio engine when captured 48 kHz mono samples arrive.
 pub type AudioCaptureCallback = Arc<dyn Fn(&[f32]) + Send + Sync>;
 
@@ -189,7 +192,7 @@ pub trait MediaBackend: Send + Sync {
         &self,
         config: ScreenShareConfig,
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        preview_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
         perf: Arc<HuddlePerfCounters>,
     ) -> Result<Box<dyn ScreenShareHandle>>;
 
@@ -198,14 +201,14 @@ pub trait MediaBackend: Send + Sync {
         &self,
         config: CameraConfig,
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        preview_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
     ) -> Result<Box<dyn CameraHandle>>;
 
     /// Start preview-only camera capture (for Preferences preview and video clip recording).
     fn start_camera_preview(
         &self,
         config: CameraPreviewConfig,
-        on_frame: Arc<dyn Fn(VideoFrame) + Send + Sync>,
+        on_frame: VideoFrameSink,
     ) -> Result<Box<dyn CameraPreviewHandle>>;
 
     /// Create an H.264 Annex-B decoder (HW with lazy SW fallback).

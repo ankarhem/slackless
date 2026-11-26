@@ -27,7 +27,7 @@ use crate::rtc::{InboundVideoPacket, VideoSenderFeedback};
 use crate::signaling::{
     RemoteVideoSource, build_client_metric_frame, build_data_message_frame, parse_external_user_id,
 };
-use crate::video::{VideoFrame, VideoTileKey};
+use crate::video::VideoTileKey;
 use crate::{
     HuddleAudioConfig, HuddleAudioLevels, HuddleControl, HuddleCredentials, HuddleError,
     HuddlePhase, HuddleSessionSnapshot, HuddleUpdate,
@@ -66,8 +66,6 @@ pub(super) struct SessionRuntime<'a, M: MediaDevices = LiveMediaDevices> {
     pub(super) vdec_shutdown: Arc<AtomicBool>,
     pub(super) perf: Arc<HuddlePerfCounters>,
     pub(super) outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-    pub(super) local_cam_tx: mpsc::UnboundedSender<VideoFrame>,
-    pub(super) local_screen_tx: mpsc::UnboundedSender<VideoFrame>,
     pub(super) bg_done_tx: mpsc::UnboundedSender<BackgroundDone<M>>,
 }
 
@@ -171,8 +169,6 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
     let mut outbound_opus_rx = hs.outbound_opus_rx;
     let inbound_video_rx = hs.inbound_video_rx;
     let mut outbound_h264_rx = hs.outbound_h264_rx;
-    let mut local_cam_rx = hs.local_cam_rx;
-    let mut local_screen_rx = hs.local_screen_rx;
     let mut pc_state_rx = hs.pc_state_rx;
     let mut keyframe_req_rx = hs.keyframe_req_rx;
     let mut codec_rx = hs.codec_rx;
@@ -289,8 +285,6 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
         vdec_shutdown,
         perf,
         outbound_h264_tx: hs.outbound_h264_tx,
-        local_cam_tx: hs.local_cam_tx,
-        local_screen_tx: hs.local_screen_tx,
         bg_done_tx,
     };
 
@@ -342,18 +336,6 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
                         state.media.set_camera_target_bitrate(bps.clamp(350_000, 1_500_000));
                     }
                 }
-            }
-            Some(frame) = local_cam_rx.recv() => {
-                let _ = updates.send(HuddleUpdate::VideoFrame {
-                    tile: VideoTileKey::LocalCamera,
-                    frame,
-                });
-            }
-            Some(frame) = local_screen_rx.recv() => {
-                let _ = updates.send(HuddleUpdate::VideoFrame {
-                    tile: VideoTileKey::LocalScreen,
-                    frame,
-                });
             }
             Some(ssrc) = keyframe_req_rx.recv() => {
                 peer.request_keyframe(ssrc).await;

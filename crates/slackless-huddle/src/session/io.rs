@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use webrtc::peer_connection::RTCPeerConnectionState;
 
 use crate::audio::{AmbientMusicPlayer, AudioEngine, AudioSharedState};
-use crate::backend::CameraHandle;
+use crate::backend::{CameraHandle, VideoFrameSink};
 use crate::content_share::ContentShareSession;
 use crate::metrics::HuddlePerfCounters;
 use crate::proto::{
@@ -22,7 +22,7 @@ use crate::rtc::{
     VideoTrackSender,
 };
 use crate::signaling::{ChimeSignalClient, ClientMetricsSnapshot};
-use crate::video::{VideoFrame, start_camera_capture};
+use crate::video::start_camera_capture;
 use crate::{HuddleAudioConfig, HuddleCredentials, HuddleError, Result};
 
 /// Boxed `Send` future alias keeping trait signatures concise for `clippy::type_complexity`.
@@ -314,7 +314,7 @@ pub(super) trait MediaDevices: 'static {
         blur: bool,
         compact: bool,
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        local_cam_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
     ) -> BoxFuture<'static, Result<Self::Camera>>;
 
     fn install_camera(&mut self, camera: Self::Camera);
@@ -337,7 +337,7 @@ pub(super) trait MediaDevices: 'static {
         creds: HuddleCredentials,
         source_id: String,
         share_audio: bool,
-        local_screen_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
         perf: Arc<HuddlePerfCounters>,
     ) -> BoxFuture<'static, Result<Self::ScreenShare>>;
 
@@ -455,13 +455,13 @@ impl MediaDevices for LiveMediaDevices {
         blur: bool,
         compact: bool,
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        local_cam_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
     ) -> BoxFuture<'static, Result<Box<dyn CameraHandle>>> {
         let prev = self.camera_capture.take();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 drop(prev);
-                start_camera_capture(device_index, blur, compact, outbound_h264_tx, local_cam_tx)
+                start_camera_capture(device_index, blur, compact, outbound_h264_tx, on_preview)
             })
             .await
             .map_err(|e| HuddleError::Video(format!("camera start task panicked: {e}")))?
@@ -510,13 +510,13 @@ impl MediaDevices for LiveMediaDevices {
         creds: HuddleCredentials,
         source_id: String,
         share_audio: bool,
-        local_screen_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
         perf: Arc<HuddlePerfCounters>,
     ) -> BoxFuture<'static, Result<ContentShareSession>> {
         let prev = self.content_share.take();
         Box::pin(async move {
             Self::stop_detached_share(prev).await;
-            ContentShareSession::start(creds, source_id, share_audio, local_screen_tx, perf).await
+            ContentShareSession::start(creds, source_id, share_audio, on_preview, perf).await
         })
     }
 

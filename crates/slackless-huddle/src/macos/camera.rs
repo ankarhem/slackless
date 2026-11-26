@@ -11,7 +11,7 @@ use super::ffi::{
     slackless_cam_capture_set_blur, slackless_cam_capture_set_compact, slackless_cam_capture_start,
     slackless_cam_capture_stop, slackless_list_cameras,
 };
-use crate::backend::CameraConfig;
+use crate::backend::{CameraConfig, VideoFrameSink};
 use crate::video::{CameraDeviceInfo, VideoFrame};
 use crate::{HuddleError, Result};
 
@@ -57,14 +57,12 @@ impl AvVtCameraCapture {
     pub fn start(
         config: &CameraConfig,
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        preview_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
     ) -> Result<Self> {
         Self::start_inner(
             config,
             Some(outbound_h264_tx),
-            Box::new(move |frame| {
-                let _ = preview_tx.send(frame);
-            }),
+            Box::new(move |frame| on_preview(frame)),
         )
     }
 

@@ -15,7 +15,7 @@ use super::{
     AudioDeviceChangeKind, AudioDeviceMonitorHandle, AudioLoopHandle, CameraConfig, CameraHandle,
     CameraPreviewConfig, CameraPreviewHandle, HwAudioDuplexConfig, HwAudioDuplexHandle,
     MediaBackend, MediaCapabilities, ScreenShareConfig, ScreenShareHandle, SystemAudioTapHandle,
-    VideoDecoderHandle,
+    VideoDecoderHandle, VideoFrameSink,
 };
 use crate::audio::ring::SpscRing;
 use crate::macos::{
@@ -246,7 +246,7 @@ fn resolve_camera_start_config(
 fn start_camera_with<L, S>(
     config: CameraConfig,
     outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-    preview_tx: mpsc::UnboundedSender<VideoFrame>,
+    on_preview: VideoFrameSink,
     list_devices: L,
     start_native: S,
 ) -> Result<Box<dyn CameraHandle>>
@@ -255,12 +255,12 @@ where
     S: FnOnce(
         CameraConfig,
         mpsc::UnboundedSender<Vec<u8>>,
-        mpsc::UnboundedSender<VideoFrame>,
+        VideoFrameSink,
     ) -> Result<Box<dyn CameraHandle>>,
 {
     let available = list_devices();
     let resolved = resolve_camera_start_config(config, &available)?;
-    start_native(resolved, outbound_h264_tx, preview_tx)
+    start_native(resolved, outbound_h264_tx, on_preview)
 }
 
 impl MediaBackend for MacOsMediaBackend {
@@ -316,7 +316,7 @@ impl MediaBackend for MacOsMediaBackend {
         &self,
         config: ScreenShareConfig,
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        preview_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
         perf: Arc<HuddlePerfCounters>,
     ) -> Result<Box<dyn ScreenShareHandle>> {
         if !self.has_screen_capture_permission() {
@@ -328,7 +328,7 @@ impl MediaBackend for MacOsMediaBackend {
         match ScVtScreenCapture::start(
             &config,
             outbound_h264_tx.clone(),
-            preview_tx.clone(),
+            Arc::clone(&on_preview),
             Arc::clone(&perf),
         ) {
             Ok(hw) => Ok(Box::new(hw)),
@@ -344,7 +344,7 @@ impl MediaBackend for MacOsMediaBackend {
                 Ok(Box::new(SoftwareScreenShare::start(
                     config,
                     outbound_h264_tx,
-                    preview_tx,
+                    on_preview,
                     perf,
                 )?))
             }
@@ -355,15 +355,15 @@ impl MediaBackend for MacOsMediaBackend {
         &self,
         config: CameraConfig,
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        preview_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
     ) -> Result<Box<dyn CameraHandle>> {
         start_camera_with(
             config,
             outbound_h264_tx,
-            preview_tx,
+            on_preview,
             list_macos_cameras,
-            |cfg, h264_tx, prev_tx| {
-                AvVtCameraCapture::start(&cfg, h264_tx, prev_tx)
+            |cfg, h264_tx, on_preview| {
+                AvVtCameraCapture::start(&cfg, h264_tx, on_preview)
                     .map(|hw| Box::new(hw) as Box<dyn CameraHandle>)
             },
         )
@@ -372,7 +372,7 @@ impl MediaBackend for MacOsMediaBackend {
     fn start_camera_preview(
         &self,
         config: CameraPreviewConfig,
-        on_frame: Arc<dyn Fn(VideoFrame) + Send + Sync>,
+        on_frame: VideoFrameSink,
     ) -> Result<Box<dyn CameraPreviewHandle>> {
         let available = list_macos_cameras();
         let resolved = select_camera_index(config.device_index, &available)
@@ -636,7 +636,7 @@ mod tests {
 
         // When preferred device is unplugged (index 5), native starter receives fallback index 0.
         let (h264_tx, _h264_rx) = mpsc::unbounded_channel();
-        let (prev_tx, _prev_rx) = mpsc::unbounded_channel();
+        let no_preview: VideoFrameSink = Arc::new(|_| {});
         let seen_idx = Arc::new(std::sync::Mutex::new(None));
         let seen_idx_cb = Arc::clone(&seen_idx);
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -645,7 +645,7 @@ mod tests {
         let mut handle = start_camera_with(
             sample_camera_config(Some(5)),
             h264_tx,
-            prev_tx,
+            Arc::clone(&no_preview),
             || devices.clone(),
             move |cfg, _, _| {
                 *seen_idx_cb.lock().unwrap() = cfg.device_index;
@@ -661,11 +661,10 @@ mod tests {
 
         // Empty device list fails before invoking native starter.
         let (h264_tx2, _) = mpsc::unbounded_channel();
-        let (prev_tx2, _) = mpsc::unbounded_channel();
         let err = start_camera_with(
             sample_camera_config(None),
             h264_tx2,
-            prev_tx2,
+            Arc::clone(&no_preview),
             Vec::new,
             |_, _, _| unreachable!("native starter must not run when no cameras exist"),
         )
@@ -675,11 +674,10 @@ mod tests {
 
         // Native startup error propagates directly (no nokhwa fallback on macOS).
         let (h264_tx3, _) = mpsc::unbounded_channel();
-        let (prev_tx3, _) = mpsc::unbounded_channel();
         let native_err = start_camera_with(
             sample_camera_config(Some(1)),
             h264_tx3,
-            prev_tx3,
+            no_preview,
             || devices,
             |cfg, _, _| {
                 assert_eq!(cfg.device_index, Some(1));

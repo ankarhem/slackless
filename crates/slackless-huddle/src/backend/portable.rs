@@ -20,7 +20,7 @@ use super::{
     AudioDeviceChangeKind, AudioDeviceMonitorHandle, CameraConfig, CameraHandle,
     CameraPreviewConfig, CameraPreviewHandle, MediaBackend, MediaCapabilities,
 };
-use super::{ScreenShareConfig, ScreenShareHandle, VideoDecoderHandle};
+use super::{ScreenShareConfig, ScreenShareHandle, VideoDecoderHandle, VideoFrameSink};
 use crate::av1::Av1Decoder;
 use crate::metrics::HuddlePerfCounters;
 use crate::screen::{capture_once_result, fast_stride_hash, with_autorelease_pool};
@@ -54,7 +54,7 @@ impl SoftwareScreenShare {
     pub(crate) fn start(
         config: ScreenShareConfig,
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        preview_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
         perf: Arc<HuddlePerfCounters>,
     ) -> Result<Self> {
         perf.set_tx_backend("xcap + OpenH264 ScreenContent (SW)");
@@ -127,7 +127,7 @@ impl SoftwareScreenShare {
                                         enc.force_keyframe();
                                     }
                                     if changed || forced {
-                                        let _ = preview_tx.send(VideoFrame::from_bgra(
+                                        on_preview(VideoFrame::from_bgra(
                                             w,
                                             h,
                                             scratch.bgra.clone(),
@@ -237,7 +237,7 @@ impl SoftwareCamera {
     pub(crate) fn start(
         config: CameraConfig,
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        preview_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
     ) -> Result<Self> {
         let running = Arc::new(AtomicBool::new(true));
         let blur = Arc::new(AtomicBool::new(config.blur_background));
@@ -287,7 +287,7 @@ impl SoftwareCamera {
                                 apply_portrait_blur(&mut rgb, w as usize, h as usize);
                             }
                             let bgra = rgb_to_bgra(&rgb);
-                            let _ = preview_tx.send(VideoFrame::from_bgra(w, h, bgra));
+                            on_preview(VideoFrame::from_bgra(w, h, bgra));
                             if kf_flag.swap(false, Ordering::Relaxed) {
                                 enc.force_keyframe();
                             }
@@ -561,13 +561,13 @@ impl MediaBackend for PortableMediaBackend {
         &self,
         config: ScreenShareConfig,
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        preview_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
         perf: Arc<HuddlePerfCounters>,
     ) -> Result<Box<dyn ScreenShareHandle>> {
         Ok(Box::new(SoftwareScreenShare::start(
             config,
             outbound_h264_tx,
-            preview_tx,
+            on_preview,
             perf,
         )?))
     }
@@ -576,12 +576,12 @@ impl MediaBackend for PortableMediaBackend {
         &self,
         config: CameraConfig,
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        preview_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
     ) -> Result<Box<dyn CameraHandle>> {
         Ok(Box::new(SoftwareCamera::start(
             config,
             outbound_h264_tx,
-            preview_tx,
+            on_preview,
         )?))
     }
 

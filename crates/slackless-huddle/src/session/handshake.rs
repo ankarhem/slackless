@@ -14,7 +14,6 @@ use crate::backend::platform_backend;
 use crate::proto::{SdkAudioStreamIdInfoFrame, SdkIndexFrame};
 use crate::rtc::{InboundVideoPacket, VideoSenderFeedback};
 use crate::signaling::{build_join_frame, build_subscribe_frame, decode_sdp_answer_with_prev};
-use crate::video::VideoFrame;
 use crate::{HuddleAudioConfig, HuddleCredentials, HuddleError, HuddleSessionSnapshot, Result};
 
 const HANDSHAKE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -32,10 +31,6 @@ pub(super) struct HandshakeResult<S, R, M> {
     pub(super) inbound_video_rx: mpsc::UnboundedReceiver<InboundVideoPacket>,
     pub(super) outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
     pub(super) outbound_h264_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    pub(super) local_cam_tx: mpsc::UnboundedSender<VideoFrame>,
-    pub(super) local_cam_rx: mpsc::UnboundedReceiver<VideoFrame>,
-    pub(super) local_screen_tx: mpsc::UnboundedSender<VideoFrame>,
-    pub(super) local_screen_rx: mpsc::UnboundedReceiver<VideoFrame>,
     pub(super) pc_state_rx: mpsc::UnboundedReceiver<RTCPeerConnectionState>,
     pub(super) keyframe_req_tx: mpsc::UnboundedSender<u32>,
     pub(super) keyframe_req_rx: mpsc::UnboundedReceiver<u32>,
@@ -179,8 +174,6 @@ pub(super) async fn perform_handshake_with<F: SessionFactory>(
     let (outbound_opus_tx, outbound_opus_rx) = mpsc::unbounded_channel::<bytes::Bytes>();
     let (inbound_video_tx, inbound_video_rx) = mpsc::unbounded_channel::<InboundVideoPacket>();
     let (outbound_h264_tx, outbound_h264_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (local_cam_tx, local_cam_rx) = mpsc::unbounded_channel::<VideoFrame>();
-    let (local_screen_tx, local_screen_rx) = mpsc::unbounded_channel::<VideoFrame>();
     let (pc_state_tx, pc_state_rx) = mpsc::unbounded_channel();
     let (keyframe_req_tx, keyframe_req_rx) = mpsc::unbounded_channel::<u32>();
     let (codec_tx, codec_rx) = mpsc::unbounded_channel::<String>();
@@ -314,10 +307,6 @@ pub(super) async fn perform_handshake_with<F: SessionFactory>(
         inbound_video_rx,
         outbound_h264_tx,
         outbound_h264_rx,
-        local_cam_tx,
-        local_cam_rx,
-        local_screen_tx,
-        local_screen_rx,
         pc_state_rx,
         keyframe_req_tx,
         keyframe_req_rx,

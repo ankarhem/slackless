@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::backend::{
     CameraConfig, CameraHandle, CameraPreviewConfig, CameraPreviewHandle, VideoDecoderHandle,
-    platform_backend,
+    VideoFrameSink, platform_backend,
 };
 use crate::{HuddleError, Result};
 
@@ -827,7 +827,7 @@ pub(crate) fn start_camera_capture(
     blur_background: bool,
     compact: bool,
     outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-    preview_tx: mpsc::UnboundedSender<VideoFrame>,
+    on_preview: VideoFrameSink,
 ) -> Result<Box<dyn CameraHandle>> {
     let (max_w, max_h, bitrate_bps) = if compact {
         (640, 480, 500_000)
@@ -844,7 +844,7 @@ pub(crate) fn start_camera_capture(
             blur_background,
         },
         outbound_h264_tx,
-        preview_tx,
+        on_preview,
     )
 }
 

@@ -10,7 +10,7 @@ use super::ffi::{
     slackless_capture_thumbnails, slackless_sc_capture_force_keyframe,
     slackless_sc_capture_set_bitrate, slackless_sc_capture_start, slackless_sc_capture_stop,
 };
-use crate::backend::ScreenShareConfig;
+use crate::backend::{ScreenShareConfig, VideoFrameSink};
 use crate::metrics::HuddlePerfCounters;
 use crate::video::VideoFrame;
 use crate::{HuddleError, Result};
@@ -40,7 +40,7 @@ impl ScVtScreenCapture {
     pub fn start(
         config: &ScreenShareConfig,
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        preview_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
         perf: Arc<HuddlePerfCounters>,
     ) -> Result<Self> {
         let (is_monitor, target_id) = match parse_screen_source_id(&config.source_id) {
@@ -52,9 +52,7 @@ impl ScVtScreenCapture {
         perf.set_tx_backend("ScreenCaptureKit + VideoToolbox H.264 High (HW)");
         let ctx = Box::into_raw(Box::new(CaptureCallbackCtx {
             outbound_h264_tx: Some(outbound_h264_tx),
-            on_preview: Box::new(move |frame| {
-                let _ = preview_tx.send(frame);
-            }),
+            on_preview: Box::new(move |frame| on_preview(frame)),
             perf: Some(perf),
         }));
         let mut err_buf = [0 as c_char; 512];

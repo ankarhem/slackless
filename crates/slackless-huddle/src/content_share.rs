@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use webrtc::peer_connection::RTCPeerConnectionState;
 
 use crate::audio::ring::SpscRing;
-use crate::backend::{ScreenShareConfig, platform_backend};
+use crate::backend::{ScreenShareConfig, VideoFrameSink, platform_backend};
 use crate::metrics::HuddlePerfCounters;
 use crate::proto::sdk_signal_frame;
 use crate::rtc::{ChimeRtcPeer, VideoSenderFeedback};
@@ -26,7 +26,6 @@ use crate::signaling::{
     ChimeSignalClient, ClientMetricsSnapshot, build_client_metric_frame,
     build_content_subscribe_frame, build_join_frame, decode_sdp_answer,
 };
-use crate::video::VideoFrame;
 use crate::{HuddleCredentials, HuddleError, Result};
 
 const CONTENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -110,14 +109,14 @@ impl ContentShareSession {
         self.loopback_device.as_deref()
     }
 
-    /// Start a native `#content` attendee sharing `source_id`, forwarding local preview frames
-    /// onto `preview_tx`. When `share_audio` is `true`, captures system audio via the platform
+    /// Start a native `#content` attendee sharing `source_id`, handing local preview frames to
+    /// `on_preview`. When `share_audio` is `true`, captures system audio via the platform
     /// backend's native system-audio tap or a virtual loopback device.
     pub async fn start(
         base_creds: HuddleCredentials,
         source_id: String,
         share_audio: bool,
-        preview_tx: mpsc::UnboundedSender<VideoFrame>,
+        on_preview: VideoFrameSink,
         perf: Arc<HuddlePerfCounters>,
     ) -> Result<Self> {
         let content_creds = content_credentials(base_creds);
@@ -171,7 +170,7 @@ impl ContentShareSession {
                 bitrate_bps: SCREEN_BITRATE_BPS,
             },
             h264_tx,
-            preview_tx,
+            on_preview,
             Arc::clone(&perf),
         )?;
         let video = rtc.video_sender();

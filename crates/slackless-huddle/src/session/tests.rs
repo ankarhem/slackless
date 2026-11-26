@@ -549,6 +549,7 @@ mod state_machine {
     use std::sync::Mutex;
 
     use crate::audio::AudioSharedState;
+    use crate::backend::VideoFrameSink;
     use crate::peer_message::{
         build_jukebox_message, build_mute_request_message, build_reacji_message,
     };
@@ -565,7 +566,6 @@ mod state_machine {
     };
     use crate::session::signaling_handlers::handle_signal_frame;
     use crate::session::video_rx::VideoRoutingTable;
-    use crate::video::VideoFrame;
     use crate::{
         HuddleAudioConfig, HuddleCredentials, HuddleDrawMessage, HuddleDrawSegment,
         HuddleReactionKind,
@@ -757,7 +757,7 @@ mod state_machine {
             blur: bool,
             compact: bool,
             _outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-            _local_cam_tx: mpsc::UnboundedSender<VideoFrame>,
+            _on_preview: VideoFrameSink,
         ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send>> {
             if self.fail_camera {
                 return Box::pin(async {
@@ -798,7 +798,7 @@ mod state_machine {
             _creds: HuddleCredentials,
             source_id: String,
             share_audio: bool,
-            _local_screen_tx: mpsc::UnboundedSender<VideoFrame>,
+            _on_preview: VideoFrameSink,
             _perf: Arc<HuddlePerfCounters>,
         ) -> Pin<Box<dyn Future<Output = crate::Result<Self::ScreenShare>> + Send>> {
             if self.fail_screen_share {
@@ -873,8 +873,6 @@ mod state_machine {
         mpsc::UnboundedReceiver<BackgroundDone<FakeMedia>>,
     ) {
         let (outbound_h264_tx, _h264_rx) = mpsc::unbounded_channel();
-        let (local_cam_tx, _cam_rx) = mpsc::unbounded_channel();
-        let (local_screen_tx, _scr_rx) = mpsc::unbounded_channel();
         let (bg_done_tx, bg_done_rx) = mpsc::unbounded_channel();
         let rt = SessionRuntime {
             creds,
@@ -902,8 +900,6 @@ mod state_machine {
             vdec_shutdown: Arc::new(AtomicBool::new(false)),
             perf: Arc::new(HuddlePerfCounters::default()),
             outbound_h264_tx,
-            local_cam_tx,
-            local_screen_tx,
             bg_done_tx,
         };
         (rt, bg_done_rx)
@@ -2117,6 +2113,7 @@ mod handshake_and_connected_loop_tests {
     };
     use super::super::supervisor::LoopExit;
     use crate::audio::AudioSharedState;
+    use crate::backend::VideoFrameSink;
     use crate::metrics::HuddlePerfCounters;
     use crate::proto::{
         SdkAudioStreamIdInfo, SdkAudioStreamIdInfoFrame, SdkIndexFrame, SdkJoinAckFrame,
@@ -2415,8 +2412,8 @@ mod handshake_and_connected_loop_tests {
         camera_active: bool,
         restart_gate: Option<RestartGate>,
         outbound_h264_tx_slot: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
-        local_cam_tx_slot: Arc<Mutex<Option<mpsc::UnboundedSender<VideoFrame>>>>,
-        local_screen_tx_slot: Arc<Mutex<Option<mpsc::UnboundedSender<VideoFrame>>>>,
+        cam_preview_slot: Arc<Mutex<Option<VideoFrameSink>>>,
+        screen_preview_slot: Arc<Mutex<Option<VideoFrameSink>>>,
     }
 
     impl MediaDevices for MockMedia {
@@ -2467,18 +2464,18 @@ mod handshake_and_connected_loop_tests {
             _blur: bool,
             _compact: bool,
             outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-            local_cam_tx: mpsc::UnboundedSender<VideoFrame>,
+            on_preview: VideoFrameSink,
         ) -> BoxFuture<'static, Result<()>> {
             let gate = self.restart_gate.take();
             let h264_slot = Arc::clone(&self.outbound_h264_tx_slot);
-            let cam_slot = Arc::clone(&self.local_cam_tx_slot);
+            let cam_slot = Arc::clone(&self.cam_preview_slot);
             Box::pin(async move {
                 tokio::task::spawn_blocking(move || {
                     if let Some(gate) = gate {
                         gate.block();
                     }
                     *h264_slot.lock().unwrap() = Some(outbound_h264_tx);
-                    *cam_slot.lock().unwrap() = Some(local_cam_tx);
+                    *cam_slot.lock().unwrap() = Some(on_preview);
                 })
                 .await
                 .map_err(|e| HuddleError::Video(format!("mock camera start panicked: {e}")))
@@ -2518,17 +2515,17 @@ mod handshake_and_connected_loop_tests {
             _creds: HuddleCredentials,
             _source_id: String,
             _share_audio: bool,
-            local_screen_tx: mpsc::UnboundedSender<VideoFrame>,
+            on_preview: VideoFrameSink,
             _perf: Arc<HuddlePerfCounters>,
         ) -> BoxFuture<'static, Result<()>> {
             let gate = self.restart_gate.take();
-            let slot = Arc::clone(&self.local_screen_tx_slot);
+            let slot = Arc::clone(&self.screen_preview_slot);
             Box::pin(async move {
                 tokio::task::spawn_blocking(move || {
                     if let Some(gate) = gate {
                         gate.block();
                     }
-                    *slot.lock().unwrap() = Some(local_screen_tx);
+                    *slot.lock().unwrap() = Some(on_preview);
                 })
                 .await
                 .map_err(|e| HuddleError::Video(format!("mock screen share panicked: {e}")))
@@ -2588,8 +2585,8 @@ mod handshake_and_connected_loop_tests {
         inbound_video_tx: Arc<Mutex<Option<mpsc::UnboundedSender<InboundVideoPacket>>>>,
         cam_fb_tx: Arc<Mutex<Option<mpsc::UnboundedSender<VideoSenderFeedback>>>>,
         outbound_h264_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
-        local_cam_tx: Arc<Mutex<Option<mpsc::UnboundedSender<VideoFrame>>>>,
-        local_screen_tx: Arc<Mutex<Option<mpsc::UnboundedSender<VideoFrame>>>>,
+        cam_preview: Arc<Mutex<Option<VideoFrameSink>>>,
+        screen_preview: Arc<Mutex<Option<VideoFrameSink>>>,
         shared_audio: Arc<Mutex<Option<AudioSharedState>>>,
     }
 
@@ -2639,8 +2636,8 @@ mod handshake_and_connected_loop_tests {
                 inbound_video_tx: Arc::new(Mutex::new(None)),
                 cam_fb_tx: Arc::new(Mutex::new(None)),
                 outbound_h264_tx: Arc::new(Mutex::new(None)),
-                local_cam_tx: Arc::new(Mutex::new(None)),
-                local_screen_tx: Arc::new(Mutex::new(None)),
+                cam_preview: Arc::new(Mutex::new(None)),
+                screen_preview: Arc::new(Mutex::new(None)),
                 shared_audio: Arc::new(Mutex::new(None)),
             };
             (f, sig_tx, log)
@@ -2683,8 +2680,8 @@ mod handshake_and_connected_loop_tests {
             *self.outbound_opus_tx.lock().unwrap() = Some(outbound_opus_tx);
             let log = Arc::clone(&self.log);
             let h264_slot = Arc::clone(&self.outbound_h264_tx);
-            let cam_slot = Arc::clone(&self.local_cam_tx);
-            let scr_slot = Arc::clone(&self.local_screen_tx);
+            let cam_slot = Arc::clone(&self.cam_preview);
+            let scr_slot = Arc::clone(&self.screen_preview);
             let script = std::mem::replace(&mut self.audio_script, AudioStartScript::Ok);
             let gate = self.restart_gate.take();
             tokio::spawn(async move {
@@ -2694,8 +2691,8 @@ mod handshake_and_connected_loop_tests {
                     camera_active: false,
                     restart_gate: gate,
                     outbound_h264_tx_slot: h264_slot,
-                    local_cam_tx_slot: cam_slot,
-                    local_screen_tx_slot: scr_slot,
+                    cam_preview_slot: cam_slot,
+                    screen_preview_slot: scr_slot,
                 };
                 match script {
                     AudioStartScript::Ok => Ok(media(log)),
@@ -2963,8 +2960,8 @@ mod handshake_and_connected_loop_tests {
         let inbound_video_slot = Arc::clone(&factory.inbound_video_tx);
         let cam_fb_slot = Arc::clone(&factory.cam_fb_tx);
         let h264_slot = Arc::clone(&factory.outbound_h264_tx);
-        let local_cam_slot = Arc::clone(&factory.local_cam_tx);
-        let local_screen_slot = Arc::clone(&factory.local_screen_tx);
+        let local_cam_slot = Arc::clone(&factory.cam_preview);
+        let local_screen_slot = Arc::clone(&factory.screen_preview);
         let shared_slot = Arc::clone(&factory.shared_audio);
 
         let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
@@ -3013,7 +3010,7 @@ mod handshake_and_connected_loop_tests {
             .send(VideoSenderFeedback::TargetBitrateBps(9_000_000))
             .unwrap();
 
-        // 2. Enable camera + screen share via ctrl_tx to populate local_cam_tx / local_screen_tx / h264_tx.
+        // 2. Enable camera + screen share via ctrl_tx to populate the preview sinks and h264_tx.
         ctrl_tx
             .send(HuddleControl::SetCamera {
                 enabled: true,
@@ -3036,20 +3033,10 @@ mod handshake_and_connected_loop_tests {
             height: 2,
             data: VideoFrameData::Bgra(Arc::new(vec![0u8; 16])),
         };
-        local_cam_slot
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .send(dummy_frame())
-            .unwrap();
-        local_screen_slot
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .send(dummy_frame())
-            .unwrap();
+        let cam_preview = local_cam_slot.lock().unwrap().clone().unwrap();
+        cam_preview(dummy_frame());
+        let screen_preview = local_screen_slot.lock().unwrap().clone().unwrap();
+        screen_preview(dummy_frame());
         h264_slot
             .lock()
             .unwrap()

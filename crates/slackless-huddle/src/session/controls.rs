@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use super::connected::{SessionRuntime, announce_screen_share_capabilities};
 use super::io::{AudioSwitch, BackgroundDone, MediaDevices, RtcController, SignalSink};
 use super::supervisor::LoopExit;
+use crate::backend::VideoFrameSink;
 use crate::peer_message::{
     SLACK_DATA_CHANNEL_TOPIC, build_capabilities_message, build_draw_message,
     build_jukebox_message, build_mute_request_message, build_reacji_message,
@@ -36,6 +37,18 @@ impl<M: MediaDevices> SessionRuntime<'_, M> {
         });
     }
 
+    /// Sink that publishes a local capture's preview frames as `tile` straight from the capture
+    /// thread; the UI keeps only the latest frame per tile.
+    fn preview_sink(&self, tile: VideoTileKey) -> VideoFrameSink {
+        let updates = self.updates.clone();
+        Arc::new(move |frame| {
+            let _ = updates.send(HuddleUpdate::VideoFrame {
+                tile: tile.clone(),
+                frame,
+            });
+        })
+    }
+
     /// Start the camera off the event loop; the result reports back tagged with its request
     /// `generation` so a superseded start is dropped when it lands.
     pub(super) fn start_camera(
@@ -50,7 +63,7 @@ impl<M: MediaDevices> SessionRuntime<'_, M> {
             blur,
             compact,
             self.outbound_h264_tx.clone(),
-            self.local_cam_tx.clone(),
+            self.preview_sink(VideoTileKey::LocalCamera),
         );
         let done_tx = self.bg_done_tx.clone();
         tokio::spawn(async move {
@@ -71,7 +84,7 @@ impl<M: MediaDevices> SessionRuntime<'_, M> {
             self.creds.clone(),
             source_id.clone(),
             share_audio,
-            self.local_screen_tx.clone(),
+            self.preview_sink(VideoTileKey::LocalScreen),
             Arc::clone(&self.perf),
         );
         let done_tx = self.bg_done_tx.clone();
