@@ -805,6 +805,108 @@ fn wired_huddle_commands_follow_the_workspace_running_it(cx: &mut gpui::TestAppC
 }
 
 #[gpui::test]
+fn wired_unread_counts_fold_alike_in_shown_and_background_workspaces(
+    cx: &mut gpui::TestAppContext,
+) {
+    let people = [user("U0ME", "me"), user("U0PEER", "peer")];
+    let workspace = |team: &str, cx: &mut gpui::App| {
+        let channels = [("C0OPEN", "open"), ("C0CHAN", "chan")];
+        let (bridge, core) = make_wired_workspace(team, team, &channels, &people, cx);
+        let im = Conversation {
+            id: ChannelId::from("D0PEER"),
+            is_im: true,
+            is_open: true,
+            user: Some(UserId::from("U0PEER")),
+            ..Default::default()
+        };
+        (core.store().lock().expect("store lock"))
+            .upsert_conversation(&TeamId::from(team), &im)
+            .expect("upsert IM");
+        (bridge, core)
+    };
+    let ((b1, c1), (b2, c2)) = cx.update(|cx| (workspace("T0ONE", cx), workspace("T0TWO", cx)));
+    let mut fx = b1.snapshot(&HashMap::new()).expect("ws1 snapshot");
+    fx.workspaces = vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()];
+    let (root, app, cx) = mount_wired(fx, vec![b1, b2], cx);
+    // The shown workspace reads #open, so neither workspace sees the rows below arrive.
+    cx.update(|_, cx| app.update(cx, |app, cx| app.select(ChannelId::from("C0OPEN"), cx)));
+    let (chan, dm) = (ChannelId::from("C0CHAN"), ChannelId::from("D0PEER"));
+    let post = |channel: &ChannelId, ts: &str, user: &str, text: &str| Event::MessagePosted {
+        channel: channel.clone(),
+        message: Box::new(Message {
+            ts: Ts::from(ts),
+            user: Some(UserId::from(user)),
+            text: text.into(),
+            ..Default::default()
+        }),
+    };
+    let mark = |channel: &ChannelId, ts: &str| Event::ReadMarker {
+        channel: channel.clone(),
+        ts: Ts::from(ts),
+    };
+    // What happens, then the conversation's unread flag, mentions, DM count and read cursor.
+    let rows = [
+        (
+            "a peer posts",
+            post(&chan, "1700000001.000100", "U0PEER", "hello"),
+            &chan,
+            (true, 0, 0, None),
+        ),
+        (
+            "a peer mentions me",
+            post(&chan, "1700000002.000100", "U0PEER", "<@U0ME> look"),
+            &chan,
+            (true, 1, 0, None),
+        ),
+        (
+            "a peer DMs me",
+            post(&dm, "1700000003.000100", "U0PEER", "hi"),
+            &dm,
+            (true, 1, 1, None),
+        ),
+        (
+            "the DM is read",
+            mark(&dm, "1700000003.000100"),
+            &dm,
+            (false, 0, 0, Some("1700000003.000100")),
+        ),
+        (
+            "the DM is marked unread elsewhere",
+            mark(&dm, "1700000002.000100"),
+            &dm,
+            (true, 1, 0, Some("1700000002.000100")),
+        ),
+        (
+            "I reply",
+            post(&chan, "1700000004.000100", "U0ME", "on it"),
+            &chan,
+            (true, 1, 0, Some("1700000004.000100")),
+        ),
+    ];
+    for (what, event, channel, expected) in rows {
+        cx.update(|_, cx| {
+            c1.emit(event.clone(), cx);
+            c2.emit(event, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let app = app.read(cx);
+            let shown = app.ws.counts.get(channel).cloned().unwrap_or_default();
+            let background = (app.slots[1].state.counts.get(channel).cloned()).unwrap_or_default();
+            assert_eq!(shown, background, "{what}: both workspaces fold it alike");
+            let observed = (
+                shown.has_unreads,
+                shown.mention_count,
+                shown.dm_count,
+                shown.last_read.as_ref().map(Ts::as_str),
+            );
+            assert_eq!(observed, expected, "{what}");
+        });
+    }
+    drop(root);
+}
+
+#[gpui::test]
 fn wired_pending_dm_delivers_only_to_the_dm_it_was_addressed_to(cx: &mut gpui::TestAppContext) {
     let people = [
         user("U0ME", "me"),

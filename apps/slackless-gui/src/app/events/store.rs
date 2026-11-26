@@ -237,39 +237,14 @@ impl App {
         ts: &Ts,
         cx: &mut Context<Self>,
     ) {
-        let entry = self
-            .ws
-            .counts
-            .entry(channel.clone())
-            .or_insert_with(|| ConversationCounts {
-                id: channel.clone(),
-                ..Default::default()
-            });
-        entry.last_read = Some(ts.clone());
-        let caught_up = entry.latest.as_ref().is_none_or(|latest| *ts >= *latest);
-        if caught_up {
-            entry.clear_unreads();
-            let advance = self
-                .ws
-                .marked_read
-                .get(channel)
-                .is_none_or(|prev| *ts > *prev);
-            if advance {
-                self.ws.marked_read.insert(channel.clone(), ts.clone());
-            }
+        let dm = self
+            .fixtures
+            .conversation(channel)
+            .is_some_and(|c| matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim));
+        if self.ws.fold_read_marker(channel, ts, dm) {
             self.sidebar
                 .update(cx, |sidebar, cx| sidebar.mark_read(channel.clone(), cx));
         } else {
-            entry.has_unreads = true;
-            if self
-                .fixtures
-                .conversation(channel)
-                .is_some_and(|c| matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim))
-                && entry.effective_mentions() == 0
-            {
-                entry.mention_count = 1;
-            }
-            self.ws.marked_read.remove(channel);
             self.sidebar
                 .update(cx, |sidebar, cx| sidebar.mark_unread(channel, cx));
         }

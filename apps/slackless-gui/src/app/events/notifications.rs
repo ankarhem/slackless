@@ -248,46 +248,21 @@ impl App {
             let allow_mark =
                 settings.mark_read != 2 && (!settings.no_bg_mark_read || self.window_active);
             let viewing = *channel == self.channel && self.transcript_visible(cx);
-            let entry =
-                self.ws
-                    .counts
-                    .entry(channel.clone())
-                    .or_insert_with(|| ConversationCounts {
-                        id: channel.clone(),
-                        ..Default::default()
-                    });
-            if entry.latest.as_ref().is_none_or(|l| message.ts > *l) {
-                entry.latest = Some(message.ts.clone());
-            }
-            if from_self {
-                if entry.last_read.as_ref().is_none_or(|r| message.ts > *r) {
-                    entry.last_read = Some(message.ts.clone());
+            let arrival = if from_self {
+                Arrival::Own
+            } else if viewing && allow_mark {
+                Arrival::Seen
+            } else {
+                let kind = self.fixtures.conversation(channel).map(Conversation::kind);
+                Arrival::Unread {
+                    mention: matches!(kind, Some(ConversationKind::Im | ConversationKind::Mpim))
+                        || mentions_me(&message.text, &self.fixtures.self_user, &settings.keywords),
+                    im: kind == Some(ConversationKind::Im),
                 }
-            } else if !viewing || !allow_mark {
-                let is_dm = self.fixtures.conversation(channel).is_some_and(|c| {
-                    matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim)
-                });
-                let is_im = self
-                    .fixtures
-                    .conversation(channel)
-                    .is_some_and(|c| c.kind() == ConversationKind::Im);
-                let mentioned =
-                    mentions_me(&message.text, &self.fixtures.self_user, &settings.keywords);
-                entry.has_unreads = true;
-                if is_dm || mentioned {
-                    entry.mention_count = entry.mention_count.saturating_add(1);
-                }
-                if is_im {
-                    entry.dm_count = entry.dm_count.saturating_add(1);
-                }
-                if self
-                    .ws
-                    .marked_read
-                    .get(channel)
-                    .is_some_and(|marked| message.ts > *marked)
-                {
-                    self.ws.marked_read.remove(channel);
-                }
+            };
+            let unread = matches!(arrival, Arrival::Unread { .. });
+            self.ws.fold_message(channel, &message.ts, arrival);
+            if unread {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.mark_unread(channel, cx));
                 self.sync_counts_to_views(cx);

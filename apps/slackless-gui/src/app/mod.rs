@@ -586,6 +586,85 @@ pub(super) struct WorkspaceState {
     pub(super) backfill_progress: Option<slackless_core::WorkspaceBackfillProgress>,
 }
 
+/// How a posted message moves its conversation's unread state.
+pub(super) enum Arrival {
+    /// The user's own message: the conversation is read up to it.
+    Own,
+    /// Read as it arrived (the open conversation, marked read as shown).
+    Seen,
+    /// Unread: `mention` bumps the mention badge, `im` the DM count.
+    Unread { mention: bool, im: bool },
+}
+
+impl WorkspaceState {
+    /// Fold Slack's read marker (`*_marked`, from here or another device) for `channel` at `ts`
+    /// into the counts. A DM left unread (`dm`) keeps a mention, as Slack badges it. Returns
+    /// whether the conversation is read now.
+    pub(super) fn fold_read_marker(&mut self, channel: &ChannelId, ts: &Ts, dm: bool) -> bool {
+        let entry = counts_entry(&mut self.counts, channel);
+        entry.last_read = Some(ts.clone());
+        let read = entry.latest.as_ref().is_none_or(|latest| ts >= latest);
+        if read {
+            entry.clear_unreads();
+            if self.marked_read.get(channel).is_none_or(|prev| ts > prev) {
+                self.marked_read.insert(channel.clone(), ts.clone());
+            }
+        } else {
+            entry.has_unreads = true;
+            if dm && entry.effective_mentions() == 0 {
+                entry.mention_count = 1;
+            }
+            self.marked_read.remove(channel);
+        }
+        read
+    }
+
+    /// Fold a message posted in `channel` at `ts` into the counts.
+    pub(super) fn fold_message(&mut self, channel: &ChannelId, ts: &Ts, arrival: Arrival) {
+        let entry = counts_entry(&mut self.counts, channel);
+        if entry.latest.as_ref().is_none_or(|latest| ts > latest) {
+            entry.latest = Some(ts.clone());
+        }
+        match arrival {
+            Arrival::Own => {
+                if entry.last_read.as_ref().is_none_or(|read| ts > read) {
+                    entry.last_read = Some(ts.clone());
+                }
+            }
+            Arrival::Seen => {}
+            Arrival::Unread { mention, im } => {
+                entry.has_unreads = true;
+                if mention {
+                    entry.mention_count = entry.mention_count.saturating_add(1);
+                }
+                if im {
+                    entry.dm_count = entry.dm_count.saturating_add(1);
+                }
+                if self
+                    .marked_read
+                    .get(channel)
+                    .is_some_and(|marked| ts > marked)
+                {
+                    self.marked_read.remove(channel);
+                }
+            }
+        }
+    }
+}
+
+/// `channel`'s entry in `counts`, empty until Slack counts it.
+fn counts_entry<'a>(
+    counts: &'a mut HashMap<ChannelId, ConversationCounts>,
+    channel: &ChannelId,
+) -> &'a mut ConversationCounts {
+    counts
+        .entry(channel.clone())
+        .or_insert_with(|| ConversationCounts {
+            id: channel.clone(),
+            ..Default::default()
+        })
+}
+
 /// A visited workspace that is not shown: its fixtures, open conversation, views and
 /// subscriptions.
 struct Parked {

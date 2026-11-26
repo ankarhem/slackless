@@ -102,21 +102,22 @@ impl App {
                     .extend(users.iter().map(|u| (u.clone(), presence.clone())));
             }
             Event::ReadMarker { channel, ts } => {
-                let entry = (slot.state.counts.entry(channel.clone())).or_insert_with(|| {
-                    ConversationCounts {
-                        id: channel.clone(),
-                        ..Default::default()
-                    }
-                });
-                entry.last_read = Some(ts.clone());
-                let caught_up = entry.latest.as_ref().is_none_or(|latest| *ts >= *latest);
-                if caught_up {
-                    entry.clear_unreads();
-                } else {
-                    entry.has_unreads = true;
-                }
+                // The workspace's snapshot knows the conversation once visited, else its store.
+                let kind = (slot.parked.as_ref())
+                    .and_then(|parked| {
+                        parked
+                            .fixtures
+                            .conversation(channel)
+                            .map(Conversation::kind)
+                    })
+                    .or_else(|| {
+                        let ctx = slot.bridge.as_ref()?.bg_message_context(channel, None)?;
+                        ctx.conversation.map(|c| c.kind())
+                    });
+                let dm = matches!(kind, Some(ConversationKind::Im | ConversationKind::Mpim));
+                let read = slot.state.fold_read_marker(channel, ts, dm);
                 if let Some(parked) = &slot.parked {
-                    if caught_up {
+                    if read {
                         parked
                             .views
                             .sidebar
@@ -144,42 +145,26 @@ impl App {
                 let counts_in_channel =
                     !message.hidden && !message.is_ephemeral && (!reply || broadcast);
                 if counts_in_channel {
-                    let from_self = bg_ctx
-                        .as_ref()
-                        .is_some_and(|s| message.user.as_ref() == Some(&s.self_user));
-                    if !from_self {
-                        let is_dm = bg_ctx
-                            .as_ref()
-                            .and_then(|s| s.conversation.as_ref())
-                            .is_some_and(|c| {
-                                matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim)
-                            });
-                        let is_im = bg_ctx
-                            .as_ref()
-                            .and_then(|s| s.conversation.as_ref())
-                            .is_some_and(|c| c.kind() == ConversationKind::Im);
-                        let mentioned = bg_ctx.as_ref().is_some_and(|s| {
-                            mentions_me(&message.text, &s.self_user, &settings.keywords)
-                        });
-                        let bump = |counts: &mut HashMap<ChannelId, ConversationCounts>| {
-                            let entry = counts.entry(channel.clone()).or_insert_with(|| {
-                                ConversationCounts {
-                                    id: channel.clone(),
-                                    ..Default::default()
-                                }
-                            });
-                            if entry.latest.as_ref().is_none_or(|l| message.ts > *l) {
-                                entry.latest = Some(message.ts.clone());
-                            }
-                            entry.has_unreads = true;
-                            if is_dm || mentioned {
-                                entry.mention_count = entry.mention_count.saturating_add(1);
-                            }
-                            if is_im {
-                                entry.dm_count = entry.dm_count.saturating_add(1);
-                            }
-                        };
-                        bump(&mut slot.state.counts);
+                    let me = bg_ctx.as_ref().map(|ctx| &ctx.self_user);
+                    let arrival = if me.is_some_and(|me| message.user.as_ref() == Some(me)) {
+                        Arrival::Own
+                    } else {
+                        let kind = (bg_ctx.as_ref())
+                            .and_then(|ctx| ctx.conversation.as_ref())
+                            .map(Conversation::kind);
+                        Arrival::Unread {
+                            mention: matches!(
+                                kind,
+                                Some(ConversationKind::Im | ConversationKind::Mpim)
+                            ) || me.is_some_and(|me| {
+                                mentions_me(&message.text, me, &settings.keywords)
+                            }),
+                            im: kind == Some(ConversationKind::Im),
+                        }
+                    };
+                    let unread = matches!(arrival, Arrival::Unread { .. });
+                    slot.state.fold_message(channel, &message.ts, arrival);
+                    if unread {
                         if let Some(parked) = &slot.parked {
                             parked
                                 .views
