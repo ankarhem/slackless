@@ -1,5 +1,6 @@
 //! Cursor pagination (`cursor` param in, `response_metadata.next_cursor` out).
 
+use std::collections::HashSet;
 use std::future::Future;
 
 use futures::stream::{self, Stream, TryStreamExt};
@@ -17,7 +18,8 @@ pub struct Page<T> {
 /// Walks every page of a cursor-paginated method, yielding items in order.
 ///
 /// `fetch` gets `None` for the first page, then each page's `next_cursor`. Stops when a page has
-/// no cursor, or when Slack hands back the cursor it was just given (a loop guard).
+/// no cursor, or when Slack hands back a cursor already followed (a loop guard that also catches
+/// cycles such as `a -> b -> a`).
 ///
 /// ```no_run
 /// # use futures::TryStreamExt;
@@ -33,19 +35,21 @@ where
     F: FnMut(Option<String>) -> Fut,
     Fut: Future<Output = Result<Page<T>, ApiError>>,
 {
-    // State: Some(cursor) while there is a page to fetch; None when done.
+    // State: Some(cursor) while there is a page to fetch (None when done), and every cursor
+    // followed so far.
     stream::try_unfold(
-        (fetch, Some(None::<String>)),
-        |(mut fetch, state)| async move {
+        (fetch, Some(None::<String>), HashSet::new()),
+        |(mut fetch, state, mut followed)| async move {
             let Some(cursor) = state else {
                 return Ok::<_, ApiError>(None);
             };
-            let page = fetch(cursor.clone()).await?;
+            let page = fetch(cursor).await?;
+            // `insert` is false for a cursor already followed: a cycle ends the walk.
             let next = page
                 .next_cursor
-                .filter(|c| !c.is_empty() && Some(c) != cursor.as_ref())
+                .filter(|c| !c.is_empty() && followed.insert(c.clone()))
                 .map(Some);
-            Ok(Some((page.items, (fetch, next))))
+            Ok(Some((page.items, (fetch, next, followed))))
         },
     )
     .map_ok(|items| stream::iter(items.into_iter().map(Ok)))
@@ -54,39 +58,45 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
     #[tokio::test]
-    async fn paginate_stops_on_repeated_cursor_loop_guard() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_ref = Arc::clone(&calls);
-        let items: Vec<u32> = paginate(move |cursor| {
-            let calls = Arc::clone(&calls_ref);
-            async move {
-                let n = calls.fetch_add(1, Ordering::SeqCst);
-                match cursor.as_deref() {
-                    None => Ok(Page {
-                        items: vec![1, 2],
-                        next_cursor: Some("stuck".to_owned()),
-                    }),
-                    Some("stuck") if n < 5 => Ok(Page {
-                        items: vec![3],
-                        // Returns the exact cursor it was just given: loop guard must terminate.
-                        next_cursor: Some("stuck".to_owned()),
-                    }),
-                    _ => unreachable!("loop guard should have stopped after repeated cursor"),
+    async fn paginate_stops_when_slack_hands_back_a_cursor_already_followed() {
+        // (cursor asked for, items, next_cursor) per page: a cursor repeated right away
+        // (a -> a) or after a detour (a -> b -> a) ends the walk with every page read once.
+        let self_loop: &[(Option<&str>, &[u32], &str)] =
+            &[(None, &[1, 2], "a"), (Some("a"), &[3], "a")];
+        let two_cycle: &[(Option<&str>, &[u32], &str)] = &[
+            (None, &[1], "a"),
+            (Some("a"), &[2], "b"),
+            (Some("b"), &[3], "a"),
+        ];
+        for pages in [self_loop, two_cycle] {
+            let fetches = AtomicUsize::new(0);
+            let items: Vec<u32> = paginate(|cursor| {
+                assert!(
+                    fetches.fetch_add(1, Ordering::SeqCst) < pages.len(),
+                    "a page was fetched twice: {pages:?}"
+                );
+                let (_, items, next) = pages
+                    .iter()
+                    .find(|(asked, ..)| *asked == cursor.as_deref())
+                    .copied()
+                    .unwrap_or_else(|| panic!("unexpected cursor {cursor:?}"));
+                async move {
+                    Ok(Page {
+                        items: items.to_vec(),
+                        next_cursor: Some(next.to_owned()),
+                    })
                 }
-            }
-        })
-        .try_collect()
-        .await
-        .unwrap();
-
-        assert_eq!(items, vec![1, 2, 3]);
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+            })
+            .try_collect()
+            .await
+            .unwrap();
+            assert_eq!(items, [1, 2, 3]);
+        }
     }
 
     #[tokio::test]
