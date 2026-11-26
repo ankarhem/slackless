@@ -796,7 +796,7 @@ impl Render for LaterView {
 
         let tab = self.tab;
         let ws = self.workspace;
-        let shown: Vec<(usize, LaterItem)> = self
+        let shown: Vec<(usize, &LaterItem)> = self
             .items
             .iter()
             .enumerate()
@@ -809,7 +809,6 @@ impl Render for LaterView {
                         LaterFilter::Todos => item.is_todo,
                     }
             })
-            .map(|(ix, item)| (ix, item.clone()))
             .collect();
         let rows: Vec<_> = shown
             .into_iter()

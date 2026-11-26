@@ -679,6 +679,25 @@ impl ThreadsView {
         cx.notify();
     }
 
+    /// The message `ts` of the thread `(channel, thread_ts)` this view shows: its root, or
+    /// a reply it holds.
+    pub(super) fn message_in(
+        &self,
+        channel: &ChannelId,
+        thread_ts: &Ts,
+        ts: &Ts,
+    ) -> Option<&Message> {
+        let card = self
+            .cards
+            .iter()
+            .find(|card| &card.channel == channel && &card.thread_ts == thread_ts)?;
+        if &card.root.ts == ts {
+            Some(&card.root)
+        } else {
+            card.replies.iter().find(|reply| &reply.ts == ts)
+        }
+    }
+
     /// Expanded `(channel, thread_ts)` pairs matching `channel`, for live store refreshes.
     pub fn expanded_in(&self, channel: &ChannelId) -> Vec<Ts> {
         self.expanded
@@ -853,10 +872,9 @@ impl Render for ThreadsView {
         let list_count = self.cards.iter().filter(|c| c.list_item.is_some()).count();
         let msg_count = self.cards.len().saturating_sub(list_count);
         let filter = self.filter;
-        let cards: Vec<(usize, ThreadCard)> = self
+        let cards: Vec<(usize, &ThreadCard)> = self
             .cards
             .iter()
-            .cloned()
             .enumerate()
             .filter(|(_, card)| match filter {
                 ThreadsFilter::All => true,
@@ -866,14 +884,14 @@ impl Render for ThreadsView {
             .collect();
         let mut inner = v_flex().w_full().px_5().py_4().gap_6();
         let editing = self.editing.clone();
-        for (ix, card) in &cards {
-            let expanded = self
-                .expanded
-                .contains(&(card.channel.clone(), card.thread_ts.clone()));
+        for &(ix, card) in &cards {
+            let expanded = self.expanded.iter().any(|(channel, thread_ts)| {
+                *channel == card.channel && *thread_ts == card.thread_ts
+            });
             inner = inner.child(card_view(
                 crate::threads_cards::ThreadCardRenderArgs {
                     fixtures: &self.fixtures,
-                    ix: *ix,
+                    ix,
                     card,
                     active: self.active.as_ref().is_some_and(|(channel, thread_ts)| {
                         *channel == card.channel && *thread_ts == card.thread_ts

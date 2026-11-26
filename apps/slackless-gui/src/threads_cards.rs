@@ -537,18 +537,18 @@ fn render_thread_message(
 
     let is_saved = saved_set.contains(&msg.ts);
     let view = cx.entity();
-    let ch_for_action = card.channel.clone();
-    let thread_ts_for_action = card.thread_ts.clone();
-    let msg_for_action = msg.clone();
+    let (ch, thread_ts, ts) = (card.channel.clone(), card.thread_ts.clone(), msg.ts.clone());
     let handler: ActionHandler = Rc::new(move |action, _window, cx| {
-        let ch = ch_for_action.clone();
-        let thread_ts = thread_ts_for_action.clone();
-        let message = Box::new(msg_for_action.clone());
-        view.update(cx, |_, cx| {
+        let (ch, thread_ts, ts) = (ch.clone(), thread_ts.clone(), ts.clone());
+        view.update(cx, |view, cx| {
+            // The cards may have re-sorted or dropped the thread since the row rendered.
+            let Some(message) = view.message_in(&ch, &thread_ts, &ts) else {
+                return;
+            };
             cx.emit(ThreadsEvent::MessageAction {
                 channel: ch,
                 thread_ts,
-                message,
+                message: Box::new(message.clone()),
                 action,
             });
         });
@@ -560,11 +560,7 @@ fn render_thread_message(
         pinned: msg.pinned_to.contains(&card.channel),
         in_thread: msg.ts != card.thread_ts,
     };
-    let mut display = msg.clone();
-    let reactions = std::mem::take(&mut display.reactions);
-    let chips = actions::reaction_chips(&key, &reactions, fixtures, Some(&handler), cx)
-        .map(|c| c.pl(px(48.)));
-    let row_body = message_row_linked(fixtures, &display, Some(&handler), Some(links), grouped, cx);
+    let row_body = message_row_linked(fixtures, msg, Some(&handler), Some(links), grouped, cx);
     let quick = crate::preferences::active_quick_reactions(&fixtures.quick_reactions, cx);
     let menu_handler = handler.clone();
     let row_key = key.clone();
@@ -582,7 +578,6 @@ fn render_thread_message(
             })
             .when(!is_saved && revealed, |row| row.bg(hover_bg))
             .child(row_body)
-            .children(chips)
             .when(revealed, |row| {
                 row.child(
                     actions::hover_toolbar(&row_key, &quick, set, &handler, &hover, cx)

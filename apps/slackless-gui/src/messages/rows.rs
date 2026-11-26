@@ -714,9 +714,10 @@ pub fn message_row(
 }
 
 /// [`message_row`] with its text selectable and links routed through `links` (the thread
-/// panel: its events reach the root without a transcript). With `grouped` (the row's hover
-/// group) the card continues the previous message's: no avatar or name, its time showing in
-/// the gutter on hover, as in Slack.
+/// panel: its events reach the root without a transcript). With a `handler` the reaction
+/// chips toggle and add reactions, as in the transcript; without one they are static. With
+/// `grouped` (the row's hover group) the card continues the previous message's: no avatar or
+/// name, its time showing in the gutter on hover, as in Slack.
 pub fn message_row_linked(
     fixtures: &Fixtures,
     message: &Message,
@@ -767,7 +768,7 @@ pub fn message_row_linked(
         &key,
         &message.reactions,
         fixtures,
-        None,
+        handler,
         cx,
     ));
     let compact = crate::preferences::display_prefs(cx).compact;

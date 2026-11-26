@@ -63,12 +63,7 @@ pub(super) fn people(fixtures: &Fixtures, needle: &str) -> Vec<UserId> {
         })
         .map(|user| user.id.clone())
         .collect();
-    people.sort_by(|a, b| {
-        fixtures
-            .user_name(a)
-            .to_lowercase()
-            .cmp(&fixtures.user_name(b).to_lowercase())
-    });
+    people.sort_by_cached_key(|id| fixtures.user_name(id).to_lowercase());
     people
 }
 
@@ -97,11 +92,6 @@ pub(crate) fn filter_channels(fixtures: &Fixtures, needle: &str) -> Vec<Conversa
         .collect();
     channels.sort_by(|a, b| a.name.cmp(&b.name));
     channels
-}
-
-/// Channels matching `needle` (name or topic, case-insensitive), by name.
-pub(super) fn channels(fixtures: &Fixtures, needle: &str) -> Vec<Conversation> {
-    filter_channels(fixtures, needle)
 }
 
 /// Parameters and visual layout variant for [`render_channel_row`].

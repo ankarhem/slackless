@@ -1111,14 +1111,10 @@ impl ThreadPanel {
         let row_group = SharedString::from(format!("thread-row-group-{}", ts.as_str()));
         let hover_bg = cx.theme().secondary.opacity(0.5);
 
-        // `message_row` renders its own static chips; strip them here and render the
-        // interactive chips (toggle + add control) below the card instead.
-        let mut display = message.clone();
-        let reactions = std::mem::take(&mut display.reactions);
         // Like Slack, a reply continuing the previous author's run drops its avatar and name.
         let card = message_row_linked(
             &self.fixtures,
-            &display,
+            message,
             Some(&handler),
             Some(&links),
             grouped.then(|| row_group.clone()),
@@ -1158,9 +1154,6 @@ impl ThreadPanel {
         } else {
             card
         };
-        let chips = actions::reaction_chips(&key, &reactions, &self.fixtures, Some(&handler), cx)
-            .map(|chips| chips.pl(px(text_inset)));
-
         // Straddling the row's top edge would cut the root's bar off at the panel's top, so
         // Slack keeps it inside the row, 3pt down.
         let quick = crate::preferences::active_quick_reactions(&self.fixtures.quick_reactions, cx);
@@ -1179,7 +1172,7 @@ impl ThreadPanel {
                 .pb_1()
                 .when(revealed, |row| row.bg(hover_bg))
                 .when(saved, |row| row.child(actions::saved_banner(cx)))
-                .child(v_flex().min_w_0().child(card).children(chips))
+                .child(card)
                 .when(revealed, |row| {
                     row.child(
                         actions::hover_toolbar(&row_key, &quick, set, &handler, &hover, cx)

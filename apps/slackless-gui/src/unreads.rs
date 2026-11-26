@@ -603,6 +603,16 @@ impl UnreadsView {
         cx.notify();
     }
 
+    /// The message `ts` of `channel` the list shows.
+    fn message_in(&self, channel: &ChannelId, ts: &Ts) -> Option<&Message> {
+        self.groups
+            .iter()
+            .find(|group| &group.channel == channel)?
+            .messages
+            .iter()
+            .find(|message| &message.ts == ts)
+    }
+
     fn submit_reply(&mut self, cx: &mut Context<Self>) {
         let Some((channel, input)) = self.replying.take() else {
             return;
@@ -625,10 +635,11 @@ impl Render for UnreadsView {
         let theme = cx.theme();
         let (border, muted) = (theme.border, theme.muted_foreground);
         let background = theme.background;
-        let groups: Vec<UnreadGroup> = self.groups.clone();
+        let groups = &self.groups;
+        let collapsed = &self.collapsed;
+        let (replying, open_thread, saved) = (&self.replying, &self.open_thread, &self.saved);
+        let fixtures: &Fixtures = &self.fixtures;
         let focused = self.focused;
-        let collapsed: HashSet<ChannelId> = self.collapsed.clone();
-        let fixtures = self.fixtures.clone();
         let sort = self.sort;
         let this = cx.entity().downgrade();
 
@@ -712,9 +723,6 @@ impl Render for UnreadsView {
                 })
                 .into_any_element()
         } else {
-            let replying = self.replying.clone();
-            let open_thread = self.open_thread.clone();
-            let saved = self.saved.clone();
             div()
                 .id("unreads-scroll")
                 .flex_1()
@@ -732,7 +740,7 @@ impl Render for UnreadsView {
                                 focused == Some(ix) || (focused.is_none() && ix == 0);
                             card_view(
                                 UnreadCardArgs {
-                                    fixtures: &fixtures,
+                                    fixtures,
                                     ix,
                                     group: &groups[ix],
                                     collapsed: collapsed.contains(&groups[ix].channel),
@@ -740,7 +748,7 @@ impl Render for UnreadsView {
                                     show_esc_hint,
                                     reply_input,
                                     open_thread: open_thread.as_ref(),
-                                    saved_set: &saved,
+                                    saved_set: saved,
                                     background,
                                 },
                                 cx,
@@ -1044,16 +1052,18 @@ fn card_view(args: UnreadCardArgs<'_>, cx: &mut Context<UnreadsView>) -> AnyElem
             let is_open_thread = !is_saved
                 && open_thread.is_some_and(|(ch, ts)| *ch == group.channel && *ts == message.ts);
 
-            let view_for_action = view.clone();
-            let ch_for_action = group.channel.clone();
-            let msg_for_action = message.clone();
+            let (view_for_action, ch_for_action, ts_for_action) =
+                (view.clone(), group.channel.clone(), message.ts.clone());
             let handler: ActionHandler = Rc::new(move |action, _window, cx| {
-                let ch = ch_for_action.clone();
-                let msg = Box::new(msg_for_action.clone());
-                view_for_action.update(cx, |_, cx| {
+                let (ch, ts) = (ch_for_action.clone(), ts_for_action.clone());
+                view_for_action.update(cx, |view, cx| {
+                    // The groups may have reordered or dropped the message since the row rendered.
+                    let Some(message) = view.message_in(&ch, &ts) else {
+                        return;
+                    };
                     cx.emit(UnreadsEvent::MessageAction {
                         channel: ch,
-                        message: msg,
+                        message: Box::new(message.clone()),
                         action,
                     });
                 });
@@ -1065,18 +1075,8 @@ fn card_view(args: UnreadCardArgs<'_>, cx: &mut Context<UnreadsView>) -> AnyElem
                 pinned: message.pinned_to.contains(&group.channel),
                 in_thread: false,
             };
-            let mut display = message.clone();
-            let reactions = std::mem::take(&mut display.reactions);
-            let chips = actions::reaction_chips(&key, &reactions, fixtures, Some(&handler), cx)
-                .map(|c| c.pl(px(48.)));
-            let row_body = message_row_linked(
-                fixtures,
-                &display,
-                Some(&handler),
-                Some(&links),
-                grouped,
-                cx,
-            );
+            let row_body =
+                message_row_linked(fixtures, message, Some(&handler), Some(&links), grouped, cx);
             let ch = group.channel.clone();
             let ts = message.ts.clone();
             let view_for_thread = view.clone();
@@ -1119,7 +1119,6 @@ fn card_view(args: UnreadCardArgs<'_>, cx: &mut Context<UnreadsView>) -> AnyElem
                         row.bg(hover_bg)
                     })
                     .child(row_body)
-                    .children(chips)
                     .children(reply_bar_el)
                     .when(revealed, |row| {
                         row.child(

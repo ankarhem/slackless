@@ -24,9 +24,11 @@ use gpui_kit::gpui::{
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
-use slackless_core::types::{ChannelId, UserId, Usergroup, UsergroupId};
+use slackless_core::types::{ChannelId, Conversation, UserId, Usergroup, UsergroupId};
 
-use crate::directory_rows::{channel_row, channels, people, person_row, usergroup_row, usergroups};
+use crate::directory_rows::{
+    channel_row, filter_channels, people, person_row, usergroup_row, usergroups,
+};
 use crate::fixtures::Fixtures;
 
 /// Rows listed per tab at once.
@@ -198,15 +200,38 @@ pub(crate) fn reconcile_usergroups_from_server(groups: &[Usergroup], cx: &mut Ap
     }
 }
 
+/// The active tab's matches, computed when the tab, the query, the "Show disabled" toggle,
+/// the workspace data or the session's user-group overrides change (a counts-only snapshot
+/// shares the data, so it keeps the matches); rows render from it each frame.
+struct DirectoryMemo {
+    tab: DirectoryTab,
+    needle: String,
+    show_disabled: bool,
+    fixtures: Arc<Fixtures>,
+    /// The user-group overrides the list was computed with.
+    overrides: Option<(
+        HashMap<UsergroupId, Usergroup>,
+        HashMap<UsergroupId, UsergroupLocalEdit>,
+    )>,
+    list: TabList,
+    /// Disabled groups the User groups tab's query matched (its summary line).
+    disabled_count: usize,
+}
+
+enum TabList {
+    People(Vec<UserId>),
+    Channels(Vec<Conversation>),
+    UserGroups(Vec<Usergroup>),
+}
+
 fn live_overrides(
     cx: &App,
-) -> (
+) -> Option<(
     HashMap<UsergroupId, Usergroup>,
     HashMap<UsergroupId, UsergroupLocalEdit>,
-) {
+)> {
     cx.try_global::<UsergroupLiveState>()
         .map(|s| (s.disabled_groups.clone(), s.edited_groups.clone()))
-        .unwrap_or_default()
 }
 
 pub struct DirectoryView {
@@ -219,6 +244,8 @@ pub struct DirectoryView {
     expanded_group: Option<String>,
     /// Whether disabled user groups are shown in the User groups tab.
     show_disabled_groups: bool,
+    /// The active tab's matches (see [`DirectoryMemo`]).
+    memo: Option<DirectoryMemo>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -248,6 +275,7 @@ impl DirectoryView {
                 joined: HashSet::new(),
                 expanded_group: None,
                 show_disabled_groups: false,
+                memo: None,
                 _subscriptions: subscriptions,
             }
         })
@@ -257,6 +285,58 @@ impl DirectoryView {
     pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
         self.fixtures = fixtures;
         cx.notify();
+    }
+
+    /// The active tab's matches for the current query, recomputed only when an input changed.
+    fn refresh_memo(&mut self, cx: &Context<Self>) {
+        let needle = self.needle(cx);
+        let overrides = live_overrides(cx);
+        let up_to_date = self.memo.as_ref().is_some_and(|memo| {
+            memo.tab == self.tab
+                && memo.needle == needle
+                && memo.show_disabled == self.show_disabled_groups
+                && memo.fixtures.shares_data(&self.fixtures)
+                && overrides
+                    .as_ref()
+                    .map(|(disabled, edited)| (disabled, edited))
+                    == memo
+                        .overrides
+                        .as_ref()
+                        .map(|(disabled, edited)| (disabled, edited))
+        });
+        if !up_to_date {
+            let (disabled, edited) = overrides
+                .as_ref()
+                .map_or((HashMap::new(), HashMap::new()), |(disabled, edited)| {
+                    (disabled.clone(), edited.clone())
+                });
+            let fixtures = self.fixtures.clone();
+            let (list, disabled_count) = match self.tab {
+                DirectoryTab::People => (TabList::People(people(&fixtures, &needle)), 0),
+                DirectoryTab::Channels => {
+                    (TabList::Channels(filter_channels(&fixtures, &needle)), 0)
+                }
+                DirectoryTab::UserGroups => {
+                    let (groups, disabled_count) = usergroups(
+                        &fixtures,
+                        &disabled,
+                        &edited,
+                        &needle,
+                        self.show_disabled_groups,
+                    );
+                    (TabList::UserGroups(groups), disabled_count)
+                }
+            };
+            self.memo = Some(DirectoryMemo {
+                tab: self.tab,
+                needle,
+                show_disabled: self.show_disabled_groups,
+                fixtures,
+                overrides,
+                list,
+                disabled_count,
+            });
+        }
     }
 
     /// The snapshot the rows read.
@@ -305,40 +385,38 @@ impl Render for DirectoryView {
             theme.secondary,
             theme.secondary_hover,
         );
-        let needle = self.needle(cx);
-        let fixtures = self.fixtures.clone();
-        let (tab, joined, show_disabled) = (self.tab, &self.joined, self.show_disabled_groups);
-        let (disabled_overrides, edit_overrides) = live_overrides(cx);
-        let (matching_people, matching_channels, (matching_groups, disabled_count)) = (
-            people(&fixtures, &needle),
-            channels(&fixtures, &needle),
-            usergroups(
-                &fixtures,
-                &disabled_overrides,
-                &edit_overrides,
-                &needle,
-                show_disabled,
-            ),
-        );
-        let count = match tab {
-            DirectoryTab::People => matching_people.len(),
-            DirectoryTab::Channels => matching_channels.len(),
-            DirectoryTab::UserGroups => matching_groups.len(),
+        self.refresh_memo(cx);
+        let (tab, joined) = (self.tab, &self.joined);
+        let DirectoryMemo {
+            list,
+            disabled_count,
+            show_disabled,
+            ..
+        } = self
+            .memo
+            .as_ref()
+            .expect("refresh_memo computed the matches");
+        let show_disabled = *show_disabled;
+        let disabled_count = *disabled_count;
+        let count = match list {
+            TabList::People(people) => people.len(),
+            TabList::Channels(channels) => channels.len(),
+            TabList::UserGroups(groups) => groups.len(),
         };
-        let rows: Vec<_> = match tab {
-            DirectoryTab::People => matching_people
+        let rows: Vec<_> = match list {
+            TabList::People(people) => people
                 .iter()
                 .take(MAX_ROWS)
                 .enumerate()
                 .map(|(ix, user)| person_row(self, ix, user, cx))
                 .collect(),
-            DirectoryTab::Channels => matching_channels
+            TabList::Channels(channels) => channels
                 .iter()
                 .take(MAX_ROWS)
                 .enumerate()
                 .map(|(ix, channel)| channel_row(ix, channel, joined, cx))
                 .collect(),
-            DirectoryTab::UserGroups => matching_groups
+            TabList::UserGroups(groups) => groups
                 .iter()
                 .take(MAX_ROWS)
                 .enumerate()
