@@ -432,6 +432,16 @@ impl<B: Backend> Core<B> {
                     .store(enabled, Ordering::Relaxed);
             }
             WorkspaceCommand::SetUserPref { name, value } => self.set_user_pref(name, value),
+            WorkspaceCommand::BackfillChannel {
+                channel,
+                include_threads,
+            } => self.backfill_channel(channel, include_threads),
+            WorkspaceCommand::BackfillWorkspace { include_threads } => {
+                self.backfill_workspace(include_threads);
+            }
+            WorkspaceCommand::PauseBackfill => self.pause_backfill(),
+            WorkspaceCommand::ResumeBackfill => self.resume_backfill(),
+            WorkspaceCommand::QueryBackfillProgress => self.query_backfill_progress(),
             WorkspaceCommand::SignOut => self.sign_out(),
         }
     }

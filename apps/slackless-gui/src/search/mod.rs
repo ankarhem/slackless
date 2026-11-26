@@ -12,5 +12,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use query::fixture_archive;
-pub use state::{SearchEvent, SearchView};
+pub use query::{fixture_archive, fixture_archive_for};
+#[cfg(test)]
+pub use state::SearchScope;
+pub use state::{SearchEvent, SearchView, SearchWorkspaceSource};

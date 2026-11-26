@@ -1,9 +1,11 @@
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use slackless_core::types::TeamId;
+use slackless_core::read_synced_spans;
 use slackless_core::types::time::format_bytes;
+use slackless_core::types::{ChannelId, TeamId};
 
 use super::{archive_hint, empty_local};
 use crate::archive::{self, Archive, format_channel_name};
@@ -189,4 +191,179 @@ pub(crate) fn format_stats_human(summary: &StatsSummary<'_>) -> String {
         summary.users,
         summary.offline_queued,
     )
+}
+
+/// Per-channel archive backfill coverage row for `slackless archive status`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ArchiveChannelStatusRow {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    pub messages: u64,
+    pub complete: bool,
+    pub oldest_ts: Option<String>,
+    pub newest_ts: Option<String>,
+}
+
+/// `archive status`: show per-channel local backfill progress and archive coverage.
+pub(crate) fn cmd_archive_status(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode> {
+    let Some(workspace) = workspace else {
+        return Ok(empty_local(
+            ctx,
+            serde_json::json!({
+                "workspace": null,
+                "archive_exists": false,
+                "total_channels": 0,
+                "completed_channels": 0,
+                "synced_channels": 0,
+                "total_messages": 0,
+                "db_bytes": 0,
+                "channels": [],
+            }),
+            "reading archive backfill status",
+        ));
+    };
+    let archive = Archive::open(workspace)
+        .with_context(|| format!("opening local archive for {workspace}"))?;
+    if archive.is_none() && !ctx.json {
+        archive_hint(workspace);
+        return Ok(ExitCode::SUCCESS);
+    }
+    cmd_archive_status_in_archive(ctx, workspace, archive.as_ref())
+}
+
+pub(crate) fn cmd_archive_status_in_archive(
+    ctx: &Ctx,
+    workspace: &TeamId,
+    archive: Option<&Archive>,
+) -> Result<ExitCode> {
+    let Some(archive) = archive else {
+        output::emit(
+            ctx.json,
+            &serde_json::json!({
+                "workspace": workspace.as_str(),
+                "archive_exists": false,
+                "total_channels": 0,
+                "completed_channels": 0,
+                "synced_channels": 0,
+                "total_messages": 0,
+                "db_bytes": 0,
+                "channels": [],
+            }),
+            "",
+        );
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    let (json, human) = build_archive_status_report(workspace, archive)?;
+    output::emit(ctx.json, &json, &human);
+    Ok(ExitCode::SUCCESS)
+}
+
+pub(crate) fn build_archive_status_report(
+    workspace: &TeamId,
+    archive: &Archive,
+) -> Result<(serde_json::Value, String)> {
+    let store = archive.store();
+    let stats = store
+        .stats(workspace)
+        .with_context(|| format!("reading local archive stats for {workspace}"))?;
+    let spans = read_synced_spans(store, workspace);
+    let counts = store
+        .channel_message_counts(workspace)
+        .with_context(|| format!("reading channel message counts for {workspace}"))?;
+    let channels = archive
+        .channels(workspace)
+        .with_context(|| format!("listing channels for {workspace}"))?;
+    let dms = archive
+        .dms(workspace)
+        .with_context(|| format!("listing dms for {workspace}"))?;
+
+    let mut by_id: HashMap<ChannelId, (String, String)> = HashMap::new();
+    for ch in channels.into_iter().chain(dms) {
+        by_id.insert(ch.id.clone(), (ch.label(), ch.kind));
+    }
+
+    let mut all_ids: BTreeMap<String, ChannelId> = BTreeMap::new();
+    for id in by_id.keys() {
+        all_ids.insert(id.as_str().to_owned(), id.clone());
+    }
+    for id in spans.keys() {
+        all_ids.insert(id.as_str().to_owned(), id.clone());
+    }
+    for id in counts.keys() {
+        all_ids.insert(id.as_str().to_owned(), id.clone());
+    }
+
+    let mut rows: Vec<ArchiveChannelStatusRow> = all_ids
+        .into_values()
+        .map(|id| {
+            let (label, kind) = by_id
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| (id.as_str().to_owned(), "unknown".to_owned()));
+            let span = spans.get(&id);
+            let messages = counts.get(&id).copied().unwrap_or(0);
+            ArchiveChannelStatusRow {
+                id: id.as_str().to_owned(),
+                label,
+                kind,
+                messages,
+                complete: span.is_some_and(|s| s.complete),
+                oldest_ts: span.map(|s| s.oldest.as_str().to_owned()),
+                newest_ts: span.map(|s| s.newest.as_str().to_owned()),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.complete
+            .cmp(&a.complete)
+            .then_with(|| b.messages.cmp(&a.messages))
+            .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+    });
+
+    let total_channels = rows.len();
+    let completed_channels = rows.iter().filter(|r| r.complete).count();
+    let synced_channels = rows
+        .iter()
+        .filter(|r| r.complete || r.messages > 0 || r.oldest_ts.is_some())
+        .count();
+
+    let mut human = format!(
+        "Workspace:\t{}\nArchive size:\t{}\nMessages:\t{}\nBackfilled:\t{completed_channels}/{total_channels} complete ({synced_channels} with local history)\n",
+        workspace.as_str(),
+        format_bytes(stats.db_bytes()),
+        stats.messages,
+    );
+    if !rows.is_empty() {
+        human.push('\n');
+        for row in &rows {
+            let status = if row.complete {
+                "complete"
+            } else if row.messages > 0 || row.oldest_ts.is_some() {
+                "partial"
+            } else {
+                "idle"
+            };
+            human.push_str(&format!(
+                "{}\t{}\t{status}\t{} msgs\toldest={}\n",
+                row.id,
+                row.label,
+                row.messages,
+                row.oldest_ts.as_deref().unwrap_or("-"),
+            ));
+        }
+    }
+
+    let json = serde_json::json!({
+        "workspace": workspace.as_str(),
+        "archive_exists": true,
+        "total_channels": total_channels,
+        "completed_channels": completed_channels,
+        "synced_channels": synced_channels,
+        "total_messages": stats.messages,
+        "db_bytes": stats.db_bytes(),
+        "channels": rows,
+    });
+    Ok((json, human))
 }

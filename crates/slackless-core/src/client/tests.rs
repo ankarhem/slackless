@@ -6777,3 +6777,157 @@ async fn usergroup_disable_enable_and_users_commands_update_state_and_emit_event
         vec![(ug_id, updated_members)]
     );
 }
+
+#[tokio::test]
+async fn workspace_backfill_commands_report_progress_and_honor_pause_resume() {
+    use crate::{BackfillStatus, WorkspaceCommand};
+
+    let fake = FakeBackend::default();
+    let ws = TeamId::from("T1");
+    let c1 = ChannelId::from("C_BF_1");
+    let c2 = ChannelId::from("C_BF_2");
+
+    let (store, events, mut rx) = fake_core_parts();
+    {
+        let mut s = store.lock().unwrap();
+        s.upsert_conversations(
+            &ws,
+            &[
+                Conversation {
+                    id: c1.clone(),
+                    name: Some("general".into()),
+                    is_channel: true,
+                    is_member: true,
+                    ..Conversation::default()
+                },
+                Conversation {
+                    id: c2.clone(),
+                    name: Some("ops".into()),
+                    is_channel: true,
+                    is_member: true,
+                    ..Conversation::default()
+                },
+            ],
+        )
+        .unwrap();
+    }
+    {
+        let mut st = fake.state.lock().unwrap();
+        st.history = vec![Message {
+            ts: Ts::from("1700000100.000100"),
+            text: "root in general".into(),
+            reply_count: Some(1),
+            ..Message::default()
+        }];
+        st.thread = vec![
+            Message {
+                ts: Ts::from("1700000100.000100"),
+                text: "root in general".into(),
+                reply_count: Some(1),
+                ..Message::default()
+            },
+            Message {
+                ts: Ts::from("1700000101.000100"),
+                thread_ts: Some(Ts::from("1700000100.000100")),
+                text: "reply in general".into(),
+                ..Message::default()
+            },
+        ];
+    }
+
+    let mut core = Core::new(
+        fake,
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    // 1. QueryBackfillProgress before running returns Idle inventory for both channels.
+    core.handle(Command::Workspace(WorkspaceCommand::QueryBackfillProgress))
+        .await;
+    let Event::BackfillProgress(initial) = next(&mut rx).await else {
+        panic!("expected BackfillProgress on query");
+    };
+    assert_eq!(initial.total_channels, 2);
+    assert_eq!(initial.completed_channels, 0);
+    assert_eq!(initial.status, BackfillStatus::Idle);
+
+    // 2. Pause -> Resume toggles paused flag via Event::BackfillProgress.
+    core.handle(Command::Workspace(WorkspaceCommand::PauseBackfill))
+        .await;
+    let Event::BackfillProgress(paused) = next(&mut rx).await else {
+        panic!("expected BackfillProgress on pause");
+    };
+    assert!(paused.paused);
+
+    core.handle(Command::Workspace(WorkspaceCommand::ResumeBackfill))
+        .await;
+    let Event::BackfillProgress(resumed) = next(&mut rx).await else {
+        panic!("expected BackfillProgress on resume");
+    };
+    assert!(!resumed.paused);
+
+    // 3. BackfillWorkspace with include_threads=true walks both channels + thread reply.
+    core.handle(Command::Workspace(WorkspaceCommand::BackfillWorkspace {
+        include_threads: true,
+    }))
+    .await;
+
+    let mut saw_complete = false;
+    for _ in 0..32 {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Ok(Event::BackfillProgress(p))) if p.status == BackfillStatus::Complete => {
+                assert_eq!(p.total_channels, 2);
+                assert_eq!(p.completed_channels, 2);
+                assert!(p.replies_stored >= 1);
+                saw_complete = true;
+                break;
+            }
+            Ok(Ok(_)) => {}
+            other => panic!("unexpected event waiting for workspace backfill: {other:?}"),
+        }
+    }
+    assert!(saw_complete, "workspace backfill should reach Complete");
+
+    let replies = store
+        .lock()
+        .unwrap()
+        .thread_replies(&ws, &c1, &Ts::from("1700000100.000100"))
+        .unwrap();
+    assert_eq!(replies.len(), 2);
+
+    // 4. Pausing then issuing an explicit BackfillChannel clears stale paused state and completes.
+    core.handle(Command::Workspace(WorkspaceCommand::PauseBackfill))
+        .await;
+    let Event::BackfillProgress(paused_again) = next(&mut rx).await else {
+        panic!("expected BackfillProgress on second pause");
+    };
+    assert!(paused_again.paused);
+
+    core.handle(Command::Workspace(WorkspaceCommand::BackfillChannel {
+        channel: c2.clone(),
+        include_threads: false,
+    }))
+    .await;
+    let mut saw_ch_complete = false;
+    for _ in 0..32 {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Ok(Event::BackfillProgress(p)))
+                if !p.paused
+                    && p.status == BackfillStatus::Complete
+                    && p.channels.iter().any(|c| c.channel == c2 && c.complete) =>
+            {
+                saw_ch_complete = true;
+                break;
+            }
+            Ok(Ok(_)) => {}
+            other => panic!("unexpected event waiting for single-channel backfill: {other:?}"),
+        }
+    }
+    assert!(
+        saw_ch_complete,
+        "BackfillChannel after PauseBackfill must clear stale pause and complete"
+    );
+}

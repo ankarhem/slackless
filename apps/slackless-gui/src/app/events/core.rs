@@ -364,6 +364,15 @@ impl App {
             Event::AppHomeLoaded { .. } | Event::AppHomeUpdated(_) => {
                 self.on_app_home_event(event, cx)
             }
+            Event::BackfillProgress(progress) => {
+                self.ws.backfill_progress = Some(progress.clone());
+                let snap = progress.clone();
+                self.preferences.update(cx, |prefs, cx| {
+                    prefs.set_backfill_progress(Some(snap), cx);
+                });
+                window.refresh();
+                cx.notify();
+            }
             Event::WorkflowTripped { .. } => {
                 notify(
                     "Workflow started",

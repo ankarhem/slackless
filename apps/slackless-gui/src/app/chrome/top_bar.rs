@@ -145,10 +145,32 @@ impl App {
                             }),
                     );
                 }
-                if channel.is_some() {
+                if let Some(ch_id) = channel.clone() {
                     let this_md = this.clone();
                     let this_json = this.clone();
+                    let this_bf = this.clone();
+                    let this_storage = this.clone();
+                    let ch_bf = ch_id.clone();
                     menu = menu
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("Backfill channel history")
+                                .icon(IconName::RotateCcw)
+                                .on_click(move |_, window, cx| {
+                                    let _ = this_bf.update(cx, |app, cx| {
+                                        app.start_channel_backfill(ch_bf.clone(), window, cx);
+                                    });
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new("Archive & storage\u{2026}")
+                                .icon(IconName::HardDrive)
+                                .on_click(move |_, window, cx| {
+                                    let _ = this_storage.update(cx, |app, cx| {
+                                        app.open_storage_dialog(window, cx);
+                                    });
+                                }),
+                        )
                         .separator()
                         .item(
                             PopupMenuItem::new("Export transcript (Markdown…)")

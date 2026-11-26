@@ -25,7 +25,7 @@ pub use canvas::{
     run_canvas_comment, run_canvas_comments, run_canvas_create, run_canvas_delete, run_canvas_edit,
     run_canvas_info, run_canvas_read, run_canvas_resolve, run_canvas_share, run_canvas_unshare,
 };
-pub use channels::{run_backfill, run_unread};
+pub use channels::{run_archive_backfill, run_backfill, run_unread};
 pub use files::{run_download, run_files, run_transcribe};
 pub use huddle::{
     HuddleJoinArgs, HuddleTranscriptsArgs, run_huddle_cameras, run_huddle_devices,
@@ -50,7 +50,8 @@ pub(crate) use canvas::{
 };
 #[cfg(test)]
 pub(crate) use channels::{
-    backfill_should_stop, clamp_backfill_page_size, format_backfill_output, format_unread_json,
+    ArchiveBackfillChannelSummary, backfill_should_stop, clamp_backfill_page_size,
+    format_archive_backfill_output, format_backfill_output, format_unread_json,
     next_backfill_cursor, summarize_unread,
 };
 #[cfg(test)]

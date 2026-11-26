@@ -438,10 +438,119 @@ impl App {
         }
     }
 
+    /// Resolve the workspace switcher index for `team_id` (matching live teams or fixture workspaces).
+    pub(in crate::app) fn workspace_index_for(
+        &self,
+        team_id: &slackless_core::types::TeamId,
+    ) -> Option<usize> {
+        if !self.fixtures.sample {
+            self.live_teams
+                .iter()
+                .position(|t| t.id == *team_id)
+                .or_else(|| {
+                    self.fixtures
+                        .workspaces
+                        .iter()
+                        .position(|t| t.id == *team_id)
+                })
+        } else {
+            self.fixtures
+                .workspaces
+                .iter()
+                .position(|t| t.id == *team_id)
+        }
+    }
+
+    /// Build the list of all mounted workspace archives (active + parked live workspaces, or all
+    /// fixture workspaces in sample mode) and hand them to `SearchView` for "All workspaces" FTS5.
+    pub(in crate::app) fn sync_search_workspace_sources(&self, cx: &mut Context<Self>) {
+        let mut sources: Vec<SearchWorkspaceSource> = Vec::new();
+        if !self.fixtures.sample {
+            let count = self.live_teams.len().max(1);
+            for idx in 0..count {
+                let team = self
+                    .live_teams
+                    .get(idx)
+                    .or_else(|| self.fixtures.workspaces.get(idx));
+                let bridge = if idx == self.workspace {
+                    Some(&self.bridge)
+                } else {
+                    self.parked_bridges.get(idx).and_then(Option::as_ref)
+                };
+                if let Some(bridge) = bridge
+                    && let (Some(store), Some(tid)) =
+                        (bridge.read_store_clone(), bridge.team_id().cloned())
+                {
+                    let name = team
+                        .map(|t| t.name.clone())
+                        .filter(|n| !n.trim().is_empty())
+                        .unwrap_or_else(|| tid.to_string());
+                    sources.push(SearchWorkspaceSource {
+                        team_id: tid,
+                        name,
+                        store,
+                    });
+                }
+            }
+        } else {
+            let count = self.fixtures.workspaces.len();
+            for idx in 0..count {
+                let team = &self.fixtures.workspaces[idx];
+                let fx = if idx == self.workspace {
+                    self.fixtures.clone()
+                } else if let Some(parked) = self.parked.get(idx).and_then(Option::as_ref) {
+                    parked.fixtures.clone()
+                } else {
+                    Arc::new(fixtures::workspace(idx))
+                };
+                if let Some(store) = fixture_archive_for(&fx, &team.id) {
+                    sources.push(SearchWorkspaceSource {
+                        team_id: team.id.clone(),
+                        name: team.name.clone(),
+                        store,
+                    });
+                }
+            }
+        }
+        self.results.update(cx, |results, cx| {
+            results.set_workspace_sources(sources, cx);
+        });
+    }
+
+    /// Jump to a search hit located in `workspace`: switches workspace if needed, selects the
+    /// channel, and reveals `ts` in the transcript.
+    pub(in crate::app) fn open_message_in_workspace(
+        &mut self,
+        workspace: &slackless_core::types::TeamId,
+        channel: ChannelId,
+        ts: Ts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(idx) = self.workspace_index_for(workspace) else {
+            notify(
+                "Workspace not loaded",
+                format!(
+                    "Workspace {} is archived on disk but not currently signed in.",
+                    workspace
+                ),
+                window,
+                cx,
+            );
+            return;
+        };
+        if idx != self.workspace {
+            self.switch_workspace(idx, window, cx);
+        }
+        self.select(channel, cx);
+        self.messages.update(cx, |list, cx| list.reveal(&ts, cx));
+    }
+
     /// Search messages for `query`, showing results in place of the message column. The
     /// pill's Enter and the dropdown's rows both land here; the dropdown's filter chips
     /// (and only its non-empty query) narrow the run and join its history.
     pub(super) fn run_message_search(&mut self, query: String, cx: &mut Context<Self>) {
+        self.sync_search_workspace_sources(cx);
         let filters = self
             .search_menu
             .read(cx)
@@ -732,7 +841,11 @@ impl App {
                     } else {
                         let fixtures = Arc::new(fixtures::workspace(index));
                         let channel = first_conversation(&fixtures);
-                        let archive = fixture_archive(&fixtures);
+                        let archive = fixtures
+                            .workspaces
+                            .get(index)
+                            .or_else(|| fixtures.workspaces.first())
+                            .and_then(|t| fixture_archive_for(&fixtures, &t.id));
                         (fixtures, channel, archive, false)
                     };
                 let views = build_workspace(&fixtures, index, archive, &channel, window, cx);
@@ -816,6 +929,21 @@ impl App {
             });
         }
         // New thread panels / profile panes pick up Enter-to-send and the self state.
+        let active_team = self
+            .bridge
+            .team_id()
+            .cloned()
+            .or_else(|| self.fixtures.workspaces.get(index).map(|t| t.id.clone()))
+            .or_else(|| self.fixtures.workspaces.first().map(|t| t.id.clone()));
+        if let Some(ws_id) = active_team {
+            self.results
+                .update(cx, |view, cx| view.set_workspace(ws_id, cx));
+        }
+        let bf_progress = self.ws.backfill_progress.clone();
+        self.preferences.update(cx, |prefs, cx| {
+            prefs.set_backfill_progress(bf_progress, cx);
+        });
+        self.sync_search_workspace_sources(cx);
         self.apply_preferences(window, cx);
         self.update_menus(cx);
         self.sync_window_title_in(window);

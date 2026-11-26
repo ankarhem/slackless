@@ -12,6 +12,16 @@ pub struct StoredFileTranscript {
     pub updated_at: i64,
 }
 
+/// A matched `file_transcript` row attributed to its workspace (plus optional carrying message).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceFileTranscript {
+    pub workspace: TeamId,
+    pub transcript: StoredFileTranscript,
+    /// First carrying message's channel & ts when linked via `message_file`.
+    pub channel: Option<ChannelId>,
+    pub message_ts: Option<Ts>,
+}
+
 /// Extract Slack's inline clip transcript text from a [`File`]'s metadata
 /// (`extra["transcription"]["preview"]["content"]`, `extra["transcription"]["text"]`, or
 /// `extra["transcript"]`), trimmed and non-empty.
@@ -43,9 +53,44 @@ pub fn extract_inline_file_transcript(file: &File) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// Combine transcripts for every file attached to a message: prefer the persisted
-/// `file_transcript.text` for `(workspace, file.id)` when present, falling back to
-/// [`extract_inline_file_transcript`].
+/// Extract searchable inline body text for snippets and canvases attached to a message:
+/// `file.preview`, `extra["plain_text"]`, `extra["preview_plain_text"]`, `extra["canvas_markdown"]`,
+/// `extra["canvas_text"]`, `extra["markdown"]`, and `extra["document_content"]`.
+pub fn extract_inline_file_body(file: &File) -> Option<String> {
+    fn push_unique<'a>(parts: &mut Vec<&'a str>, s: &'a str) {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() && !parts.contains(&trimmed) {
+            parts.push(trimmed);
+        }
+    }
+
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(preview) = file.preview.as_deref() {
+        push_unique(&mut parts, preview);
+    }
+    for key in [
+        "plain_text",
+        "preview_plain_text",
+        "canvas_markdown",
+        "canvas_text",
+        "markdown",
+        "document_content",
+    ] {
+        if let Some(val) = file.extra.get(key).and_then(|v| v.as_str()) {
+            push_unique(&mut parts, val);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+/// Combine transcripts and inline snippet/canvas body text for every file attached to a message:
+/// prefer the persisted `file_transcript.text` for `(workspace, file.id)` when present, falling
+/// back to [`extract_inline_file_transcript`], and append [`extract_inline_file_body`] when
+/// distinct so snippets, canvases, and spoken clips are all searchable in `message_fts`.
 pub(super) fn compute_message_file_transcripts(
     tx: &Transaction<'_>,
     workspace: &TeamId,
@@ -69,8 +114,14 @@ pub(super) fn compute_message_file_transcripts(
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
         };
-        if let Some(text) = stored.or_else(|| extract_inline_file_transcript(file)) {
-            parts.push(text);
+        let transcript = stored.or_else(|| extract_inline_file_transcript(file));
+        if let Some(text) = &transcript {
+            parts.push(text.clone());
+        }
+        if let Some(body) = extract_inline_file_body(file)
+            && transcript.as_deref() != Some(body.as_str())
+        {
+            parts.push(body);
         }
     }
     Ok(parts.join(" "))
@@ -191,6 +242,101 @@ impl Store {
         for row in rows {
             let (id, text) = row?;
             out.insert(id, text);
+        }
+        Ok(out)
+    }
+
+    /// Search persisted `file_transcript` entries in one `workspace` (or across ALL stored
+    /// workspaces when `workspace` is `None`). Matches every positive term in `query`
+    /// case-insensitively (with trailing `*` treated as a substring stem) and excludes any
+    /// `excluded_terms`, returning newest-updated transcripts first along with optional
+    /// carrying-message coordinates from `message_file`.
+    pub fn search_file_transcripts(
+        &self,
+        workspace: Option<&TeamId>,
+        query: &SearchQuery,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceFileTranscript>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let terms: Vec<String> = query
+            .terms
+            .iter()
+            .map(|t| t.trim_end_matches('*').to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let excluded: Vec<String> = query
+            .excluded_terms
+            .iter()
+            .map(|t| t.trim_end_matches('*').to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if terms.is_empty() && excluded.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut sql = String::from(
+            "SELECT ft.workspace_id, ft.file_id, ft.source, ft.text, ft.updated_at,
+                    (SELECT mc.channel_id
+                     FROM message_file mf
+                     JOIN message_current mc ON mc.id = mf.message_id
+                     WHERE mf.workspace_id = ft.workspace_id AND mf.file_id = ft.file_id
+                     ORDER BY mc.ts_key DESC LIMIT 1),
+                    (SELECT mc.ts
+                     FROM message_file mf
+                     JOIN message_current mc ON mc.id = mf.message_id
+                     WHERE mf.workspace_id = ft.workspace_id AND mf.file_id = ft.file_id
+                     ORDER BY mc.ts_key DESC LIMIT 1)
+             FROM file_transcript ft",
+        );
+        let mut args: Vec<SqlValue> = Vec::new();
+        if let Some(ws) = workspace {
+            sql.push_str(" WHERE ft.workspace_id = ?1");
+            args.push(SqlValue::Text(ws.as_str().to_owned()));
+        }
+        sql.push_str(" ORDER BY ft.updated_at DESC, ft.file_id ASC");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            let ws: String = r.get(0)?;
+            let fid: String = r.get(1)?;
+            let source: String = r.get(2)?;
+            let text: String = r.get(3)?;
+            let updated_at: i64 = r.get(4)?;
+            let channel: Option<String> = r.get(5)?;
+            let message_ts: Option<String> = r.get(6)?;
+            Ok(WorkspaceFileTranscript {
+                workspace: TeamId::from(ws),
+                transcript: StoredFileTranscript {
+                    file_id: FileId::from(fid),
+                    source,
+                    text,
+                    updated_at,
+                },
+                channel: channel.map(ChannelId::from),
+                message_ts: message_ts.map(Ts::from),
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let entry = row?;
+            let lower = entry.transcript.text.to_lowercase();
+            let id_lower = entry.transcript.file_id.as_str().to_lowercase();
+            let matches_pos = terms
+                .iter()
+                .all(|t| lower.contains(t.as_str()) || id_lower.contains(t.as_str()));
+            if !matches_pos {
+                continue;
+            }
+            if excluded.iter().any(|t| lower.contains(t.as_str())) {
+                continue;
+            }
+            out.push(entry);
+            if out.len() >= limit {
+                break;
+            }
         }
         Ok(out)
     }
