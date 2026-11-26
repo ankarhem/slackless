@@ -16,6 +16,13 @@ use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 /// first use; every caller shares the one instance.
 pub(crate) fn shared_runtime() -> io::Result<&'static Runtime> {
     static RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+    static INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if let Some(rt) = RUNTIME.get() {
+        return Ok(rt);
+    }
+    let _guard = INIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(rt) = RUNTIME.get() {
         return Ok(rt);
     }

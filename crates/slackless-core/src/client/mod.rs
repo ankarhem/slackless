@@ -70,6 +70,27 @@ impl Client {
     /// is dropped. The caller opens `store` (on disk for real sessions) so the location stays a
     /// front-end decision.
     pub fn start(session: Session, store: Store) -> std::io::Result<ClientHandle> {
+        let api_base = session.api_base();
+        Self::start_with_endpoints(
+            session,
+            store,
+            api_base,
+            crate::types::endpoints::WSS_PRIMARY.to_owned(),
+        )
+    }
+
+    /// Starts the core against custom HTTP (`api_base`) and RTM WebSocket (`rtm_base_url`)
+    /// endpoints. Production uses [`Client::start`]; integration tests use this seam to exercise
+    /// the real [`SlackApi`], [`RtmClient`], and SQLite [`Store`] end-to-end against local mock
+    /// servers without bypassing the wire adapters.
+    pub fn start_with_endpoints(
+        session: Session,
+        store: Store,
+        api_base: impl Into<String>,
+        rtm_base_url: impl Into<String>,
+    ) -> std::io::Result<ClientHandle> {
+        let api_base = api_base.into();
+        let rtm_base_url = rtm_base_url.into();
         let store: SharedStore = Arc::new(Mutex::new(store));
         let (command_tx, command_rx) = mpsc::unbounded();
         let (event_tx, event_rx) = mpsc::unbounded();
@@ -77,18 +98,15 @@ impl Client {
         let events = Emitter(event_tx);
         let thread_store = Arc::clone(&store);
         let handle = shared_runtime()?.handle().clone();
-        let files = SlackApi::new(
-            &session.api_base(),
-            session.xoxc_token.clone(),
-            &session.d_cookie,
-        )
-        .ok();
+        let files = SlackApi::new(&api_base, session.xoxc_token.clone(), &session.d_cookie).ok();
         let fetcher = Fetcher::new(handle.clone(), files);
         let thread = std::thread::Builder::new()
             .name("slackless-core".into())
             .spawn(move || {
                 handle.block_on(run_session(
                     session,
+                    api_base,
+                    rtm_base_url,
                     thread_store,
                     command_rx,
                     events,
@@ -346,16 +364,14 @@ where
 
 async fn run_session(
     session: Session,
+    api_base: String,
+    rtm_base_url: String,
     store: SharedStore,
     commands: UnboundedReceiver<Command>,
     events: Emitter,
     huddle_media: HuddleMediaSender,
 ) {
-    let api = match SlackApi::new(
-        &session.api_base(),
-        session.xoxc_token.clone(),
-        &session.d_cookie,
-    ) {
+    let api = match SlackApi::new(&api_base, session.xoxc_token.clone(), &session.d_cookie) {
         Ok(api) => api,
         Err(e) => return events.report("api client", e.into()),
     };
@@ -372,6 +388,7 @@ async fn run_session(
     // full workspace hydration runs concurrently in the background.
     let mut config =
         RtmConfig::new(ConnectParams::new(session.xoxc_token.clone()).with_team(&session.team_id));
+    config.base_url = rtm_base_url;
     config.d_cookie = Some(session.d_cookie.clone());
     let rtm = match RtmClient::new(config) {
         Ok((client, rx, driver)) => {

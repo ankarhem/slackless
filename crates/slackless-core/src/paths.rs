@@ -5,10 +5,16 @@
 
 use std::path::PathBuf;
 
-/// Application data directory (`~/Library/Application Support/slackless` on macOS,
-/// `$XDG_DATA_HOME/slackless` or `~/.local/share/slackless` on Linux,
-/// `%APPDATA%\slackless` on Windows).
+/// Application data directory (`$SLACKLESS_DATA_DIR` when set and non-empty; otherwise
+/// `~/Library/Application Support/slackless` on macOS, `$XDG_DATA_HOME/slackless` or
+/// `~/.local/share/slackless` on Linux, `%APPDATA%\slackless` on Windows).
 pub fn app_data_dir() -> Option<PathBuf> {
+    if let Ok(override_dir) = std::env::var("SLACKLESS_DATA_DIR") {
+        let trimmed = override_dir.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
     dirs::data_dir().map(|dir| dir.join("slackless"))
 }
 

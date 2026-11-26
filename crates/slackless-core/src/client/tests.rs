@@ -8158,3 +8158,574 @@ async fn outbox_flush_stops_at_a_transient_failure_and_keeps_the_item_pending() 
         1
     );
 }
+
+#[tokio::test]
+async fn huddle_join_success_controls_leave_and_stale_generation_guard() {
+    crate::huddle::install_default_crypto_provider();
+    let fake = FakeBackend::default();
+    fake.state.lock().unwrap().rooms_join_response = Some(api::RoomJoinResponse {
+        call_id: "R0LIVE1".into(),
+        chime: api::ChimeJoinData {
+            attendee: api::ChimeAttendee {
+                attendee_id: "att-1".into(),
+                external_user_id: "T1-R0LIVE1-U1".into(),
+                join_token: "tok".into(),
+                ..Default::default()
+            },
+            meeting: api::ChimeMeeting {
+                meeting_id: "M0LIVE1".into(),
+                media_placement: api::ChimeMediaPlacement {
+                    // Closed loopback port so the spawned Chime WS fails fast without network I/O.
+                    signaling_url: "ws://127.0.0.1:1/control".into(),
+                    turn_control_url: "http://127.0.0.1:1/turn".into(),
+                    audio_host_url: "127.0.0.1:1".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        },
+        huddle: crate::types::HuddleRoom {
+            thread_root_ts: Some(Ts::from("   ")),
+            huddle_link: None,
+            ..Default::default()
+        },
+        canvas: Some(api::HuddleCanvasRef {
+            root_thread_ts: Some(Ts::from("1700000111.000100")),
+            thread_channel_id: Some(c1()),
+            file_id: Some("F0HCANVAS".into()),
+        }),
+    });
+
+    let (store, events, mut rx) = fake_core_parts();
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    // 1. Join huddle, receive Connecting snapshot, exercise live control + TestSpeaker + Leave.
+    core.handle(Command::Huddle(HuddleCommand::Join {
+        channel: c1(),
+        audio: crate::huddle::HuddleAudioConfig::default(),
+    }))
+    .await;
+
+    let mut saw_connecting = false;
+    for _ in 0..10 {
+        if let Event::Huddle(HuddleEvent::SessionChanged(snap)) = next(&mut rx).await
+            && snap.phase == crate::huddle::HuddlePhase::Connecting
+        {
+            assert_eq!(
+                snap.thread_root_ts.as_ref().map(Ts::as_str),
+                Some("1700000111.000100"),
+                "blank huddle.thread_root_ts must fall back to canvas.root_thread_ts"
+            );
+            assert_eq!(snap.canvas_file_id.as_deref(), Some("F0HCANVAS"));
+            assert!(
+                snap.huddle_link
+                    .as_deref()
+                    .is_some_and(|u| u.contains("/huddle/T1/C1"))
+            );
+            saw_connecting = true;
+            break;
+        }
+    }
+    assert!(saw_connecting, "expected initial Connecting huddle state");
+
+    // Forward controls while handle is active (or recently active) & exercise TestSpeaker.
+    core.handle(crate::HuddleControlCommand::SetMuted(true).into())
+        .await;
+    core.handle(Command::Huddle(HuddleCommand::TestSpeaker {
+        output_device: None,
+    }))
+    .await;
+
+    // 2. Replace active handle with a second join, then leave while `rooms.join` is gated
+    //    so the stale generation guard discards the late `rooms.join` result cleanly.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    fake.state.lock().unwrap().rooms_join_gate = Some(Arc::clone(&gate));
+    core.handle(Command::Huddle(HuddleCommand::Join {
+        channel: c1(),
+        audio: crate::huddle::HuddleAudioConfig::default(),
+    }))
+    .await;
+    // Duplicate concurrent join while joining == true must be ignored.
+    core.handle(Command::Huddle(HuddleCommand::Join {
+        channel: c1(),
+        audio: crate::huddle::HuddleAudioConfig::default(),
+    }))
+    .await;
+    // Wait until Join #2 actually enters `rooms_join` and blocks on `gate`.
+    for _ in 0..20 {
+        if fake.state.lock().unwrap().rooms_join_calls.len() == 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    // Leave bumps generation while `rooms.join` is still blocked on `gate`.
+    core.handle(Command::Huddle(HuddleCommand::Leave)).await;
+    gate.notify_waiters();
+    core.shutdown().await;
+    assert_eq!(
+        fake.state.lock().unwrap().rooms_join_calls.len(),
+        2,
+        "duplicate concurrent join while joining=true must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn offline_outbox_and_legacy_queue_edge_cases_reach_full_coverage() {
+    use crate::client::QueuedMutation;
+    use crate::store::{NewOutboxItem, OutboxKind, OutboxStatus};
+
+    // 1. QueuedMutation::summary across all variants.
+    assert_eq!(
+        QueuedMutation::SendMessage {
+            channel: c1(),
+            content: MessageContent::plain("hi"),
+            thread_ts: None,
+            broadcast: false,
+        }
+        .summary(),
+        "Message \"hi\""
+    );
+    assert_eq!(
+        QueuedMutation::AddReaction {
+            channel: c1(),
+            ts: Ts::from("1.0"),
+            name: "fire".into(),
+        }
+        .summary(),
+        "Reaction :fire:"
+    );
+    assert_eq!(
+        QueuedMutation::RemoveReaction {
+            channel: c1(),
+            ts: Ts::from("1.0"),
+            name: "fire".into(),
+        }
+        .summary(),
+        "Remove reaction :fire:"
+    );
+    assert_eq!(
+        QueuedMutation::MarkRead {
+            channel: c1(),
+            ts: Ts::from("1.0"),
+        }
+        .summary(),
+        "Mark read (C1)"
+    );
+
+    let fake = FakeBackend::default();
+    fake.state.lock().unwrap().mark_read_ok = true;
+    let (store, events, mut rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    // 2. While offline, SendMessage(thread_ts), ReplyThread, RemoveReaction go to outbox;
+    //    MarkRead under Stealth Mode is silently dropped.
+    core.is_offline = true;
+    core.handle(Command::Workspace(WorkspaceCommand::SetStealthMode(true)))
+        .await;
+    core.handle(Command::Messaging(MessagingCommand::MarkRead {
+        channel: c1(),
+        ts: Ts::from("1700000010.000100"),
+    }))
+    .await;
+    assert!(core.offline_queue.is_empty());
+
+    core.handle(Command::Messaging(MessagingCommand::SendMessage {
+        channel: c1(),
+        content: MessageContent::plain("threaded send"),
+        thread_ts: Some(Ts::from("1700000001.000100")),
+        broadcast: true,
+    }))
+    .await;
+    assert!(matches!(next(&mut rx).await, Event::OutboxUpdated(v) if v.len() == 1));
+    core.handle(Command::Messaging(MessagingCommand::ReplyThread {
+        channel: c1(),
+        thread_ts: Ts::from("1700000001.000100"),
+        content: MessageContent::plain("explicit reply"),
+        broadcast: false,
+    }))
+    .await;
+    assert!(matches!(next(&mut rx).await, Event::OutboxUpdated(v) if v.len() == 2));
+    core.handle(Command::Messaging(MessagingCommand::RemoveReaction {
+        channel: c1(),
+        ts: Ts::from("1700000001.000100"),
+        name: "eyes".into(),
+    }))
+    .await;
+    assert!(matches!(next(&mut rx).await, Event::OutboxUpdated(v) if v.len() == 3));
+
+    // Also insert a corrupt outbox item to exercise `corrupt_outbox_payload` failure handling.
+    let corrupt = store
+        .lock()
+        .unwrap()
+        .enqueue_outbox(
+            &ws,
+            &NewOutboxItem {
+                channel_id: &c1(),
+                thread_ts: None,
+                kind: OutboxKind::Message,
+                payload_json: "{not valid json",
+                last_error: None,
+            },
+        )
+        .unwrap();
+
+    // Flush while offline is a no-op; retrying a nonexistent outbox id is a no-op.
+    core.handle(Command::Messaging(MessagingCommand::FlushOutbox))
+        .await;
+    core.handle(Command::Messaging(MessagingCommand::RetryOutboxItem(
+        999_999,
+    )))
+    .await;
+
+    // Come online and flush all 4 items: first 3 succeed, corrupt one becomes Failed.
+    core.is_offline = false;
+    core.handle(Command::Messaging(MessagingCommand::FlushOutbox))
+        .await;
+    // Wait until the flush task finishes leaving only the corrupt Failed item.
+    for _ in 0..20 {
+        match next(&mut rx).await {
+            Event::OutboxUpdated(items)
+                if items.len() == 1 && items[0].status == OutboxStatus::Failed =>
+            {
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(core.outbox_flush_lock.lock().await);
+    let remaining = store.lock().unwrap().list_outbox(&ws).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].id, corrupt.id);
+    assert_eq!(remaining[0].status, OutboxStatus::Failed);
+    assert!(
+        remaining[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("corrupt_outbox_payload"))
+    );
+    store
+        .lock()
+        .unwrap()
+        .delete_outbox_item(corrupt.id)
+        .unwrap();
+    while rx.try_recv().is_ok() {}
+
+    // 3. ReactionAdd & ReactionRemove non-idempotent errors + AuthExpired stopping flush.
+    fake.state.lock().unwrap().add_reaction_error = Some(FakeSendError::Slack("invalid_name"));
+    fake.state.lock().unwrap().remove_reaction_error = Some(FakeSendError::Slack("cant_remove"));
+    let add_payload = crate::outbox::OutboxPayload::ReactionAdd {
+        ts: Ts::from("1.0"),
+        name: "bad".into(),
+    }
+    .encode();
+    let rem_payload = crate::outbox::OutboxPayload::ReactionRemove {
+        ts: Ts::from("1.0"),
+        name: "bad".into(),
+    }
+    .encode();
+    let auth_payload = crate::outbox::OutboxPayload::Message {
+        content: MessageContent::plain("auth fail"),
+        client_msg_id: None,
+    }
+    .encode();
+    {
+        let mut s = store.lock().unwrap();
+        for (kind, payload) in [
+            (OutboxKind::ReactionAdd, add_payload),
+            (OutboxKind::ReactionRemove, rem_payload),
+            (OutboxKind::Message, auth_payload),
+        ] {
+            s.enqueue_outbox(
+                &ws,
+                &NewOutboxItem {
+                    channel_id: &c1(),
+                    thread_ts: None,
+                    kind,
+                    payload_json: &payload,
+                    last_error: None,
+                },
+            )
+            .unwrap();
+        }
+    }
+    fake.state.lock().unwrap().post_message_error =
+        Some(FakeSendError::AuthExpired("token_revoked"));
+    core.handle(Command::Messaging(MessagingCommand::FlushOutbox))
+        .await;
+    let mut saw_auth_expired = false;
+    for _ in 0..20 {
+        match next(&mut rx).await {
+            Event::AuthExpired(c) if c == "token_revoked" => {
+                saw_auth_expired = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(core.outbox_flush_lock.lock().await);
+    assert!(saw_auth_expired);
+    let failed_items = store.lock().unwrap().list_outbox(&ws).unwrap();
+    assert_eq!(failed_items.len(), 3);
+    assert!(
+        failed_items
+            .iter()
+            .all(|i| i.status == OutboxStatus::Failed)
+    );
+
+    // 4. Legacy offline queue: retry while offline, discard, and retry while online (SendMessage + AddReaction + failure).
+    fake.state.lock().unwrap().post_message_error = None;
+    fake.state.lock().unwrap().add_reaction_error = Some(FakeSendError::Slack("reaction_failed"));
+    let legacy_msg = serde_json::to_string(&QueuedMutation::SendMessage {
+        channel: c1(),
+        content: MessageContent::plain("legacy msg"),
+        thread_ts: None,
+        broadcast: false,
+    })
+    .unwrap();
+    let legacy_rxn = serde_json::to_string(&QueuedMutation::AddReaction {
+        channel: c1(),
+        ts: Ts::from("1.0"),
+        name: "tada".into(),
+    })
+    .unwrap();
+    let legacy_disc = serde_json::to_string(&QueuedMutation::MarkRead {
+        channel: c1(),
+        ts: Ts::from("2.0"),
+    })
+    .unwrap();
+    let (id_msg, id_rxn, id_disc) = {
+        let mut s = store.lock().unwrap();
+        (
+            s.enqueue_offline(&ws, &legacy_msg).unwrap(),
+            s.enqueue_offline(&ws, &legacy_rxn).unwrap(),
+            s.enqueue_offline(&ws, &legacy_disc).unwrap(),
+        )
+    };
+    core.is_offline = true;
+    core.handle(Command::Messaging(MessagingCommand::RetryOfflineMutation(
+        id_disc,
+    )))
+    .await;
+    assert_eq!(core.offline_queue.len(), 1);
+    core.handle(Command::Messaging(
+        MessagingCommand::DiscardOfflineMutation(id_disc),
+    ))
+    .await;
+    assert!(core.offline_queue.is_empty());
+
+    core.is_offline = false;
+    core.handle(Command::Messaging(MessagingCommand::RetryOfflineMutation(
+        id_msg,
+    )))
+    .await;
+    core.handle(Command::Messaging(MessagingCommand::RetryOfflineMutation(
+        id_rxn,
+    )))
+    .await;
+    let mut saw_offline_failed = false;
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Ok(Event::OfflineMutationFailed(f))) if f.id == id_rxn => {
+                saw_offline_failed = true;
+                break;
+            }
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    assert!(
+        saw_offline_failed,
+        "expected OfflineMutationFailed for id_rxn"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn channels_tabs_dnd_presence_profile_usergroups_and_sign_out_commands() {
+    let fake = FakeBackend::default();
+    let u1 = UserId::from("U1");
+    fake.state.lock().unwrap().user_profile_response = Some(crate::types::Profile {
+        pronouns: Some("they/them".into()),
+        fields: Some(serde_json::json!({
+            "Xf1": { "label": "Title", "value": "Staff", "is_protected": true },
+            "Xf2": { "value": "   " }
+        })),
+        ..Default::default()
+    });
+    fake.state.lock().unwrap().team_profile_field_defs_response =
+        Some(vec![api::TeamProfileField {
+            id: "Xf3".into(),
+            label: "Department".into(),
+            field_name: Some("dept".into()),
+            is_hidden: false,
+            is_locked: true,
+            lock_reason: None,
+        }]);
+
+    let (store, events, mut rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+    store
+        .lock()
+        .unwrap()
+        .upsert_conversation(
+            &ws,
+            &Conversation {
+                id: c1(),
+                name: Some("general".into()),
+                is_channel: true,
+                is_member: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+    *core.self_user_id.lock().unwrap() = Some(u1.clone());
+
+    // Empty invite_to_channel is a clean no-op.
+    core.handle(Command::Channel(ChannelCommand::InviteToChannel {
+        channel: c1(),
+        users: Vec::new(),
+    }))
+    .await;
+
+    // Tabs (with conversation_info both succeeding and failing non-auth).
+    core.handle(Command::Channel(ChannelCommand::AddConversationTab {
+        channel: c1(),
+        tab_type: "canvas".into(),
+        label: Some("Notes".into()),
+    }))
+    .await;
+    core.handle(Command::Channel(ChannelCommand::MoveConversationTab {
+        channel: c1(),
+        tab_id: "tab1".into(),
+        after: None,
+    }))
+    .await;
+    fake.state.lock().unwrap().fail_info = true;
+    core.handle(Command::Channel(ChannelCommand::RemoveConversationTab {
+        channel: c1(),
+        tab_id: "tab1".into(),
+    }))
+    .await;
+
+    // Global notif pref, DND end/team, presence active/away, user pref, photo, usergroups, profile, sign out.
+    core.handle(Command::Workspace(
+        WorkspaceCommand::SetGlobalNotificationPref {
+            name: "highlight_words".into(),
+            value: "deploy".into(),
+            sync: true,
+        },
+    ))
+    .await;
+    core.handle(Command::Workspace(WorkspaceCommand::EndDnd))
+        .await;
+    core.handle(Command::Workspace(WorkspaceCommand::LoadTeamDnd(vec![
+        u1.clone(),
+    ])))
+    .await;
+    core.handle(Command::Workspace(WorkspaceCommand::SetPresence {
+        away: true,
+    }))
+    .await;
+    core.handle(Command::Workspace(WorkspaceCommand::SetPresence {
+        away: false,
+    }))
+    .await;
+    core.handle(Command::Workspace(WorkspaceCommand::SetUserPref {
+        name: "sidebar_theme".into(),
+        value: "aubergine".into(),
+    }))
+    .await;
+    core.handle(Command::Workspace(WorkspaceCommand::SetUserPhoto {
+        filename: "avatar.png".into(),
+        bytes: vec![1, 2, 3],
+    }))
+    .await;
+    core.handle(Command::Workspace(WorkspaceCommand::CreateUsergroup {
+        name: "Core".into(),
+        handle: "core".into(),
+        description: "Core team".into(),
+    }))
+    .await;
+    core.handle(Command::Workspace(WorkspaceCommand::UpdateUsergroup {
+        usergroup: "S1".into(),
+        name: "Core v2".into(),
+        handle: "core".into(),
+        description: "Updated".into(),
+    }))
+    .await;
+    core.handle(Command::Workspace(WorkspaceCommand::FetchUserProfile(
+        u1.clone(),
+    )))
+    .await;
+    core.handle(Command::Workspace(WorkspaceCommand::SignOut))
+        .await;
+
+    // BackfillWorkspace starting from a paused state clears paused cleanly.
+    core.handle(Command::Workspace(WorkspaceCommand::PauseBackfill))
+        .await;
+    core.handle(Command::Workspace(WorkspaceCommand::BackfillWorkspace {
+        include_threads: false,
+    }))
+    .await;
+
+    let mut saw_profile = false;
+    let mut saw_team_dnd = false;
+    let mut saw_away = false;
+    let mut saw_active = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline
+        && !(saw_profile && saw_team_dnd && saw_away && saw_active)
+    {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Ok(Event::UserProfileLoaded {
+                pronouns,
+                fields,
+                locked_fields,
+                ..
+            })) => {
+                assert_eq!(pronouns.as_deref(), Some("they/them"));
+                assert_eq!(fields, vec![("Title".to_owned(), "Staff".to_owned())]);
+                assert!(locked_fields.iter().any(|(k, _)| k == "dept"));
+                assert!(locked_fields.iter().any(|(k, _)| k == "Title"));
+                saw_profile = true;
+            }
+            Ok(Ok(Event::TeamDndLoaded(_))) => saw_team_dnd = true,
+            Ok(Ok(Event::Presence {
+                presence: Presence::Away,
+                ..
+            })) => saw_away = true,
+            Ok(Ok(Event::Presence {
+                presence: Presence::Active,
+                ..
+            })) => saw_active = true,
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    assert!(saw_profile && saw_team_dnd && saw_away && saw_active);
+    core.shutdown().await;
+}
