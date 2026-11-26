@@ -669,17 +669,6 @@ pub(crate) fn canvas_file_markdown(filename: &str, url: &str) -> String {
     }
 }
 
-/// Cycle the last non-empty line through plain -> `# ` -> `## ` -> `### ` -> plain (`F-SHELL-262`).
-#[cfg(test)]
-pub(crate) fn cycle_last_line_heading(markdown: &str) -> String {
-    let mut lines: Vec<String> = markdown.lines().map(str::to_owned).collect();
-    let Some(ix) = lines.iter().rposition(|l| !l.trim().is_empty()) else {
-        return "# Heading".to_owned();
-    };
-    lines[ix] = cycle_heading_line(&lines[ix]);
-    lines.join("\n")
-}
-
 /// Swap the last non-empty line with its neighbor (`delta = -1` moves up, `1` moves down, `F-SHELL-269`).
 pub(crate) fn move_last_line(markdown: &str, delta: isize) -> String {
     let mut lines: Vec<String> = markdown.lines().map(str::to_owned).collect();

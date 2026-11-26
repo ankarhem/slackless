@@ -967,23 +967,6 @@ pub fn collect_modal_state_errors(
     Ok(Json::Object(values))
 }
 
-/// Collect Slack `state.values` from modal `input` blocks and validate required / typed inputs.
-#[cfg(test)]
-pub fn collect_modal_state(
-    ts: &Ts,
-    raw_blocks: &[Json],
-    kit: &Entity<BlockKitState>,
-    cx: &App,
-) -> Result<Json, String> {
-    collect_modal_state_errors(ts, raw_blocks, kit, cx).map_err(|mut map| {
-        let mut keys: Vec<String> = map.keys().cloned().collect();
-        keys.sort();
-        keys.first()
-            .and_then(|k| map.remove(k))
-            .unwrap_or_else(|| "Missing or invalid field.".to_owned())
-    })
-}
-
 #[cfg(test)]
 mod suggestion_race_tests {
     use super::*;

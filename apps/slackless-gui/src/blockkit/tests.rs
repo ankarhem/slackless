@@ -2,6 +2,22 @@ use super::*;
 use gpui_kit::gpui;
 use serde_json::json;
 
+/// [`collect_modal_state_errors`] with the first error (sorted by block) as the message.
+fn collect_modal_state(
+    ts: &Ts,
+    raw_blocks: &[Json],
+    kit: &Entity<BlockKitState>,
+    cx: &App,
+) -> Result<Json, String> {
+    collect_modal_state_errors(ts, raw_blocks, kit, cx).map_err(|mut map| {
+        let mut keys: Vec<String> = map.keys().cloned().collect();
+        keys.sort();
+        keys.first()
+            .and_then(|k| map.remove(k))
+            .unwrap_or_else(|| "Missing or invalid field.".to_owned())
+    })
+}
+
 #[test]
 fn validates_email_url_number_and_plain_text_inputs() {
     let email = json!({ "type": "email_text_input" });

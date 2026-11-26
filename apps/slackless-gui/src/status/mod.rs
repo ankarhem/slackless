@@ -228,14 +228,14 @@ impl UserStatus {
     }
 
     /// Whether this status has expired right now.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_expired(&self) -> bool {
         self.is_expired_at(now_secs())
     }
 
     /// Human-readable time remaining until expiration (`"45s"`, `"12m"`, `"2h 15m"`, `"3d 4h"`),
     /// or `None` when the status has no expiration or has already expired.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn format_remaining(&self, now: i64) -> Option<String> {
         let rem = self.expiration? - now;
         if rem <= 0 {

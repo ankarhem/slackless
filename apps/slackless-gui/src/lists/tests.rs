@@ -3,6 +3,10 @@ use gpui_kit::gpui;
 use slackless_core::api::SlackListChoice;
 use std::collections::HashMap;
 
+fn list_status(list_id: &str, cx: &App) -> Option<(bool, String)> {
+    panel_state(list_id, cx).share_status
+}
+
 #[test]
 fn filters_and_sorts_live_slack_list_rows() {
     let fixtures = crate::fixtures::load();

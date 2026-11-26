@@ -7,18 +7,18 @@ use gpui_kit::gpui::{self, IntoElement, Render, Window};
 use slackless_core::api::{
     CanvasAccessLevel, CanvasCommentReply, CanvasCommentThread, CanvasEditOp, CanvasMeta,
 };
+use slackless_core::domain::canvas_doc::{
+    classify_media_mime, parse_canvas_markdown, parse_slack_doc_url, parse_slack_profile_url,
+};
 use slackless_core::types::{ChannelId, Ts, UserId};
 
 use crate::canvas::format::{
     BlockFormat, InlineFormat, SlashCommand, add_table_column_at, add_table_row_at,
     apply_block_format, apply_inline_format, apply_slash_command, canvas_file_markdown,
-    cycle_last_line_heading, detect_slash_query, filter_slash_commands, insert_markdown_table,
-    insert_text_at, is_image_filename, move_last_line,
+    detect_slash_query, filter_slash_commands, insert_markdown_table, insert_text_at,
+    is_image_filename, move_last_line,
 };
-use crate::canvas::parse::{
-    classify_media_mime, classify_media_url, media_format_pill, parse_slack_doc_url,
-    parse_slack_profile_url, resolve_canvas_emoji,
-};
+use crate::canvas::parse::{classify_media_url, media_format_pill, resolve_canvas_emoji};
 use crate::canvas::{
     CanvasAccessDeleteFn, CanvasAccessSetFn, CanvasActions, CanvasActivation, CanvasBlock,
     CanvasChannelLookupFn, CanvasCommentFilter, CanvasCommentPostFn, CanvasCommentResolveAllFn,
@@ -30,11 +30,19 @@ use crate::canvas::{
     build_share_access_request, canvas_export_stem, canvas_print_allowed,
     canvas_server_rule_notice, canvas_to_printable_html, canvas_view, comment_thread_counts,
     cycle_canvas_focus_region, cycle_region, filter_comment_threads, general_access_summary,
-    live_canvas_view, parse_canvas_html, parse_canvas_markdown, parse_inline_canvas_segments,
-    parse_share_targets, resolve_profile_card, section_delete_op, section_insert_after_op,
-    section_replace_op, step_block, toggle_section_actions_shortcut, trigger_canvas_print,
-    write_printable_html,
+    live_canvas_view, parse_inline_canvas_segments, parse_share_targets, resolve_profile_card,
+    section_delete_op, section_insert_after_op, section_replace_op, step_block,
+    toggle_section_actions_shortcut, trigger_canvas_print, write_printable_html,
 };
+
+/// Parse a Canvas HTML export the way the canvas loader does, with the GUI's emoji catalog.
+fn parse_canvas_html(html: &str) -> Vec<CanvasBlock> {
+    slackless_core::domain::canvas_doc::parse_canvas_html_with_ids_and_emoji(
+        html,
+        &crate::emoji::display_glyph,
+    )
+    .0
+}
 
 #[test]
 fn parses_canvas_html_blocks_and_filters_by_query() {
@@ -131,23 +139,7 @@ fn preserves_section_ids_and_roundtrips_canvas_markdown() {
 }
 
 #[test]
-fn cycles_heading_levels_and_moves_lines() {
-    assert_eq!(
-        cycle_last_line_heading("Notes\nShip it"),
-        "Notes\n# Ship it"
-    );
-    assert_eq!(
-        cycle_last_line_heading("Notes\n# Ship it"),
-        "Notes\n## Ship it"
-    );
-    assert_eq!(
-        cycle_last_line_heading("Notes\n## Ship it"),
-        "Notes\n### Ship it"
-    );
-    assert_eq!(
-        cycle_last_line_heading("Notes\n### Ship it"),
-        "Notes\nShip it"
-    );
+fn moves_lines() {
     assert_eq!(
         move_last_line("First\nSecond\nThird", -1),
         "First\nThird\nSecond"
@@ -245,6 +237,8 @@ fn block_formatting_toggles_headings_quotes_lists_tables_and_code() {
     assert_eq!(h3, "### Title");
     let (plain, _) = apply_block_format(&h3, 0..h3.len(), BlockFormat::CycleHeading);
     assert_eq!(plain, "Title");
+    let (placeholder, _) = apply_block_format("", 0..0, BlockFormat::CycleHeading);
+    assert_eq!(placeholder, "# Heading");
 
     // Multi-line quote toggle.
     let (quoted, qsel) = apply_block_format("line 1\nline 2", 0..13, BlockFormat::Quote);

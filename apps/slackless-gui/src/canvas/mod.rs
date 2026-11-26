@@ -48,8 +48,6 @@ pub use mentions::{CanvasInlineSegment, parse_inline_canvas_segments};
 #[cfg(test)]
 pub use model::{CanvasBlock, resolve_profile_card};
 pub use model::{CanvasDoc, CanvasEmbedKind, CanvasUserProfile, MediaKind};
-#[cfg(test)]
-pub use parse::{parse_canvas_html, parse_canvas_markdown};
 pub use render::{canvas_view, live_canvas_view, read_only_badge, render_popout_canvas};
 pub use share::{CanvasAccessDeleteFn, CanvasAccessSetFn, CanvasDeleteFn, ShareAccessRequest};
 #[cfg(test)]

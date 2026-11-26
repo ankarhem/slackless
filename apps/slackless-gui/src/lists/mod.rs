@@ -183,13 +183,6 @@ pub(super) fn list_meta(file_id: &str, cx: &App) -> Option<ListMeta> {
         .cloned()
 }
 
-#[cfg(test)]
-pub(super) fn list_status(list_id: &str, cx: &App) -> Option<(bool, String)> {
-    cx.try_global::<ListUiStore>()
-        .and_then(|s| s.panels.get(list_id))
-        .and_then(|p| p.share_status.clone())
-}
-
 fn record_comments(list_id: &str, record_id: &str, cx: &App) -> Vec<(String, String)> {
     cx.try_global::<ListUiStore>()
         .and_then(|s| {
