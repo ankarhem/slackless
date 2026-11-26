@@ -90,6 +90,71 @@ impl SemanticStorageSnapshot {
     }
 }
 
+/// Compute cosine similarity between `text` and `topic` using the locally installed ONNX
+/// embedding model. **Blocking** — call only from a background executor, never on the UI thread.
+pub(crate) fn compute_local_semantic_similarity(text: &str, topic: &str) -> Option<f32> {
+    #[cfg(test)]
+    {
+        let _ = (text, topic);
+        None
+    }
+    #[cfg(not(test))]
+    {
+        use slackless_core::embeddings::{
+            Embedder as _, EmbeddingModel, OnnxEmbedder, detect_embedding_model_setup,
+        };
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex, OnceLock};
+
+        let text = text.trim();
+        let topic = topic.trim();
+        if text.is_empty() || topic.is_empty() {
+            return None;
+        }
+        let model = EmbeddingModel::default();
+        if !detect_embedding_model_setup(model).model_ready {
+            return None;
+        }
+
+        static EMBEDDER: OnceLock<Mutex<Option<Arc<OnnxEmbedder>>>> = OnceLock::new();
+        static TOPIC_CACHE: OnceLock<Mutex<HashMap<String, Vec<f32>>>> = OnceLock::new();
+
+        let embedder = {
+            let slot = EMBEDDER.get_or_init(|| Mutex::new(None));
+            let mut guard = slot.lock().ok()?;
+            if let Some(existing) = guard.as_ref() {
+                Arc::clone(existing)
+            } else {
+                let loaded = Arc::new(OnnxEmbedder::load_default(model).ok()?);
+                *guard = Some(Arc::clone(&loaded));
+                loaded
+            }
+        };
+
+        let topic_vec = {
+            let cache = TOPIC_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            let cached = cache.lock().ok().and_then(|g| g.get(topic).cloned());
+            if let Some(vec) = cached {
+                vec
+            } else {
+                let vec = embedder.embed_query(topic).ok()?;
+                if let Ok(mut guard) = cache.lock() {
+                    if guard.len() >= 64 {
+                        guard.clear();
+                    }
+                    guard.insert(topic.to_owned(), vec.clone());
+                }
+                vec
+            }
+        };
+
+        let msg_vec = embedder.embed_document(text).ok()?;
+        Some(slackless_core::store::cosine_similarity(
+            &msg_vec, &topic_vec,
+        ))
+    }
+}
+
 /// Similarity threshold presets for smart-rule semantic topic matching.
 pub(super) const RULE_SEMANTIC_THRESHOLDS: [(f32, &str); 4] = [
     (0.35, "0.35 (Broad)"),
@@ -117,6 +182,12 @@ pub(super) struct RuleEditorState {
     pub(super) test_message: Entity<TextareaState>,
     pub(super) test_is_thread: bool,
     pub(super) test_mentions_me: bool,
+    /// Last off-thread semantic similarity preview result: `(sample_text, topic, score)`.
+    pub(super) semantic_test_cache: Option<(String, String, Option<f32>)>,
+    /// True while a background embedding preview computation is in flight.
+    pub(super) semantic_test_loading: bool,
+    /// Monotonic generation token dropping stale background semantic previews.
+    pub(super) semantic_test_gen: u64,
     pub(super) next_rule_seq: u64,
 }
 
@@ -358,6 +429,9 @@ impl Preferences {
                 test_message: rule_test_message,
                 test_is_thread: false,
                 test_mentions_me: false,
+                semantic_test_cache: None,
+                semantic_test_loading: false,
+                semantic_test_gen: 0,
                 next_rule_seq: 1,
             };
             let excluded_channels = cx.new(|cx| {
@@ -497,16 +571,26 @@ impl Preferences {
                 &rule_editor.in_channels,
                 &rule_editor.keywords,
                 &rule_editor.regex_pattern,
-                &rule_editor.semantic_topic,
                 &rule_editor.test_sender,
                 &rule_editor.test_channel,
-                &rule_editor.test_message,
             ] {
                 subscriptions.push(cx.subscribe_in(
                     editor_field,
                     window,
                     |_this: &mut Preferences, _, event: &InputEvent, _, cx| {
                         if let InputEvent::Change = event {
+                            cx.notify();
+                        }
+                    },
+                ));
+            }
+            for semantic_field in [&rule_editor.semantic_topic, &rule_editor.test_message] {
+                subscriptions.push(cx.subscribe_in(
+                    semantic_field,
+                    window,
+                    |this: &mut Preferences, _, event: &InputEvent, _, cx| {
+                        if let InputEvent::Change = event {
+                            this.refresh_rule_editor_semantic_preview(cx);
                             cx.notify();
                         }
                     },
@@ -570,7 +654,12 @@ impl Preferences {
         snapshot: SemanticStorageSnapshot,
         cx: &mut Context<Self>,
     ) {
+        let ready = snapshot.setup.model_ready;
         self.semantic_snapshot = Some(snapshot);
+        if ready && self.rule_editor.open {
+            self.rule_editor.semantic_test_cache = None;
+            self.refresh_rule_editor_semantic_preview(cx);
+        }
         cx.notify();
     }
 
@@ -680,6 +769,72 @@ impl Preferences {
         }
     }
 
+    /// Compute the live semantic-topic preview score off the UI thread when the rule editor is
+    /// open and has a non-empty `semantic_topic`.
+    pub(super) fn refresh_rule_editor_semantic_preview(&mut self, cx: &mut Context<Self>) {
+        if !self.rule_editor.open {
+            self.rule_editor.semantic_test_loading = false;
+            return;
+        }
+        let topic = self
+            .rule_editor
+            .semantic_topic
+            .read(cx)
+            .value()
+            .trim()
+            .to_owned();
+        let text = self
+            .rule_editor
+            .test_message
+            .read(cx)
+            .value()
+            .trim()
+            .to_owned();
+        if topic.is_empty() || text.is_empty() {
+            self.rule_editor.semantic_test_loading = false;
+            self.rule_editor.semantic_test_cache = None;
+            return;
+        }
+        if self
+            .rule_editor
+            .semantic_test_cache
+            .as_ref()
+            .is_some_and(|(t, top, _)| t == &text && top == &topic)
+        {
+            self.rule_editor.semantic_test_loading = false;
+            return;
+        }
+        let model_ready = self
+            .semantic_snapshot
+            .as_ref()
+            .is_some_and(|s| s.setup.model_ready);
+        if !model_ready {
+            self.rule_editor.semantic_test_loading = false;
+            self.rule_editor.semantic_test_cache = Some((text, topic, None));
+            return;
+        }
+        self.rule_editor.semantic_test_gen = self.rule_editor.semantic_test_gen.wrapping_add(1);
+        let generation = self.rule_editor.semantic_test_gen;
+        self.rule_editor.semantic_test_loading = true;
+        cx.spawn(async move |this, cx| {
+            let text_bg = text.clone();
+            let topic_bg = topic.clone();
+            let score = cx
+                .background_executor()
+                .spawn(async move { compute_local_semantic_similarity(&text_bg, &topic_bg) })
+                .await;
+            let _ = this.update(cx, |prefs, cx| {
+                if prefs.rule_editor.semantic_test_gen != generation {
+                    return;
+                }
+                prefs.rule_editor.semantic_test_loading = false;
+                prefs.rule_editor.semantic_test_cache = Some((text, topic, score));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Save the active Smart Rule editor draft into `settings.smart_notification_rules`
     /// (updating an existing rule when editing, or appending a new one).
     pub fn save_rule_draft(&mut self, cx: &mut Context<Self>) -> bool {
@@ -706,6 +861,17 @@ impl Preferences {
         if !draft.has_any_condition() {
             return false;
         }
+        let has_semantic_topic = draft
+            .semantic_topic
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty());
+        let model_ready = self
+            .semantic_snapshot
+            .as_ref()
+            .is_some_and(|s| s.setup.model_ready);
+        if has_semantic_topic && !model_ready {
+            return false;
+        }
         if let Some(pat) = draft.regex_pattern.as_deref()
             && slackless_core::rules::validate_regex(pat).is_err()
         {
@@ -723,6 +889,7 @@ impl Preferences {
         }
         self.rule_editor.open = false;
         self.rule_editor.editing_id = None;
+        self.rule_editor.semantic_test_loading = false;
         self.changed(cx);
         true
     }
@@ -772,7 +939,7 @@ impl Preferences {
         } else {
             self.stop_mic_probe(cx);
         }
-        if section == Section::Advanced {
+        if matches!(section, Section::Advanced | Section::Notifications) {
             self.refresh_semantic_snapshot(cx);
         }
         cx.notify();

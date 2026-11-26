@@ -338,7 +338,9 @@ impl Preferences {
     }
 
     fn smart_rules_group(&mut self, m: ControlMetrics, cx: &mut Context<Self>) -> Div {
-        use slackless_core::rules::{RuleAction, RuleContext, test_rule, validate_regex};
+        use slackless_core::rules::{
+            RuleAction, RuleContext, test_rule_with_semantic, validate_regex,
+        };
 
         let theme = cx.theme();
         let (fg, muted, border, card_bg, accent, danger, fill, fill_fg, input_border) = (
@@ -476,6 +478,8 @@ impl Preferences {
                                             .find(|r| r.id == rule_id_edit)
                                             .cloned();
                                         this.rule_editor.load_rule(existing.as_ref(), window, cx);
+                                        this.refresh_semantic_snapshot(cx);
+                                        this.refresh_rule_editor_semantic_preview(cx);
                                         cx.notify();
                                     },
                                 )),
@@ -510,6 +514,8 @@ impl Preferences {
             )
             .on_click(cx.listener(|this, _, window, cx| {
                 this.rule_editor.load_rule(None, window, cx);
+                this.refresh_semantic_snapshot(cx);
+                this.refresh_rule_editor_semantic_preview(cx);
                 cx.notify();
             })),
         );
@@ -522,7 +528,16 @@ impl Preferences {
                     .regex_pattern
                     .as_deref()
                     .and_then(|p| validate_regex(p).err());
-                let can_save = draft.has_any_condition() && regex_err.is_none();
+                let has_semantic_topic = draft
+                    .semantic_topic
+                    .as_deref()
+                    .is_some_and(|t| !t.trim().is_empty());
+                let semantic_model_ready = self
+                    .semantic_snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.setup.model_ready);
+                let semantic_blocked = has_semantic_topic && !semantic_model_ready;
+                let can_save = draft.has_any_condition() && regex_err.is_none() && !semantic_blocked;
 
                 let sample_sender_raw = self.rule_editor.test_sender.read(cx).value().to_string();
                 let sample_sender = sample_sender_raw.trim();
@@ -542,7 +557,29 @@ impl Preferences {
                     is_thread_reply: self.rule_editor.test_is_thread,
                     mentions_me: self.rule_editor.test_mentions_me,
                 };
-                let test_preview = test_rule(&draft, &sample_ctx);
+                let cached_score = self.rule_editor.semantic_test_cache.as_ref().and_then(
+                    |(cached_text, cached_topic, score)| {
+                        (cached_text == sample_text.trim()
+                            && draft
+                                .semantic_topic
+                                .as_deref()
+                                .is_some_and(|t| t.trim() == cached_topic))
+                        .then_some(*score)
+                        .flatten()
+                    },
+                );
+                let scorer = |_text: &str, _topic: &str| cached_score;
+                let test_preview = test_rule_with_semantic(
+                    &draft,
+                    &sample_ctx,
+                    cached_score.is_some().then_some(&scorer as _),
+                );
+                let preview_summary =
+                    if self.rule_editor.semantic_test_loading && has_semantic_topic {
+                        "Evaluating semantic similarity\u{2026}".to_owned()
+                    } else {
+                        test_preview.summary.clone()
+                    };
 
                 let action_chips = h_flex().flex_wrap().gap_1p5().children(
                     RuleAction::ALL.iter().enumerate().map(|(ix, &act)| {
@@ -745,7 +782,19 @@ impl Preferences {
                                 .w_full()
                                 .max_w(px(420.)),
                         ))
-                        .child(threshold_chips),
+                        .child(threshold_chips)
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(if semantic_blocked { danger } else { muted })
+                                .child(if semantic_model_ready {
+                                    "Local embedding model ready — semantic topics are evaluated asynchronously off the UI thread."
+                                } else if has_semantic_topic {
+                                    "Local embedding model is not installed. Download it in Preferences \u{2192} Advanced before saving a semantic-topic rule."
+                                } else {
+                                    "Requires the local embedding model (Preferences \u{2192} Advanced)."
+                                }),
+                        ),
                 )
                 .child(
                     v_flex()
@@ -828,7 +877,7 @@ impl Preferences {
                                 .border_color(preview_color)
                                 .text_xs()
                                 .text_color(preview_color)
-                                .child(test_preview.summary),
+                                .child(preview_summary),
                         ),
                 )
                 .child(

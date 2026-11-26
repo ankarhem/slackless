@@ -343,6 +343,43 @@ fn preferences_smart_rule_crud_validation_and_catchup_mark(cx: &mut gpui::TestAp
                 prefs.delete_rule(&id, cx);
                 assert!(prefs.settings().smart_notification_rules.is_empty());
 
+                // Semantic-topic rule refuses to save when local embedding model is not installed,
+                // and saves cleanly once the model snapshot reports ready.
+                prefs.rule_editor.load_rule(None, window, cx);
+                prefs
+                    .rule_editor
+                    .name
+                    .update(cx, |s, cx| s.set_value("DB outage topic", window, cx));
+                prefs
+                    .rule_editor
+                    .semantic_topic
+                    .update(cx, |s, cx| s.set_value("database outage", window, cx));
+                assert!(
+                    !prefs.save_rule_draft(cx),
+                    "semantic topic rule must be gated when embedding model is not ready"
+                );
+                prefs.set_semantic_snapshot(
+                    SemanticStorageSnapshot {
+                        setup: slackless_core::embeddings::EmbeddingModelStatus {
+                            model: slackless_core::embeddings::EmbeddingModel::default(),
+                            model_ready: true,
+                            model_path: std::path::PathBuf::from("/tmp/mock-model"),
+                            disk_bytes: 1_024,
+                            dims: 384,
+                            download_size_hint: "~23 MB".to_owned(),
+                        },
+                        stats: slackless_core::store::SemanticIndexStats::default(),
+                    },
+                    cx,
+                );
+                assert!(
+                    prefs.save_rule_draft(cx),
+                    "semantic topic rule saves once local embedding model is ready"
+                );
+                assert_eq!(prefs.settings().smart_notification_rules.len(), 1);
+                let sem_id = prefs.settings().smart_notification_rules[0].id.clone();
+                prefs.delete_rule(&sem_id, cx);
+
                 // Mark daily catchup reminder fired.
                 prefs.mark_catchup_reminder_fired("2026-11-26".to_owned(), cx);
                 assert_eq!(

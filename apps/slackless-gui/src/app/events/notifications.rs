@@ -2,6 +2,33 @@
 
 use super::super::*;
 
+/// Owned snapshot of [`slackless_core::rules::RuleContext`] for off-thread semantic evaluation.
+pub(super) struct OwnedRuleContext {
+    pub(super) sender_id: Option<String>,
+    pub(super) sender_handle: Option<String>,
+    pub(super) sender_display_name: Option<String>,
+    pub(super) channel_id: String,
+    pub(super) channel_name: Option<String>,
+    pub(super) text: String,
+    pub(super) is_thread_reply: bool,
+    pub(super) mentions_me: bool,
+}
+
+impl OwnedRuleContext {
+    pub(super) fn as_rule_context(&self) -> slackless_core::rules::RuleContext<'_> {
+        slackless_core::rules::RuleContext {
+            sender_id: self.sender_id.as_deref(),
+            sender_handle: self.sender_handle.as_deref(),
+            sender_display_name: self.sender_display_name.as_deref(),
+            channel_id: &self.channel_id,
+            channel_name: self.channel_name.as_deref(),
+            text: &self.text,
+            is_thread_reply: self.is_thread_reply,
+            mentions_me: self.mentions_me,
+        }
+    }
+}
+
 impl App {
     /// A system notification (a macOS banner) with the notification sound, as Slack's desktop
     /// notifications come.
@@ -266,8 +293,62 @@ impl App {
                 self.sync_counts_to_views(cx);
             }
         }
-        let rule_eval = self.evaluate_smart_rules(channel, message, cx);
-        if !self.should_notify_with_eval(channel, message, &rule_eval, window, cx) {
+        let has_semantic_rule = self
+            .preferences
+            .read(cx)
+            .settings()
+            .smart_notification_rules
+            .iter()
+            .any(|r| {
+                r.enabled
+                    && r.semantic_topic
+                        .as_deref()
+                        .is_some_and(|t| !t.trim().is_empty())
+            });
+        if !has_semantic_rule {
+            let rule_eval = self.evaluate_smart_rules(channel, message, cx);
+            self.dispatch_message_notification(channel, message, &rule_eval, window, cx);
+            return;
+        }
+        // Off-thread semantic rule evaluation: keep the UI thread completely non-blocking when
+        // an enabled rule uses `semantic_topic`.
+        let (rules, owned_ctx) = self.build_owned_rule_context(channel, message, cx);
+        let channel_owned = channel.clone();
+        let message_owned = message.clone();
+        let window_handle = self.window_handle;
+        cx.spawn(async move |this, cx| {
+            let rule_eval = cx
+                .background_executor()
+                .spawn(async move {
+                    let ctx = owned_ctx.as_rule_context();
+                    let scorer = crate::preferences::compute_local_semantic_similarity;
+                    slackless_core::rules::evaluate_rules_with_semantic(&rules, &ctx, Some(&scorer))
+                })
+                .await;
+            let _ = window_handle.update(cx, |_, window, cx| {
+                let _ = this.update(cx, |app, cx| {
+                    app.dispatch_message_notification(
+                        &channel_owned,
+                        &message_owned,
+                        &rule_eval,
+                        window,
+                        cx,
+                    );
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn dispatch_message_notification(
+        &mut self,
+        channel: &ChannelId,
+        message: &Message,
+        rule_eval: &slackless_core::rules::RuleEvaluation,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.should_notify_with_eval(channel, message, rule_eval, window, cx) {
             return;
         }
         let Some(conversation) = self.fixtures.conversation(channel) else {
@@ -334,6 +415,53 @@ impl App {
                 }
             }
         }
+    }
+
+    fn build_owned_rule_context(
+        &self,
+        channel: &ChannelId,
+        message: &Message,
+        cx: &gpui::App,
+    ) -> (
+        Vec<slackless_core::rules::NotificationRule>,
+        OwnedRuleContext,
+    ) {
+        let settings = self.preferences.read(cx).settings();
+        let user_obj = message.user.as_ref().and_then(|u| self.fixtures.user(u));
+        let sender_id = message
+            .user
+            .as_ref()
+            .map(|u| u.as_str().to_owned())
+            .or_else(|| message.bot_id.as_ref().map(|b| b.as_str().to_owned()));
+        let sender_handle = user_obj
+            .map(|u| u.name.clone())
+            .or_else(|| message.username.clone())
+            .or_else(|| message.bot_profile.as_ref().map(|b| b.name.clone()));
+        let sender_display = user_obj
+            .map(|u| u.display_name().to_owned())
+            .or_else(|| message.bot_profile.as_ref().map(|b| b.name.clone()));
+        let channel_name = self
+            .fixtures
+            .conversation(channel)
+            .and_then(|c| c.name.clone());
+        let is_thread_reply = message
+            .thread_ts
+            .as_ref()
+            .is_some_and(|ts| *ts != message.ts);
+        let mentioned = mentions_me(&message.text, &self.fixtures.self_user, &settings.keywords);
+        (
+            settings.smart_notification_rules.clone(),
+            OwnedRuleContext {
+                sender_id,
+                sender_handle,
+                sender_display_name: sender_display,
+                channel_id: channel.as_str().to_owned(),
+                channel_name,
+                text: message.text.clone(),
+                is_thread_reply,
+                mentions_me: mentioned,
+            },
+        )
     }
 
     /// Evaluate configured local smart notification rules for one incoming message.
