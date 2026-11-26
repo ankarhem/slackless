@@ -1740,20 +1740,19 @@ impl Render for App {
         let chrome = cx.theme().title_bar;
         let (glow_side, glow) = crate::theme::chrome_glow(cx);
 
-        let conversation = self.fixtures.conversation(&self.channel).cloned();
+        // Borrowed through a handle of its own, so `global_bar` may take `&mut self`.
+        let fixtures = Arc::clone(&self.fixtures);
+        let conversation = fixtures.conversation(&self.channel);
         let title = conversation
-            .as_ref()
-            .map(|c| self.fixtures.conversation_label(c))
+            .map(|c| fixtures.conversation_label(c))
             .unwrap_or_else(|| self.channel.to_string());
         let topic = conversation
-            .as_ref()
             .and_then(|c| c.topic.as_ref())
             .map(|t| t.value.clone())
             .unwrap_or_default();
 
         let title_bar = self.global_bar(cx);
-        let main_column =
-            self.render_main_column(&title, &topic, conversation.as_ref(), window, cx);
+        let main_column = self.render_main_column(&title, &topic, conversation, window, cx);
 
         // Slack's DM list is wider than its channel sidebar, and each keeps the width it is
         // dragged to: one resizable layout (and so one remembered width) per destination.
