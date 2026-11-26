@@ -2,6 +2,29 @@
 
 use super::*;
 
+/// Mount `view` as a cached pane filling its parent. GPUI replays the pane's last subtree until
+/// the view (or a view inside it) is notified, the theme or preferences refresh every window,
+/// focus moves or the pane is resized; nothing else re-renders it, so a pane must own its data
+/// and `notify` when that changes, as every view the root mounts does. A cached view is laid
+/// out from this style rather than measured, so only panes the root sizes can be cached: the
+/// content-sized composer and huddle strip stay plain children.
+pub(crate) fn cached_pane<V: Render>(view: Entity<V>) -> AnyElement {
+    view.cached(gpui::StyleRefinement::default().size_full())
+        .into_any_element()
+}
+
+/// A pane that can show an inline media card (a transcript, a thread, a page of results): a
+/// [`cached_pane`], except while a clip is loaded. The media ticks then redraw the root, so the
+/// pane re-renders with it: its card shows the newest frame and the card's viewport probe,
+/// which decides the mini-player, sees every frame.
+pub(crate) fn media_pane<V: Render>(view: Entity<V>, cx: &gpui::App) -> AnyElement {
+    if crate::media::inline_media_active(cx) {
+        view.into_any_element()
+    } else {
+        cached_pane(view)
+    }
+}
+
 impl App {
     /// Shared Canvas callbacks used by both live and sample canvases (profile/channel links,
     /// media links, print/PDF export, lookups, and pop-out).
@@ -760,7 +783,12 @@ impl App {
                 );
                 let column = column
                     .children(self.app_dm_banner(conversation, cx))
-                    .child(div().flex_1().min_h_0().child(self.messages.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .child(media_pane(self.messages.clone(), cx)),
+                    )
                     .children(outbox_strip);
                 // In a public channel the user is not in, Slack's Join card takes the
                 // composer's place.
@@ -849,22 +877,23 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
+        let page = |pane: AnyElement| v_flex().size_full().child(pane);
         match self.page {
-            MainPage::CatchUp => v_flex().size_full().child(self.catchup.clone()),
-            MainPage::Search => v_flex().size_full().child(self.results.clone()),
-            MainPage::Drafts => v_flex().size_full().child(self.drafts.clone()),
-            MainPage::Later => v_flex().size_full().child(self.later.clone()),
-            MainPage::Threads => v_flex().size_full().child(self.threads.clone()),
-            MainPage::Unreads => v_flex().size_full().child(self.unreads.clone()),
-            MainPage::Huddles => v_flex().size_full().child(self.huddles.clone()),
-            MainPage::Directory => v_flex().size_full().child(self.directory.clone()),
-            MainPage::Tools => v_flex().size_full().child(self.tools_page.clone()),
-            MainPage::Compose => v_flex().size_full().child(self.compose.clone()),
-            MainPage::Activity => v_flex().size_full().child(self.activity.clone()),
-            MainPage::Files => v_flex().size_full().child(self.files_page.clone()),
+            MainPage::CatchUp => page(cached_pane(self.catchup.clone())),
+            MainPage::Search => page(media_pane(self.results.clone(), cx)),
+            MainPage::Drafts => page(cached_pane(self.drafts.clone())),
+            MainPage::Later => page(cached_pane(self.later.clone())),
+            MainPage::Threads => page(media_pane(self.threads.clone(), cx)),
+            MainPage::Unreads => page(media_pane(self.unreads.clone(), cx)),
+            MainPage::Huddles => page(cached_pane(self.huddles.clone())),
+            MainPage::Directory => page(cached_pane(self.directory.clone())),
+            MainPage::Tools => page(cached_pane(self.tools_page.clone())),
+            MainPage::Compose => page(cached_pane(self.compose.clone())),
+            MainPage::Activity => page(cached_pane(self.activity.clone())),
+            MainPage::Files => page(cached_pane(self.files_page.clone())),
             MainPage::Channel => {
                 if self.sidebar.read(cx).active_nav() == NavItem::Files {
-                    v_flex().size_full().child(self.files_page.clone())
+                    page(cached_pane(self.files_page.clone()))
                 } else {
                     self.render_channel_column(title, topic, conversation, window, cx)
                 }
@@ -888,8 +917,8 @@ impl App {
         };
         match self.right_pane {
             RightPane::None => None,
-            RightPane::Profile { .. } => Some(wrap(self.profile.clone().into_any_element())),
-            RightPane::Thread => Some(wrap(self.thread.clone().into_any_element())),
+            RightPane::Profile { .. } => Some(wrap(cached_pane(self.profile.clone()))),
+            RightPane::Thread => Some(wrap(media_pane(self.thread.clone(), cx))),
             RightPane::Pins => {
                 let this = cx.weak_entity();
                 let close = move |_: &mut Window, cx: &mut gpui::App| {
@@ -1783,7 +1812,7 @@ impl Render for App {
                     .size(sidebar_width)
                     .size_range(px(288.)..px(728.))
                     .fixed()
-                    .child(self.sidebar.clone()),
+                    .child(cached_pane(self.sidebar.clone())),
             );
         }
         let mut panels = panels.child(
@@ -1944,5 +1973,277 @@ impl Render for App {
                 root.child(div().flex_none().w_full().px_1().pb_1().child(dock))
             });
         self.render_overlays(root, window, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::gpui::{self, Bounds, TestAppContext, VisualTestContext};
+    use std::cell::{Cell, RefCell};
+
+    /// A pane wrapped so a test can count how often GPUI rebuilt its subtree: the host caches
+    /// this view (through [`cached_pane`], as the root does) and the real pane renders inside it,
+    /// so `renders` is exactly the number of frames the pane's subtree was laid out again.
+    struct Counted<V: Render> {
+        pane: Entity<V>,
+        renders: Rc<Cell<u32>>,
+        bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    }
+
+    impl<V: Render> Counted<V> {
+        fn new(pane: Entity<V>, cx: &mut gpui::App) -> Entity<Self> {
+            cx.new(|_| Self {
+                pane,
+                renders: Rc::default(),
+                bounds: Rc::default(),
+            })
+        }
+
+        fn renders(&self) -> u32 {
+            self.renders.get()
+        }
+
+        fn bounds(&self) -> Bounds<Pixels> {
+            self.bounds.borrow().expect("the pane painted")
+        }
+    }
+
+    impl<V: Render> Render for Counted<V> {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let bounds = self.bounds.clone();
+            div().size_full().relative().child(self.pane.clone()).child(
+                canvas(
+                    move |painted, _, _| *bounds.borrow_mut() = Some(painted),
+                    |_, (), _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+        }
+    }
+
+    /// The root's pane composition in miniature: the inline-video paint bookkeeping the root
+    /// keeps, the sidebar in its resizable panel and the transcript in the column the composer
+    /// would sit under.
+    struct Layout {
+        sidebar: Entity<Counted<crate::sidebar::Sidebar>>,
+        messages: Entity<Counted<crate::messages::MessageList>>,
+        channel: ChannelId,
+    }
+
+    impl Render for Layout {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let panels = h_resizable("layout")
+                .child(
+                    resizable_panel()
+                        .size(SIDEBAR_WIDTH)
+                        .size_range(px(288.)..px(728.))
+                        .fixed()
+                        .child(cached_pane(self.sidebar.clone())),
+                )
+                .child(
+                    resizable_panel().child(
+                        v_flex()
+                            .size_full()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .child(media_pane(self.messages.clone(), cx)),
+                            )
+                            .child(div().flex_none().h(px(80.)).child("composer")),
+                    ),
+                );
+            div()
+                .relative()
+                .size_full()
+                .child(
+                    canvas(
+                        |_, _, cx| crate::media::inline_video_begin_paint(cx),
+                        |_, epoch, window, cx| {
+                            crate::media::inline_video_finish_paint(epoch, window, cx)
+                        },
+                    )
+                    .absolute()
+                    .size_0(),
+                )
+                .child(panels)
+        }
+    }
+
+    #[gpui::test]
+    fn cached_panes_rerender_only_when_their_own_data_changes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(crate::zoom::Zoom::default());
+            gpui_kit::init(cx);
+            theme::init(cx);
+        });
+        let fixtures = Arc::new(crate::fixtures::load());
+        let channel = fixtures.channels[0].id.clone();
+        let selected = fixtures.channels[1].id.clone();
+        let ch = channel.clone();
+        let (layout, cx) = cx.add_window_view(|window, cx| {
+            let sidebar = crate::sidebar::Sidebar::new(fixtures.clone(), selected, window, cx);
+            let messages =
+                crate::messages::MessageList::new(fixtures.clone(), ch.clone(), window, cx);
+            let sidebar = Counted::new(sidebar, cx);
+            let messages = Counted::new(messages, cx);
+            Layout {
+                sidebar,
+                messages,
+                channel: ch,
+            }
+        });
+        let (sidebar, messages) =
+            layout.read_with(cx, |l, _| (l.sidebar.clone(), l.messages.clone()));
+        let draw = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            })
+        };
+        let counts = |cx: &mut VisualTestContext| {
+            (
+                sidebar.read_with(cx, |s, _| s.renders()),
+                messages.read_with(cx, |m, _| m.renders()),
+            )
+        };
+
+        // Both panes paint once and fill the space the root gives them.
+        draw(cx);
+        assert_eq!(counts(cx), (1, 1));
+        let sidebar_bounds = sidebar.read_with(cx, |s, _| s.bounds());
+        let message_bounds = messages.read_with(cx, |m, _| m.bounds());
+        assert_eq!(sidebar_bounds.size.width, SIDEBAR_WIDTH);
+        assert!(sidebar_bounds.size.height > px(0.));
+        assert_eq!(message_bounds.origin.x, SIDEBAR_WIDTH);
+        assert!(message_bounds.size.height > px(0.));
+
+        // A frame nothing caused (a hover elsewhere, a clock tick) reuses both subtrees.
+        layout.update(cx, |_, cx| cx.notify());
+        draw(cx);
+        assert_eq!(counts(cx), (1, 1));
+
+        // A message arriving rebuilds the transcript, not the sidebar.
+        let ts = Ts::from("1700000500.000100");
+        let channel = layout.read_with(cx, |l, _| l.channel.clone());
+        messages
+            .read_with(cx, |m, _| m.pane.clone())
+            .update(cx, |list, cx| {
+                list.append(
+                    channel,
+                    Message {
+                        ts,
+                        user: Some(fixtures.self_user.clone()),
+                        text: "cached?".to_owned(),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+        draw(cx);
+        assert_eq!(counts(cx), (1, 2));
+
+        // A sidebar count changing rebuilds the sidebar, not the transcript.
+        sidebar
+            .read_with(cx, |s, _| s.pane.clone())
+            .update(cx, |s, cx| s.set_draft_count(3, cx));
+        draw(cx);
+        assert_eq!(counts(cx), (2, 2));
+
+        // While a clip is loaded the panes that can show its card render with every frame: the
+        // card shows each new frame and its viewport probe decides the mini-player. The
+        // sidebar stays cached.
+        cx.update(|_, cx| {
+            crate::media::seed_inline_video_for_test(
+                crate::media::InlineVideoMeta {
+                    file_id: "F_CACHED".into(),
+                    ..Default::default()
+                },
+                true,
+                true,
+                cx,
+            )
+        });
+        draw(cx);
+        draw(cx);
+        assert_eq!(counts(cx), (2, 4));
+
+        // Once it stops, the transcript is cached again.
+        cx.update(crate::media::stop_active_inline_video);
+        draw(cx);
+        let settled = counts(cx);
+        draw(cx);
+        assert_eq!(counts(cx), settled);
+    }
+
+    /// What a frame of the real root costs over the sample workspace: one drawn because the
+    /// root was notified (a click or a hover outside the panes), and the media tick frames
+    /// while a clip plays, a full refresh against a root notification. Run with
+    /// `cargo test -p slackless-gui benchmark_root_frame -- --ignored --nocapture`.
+    #[gpui::test]
+    #[ignore = "benchmark: prints frame durations"]
+    fn benchmark_root_frame_durations(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(crate::zoom::Zoom::default());
+            gpui_kit::init(cx);
+            theme::init(cx);
+        });
+        let mounted = Rc::new(RefCell::new(None));
+        let slot = mounted.clone();
+        let (_root, cx) = cx.add_window_view(move |window, cx| {
+            let app = App::new(
+                Arc::new(crate::fixtures::load()),
+                CoreBridge::offline(),
+                window,
+                cx,
+            );
+            *slot.borrow_mut() = Some(app.clone());
+            gpui_kit::base::Root::new(app, window, cx)
+        });
+        let app = mounted
+            .borrow_mut()
+            .take()
+            .expect("the root view mounted App");
+        cx.run_until_parked();
+        const FRAMES: u32 = 200;
+        let measure = |cx: &mut VisualTestContext, label: &str, refresh: bool| {
+            let mut frames: Vec<Duration> = (0..FRAMES)
+                .map(|_| {
+                    cx.update(|window, cx| {
+                        if refresh {
+                            window.refresh();
+                        } else {
+                            app.update(cx, |_, cx| cx.notify());
+                        }
+                        let start = Instant::now();
+                        let _ = window.draw(cx);
+                        start.elapsed()
+                    })
+                })
+                .collect();
+            frames.sort_unstable();
+            let mean = frames.iter().sum::<Duration>() / FRAMES;
+            eprintln!(
+                "frame duration {label}: mean {mean:?}, median {:?}",
+                frames[frames.len() / 2]
+            );
+        };
+        measure(cx, "warm-up", true);
+        measure(cx, "root notified, no clip", false);
+        cx.update(|_, cx| {
+            crate::media::seed_inline_video_for_test(
+                crate::media::InlineVideoMeta {
+                    file_id: "F_BENCH".into(),
+                    ..Default::default()
+                },
+                false,
+                true,
+                cx,
+            )
+        });
+        measure(cx, "clip loaded, window refreshed (the old tick)", true);
+        measure(cx, "clip loaded, root notified (the new tick)", false);
     }
 }

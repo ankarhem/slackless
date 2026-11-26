@@ -359,6 +359,15 @@ pub fn stop_active_inline_video(window: &mut Window, cx: &mut App) {
     }
 }
 
+/// Whether an inline clip (video or audio) is loaded: loading, playing or paused. The panes
+/// that can show its card then render with every frame, as its card and the card's viewport
+/// probe must.
+pub(crate) fn inline_media_active(cx: &App) -> bool {
+    cx.try_global::<InlineVideoManager>()
+        .is_some_and(|mgr| mgr.active.is_some())
+        || super::audio_player::audio_active(cx)
+}
+
 /// Whether `url` points to an HLS playlist (`.m3u8`) that `AVPlayer` must stream directly via
 /// [`NativeVideoPlayer::open_url`] instead of caching locally.
 pub fn is_hls_url(url: &str) -> bool {

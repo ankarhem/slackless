@@ -39,5 +39,5 @@ pub use video_player::{
     toggle_inline_video_mute, toggle_inline_video_pause, transcribe_media, video_scrub_bar,
 };
 pub(crate) use video_player::{
-    VIDEO_FRAME_INTERVAL, copy_player_surface, take_inline_handoff_for_viewer,
+    VIDEO_FRAME_INTERVAL, copy_player_surface, inline_media_active, take_inline_handoff_for_viewer,
 };

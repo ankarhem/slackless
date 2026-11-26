@@ -163,6 +163,12 @@ pub fn audio_state(file_id: &str, cx: &App) -> Option<AudioSnapshot> {
     cx.try_global::<MediaPlayer>()?.snapshot(file_id)
 }
 
+/// Whether an audio clip is loading, playing or paused.
+pub(super) fn audio_active(cx: &App) -> bool {
+    cx.try_global::<MediaPlayer>()
+        .is_some_and(|player| player.audio.is_some())
+}
+
 /// Pause or resume the currently active audio clip without restarting (`F-CORE-126`).
 pub fn toggle_pause_audio(file_id: &str, window: &mut Window, cx: &mut App) {
     let kick = {

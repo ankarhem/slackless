@@ -410,7 +410,7 @@ impl MessageList {
             // Control state and the edit composer live in their own entities: repaint the rows
             // that show them when either changes; the scroller is watched to page older
             // history in when the reader reaches the top.
-            let subscriptions = vec![
+            let mut subscriptions = vec![
                 cx.observe(&kit, |_, _, cx| cx.notify()),
                 cx.subscribe(
                     &edit_composer,
@@ -456,6 +456,9 @@ impl MessageList {
                 data.recompute_first_unread();
                 data
             });
+            // The root caches the transcript: whatever changes the projection the rows read
+            // repaints it.
+            subscriptions.push(cx.observe(&data, |_, _, cx| cx.notify()));
             MessageList {
                 fixtures,
                 channel,
