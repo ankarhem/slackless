@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
@@ -188,9 +188,9 @@ pub struct CoreBridge {
     core_thread: Option<Arc<Mutex<Option<std::thread::JoinHandle<()>>>>>,
     /// Live mode: the store the core keeps current (writer connection). Fixture mode: `None`.
     store: Option<SharedStore>,
-    /// Live mode: dedicated read-only WAL connection so UI queries never block on background
-    /// backfill write transactions. Falls back to `store` when in-memory.
-    reader: Option<SharedStore>,
+    /// Live mode: read-only WAL connections, so reads never wait on the writer's transactions.
+    /// Empty in memory, where reads fall back to `store`.
+    readers: Readers,
     /// Live mode: the signed-in session the core runs with.
     session: Option<Session>,
     /// Live mode: authenticated HTTP fetcher for remote images and file downloads.
@@ -210,7 +210,7 @@ impl CoreBridge {
             commands: None,
             core_thread: None,
             store: None,
-            reader: None,
+            readers: Readers::default(),
             session: None,
             fetcher: None,
             hub: None,
@@ -224,6 +224,20 @@ impl CoreBridge {
     pub(crate) fn with_store(session: Session, store: SharedStore) -> Self {
         Self {
             store: Some(store),
+            session: Some(session),
+            ..Self::offline()
+        }
+    }
+
+    /// A live bridge over the archive file at `path`, opened like [`CoreBridge::start`] opens
+    /// one but with no core behind it, for tests of which connection each read takes.
+    #[cfg(test)]
+    pub(crate) fn with_store_file(session: Session, path: &Path) -> Self {
+        Self {
+            store: Some(Arc::new(Mutex::new(
+                Store::open(path).expect("open the test archive"),
+            ))),
+            readers: Readers::open(path),
             session: Some(session),
             ..Self::offline()
         }
@@ -246,7 +260,7 @@ impl CoreBridge {
             commands: Some(cmd_tx),
             core_thread: None,
             store: Some(Arc::clone(&store)),
-            reader: None,
+            readers: Readers::default(),
             session: Some(session),
             fetcher: None,
             hub: Some(hub.clone()),
@@ -268,7 +282,7 @@ impl CoreBridge {
     /// independent coalescing loop via [`CoreBridge::subscribe_huddle_media_in`]. `None` when the
     /// store or the core cannot be started.
     pub fn start(session: Session, cx: &mut gpui::App) -> Option<Self> {
-        let (store, reader) = open_store(&session)?;
+        let (store, readers) = open_store(&session)?;
         let handle = match Client::start(session.clone(), store) {
             Ok(handle) => handle,
             Err(e) => {
@@ -293,7 +307,7 @@ impl CoreBridge {
             commands: Some(commands),
             core_thread: Some(Arc::new(Mutex::new(Some(thread)))),
             store: Some(store),
-            reader,
+            readers,
             session: Some(session),
             fetcher: Some(fetcher),
             hub: Some(hub.clone()),
@@ -367,8 +381,19 @@ impl CoreBridge {
         }))
     }
 
+    /// The connection for reads on the UI thread.
     fn read_store(&self) -> Option<&SharedStore> {
-        self.reader.as_ref().or(self.store.as_ref())
+        self.readers.ui.as_ref().or(self.store.as_ref())
+    }
+
+    /// The connection for reads off the UI thread, apart from [`Self::read_store`] so a slow
+    /// one (a snapshot reload, a search, an export) never holds up a read the UI thread waits
+    /// on.
+    fn background_store(&self) -> Option<&SharedStore> {
+        self.readers
+            .background
+            .as_ref()
+            .or_else(|| self.read_store())
     }
 
     /// Lightweight startup read of just this workspace's `Team` record (1 PK query) so background
@@ -449,13 +474,13 @@ impl CoreBridge {
         Some(fixtures::live(session, &store, counts))
     }
 
-    /// Live mode: build a fresh store snapshot off the UI thread on the read-only WAL connection.
+    /// Live mode: build a fresh store snapshot off the UI thread on the background connection.
     pub fn snapshot_async(
         &self,
         counts: HashMap<ChannelId, ConversationCounts>,
     ) -> Option<impl Future<Output = Option<Fixtures>> + Send + 'static + use<>> {
         let session = self.session.clone()?;
-        let store = self.read_store()?.clone();
+        let store = self.background_store()?.clone();
         Some(async move {
             let store = store.lock().ok()?;
             Some(fixtures::live(&session, &store, &counts))
@@ -478,7 +503,7 @@ impl CoreBridge {
         users: Vec<UserId>,
     ) -> Option<impl Future<Output = Vec<User>> + Send + 'static + use<>> {
         let team = self.session.as_ref()?.team_id.clone();
-        let store = self.read_store()?.clone();
+        let store = self.background_store()?.clone();
         Some(async move {
             let Ok(store) = store.lock() else {
                 return Vec::new();
@@ -558,7 +583,7 @@ impl CoreBridge {
         _include_deleted: bool,
     ) -> Option<impl Future<Output = Vec<Message>> + Send + 'static + use<>> {
         let team = self.session.as_ref()?.team_id.clone();
-        let store = self.read_store()?.clone();
+        let store = self.background_store()?.clone();
         Some(async move {
             let Ok(store) = store.lock() else {
                 return Vec::new();
@@ -580,7 +605,7 @@ impl CoreBridge {
         channel: ChannelId,
     ) -> Option<impl Future<Output = Option<Message>> + Send + 'static> {
         let team = self.session.as_ref()?.team_id.clone();
-        let store = self.read_store()?.clone();
+        let store = self.background_store()?.clone();
         Some(async move {
             let store = store.lock().ok()?;
             match store.latest_messages(&team, std::slice::from_ref(&channel)) {
@@ -602,7 +627,7 @@ impl CoreBridge {
     ) -> Option<impl Future<Output = Vec<slackless_core::store::StoredMessage>> + Send + 'static>
     {
         let team = self.session.as_ref()?.team_id.clone();
-        let store = self.read_store()?.clone();
+        let store = self.background_store()?.clone();
         Some(async move {
             let Ok(store) = store.lock() else {
                 return Vec::new();
@@ -624,7 +649,7 @@ impl CoreBridge {
         _include_deleted: bool,
     ) -> Option<impl Future<Output = Vec<Message>> + Send + 'static> {
         let team = self.session.as_ref()?.team_id.clone();
-        let store = self.read_store()?.clone();
+        let store = self.background_store()?.clone();
         Some(async move {
             let Ok(store) = store.lock() else {
                 return Vec::new();
@@ -666,10 +691,10 @@ impl CoreBridge {
         self.store.as_ref()
     }
 
-    /// A clone of the dedicated read-only WAL store (falling back to the main store if needed) so
-    /// background UI queries never contend with the core writer mutex.
+    /// A clone of the connection for reads off the UI thread (the writer when the store is in
+    /// memory), so background queries never hold up a UI-thread read or the core's writes.
     pub fn read_store_clone(&self) -> Option<SharedStore> {
-        self.read_store().cloned()
+        self.background_store().cloned()
     }
 
     pub fn team_id(&self) -> Option<&slackless_core::types::TeamId> {
@@ -1038,21 +1063,48 @@ impl CoreBridge {
     }
 }
 
-/// Opens the durable store for a session plus a dedicated read-only WAL connection for lock-free
-/// concurrent UI reads. Falls back to an in-memory store when no home directory is available.
-fn open_store(session: &Session) -> Option<(Store, Option<SharedStore>)> {
+/// Read-only WAL connections to a workspace archive, one per kind of caller, so a read the UI
+/// thread waits on never queues behind a background read, which may take as long as it needs.
+#[derive(Default)]
+struct Readers {
+    /// Reads on the UI thread.
+    ui: Option<SharedStore>,
+    /// Reads off the UI thread.
+    background: Option<SharedStore>,
+}
+
+impl Readers {
+    /// Opens both connections to the archive at `path`; one that fails to open falls back to
+    /// the writer.
+    fn open(path: &Path) -> Self {
+        let open = || match Store::open_read_only(path) {
+            Ok(reader) => Some(Arc::new(Mutex::new(reader))),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "could not open a read-only connection; reads share the writer"
+                );
+                None
+            }
+        };
+        Self {
+            ui: open(),
+            background: open(),
+        }
+    }
+}
+
+/// Opens the durable store for a session plus its read-only connections ([`Readers`]). Falls
+/// back to an in-memory store, read through the writer, when no home directory is available.
+fn open_store(session: &Session) -> Option<(Store, Readers)> {
     match default_store_path(&session.team_id) {
         Some(path) => {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
             match Store::open(&path) {
-                Ok(store) => {
-                    let reader = Store::open_read_only(&path)
-                        .ok()
-                        .map(|r| Arc::new(Mutex::new(r)));
-                    Some((store, reader))
-                }
+                Ok(store) => Some((store, Readers::open(&path))),
                 Err(e) => {
                     tracing::warn!(
                         path = %path.display(),
@@ -1064,7 +1116,7 @@ fn open_store(session: &Session) -> Option<(Store, Option<SharedStore>)> {
             }
         }
         None => match Store::open_in_memory() {
-            Ok(store) => Some((store, None)),
+            Ok(store) => Some((store, Readers::default())),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -1132,18 +1184,73 @@ mod tests {
         assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Ready(())));
     }
 
-    fn memory_bridge() -> CoreBridge {
-        let store = Arc::new(Mutex::new(
-            Store::open_in_memory().expect("in-memory store"),
-        ));
-        let session = Session {
+    fn test_session() -> Session {
+        Session {
             team_id: TeamId::from("T0TEST"),
             user_id: slackless_core::types::UserId::from("U0ME"),
             workspace_url: "https://acme.slack.com".into(),
             xoxc_token: String::new(),
             d_cookie: String::new(),
+        }
+    }
+
+    fn memory_bridge() -> CoreBridge {
+        let store = Arc::new(Mutex::new(
+            Store::open_in_memory().expect("in-memory store"),
+        ));
+        CoreBridge::with_store(test_session(), store)
+    }
+
+    #[test]
+    fn ui_thread_reads_do_not_wait_behind_a_background_read() {
+        let dir = std::env::temp_dir().join(format!(
+            "slackless-gui-bridge-readers-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bridge = CoreBridge::with_store_file(test_session(), &dir.join("T0TEST.sqlite"));
+        let channel = ChannelId::from("C0ENG");
+        let message = Message {
+            ts: Ts::from("1700000000.000100"),
+            text: "hello".into(),
+            ..Default::default()
         };
-        CoreBridge::with_store(session, store)
+        bridge
+            .store()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .upsert_message(&TeamId::from("T0TEST"), &channel, &message)
+            .unwrap();
+
+        // A background read (a snapshot reload, a search, an export) holds its connection.
+        let background = bridge.read_store_clone().unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _read = background.lock().unwrap();
+            held_tx.send(()).unwrap();
+            // `true` once released by the UI-thread read below; the timeout is a circuit
+            // breaker so a UI read stuck behind this one fails the test instead of hanging it.
+            !matches!(
+                done_rx.recv_timeout(std::time::Duration::from_secs(5)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            )
+        });
+        held_rx.recv().unwrap();
+        let history = bridge.history_sync(&channel, false);
+        drop(done_tx);
+
+        assert!(
+            holder.join().unwrap(),
+            "history_sync waited for the background read to finish"
+        );
+        assert_eq!(
+            history.into_iter().map(|m| m.ts).collect::<Vec<_>>(),
+            vec![message.ts]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
