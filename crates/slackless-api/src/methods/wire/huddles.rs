@@ -120,3 +120,47 @@ pub(in crate::methods) struct RoomsGetLinkWire {
     #[serde(default)]
     pub(in crate::methods) url: Option<String>,
 }
+
+/// Participant entry returned by `calls.info` (`F-COLLAB-086..088`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct CallParticipant {
+    #[serde(default)]
+    pub slack_id: Option<String>,
+    #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+}
+
+/// Third-party Call object returned by `calls.info` (`docs/research/api-huddles.md`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct CallInfo {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub date_start: Option<i64>,
+    #[serde(default)]
+    pub date_end: Option<i64>,
+    #[serde(default)]
+    pub external_unique_id: Option<String>,
+    #[serde(default)]
+    pub external_display_id: Option<String>,
+    #[serde(default)]
+    pub join_url: Option<String>,
+    #[serde(default)]
+    pub desktop_app_join_url: Option<String>,
+    #[serde(default)]
+    pub users: Vec<CallParticipant>,
+    #[serde(default)]
+    pub channels: Vec<ChannelId>,
+}
+
+#[derive(Deserialize, Default)]
+pub(in crate::methods) struct CallsInfoWire {
+    #[serde(default)]
+    pub(in crate::methods) call: CallInfo,
+}

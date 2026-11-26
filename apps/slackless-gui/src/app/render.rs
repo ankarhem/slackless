@@ -650,6 +650,20 @@ impl App {
                     let _ = this.update(cx, |app, cx| app.open_folder_tab(folder, cx));
                 }
             }),
+            workflow_run: Rc::new({
+                let this = this.clone();
+                move |url, window, cx| {
+                    let _ = this.update(cx, |app, cx| {
+                        app.trip_workflow_url(url, "channel_bookmark", window, cx);
+                    });
+                }
+            }),
+            workflow_details: Rc::new({
+                let this = this.clone();
+                move |req, window, cx| {
+                    let _ = this.update(cx, |app, cx| app.open_workflow_details(req, window, cx));
+                }
+            }),
             add: Rc::new(move |window, cx| {
                 let _ = this.update(cx, |app, cx| app.open_link_dialog(window, cx));
             }),

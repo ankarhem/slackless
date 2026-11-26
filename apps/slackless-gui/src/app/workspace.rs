@@ -296,6 +296,51 @@ pub(super) fn subscribe_workspace(
                 MessageListEvent::PickEditEmoji(position) => {
                     this.open_picker(PickerTarget::MessageEdit, *position, window, cx);
                 }
+                MessageListEvent::BlockSuggestions {
+                    channel,
+                    message_ts,
+                    bot,
+                    app_id,
+                    team,
+                    is_ephemeral,
+                    request,
+                } => {
+                    if this.fixtures.sample {
+                        let options =
+                            crate::app::dialogs::sample_external_suggestions(&request.value);
+                        this.messages.update(cx, |list, cx| {
+                            list.set_block_suggestions(request.key.clone(), options, cx);
+                        });
+                    } else {
+                        let team = team.clone().unwrap_or_else(|| this.workspace_team_id());
+                        this.bridge.send(CollabCommand::BlockSuggestions {
+                            key: request.key.clone(),
+                            bot: bot.clone(),
+                            app_id: app_id.clone(),
+                            team,
+                            action_id: request.action_id.clone(),
+                            block_id: request.block_id.clone(),
+                            value: request.value.clone(),
+                            container: slackless_core::api::ActionContainer {
+                                channel: channel.clone(),
+                                message_ts: message_ts.clone(),
+                                attachment_id: request.attachment,
+                                is_ephemeral: *is_ephemeral,
+                                view_id: None,
+                            },
+                        });
+                    }
+                }
+                MessageListEvent::WorkflowDetails(req) => {
+                    this.open_workflow_details(req.clone(), window, cx);
+                }
+                MessageListEvent::RefreshCallInfo { call_id } => {
+                    if !this.fixtures.sample {
+                        this.bridge.send(CollabCommand::FetchCallInfo {
+                            call_id: call_id.clone(),
+                        });
+                    }
+                }
             },
         ),
         cx.subscribe_in(

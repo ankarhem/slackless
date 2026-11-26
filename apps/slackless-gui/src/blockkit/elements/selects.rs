@@ -1,5 +1,7 @@
 //! Block Kit single/multi select menus, conversation filters, checkboxes, and radio buttons.
 
+use gpui_kit::component::Disableable as _;
+
 use super::super::*;
 use super::{action_base, dispatch_action};
 
@@ -13,6 +15,142 @@ pub(in crate::blockkit) struct DropdownSpec {
     pub(in crate::blockkit) kit: Option<Entity<BlockKitState>>,
     pub(in crate::blockkit) on_action: Option<actions::ActionHandler>,
     pub(in crate::blockkit) attachment: Option<i64>,
+}
+
+/// Async `external_select` / `multi_external_select` control (`F-COLLAB-604`, `F-COLLAB-786`):
+/// renders an inline query box (when prepared) + Load/Search trigger invoking `blocks.suggestions`
+/// while honoring `min_query_length`, merging initial options with loaded suggestions.
+pub(in crate::blockkit) fn external_select(
+    element: &Json,
+    block: &Json,
+    key: String,
+    kcx: &KitCx,
+    cx: &App,
+) -> AnyElement {
+    let mut opts = options(element);
+    let push_initial = |opts: &mut Vec<(String, String)>, opt: &Json| {
+        if let (Some(text), Some(val)) = (text_of(&opt["text"]), opt["value"].as_str())
+            && !opts.iter().any(|(_, v)| v == val)
+        {
+            opts.push((text.to_owned(), val.to_owned()));
+        }
+    };
+    if element["initial_option"].is_object() {
+        push_initial(&mut opts, &element["initial_option"]);
+    }
+    if let Some(arr) = element["initial_options"].as_array() {
+        for opt in arr {
+            push_initial(&mut opts, opt);
+        }
+    }
+
+    let (loaded, is_loading, query_input) = match kcx.kit {
+        Some(kit) => {
+            let state = kit.read(cx);
+            (
+                state.suggestions.get(&key).cloned(),
+                state.suggestions_loading.contains(&key),
+                state.suggestion_queries.get(&key).cloned(),
+            )
+        }
+        None => (None, false, None),
+    };
+    if let Some(live) = loaded {
+        for (text, val) in live {
+            if !opts.iter().any(|(_, v)| v == &val) {
+                opts.push((text, val));
+            }
+        }
+    }
+
+    let action_id = element["action_id"].as_str().unwrap_or_default().to_owned();
+    let block_id = block["block_id"].as_str().unwrap_or_default().to_owned();
+    let min_query_length = element["min_query_length"].as_u64().unwrap_or(0) as usize;
+    let on_suggest = kcx.on_suggest.clone();
+    let kit_for_fetch = kcx.kit.cloned();
+    let attachment = kcx.attachment;
+
+    let select_el = select(element, block, key.clone(), opts, kcx, cx);
+    let Some(on_suggest) = on_suggest else {
+        return select_el;
+    };
+
+    let has_query = query_input.is_some();
+    let fetch_label = if is_loading {
+        "Loading\u{2026}"
+    } else if has_query {
+        "Search"
+    } else {
+        "Load options"
+    };
+    let query_for_btn = query_input.clone();
+    let key_for_btn = key.clone();
+    let action_for_btn = action_id.clone();
+    let block_for_btn = block_id.clone();
+    let fetch_btn = Button::new(SharedString::from(format!("bk-ext-load-{key}")))
+        .outline()
+        .with_size(Size::Small)
+        .icon(IconName::Search)
+        .label(fetch_label)
+        .disabled(is_loading)
+        .on_click(move |_, window, cx| {
+            let value = query_for_btn
+                .as_ref()
+                .map(|q| q.read(cx).value().trim().to_owned())
+                .unwrap_or_default();
+            if min_query_length > 0 && value.chars().count() < min_query_length {
+                actions::notify(
+                    "Query too short",
+                    format!("Type at least {min_query_length} characters to search options."),
+                    window,
+                    cx,
+                );
+                return;
+            }
+            if let Some(kit) = &kit_for_fetch {
+                kit.update(cx, |state, cx| {
+                    state.mark_suggestions_loading(key_for_btn.clone());
+                    cx.notify();
+                });
+            }
+            on_suggest(
+                SuggestRequest {
+                    key: key_for_btn.clone(),
+                    action_id: action_for_btn.clone(),
+                    block_id: block_for_btn.clone(),
+                    value,
+                    attachment,
+                },
+                cx,
+            );
+        });
+
+    if let Some(query) = query_input {
+        v_flex()
+            .w_full()
+            .gap_1p5()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        crate::preferences::text_input_box(&query, false, cx)
+                            .flex_1()
+                            .min_w_0(),
+                    )
+                    .child(fetch_btn),
+            )
+            .child(select_el)
+            .into_any_element()
+    } else {
+        h_flex()
+            .items_center()
+            .gap_1p5()
+            .child(select_el)
+            .child(fetch_btn)
+            .into_any_element()
+    }
 }
 
 /// A select menu: supports both single-select and real multi-select (`multi_*_select`,

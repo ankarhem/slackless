@@ -191,6 +191,11 @@ pub(in crate::blockkit) fn text_input(
         .and_then(|kit| kit.read(cx).inputs.get(key).cloned())
     {
         let value = input.read(cx).value();
+        let block_id = block["block_id"].as_str().unwrap_or_default();
+        let has_block_error = kcx
+            .kit
+            .and_then(|kit| kit.read(cx).block_error(block_id))
+            .is_some();
         let error = validate_text_input(element, &value);
         let danger = cx.theme().danger;
         let dispatch_enabled = block["dispatch_action"].as_bool().unwrap_or(false)
@@ -246,7 +251,9 @@ pub(in crate::blockkit) fn text_input(
                         crate::preferences::text_input_box(&input, multi_line, cx)
                             .flex_1()
                             .min_w_0()
-                            .when(error.is_some(), |el| el.border_color(danger)),
+                            .when(error.is_some() || has_block_error, |el| {
+                                el.border_color(danger)
+                            }),
                     )
                     .children(apply_btn),
             )

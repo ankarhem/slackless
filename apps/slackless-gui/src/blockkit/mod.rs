@@ -75,6 +75,15 @@ pub struct BlockKitState {
     calendar_months: HashMap<String, (i32, u32)>,
     /// Live option suggestions fetched via `blocks.suggestions` for `external_select` (`F-COLLAB-786`).
     suggestions: HashMap<String, Vec<(String, String)>>,
+    /// Query inputs for `external_select` / `multi_external_select` elements.
+    suggestion_queries: HashMap<String, Entity<TextareaState>>,
+    /// Keys currently waiting on an in-flight `blocks.suggestions` request.
+    suggestions_loading: HashSet<String>,
+    /// Inline validation errors keyed by `block_id` (`views.submit` `response_action: "errors"`
+    /// and local required/typed field checks, `F-COLLAB-612`).
+    block_errors: HashMap<String, String>,
+    /// Hydrated third-party `calls.info` payloads keyed by `call_id` (`F-COLLAB-087`).
+    hydrated_calls: HashMap<String, slackless_core::api::CallInfo>,
     /// Locally chosen file paths for `file_input` elements in modals (`F-COLLAB-751`).
     files: HashMap<String, Vec<String>>,
 }
@@ -82,12 +91,69 @@ pub struct BlockKitState {
 impl BlockKitState {
     /// Store dynamically loaded `blocks.suggestions` options for `key`.
     pub fn set_suggestions(&mut self, key: String, options: Vec<(String, String)>) {
+        self.suggestions_loading.remove(&key);
         self.suggestions.insert(key, options);
+    }
+
+    /// Mark an `external_select` key as currently loading suggestions.
+    pub fn mark_suggestions_loading(&mut self, key: String) {
+        self.suggestions_loading.insert(key);
+    }
+
+    /// Replace all inline `block_id -> error` validation messages (e.g. from `views.submit`).
+    pub fn set_block_errors(&mut self, errors: HashMap<String, String>) {
+        self.block_errors = errors;
+    }
+
+    /// Clear the inline validation error for `block_id` once the user edits that input.
+    pub fn clear_block_error(&mut self, block_id: &str) {
+        self.block_errors.remove(block_id);
+    }
+
+    /// Current inline validation error for `block_id`, if any.
+    pub fn block_error(&self, block_id: &str) -> Option<&str> {
+        self.block_errors.get(block_id).map(String::as_str)
+    }
+
+    /// Cache a hydrated `calls.info` payload for live `call` block updates (`F-COLLAB-087`).
+    pub fn set_call_info(&mut self, call_id: String, info: slackless_core::api::CallInfo) {
+        self.hydrated_calls.insert(call_id, info);
+    }
+
+    /// Look up hydrated `calls.info` metadata for `call_id`.
+    pub fn call_info(&self, call_id: &str) -> Option<&slackless_core::api::CallInfo> {
+        self.hydrated_calls.get(call_id)
     }
 }
 
+/// Request payload emitted when an `external_select` / `multi_external_select` queries
+/// `blocks.suggestions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuggestRequest {
+    pub key: String,
+    pub action_id: String,
+    pub block_id: String,
+    pub value: String,
+    pub attachment: Option<i64>,
+}
+
 /// Callback invoked when an `external_select` needs live options from `blocks.suggestions`.
-pub type SuggestHandler = std::rc::Rc<dyn Fn(String, String, String, &mut App)>;
+pub type SuggestHandler = std::rc::Rc<dyn Fn(SuggestRequest, &mut App)>;
+
+/// Request to inspect a workflow trigger's details (`workflows.triggers.info`, `F-COLLAB-432`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowDetailsRequest {
+    pub trigger_id: Option<String>,
+    pub url: Option<String>,
+    pub title: String,
+}
+
+/// Callback invoked when a user asks to view workflow details from a workflow button or chip.
+pub type WorkflowDetailsHandler =
+    std::rc::Rc<dyn Fn(WorkflowDetailsRequest, &mut Window, &mut App)>;
+
+/// Callback invoked when a user asks to refresh a `call` block via `calls.info`.
+pub type CallRefreshHandler = std::rc::Rc<dyn Fn(String, &mut App)>;
 
 /// What one message's blocks render with.
 pub struct KitCx<'a> {
@@ -106,6 +172,10 @@ pub struct KitCx<'a> {
     pub on_action: Option<actions::ActionHandler>,
     /// Optional callback for fetching `external_select` options (`blocks.suggestions`).
     pub on_suggest: Option<SuggestHandler>,
+    /// Optional callback for opening the Workflow Details dialog (`workflows.triggers.info`).
+    pub on_workflow_details: Option<WorkflowDetailsHandler>,
+    /// Optional callback for hydrating a `call` block via `calls.info`.
+    pub on_call_refresh: Option<CallRefreshHandler>,
     /// The legacy attachment these blocks sit in, by its `id` (a button's container names it).
     attachment: Option<i64>,
     /// The next selection-order slice handed to a text theme (see [`messages::mrkdwn`]).
@@ -125,6 +195,8 @@ impl<'a> KitCx<'a> {
             image_open: None,
             on_action: None,
             on_suggest: None,
+            on_workflow_details: None,
+            on_call_refresh: None,
             attachment: None,
             order: std::cell::Cell::new(0),
             keys: std::cell::Cell::new(0),
@@ -135,6 +207,24 @@ impl<'a> KitCx<'a> {
     /// [`MessageAction::BlockAction`](actions::MessageAction::BlockAction).
     pub fn dispatching_actions(mut self, on_action: actions::ActionHandler) -> Self {
         self.on_action = Some(on_action);
+        self
+    }
+
+    /// Routes `external_select` / `multi_external_select` option queries through `on_suggest`.
+    pub fn with_suggestions(mut self, on_suggest: SuggestHandler) -> Self {
+        self.on_suggest = Some(on_suggest);
+        self
+    }
+
+    /// Routes workflow details requests through `on_workflow_details`.
+    pub fn with_workflow_details(mut self, on_workflow_details: WorkflowDetailsHandler) -> Self {
+        self.on_workflow_details = Some(on_workflow_details);
+        self
+    }
+
+    /// Routes `call` block live refresh requests through `on_call_refresh`.
+    pub fn with_call_refresh(mut self, on_call_refresh: CallRefreshHandler) -> Self {
+        self.on_call_refresh = Some(on_call_refresh);
         self
     }
 
@@ -167,6 +257,8 @@ impl<'a> KitCx<'a> {
             image_open: self.image_open.clone(),
             on_action: self.on_action.clone(),
             on_suggest: self.on_suggest.clone(),
+            on_workflow_details: self.on_workflow_details.clone(),
+            on_call_refresh: self.on_call_refresh.clone(),
             attachment: self.attachment,
             order: std::cell::Cell::new(self.order.get()),
             keys: std::cell::Cell::new(0),
@@ -235,21 +327,80 @@ fn extract_rich_text_plain(value: &Json) -> String {
     out
 }
 
-/// Give each text input of `message` its textarea state (needs the window, so the transcript
-/// calls this from its row renderer before painting the row).
+/// Give each text input and `external_select` query input of `message` its textarea state
+/// (needs the window, so the transcript / modal calls this before painting).
 pub fn prepare_inputs(
     kit: &Entity<BlockKitState>,
     message: &Message,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let ensure_suggest_query = |kit: &Entity<BlockKitState>,
+                                key: String,
+                                element: &Json,
+                                window: &mut Window,
+                                cx: &mut App| {
+        if kit.read(cx).suggestion_queries.contains_key(&key) {
+            return;
+        }
+        let min_len = element["min_query_length"].as_u64().unwrap_or(0);
+        let placeholder = if min_len > 0 {
+            format!("Type {min_len}+ chars to search\u{2026}")
+        } else {
+            text_of(&element["placeholder"])
+                .map(|p| format!("Search {p}\u{2026}"))
+                .unwrap_or_else(|| "Search options\u{2026}".to_owned())
+        };
+        kit.update(cx, |state, cx| {
+            let query = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder(placeholder)
+                    .auto_grow(1, 1)
+            });
+            state.suggestion_queries.insert(key, query);
+        });
+    };
+
     for (ix, block) in message.blocks.iter().enumerate() {
         let Block::Unknown { r#type, raw } = block else {
             continue;
         };
+        if r#type == "section"
+            && let Some(acc) = raw.get("accessory").filter(|v| v.is_object())
+            && matches!(
+                acc["type"].as_str(),
+                Some("external_select" | "multi_external_select")
+            )
+        {
+            let key = control_key(&message.ts, raw, ix, acc, 0);
+            ensure_suggest_query(kit, key, acc, window, cx);
+            continue;
+        }
+        if r#type == "actions"
+            && let Some(elements) = raw["elements"].as_array()
+        {
+            for (n, el) in elements.iter().enumerate() {
+                if matches!(
+                    el["type"].as_str(),
+                    Some("external_select" | "multi_external_select")
+                ) {
+                    let key = control_key(&message.ts, raw, ix, el, n);
+                    ensure_suggest_query(kit, key, el, window, cx);
+                }
+            }
+            continue;
+        }
         let element = &raw["element"];
         let kind = element["type"].as_str().unwrap_or_default();
-        if r#type != "input" || !TEXT_INPUTS.contains(&kind) {
+        if r#type != "input" {
+            continue;
+        }
+        if matches!(kind, "external_select" | "multi_external_select") {
+            let key = control_key(&message.ts, raw, ix, element, 0);
+            ensure_suggest_query(kit, key, element, window, cx);
+            continue;
+        }
+        if !TEXT_INPUTS.contains(&kind) {
             continue;
         }
         let key = control_key(&message.ts, raw, ix, element, 0);
@@ -587,14 +738,16 @@ pub fn render_raw_blocks(raw_blocks: &[Json], kcx: &KitCx, cx: &App) -> Div {
     column
 }
 
-/// Collect Slack `state.values` from modal `input` blocks and validate required / typed inputs.
-pub fn collect_modal_state(
+/// Collect Slack `state.values` from modal `input` blocks and validate required / typed inputs,
+/// returning either the `state.values` map or per-`block_id` inline validation errors.
+pub fn collect_modal_state_errors(
     ts: &Ts,
     raw_blocks: &[Json],
     kit: &Entity<BlockKitState>,
     cx: &App,
-) -> Result<Json, String> {
+) -> Result<Json, HashMap<String, String>> {
     let mut values = serde_json::Map::new();
+    let mut errors = HashMap::new();
     let state = kit.read(cx);
     for (ix, raw) in raw_blocks.iter().enumerate() {
         if raw["type"].as_str() != Some("input") {
@@ -626,10 +779,12 @@ pub fn collect_modal_state(
                 })
                 .unwrap_or_default();
             if !optional && val.trim().is_empty() {
-                return Err(format!("{label} is required."));
+                errors.insert(block_id.clone(), format!("{label} is required."));
+                continue;
             }
             if let Some(err) = validate_text_input(element, &val) {
-                return Err(format!("{label}: {err}"));
+                errors.insert(block_id.clone(), format!("{label}: {err}"));
+                continue;
             }
             if kind == "rich_text_input" {
                 serde_json::json!({
@@ -642,7 +797,8 @@ pub fn collect_modal_state(
         } else if kind == "file_input" {
             let files = state.files.get(&key).cloned().unwrap_or_default();
             if !optional && files.is_empty() {
-                return Err(format!("{label} is required."));
+                errors.insert(block_id.clone(), format!("{label} is required."));
+                continue;
             }
             let arr: Vec<Json> = files
                 .into_iter()
@@ -656,7 +812,8 @@ pub fn collect_modal_state(
                 .cloned()
                 .or_else(|| element["initial_date"].as_str().map(str::to_owned));
             if !optional && val.is_none() {
-                return Err(format!("{label} is required."));
+                errors.insert(block_id.clone(), format!("{label} is required."));
+                continue;
             }
             serde_json::json!({ "type": kind, "selected_date": val })
         } else if kind == "timepicker" {
@@ -666,19 +823,66 @@ pub fn collect_modal_state(
                 .cloned()
                 .or_else(|| element["initial_time"].as_str().map(str::to_owned));
             if !optional && val.is_none() {
-                return Err(format!("{label} is required."));
+                errors.insert(block_id.clone(), format!("{label} is required."));
+                continue;
             }
             serde_json::json!({ "type": kind, "selected_time": val })
         } else if kind == "checkboxes" || kind.starts_with("multi_") {
-            let selected = state.checked.get(&key).cloned().unwrap_or_default();
+            let selected: Vec<String> = if let Some(set) = state.checked.get(&key) {
+                let mut v: Vec<String> = set.iter().cloned().collect();
+                v.sort();
+                v
+            } else {
+                element["initial_options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|o| o["value"].as_str().map(str::to_owned))
+                    .chain(
+                        element["initial_users"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|v| v.as_str().map(str::to_owned)),
+                    )
+                    .chain(
+                        element["initial_conversations"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|v| v.as_str().map(str::to_owned)),
+                    )
+                    .chain(
+                        element["initial_channels"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|v| v.as_str().map(str::to_owned)),
+                    )
+                    .collect()
+            };
             if !optional && selected.is_empty() {
-                return Err(format!("{label} is required."));
+                errors.insert(block_id.clone(), format!("{label} is required."));
+                continue;
             }
-            let arr: Vec<Json> = selected
-                .into_iter()
-                .map(|v| serde_json::json!({ "value": v }))
-                .collect();
-            serde_json::json!({ "type": kind, "selected_options": arr })
+            match kind {
+                "multi_users_select" => {
+                    serde_json::json!({ "type": kind, "selected_users": selected })
+                }
+                "multi_conversations_select" => {
+                    serde_json::json!({ "type": kind, "selected_conversations": selected })
+                }
+                "multi_channels_select" => {
+                    serde_json::json!({ "type": kind, "selected_channels": selected })
+                }
+                _ => {
+                    let arr: Vec<Json> = selected
+                        .into_iter()
+                        .map(|v| serde_json::json!({ "value": v }))
+                        .collect();
+                    serde_json::json!({ "type": kind, "selected_options": arr })
+                }
+            }
         } else {
             let val = state
                 .choices
@@ -693,7 +897,8 @@ pub fn collect_modal_state(
                 .or_else(|| element["initial_conversation"].as_str().map(str::to_owned))
                 .or_else(|| element["initial_channel"].as_str().map(str::to_owned));
             if !optional && val.is_none() {
-                return Err(format!("{label} is required."));
+                errors.insert(block_id.clone(), format!("{label} is required."));
+                continue;
             }
             match kind {
                 "users_select" => serde_json::json!({ "type": kind, "selected_user": val }),
@@ -715,5 +920,24 @@ pub fn collect_modal_state(
             obj.insert(action_id, entry);
         }
     }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
     Ok(Json::Object(values))
+}
+
+/// Collect Slack `state.values` from modal `input` blocks and validate required / typed inputs.
+pub fn collect_modal_state(
+    ts: &Ts,
+    raw_blocks: &[Json],
+    kit: &Entity<BlockKitState>,
+    cx: &App,
+) -> Result<Json, String> {
+    collect_modal_state_errors(ts, raw_blocks, kit, cx).map_err(|mut map| {
+        let mut keys: Vec<String> = map.keys().cloned().collect();
+        keys.sort();
+        keys.first()
+            .and_then(|k| map.remove(k))
+            .unwrap_or_else(|| "Missing or invalid field.".to_owned())
+    })
 }

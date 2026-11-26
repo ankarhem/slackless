@@ -325,6 +325,9 @@ impl<B: Backend> Core<B> {
             CollabCommand::TripWorkflowTrigger { url, context } => {
                 self.trip_workflow_trigger(url, context);
             }
+            CollabCommand::FetchWorkflowTriggerInfo { trigger_id } => {
+                self.fetch_workflow_trigger_info(trigger_id);
+            }
             CollabCommand::BlockAction {
                 bot,
                 app_id,
@@ -351,12 +354,18 @@ impl<B: Backend> Core<B> {
                 value,
                 container,
             }),
+            CollabCommand::GetModalView { view_id } => self.get_modal_view(view_id),
             CollabCommand::SubmitModal {
                 view_id,
                 hash,
                 state_values,
             } => self.submit_modal(view_id, hash, state_values),
-            CollabCommand::CloseModal { view_id, hash } => self.close_modal(view_id, hash),
+            CollabCommand::CloseModal {
+                view_id,
+                root_view_id,
+                hash,
+            } => self.close_modal(view_id, root_view_id, hash),
+            CollabCommand::FetchCallInfo { call_id } => self.fetch_call_info(call_id),
             CollabCommand::TranscribeMediaFile {
                 file_id,
                 local_path,

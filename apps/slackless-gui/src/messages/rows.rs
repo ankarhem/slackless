@@ -205,10 +205,56 @@ pub(super) fn transcript_row(
     if editing {
         body = body.child(store.edit_composer.clone());
     } else {
+        let on_suggest: crate::blockkit::SuggestHandler = {
+            let this = this.clone();
+            let channel = store.channel.clone();
+            let message_ts = message.ts.clone();
+            let bot = message
+                .bot_id
+                .clone()
+                .unwrap_or_else(|| slackless_core::types::BotId::from("B01"));
+            let app_id = message
+                .bot_profile
+                .as_ref()
+                .and_then(|p| p.app_id.clone())
+                .unwrap_or_default();
+            let team = message.bot_profile.as_ref().and_then(|p| p.team_id.clone());
+            let is_ephemeral = message.is_ephemeral;
+            Rc::new(move |request, cx| {
+                this.update(cx, |_, cx| {
+                    cx.emit(MessageListEvent::BlockSuggestions {
+                        channel: channel.clone(),
+                        message_ts: message_ts.clone(),
+                        bot: bot.clone(),
+                        app_id: app_id.clone(),
+                        team: team.clone(),
+                        is_ephemeral,
+                        request,
+                    });
+                });
+            })
+        };
+        let on_wf: crate::blockkit::WorkflowDetailsHandler = {
+            let this = this.clone();
+            Rc::new(move |req, _window, cx| {
+                this.update(cx, |_, cx| cx.emit(MessageListEvent::WorkflowDetails(req)));
+            })
+        };
+        let on_call: crate::blockkit::CallRefreshHandler = {
+            let this = this.clone();
+            Rc::new(move |call_id, cx| {
+                this.update(cx, |_, cx| {
+                    cx.emit(MessageListEvent::RefreshCallInfo { call_id });
+                });
+            })
+        };
         let kcx = KitCx::new(fixtures, Some(&store.kit), &message.ts)
             .with_links(links.clone())
             .opening_images(image_open)
-            .dispatching_actions(handler.clone());
+            .dispatching_actions(handler.clone())
+            .with_suggestions(on_suggest)
+            .with_workflow_details(on_wf)
+            .with_call_refresh(on_call);
         // The root as loaded here, so an edit to it shows as in Slack; else the copy the
         // broadcast carries.
         let broadcast_root = message

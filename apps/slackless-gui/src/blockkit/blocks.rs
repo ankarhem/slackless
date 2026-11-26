@@ -301,46 +301,237 @@ pub(super) fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
     card
 }
 
-/// Slack's Block Kit `call` block (third-party / legacy calls): title, live status, Join link.
+/// Slack's Block Kit `call` block (third-party / legacy calls, `F-COLLAB-086..088`):
+/// supports both inline `call` / `call.v1` JSON and hydrated `calls.info` updates with provider
+/// badges, live participant list, Join / Open in browser / Copy link / Refresh actions, and
+/// ended duration state.
 pub(super) fn call_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
     let theme = cx.theme();
-    let call = raw.get("call").unwrap_or(raw);
-    let title = call["title"].as_str().unwrap_or("Call").to_owned();
-    let ended = call["date_end"].as_i64().is_some_and(|t| t > 0);
-    let participants = call["active_participants"].as_array().map_or(0, Vec::len);
-    let join_url = call["join_url"]
+    let call_outer = raw.get("call").unwrap_or(raw);
+    let call = call_outer
+        .get("v1")
+        .filter(|v| v.is_object())
+        .unwrap_or(call_outer);
+    let call_id = call["id"]
         .as_str()
-        .or_else(|| call["desktop_app_join_url"].as_str())
+        .or_else(|| raw["call_id"].as_str())
+        .or_else(|| call_outer["id"].as_str())
+        .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    let status = if ended {
-        "Call ended".to_owned()
-    } else if participants > 0 {
-        format!(
-            "Live · {participants} {}",
-            if participants == 1 {
-                "participant"
+    let hydrated = call_id
+        .as_deref()
+        .and_then(|id| kcx.kit.and_then(|kit| kit.read(cx).call_info(id).cloned()));
+
+    let title = hydrated
+        .as_ref()
+        .and_then(|h| h.title.as_deref())
+        .filter(|s| !s.is_empty())
+        .or_else(|| call["title"].as_str().filter(|s| !s.is_empty()))
+        .or_else(|| call["name"].as_str().filter(|s| !s.is_empty()))
+        .unwrap_or("Call")
+        .to_owned();
+    let date_start = hydrated
+        .as_ref()
+        .and_then(|h| h.date_start)
+        .or_else(|| call["date_start"].as_i64());
+    let date_end = hydrated
+        .as_ref()
+        .and_then(|h| h.date_end)
+        .or_else(|| call["date_end"].as_i64());
+    let ended = date_end.is_some_and(|t| t > 0) || call["has_ended"].as_bool().unwrap_or(false);
+
+    let participant_names: Vec<String> = if let Some(ref h) = hydrated {
+        h.users
+            .iter()
+            .filter_map(|p| {
+                p.slack_id
+                    .as_deref()
+                    .map(|uid| kcx.fixtures.user_name(&UserId::from(uid)).to_owned())
+                    .or_else(|| p.display_name.clone())
+            })
+            .collect()
+    } else {
+        call["active_participants"]
+            .as_array()
+            .or_else(|| call["users"].as_array())
+            .or_else(|| call["all_participants"].as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|p| {
+                        p["slack_id"]
+                            .as_str()
+                            .map(|uid| kcx.fixtures.user_name(&UserId::from(uid)).to_owned())
+                            .or_else(|| p["display_name"].as_str().map(str::to_owned))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let participants = participant_names.len();
+
+    let web_join_url = hydrated
+        .as_ref()
+        .and_then(|h| h.join_url.clone())
+        .or_else(|| call["join_url"].as_str().map(str::to_owned))
+        .filter(|s| !s.is_empty());
+    let desktop_join_url = hydrated
+        .as_ref()
+        .and_then(|h| h.desktop_app_join_url.clone())
+        .or_else(|| call["desktop_app_join_url"].as_str().map(str::to_owned))
+        .filter(|s| !s.is_empty());
+    let primary_join_url = desktop_join_url.clone().or_else(|| web_join_url.clone());
+    let copy_url = web_join_url.clone().or_else(|| desktop_join_url.clone());
+    let provider = web_join_url
+        .as_deref()
+        .and_then(slackless_core::domain::calling::call_provider_for_url)
+        .or_else(|| {
+            desktop_join_url
+                .as_deref()
+                .and_then(slackless_core::domain::calling::call_provider_for_url)
+        });
+
+    let duration_label = match (date_start, date_end) {
+        (Some(start), Some(end)) if end > start => {
+            let mins = ((end - start) + 30) / 60;
+            if mins >= 60 {
+                Some(format!("{}h {}m", mins / 60, mins % 60))
+            } else if mins >= 1 {
+                Some(format!("{mins}m"))
             } else {
-                "participants"
+                Some("<1m".to_owned())
             }
-        )
+        }
+        _ => None,
+    };
+
+    let status = if ended {
+        match (duration_label, participants) {
+            (Some(dur), n) if n > 0 => format!(
+                "Call ended · {dur} · {n} {}",
+                if n == 1 {
+                    "participant"
+                } else {
+                    "participants"
+                }
+            ),
+            (Some(dur), _) => format!("Call ended · {dur}"),
+            (None, n) if n > 0 => format!(
+                "Call ended · {n} {}",
+                if n == 1 {
+                    "participant"
+                } else {
+                    "participants"
+                }
+            ),
+            (None, _) => "Call ended".to_owned(),
+        }
+    } else if participants > 0 {
+        let preview = if participants <= 3 {
+            participant_names.join(", ")
+        } else {
+            format!(
+                "{}, {} +{} more",
+                participant_names[0],
+                participant_names[1],
+                participants - 2
+            )
+        };
+        format!("Live · {preview}")
     } else {
         "Live call".to_owned()
     };
 
-    let mut row = h_flex()
+    let mut action_row = h_flex().flex_none().items_center().gap_1p5();
+    if !ended && let Some(href) = primary_join_url {
+        let target = LinkTarget::Url(href.into());
+        let links = kcx.links.clone();
+        action_row = action_row.child(
+            Button::new(SharedString::from(format!(
+                "bk-call-join-{}-{ix}",
+                kcx.ts.as_str()
+            )))
+            .primary()
+            .with_size(Size::XSmall)
+            .icon(IconName::Video)
+            .label("Join")
+            .on_click(move |_, window, cx| {
+                messages::route_link(links.as_ref(), target.clone(), window, cx)
+            }),
+        );
+    }
+    if !ended
+        && let (Some(desktop), Some(web)) = (&desktop_join_url, &web_join_url)
+        && desktop != web
+    {
+        let target = LinkTarget::Url(web.clone().into());
+        let links = kcx.links.clone();
+        action_row = action_row.child(
+            Button::new(SharedString::from(format!(
+                "bk-call-web-{}-{ix}",
+                kcx.ts.as_str()
+            )))
+            .outline()
+            .with_size(Size::XSmall)
+            .icon(IconName::ExternalLink)
+            .tooltip("Join in browser")
+            .on_click(move |_, window, cx| {
+                messages::route_link(links.as_ref(), target.clone(), window, cx)
+            }),
+        );
+    }
+    if let Some(url) = copy_url {
+        action_row = action_row.child(
+            Button::new(SharedString::from(format!(
+                "bk-call-copy-{}-{ix}",
+                kcx.ts.as_str()
+            )))
+            .ghost()
+            .with_size(Size::XSmall)
+            .icon(IconName::Link)
+            .tooltip("Copy call link")
+            .on_click(move |_, window, cx| {
+                cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(url.clone()));
+                actions::notify(
+                    "Call link copied",
+                    "Copied meeting URL to clipboard.",
+                    window,
+                    cx,
+                );
+            }),
+        );
+    }
+    if !ended && let (Some(id), Some(on_refresh)) = (call_id.clone(), kcx.on_call_refresh.clone()) {
+        action_row = action_row.child(
+            Button::new(SharedString::from(format!(
+                "bk-call-refresh-{}-{ix}",
+                kcx.ts.as_str()
+            )))
+            .ghost()
+            .with_size(Size::XSmall)
+            .icon(IconName::RefreshCw)
+            .tooltip("Refresh call status")
+            .on_click(move |_, _, cx| on_refresh(id.clone(), cx)),
+        );
+    }
+
+    h_flex()
         .w_full()
-        .max_w(px(440.))
+        .max_w(px(500.))
         .items_center()
         .gap_3()
         .p_3()
         .rounded_lg()
         .border_1()
-        .border_color(theme.border)
+        .border_color(if ended {
+            theme.border
+        } else {
+            theme.success.opacity(0.45)
+        })
         .bg(theme.muted)
         .child(
             div()
                 .flex_none()
-                .size(px(34.))
+                .size(px(36.))
                 .rounded_md()
                 .bg(if ended {
                     theme.secondary
@@ -351,13 +542,19 @@ pub(super) fn call_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                 .items_center()
                 .justify_center()
                 .child(
-                    Icon::new(IconName::Headphones)
-                        .size(px(16.))
-                        .text_color(if ended {
-                            theme.muted_foreground
-                        } else {
-                            theme.success
-                        }),
+                    Icon::new(if ended {
+                        IconName::PhoneOff
+                    } else if provider.is_some() {
+                        IconName::Video
+                    } else {
+                        IconName::Headphones
+                    })
+                    .size(px(16.))
+                    .text_color(if ended {
+                        theme.muted_foreground
+                    } else {
+                        theme.success
+                    }),
                 ),
         )
         .child(
@@ -366,37 +563,50 @@ pub(super) fn call_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                 .min_w_0()
                 .gap_0p5()
                 .child(
-                    div()
-                        .truncate()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground)
-                        .child(plain_label(&title, cx)),
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.foreground)
+                                .child(plain_label(&title, cx)),
+                        )
+                        .when_some(provider, |hdr, prov| {
+                            hdr.child(
+                                div()
+                                    .flex_none()
+                                    .px_1p5()
+                                    .py(px(1.))
+                                    .rounded_sm()
+                                    .bg(theme.secondary)
+                                    .text_size(px(10.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.muted_foreground)
+                                    .child(prov),
+                            )
+                        }),
                 )
                 .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(status),
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .when(!ended, |r| {
+                            r.child(div().size(px(6.)).rounded_full().bg(theme.success))
+                        })
+                        .child(
+                            div()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(status),
+                        ),
                 ),
-        );
-    if !ended && let Some(href) = join_url {
-        let target = LinkTarget::Url(href.into());
-        let links = kcx.links.clone();
-        row = row.child(
-            Button::new(SharedString::from(format!(
-                "bk-call-join-{}-{ix}",
-                kcx.ts.as_str()
-            )))
-            .primary()
-            .with_size(Size::XSmall)
-            .label("Join")
-            .on_click(move |_, window, cx| {
-                messages::route_link(links.as_ref(), target.clone(), window, cx)
-            }),
-        );
-    }
-    row
+        )
+        .child(action_row)
 }
 
 /// Modern Block Kit `alert` / `callout` block (`F-COLLAB-713`): tinted left-accent banner.
@@ -1297,7 +1507,8 @@ pub(super) fn work_object_element(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) 
         .into_any_element()
 }
 
-/// Block Kit `workflow` mention link (`F-COLLAB-773`).
+/// Block Kit `workflow` mention link (`F-COLLAB-409`, `F-COLLAB-432`, `F-COLLAB-773`):
+/// shows workflow title link plus compact details & copy-URL triggers when a trigger URL/ID is present.
 pub(super) fn workflow_link_element(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let label = raw["title"]
@@ -1307,8 +1518,17 @@ pub(super) fn workflow_link_element(raw: &Json, ix: usize, kcx: &KitCx, cx: &App
         .unwrap_or("Workflow");
     let url = raw["trigger"]["url"]
         .as_str()
-        .or_else(|| raw["url"].as_str());
-    let inner: AnyElement = match url {
+        .or_else(|| raw["url"].as_str())
+        .map(str::to_owned);
+    let trigger_id = raw["trigger"]["id"]
+        .as_str()
+        .or_else(|| raw["trigger_id"].as_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            url.as_deref()
+                .and_then(slackless_core::api::extract_workflow_trigger_id)
+        });
+    let inner: AnyElement = match url.as_deref() {
         Some(href) => routed_link(
             format!("bk-wf-{}-{ix}", kcx.ts.as_str()),
             plain_label(label, cx),
@@ -1325,6 +1545,12 @@ pub(super) fn workflow_link_element(raw: &Json, ix: usize, kcx: &KitCx, cx: &App
             .child(plain_label(label, cx))
             .into_any_element(),
     };
+    let on_details = kcx.on_workflow_details.clone();
+    let details_req = (trigger_id.is_some() || url.is_some()).then(|| WorkflowDetailsRequest {
+        trigger_id,
+        url: url.clone(),
+        title: plain_label(label, cx),
+    });
     h_flex()
         .items_center()
         .gap_1()
@@ -1340,6 +1566,40 @@ pub(super) fn workflow_link_element(raw: &Json, ix: usize, kcx: &KitCx, cx: &App
                 .text_color(theme.link),
         )
         .child(inner)
+        .when_some(on_details.zip(details_req), |row, (handler, req)| {
+            row.child(
+                Button::new(SharedString::from(format!(
+                    "bk-wf-info-{}-{ix}",
+                    kcx.ts.as_str()
+                )))
+                .ghost()
+                .with_size(Size::XSmall)
+                .icon(IconName::Info)
+                .tooltip("View workflow details")
+                .on_click(move |_, window, cx| handler(req.clone(), window, cx)),
+            )
+        })
+        .when_some(url, |row, href| {
+            row.child(
+                Button::new(SharedString::from(format!(
+                    "bk-wf-copy-{}-{ix}",
+                    kcx.ts.as_str()
+                )))
+                .ghost()
+                .with_size(Size::XSmall)
+                .icon(IconName::Link)
+                .tooltip("Copy workflow URL")
+                .on_click(move |_, window, cx| {
+                    cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(href.clone()));
+                    actions::notify(
+                        "Workflow link copied",
+                        "Copied workflow URL to clipboard.",
+                        window,
+                        cx,
+                    );
+                }),
+            )
+        })
         .into_any_element()
 }
 
@@ -1707,9 +1967,16 @@ pub(super) fn section(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
 }
 
 pub(super) fn input_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
-    let muted = cx.theme().muted_foreground;
+    let theme = cx.theme();
+    let (muted, danger) = (theme.muted_foreground, theme.danger);
     let element = &raw["element"];
     let key = control_key(kcx.ts, raw, ix, element, 0);
+    let block_id = raw["block_id"]
+        .as_str()
+        .map_or_else(|| ix.to_string(), str::to_owned);
+    let inline_error = kcx
+        .kit
+        .and_then(|kit| kit.read(cx).block_error(&block_id).map(str::to_owned));
     v_flex()
         .w_full()
         .max_w(px(520.))
@@ -1730,6 +1997,21 @@ pub(super) fn input_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                 }),
         )
         .child(block_element(element, raw, key, kcx, cx))
+        .when_some(inline_error, |column, err| {
+            column.child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(danger)
+                    .child(
+                        Icon::new(IconName::TriangleAlert)
+                            .size(px(12.))
+                            .text_color(danger),
+                    )
+                    .child(err),
+            )
+        })
         .when_some(text_of(&raw["hint"]), |column, hint| {
             column.child(div().text_xs().text_color(muted).child(hint.to_owned()))
         })
@@ -1800,6 +2082,9 @@ pub(super) fn set_choice(
     if let Some(kit) = kit {
         kit.update(cx, |state, cx| {
             state.choices.insert(key.to_owned(), value.to_owned());
+            if let Some(block_id) = key.split('/').nth(1) {
+                state.clear_block_error(block_id);
+            }
             cx.notify();
         });
     }

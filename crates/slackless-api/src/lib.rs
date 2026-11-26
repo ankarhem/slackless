@@ -25,9 +25,9 @@ pub use client::{
 pub use error::ApiError;
 pub use methods::{
     ActionContainer, ActivityEntry, ActivityFeed, ActivityItem, ActivityKind, ActivityReaction,
-    AppCommand, AppHomeResponse, AuthTest, BlockSuggestionsRequest, BookmarksList,
-    CanvasAccessLevel, CanvasCommentReply, CanvasCommentThread, CanvasCreated, CanvasEditOp,
-    CanvasMeta, ChannelBookmark, ChimeAttendee, ChimeCapabilities, ChimeJoinData,
+    AppCommand, AppHomeResponse, AuthTest, BlockSuggestionsRequest, BookmarksList, CallInfo,
+    CallParticipant, CanvasAccessLevel, CanvasCommentReply, CanvasCommentThread, CanvasCreated,
+    CanvasEditOp, CanvasMeta, ChannelBookmark, ChimeAttendee, ChimeCapabilities, ChimeJoinData,
     ChimeMediaPlacement, ChimeMeeting, ClientCounts, CloudDraft, ConversationCounts,
     ConversationView, DeletedFile, EdgeSearchResults, FileCollection, FilesFilter, GifItem,
     HistoryOpts, HuddleCanvasRef, ListCellInput, ListCellInputValue, ListOpts, MessageContent,
@@ -36,8 +36,9 @@ pub use methods::{
     ScheduledMessageCreated, SearchChannel, SearchMatch, SearchMessages, SearchOpts,
     SearchPagination, SearchSort, SectionCreated, SlackListCellValue, SlackListChoice,
     SlackListColumn, SlackListData, SlackListRow, ThreadCounts, ThreadSubscription, ThreadsView,
-    UploadFile, UploadSlot, UserBoot, canvas_comment_channel_id, format_canvas_error,
-    parse_canvas_comment_threads, parse_canvas_meta_from_file,
+    UploadFile, UploadSlot, UserBoot, ViewSubmitResponse, WorkflowStepSummary, WorkflowTriggerInfo,
+    WorkflowTriggerTripResponse, canvas_comment_channel_id, extract_workflow_trigger_id,
+    format_canvas_error, parse_canvas_comment_threads, parse_canvas_meta_from_file,
 };
 pub use pagination::{Page, paginate};
 

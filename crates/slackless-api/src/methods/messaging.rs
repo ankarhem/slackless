@@ -136,35 +136,58 @@ impl SlackApi {
         Ok(options)
     }
 
-    /// `views.submit`: submit a Block Kit modal view's `state.values` back to the app (`F-COLLAB-725`).
+    /// `views.get`: fetch the latest Block Kit modal view JSON by `view_id` (`F-COLLAB-600`).
+    pub async fn views_get(&self, view_id: &str) -> Result<Value> {
+        let params = vec![
+            ("view_id", view_id.to_owned()),
+            ("_x_reason", "fetchView".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        let raw: Value = self.call(method::VIEWS_GET, params).await?.data;
+        Ok(raw.get("view").cloned().unwrap_or(raw))
+    }
+
+    /// `views.submit`: submit a Block Kit modal view's `state.values` back to the app
+    /// (`F-COLLAB-605..612`), returning the parsed `response_action` (`push`, `update`, `clear`,
+    /// `errors`, or default close).
     pub async fn views_submit(
         &self,
         view_id: &str,
         hash: Option<&str>,
         state_values: &Value,
-    ) -> Result<()> {
+    ) -> Result<ViewSubmitResponse> {
         let mut params = vec![
+            ("client_token", client_token()),
             ("view_id", view_id.to_owned()),
             (
                 "state",
                 serde_json::json!({ "values": state_values }).to_string(),
             ),
-            ("client_token", client_token()),
+            ("_x_reason", "submit-view".to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
         if let Some(hash) = hash {
             params.push(("hash", hash.to_owned()));
         }
-        self.call_ok(method::VIEWS_SUBMIT, params).await
+        let raw = self.call_raw_json(method::VIEWS_SUBMIT, params).await?;
+        parse_view_submit_response(&raw)
     }
 
     /// `views.close`: notify Slack that the user dismissed a Block Kit modal (`notify_on_close`).
-    pub async fn views_close(&self, view_id: &str, hash: Option<&str>) -> Result<()> {
+    pub async fn views_close(
+        &self,
+        view_id: &str,
+        root_view_id: Option<&str>,
+        hash: Option<&str>,
+    ) -> Result<()> {
         let mut params = vec![
-            ("view_id", view_id.to_owned()),
             ("client_token", client_token()),
+            ("view_id", view_id.to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
+        if let Some(root_view_id) = root_view_id.filter(|s| !s.is_empty()) {
+            params.push(("root_view_id", root_view_id.to_owned()));
+        }
         if let Some(hash) = hash {
             params.push(("hash", hash.to_owned()));
         }

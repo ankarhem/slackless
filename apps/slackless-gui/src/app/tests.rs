@@ -2157,3 +2157,186 @@ fn wave1_and_wave2_gui_secret_guard_link_scrubber_stealth_and_stt_provider(
     });
     drop(root);
 }
+
+#[gpui::test]
+fn modal_stack_lifecycle_inline_errors_suggestions_workflows_and_calling_apps(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui_kit::base::Root;
+    use std::cell::RefCell;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let app = App::new(
+            Arc::new(fixtures::load()),
+            CoreBridge::offline(),
+            window,
+            cx,
+        );
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            use slackless_core::api::ViewSubmitResponse;
+            use slackless_core::domain::calling::CallMode;
+
+            // 1. Open root modal V1 -> map server inline errors -> push V2 -> update V2 ->
+            //    deliver modal external_select suggestions -> pop back to V1 -> push V3 -> clear all.
+            let v1 = crate::blockkit::serde_json::json!({
+                "id": "V1",
+                "root_view_id": "V1",
+                "type": "modal",
+                "title": { "type": "plain_text", "text": "Create ticket" },
+                "submit": { "type": "plain_text", "text": "Next" },
+                "close": { "type": "plain_text", "text": "Cancel" },
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "b_summary",
+                        "label": { "type": "plain_text", "text": "Summary" },
+                        "element": { "type": "plain_text_input", "action_id": "a_summary" }
+                    }
+                ]
+            });
+            app.open_block_modal(v1, window, cx);
+            assert_eq!(app.modal_stack.read(cx).depth(), 1);
+            assert_eq!(app.modal_stack.read(cx).top_view_id(), Some("V1"));
+
+            // Server inline validation errors map onto b_summary without closing the modal.
+            app.handle_modal_submit_result(
+                "V1",
+                Ok(ViewSubmitResponse::Errors(HashMap::from([(
+                    "b_summary".to_owned(),
+                    "Summary must start with a ticket prefix.".to_owned(),
+                )]))),
+                window,
+                cx,
+            );
+            assert_eq!(app.modal_stack.read(cx).depth(), 1);
+            let v1_kit = app.modal_stack.read(cx).top_kit().expect("V1 kit");
+            assert_eq!(
+                v1_kit.read(cx).block_error("b_summary"),
+                Some("Summary must start with a ticket prefix.")
+            );
+
+            // views.submit response_action: "push" pushes V2 onto the stack.
+            let v2 = crate::blockkit::serde_json::json!({
+                "id": "V2",
+                "root_view_id": "V1",
+                "previous_view_id": "V1",
+                "type": "modal",
+                "title": { "type": "plain_text", "text": "Assign issue" },
+                "submit": { "type": "plain_text", "text": "Submit" },
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "b_issue",
+                        "label": { "type": "plain_text", "text": "Related issue" },
+                        "element": { "type": "external_select", "action_id": "a_issue" }
+                    }
+                ]
+            });
+            app.handle_modal_submit_result("V1", Ok(ViewSubmitResponse::Push(v2)), window, cx);
+            assert_eq!(app.modal_stack.read(cx).depth(), 2);
+            assert_eq!(app.modal_stack.read(cx).top_view_id(), Some("V2"));
+
+            // view_updated updates V2 in place without changing stack depth.
+            let v2_upd = crate::blockkit::serde_json::json!({
+                "id": "V2",
+                "root_view_id": "V1",
+                "previous_view_id": "V1",
+                "hash": "h2-updated",
+                "type": "modal",
+                "title": { "type": "plain_text", "text": "Assign issue (updated)" },
+                "submit": { "type": "plain_text", "text": "Submit" },
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "b_issue",
+                        "label": { "type": "plain_text", "text": "Related issue" },
+                        "element": { "type": "external_select", "action_id": "a_issue" }
+                    }
+                ]
+            });
+            app.update_block_modal(v2_upd, window, cx);
+            assert_eq!(app.modal_stack.read(cx).depth(), 2);
+            assert_eq!(
+                app.modal_stack.read(cx).frames[1].hash.as_deref(),
+                Some("h2-updated")
+            );
+
+            // Async blocks.suggestions in modal populates V2's BlockKitState.
+            app.request_modal_suggestions(
+                slackless_core::types::BotId::from("B1"),
+                "A1".to_owned(),
+                None,
+                "V2".to_owned(),
+                crate::blockkit::SuggestRequest {
+                    key: "modal-V2/b_issue/a_issue".to_owned(),
+                    action_id: "a_issue".to_owned(),
+                    block_id: "b_issue".to_owned(),
+                    value: "ENG".to_owned(),
+                    attachment: None,
+                },
+                cx,
+            );
+
+            // Back navigation pops V2 and restores V1.
+            app.modal_stack
+                .update(cx, |stack, cx| stack.pop_back(window, cx));
+            assert_eq!(app.modal_stack.read(cx).depth(), 1);
+            assert_eq!(app.modal_stack.read(cx).top_view_id(), Some("V1"));
+
+            // Push V3 then clear all modal views via response_action: "clear".
+            let v3 = crate::blockkit::serde_json::json!({
+                "id": "V3",
+                "root_view_id": "V1",
+                "previous_view_id": "V1",
+                "type": "modal",
+                "title": { "type": "plain_text", "text": "Confirm" },
+                "blocks": []
+            });
+            app.open_block_modal(v3, window, cx);
+            assert_eq!(app.modal_stack.read(cx).depth(), 2);
+            app.handle_modal_submit_result("V3", Ok(ViewSubmitResponse::Clear), window, cx);
+            assert_eq!(app.modal_stack.read(cx).depth(), 0);
+
+            // 2. Workflow details dialog opens cleanly and folds WorkflowTriggerInfoLoaded.
+            app.open_workflow_details(
+                crate::blockkit::WorkflowDetailsRequest {
+                    trigger_id: Some("Ft0DEPLOY".to_owned()),
+                    url: Some("https://slack.com/shortcuts/Ft0DEPLOY/abc".to_owned()),
+                    title: "Deploy production".to_owned(),
+                },
+                window,
+                cx,
+            );
+            assert!(app.workflow_details.is_some());
+            window.close_dialog(cx);
+
+            // 3. Third-party calling apps catalog + launcher dialog + launch flow.
+            let calling_apps = app.calling_apps();
+            assert!(
+                calling_apps.iter().any(|a| a.id == "zoom")
+                    && calling_apps.iter().any(|a| a.id == "meet")
+                    && calling_apps.iter().any(|a| a.id == "teams"),
+                "sample mode should expose Zoom, Google Meet, and Microsoft Teams"
+            );
+            app.launch_calling_app(&calling_apps[0], CallMode::Audio, "Incident", window, cx);
+            app.open_calling_app_dialog(window, cx);
+            window.close_dialog(cx);
+        });
+    });
+    cx.run_until_parked();
+    drop(root);
+}

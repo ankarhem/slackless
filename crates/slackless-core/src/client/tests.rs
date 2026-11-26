@@ -5338,7 +5338,8 @@ async fn rtm_handlers_dnd_huddles_emoji_unknown_and_posted_subtypes() {
         r#"{"type":"saved_added"}"#,
         r#"{"type":"commands_changed"}"#,
         r#"{"type":"user_status_changed","user":{"id":"U5","name":"eve"}}"#,
-        r#"{"type":"view_opened","view":{"id":"V1","type":"modal"}}"#,
+        r#"{"type":"view_opened","title":{"type":"plain_text","text":"Outer Title"},"app_id":"A1","view":{"id":"V1","type":"modal"}}"#,
+        r#"{"type":"view_updated","view":{"id":"V1","type":"modal","hash":"h2"}}"#,
         r#"{"type":"view_updated","view":{"id":"V2","type":"home"}}"#,
         r#"{"type":"view_closed","view":{"id":"V1"}}"#,
     ] {
@@ -5349,22 +5350,40 @@ async fn rtm_handlers_dnd_huddles_emoji_unknown_and_posted_subtypes() {
     let mut saw_cmds = false;
     let mut saw_user = false;
     let mut saw_modal_open = false;
+    let mut saw_modal_update = false;
     let mut saw_home = false;
     let mut saw_modal_close = false;
-    for _ in 0..6 {
+    for _ in 0..7 {
         match next(&mut rx).await {
             Event::SavedLoaded(Ok(_)) => saw_saved = true,
             Event::AppCommands(cmds) if cmds.len() == 1 && cmds[0].name == "deploy" => {
                 saw_cmds = true;
             }
             Event::UsersChanged(ids) if ids == vec![UserId::from("U5")] => saw_user = true,
-            Event::ModalOpened(v) if v["id"] == "V1" => saw_modal_open = true,
+            Event::ModalOpened(v)
+                if v["id"] == "V1"
+                    && v["title"]["text"] == "Outer Title"
+                    && v["app_id"] == "A1" =>
+            {
+                saw_modal_open = true;
+            }
+            Event::ModalUpdated(v) if v["id"] == "V1" && v["hash"] == "h2" => {
+                saw_modal_update = true;
+            }
             Event::AppHomeUpdated(v) if v["id"] == "V2" => saw_home = true,
             Event::ModalClosed(id) if id == "V1" => saw_modal_close = true,
             other => panic!("unexpected event: {other:?}"),
         }
     }
-    assert!(saw_saved && saw_cmds && saw_user && saw_modal_open && saw_home && saw_modal_close);
+    assert!(
+        saw_saved
+            && saw_cmds
+            && saw_user
+            && saw_modal_open
+            && saw_modal_update
+            && saw_home
+            && saw_modal_close
+    );
 
     // posted_message subtypes: allowed subtypes emit MessagePosted, channel_join does NOT.
     for (ts, subtype, expect_posted) in [

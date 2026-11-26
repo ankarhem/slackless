@@ -1708,6 +1708,8 @@ impl App {
                     .auto_grow(1, 1)
             });
             let app_home_kit = cx.new(|_| crate::blockkit::BlockKitState::default());
+            let modal_stack =
+                dialogs::modal::AppModalStack::new(fixtures.clone(), cx.weak_entity(), cx);
             if fixtures.sample {
                 later.update(cx, |later, cx| later.seed(0, &fixtures, cx));
             }
@@ -1912,6 +1914,8 @@ impl App {
                 list_query: String::new(),
                 list_sort: None,
                 app_home_kit,
+                modal_stack,
+                workflow_details: None,
                 fixture_bookmarks: HashMap::new(),
                 #[cfg(test)]
                 os: Rc::new(platform::noop()),

@@ -138,4 +138,12 @@ impl SlackApi {
         ];
         self.call_ok(method::HUDDLES_UPDATE, params).await
     }
+
+    /// `calls.info`: hydrate a third-party `call` block with live participants, title, join URLs,
+    /// and ended state (`F-COLLAB-086..088`).
+    pub async fn calls_info(&self, call_id: &str) -> Result<CallInfo> {
+        let params = vec![("id", call_id.to_owned())];
+        let wire: CallsInfoWire = self.call(method::CALLS_INFO, params).await?.data;
+        Ok(wire.call)
+    }
 }

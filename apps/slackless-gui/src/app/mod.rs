@@ -749,6 +749,10 @@ pub struct App {
     list_sort: Option<(usize, bool)>,
     /// Interactive Block Kit widget state (selects, checkboxes, inputs) for App Home tabs.
     app_home_kit: Entity<crate::blockkit::BlockKitState>,
+    /// Multi-view app modal stack (`view_opened` / `view_updated` / `view_closed` / `views.submit`).
+    modal_stack: Entity<dialogs::modal::AppModalStack>,
+    /// Currently open Workflow Details dialog (`workflows.triggers.info`), if any.
+    workflow_details: Option<Entity<dialogs::workflow::WorkflowDetailsView>>,
     /// Fixture mode: link bookmarks added through the add-link dialog, per channel.
     fixture_bookmarks: HashMap<ChannelId, Vec<bookmarks::Bookmark>>,
     /// Dock badge + native notifications + menu-bar status item (`slackless-platform`).

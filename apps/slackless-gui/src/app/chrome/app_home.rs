@@ -173,6 +173,12 @@ impl App {
                     );
                     let this_action = cx.entity().downgrade();
                     let ch_action = channel.clone();
+                    let (act_bot, act_app, act_team, act_view) = (
+                        bot_id.clone(),
+                        app_id.clone(),
+                        team.clone(),
+                        view_id.clone(),
+                    );
                     let on_action: crate::actions::ActionHandler =
                         Rc::new(move |action, _window, cx| {
                             if let crate::actions::MessageAction::BlockAction { action, .. } =
@@ -180,20 +186,67 @@ impl App {
                             {
                                 let _ = this_action.update(cx, |app, _| {
                                     app.bridge.send(CollabCommand::BlockAction {
-                                        bot: bot_id.clone(),
-                                        app_id: app_id.clone(),
-                                        team: team.clone(),
+                                        bot: act_bot.clone(),
+                                        app_id: act_app.clone(),
+                                        team: act_team.clone(),
                                         action,
                                         container: slackless_core::api::ActionContainer {
                                             channel: ch_action.clone(),
                                             message_ts: Ts::default(),
                                             attachment_id: None,
                                             is_ephemeral: false,
-                                            view_id: Some(view_id.clone()),
+                                            view_id: Some(act_view.clone()),
                                         },
                                     });
                                 });
                             }
+                        });
+                    let this_suggest = cx.entity().downgrade();
+                    let ch_suggest = channel.clone();
+                    let on_suggest: crate::blockkit::SuggestHandler = Rc::new(move |req, cx| {
+                        let _ = this_suggest.update(cx, |app, cx| {
+                            if app.fixtures.sample {
+                                let opts =
+                                    crate::app::dialogs::sample_external_suggestions(&req.value);
+                                app.app_home_kit.update(cx, |kit, cx| {
+                                    kit.set_suggestions(req.key.clone(), opts);
+                                    cx.notify();
+                                });
+                            } else {
+                                let team = team.clone().unwrap_or_else(|| app.workspace_team_id());
+                                app.bridge.send(CollabCommand::BlockSuggestions {
+                                    key: req.key,
+                                    bot: bot_id.clone(),
+                                    app_id: app_id.clone(),
+                                    team,
+                                    action_id: req.action_id,
+                                    block_id: req.block_id,
+                                    value: req.value,
+                                    container: slackless_core::api::ActionContainer {
+                                        channel: ch_suggest.clone(),
+                                        message_ts: Ts::default(),
+                                        attachment_id: req.attachment,
+                                        is_ephemeral: false,
+                                        view_id: Some(view_id.clone()),
+                                    },
+                                });
+                            }
+                        });
+                    });
+                    let this_wf = cx.entity().downgrade();
+                    let on_wf: crate::blockkit::WorkflowDetailsHandler =
+                        Rc::new(move |req, window, cx| {
+                            let _ = this_wf
+                                .update(cx, |app, cx| app.open_workflow_details(req, window, cx));
+                        });
+                    let this_call = cx.entity().downgrade();
+                    let on_call: crate::blockkit::CallRefreshHandler =
+                        Rc::new(move |call_id, cx| {
+                            let _ = this_call.update(cx, |app, _| {
+                                if !app.fixtures.sample {
+                                    app.bridge.send(CollabCommand::FetchCallInfo { call_id });
+                                }
+                            });
                         });
                     let this_link = cx.entity().downgrade();
                     let links: crate::messages::LinkHandler = Rc::new(move |target, window, cx| {
@@ -204,7 +257,10 @@ impl App {
                     let kcx =
                         crate::blockkit::KitCx::new(&self.fixtures, Some(&self.app_home_kit), &ts)
                             .with_links(links)
-                            .dispatching_actions(on_action);
+                            .dispatching_actions(on_action)
+                            .with_suggestions(on_suggest)
+                            .with_workflow_details(on_wf)
+                            .with_call_refresh(on_call);
                     crate::blockkit::render_raw_blocks(&raw_blocks, &kcx, cx).into_any_element()
                 }
             }

@@ -620,10 +620,42 @@ impl<B: Backend> Core<B> {
     pub(super) fn trip_workflow_trigger(&self, url: String, context: serde_json::Value) {
         let ctx = self.ctx();
         self.spawn("workflows.triggers.trip", async move {
-            ctx.backend
+            let resp = ctx
+                .backend
                 .trip_workflow_trigger(url.clone(), context)
                 .await?;
-            ctx.events.emit(Event::WorkflowTripped { url });
+            ctx.events.emit(Event::WorkflowTripped {
+                url,
+                is_slow_workflow: resp.is_slow_workflow,
+                contains_ai_steps: resp.contains_ai_steps,
+            });
+            Ok(())
+        });
+    }
+
+    pub(super) fn fetch_workflow_trigger_info(&self, trigger_id: String) {
+        let ctx = self.ctx();
+        self.spawn("workflows.triggers.info", async move {
+            let info = match ctx.backend.workflow_trigger_info(trigger_id.clone()).await {
+                Ok(info) => Ok(Box::new(info)),
+                Err(e) => {
+                    emit_if_auth_expired(&ctx.events, &e);
+                    Err(e.to_string())
+                }
+            };
+            ctx.events
+                .emit(Event::WorkflowTriggerInfoLoaded { trigger_id, info });
+            Ok(())
+        });
+    }
+
+    pub(super) fn get_modal_view(&self, view_id: String) {
+        let ctx = self.ctx();
+        self.spawn("views.get", async move {
+            let view = ctx.backend.views_get(view_id).await?;
+            if view.is_object() {
+                ctx.events.emit(Event::ModalUpdated(view));
+            }
             Ok(())
         });
     }
@@ -636,17 +668,47 @@ impl<B: Backend> Core<B> {
     ) {
         let ctx = self.ctx();
         self.spawn("views.submit", async move {
-            ctx.backend
-                .views_submit(view_id, hash, state_values)
-                .await?;
+            let outcome = match ctx
+                .backend
+                .views_submit(view_id.clone(), hash, state_values)
+                .await
+            {
+                Ok(resp) => Ok(resp),
+                Err(e) => {
+                    emit_if_auth_expired(&ctx.events, &e);
+                    Err(e.to_string())
+                }
+            };
+            ctx.events
+                .emit(Event::ModalSubmitResult { view_id, outcome });
             Ok(())
         });
     }
 
-    pub(super) fn close_modal(&self, view_id: String, hash: Option<String>) {
+    pub(super) fn close_modal(
+        &self,
+        view_id: String,
+        root_view_id: Option<String>,
+        hash: Option<String>,
+    ) {
         let ctx = self.ctx();
         self.spawn("views.close", async move {
-            ctx.backend.views_close(view_id, hash).await?;
+            ctx.backend.views_close(view_id, root_view_id, hash).await?;
+            Ok(())
+        });
+    }
+
+    pub(super) fn fetch_call_info(&self, call_id: String) {
+        let ctx = self.ctx();
+        self.spawn("calls.info", async move {
+            let call = match ctx.backend.calls_info(call_id.clone()).await {
+                Ok(call) => Ok(Box::new(call)),
+                Err(e) => {
+                    emit_if_auth_expired(&ctx.events, &e);
+                    Err(e.to_string())
+                }
+            };
+            ctx.events.emit(Event::CallInfoLoaded { call_id, call });
             Ok(())
         });
     }

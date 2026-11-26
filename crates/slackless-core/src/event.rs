@@ -221,10 +221,18 @@ pub enum Event {
         pronouns: Option<String>,
         fields: Vec<(String, String)>,
     },
-    /// An app opened or updated an interactive Block Kit modal (`view_opened` / `view_updated`).
+    /// An app opened an interactive Block Kit modal (`view_opened`).
     ModalOpened(serde_json::Value),
+    /// An app updated an interactive Block Kit modal in place (`view_updated` or `views.get`).
+    ModalUpdated(serde_json::Value),
     /// An app closed an interactive Block Kit modal (`view_closed`).
     ModalClosed(String),
+    /// Result of submitting a Block Kit modal (`views.submit`: close, clear, push, update, or
+    /// inline validation errors keyed by `block_id`).
+    ModalSubmitResult {
+        view_id: String,
+        outcome: Result<api::ViewSubmitResponse, String>,
+    },
     /// Cloud-synced drafts fetched via `drafts.list` (`F-CORE-089`).
     CloudDrafts(Vec<api::CloudDraft>),
     /// Dynamic options returned by `blocks.suggestions` (`F-COLLAB-786`).
@@ -311,7 +319,21 @@ pub enum Event {
     /// An app published a fresh Home tab view (`view_updated` with `type: "home"`).
     AppHomeUpdated(serde_json::Value),
     /// A Workflow Builder link trigger was tripped via `workflows.triggers.trip`.
-    WorkflowTripped { url: String },
+    WorkflowTripped {
+        url: String,
+        is_slow_workflow: bool,
+        contains_ai_steps: bool,
+    },
+    /// Detailed workflow trigger metadata loaded via `workflows.triggers.info` (`F-COLLAB-432`).
+    WorkflowTriggerInfoLoaded {
+        trigger_id: String,
+        info: Result<Box<api::WorkflowTriggerInfo>, String>,
+    },
+    /// Third-party call card metadata loaded via `calls.info` (`F-COLLAB-086..088`).
+    CallInfoLoaded {
+        call_id: String,
+        call: Result<Box<api::CallInfo>, String>,
+    },
     /// Starred files, custom collections, and recently deleted items for the Files browser.
     FilesExtrasLoaded {
         favorites: Vec<String>,

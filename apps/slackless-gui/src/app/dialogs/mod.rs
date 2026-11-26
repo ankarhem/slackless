@@ -1,11 +1,14 @@
 //! Modal dialogs, pickers, preferences application, and App overlays.
 
 mod channels;
+pub(super) mod modal;
 mod profile;
 pub(super) mod storage;
 mod usergroups;
+pub(super) mod workflow;
 
 use super::*;
+use slackless_core::types::{BotId, TeamId};
 
 impl App {
     /// The "+" menu's Link item and the bar's "Add a bookmark": the add-link dialog for the
@@ -733,116 +736,130 @@ impl App {
         cx.notify();
     }
 
-    /// Render an app-opened Block Kit modal (`views.open`) and submit via `views.submit` (`F-COLLAB-725`).
+    /// Render an app-opened Block Kit modal (`view_opened` / `views.push`) in the multi-view
+    /// modal stack (`F-COLLAB-600..616`).
     pub(super) fn open_block_modal(
         &mut self,
         view: crate::blockkit::Json,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let view_id = view["id"].as_str().unwrap_or_default().to_owned();
-        if view_id.is_empty() {
-            return;
-        }
-        let hash = view["hash"].as_str().map(str::to_owned);
-        let title = view["title"]["text"]
-            .as_str()
-            .unwrap_or("App modal")
-            .to_owned();
-        let submit_label = view["submit"]["text"].as_str().map(str::to_owned);
-        let close_label = view["close"]["text"]
-            .as_str()
-            .unwrap_or("Cancel")
-            .to_owned();
-        let notify_on_close = view["notify_on_close"].as_bool().unwrap_or(false);
-        let raw_blocks: Vec<crate::blockkit::Json> =
-            view["blocks"].as_array().cloned().unwrap_or_default();
-        let ts = Ts::from(format!("modal-{view_id}"));
-        let kit = cx.new(|_| crate::blockkit::BlockKitState::default());
-        crate::blockkit::prepare_raw_inputs(&kit, &ts, &raw_blocks, window, cx);
-        let fixtures = self.fixtures.clone();
-        let this = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let kcx = crate::blockkit::KitCx::new(&fixtures, Some(&kit), &ts);
-            let body = crate::blockkit::render_raw_blocks(&raw_blocks, &kcx, cx);
-            let this_close = this.clone();
-            let (close_id, close_hash) = (view_id.clone(), hash.clone());
-            let mut footer = h_flex().justify_end().gap_2().pt_3().child(
-                preferences::form_button(
-                    Button::new("modal-close")
-                        .outline()
-                        .label(close_label.clone()),
-                    cx,
-                )
-                .on_click(move |_, window, cx| {
-                    if notify_on_close && let Some(app) = this_close.upgrade() {
-                        app.update(cx, |app, _| {
-                            app.bridge.send(CollabCommand::CloseModal {
-                                view_id: close_id.clone(),
-                                hash: close_hash.clone(),
-                            });
-                        });
-                    }
-                    window.close_dialog(cx);
-                }),
-            );
-            if let Some(submit_text) = &submit_label {
-                let (this_submit, kit_submit, ts_submit, blocks_submit, sub_id, sub_hash) = (
-                    this.clone(),
-                    kit.clone(),
-                    ts.clone(),
-                    raw_blocks.clone(),
-                    view_id.clone(),
-                    hash.clone(),
-                );
-                footer = footer.child(
-                    preferences::form_button(
-                        Button::new("modal-submit")
-                            .primary()
-                            .label(submit_text.clone()),
-                        cx,
-                    )
-                    .on_click(move |_, window, cx| {
-                        match crate::blockkit::collect_modal_state(
-                            &ts_submit,
-                            &blocks_submit,
-                            &kit_submit,
-                            cx,
-                        ) {
-                            Ok(state_values) => {
-                                if let Some(app) = this_submit.upgrade() {
-                                    app.update(cx, |app, _| {
-                                        app.bridge.send(CollabCommand::SubmitModal {
-                                            view_id: sub_id.clone(),
-                                            hash: sub_hash.clone(),
-                                            state_values,
-                                        });
-                                    });
-                                }
-                                window.close_dialog(cx);
-                            }
-                            Err(err) => {
-                                notify("Missing or invalid field", err, window, cx);
-                            }
-                        }
-                    }),
-                );
-            }
-            dialog.title(title.clone()).w(px(540.)).child(
-                v_flex()
-                    .gap_3()
-                    .child(
-                        v_flex()
-                            .id("modal-blocks-body")
-                            .max_h(px(460.))
-                            .overflow_y_scroll()
-                            .child(body),
-                    )
-                    .child(footer),
-            )
+        self.modal_stack
+            .update(cx, |stack, cx| stack.open_view(view, window, cx));
+    }
+
+    /// Update an open Block Kit modal view in place (`view_updated` / `views.get`).
+    pub(super) fn update_block_modal(
+        &mut self,
+        view: crate::blockkit::Json,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.modal_stack
+            .update(cx, |stack, cx| stack.update_view(view, window, cx));
+    }
+
+    /// Close a Block Kit modal view (`view_closed`).
+    pub(super) fn close_block_modal(
+        &mut self,
+        view_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.modal_stack.update(cx, |stack, cx| {
+            stack.apply_modal_closed(view_id, window, cx)
         });
     }
 
+    /// Fold a `views.submit` response into the active modal stack (`push`, `update`, `clear`,
+    /// `close`, or inline per-`block_id` validation `errors`).
+    pub(super) fn handle_modal_submit_result(
+        &mut self,
+        view_id: &str,
+        outcome: Result<slackless_core::api::ViewSubmitResponse, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.modal_stack.update(cx, |stack, cx| {
+            stack.apply_submit_result(view_id, outcome, window, cx)
+        });
+    }
+
+    /// Dispatch `blocks.suggestions` for an `external_select` inside a modal (or return sample
+    /// options in fixture mode).
+    pub(super) fn request_modal_suggestions(
+        &mut self,
+        bot: BotId,
+        app_id: String,
+        team: Option<TeamId>,
+        view_id: String,
+        req: crate::blockkit::SuggestRequest,
+        cx: &mut Context<Self>,
+    ) {
+        if self.fixtures.sample {
+            let options = sample_external_suggestions(&req.value);
+            self.modal_stack
+                .update(cx, |stack, cx| stack.set_suggestions(&req.key, options, cx));
+            return;
+        }
+        let team = team.unwrap_or_else(|| self.workspace_team_id());
+        self.bridge.send(CollabCommand::BlockSuggestions {
+            key: req.key,
+            bot,
+            app_id,
+            team,
+            action_id: req.action_id,
+            block_id: req.block_id,
+            value: req.value,
+            container: slackless_core::api::ActionContainer {
+                channel: self.channel.clone(),
+                message_ts: Ts::default(),
+                attachment_id: req.attachment,
+                is_ephemeral: false,
+                view_id: Some(view_id),
+            },
+        });
+    }
+
+    /// Active workspace team ID fallback for Block Kit actions/suggestions.
+    pub(super) fn workspace_team_id(&self) -> TeamId {
+        self.fixtures
+            .workspaces
+            .get(self.workspace)
+            .or_else(|| self.fixtures.workspaces.first())
+            .map(|t| t.id.clone())
+            .unwrap_or_else(|| TeamId::from("T0"))
+    }
+}
+
+/// Deterministic offline suggestions for `external_select` controls in sample/fixture mode.
+pub(super) fn sample_external_suggestions(query: &str) -> Vec<(String, String)> {
+    let catalog = [
+        ("ENG-101 · Fix OAuth redirect", "ENG-101"),
+        ("ENG-204 · Upgrade GPUI renderer", "ENG-204"),
+        ("OPS-42 · Rotate staging certs", "OPS-42"),
+        ("DES-19 · Modal validation polish", "DES-19"),
+    ];
+    let q = query.trim().to_ascii_lowercase();
+    let mut out: Vec<(String, String)> = catalog
+        .iter()
+        .filter(|(label, val)| {
+            q.is_empty()
+                || label.to_ascii_lowercase().contains(&q)
+                || val.to_ascii_lowercase().contains(&q)
+        })
+        .map(|(l, v)| ((*l).to_owned(), (*v).to_owned()))
+        .collect();
+    if out.is_empty() && !q.is_empty() {
+        out.push((
+            format!("Match for \u{201C}{}\u{201D}", query.trim()),
+            query.trim().to_owned(),
+        ));
+    }
+    out
+}
+
+impl App {
     /// Shift+Esc: ask first while Preferences > Mark as read prompts to confirm (on by
     /// default), then mark everything read.
     pub(super) fn request_mark_all_read(&mut self, window: &mut Window, cx: &mut Context<Self>) {

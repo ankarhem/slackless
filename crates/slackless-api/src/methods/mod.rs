@@ -241,8 +241,12 @@ impl SlackApi {
     }
 
     /// `workflows.triggers.trip`: trigger a Slack Workflow Builder link trigger (`https://slack.com/shortcuts/Ft...`,
-    /// `F-COLLAB-319`, `F-COLLAB-376`). Any resulting modal arrives over the websocket as `view_opened`.
-    pub async fn workflows_triggers_trip(&self, url: &str, context: &Value) -> Result<()> {
+    /// `F-COLLAB-319`, `F-COLLAB-376`, `F-COLLAB-404`). Any resulting modal arrives over the websocket as `view_opened`.
+    pub async fn workflows_triggers_trip(
+        &self,
+        url: &str,
+        context: &Value,
+    ) -> Result<WorkflowTriggerTripResponse> {
         let parsed =
             url::Url::parse(url).map_err(|_| crate::ApiError::UntrustedUrl(url.to_owned()))?;
         if !crate::client::is_trusted_slack_https_url(&parsed) {
@@ -258,7 +262,25 @@ impl SlackApi {
             ),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        self.call_ok(method::WORKFLOWS_TRIGGERS_TRIP, params).await
+        Ok(self
+            .call::<WorkflowTriggerTripResponse>(method::WORKFLOWS_TRIGGERS_TRIP, params)
+            .await?
+            .data)
+    }
+
+    /// `workflows.triggers.info`: fetch trigger metadata and workflow details (`F-COLLAB-432`).
+    pub async fn workflows_triggers_info(&self, trigger_id: &str) -> Result<WorkflowTriggerInfo> {
+        let params = vec![
+            ("trigger_id", trigger_id.to_owned()),
+            ("include_workflow_details", "true".to_owned()),
+            ("_x_reason", "hermes_triggers_ufm".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        let raw: Value = self
+            .call(method::WORKFLOWS_TRIGGERS_INFO, params)
+            .await?
+            .data;
+        Ok(parse_workflow_trigger_info(trigger_id, &raw))
     }
 
     /// One page of `conversations.list`.

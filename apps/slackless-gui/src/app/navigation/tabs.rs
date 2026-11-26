@@ -117,6 +117,11 @@ impl App {
                     return Some(bookmarks::Bookmark::folder(title, bookmark.id.clone()));
                 }
                 let link = bookmark.link.as_deref().filter(|link| !link.is_empty())?;
+                if bookmark.kind.as_deref() == Some("workflow")
+                    || super::links::is_workflow_trigger_url(link)
+                {
+                    return Some(bookmarks::Bookmark::workflow(title, link.to_owned()));
+                }
                 Some(bookmarks::Bookmark::link(title, link.to_owned()))
             })
             .collect()

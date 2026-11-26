@@ -4,7 +4,8 @@ use super::super::*;
 use super::chrome_icon;
 
 impl App {
-    /// The huddle button's chevron: Slack's huddle menu.
+    /// The huddle button's chevron: Slack's huddle & third-party calling app menu
+    /// (`F-COLLAB-078..085`, `F-COLLAB-092..094`).
     pub(in crate::app) fn huddle_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
         let link = self.huddle_link();
@@ -13,27 +14,82 @@ impl App {
         } else {
             "Start huddle"
         };
+        let calling_apps = self.calling_apps();
         Button::new("hdr-huddle-menu")
             .ghost()
             .with_size(Size::XSmall)
             .icon(IconName::ChevronDown)
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
-                let this = this.clone();
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+                let this_huddle = this.clone();
                 let link = link.clone();
-                menu.item(
-                    PopupMenuItem::new(start)
-                        .icon(IconName::Headphones)
-                        .on_click(move |_, window, cx| {
-                            let _ = this.update(cx, |app, cx| app.start_huddle(window, cx));
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new("Copy huddle link")
-                        .icon(IconName::Link)
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(link.clone()))
-                        }),
-                )
+                menu = menu
+                    .item(
+                        PopupMenuItem::new(start)
+                            .icon(IconName::Headphones)
+                            .on_click(move |_, window, cx| {
+                                let _ =
+                                    this_huddle.update(cx, |app, cx| app.start_huddle(window, cx));
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Copy huddle link")
+                            .icon(IconName::Link)
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(link.clone()))
+                            }),
+                    );
+                if !calling_apps.is_empty() {
+                    menu = menu.separator().label("Calling apps");
+                    for calling_app in &calling_apps {
+                        let app_v = calling_app.clone();
+                        let this_v = this.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(format!("Start {} call", calling_app.name))
+                                .icon(IconName::Video)
+                                .on_click(move |_, window, cx| {
+                                    let _ = this_v.update(cx, |app, cx| {
+                                        app.launch_calling_app(
+                                            &app_v,
+                                            slackless_core::domain::calling::CallMode::Video,
+                                            "",
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        );
+                        if calling_app.supports_audio_only {
+                            let app_a = calling_app.clone();
+                            let this_a = this.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(format!("{} audio call", calling_app.name))
+                                    .icon(IconName::Phone)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = this_a.update(cx, |app, cx| {
+                                            app.launch_calling_app(
+                                                &app_a,
+                                                slackless_core::domain::calling::CallMode::Audio,
+                                                "",
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                            );
+                        }
+                    }
+                    let this_dialog = this.clone();
+                    menu = menu.separator().item(
+                        PopupMenuItem::new("More calling options\u{2026}")
+                            .icon(IconName::PhoneCall)
+                            .on_click(move |_, window, cx| {
+                                let _ = this_dialog.update(cx, |app, cx| {
+                                    app.open_calling_app_dialog(window, cx);
+                                });
+                            }),
+                    );
+                }
+                menu
             })
     }
 

@@ -239,6 +239,23 @@ pub enum MessageListEvent {
         channel: ChannelId,
         since: i64,
     },
+    /// An `external_select` / `multi_external_select` element requested live options via
+    /// `blocks.suggestions` (`F-COLLAB-786`).
+    BlockSuggestions {
+        channel: ChannelId,
+        message_ts: Ts,
+        bot: slackless_core::types::BotId,
+        app_id: String,
+        team: Option<slackless_core::types::TeamId>,
+        is_ephemeral: bool,
+        request: crate::blockkit::SuggestRequest,
+    },
+    /// A workflow button or mention requested the Workflow Details dialog (`workflows.triggers.info`).
+    WorkflowDetails(crate::blockkit::WorkflowDetailsRequest),
+    /// A third-party `call` block requested live status hydration (`calls.info`).
+    RefreshCallInfo {
+        call_id: String,
+    },
 }
 
 /// Snapshot the `'static` virtual-list row renderer reads: the current conversation's history
@@ -461,6 +478,21 @@ impl MessageList {
         let kit = self.data.read(cx).kit.clone();
         kit.update(cx, |kit, cx| {
             kit.set_suggestions(key, options);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Cache a hydrated `calls.info` response for live third-party `call` blocks (`F-COLLAB-087`).
+    pub fn set_call_info(
+        &mut self,
+        call_id: String,
+        info: slackless_core::api::CallInfo,
+        cx: &mut Context<Self>,
+    ) {
+        let kit = self.data.read(cx).kit.clone();
+        kit.update(cx, |kit, cx| {
+            kit.set_call_info(call_id, info);
             cx.notify();
         });
         cx.notify();

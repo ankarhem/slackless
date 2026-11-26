@@ -609,3 +609,205 @@ fn collect_modal_state_covers_all_input_types_required_and_validation_errors(
         assert!(err.contains("Contact"), "unexpected err: {err}");
     });
 }
+
+#[gpui::test]
+fn external_select_inline_errors_workflow_and_hydrated_call_blocks_render(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::{Render, Window};
+
+    struct RichBlockHost {
+        fixtures: std::sync::Arc<Fixtures>,
+        kit: Entity<BlockKitState>,
+        blocks: Vec<Json>,
+        on_suggest: SuggestHandler,
+        on_wf: WorkflowDetailsHandler,
+        on_call: CallRefreshHandler,
+    }
+    impl Render for RichBlockHost {
+        fn render(
+            &mut self,
+            window: &mut Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let ts = Ts::from("modal-V_TEST");
+            prepare_raw_inputs(&self.kit, &ts, &self.blocks, window, cx);
+            let kcx = KitCx::new(&self.fixtures, Some(&self.kit), &ts)
+                .with_suggestions(self.on_suggest.clone())
+                .with_workflow_details(self.on_wf.clone())
+                .with_call_refresh(self.on_call.clone());
+            div()
+                .size_full()
+                .p_4()
+                .child(render_raw_blocks(&self.blocks, &kcx, cx))
+        }
+    }
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::init(cx);
+    });
+
+    let blocks = vec![
+        json!({
+            "type": "input",
+            "block_id": "b_title",
+            "label": { "type": "plain_text", "text": "Title" },
+            "element": { "type": "plain_text_input", "action_id": "a_title" }
+        }),
+        json!({
+            "type": "input",
+            "block_id": "b_ext",
+            "label": { "type": "plain_text", "text": "Issue" },
+            "element": {
+                "type": "external_select",
+                "action_id": "a_ext",
+                "min_query_length": 2,
+                "placeholder": { "type": "plain_text", "text": "Pick issue" },
+                "initial_option": {
+                    "text": { "type": "plain_text", "text": "ENG-101" },
+                    "value": "ENG-101"
+                }
+            }
+        }),
+        json!({
+            "type": "input",
+            "block_id": "b_mext",
+            "optional": true,
+            "label": { "type": "plain_text", "text": "Labels" },
+            "element": {
+                "type": "multi_external_select",
+                "action_id": "a_mext",
+                "placeholder": { "type": "plain_text", "text": "Pick labels" }
+            }
+        }),
+        json!({
+            "type": "actions",
+            "block_id": "b_wf",
+            "elements": [
+                {
+                    "type": "workflow_button",
+                    "action_id": "wf_run",
+                    "style": "primary",
+                    "text": { "type": "plain_text", "text": "Deploy now" },
+                    "workflow": {
+                        "trigger": {
+                            "url": "https://slack.com/shortcuts/Ft0123ABC/xyz",
+                            "visible_to_user_ids": ["U0ME"]
+                        }
+                    }
+                },
+                {
+                    "type": "workflow_button",
+                    "action_id": "wf_hidden",
+                    "text": { "type": "plain_text", "text": "Admin only" },
+                    "workflow": {
+                        "trigger": {
+                            "url": "https://slack.com/shortcuts/Ft9999/xyz",
+                            "visible_to_user_ids": ["U0OTHER"]
+                        }
+                    }
+                }
+            ]
+        }),
+        json!({
+            "type": "call",
+            "call_id": "R0CALL1",
+            "call": {
+                "v1": {
+                    "id": "R0CALL1",
+                    "title": "Design Sync",
+                    "join_url": "https://acme.zoom.us/j/5551234",
+                    "desktop_app_join_url": "zoommtg://zoom.us/join?confno=5551234",
+                    "active_participants": [{ "slack_id": "U0ME" }]
+                }
+            }
+        }),
+        json!({
+            "type": "call",
+            "call_id": "R0CALL_END",
+            "call": {
+                "id": "R0CALL_END",
+                "title": "Retro",
+                "date_start": 1700000000,
+                "date_end": 1700001800,
+                "join_url": "https://meet.google.com/abc-defg-hij"
+            }
+        }),
+    ];
+
+    let fixtures = std::sync::Arc::new(crate::fixtures::load());
+    let kit = cx.new(|_| {
+        let mut st = BlockKitState::default();
+        st.set_block_errors(HashMap::from([(
+            "b_title".to_owned(),
+            "Title is already in use.".to_owned(),
+        )]));
+        st.set_suggestions(
+            "modal-V_TEST/b_ext/a_ext".to_owned(),
+            vec![
+                ("ENG-101 · Fix OAuth".to_owned(), "ENG-101".to_owned()),
+                ("ENG-204 · GPUI perf".to_owned(), "ENG-204".to_owned()),
+            ],
+        );
+        st.set_call_info(
+            "R0CALL1".to_owned(),
+            slackless_core::api::CallInfo {
+                id: "R0CALL1".to_owned(),
+                title: Some("Design Sync (Hydrated)".to_owned()),
+                date_start: Some(1700000000),
+                date_end: None,
+                join_url: Some("https://acme.zoom.us/j/5551234".to_owned()),
+                desktop_app_join_url: Some("zoommtg://zoom.us/join?confno=5551234".to_owned()),
+                users: vec![slackless_core::api::CallParticipant {
+                    slack_id: Some("U0ME".to_owned()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        st
+    });
+
+    let kit_for_check = kit.clone();
+    let blocks_for_check = blocks.clone();
+    let (_view, cx) = cx.add_window_view(move |_, _| RichBlockHost {
+        fixtures,
+        kit,
+        blocks,
+        on_suggest: Rc::new(|_, _| {}),
+        on_wf: Rc::new(|_, _, _| {}),
+        on_call: Rc::new(|_, _| {}),
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let st = kit_for_check.read(cx);
+        assert_eq!(st.block_error("b_title"), Some("Title is already in use."));
+        assert!(
+            st.suggestion_queries
+                .contains_key("modal-V_TEST/b_ext/a_ext")
+        );
+        assert!(
+            st.suggestion_queries
+                .contains_key("modal-V_TEST/b_mext/a_mext")
+        );
+        assert_eq!(
+            st.call_info("R0CALL1").and_then(|c| c.title.as_deref()),
+            Some("Design Sync (Hydrated)")
+        );
+
+        let ts = Ts::from("modal-V_TEST");
+        let errs =
+            collect_modal_state_errors(&ts, &blocks_for_check, &kit_for_check, cx).unwrap_err();
+        assert!(errs.contains_key("b_title"));
+        assert!(
+            !errs.contains_key("b_ext"),
+            "initial_option satisfies required external_select"
+        );
+    });
+}

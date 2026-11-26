@@ -930,8 +930,27 @@ pub trait CollabBackend: Clone + Send + Sync + 'static {
         &self,
         _url: String,
         _context: serde_json::Value,
-    ) -> impl Future<Output = api::Result<()>> + Send {
-        async { Ok(()) }
+    ) -> impl Future<Output = api::Result<api::WorkflowTriggerTripResponse>> + Send {
+        async { Ok(api::WorkflowTriggerTripResponse::default()) }
+    }
+    /// Fetch workflow trigger metadata and workflow details (`workflows.triggers.info`).
+    fn workflow_trigger_info(
+        &self,
+        trigger_id: String,
+    ) -> impl Future<Output = api::Result<api::WorkflowTriggerInfo>> + Send {
+        async move {
+            Ok(api::WorkflowTriggerInfo {
+                trigger_id,
+                ..Default::default()
+            })
+        }
+    }
+    /// Fetch the latest modal view payload (`views.get`).
+    fn views_get(
+        &self,
+        _view_id: String,
+    ) -> impl Future<Output = api::Result<serde_json::Value>> + Send {
+        async { Ok(serde_json::Value::Null) }
     }
     /// Submit a Block Kit modal view (`views.submit`).
     fn views_submit(
@@ -939,13 +958,14 @@ pub trait CollabBackend: Clone + Send + Sync + 'static {
         _view_id: String,
         _hash: Option<String>,
         _state_values: serde_json::Value,
-    ) -> impl Future<Output = api::Result<()>> + Send {
-        async { Ok(()) }
+    ) -> impl Future<Output = api::Result<api::ViewSubmitResponse>> + Send {
+        async { Ok(api::ViewSubmitResponse::Close) }
     }
     /// Close a Block Kit modal view (`views.close`).
     fn views_close(
         &self,
         _view_id: String,
+        _root_view_id: Option<String>,
         _hash: Option<String>,
     ) -> impl Future<Output = api::Result<()>> + Send {
         async { Ok(()) }
@@ -956,6 +976,18 @@ pub trait CollabBackend: Clone + Send + Sync + 'static {
         _req: BlockSuggestionsRequest<'_>,
     ) -> impl Future<Output = api::Result<Vec<(String, String)>>> + Send {
         async { Ok(Vec::new()) }
+    }
+    /// Hydrate a third-party `call` block (`calls.info`).
+    fn calls_info(
+        &self,
+        call_id: String,
+    ) -> impl Future<Output = api::Result<api::CallInfo>> + Send {
+        async move {
+            Ok(api::CallInfo {
+                id: call_id,
+                ..Default::default()
+            })
+        }
     }
 }
 

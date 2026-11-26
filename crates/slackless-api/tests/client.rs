@@ -2631,3 +2631,252 @@ async fn lists_do_not_swallow_auth_expired_and_search_modules_files_uses_files_f
         assert_eq!(opts, vec![("Item 1".to_owned(), "v1".to_owned())]);
     }
 }
+
+#[tokio::test]
+async fn modal_views_workflows_and_calls_info_endpoints() {
+    use slackless_api::{ViewSubmitResponse, extract_workflow_trigger_id};
+
+    // 1. views.submit response_action variants: push, update, clear, errors (ok:true and ok:false), close
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/views.submit"))
+            .and(body_string_contains("view_id=V_PUSH"))
+            .and(body_string_contains("_x_reason=submit-view"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "response_action": "push",
+                "view": {
+                    "id": "V_STEP2",
+                    "root_view_id": "V_PUSH",
+                    "previous_view_id": "V_PUSH",
+                    "type": "modal",
+                    "title": { "type": "plain_text", "text": "Step 2" }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let pushed = api
+            .views_submit("V_PUSH", Some("h1"), &json!({}))
+            .await
+            .unwrap();
+        match pushed {
+            ViewSubmitResponse::Push(view) => {
+                assert_eq!(view["id"], "V_STEP2");
+                assert_eq!(view["previous_view_id"], "V_PUSH");
+            }
+            other => panic!("expected Push, got {other:?}"),
+        }
+
+        Mock::given(method("POST"))
+            .and(path("/api/views.submit"))
+            .and(body_string_contains("view_id=V_ERR_TRUE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "response_action": "errors",
+                "errors": { "title_block": "Title must be at least 5 characters" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let errs = api
+            .views_submit("V_ERR_TRUE", None, &json!({}))
+            .await
+            .unwrap();
+        match errs {
+            ViewSubmitResponse::Errors(map) => {
+                assert_eq!(
+                    map.get("title_block").map(String::as_str),
+                    Some("Title must be at least 5 characters")
+                );
+            }
+            other => panic!("expected Errors, got {other:?}"),
+        }
+
+        Mock::given(method("POST"))
+            .and(path("/api/views.submit"))
+            .and(body_string_contains("view_id=V_ERR_FALSE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": false,
+                "error": "validation_errors",
+                "errors": { "email_block": "Invalid work email" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let errs2 = api
+            .views_submit("V_ERR_FALSE", None, &json!({}))
+            .await
+            .unwrap();
+        match errs2 {
+            ViewSubmitResponse::Errors(map) => {
+                assert_eq!(
+                    map.get("email_block").map(String::as_str),
+                    Some("Invalid work email")
+                );
+            }
+            other => panic!("expected Errors on ok:false validation_errors, got {other:?}"),
+        }
+
+        Mock::given(method("POST"))
+            .and(path("/api/views.submit"))
+            .and(body_string_contains("view_id=V_CLEAR"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "response_action": "clear",
+                "view": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            api.views_submit("V_CLEAR", None, &json!({})).await.unwrap(),
+            ViewSubmitResponse::Clear
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/api/views.submit"))
+            .and(body_string_contains("view_id=V_UPD"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "response_action": "update",
+                "view": { "id": "V_UPD", "type": "modal", "hash": "h2" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            api.views_submit("V_UPD", None, &json!({})).await.unwrap(),
+            ViewSubmitResponse::Update(v) if v["hash"] == "h2"
+        ));
+
+        Mock::given(method("POST"))
+            .and(path("/api/views.get"))
+            .and(body_string_contains("view_id=V_GET1"))
+            .and(body_string_contains("_x_reason=fetchView"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "view": { "id": "V_GET1", "type": "modal" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let fetched = api.views_get("V_GET1").await.unwrap();
+        assert_eq!(fetched["id"], "V_GET1");
+
+        Mock::given(method("POST"))
+            .and(path("/api/views.close"))
+            .and(body_string_contains("view_id=V_STEP2"))
+            .and(body_string_contains("root_view_id=V_PUSH"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        api.views_close("V_STEP2", Some("V_PUSH"), Some("h2"))
+            .await
+            .unwrap();
+    }
+
+    // 2. workflows.triggers.info + trip metadata + trigger_id extraction
+    {
+        assert_eq!(
+            extract_workflow_trigger_id("https://slack.com/shortcuts/Ft0123ABC/deadbeef"),
+            Some("Ft0123ABC".to_owned())
+        );
+        assert_eq!(
+            extract_workflow_trigger_id("https://acme.slack.com/shortcuts/Ft999"),
+            Some("Ft999".to_owned())
+        );
+        assert_eq!(
+            extract_workflow_trigger_id("https://evil.example/shortcuts/Ft999"),
+            None
+        );
+
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/workflows.triggers.info"))
+            .and(body_string_contains("trigger_id=Ft0123ABC"))
+            .and(body_string_contains("include_workflow_details=true"))
+            .and(body_string_contains("_x_reason=hermes_triggers_ufm"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "trigger": {
+                    "id": "Ft0123ABC",
+                    "name": "Deploy to Production",
+                    "description": "Collects release notes and triggers deploy",
+                    "type": "shortcut",
+                    "shortcut_url": "https://slack.com/shortcuts/Ft0123ABC/hash",
+                    "workflow": {
+                        "id": "Wf001",
+                        "app_id": "A0WF",
+                        "is_published": true,
+                        "collaborators": ["U1", "U2"],
+                        "steps": [
+                            { "title": "Collect form responses", "description": "Ask for release tag" },
+                            { "function": { "id": "FnDeploy", "title": "Trigger CI deploy" } }
+                        ]
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let info = api.workflows_triggers_info("Ft0123ABC").await.unwrap();
+        assert_eq!(info.trigger_id, "Ft0123ABC");
+        assert_eq!(info.name, "Deploy to Production");
+        assert_eq!(info.workflow_id.as_deref(), Some("Wf001"));
+        assert_eq!(info.steps.len(), 2);
+        assert_eq!(info.steps[1].title, "Trigger CI deploy");
+        assert_eq!(info.collaborators, vec!["U1", "U2"]);
+        assert_eq!(info.is_published, Some(true));
+
+        Mock::given(method("POST"))
+            .and(path("/api/workflows.triggers.trip"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "is_slow_workflow": true,
+                "contains_ai_steps": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let trip = api
+            .workflows_triggers_trip("https://slack.com/shortcuts/Ft0123ABC/hash", &json!({}))
+            .await
+            .unwrap();
+        assert!(trip.is_slow_workflow);
+        assert!(trip.contains_ai_steps);
+    }
+
+    // 3. calls.info hydration
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/calls.info"))
+            .and(body_string_contains("id=R0CALL123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "call": {
+                    "id": "R0CALL123",
+                    "title": "Incident Bridge",
+                    "date_start": 1700000000,
+                    "join_url": "https://acme.zoom.us/j/987654321",
+                    "desktop_app_join_url": "zoommtg://zoom.us/join?confno=987654321",
+                    "users": [
+                        { "slack_id": "U1" },
+                        { "external_id": "ext-2", "display_name": "Guest Bob" }
+                    ],
+                    "channels": ["C1"]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let call = api.calls_info("R0CALL123").await.unwrap();
+        assert_eq!(call.id, "R0CALL123");
+        assert_eq!(call.title.as_deref(), Some("Incident Bridge"));
+        assert_eq!(call.users.len(), 2);
+        assert_eq!(call.users[1].display_name.as_deref(), Some("Guest Bob"));
+    }
+}

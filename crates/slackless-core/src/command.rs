@@ -446,6 +446,8 @@ pub enum CollabCommand {
         url: String,
         context: serde_json::Value,
     },
+    /// Fetch workflow trigger metadata and step details (`workflows.triggers.info`, `F-COLLAB-432`).
+    FetchWorkflowTriggerInfo { trigger_id: String },
     /// Dispatch a Block Kit interactive element action (`blocks.actions`).
     BlockAction {
         bot: BotId,
@@ -467,6 +469,8 @@ pub enum CollabCommand {
         value: String,
         container: api::ActionContainer,
     },
+    /// Fetch a Block Kit modal view by ID (`views.get`).
+    GetModalView { view_id: String },
     /// Submit an interactive Block Kit modal (`views.submit`).
     SubmitModal {
         view_id: String,
@@ -476,8 +480,11 @@ pub enum CollabCommand {
     /// Dismiss an interactive Block Kit modal (`views.close`).
     CloseModal {
         view_id: String,
+        root_view_id: Option<String>,
         hash: Option<String>,
     },
+    /// Hydrate a third-party `call` block via `calls.info` (`F-COLLAB-086..088`).
+    FetchCallInfo { call_id: String },
     /// Transcribe a locally cached video/audio file with the configured local transcription
     /// provider, persist it in SQLite, and index it in `message_fts` under carrying messages.
     TranscribeMediaFile {

@@ -18,7 +18,7 @@ pub(super) use pickers::{
 };
 #[cfg(test)]
 pub(super) use selects::rich_options;
-pub(super) use selects::{checkboxes, filtered_conversations, radios, select};
+pub(super) use selects::{checkboxes, external_select, filtered_conversations, radios, select};
 
 /// Fixture mode has no app to receive `block_actions`: log the interaction and toast it.
 pub(super) fn log_action(key: &str, detail: &str, window: &mut Window, cx: &mut App) {
@@ -172,29 +172,12 @@ pub(super) fn block_element(
     let kind = element["type"].as_str().unwrap_or_default();
     match kind {
         "button" => button(element, block, key, kcx).into_any_element(),
-        "workflow_button" => workflow_button(element, block, key, kcx).into_any_element(),
-        "static_select" | "external_select" | "multi_static_select" | "multi_external_select" => {
-            let mut opts = options(element);
-            if matches!(kind, "external_select" | "multi_external_select") {
-                if let Some(live) = kcx
-                    .kit
-                    .and_then(|kit| kit.read(cx).suggestions.get(&key).cloned())
-                {
-                    opts = live;
-                } else if let Some(on_suggest) = kcx.on_suggest.clone() {
-                    let action_id = element["action_id"].as_str().unwrap_or_default().to_owned();
-                    let block_id = block["block_id"].as_str().unwrap_or_default().to_owned();
-                    let key_c = key.clone();
-                    if opts.is_empty() {
-                        opts.push((
-                            "Load options\u{2026}".to_owned(),
-                            "__slackless_load__".to_owned(),
-                        ));
-                    }
-                    let _ = (on_suggest, action_id, block_id, key_c);
-                }
-            }
-            select(element, block, key, opts, kcx, cx)
+        "workflow_button" => workflow_button(element, block, key, kcx, cx).into_any_element(),
+        "static_select" | "multi_static_select" => {
+            select(element, block, key, options(element), kcx, cx)
+        }
+        "external_select" | "multi_external_select" => {
+            external_select(element, block, key, kcx, cx)
         }
         "users_select" | "multi_users_select" => {
             let users = kcx

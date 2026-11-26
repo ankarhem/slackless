@@ -290,6 +290,29 @@ fn link_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div 
         .title_link
         .clone()
         .or_else(|| attachment.from_url.clone());
+    let call_provider = open_url
+        .as_deref()
+        .and_then(slackless_core::domain::calling::call_provider_for_url);
+    let call_action = call_provider.and_then(|provider| {
+        let href = open_url.clone()?;
+        let target = LinkTarget::Url(href.into());
+        let links = kcx.links.clone();
+        Some(
+            h_flex().items_center().gap_2().pt_1().child(
+                Button::new(SharedString::from(format!(
+                    "bk-{}-att-{n}-call-join",
+                    kcx.ts.as_str()
+                )))
+                .primary()
+                .with_size(Size::XSmall)
+                .icon(IconName::Video)
+                .label(format!("Join {provider} call"))
+                .on_click(move |_, window, cx| {
+                    messages::route_link(links.as_ref(), target.clone(), window, cx)
+                }),
+            ),
+        )
+    });
     let thumb = attachment
         .image_url
         .as_deref()
@@ -388,6 +411,7 @@ fn link_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div 
                 .gap_1()
                 .children(title)
                 .children(description)
+                .children(call_action)
                 .children(site),
         )
         .children(thumb)

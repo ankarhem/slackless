@@ -292,6 +292,25 @@ impl SlackApi {
         Ok(())
     }
 
+    /// Calls `method` and returns the raw decoded JSON object without rejecting `ok: false`.
+    /// Used by `views.submit` where Slack can return field validation `errors` on `ok: false`.
+    pub(crate) async fn call_raw_json(
+        &self,
+        method: &str,
+        params: Params,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .send_with_retry(|| self.build_request(method, &params))
+            .await?;
+        let status = resp.status();
+        let body = resp.bytes().await?;
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(value) => Ok(value),
+            Err(_) if !status.is_success() => Err(status_error(status, &body)),
+            Err(e) => Err(ApiError::Decode(e)),
+        }
+    }
+
     /// Posts JSON to Slack's Edge cache API (`https://edgeapi.slack.com/cache/<team>/<path>`),
     /// attaching `token` in the JSON body and the `d` session cookie (docs/research/api-search.md).
     pub(crate) async fn call_edge_json<T: DeserializeOwned>(

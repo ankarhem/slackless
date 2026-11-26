@@ -158,9 +158,11 @@ impl<B: Backend> Core<B> {
                         r#type.as_str(),
                         "view_opened" | "view_open" | "view_updated" | "view_update"
                     ) {
-                        let view = raw.get("view").cloned().unwrap_or_else(|| raw.clone());
+                        let view = merge_view_envelope(raw);
                         if view.get("type").and_then(serde_json::Value::as_str) == Some("home") {
                             self.events.emit(Event::AppHomeUpdated(view));
+                        } else if matches!(r#type.as_str(), "view_updated" | "view_update") {
+                            self.events.emit(Event::ModalUpdated(view));
                         } else {
                             self.events.emit(Event::ModalOpened(view));
                         }
@@ -169,6 +171,7 @@ impl<B: Backend> Core<B> {
                             .get("view")
                             .and_then(|v| v.get("id"))
                             .or_else(|| raw.get("view_id"))
+                            .or_else(|| raw.get("root_view_id"))
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or_default()
                             .to_owned();
@@ -479,6 +482,44 @@ pub(super) fn refresh_target(event: &SlackEvent) -> Option<ChannelId> {
         | SlackEvent::ChannelLeft(e) => Some(e.channel.clone()),
         _ => None,
     }
+}
+
+/// Merge top-level Slack `view_opened`/`view_updated` envelope fields (`title`, `submit`, `close`,
+/// `app_id`, `app_installed_team_id`, `root_view_id`, `previous_view_id`, `view_id`,
+/// `client_token`) into `raw["view"]` when absent inside the nested view object
+/// (`docs/research/api-apps-blocks.md`).
+pub(super) fn merge_view_envelope(raw: &serde_json::Value) -> serde_json::Value {
+    let mut view = raw.get("view").cloned().unwrap_or_else(|| raw.clone());
+    let Some(obj) = view.as_object_mut() else {
+        return view;
+    };
+    if !obj.contains_key("id")
+        && let Some(id) = raw.get("view_id").filter(|v| !v.is_null())
+    {
+        obj.insert("id".to_owned(), id.clone());
+    }
+    if !obj.contains_key("type")
+        && let Some(kind) = raw.get("view_type").filter(|v| !v.is_null())
+    {
+        obj.insert("type".to_owned(), kind.clone());
+    }
+    for key in [
+        "title",
+        "submit",
+        "close",
+        "app_id",
+        "app_installed_team_id",
+        "root_view_id",
+        "previous_view_id",
+        "client_token",
+        "bot_id",
+    ] {
+        let missing = obj.get(key).is_none_or(serde_json::Value::is_null);
+        if missing && let Some(val) = raw.get(key).filter(|v| !v.is_null()) {
+            obj.insert(key.to_owned(), val.clone());
+        }
+    }
+    view
 }
 
 /// The peer of an IM channel as stored; `None` unless the channel is an IM with a known peer.

@@ -691,25 +691,42 @@ impl CollabBackend for SlackApi {
         &self,
         url: String,
         context: serde_json::Value,
-    ) -> api::Result<()> {
+    ) -> api::Result<api::WorkflowTriggerTripResponse> {
         self.workflows_triggers_trip(&url, &context).await
+    }
+    async fn workflow_trigger_info(
+        &self,
+        trigger_id: String,
+    ) -> api::Result<api::WorkflowTriggerInfo> {
+        self.workflows_triggers_info(&trigger_id).await
+    }
+    async fn views_get(&self, view_id: String) -> api::Result<serde_json::Value> {
+        SlackApi::views_get(self, &view_id).await
     }
     async fn views_submit(
         &self,
         view_id: String,
         hash: Option<String>,
         state_values: serde_json::Value,
-    ) -> api::Result<()> {
+    ) -> api::Result<api::ViewSubmitResponse> {
         SlackApi::views_submit(self, &view_id, hash.as_deref(), &state_values).await
     }
-    async fn views_close(&self, view_id: String, hash: Option<String>) -> api::Result<()> {
-        SlackApi::views_close(self, &view_id, hash.as_deref()).await
+    async fn views_close(
+        &self,
+        view_id: String,
+        root_view_id: Option<String>,
+        hash: Option<String>,
+    ) -> api::Result<()> {
+        SlackApi::views_close(self, &view_id, root_view_id.as_deref(), hash.as_deref()).await
     }
     async fn block_suggestions(
         &self,
         req: BlockSuggestionsRequest<'_>,
     ) -> api::Result<Vec<(String, String)>> {
         self.blocks_suggestions_for(&req).await
+    }
+    async fn calls_info(&self, call_id: String) -> api::Result<api::CallInfo> {
+        SlackApi::calls_info(self, &call_id).await
     }
 }
 

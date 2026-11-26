@@ -46,6 +46,7 @@ pub mod method {
     pub const BOOKMARKS_LIST: &str = "bookmarks.list";
     pub const BOOKMARKS_REMOVE: &str = "bookmarks.remove";
     pub const BOTS_INFO: &str = "bots.info";
+    pub const CALLS_INFO: &str = "calls.info";
     pub const CANVASES_ACCESS_DELETE: &str = "canvases.access.delete";
     pub const CANVASES_ACCESS_SET: &str = "canvases.access.set";
     pub const CANVASES_CREATE: &str = "canvases.create";
@@ -179,7 +180,9 @@ pub mod method {
     pub const USERS_PROFILE_SET: &str = "users.profile.set";
     pub const USERS_SET_PHOTO: &str = "users.setPhoto";
     pub const VIEWS_CLOSE: &str = "views.close";
+    pub const VIEWS_GET: &str = "views.get";
     pub const VIEWS_SUBMIT: &str = "views.submit";
+    pub const WORKFLOWS_TRIGGERS_INFO: &str = "workflows.triggers.info";
     pub const WORKFLOWS_TRIGGERS_TRIP: &str = "workflows.triggers.trip";
 }
 

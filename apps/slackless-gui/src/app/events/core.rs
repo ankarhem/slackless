@@ -299,12 +299,27 @@ impl App {
                 });
             }
             Event::ModalOpened(view) => self.open_block_modal(view.clone(), window, cx),
-            Event::ModalClosed(_) => window.close_dialog(cx),
+            Event::ModalUpdated(view) => self.update_block_modal(view.clone(), window, cx),
+            Event::ModalClosed(view_id) => self.close_block_modal(view_id, window, cx),
+            Event::ModalSubmitResult { view_id, outcome } => {
+                self.handle_modal_submit_result(view_id, outcome.clone(), window, cx);
+            }
             Event::CloudDrafts(cloud_drafts) => self.on_cloud_drafts_event(cloud_drafts, cx),
             Event::BlockSuggestions { key, options } => {
-                self.messages.update(cx, |list, cx| {
-                    list.set_block_suggestions(key.clone(), options.clone(), cx);
-                });
+                if key.starts_with("modal-") {
+                    self.modal_stack.update(cx, |stack, cx| {
+                        stack.set_suggestions(key, options.clone(), cx);
+                    });
+                } else if key.starts_with("home-") {
+                    self.app_home_kit.update(cx, |kit, cx| {
+                        kit.set_suggestions(key.clone(), options.clone());
+                        cx.notify();
+                    });
+                } else {
+                    self.messages.update(cx, |list, cx| {
+                        list.set_block_suggestions(key.clone(), options.clone(), cx);
+                    });
+                }
             }
             Event::ChannelCanvasCreated { .. }
             | Event::CanvasLoaded { .. }
@@ -364,14 +379,42 @@ impl App {
             Event::AppHomeLoaded { .. } | Event::AppHomeUpdated(_) => {
                 self.on_app_home_event(event, cx)
             }
-            Event::WorkflowTripped { .. } => {
-                notify(
-                    "Workflow started",
-                    "Workflow trigger dispatched.",
-                    window,
-                    cx,
-                );
+            Event::WorkflowTripped {
+                is_slow_workflow,
+                contains_ai_steps,
+                ..
+            } => {
+                let detail = match (*is_slow_workflow, *contains_ai_steps) {
+                    (true, true) => "Workflow started (AI steps running — this may take a moment).",
+                    (true, false) => {
+                        "Workflow started — this workflow may take a moment to finish."
+                    }
+                    (false, true) => "Workflow with AI steps started.",
+                    (false, false) => "Workflow trigger dispatched.",
+                };
+                notify("Workflow started", detail, window, cx);
             }
+            Event::WorkflowTriggerInfoLoaded { trigger_id, info } => {
+                if let Some(view) = self.workflow_details.clone() {
+                    let mapped = info.as_ref().map(|b| (**b).clone()).map_err(Clone::clone);
+                    view.update(cx, |v, cx| v.apply_loaded(trigger_id, mapped, cx));
+                }
+            }
+            Event::CallInfoLoaded { call_id, call } => match call {
+                Ok(info) => {
+                    let call_info = (**info).clone();
+                    self.messages.update(cx, |list, cx| {
+                        list.set_call_info(call_id.clone(), call_info.clone(), cx);
+                    });
+                    self.app_home_kit.update(cx, |kit, cx| {
+                        kit.set_call_info(call_id.clone(), call_info);
+                        cx.notify();
+                    });
+                }
+                Err(err) => {
+                    notify("Call update failed", err.clone(), window, cx);
+                }
+            },
             _ => {}
         }
     }
