@@ -63,6 +63,10 @@ pub enum ChannelDetailsEvent {
     },
     /// A member row: open the person's profile panel (after the dialog closes).
     OpenProfile(UserId),
+    /// Export this channel's locally archived messages as Markdown (`markdown = true`) or JSON.
+    Export { channel: ChannelId, markdown: bool },
+    /// Start background history + thread backfill for this channel.
+    Backfill(ChannelId),
 }
 
 /// Which of the dialog's tabs shows: the About cards or the member list.

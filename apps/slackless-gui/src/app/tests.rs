@@ -2262,3 +2262,231 @@ fn wave1_and_wave2_gui_secret_guard_link_scrubber_stealth_and_stt_provider(
     });
     drop(root);
 }
+
+#[gpui::test]
+fn cross_workspace_search_jump_storage_backfill_progress_and_export_engine(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui_kit::base::Root;
+    use slackless_core::{BackfillStatus, ChannelBackfillProgress, WorkspaceBackfillProgress};
+    use std::cell::RefCell;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let fx = Arc::new(fixtures::workspace(0));
+        let app = App::new(fx, CoreBridge::offline(), window, cx);
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            assert_eq!(app.workspace, 0);
+            assert!(
+                app.fixtures.workspaces.len() >= 2,
+                "fixture mode should provide at least two workspaces for cross-workspace jump test"
+            );
+
+            // 1. Cross-workspace search jump switches workspace and selects the target channel.
+            let target_ws_id = app.fixtures.workspaces[1].id.clone();
+            let ws1_fx = fixtures::workspace(1);
+            let target_ch = ws1_fx.channels[0].id.clone();
+            let target_ts = ws1_fx
+                .messages
+                .get(&target_ch)
+                .and_then(|msgs| msgs.first())
+                .map(|m| m.ts.clone())
+                .unwrap_or_else(|| Ts::from("1700000001.000000"));
+
+            app.open_message_in_workspace(&target_ws_id, target_ch.clone(), target_ts, window, cx);
+            assert_eq!(app.workspace, 1);
+            assert_eq!(app.channel, target_ch);
+
+            // 2. Event::BackfillProgress updates workspace state, preferences, and storage dialog opens cleanly.
+            let progress = WorkspaceBackfillProgress {
+                workspace: target_ws_id.clone(),
+                status: BackfillStatus::Running,
+                paused: false,
+                active_channel: Some(target_ch.clone()),
+                total_channels: 2,
+                completed_channels: 1,
+                pages_fetched: 3,
+                messages_stored: 120,
+                threads_fetched: 2,
+                replies_stored: 8,
+                channels: vec![ChannelBackfillProgress {
+                    channel: target_ch.clone(),
+                    channel_name: Some("#general".into()),
+                    status: BackfillStatus::Running,
+                    pages_fetched: 3,
+                    messages_stored: 120,
+                    threads_fetched: 2,
+                    replies_stored: 8,
+                    oldest_ts: None,
+                    newest_ts: None,
+                    complete: false,
+                    last_error: None,
+                }],
+            };
+            app.on_core_event(&Event::BackfillProgress(progress.clone()), window, cx);
+            assert_eq!(app.ws.backfill_progress.as_ref(), Some(&progress));
+
+            app.open_storage_dialog(window, cx);
+            window.close_dialog(cx);
+
+            // 3. Searching from workspace index 1 works in both CurrentWorkspace and AllWorkspaces
+            //    scopes, and jumping back to workspace 0 switches workspaces accurately.
+            let ws0_id = app.fixtures.workspaces[0].id.clone();
+            let ws0_fx = fixtures::workspace(0);
+            let ws0_ch = ws0_fx.channels[0].id.clone();
+            let ws0_ts = ws0_fx
+                .messages
+                .get(&ws0_ch)
+                .and_then(|msgs| msgs.first())
+                .map(|m| m.ts.clone())
+                .unwrap_or_else(|| Ts::from("1700000001.000000"));
+            let ws1_word = ws1_fx
+                .messages
+                .values()
+                .flatten()
+                .flat_map(|m| m.text.split_whitespace())
+                .find(|w| w.len() >= 5 && w.chars().all(|c| c.is_ascii_alphabetic()))
+                .expect("workspace 1 should contain a searchable word")
+                .to_owned();
+
+            app.run_message_search(ws1_word.clone(), cx);
+            let results_entity = app.results.clone();
+            assert_eq!(
+                results_entity.read(cx).active_workspace_for_test(),
+                target_ws_id
+            );
+
+            // 4. Fixture channel & thread export on workspace 1 uses workspace 1's ID/name and
+            //    includes file transcripts in thread exports.
+            let mut fx1_export = fixtures::workspace(1);
+            let fid = slackless_core::types::FileId::from("F_CLIP_WS1");
+            fx1_export
+                .file_transcripts
+                .insert(fid.clone(), "Spoken note in ws1 thread".into());
+            let export_ch = fx1_export.channels[0].id.clone();
+            let root_ts = Ts::from("1700999000.000100");
+            fx1_export
+                .messages
+                .entry(export_ch.clone())
+                .or_default()
+                .push(Message {
+                    ts: root_ts.clone(),
+                    text: "Clip root".into(),
+                    files: vec![File {
+                        id: fid,
+                        name: Some("clip.mp4".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+            let ch_doc = super::dialogs::storage::build_fixture_channel_export(
+                &fx1_export,
+                1,
+                &export_ch,
+                "#ch",
+            );
+            assert_eq!(ch_doc.workspace, target_ws_id.as_str());
+            assert_eq!(
+                ch_doc.workspace_name.as_deref(),
+                Some(fx1_export.workspaces[1].name.as_str())
+            );
+            let th_doc = super::dialogs::storage::build_fixture_thread_export(
+                &fx1_export,
+                1,
+                &export_ch,
+                "#ch",
+                &root_ts,
+            );
+            assert_eq!(th_doc.workspace, target_ws_id.as_str());
+            assert_eq!(
+                th_doc.messages[0].files[0].transcript.as_deref(),
+                Some("Spoken note in ws1 thread")
+            );
+
+            // Jump from workspace 1 back to workspace 0 via open_message_in_workspace.
+            app.open_message_in_workspace(&ws0_id, ws0_ch.clone(), ws0_ts, window, cx);
+            assert_eq!(app.workspace, 0);
+            assert_eq!(app.channel, ws0_ch);
+        });
+    });
+    cx.run_until_parked();
+
+    // Verify workspace-1 search actually produced workspace-1 hits in CurrentWorkspace scope,
+    // and switching to AllWorkspaces returns hits attributed to their respective workspaces.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            let ws1_id = app.fixtures.workspaces[1].id.clone();
+            app.switch_workspace(1, window, cx);
+            let ws1_word = app
+                .fixtures
+                .messages
+                .values()
+                .flatten()
+                .flat_map(|m| m.text.split_whitespace())
+                .find(|w| w.len() >= 5 && w.chars().all(|c| c.is_ascii_alphabetic()))
+                .unwrap()
+                .to_owned();
+            app.run_message_search(ws1_word, cx);
+            app.results.update(cx, |v, cx| {
+                v.set_scope(crate::search::SearchScope::CurrentWorkspace, cx);
+            });
+            assert_eq!(app.results.read(cx).active_workspace_for_test(), ws1_id);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        app.read_with(cx, |app, cx| {
+            let ws1_id = &app.fixtures.workspaces[1].id;
+            let hits = app.results.read(cx).local_hits_for_test();
+            assert!(
+                !hits.is_empty(),
+                "CurrentWorkspace search on workspace index 1 must return hits"
+            );
+            assert!(hits.iter().all(|h| h.workspace == *ws1_id));
+        });
+    });
+
+    // Now test AllWorkspaces scope from workspace 1 with a word present in workspace 0.
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            let ws0_fx = fixtures::workspace(0);
+            let ws0_word = ws0_fx
+                .messages
+                .values()
+                .flatten()
+                .flat_map(|m| m.text.split_whitespace())
+                .find(|w| w.len() >= 6 && w.chars().all(|c| c.is_ascii_alphabetic()))
+                .expect("workspace 0 searchable word")
+                .to_owned();
+            app.run_message_search(ws0_word, cx);
+            app.results.update(cx, |v, cx| {
+                v.set_scope(crate::search::SearchScope::AllWorkspaces, cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        app.read_with(cx, |app, cx| {
+            let ws0_id = &app.fixtures.workspaces[0].id;
+            let hits = app.results.read(cx).local_hits_for_test();
+            assert!(
+                hits.iter().any(|h| h.workspace == *ws0_id),
+                "AllWorkspaces search from workspace 1 must find workspace 0 hits"
+            );
+        });
+    });
+    drop(root);
+}

@@ -521,26 +521,95 @@ impl ChannelDetails {
         let danger = crate::theme::danger_text(cx);
 
         let channel = self.channel.clone();
-        let mut actions = v_flex().flex_none().gap_2().child(
-            h_flex()
-                .id("details-leave")
-                .flex_none()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .cursor_pointer()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(danger)
-                .hover(move |row| row.bg(danger.alpha(0.12)))
-                .child(Icon::new(IconName::LogOut).size(px(16.)))
-                .child("Leave channel")
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    cx.emit(ChannelDetailsEvent::Leave(channel.clone()))
-                })),
-        );
+        let backfill_ch = self.channel.clone();
+        let export_md_ch = self.channel.clone();
+        let export_json_ch = self.channel.clone();
+        let mut actions = v_flex()
+            .flex_none()
+            .gap_2()
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Local archive & export"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_foreground)
+                            .child("Backfill full channel + thread history into SQLite, or export archived messages."),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .flex_wrap()
+                            .gap_2()
+                            .pt_1()
+                            .child(
+                                Button::new("details-backfill-channel")
+                                    .outline()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::RotateCcw)
+                                    .label("Backfill history")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(ChannelDetailsEvent::Backfill(backfill_ch.clone()));
+                                    })),
+                            )
+                            .child(
+                                Button::new("details-export-md")
+                                    .outline()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::Download)
+                                    .label("Export Markdown\u{2026}")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(ChannelDetailsEvent::Export {
+                                            channel: export_md_ch.clone(),
+                                            markdown: true,
+                                        });
+                                    })),
+                            )
+                            .child(
+                                Button::new("details-export-json")
+                                    .outline()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::FileCode)
+                                    .label("Export JSON\u{2026}")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(ChannelDetailsEvent::Export {
+                                            channel: export_json_ch.clone(),
+                                            markdown: false,
+                                        });
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .id("details-leave")
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(danger)
+                    .hover(move |row| row.bg(danger.alpha(0.12)))
+                    .child(Icon::new(IconName::LogOut).size(px(16.)))
+                    .child("Leave channel")
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(ChannelDetailsEvent::Leave(channel.clone()))
+                    })),
+            );
 
         // Convert public channel or group DM to private channel (`F-CORE-049`, `F-CORE-072`).
         if (!conversation.is_private && !conversation.is_general && !conversation.is_im)

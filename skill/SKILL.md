@@ -14,6 +14,8 @@ Two kinds of commands exist.
 - **Offline archive commands** (`search`, `read`, `thread`, `channels`, `dms`, `users`, `digest`, `threads`, `revisions`, `export`, `stats`, `vacuum`, `huddle devices`, `huddle cameras`, `huddle screens`, `auth status`) work offline against the local SQLite archive (or local host media devices). Archive read commands always exit 0; with no known workspace they print empty results (plus a stderr hint in human mode) instead of failing.
 - **Live Slack commands** (`send`, `reply`, `edit`, `delete`, `react`, `unreact`, `upload`, `thread --live`, `mark-read`, `mark-thread`, `pins`, `pin`, `unpin`, `schedule`, `scheduled`, `saved`, `files`, `download`, `canvas`, `list`, `status`, `unread`, `watch`, `backfill`, `huddle join|link|invite`) talk to Slack using a stored session (`slackless auth login` or the desktop app). Every REST command is one deterministic invocation; `send`, `reply`, `edit`, `schedule`, and `canvas comment` accept `-` as `<TEXT>` to read multi-line bodies from stdin. `watch` opens a live websocket and streams NDJSON events until interrupted (or `--count N`); `huddle join` connects natively to Amazon Chime audio until interrupted or `--duration N`. `slackless update` checks for and installs new Slackless releases from GitHub Releases (updating both `Slackless.app` and the CLI).
 
+- **MCP server** (`slackless mcp`) exposes the local archive and live messaging actions over standard JSON-RPC 2.0 stdio for MCP-compatible AI clients (Claude Desktop, Claude Code, Cursor, etc.).
+
 ## Setup and auth
 
 Sign-in is interactive: `slackless auth login` (or the desktop app's first launch) opens Slack's own sign-in page in a window, and a human completes it (email code, SSO, 2FA). Do not run it unattended; ask the user to sign in when `auth status` reports `signed_in: false`. The CLI and the desktop app share the stored session. macOS may ask once to let the `slackless` binary read the Keychain item.
@@ -797,6 +799,45 @@ Native Amazon Chime huddles from the terminal:
 - `join`: connects to Slack `rooms.join` + Chime DTLS-SRTP media until Ctrl+C or `--duration SECS`; under `--json`, streams NDJSON state/data events (`{ "event": "state", "phase", "channel", "call_id", "muted", "packets_sent", "packets_received", "pongs_sent", "error", "udp_blocked" }`).
 - `link`: fetches shareable huddle URL (`rooms.getLink`) -> `{ "ok": true, "channel", "url" }`.
 - `invite`: rings a workspace member (`rooms.notifyMember`) -> `{ "ok": true, "channel", "user" }`.
+
+---
+
+### Model Context Protocol (MCP) server
+
+#### mcp
+
+```sh
+slackless mcp [--workspace TEAM_ID]
+```
+
+Runs a lightweight JSON-RPC 2.0 stdio MCP server (`initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`). Pass `--workspace TEAM_ID` to set a default workspace when multiple archives exist.
+
+Exposed tools:
+
+| Tool              | Mode          | Summary                                                                                          |
+| ----------------- | ------------- | ------------------------------------------------------------------------------------------------ |
+| `list_workspaces` | Offline       | Stored sessions and local SQLite archives with message counts and default workspace              |
+| `list_channels`   | Offline       | Channels and/or DMs for a workspace (`kind`: `all`/`channels`/`dms`, optional `filter`)          |
+| `search_messages` | Offline       | Local FTS5 search over messages, file names, and audio/video transcripts (single or all-workspace) |
+| `read_channel`    | Offline/Live  | Recent or windowed channel/DM messages (`limit`, `since`, `before`, `include_deleted`, `live`)   |
+| `read_thread`     | Offline/Live  | Thread root and replies (`channel`, `thread_ts`, optional `live`, `limit`)                       |
+| `get_transcript`  | Offline       | Fetch stored audio/video file transcript by `file_id`                                            |
+| `send_message`    | Live          | Post a message (`chat.postMessage`) with pre-send secret detection and local archive echo        |
+| `reply_thread`    | Live          | Reply in a thread (`chat.postMessage` + `thread_ts`, optional `reply_broadcast`)                 |
+| `add_reaction`    | Live          | Add an emoji reaction (`reactions.add`)                                                          |
+
+Example MCP client configuration (Claude Desktop, Cursor, Claude Code):
+
+```json
+{
+  "mcpServers": {
+    "slackless": {
+      "command": "slackless",
+      "args": ["mcp"]
+    }
+  }
+}
+```
 
 ---
 

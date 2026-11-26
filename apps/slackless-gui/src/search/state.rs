@@ -7,7 +7,8 @@ use slackless_core::SharedStore;
 use slackless_core::api::{
     RemoteFilePage, RemoteMessageHit, RemoteMessagePage, SearchSort as ApiSearchSort,
 };
-use slackless_core::store::{HuddleTranscriptSegment, SearchFilters, SearchSort, StoredMessage};
+use slackless_core::search::{UnifiedSearchHit, UnifiedTranscriptHit};
+use slackless_core::store::{SearchFilters, SearchSort};
 use slackless_core::types::{ChannelId, File, TeamId, Ts, UserId};
 
 use crate::fixtures::Fixtures;
@@ -15,7 +16,7 @@ use crate::fixtures::Fixtures;
 /// Most local hits listed per query.
 pub(super) const RESULT_LIMIT: usize = 50;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SearchTab {
     Messages,
     Transcripts,
@@ -25,15 +26,37 @@ pub enum SearchTab {
     Dms,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SearchSource {
     Local,
     Remote,
 }
 
+/// Whether local FTS5 search targets only the active workspace or all stored workspaces.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SearchScope {
+    #[default]
+    CurrentWorkspace,
+    AllWorkspaces,
+}
+
+/// One workspace store registered for cross-workspace local FTS5 search.
+#[derive(Clone)]
+pub struct SearchWorkspaceSource {
+    pub team_id: TeamId,
+    pub name: String,
+    pub store: SharedStore,
+}
+
 pub enum SearchEvent {
     Close,
     Open {
+        channel: ChannelId,
+        ts: Ts,
+    },
+    /// Jump to a message in another workspace (switches workspace, selects channel, reveals `ts`).
+    OpenInWorkspace {
+        workspace: TeamId,
         channel: ChannelId,
         ts: Ts,
     },
@@ -43,6 +66,14 @@ pub enum SearchEvent {
     OpenProfile(UserId),
     /// Open a locally archived huddle transcript matched in the Huddles search tab.
     OpenTranscript {
+        call_id: String,
+        channel: ChannelId,
+        highlight_segment_id: Option<i64>,
+        highlight_query: Option<String>,
+    },
+    /// Open a locally archived huddle transcript belonging to another workspace.
+    OpenTranscriptInWorkspace {
+        workspace: TeamId,
         call_id: String,
         channel: ChannelId,
         highlight_segment_id: Option<i64>,
@@ -66,19 +97,23 @@ pub struct SearchView {
     pub(super) fixtures: Arc<Fixtures>,
     pub(super) archive: Option<SharedStore>,
     pub(super) workspace: TeamId,
+    /// All known workspace archives (active + parked live workspaces, or all fixture workspaces)
+    /// searched when `scope == SearchScope::AllWorkspaces`.
+    pub(super) workspace_sources: Vec<SearchWorkspaceSource>,
+    pub(super) scope: SearchScope,
     pub(super) query: String,
     pub(super) filters: SearchFilters,
     pub(super) tab: SearchTab,
     pub(super) source: SearchSource,
     pub(super) sort: SearchSort,
     pub(super) remote_auto: bool,
-    /// Instant local FTS5 hits.
-    pub(super) local_results: Vec<StoredMessage>,
+    /// Instant local FTS5 hits (single-workspace or unified cross-workspace).
+    pub(super) local_results: Vec<UnifiedSearchHit>,
     pub(super) local_error: Option<String>,
     /// Monotonic counter so stale async local FTS5 queries are discarded when a newer query starts.
     pub(super) local_gen: u64,
     /// Instant local FTS5 huddle transcript hits (text-only; EN + SV diacritic-folding).
-    pub(super) transcript_results: Vec<HuddleTranscriptSegment>,
+    pub(super) transcript_results: Vec<UnifiedTranscriptHit>,
     /// Opt-in remote Slack message hits (`search.modules.messages`).
     pub(super) remote_messages: Vec<RemoteMessageHit>,
     pub(super) remote_messages_total: usize,
@@ -116,6 +151,8 @@ impl SearchView {
             fixtures,
             archive,
             workspace,
+            workspace_sources: Vec::new(),
+            scope: SearchScope::CurrentWorkspace,
             query: String::new(),
             filters: SearchFilters::default(),
             tab: SearchTab::Messages,
@@ -143,6 +180,35 @@ impl SearchView {
         })
     }
 
+    /// Register all available workspace stores (active + parked live stores or sample workspaces)
+    /// for cross-workspace local FTS5 search.
+    pub fn set_workspace_sources(
+        &mut self,
+        sources: Vec<SearchWorkspaceSource>,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace_sources = sources;
+        if self.scope == SearchScope::AllWorkspaces && !self.query.is_empty() {
+            self.run_local(cx);
+        }
+        cx.notify();
+    }
+
+    /// Switch local FTS5 search scope between the active workspace and all stored workspaces.
+    pub fn set_scope(&mut self, scope: SearchScope, cx: &mut Context<Self>) {
+        if self.scope == scope {
+            return;
+        }
+        self.scope = scope;
+        if scope == SearchScope::AllWorkspaces {
+            self.source = SearchSource::Local;
+        }
+        if !self.query.is_empty() {
+            self.run_local(cx);
+        }
+        cx.notify();
+    }
+
     /// Honor Preferences → Advanced → Search exclusions (comma-separated channel names).
     pub fn set_excluded_channels(&mut self, csv: &str) {
         self.excluded_channels = csv
@@ -157,9 +223,30 @@ impl SearchView {
         self.include_deleted = include;
     }
 
+    /// Point this view at the active workspace's `TeamId` (especially when workspace index > 0).
+    pub fn set_workspace(&mut self, workspace: TeamId, cx: &mut Context<Self>) {
+        if self.workspace != workspace {
+            self.workspace = workspace;
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn active_workspace_for_test(&self) -> TeamId {
+        self.workspace.clone()
+    }
+
+    #[cfg(test)]
+    pub fn local_hits_for_test(&self) -> &[UnifiedSearchHit] {
+        &self.local_results
+    }
+
     /// Live refresh: the query and its results stay; names come from `fixtures`.
+    /// Preserves `self.workspace` once initialized so workspace index > 0 is never clobbered.
     pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
-        if let Some(team) = fixtures.workspaces.first() {
+        if self.workspace.as_str().is_empty()
+            && let Some(team) = fixtures.workspaces.first()
+        {
             self.workspace = team.id.clone();
         }
         self.fixtures = fixtures;

@@ -18,7 +18,7 @@
 - **Permanent local archive & offline FTS5 search** — Every message, edit, and deletion observed is stored permanently in a zlib-compressed SQLite archive (`~194 MiB` for 148k messages), with instant offline search (`in:`, `from:`, `has:`, `before:`, `after:`) that outlives Slack's 90-day retention wall.
 - **Native Amazon Chime Huddles** — Pluggable hardware media backend (`ScreenCaptureKit` + `AVFoundation` + `VideoToolbox` H.264 High/CABAC + `VTPixelTransferSession` GPU scaling + runtime-gated HW AV1 decode on M3+ + zero-copy `420f` Metal surfaces + parallel `SCScreenshotManager` thumbnails + async Apple Vision ANE / 4× Metal bokeh blur + CoreAudio `VoiceProcessingIO` hardware AEC/NS/AGC on macOS, with portable `cpal`/`sonora`/software fallback for future Linux/Windows ports), parallel per-track remote video decoders, Opus FEC/DTX & CoreAudio hot-plug, macOS 14.2+ CoreAudio system audio tap, smooth Bézier drawing, live captions, and floating reactions.
 - **Daily-driver Slack parity** — Multi-workspace switcher, Slack Connect, full Block Kit, Canvases, Lists (CSV/JSON import & export, item comment threads with `@mention` autocomplete), dual-track H.264/AAC Clips, VIP breakthrough & Focus mode, opt-in macOS Calendar status sync, native macOS notifications, menu bar item, and `slack://` deep links.
-- **Headless CLI & AI agent skill** — Scriptable `slackless` binary sharing the same local archive and macOS Keychain session, emitting single-line `--json` for automation and agents ([`skill/SKILL.md`](skill/SKILL.md)).
+- **Headless CLI, MCP server & AI agent skill** — Scriptable `slackless` binary sharing the same local archive and macOS Keychain session, emitting single-line `--json` for automation and exposing a built-in stdio MCP server (`slackless mcp`) for AI agents ([`skill/SKILL.md`](skill/SKILL.md)).
 
 ## Performance Benchmarks
 
@@ -83,6 +83,21 @@ slackless stats --breakdown && slackless vacuum   # inspect & compact local arch
 ```
 
 See [`skill/SKILL.md`](skill/SKILL.md) for the full command reference and `--json` schemas.
+
+### MCP Server (`slackless mcp`)
+
+`slackless mcp` runs a lightweight JSON-RPC 2.0 stdio Model Context Protocol server exposing offline archive search/reads (`list_workspaces`, `list_channels`, `search_messages`, `read_channel`, `read_thread`, `get_transcript`) and live write actions (`send_message`, `reply_thread`, `add_reaction`). Configure it in any MCP client (Claude Desktop, Claude Code, Cursor):
+
+```json
+{
+  "mcpServers": {
+    "slackless": {
+      "command": "slackless",
+      "args": ["mcp"]
+    }
+  }
+}
+```
 
 ## Workspace Layout
 

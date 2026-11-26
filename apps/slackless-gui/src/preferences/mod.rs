@@ -56,6 +56,14 @@ pub enum PreferencesEvent {
     CheckForUpdates,
     /// User clicked "Download & restart" in Preferences -> Advanced (`F-SHELL-163`).
     InstallUpdate,
+    /// Open the Archive & Storage modal dialog showing per-channel backfill progress.
+    OpenStorageDialog,
+    /// Start background archive backfill for the entire active workspace.
+    StartWorkspaceBackfill,
+    /// Pause active background archive backfill.
+    PauseBackfill,
+    /// Resume paused background archive backfill.
+    ResumeBackfill,
 }
 
 /// Accessor for a checkbox's flag.
@@ -78,6 +86,7 @@ pub struct Preferences {
     pub(super) custom_accent_hex: Entity<TextareaState>,
     pub(super) slack_theme_import: Entity<TextareaState>,
     pub(super) storage_stats: Option<StorageInfo>,
+    pub(super) backfill_progress: Option<slackless_core::WorkspaceBackfillProgress>,
     pub(super) cli_status_note: Option<String>,
     pub(super) update_state: crate::updater::UpdateState,
     pub(super) available_update: Option<crate::updater::ReleaseInfo>,
@@ -249,6 +258,7 @@ impl Preferences {
                 custom_accent_hex,
                 slack_theme_import,
                 storage_stats: None,
+                backfill_progress: None,
                 cli_status_note: None,
                 update_state: crate::updater::UpdateState::Idle,
                 available_update: None,
@@ -272,6 +282,21 @@ impl Preferences {
     /// Update the local SQLite & media cache metrics shown in Preferences -> Advanced.
     pub fn set_storage_stats(&mut self, stats: Option<StorageInfo>, cx: &mut Context<Self>) {
         self.storage_stats = stats;
+        cx.notify();
+    }
+
+    /// Snapshot of the latest local SQLite & media cache metrics (if loaded).
+    pub fn storage_stats_snapshot(&self) -> Option<StorageInfo> {
+        self.storage_stats.clone()
+    }
+
+    /// Update the live workspace backfill progress shown in Preferences -> Advanced.
+    pub fn set_backfill_progress(
+        &mut self,
+        progress: Option<slackless_core::WorkspaceBackfillProgress>,
+        cx: &mut Context<Self>,
+    ) {
+        self.backfill_progress = progress;
         cx.notify();
     }
 

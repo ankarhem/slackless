@@ -87,6 +87,55 @@ impl Preferences {
         let excluded_input = text_input_box_for(&self.excluded_channels, true, false, m, cx)
             .w_full()
             .max_w(px(420.));
+        let open_storage_dialog = self
+            .btn(
+                Button::new("adv-open-storage")
+                    .outline()
+                    .label("Archive & backfill\u{2026}"),
+            )
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::OpenStorageDialog)));
+        let backfill_btn = {
+            let status = self
+                .backfill_progress
+                .as_ref()
+                .map(|p| p.status)
+                .unwrap_or_default();
+            match status {
+                slackless_core::BackfillStatus::Running => self
+                    .btn(
+                        Button::new("adv-backfill-pause")
+                            .outline()
+                            .label("Pause backfill"),
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::PauseBackfill))),
+                slackless_core::BackfillStatus::Paused => self
+                    .btn(
+                        Button::new("adv-backfill-resume")
+                            .primary()
+                            .label("Resume backfill"),
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::ResumeBackfill))),
+                _ => self
+                    .btn(
+                        Button::new("adv-backfill-start")
+                            .outline()
+                            .label("Backfill workspace"),
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(PreferencesEvent::StartWorkspaceBackfill);
+                    })),
+            }
+        };
+        let backfill_note = self.backfill_progress.as_ref().map(|p| {
+            format!(
+                "Backfill: {} · {}/{} channels complete · {} messages ({} thread replies)",
+                p.status.label(),
+                p.completed_channels,
+                p.total_channels,
+                p.messages_stored,
+                p.replies_stored,
+            )
+        });
         let compact_db = self
             .btn(
                 Button::new("adv-compact-db")
@@ -162,6 +211,9 @@ impl Preferences {
                 .border_color(border)
                 .bg(card_bg)
                 .child(body)
+                .when_some(backfill_note, |col, note| {
+                    col.child(div().text_xs().text_color(muted).child(note))
+                })
                 .child(
                     h_flex()
                         .items_center()
@@ -173,6 +225,8 @@ impl Preferences {
                                 .items_center()
                                 .gap_2()
                                 .flex_wrap()
+                                .child(open_storage_dialog)
+                                .child(backfill_btn)
                                 .child(compact_db)
                                 .child(prune_media),
                         )

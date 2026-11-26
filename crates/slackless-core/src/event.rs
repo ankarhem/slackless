@@ -333,6 +333,8 @@ pub enum Event {
         file_id: crate::types::FileId,
         error: String,
     },
+    /// Live per-channel & per-workspace archive backfill progress update.
+    BackfillProgress(crate::backfill::WorkspaceBackfillProgress),
     /// A non-fatal failure worth surfacing.
     Error(String),
 }

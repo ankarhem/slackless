@@ -92,6 +92,11 @@ impl App {
                     parked.state.offline_queued = *count;
                 }
             }
+            Event::BackfillProgress(progress) => {
+                if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
+                    parked.state.backfill_progress = Some(progress.clone());
+                }
+            }
             Event::OfflineMutationFailed(failed) => {
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut)
                     && !parked
