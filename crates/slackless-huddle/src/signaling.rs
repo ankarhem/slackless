@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flate2::Compression;
@@ -49,7 +49,13 @@ pub fn install_default_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// TLS settings for the signaling WebSocket, built on first use (the root store copies ~150
+/// webpki roots) and shared by every huddle join and content share after that.
 fn tls_connector() -> Result<Connector> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    if let Some(config) = CONFIG.get() {
+        return Ok(Connector::Rustls(Arc::clone(config)));
+    }
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
@@ -60,7 +66,8 @@ fn tls_connector() -> Result<Connector> {
     .map_err(|e| HuddleError::Signaling(format!("tls config failed: {e}")))?
     .with_root_certificates(roots)
     .with_no_client_auth();
-    Ok(Connector::Rustls(Arc::new(config)))
+    let config = CONFIG.get_or_init(|| Arc::new(config));
+    Ok(Connector::Rustls(Arc::clone(config)))
 }
 
 impl ChimeSignalClient {
