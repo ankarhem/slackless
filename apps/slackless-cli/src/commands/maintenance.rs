@@ -679,9 +679,6 @@ pub(crate) async fn cmd_archive_index_semantic(
     workspace: Option<&TeamId>,
     args: ArchiveIndexSemanticArgs,
 ) -> Result<ExitCode> {
-    if args.status {
-        return emit_semantic_model_status(ctx, args.model.into());
-    }
     let model = EmbeddingModel::from(args.model);
 
     let mut setup = detect_embedding_model_setup(model);

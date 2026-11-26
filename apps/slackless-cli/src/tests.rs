@@ -637,8 +637,10 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
     assert!(Cli::try_parse_from(["slackless", "upload", "#eng"]).is_err());
     assert!(Cli::try_parse_from(["slackless", "schedule", "#eng", "hi"]).is_err());
     assert!(Cli::try_parse_from(["slackless", "export", "#eng", "--format", "xml"]).is_err());
-    // Unknown models, transcribers, and saved filters are usage errors before anything runs.
+    // Unknown models, transcribers, and saved filters, and the retired `index-semantic
+    // --status` (use `archive semantic-model status`), are usage errors before anything runs.
     for argv in [
+        vec!["slackless", "archive", "index-semantic", "--status"],
         vec!["slackless", "search", "q", "--semantic", "--model", "bogus"],
         vec![
             "slackless",

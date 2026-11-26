@@ -1167,8 +1167,6 @@ fn canvas_share_target_and_post_validation_enforce_xor_dedup_and_non_empty() {
         target,
         CanvasShareTarget::Channels(vec![ChannelId::from("C_ENG"), ChannelId::from("C_OPS")])
     );
-    assert!(validate_canvas_share_post(&target, false).is_ok());
-    assert!(validate_canvas_share_post(&target, true).is_ok());
 
     // Valid users with trimming and deduplication.
     let user_target =
@@ -1177,12 +1175,6 @@ fn canvas_share_target_and_post_validation_enforce_xor_dedup_and_non_empty() {
     assert_eq!(
         user_target,
         CanvasShareTarget::Users(vec![UserId::from("U1"), UserId::from("U2")])
-    );
-    assert!(validate_canvas_share_post(&user_target, false).is_ok());
-    assert!(
-        validate_canvas_share_post(&user_target, true)
-            .expect_err("--post with users must fail")
-            .contains("--channel")
     );
 
     // XOR errors: neither or both specified.

@@ -474,9 +474,6 @@ pub(crate) struct ArchiveIndexSemanticArgs {
     /// Clear existing vectors and re-embed every archived document from scratch.
     #[arg(long)]
     pub(crate) rebuild: bool,
-    /// Print semantic model and index status without indexing.
-    #[arg(long)]
-    pub(crate) status: bool,
 }
 
 #[derive(Args)]

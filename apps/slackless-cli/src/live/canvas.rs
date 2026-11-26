@@ -307,18 +307,6 @@ pub(crate) fn parse_canvas_share_target(
     }
 }
 
-/// Validate that `--post` is only requested when sharing with channels.
-#[cfg(test)]
-pub(crate) fn validate_canvas_share_post(
-    target: &CanvasShareTarget,
-    post: bool,
-) -> std::result::Result<(), String> {
-    if post && matches!(target, CanvasShareTarget::Users(_)) {
-        return Err("--post can only be used with --channel".to_owned());
-    }
-    Ok(())
-}
-
 pub(crate) fn format_canvas_delete_result(canvas_id: &str) -> (serde_json::Value, String) {
     let json = serde_json::json!({
         "ok": true,

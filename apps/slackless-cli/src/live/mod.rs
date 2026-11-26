@@ -46,7 +46,7 @@ pub(crate) use canvas::{
     format_canvas_comments, format_canvas_delete_result, format_canvas_meta, format_canvas_read,
     format_canvas_resolve_result, format_canvas_share_result, format_canvas_unshare_result,
     parse_canvas_resolve_action, parse_canvas_share_target, render_canvas_html_fallback,
-    should_fallback_canvas_html, validate_canvas_comment_args, validate_canvas_share_post,
+    should_fallback_canvas_html, validate_canvas_comment_args,
 };
 #[cfg(test)]
 pub(crate) use channels::{
