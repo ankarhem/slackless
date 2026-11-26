@@ -16,7 +16,7 @@ use slackless_core::maintenance::{
 use slackless_core::types::FileId;
 
 use super::downloads::active_fetcher;
-use super::video_player::{sanitize_secs, transcribe_media};
+use super::video_player::{refresh_media_views, sanitize_secs, transcribe_media};
 
 /// User-configurable byte cap for `$TMPDIR/slackless-media/` (`0` = unlimited), set from
 /// Preferences via [`set_media_cache_policy`].
@@ -189,7 +189,7 @@ pub fn toggle_pause_audio(file_id: &str, window: &mut Window, cx: &mut App) {
             None
         }
     };
-    window.refresh();
+    refresh_media_views(window, cx);
     if let Some((generation, tick_gen)) = kick {
         spawn_audio_progress_loop(generation, tick_gen, window, cx);
     }
@@ -202,14 +202,14 @@ pub fn seek_audio(file_id: &str, secs: f64, window: &mut Window, cx: &mut App) {
         .seek_for(file_id, secs)
         .is_some()
     {
-        window.refresh();
+        refresh_media_views(window, cx);
     }
 }
 
 /// Cycle playback speed (`1x -> 1.5x -> 2x -> 1x`) on the currently active audio clip.
 pub fn cycle_audio_rate(file_id: &str, window: &mut Window, cx: &mut App) -> Option<f32> {
     let rate = cx.default_global::<MediaPlayer>().cycle_rate_for(file_id)?;
-    window.refresh();
+    refresh_media_views(window, cx);
     Some(rate)
 }
 
@@ -220,14 +220,14 @@ pub fn toggle_audio_mute(file_id: &str, window: &mut Window, cx: &mut App) {
         .toggle_mute_for(file_id)
         .is_some()
     {
-        window.refresh();
+        refresh_media_views(window, cx);
     }
 }
 
 /// Stop any active audio playback immediately.
 pub fn stop_audio(window: &mut Window, cx: &mut App) {
     cx.default_global::<MediaPlayer>().stop_all();
-    window.refresh();
+    refresh_media_views(window, cx);
 }
 
 fn spawn_audio_progress_loop(generation: u64, tick_gen: u64, window: &mut Window, cx: &mut App) {
@@ -262,10 +262,10 @@ async fn run_audio_progress_loop(
                 let st = player.state();
                 if st.failed || st.ended {
                     mgr.audio = None;
-                    window.refresh();
+                    refresh_media_views(window, cx);
                     return false;
                 }
-                window.refresh();
+                refresh_media_views(window, cx);
                 if st.playing {
                     ever_playing = true;
                     startup_ticks = 0;
@@ -451,7 +451,7 @@ pub fn toggle_audio(
         fallback_duration_ms: duration_ms,
         loading: true,
     });
-    window.refresh();
+    refresh_media_views(window, cx);
 
     let cache_id = file_id.clone();
     let fetch_url = url.clone();
@@ -497,13 +497,13 @@ pub fn toggle_audio(
                                 window,
                                 cx,
                             );
-                            window.refresh();
+                            refresh_media_views(window, cx);
                             Some(tick_gen)
                         }
                         Err(e) => {
                             mgr.audio = None;
                             crate::actions::notify("Audio playback failed", e, window, cx);
-                            window.refresh();
+                            refresh_media_views(window, cx);
                             None
                         }
                     }

@@ -16,10 +16,10 @@ use std::time::Duration;
 
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    AnyElement, App, Bounds, Global, Hsla, ImageSource, InteractiveElement as _, IntoElement as _,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement as _, Pixels,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, canvas, div, px, relative,
-    rgb,
+    AnyElement, App, Bounds, EntityId, Global, Hsla, ImageSource, InteractiveElement as _,
+    IntoElement as _, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement as _,
+    Pixels, SharedString, StatefulInteractiveElement as _, Styled as _, Window, WindowId, canvas,
+    div, px, relative, rgb,
 };
 use slackless_core::huddle::{
     NativeVideoPlayer, TranscriptionProvider, resolve_local_file_provider,
@@ -77,10 +77,11 @@ pub struct InlineVideoMeta {
     pub taken_at: Option<i64>,
 }
 
-/// Snapshot rendered by the floating mini-player / picture-in-picture dock.
+/// Snapshot rendered by the floating mini-player / picture-in-picture dock: the playing clip's
+/// metadata is shared, not copied, on every frame it shows.
 #[derive(Clone, Debug)]
 pub struct PipVideoSnapshot {
-    pub meta: InlineVideoMeta,
+    pub meta: Rc<InlineVideoMeta>,
     pub snapshot: InlineVideoSnapshot,
 }
 
@@ -95,9 +96,10 @@ struct ActiveInlineVideo {
     generation: u64,
     tick_gen: u64,
     file_id: String,
-    meta: InlineVideoMeta,
+    meta: Rc<InlineVideoMeta>,
     loading: bool,
     player: Option<NativeVideoPlayer>,
+    /// The newest frame, copied once per tick (or playback control); renders read it.
     last_frame: Option<Arc<VideoSurface>>,
     last_painted_epoch: u64,
     inline_in_viewport: bool,
@@ -218,9 +220,8 @@ fn snapshot_from_active(active: &ActiveInlineVideo) -> Option<InlineVideoSnapsho
             surface: active.last_frame.clone(),
         });
     }
-    let player = active.player.as_ref()?;
-    let st = player.state();
-    let surface = copy_player_surface(player).or_else(|| active.last_frame.clone());
+    let st = active.player.as_ref()?.state();
+    let surface = active.last_frame.clone();
     let rate = if st.rate.is_finite() && st.rate > 0.0 {
         st.rate
     } else {
@@ -256,10 +257,43 @@ pub fn inline_video_snapshot(file_id: &str, cx: &App) -> Option<InlineVideoSnaps
     snapshot_from_active(active)
 }
 
+/// The view the root canvas paints in, and its window: it draws the mini-player and mounts every
+/// pane that can show an inline card (uncached while a clip is loaded), so redrawing it alone
+/// reaches everything inline media shows in that window.
+#[derive(PartialEq)]
+struct MediaRoot {
+    window: WindowId,
+    view: EntityId,
+}
+
+impl Global for MediaRoot {}
+
+/// Redraw what shows inline media after a playback tick or control: the root recorded by
+/// [`inline_video_begin_paint`] for `window`, leaving every cached pane alone. A window whose
+/// root does not record itself (a pop-out) refreshes whole.
+pub(crate) fn refresh_media_views(window: &mut Window, cx: &mut App) {
+    let id = window.window_handle().window_id();
+    match cx
+        .try_global::<MediaRoot>()
+        .filter(|root| root.window == id)
+        .map(|root| root.view)
+    {
+        Some(root) => cx.notify(root),
+        None => window.refresh(),
+    }
+}
+
 /// Begin one window prepaint pass (called from the root `App` canvas `prepaint`, which runs
-/// before every child element's `prepaint`). Returns the epoch to pass into
-/// [`inline_video_finish_paint`] during `paint`.
-pub fn inline_video_begin_paint(cx: &mut App) -> u64 {
+/// before every child element's `prepaint`): records the root for [`refresh_media_views`] and
+/// returns the epoch to pass into [`inline_video_finish_paint`] during `paint`.
+pub fn inline_video_begin_paint(window: &Window, cx: &mut App) -> u64 {
+    let root = MediaRoot {
+        window: window.window_handle().window_id(),
+        view: window.current_view(),
+    };
+    if cx.try_global::<MediaRoot>() != Some(&root) {
+        cx.set_global(root);
+    }
     if cx.has_global::<InlineVideoManager>() {
         let mgr = cx.global_mut::<InlineVideoManager>();
         mgr.paint_epoch = mgr.paint_epoch.wrapping_add(1);
@@ -284,9 +318,9 @@ pub fn report_inline_video_painted(file_id: &str, in_viewport: bool, cx: &mut Ap
 
 /// Finish one window paint pass (called from the root `App` canvas `paint`, after all children's
 /// `prepaint` callbacks have run). Compares whether the active inline video card was actually
-/// mounted & in-viewport during `epoch` against `confirmed_inline_visible`, refreshing the window
-/// only on transitions so the floating PiP dock appears/disappears immediately without false
-/// triggers when the inline card is visible.
+/// mounted & in-viewport during `epoch` against `confirmed_inline_visible`, and on a transition
+/// asks the root for one more frame (a `refresh` is ignored mid-frame), so the floating PiP dock
+/// appears/disappears immediately, even while the clip is paused and no tick redraws.
 pub fn inline_video_finish_paint(epoch: u64, window: &mut Window, cx: &mut App) {
     if epoch == 0 || !cx.has_global::<InlineVideoManager>() {
         return;
@@ -302,7 +336,7 @@ pub fn inline_video_finish_paint(epoch: u64, window: &mut Window, cx: &mut App) 
             prev != actually_visible
         });
     if changed {
-        window.refresh();
+        window.request_animation_frame();
     }
 }
 
@@ -339,7 +373,7 @@ pub fn active_pip_video(image_viewer_open: bool, cx: &mut App) -> Option<PipVide
     }
     if active.pip_engaged {
         Some(PipVideoSnapshot {
-            meta: active.meta.clone(),
+            meta: Rc::clone(&active.meta),
             snapshot: snap,
         })
     } else {
@@ -355,7 +389,7 @@ pub fn stop_active_inline_video(window: &mut Window, cx: &mut App) {
         false
     };
     if had {
-        window.refresh();
+        refresh_media_views(window, cx);
     }
 }
 
@@ -471,7 +505,7 @@ pub fn play_inline_video_with_meta(
         generation,
         tick_gen: 0,
         file_id: file_id.clone(),
-        meta,
+        meta: Rc::new(meta),
         loading: true,
         player: None,
         last_frame: None,
@@ -480,7 +514,7 @@ pub fn play_inline_video_with_meta(
         confirmed_inline_visible: true,
         pip_engaged: false,
     });
-    window.refresh();
+    refresh_media_views(window, cx);
 
     let cache_id = file_id.clone();
     let fetch_url = url.clone();
@@ -544,13 +578,13 @@ pub fn play_inline_video_with_meta(
                                     cx,
                                 );
                             }
-                            window.refresh();
+                            refresh_media_views(window, cx);
                             Some(tick_gen)
                         }
                         Err(err) => {
                             mgr.active = None;
                             crate::actions::notify("Video playback failed", err, window, cx);
-                            window.refresh();
+                            refresh_media_views(window, cx);
                             None
                         }
                     }
@@ -582,7 +616,7 @@ pub fn toggle_inline_video_pause(file_id: &str, window: &mut Window, cx: &mut Ap
         active.tick_gen = active.tick_gen.wrapping_add(1);
         (active.generation, active.tick_gen)
     };
-    window.refresh();
+    refresh_media_views(window, cx);
     spawn_inline_refresh_loop(kick.0, kick.1, window, cx);
 }
 
@@ -597,7 +631,7 @@ pub fn toggle_inline_video_mute(file_id: &str, window: &mut Window, cx: &mut App
     };
     let next_muted = !player.state().muted;
     player.set_muted(next_muted);
-    window.refresh();
+    refresh_media_views(window, cx);
 }
 
 /// Cycle playback speed (`1x -> 1.5x -> 2x -> 1x`) on the active inline video matching `file_id`.
@@ -606,7 +640,7 @@ pub fn cycle_inline_video_rate(file_id: &str, window: &mut Window, cx: &mut App)
     let active = mgr.active.as_mut().filter(|a| a.file_id == file_id)?;
     let player = active.player.as_ref()?;
     let rate = player.cycle_rate();
-    window.refresh();
+    refresh_media_views(window, cx);
     Some(rate)
 }
 
@@ -633,7 +667,7 @@ pub fn seek_inline_video(file_id: &str, secs: f64, window: &mut Window, cx: &mut
         active.tick_gen = active.tick_gen.wrapping_add(1);
         (active.generation, active.tick_gen)
     };
-    window.refresh();
+    refresh_media_views(window, cx);
     spawn_inline_refresh_loop(kick.0, kick.1, window, cx);
 }
 
@@ -644,7 +678,7 @@ pub fn stop_inline_video(file_id: &str, window: &mut Window, cx: &mut App) -> Op
         .stop_matching(file_id)
         .filter(|h| h.position_secs > 0.05)
         .map(|h| h.position_secs);
-    window.refresh();
+    refresh_media_views(window, cx);
     pos
 }
 
@@ -664,7 +698,7 @@ pub fn stop_inline_video_for_expand(
     if let Some(handoff) = handoff {
         mgr.stash_handoff(file_id.to_owned(), handoff);
     }
-    window.refresh();
+    refresh_media_views(window, cx);
     pos
 }
 
@@ -688,7 +722,7 @@ pub(crate) fn take_inline_handoff_for_viewer(
             .map(|(_, h)| h)
     });
     if had_active {
-        window.refresh();
+        refresh_media_views(window, cx);
     }
     carry
 }
@@ -875,7 +909,7 @@ async fn run_inline_refresh_loop(
                     active.last_frame = Some(frame);
                 }
                 let st = player.state();
-                window.refresh();
+                refresh_media_views(window, cx);
                 if st.failed {
                     return false;
                 }
@@ -1090,7 +1124,7 @@ pub(crate) fn seed_inline_video_for_test(
         generation,
         tick_gen: 0,
         file_id: meta.file_id.clone(),
-        meta,
+        meta: Rc::new(meta),
         loading,
         player: None,
         last_frame: None,
@@ -1147,7 +1181,7 @@ mod tests {
             generation: g1,
             tick_gen: 0,
             file_id: "F_VID_1".into(),
-            meta: test_meta("F_VID_1"),
+            meta: Rc::new(test_meta("F_VID_1")),
             loading: true,
             player: None,
             last_frame: None,
@@ -1165,7 +1199,7 @@ mod tests {
             generation: g2,
             tick_gen: 0,
             file_id: "F_VID_2".into(),
-            meta: test_meta("F_VID_2"),
+            meta: Rc::new(test_meta("F_VID_2")),
             loading: false,
             player: None,
             last_frame: None,
@@ -1265,7 +1299,7 @@ mod tests {
             generation: g,
             tick_gen: 0,
             file_id: "F_SYNTH".into(),
-            meta: test_meta("F_SYNTH"),
+            meta: Rc::new(test_meta("F_SYNTH")),
             loading: false,
             player: Some(player),
             last_frame: None,
@@ -1305,7 +1339,7 @@ mod tests {
                     .size_full()
                     .child(
                         canvas(
-                            |_, _, cx| inline_video_begin_paint(cx),
+                            |_, window, cx| inline_video_begin_paint(window, cx),
                             |_, epoch, window, cx| inline_video_finish_paint(epoch, window, cx),
                         )
                         .absolute()
@@ -1468,5 +1502,68 @@ mod tests {
                 "PiP must reappear after closing an unrelated ImageViewer"
             );
         });
+    }
+
+    #[gpui::test]
+    fn media_ticks_redraw_the_root_and_leave_cached_panes_alone(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, Context, Entity, IntoElement, Render, StyleRefinement};
+        use std::cell::Cell;
+
+        struct Pane(Rc<Cell<u32>>);
+        impl Render for Pane {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.0.set(self.0.get() + 1);
+                div().size_full()
+            }
+        }
+        struct Root(Entity<Pane>);
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .child(
+                        canvas(
+                            |_, window, cx| inline_video_begin_paint(window, cx),
+                            |_, epoch, window, cx| inline_video_finish_paint(epoch, window, cx),
+                        )
+                        .absolute()
+                        .size_0(),
+                    )
+                    .child(
+                        self.0
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    )
+            }
+        }
+
+        let pane_renders = Rc::new(Cell::new(0));
+        let renders = pane_renders.clone();
+        let (root, cx) = cx.add_window_view(move |_, cx| {
+            seed_inline_video_for_test(test_meta("F_TICK"), false, true, cx);
+            Root(cx.new(|_| Pane(renders)))
+        });
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            })
+        };
+        draw(cx);
+        assert_eq!(pane_renders.get(), 1);
+        let root_notified = Rc::new(Cell::new(0));
+        let notified = root_notified.clone();
+        let _watch =
+            cx.update(|_, cx| cx.observe(&root, move |_, _| notified.set(notified.get() + 1)));
+
+        // What every playback tick and control calls: the root redraws (the mini-player and the
+        // panes that can show the card), and a cached pane keeps its subtree.
+        cx.update(refresh_media_views);
+        draw(cx);
+        assert_eq!(
+            pane_renders.get(),
+            1,
+            "a media tick must not rebuild cached panes"
+        );
+        assert_eq!(root_notified.get(), 1, "a media tick redraws the root");
     }
 }

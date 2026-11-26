@@ -1883,7 +1883,7 @@ impl Render for App {
             .child({
                 let nav_app = cx.weak_entity();
                 canvas(
-                    |_, _, cx| crate::media::inline_video_begin_paint(cx),
+                    |_, window, cx| crate::media::inline_video_begin_paint(window, cx),
                     move |_, paint_epoch, window, cx| {
                         crate::media::inline_video_finish_paint(paint_epoch, window, cx);
                         let nav_app = nav_app.clone();
@@ -2061,7 +2061,7 @@ mod tests {
                 .size_full()
                 .child(
                     canvas(
-                        |_, _, cx| crate::media::inline_video_begin_paint(cx),
+                        |_, window, cx| crate::media::inline_video_begin_paint(window, cx),
                         |_, epoch, window, cx| {
                             crate::media::inline_video_finish_paint(epoch, window, cx)
                         },
