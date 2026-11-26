@@ -393,13 +393,36 @@ pub(crate) async fn fetch_cached_media(
         return Ok(path);
     }
     let bytes = fetcher.get(url).await?;
-    let write_path = path.clone();
     bg.spawn(async move {
-        std::fs::write(&write_path, &bytes).map_err(|e| e.to_string())?;
-        enforce_media_cache_limits(&dir, Some(&write_path));
-        Ok::<PathBuf, String>(write_path)
+        write_cache_file(&path, bytes.as_slice()).map_err(|e| e.to_string())?;
+        enforce_media_cache_limits(&dir, Some(&path));
+        Ok::<PathBuf, String>(path)
     })
     .await
+}
+
+/// Copy `data` into a unique `.part` sibling of `path`, then rename it into place, so a crash or
+/// a concurrent fetch of the same file never leaves a truncated file at the cache key.
+fn write_cache_file(path: &Path, mut data: impl std::io::Read) -> std::io::Result<()> {
+    static PART_SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut part = path.as_os_str().to_owned();
+    part.push(format!(
+        ".{}-{}.part",
+        std::process::id(),
+        PART_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let part = PathBuf::from(part);
+    let copied = {
+        let mut file = std::fs::File::create(&part)?;
+        std::io::copy(&mut data, &mut file)
+    };
+    let written = copied.and_then(|_| std::fs::rename(&part, path));
+    if written.is_err()
+        && let Err(err) = std::fs::remove_file(&part)
+    {
+        tracing::warn!("could not remove partial media {}: {err}", part.display());
+    }
+    written
 }
 
 /// Toggle inline playback of a Slack-hosted audio clip or file. Downloads authenticated bytes
@@ -551,6 +574,36 @@ mod tests {
         assert!(!f3.exists());
         assert!(f4.exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_writes_expose_only_complete_files() {
+        struct ConnectionReset;
+        impl std::io::Read for ConnectionReset {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("connection reset"))
+            }
+        }
+        let dir =
+            std::env::temp_dir().join(format!("slackless-media-write-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("F1.mp4");
+        let entries = || std::fs::read_dir(&dir).unwrap().count();
+
+        // The bytes stop mid-file (connection reset, app quit): nothing may sit at the cache key.
+        let partial = std::io::Read::chain(&b"first half"[..], ConnectionReset);
+        assert!(write_cache_file(&path, partial).is_err());
+        assert!(
+            !path.exists(),
+            "a partial file at the cache key is served as a cache hit forever"
+        );
+        assert_eq!(entries(), 0, "the partial download is removed");
+
+        write_cache_file(&path, &b"whole clip"[..]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"whole clip");
+        assert_eq!(entries(), 1, "no .part file is left behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
