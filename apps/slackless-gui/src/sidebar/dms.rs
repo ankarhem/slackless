@@ -1,5 +1,10 @@
 //! Direct messages inbox column.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::Arc;
+
 use gpui_kit::assets::IconName;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
@@ -8,12 +13,26 @@ use gpui_kit::gpui::{
     AnyElement, Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use slackless_core::types::{Conversation, Message, Ts};
+use slackless_core::types::{ChannelId, Conversation, Edited, Message, Ts};
 
 use super::{Sidebar, SidebarEvent, count_pill};
 use crate::avatars::conversation_avatar;
 use crate::fixtures::Fixtures;
-use crate::messages::list_stamp;
+use crate::messages::{Preview, list_stamp, preview_model, render_preview};
+
+thread_local! {
+    /// The DM list's previews: by DM, the latest message (its ts and edit) each was modeled
+    /// for, against the workspace data and emoji preference the memo holds. A frame renders
+    /// them without parsing the message again.
+    static PREVIEWS: RefCell<PreviewMemo> = RefCell::default();
+}
+
+#[derive(Default)]
+struct PreviewMemo {
+    fixtures: Option<Arc<Fixtures>>,
+    emoji_text: bool,
+    previews: HashMap<ChannelId, (Ts, Option<Edited>, Rc<Preview>)>,
+}
 
 impl Sidebar {
     /// The rail's DMs destination, Slack's DM list: the collapsible "Direct messages" header
@@ -181,19 +200,10 @@ impl Sidebar {
                 .as_ref()
                 .is_some_and(|user| *user == self.fixtures.self_user);
         let preview = last.map(|message| {
-            // Slack prefixes only your own messages, in group DMs too.
-            let author = match &message.user {
-                Some(user) if *user == self.fixtures.self_user => "You: ",
-                _ => "",
-            };
             // Formatting, links and emoji render as in the transcript.
-            crate::messages::mrkdwn_preview(
-                &format!("{author}{}", dm_preview_text(&self.fixtures, message)),
-                &self.fixtures,
-                dim,
-                format!("dm-preview-{}", dm.id),
-                cx,
-            )
+            let emoji_text = crate::preferences::display_prefs(cx).emoji_text_mode;
+            let model = dm_preview(&self.fixtures, &dm.id, message, emoji_text);
+            render_preview(&model, dim, format!("dm-preview-{}", dm.id), cx)
         });
         let stamp = last
             .map(|message| list_stamp(&message.ts))
@@ -246,6 +256,49 @@ impl Sidebar {
             })
             .on_click(cx.listener(move |this, _, _, cx| this.select_row(id.clone(), cx)))
     }
+}
+
+/// The preview of `message`, the DM `dm`'s latest, modeled once while it stays the latest and
+/// unedited.
+fn dm_preview(
+    fixtures: &Arc<Fixtures>,
+    dm: &ChannelId,
+    message: &Message,
+    emoji_text: bool,
+) -> Rc<Preview> {
+    PREVIEWS.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        let current = memo
+            .fixtures
+            .as_ref()
+            .is_some_and(|known| known.shares_data(fixtures))
+            && memo.emoji_text == emoji_text;
+        if !current {
+            *memo = PreviewMemo {
+                fixtures: Some(fixtures.clone()),
+                emoji_text,
+                previews: HashMap::new(),
+            };
+        }
+        if let Some((ts, edited, preview)) = memo.previews.get(dm)
+            && *ts == message.ts
+            && *edited == message.edited
+        {
+            return preview.clone();
+        }
+        // Slack prefixes only your own messages, in group DMs too.
+        let author = match &message.user {
+            Some(user) if *user == fixtures.self_user => "You: ",
+            _ => "",
+        };
+        let text = format!("{author}{}", dm_preview_text(fixtures, message));
+        let preview = Rc::new(preview_model(&text, fixtures, emoji_text));
+        memo.previews.insert(
+            dm.clone(),
+            (message.ts.clone(), message.edited.clone(), preview.clone()),
+        );
+        preview
+    })
 }
 
 /// What the DM list previews of `message`: its raw mrkdwn, as the transcript renders it (a

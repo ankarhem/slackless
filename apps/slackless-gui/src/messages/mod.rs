@@ -62,9 +62,9 @@ use render::{
     message_body, message_body_cached,
 };
 pub(crate) use render::{
-    clock, day_and_time, day_label, file_day, hex_color, iso_date, list_stamp, local_offset_now,
-    mrkdwn, mrkdwn_preview, mrkdwn_with_verbatim, now_secs, plain_text, render_block,
-    selectable_code, selectable_text, short_date,
+    Preview, clock, day_and_time, day_label, file_day, hex_color, iso_date, list_stamp,
+    local_offset_now, mrkdwn, mrkdwn_preview, mrkdwn_with_verbatim, now_secs, plain_text,
+    preview_model, render_block, render_preview, selectable_code, selectable_text, short_date,
 };
 use rows::transcript_row;
 #[cfg(test)]

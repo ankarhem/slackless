@@ -417,10 +417,12 @@ pub(crate) fn mrkdwn_preview(
     render_preview(&preview_model(text, fixtures, emoji_text), color, key, cx)
 }
 
-/// A preview's model: one paragraph with its line breaks flattened, to render every frame
-/// through [`render_preview`] without parsing again.
-pub(crate) fn preview_model(text: &str, fixtures: &Fixtures, emoji_text: bool) -> Vec<Segment> {
-    line_segments(
+/// A [`mrkdwn_preview`]'s model: one paragraph with its line breaks flattened. A list that
+/// keeps it ([`crate::sidebar`]'s DM previews) renders it each frame without parsing again.
+pub(crate) struct Preview(Vec<Segment>);
+
+pub(crate) fn preview_model(text: &str, fixtures: &Fixtures, emoji_text: bool) -> Preview {
+    Preview(line_segments(
         &parse_mrkdwn_spans(&text.replace('\n', " ")),
         fixtures,
         TextOpts {
@@ -428,13 +430,14 @@ pub(crate) fn preview_model(text: &str, fixtures: &Fixtures, emoji_text: bool) -
             verbatim: false,
         },
         false,
-    )
+    ))
 }
 
-pub(crate) fn render_preview(segments: &[Segment], color: Hsla, key: String, cx: &App) -> Div {
+/// A preview's elements: plain runs in `color`, not selectable, links opening as URLs.
+pub(crate) fn render_preview(preview: &Preview, color: Hsla, key: String, cx: &App) -> Div {
     let mut theme = RunTheme::plain(cx, key.into());
     theme.foreground = color;
-    render_segments(segments, &theme)
+    render_segments(&preview.0, &theme)
 }
 
 /// Slack packs emoji code points as hex joined by `-` (`1f389`, skin tones appended).

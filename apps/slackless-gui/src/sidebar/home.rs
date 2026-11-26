@@ -1,7 +1,9 @@
 //! Home sidebar sections, Files nav column, conversation rows, and More Unreads pill.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use gpui_kit::assets::IconName;
@@ -26,9 +28,44 @@ use super::{
 };
 use crate::avatars::conversation_avatar;
 use crate::files_page::FilesSection;
+use crate::fixtures::Fixtures;
 use crate::sidebar_menu::{
     ChannelDrag, ChannelMenuInput, HiddenConversations, SectionSort, channel_menu, section_menu,
 };
+
+thread_local! {
+    static ALPHA_KEYS: RefCell<AlphaKeys> = RefCell::default();
+}
+
+/// The Alpha sort's keys by conversation, computed once for the workspace data they came
+/// from: a frame sorts by them without building and lowercasing every label again.
+#[derive(Default)]
+struct AlphaKeys {
+    fixtures: Option<Arc<Fixtures>>,
+    keys: HashMap<ChannelId, Rc<str>>,
+}
+
+/// The Alpha sort's key for `conversation`: its label lowercased, without a channel's `# `.
+fn alpha_key(fixtures: &Arc<Fixtures>, conversation: &Conversation) -> Rc<str> {
+    ALPHA_KEYS.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if !memo
+            .fixtures
+            .as_ref()
+            .is_some_and(|known| known.shares_data(fixtures))
+        {
+            memo.fixtures = Some(fixtures.clone());
+            memo.keys.clear();
+        }
+        if let Some(key) = memo.keys.get(&conversation.id) {
+            return key.clone();
+        }
+        let label = fixtures.conversation_label(conversation);
+        let key: Rc<str> = label.trim_start_matches("# ").to_lowercase().into();
+        memo.keys.insert(conversation.id.clone(), key.clone());
+        key
+    })
+}
 
 impl Sidebar {
     /// A sidebar section: a dim header row (section emoji or icon + name; click collapses)
@@ -651,10 +688,7 @@ impl Sidebar {
                         rows.sort_by_key(|c| std::cmp::Reverse(latest(c)));
                     }
                     SectionSort::Alpha => {
-                        rows.sort_by_cached_key(|c| {
-                            let label = self.fixtures.conversation_label(c);
-                            label.trim_start_matches("# ").to_lowercase()
-                        });
+                        rows.sort_by_cached_key(|c| alpha_key(&self.fixtures, c));
                     }
                     SectionSort::Priority => {
                         rows.sort_by_key(|c| {
