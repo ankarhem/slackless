@@ -7,8 +7,9 @@ use slackless_core::api::RoomJoinResponse;
 use slackless_core::domain::huddles::{CaptionDeduper, resolve_segment_at_ms};
 use slackless_core::huddle::{
     AudioDevices, CameraDeviceInfo, HuddleAudioConfig, HuddleControl, HuddleCredentials,
-    HuddlePhase, HuddleReactionKind, HuddleSessionSnapshot, HuddleUpdate, ScreenSource,
-    list_audio_devices, list_cameras, list_screen_sources, spawn_huddle_session,
+    HuddleDataEvent, HuddlePhase, HuddleReactionKind, HuddleSessionSnapshot, HuddleUpdate,
+    ScreenSource, VideoTileKey, list_audio_devices, list_cameras, list_screen_sources,
+    spawn_huddle_session,
 };
 use slackless_core::types::net::huddle_fallback_url;
 use slackless_core::types::time::civil_from_days;
@@ -231,10 +232,9 @@ pub(crate) fn format_huddle_state(
     snap: &HuddleSessionSnapshot,
     include_error: bool,
 ) -> (serde_json::Value, String) {
-    let phase = format!("{:?}", snap.phase);
     let json = serde_json::json!({
         "event": "state",
-        "phase": phase,
+        "phase": snap.phase,
         "channel": snap.channel.as_str(),
         "call_id": snap.call_id,
         "muted": snap.muted,
@@ -253,10 +253,31 @@ pub(crate) fn format_huddle_state(
         String::new()
     };
     let human = format!(
-        "huddle {display}\t{phase}\ttx={} rx={} pongs={}{err_suffix}\n",
-        snap.packets_sent, snap.packets_received, snap.pongs_sent
+        "huddle {display}\t{:?}\ttx={} rx={} pongs={}{err_suffix}\n",
+        snap.phase, snap.packets_sent, snap.packets_received, snap.pongs_sent
     );
     (json, human)
+}
+
+/// One `huddle join` data-channel event (reaction, caption, hand raise, ...).
+pub(crate) fn format_huddle_data_event(
+    display: &str,
+    ev: &HuddleDataEvent,
+) -> (serde_json::Value, String) {
+    (
+        serde_json::json!({ "event": "data", "detail": ev }),
+        format!("huddle {display}\tdata\t{ev:?}\n"),
+    )
+}
+
+/// A video tile as the JSON a snake_case `Serialize` derive would give; `VideoTileKey` has none.
+pub(crate) fn video_tile_json(tile: &VideoTileKey) -> serde_json::Value {
+    match tile {
+        VideoTileKey::LocalCamera => serde_json::json!("local_camera"),
+        VideoTileKey::LocalScreen => serde_json::json!("local_screen"),
+        VideoTileKey::RemoteCamera(user) => serde_json::json!({ "remote_camera": user }),
+        VideoTileKey::RemoteScreen(user) => serde_json::json!({ "remote_screen": user }),
+    }
 }
 
 /// `huddle join <channel> [--muted] [--duration N] [--input NAME] [--output NAME] [--react EMOJI] [--camera] [--blur] [--screen SOURCE_ID]`:
@@ -371,7 +392,7 @@ pub async fn run_huddle_join(
                         }
                     }
                     Some(HuddleUpdate::DataEvent(ev)) => {
-                        if let slackless_core::huddle::HuddleDataEvent::Caption {
+                        if let HuddleDataEvent::Caption {
                             ref user,
                             ref text,
                             is_partial,
@@ -396,14 +417,8 @@ pub async fn run_huddle_join(
                                 .store_mut()
                                 .insert_huddle_transcript_segment(&session.workspace, &seg);
                         }
-                        output::emit(
-                            ctx.json,
-                            &serde_json::json!({
-                                "event": "data",
-                                "detail": format!("{ev:?}"),
-                            }),
-                            &format!("huddle {display}\tdata\t{ev:?}\n"),
-                        );
+                        let (json, human) = format_huddle_data_event(&display, &ev);
+                        output::emit(ctx.json, &json, &human);
                     }
                     Some(HuddleUpdate::VideoFrame { tile, frame }) => {
                         video_frames += 1;
@@ -412,7 +427,7 @@ pub async fn run_huddle_join(
                                 ctx.json,
                                 &serde_json::json!({
                                     "event": "video_frame",
-                                    "tile": format!("{tile:?}"),
+                                    "tile": video_tile_json(&tile),
                                     "width": frame.width,
                                     "height": frame.height,
                                     "frames": video_frames,

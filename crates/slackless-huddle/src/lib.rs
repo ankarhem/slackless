@@ -157,7 +157,8 @@ impl Default for HuddleAudioConfig {
 }
 
 /// Lifecycle phase of the active native huddle session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HuddlePhase {
     #[default]
     Idle,
@@ -221,7 +222,8 @@ pub struct HuddleAudioLevels {
 }
 
 /// Reaction kind matching Slack's `PeerMessage.Reacji.Type`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HuddleReactionKind {
     #[default]
     Standard,
@@ -231,7 +233,7 @@ pub enum HuddleReactionKind {
 
 /// Normalized cubic Bezier segment (`0.0..=1.0` screen-share coordinates) matching Slack's
 /// `PeerMessage.Segment` for drawing on shared screens (`F-COLLAB-025`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct HuddleDrawSegment {
     pub a: [f64; 2],
     pub b: [f64; 2],
@@ -240,7 +242,8 @@ pub struct HuddleDrawSegment {
 }
 
 /// Screen-share drawing / live cursor message matching Slack's `PeerMessage.Draw`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HuddleDrawMessage {
     New {
         item_id: String,
@@ -266,7 +269,8 @@ pub enum HuddleDrawMessage {
 
 /// Interactive Chime `DATA_MESSAGE` event (`PeerMessage` on `"data-channel"` and AWS Transcribe
 /// `SdkTranscriptFrame` on `"aws:chime:transcription"`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HuddleDataEvent {
     Reaction {
         user: UserId,

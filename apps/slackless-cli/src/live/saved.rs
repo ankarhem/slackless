@@ -83,7 +83,7 @@ pub(crate) fn format_saved_list(filter: &str, items: &[SavedItem]) -> (serde_jso
             serde_json::json!({
                 "channel": it.channel.as_str(),
                 "ts": it.ts.as_str(),
-                "state": format!("{:?}", it.state).to_lowercase(),
+                "state": it.state,
                 "date_due": it.date_due,
                 "text": it.message.as_ref().map(|m| m.text.as_str()),
             })

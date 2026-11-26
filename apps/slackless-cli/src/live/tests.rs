@@ -15,8 +15,8 @@ use slackless_core::api::{
 use slackless_core::domain::canvas::CanvasCommentFilter;
 use slackless_core::domain::lists::{cell_to_text, list_to_csv, list_to_json_value, list_to_tsv};
 use slackless_core::huddle::{
-    AudioDeviceInfo, AudioDevices, CameraDeviceInfo, HuddlePhase, HuddleSessionSnapshot,
-    ScreenSource,
+    AudioDeviceInfo, AudioDevices, CameraDeviceInfo, HuddleDataEvent, HuddlePhase,
+    HuddleSessionSnapshot, ScreenSource, VideoTileKey,
 };
 use slackless_core::store::Store;
 use slackless_core::types::event::{
@@ -834,7 +834,7 @@ fn saved_mark_thread_and_files_formatters_cover_edge_cases() {
     let (json, human) = format_saved_list("saved", &saved_items);
     assert_eq!(json["filter"], "saved");
     assert_eq!(json["count"], 2);
-    assert_eq!(json["items"][0]["state"], "inprogress");
+    assert_eq!(json["items"][0]["state"], "in_progress");
     assert_eq!(json["items"][0]["text"], "follow up");
     assert_eq!(json["items"][1]["text"], serde_json::Value::Null);
     assert!(human.contains("C1\t1700.1\tInProgress\tfollow up\n"));
@@ -1153,7 +1153,7 @@ fn status_and_huddle_formatters_and_credential_builder_cover_all_branches() {
         ..Default::default()
     };
     let (json, human_err) = format_huddle_state("#eng", &snap, true);
-    assert_eq!(json["phase"], "Failed");
+    assert_eq!(json["phase"], "failed");
     assert_eq!(json["udp_blocked"], true);
     assert_eq!(
         human_err,
@@ -1161,6 +1161,26 @@ fn status_and_huddle_formatters_and_credential_builder_cover_all_branches() {
     );
     let (_, human_no_err) = format_huddle_state("#eng", &snap, false);
     assert_eq!(human_no_err, "huddle #eng\tFailed\ttx=10 rx=5 pongs=2\n");
+
+    // Data-channel events are JSON values: a caption's text is a field, not part of a string.
+    let caption = HuddleDataEvent::Caption {
+        user: UserId::from("U1"),
+        text: "hej".into(),
+        is_partial: false,
+        at_ms: 7,
+        lang: Some("sv".into()),
+    };
+    let (json, _) = format_huddle_data_event("#eng", &caption);
+    assert_eq!(
+        json,
+        serde_json::json!({"event": "data", "detail": {"caption": {
+            "user": "U1", "text": "hej", "is_partial": false, "at_ms": 7, "lang": "sv"
+        }}})
+    );
+    assert_eq!(
+        video_tile_json(&VideoTileKey::RemoteScreen(UserId::from("U2"))),
+        serde_json::json!({"remote_screen": "U2"})
+    );
 }
 
 #[test]

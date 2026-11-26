@@ -588,7 +588,7 @@ JSON output (`saved list`):
     {
       "channel": "C0123ABC",
       "ts": "1739280000.000100",
-      "state": "inprogress",
+      "state": "in_progress",
       "date_due": 1739366400,
       "text": "Review PR"
     }
@@ -796,7 +796,7 @@ slackless huddle invite <CHANNEL> <USER>
 Native Amazon Chime huddles from the terminal:
 
 - `devices`, `cameras`, `screens` (offline): enumerate local microphones/speakers (`{ "inputs", "outputs" }`), cameras (`{ "cameras": [{ "index", "name" }] }`), and screen-share monitors/windows (`{ "sources": [{ "id", "name", "monitor", "width", "height" }] }`).
-- `join`: connects to Slack `rooms.join` + Chime DTLS-SRTP media until Ctrl+C or `--duration SECS`; under `--json`, streams NDJSON state/data events (`{ "event": "state", "phase", "channel", "call_id", "muted", "packets_sent", "packets_received", "pongs_sent", "error", "udp_blocked" }`).
+- `join`: connects to Slack `rooms.join` + Chime DTLS-SRTP media until Ctrl+C or `--duration SECS`; under `--json`, streams NDJSON state/data events (`{ "event": "state", "phase", "channel", "call_id", "muted", "packets_sent", "packets_received", "pongs_sent", "error", "udp_blocked" }` with `phase` one of `idle`, `joining`, `connecting`, `connected`, `reconnecting`, `leaving`, `failed`; `{ "event": "data", "detail": { "caption": { "user", "text", "is_partial", "at_ms", "lang" } } }` and likewise `reaction`, `hand_raise`, `sticky_emoji`, `topic`, `draw`, `jukebox`, `muted_by_peer`; `{ "event": "video_frame", "tile", "width", "height", "frames" }` with `tile` `"local_camera"`, `"local_screen"`, `{ "remote_camera": USER }`, or `{ "remote_screen": USER }`).
 - `link`: fetches shareable huddle URL (`rooms.getLink`) -> `{ "ok": true, "channel", "url" }`.
 - `invite`: rings a workspace member (`rooms.notifyMember`) -> `{ "ok": true, "channel", "user" }`.
 

@@ -62,8 +62,9 @@ pub(crate) use files::{
 };
 #[cfg(test)]
 pub(crate) use huddle::{
-    build_huddle_credentials, fallback_huddle_link, format_huddle_cameras, format_huddle_devices,
-    format_huddle_screens, format_huddle_state, format_ms_utc,
+    build_huddle_credentials, fallback_huddle_link, format_huddle_cameras,
+    format_huddle_data_event, format_huddle_devices, format_huddle_screens, format_huddle_state,
+    format_ms_utc, video_tile_json,
 };
 #[cfg(test)]
 pub(crate) use list::{effective_list_format, select_list_primary_column};
