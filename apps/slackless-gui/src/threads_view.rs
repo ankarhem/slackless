@@ -491,13 +491,19 @@ impl ThreadsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(ix) = self
+        let Some(key) = self
             .cards
             .iter()
-            .position(|c| c.channel == *channel && c.thread_ts == *thread_ts)
-        {
-            self.activate(Some(ix), window, cx);
-        }
+            .find(|c| c.channel == *channel && c.thread_ts == *thread_ts)
+            .map(card_key)
+        else {
+            return;
+        };
+        self.active = Some(key);
+        self.sync_also_send(cx);
+        self.composer
+            .update(cx, |composer, cx| composer.focus_input(window, cx));
+        cx.notify();
     }
 
     /// Collect all images across a thread card (root + replies) and locate `(ts, origin)`.
@@ -660,22 +666,6 @@ impl ThreadsView {
             content,
             broadcast,
         });
-        cx.notify();
-    }
-
-    /// Dock the reply composer to card `ix` and focus it.
-    pub(super) fn activate(
-        &mut self,
-        ix: Option<usize>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.active = ix.and_then(|ix| self.cards.get(ix)).map(card_key);
-        self.sync_also_send(cx);
-        if ix.is_some() {
-            self.composer
-                .update(cx, |composer, cx| composer.focus_input(window, cx));
-        }
         cx.notify();
     }
 

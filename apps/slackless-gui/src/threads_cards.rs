@@ -841,6 +841,7 @@ pub(super) fn card_view(
             )
         });
 
+    let reply_key = (card.channel.clone(), card.thread_ts.clone());
     let reply_footer = if active {
         div().mt_2().child(composer.clone()).into_any_element()
     } else {
@@ -861,7 +862,8 @@ pub(super) fn card_view(
             .hover(|bar| bar.border_color(muted))
             .child("Reply...")
             .on_click(cx.listener(move |this, _, window: &mut Window, cx| {
-                this.activate(Some(ix), window, cx);
+                // The thread this bar was drawn for, wherever re-sorting has moved its card.
+                this.activate_thread(&reply_key.0, &reply_key.1, window, cx);
             }))
             .into_any_element()
     };
