@@ -463,6 +463,21 @@ impl App {
                     })
                     .child(self.notify_menu(conversation, cx))
                     .child(
+                        chrome_icon(
+                            "hdr-summarize",
+                            IconName::Sparkles,
+                            muted_foreground,
+                            accent,
+                        )
+                        .tooltip(|window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new("Summarize channel")
+                                .build(window, cx)
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_summary_for_channel(window, cx);
+                        })),
+                    )
+                    .child(
                         chrome_icon("hdr-search", IconName::Search, muted_foreground, accent)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.search_in_conversation(window, cx)

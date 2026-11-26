@@ -176,6 +176,11 @@ impl Archive {
         &mut self.store
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_store(store: Store) -> Self {
+        Self { store }
+    }
+
     /// Public and private channels, alphabetical by name.
     pub fn channels(&self, workspace: &TeamId) -> store::Result<Vec<ConversationRow>> {
         self.store.list_channels(workspace)

@@ -274,6 +274,64 @@ pub(crate) struct CatchupArgs {
     pub(crate) limit: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum AiProviderArg {
+    Ollama,
+    Lmstudio,
+    Openai,
+    Custom,
+}
+
+impl From<AiProviderArg> for slackless_core::summarize::AiProvider {
+    fn from(arg: AiProviderArg) -> Self {
+        match arg {
+            AiProviderArg::Ollama => Self::Ollama,
+            AiProviderArg::Lmstudio => Self::LmStudio,
+            AiProviderArg::Openai => Self::OpenAi,
+            AiProviderArg::Custom => Self::Custom,
+        }
+    }
+}
+
+#[derive(Args)]
+pub(crate) struct SummarizeArgs {
+    /// Channel id, #name, or @handle (required unless `--transcript` or `--catchup` is set).
+    pub(crate) channel: Option<String>,
+    /// Summarize a single thread (root + replies) by its root `ts` inside `channel`.
+    #[arg(long, value_name = "TS", conflicts_with_all = ["transcript", "catchup"])]
+    pub(crate) thread: Option<String>,
+    /// Summarize a stored audio/video file transcript by Slack file ID (e.g. `F0123ABC`).
+    #[arg(long, value_name = "FILE_ID", conflicts_with_all = ["thread", "catchup"])]
+    pub(crate) transcript: Option<String>,
+    /// Summarize the local Catch-Up briefing.
+    #[arg(long, conflicts_with_all = ["thread", "transcript"])]
+    pub(crate) catchup: bool,
+    /// Time window for `--catchup` (`24h`, `7d`, `since-last-visit`, or duration/date cutoff).
+    #[arg(long, value_name = "WHEN")]
+    pub(crate) since: Option<String>,
+    /// Aggregate `--catchup` across every locally archived workspace at once.
+    #[arg(long)]
+    pub(crate) all_workspaces: bool,
+    /// Maximum messages or catch-up items to include in the summary prompt.
+    #[arg(long, value_name = "N", default_value_t = slackless_core::summarize::DEFAULT_SUMMARY_MESSAGE_LIMIT)]
+    pub(crate) limit: usize,
+    /// AI provider preset (`ollama`, `lmstudio`, `openai`, or `custom`).
+    #[arg(long, value_enum)]
+    pub(crate) provider: Option<AiProviderArg>,
+    /// OpenAI-compatible base URL (e.g. `http://localhost:11434/v1` or `https://api.openai.com/v1`).
+    #[arg(long, value_name = "URL")]
+    pub(crate) endpoint: Option<String>,
+    /// Model name (e.g. `llama3.2`, `gpt-4o-mini`).
+    #[arg(long, value_name = "MODEL")]
+    pub(crate) model: Option<String>,
+    /// Environment variable name holding the Bearer API key (e.g. `OPENAI_API_KEY`).
+    #[arg(long, value_name = "ENV_VAR")]
+    pub(crate) api_key_env: Option<String>,
+    /// Request timeout in seconds.
+    #[arg(long, value_name = "SECS", default_value_t = slackless_core::summarize::DEFAULT_TIMEOUT_SECS)]
+    pub(crate) timeout: u64,
+}
+
 #[derive(Args)]
 pub(crate) struct FilesArgs {
     /// Optional channel id, #name, or @handle to filter by.
@@ -581,6 +639,8 @@ pub(crate) enum Commands {
     },
     /// Check for and install Slackless updates from GitHub Releases (updates Slackless.app + CLI).
     Update(Box<UpdateArgs>),
+    /// Summarize a channel, thread, transcript, or Catch-Up briefing using a local or BYO-key OpenAI-compatible LLM.
+    Summarize(Box<SummarizeArgs>),
     /// Run a JSON-RPC 2.0 stdio Model Context Protocol (MCP) server for AI agents.
     Mcp,
     /// Account and session management.

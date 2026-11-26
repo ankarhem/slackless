@@ -458,6 +458,9 @@ pub(super) fn subscribe_workspace(
                         cx,
                     );
                 }
+                ThreadPanelEvent::Summarize { channel, thread_ts } => {
+                    this.open_summary_for_thread(channel.clone(), thread_ts.clone(), window, cx);
+                }
                 ThreadPanelEvent::SendToChannel {
                     channel,
                     thread_ts,

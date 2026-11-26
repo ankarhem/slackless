@@ -9685,6 +9685,7 @@ dependencies = [
  "slackless-auth",
  "slackless-core",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
@@ -9708,6 +9709,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "wiremock",
 ]
 
 [[package]]

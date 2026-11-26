@@ -78,6 +78,11 @@ pub enum ThreadPanelEvent {
         thread_ts: Ts,
         markdown: bool,
     },
+    /// Summarize the open thread (root + replies) using the configured local/BYO-key AI provider.
+    Summarize {
+        channel: ChannelId,
+        thread_ts: Ts,
+    },
     /// Broadcast an existing thread reply back into the parent channel (`F-CORE-106`).
     SendToChannel {
         channel: ChannelId,
@@ -1238,9 +1243,23 @@ impl Render for ThreadPanel {
                             }),
                         );
                     if let Some((ch, tts)) = open_thread.clone() {
+                        let (sum_panel, ch_sum, tts_sum) = (panel.clone(), ch.clone(), tts.clone());
                         let (exp_md, ch_md, tts_md) = (panel.clone(), ch.clone(), tts.clone());
                         let (exp_json, ch_json, tts_json) = (panel.clone(), ch, tts);
                         menu = menu
+                            .separator()
+                            .item(
+                                PopupMenuItem::new("Summarize thread")
+                                    .icon(IconName::Sparkles)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = sum_panel.update(cx, |_, cx| {
+                                            cx.emit(ThreadPanelEvent::Summarize {
+                                                channel: ch_sum.clone(),
+                                                thread_ts: tts_sum.clone(),
+                                            });
+                                        });
+                                    }),
+                            )
                             .separator()
                             .item(
                                 PopupMenuItem::new("Export thread (Markdown\u{2026})")
@@ -1289,7 +1308,21 @@ impl Render for ThreadPanel {
                     .items_center()
                     .gap_1()
                     .when_some(self.thread.clone(), |bar, (ch, ts)| {
+                        let (ch_sum, ts_sum) = (ch.clone(), ts.clone());
                         bar.child(
+                            Button::new("summarize-thread")
+                                .ghost()
+                                .with_size(Size::Small)
+                                .icon(IconName::Sparkles)
+                                .tooltip("Summarize thread")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(ThreadPanelEvent::Summarize {
+                                        channel: ch_sum.clone(),
+                                        thread_ts: ts_sum.clone(),
+                                    });
+                                })),
+                        )
+                        .child(
                             Button::new("popout-thread")
                                 .ghost()
                                 .with_size(Size::Small)

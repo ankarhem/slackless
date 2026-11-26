@@ -39,6 +39,7 @@ pub enum CatchUpEvent {
     ScopeChanged(bool),
     Refresh,
     MarkCaughtUp,
+    Summarize,
 }
 
 /// Interactive Local Catch-Up / Daily Briefing main-column page.
@@ -119,6 +120,10 @@ impl CatchUpView {
             cx.emit(CatchUpEvent::ScopeChanged(all_workspaces));
             cx.notify();
         }
+    }
+
+    pub fn current_briefing(&self) -> CatchUpBriefing {
+        self.briefing.clone()
     }
 
     #[cfg(test)]
@@ -839,6 +844,17 @@ impl Render for CatchUpView {
                             .flex_none()
                             .items_center()
                             .gap_1p5()
+                            .child(
+                                Button::new("catchup-summarize")
+                                    .outline()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::Sparkles)
+                                    .label("Summarize")
+                                    .tooltip("Summarize Catch-Up briefing")
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(CatchUpEvent::Summarize);
+                                    })),
+                            )
                             .child(
                                 Button::new("catchup-refresh")
                                     .ghost()

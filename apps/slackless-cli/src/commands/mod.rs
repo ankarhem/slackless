@@ -2,6 +2,7 @@ pub(crate) mod auth;
 pub(crate) mod browse;
 pub(crate) mod maintenance;
 pub(crate) mod messages;
+pub(crate) mod summarize;
 
 use std::collections::HashSet;
 use std::path::Path;

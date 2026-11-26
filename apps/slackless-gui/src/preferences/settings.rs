@@ -209,6 +209,76 @@ pub const TRANSCRIPTION_PROVIDERS: [&str; 3] = [
     "Whisper Large v3 Turbo (Local)",
 ];
 
+/// Persisted non-secret settings for local / BYO-key AI summaries.
+///
+/// The optional Bearer API key is NEVER stored here — it lives exclusively in the OS Keychain
+/// (`slackless_auth::SecretStore`) under [`slackless_auth::AI_SUMMARY_API_KEY_ACCOUNT`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AiSummarySettings {
+    pub enabled: bool,
+    pub provider: slackless_core::summarize::AiProvider,
+    pub base_url: String,
+    pub model: String,
+    pub timeout_secs: u64,
+}
+
+impl Default for AiSummarySettings {
+    fn default() -> Self {
+        let provider = slackless_core::summarize::AiProvider::Ollama;
+        Self {
+            enabled: false,
+            provider,
+            base_url: provider.default_base_url().to_owned(),
+            model: provider.default_model().to_owned(),
+            timeout_secs: slackless_core::summarize::DEFAULT_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl AiSummarySettings {
+    /// Effective base URL (falling back to the selected preset's default when empty).
+    pub fn effective_base_url(&self) -> &str {
+        let trimmed = self.base_url.trim();
+        if trimmed.is_empty() {
+            self.provider.default_base_url()
+        } else {
+            trimmed
+        }
+    }
+
+    /// Effective model name (falling back to the selected preset's default when empty).
+    pub fn effective_model(&self) -> &str {
+        let trimmed = self.model.trim();
+        if trimmed.is_empty() {
+            self.provider.default_model()
+        } else {
+            trimmed
+        }
+    }
+
+    /// Whether AI summaries are enabled with a non-empty endpoint and model.
+    pub fn is_ready_to_run(&self) -> bool {
+        self.enabled && !self.effective_base_url().is_empty() && !self.effective_model().is_empty()
+    }
+
+    /// Build a runtime [`slackless_core::summarize::AiSummaryConfig`] with an optional API key
+    /// loaded from Keychain.
+    pub fn to_runtime_config(
+        &self,
+        api_key: Option<String>,
+    ) -> slackless_core::summarize::AiSummaryConfig {
+        slackless_core::summarize::AiSummaryConfig {
+            provider: self.provider,
+            base_url: self.effective_base_url().to_owned(),
+            model: self.effective_model().to_owned(),
+            api_key,
+            timeout_secs: self.timeout_secs,
+            ..slackless_core::summarize::AiSummaryConfig::default()
+        }
+    }
+}
+
 /// Every preference, in memory. Pure-choice settings are indexes into the option tables
 /// next to their controls; what the app acts on is typed.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -396,6 +466,8 @@ pub struct Settings {
     pub huddle_transcription_provider: usize,
     /// Play gentle ambient music when waiting alone in a huddle (`F-COLLAB-058`).
     pub huddle_music_when_alone: bool,
+    // Local / BYO-key AI summaries (API key stays in OS Keychain via `slackless-auth`).
+    pub ai_summary: AiSummarySettings,
 }
 
 impl Default for Settings {
@@ -517,6 +589,7 @@ impl Default for Settings {
             huddle_save_transcripts: true,
             huddle_transcription_provider: 0,
             huddle_music_when_alone: true,
+            ai_summary: AiSummarySettings::default(),
         }
     }
 }

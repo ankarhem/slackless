@@ -44,6 +44,33 @@ fn settings_json_is_backwards_compatible_with_partial_payloads() {
     let round_trip: Settings =
         serde_json::from_str(&serde_json::to_string(&partial).unwrap()).unwrap();
     assert!(round_trip == partial);
+    assert!(!round_trip.ai_summary.enabled);
+    assert_eq!(
+        round_trip.ai_summary.provider,
+        slackless_core::summarize::AiProvider::Ollama
+    );
+}
+
+#[test]
+fn ai_summary_settings_never_serialize_secrets_and_resolve_defaults() {
+    let mut ai = AiSummarySettings::default();
+    assert!(!ai.is_ready_to_run());
+    assert_eq!(ai.effective_base_url(), "http://localhost:11434/v1");
+    assert_eq!(ai.effective_model(), "llama3.2");
+
+    ai.enabled = true;
+    assert!(ai.is_ready_to_run());
+
+    ai.provider = slackless_core::summarize::AiProvider::OpenAi;
+    ai.base_url.clear();
+    ai.model.clear();
+    assert_eq!(ai.effective_base_url(), "https://api.openai.com/v1");
+    assert_eq!(ai.effective_model(), "gpt-4o-mini");
+
+    let json = serde_json::to_string(&ai).expect("serialize ai_summary");
+    assert!(!json.contains("api_key"));
+    let back: AiSummarySettings = serde_json::from_str(&json).expect("deserialize ai_summary");
+    assert_eq!(back, ai);
 }
 
 #[test]

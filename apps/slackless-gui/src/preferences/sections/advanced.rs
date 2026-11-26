@@ -309,6 +309,7 @@ impl Preferences {
                 .w_full()
                 .max_w(px(420.));
         let semantic_search_card = self.semantic_search_card(cx);
+        let ai_summaries_group = self.ai_summaries_group(cx);
         let network_group = self.network_diagnostics_group(cx);
         v_flex()
             .child(self.group(
@@ -322,6 +323,7 @@ impl Preferences {
                     .child(warn_secrets),
                 cx,
             ))
+            .child(ai_summaries_group)
             .child(self.group(
                 "Search",
                 Some("Local search is instant and works offline. Enable remote search when you want older history, unjoined channels, and server-indexed files automatically."),
@@ -758,5 +760,342 @@ impl Preferences {
                 .child(net_log_card),
             cx,
         )
+    }
+
+    fn ai_summaries_group(&mut self, cx: &mut Context<Self>) -> Div {
+        use slackless_core::summarize::AiProvider;
+
+        let enabled_cb = self.checkbox(
+            "adv-ai-enabled",
+            "Enable AI summaries (local LLM or BYO OpenAI-compatible API key)",
+            |s| &mut s.ai_summary.enabled,
+            cx,
+        );
+        let provider = self.settings.ai_summary.provider;
+        let m = self.metrics();
+        let theme = cx.theme();
+        let (fg, muted, success, danger, primary, border, secondary) = (
+            theme.foreground,
+            theme.muted_foreground,
+            theme.success,
+            theme.danger,
+            theme.primary,
+            theme.border,
+            theme.secondary,
+        );
+
+        let provider_pills = h_flex().items_center().gap_1p5().flex_wrap().children(
+            AiProvider::ALL.into_iter().map(|preset| {
+                let active = preset == provider;
+                let id = SharedString::from(format!("adv-ai-provider-{}", preset.key()));
+                let btn = self.btn(if active {
+                    Button::new(id).primary().label(preset.short_label())
+                } else {
+                    Button::new(id).outline().label(preset.short_label())
+                });
+                btn.on_click(cx.listener(move |this, _, window, cx| {
+                    let prev = this.settings.ai_summary.provider;
+                    if prev == preset {
+                        return;
+                    }
+                    this.settings.ai_summary.provider = preset;
+                    let cur_url = this.settings.ai_summary.base_url.trim();
+                    if cur_url.is_empty() || cur_url == prev.default_base_url() {
+                        let next_url = preset.default_base_url().to_owned();
+                        this.settings.ai_summary.base_url = next_url.clone();
+                        this.ai_base_url_input
+                            .update(cx, |st, cx| st.set_value(next_url, window, cx));
+                    }
+                    let cur_model = this.settings.ai_summary.model.trim();
+                    if cur_model.is_empty() || cur_model == prev.default_model() {
+                        let next_model = preset.default_model().to_owned();
+                        this.settings.ai_summary.model = next_model.clone();
+                        this.ai_model_input
+                            .update(cx, |st, cx| st.set_value(next_model, window, cx));
+                    }
+                    this.ai_test_status = None;
+                    this.changed(cx);
+                }))
+            }),
+        );
+
+        let url_field = text_input_box_for(&self.ai_base_url_input, false, true, m, cx)
+            .w_full()
+            .max_w(px(460.));
+        let model_field = text_input_box_for(&self.ai_model_input, false, true, m, cx)
+            .w_full()
+            .max_w(px(320.));
+
+        let has_stored_key = self.ai_api_key_stored == Some(true);
+        let key_badge_label = if has_stored_key {
+            "Stored in Keychain"
+        } else if provider.requires_api_key() {
+            "Required for OpenAI"
+        } else {
+            "Optional (not set)"
+        };
+        let key_badge_color = if has_stored_key {
+            success
+        } else if provider.requires_api_key() {
+            danger
+        } else {
+            muted
+        };
+        let key_input = text_input_box_for(&self.ai_api_key_input, false, true, m, cx)
+            .flex_1()
+            .min_w_0();
+        let save_key_btn = self
+            .btn(Button::new("adv-ai-key-save").outline().label("Save key"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.save_ai_api_key(window, cx);
+            }));
+        let clear_key_btn = self
+            .btn(Button::new("adv-ai-key-clear").ghost().label("Clear"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.clear_ai_api_key(cx);
+            }));
+        let key_row = v_flex()
+            .gap_1p5()
+            .max_w(px(460.))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(fg)
+                            .child("API key (stored in Keychain)"),
+                    )
+                    .child(
+                        div()
+                            .px_1p5()
+                            .py(px(1.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(border)
+                            .bg(secondary.opacity(0.5))
+                            .text_xs()
+                            .text_color(key_badge_color)
+                            .child(key_badge_label),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(key_input)
+                    .child(save_key_btn)
+                    .when(has_stored_key, |row| row.child(clear_key_btn)),
+            )
+            .when_some(self.ai_key_status_note.clone(), |col, note| {
+                col.child(div().text_xs().text_color(muted).child(note))
+            });
+
+        let (dot_color, title, chip, detail, detail_is_err) = if self.ai_test_running {
+            (
+                primary,
+                "Testing connection\u{2026}".to_owned(),
+                Some(SharedString::from(provider.short_label())),
+                format!(
+                    "Probing {} ({})…",
+                    self.settings.ai_summary.effective_base_url(),
+                    self.settings.ai_summary.effective_model()
+                ),
+                false,
+            )
+        } else if let Some((ok, msg)) = &self.ai_test_status {
+            (
+                if *ok { success } else { danger },
+                if *ok {
+                    "Endpoint reachable".to_owned()
+                } else {
+                    "Connection failed".to_owned()
+                },
+                Some(SharedString::from(format!(
+                    "{} · {}",
+                    provider.short_label(),
+                    self.settings.ai_summary.effective_model()
+                ))),
+                msg.clone(),
+                !*ok,
+            )
+        } else {
+            let eff_url = self.settings.ai_summary.effective_base_url();
+            let eff_model = self.settings.ai_summary.effective_model();
+            let status_detail = if eff_url.is_empty() || eff_model.is_empty() {
+                "Set an OpenAI-compatible base URL and model name, then click Test connection."
+                    .to_owned()
+            } else {
+                format!("Ready to summarize via {eff_url} using \"{eff_model}\".")
+            };
+            (
+                if self.settings.ai_summary.is_ready_to_run() {
+                    success
+                } else {
+                    muted
+                },
+                if self.settings.ai_summary.enabled {
+                    "AI summaries enabled".to_owned()
+                } else {
+                    "AI summaries disabled".to_owned()
+                },
+                Some(SharedString::from(provider.short_label())),
+                status_detail,
+                false,
+            )
+        };
+
+        let test_card = self.status_card(
+            super::StatusCard {
+                dot_color,
+                title: title.into(),
+                chip,
+                detail: detail.into(),
+                detail_is_err,
+                actions: h_flex().items_center().gap_1p5().child(
+                    self.btn(
+                        Button::new("adv-ai-test-conn")
+                            .outline()
+                            .icon(IconName::Sparkles)
+                            .disabled(self.ai_test_running)
+                            .label(if self.ai_test_running {
+                                "Testing\u{2026}"
+                            } else {
+                                "Test connection"
+                            }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.start_ai_connection_test(cx);
+                    })),
+                ),
+            },
+            cx,
+        );
+
+        self.group(
+            "AI Summaries (Local / BYO-key)",
+            Some("Summarize threads, channels, Catch-Up briefings, and transcripts with local Ollama / LM Studio or your own OpenAI-compatible endpoint. API keys are kept in the OS Keychain and never logged."),
+            v_flex()
+                .gap_2p5()
+                .child(enabled_cb)
+                .child(self.labeled("Provider preset", provider_pills))
+                .child(self.labeled("Endpoint base URL (http:// or https://)", url_field))
+                .child(self.labeled("Model", model_field))
+                .child(key_row)
+                .child(test_card),
+            cx,
+        )
+    }
+
+    fn save_ai_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.ai_api_key_input.read(cx).value().trim().to_owned();
+        if raw.is_empty() {
+            self.ai_key_status_note = Some("Enter an API key first, or click Clear.".to_owned());
+            cx.notify();
+            return;
+        }
+        // Clear the input buffer immediately so the secret does not sit in UI memory.
+        self.ai_api_key_input
+            .update(cx, |st, cx| st.set_value(String::new(), window, cx));
+        self.ai_key_status_note = Some("Saving API key to Keychain\u{2026}".to_owned());
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let outcome: Result<(), String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let store =
+                        slackless_core::auth::SecretStore::new().map_err(|e| e.to_string())?;
+                    store
+                        .set(slackless_core::auth::AI_SUMMARY_API_KEY_ACCOUNT, &raw)
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |prefs, cx| {
+                match outcome {
+                    Ok(()) => {
+                        prefs.ai_api_key_stored = Some(true);
+                        prefs.ai_key_status_note =
+                            Some("API key saved securely in Keychain.".to_owned());
+                        prefs.ai_test_status = None;
+                    }
+                    Err(err) => {
+                        prefs.ai_key_status_note = Some(format!("Could not save API key: {err}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn clear_ai_api_key(&mut self, cx: &mut Context<Self>) {
+        self.ai_key_status_note = Some("Removing API key from Keychain\u{2026}".to_owned());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let outcome: Result<(), String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let store =
+                        slackless_core::auth::SecretStore::new().map_err(|e| e.to_string())?;
+                    store
+                        .delete(slackless_core::auth::AI_SUMMARY_API_KEY_ACCOUNT)
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |prefs, cx| {
+                match outcome {
+                    Ok(()) => {
+                        prefs.ai_api_key_stored = Some(false);
+                        prefs.ai_key_status_note =
+                            Some("API key removed from Keychain.".to_owned());
+                        prefs.ai_test_status = None;
+                    }
+                    Err(err) => {
+                        prefs.ai_key_status_note = Some(format!("Could not remove API key: {err}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_ai_connection_test(&mut self, cx: &mut Context<Self>) {
+        if self.ai_test_running {
+            return;
+        }
+        let ai_settings = self.settings.ai_summary.clone();
+        self.ai_test_running = true;
+        self.ai_test_status = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let outcome: Result<slackless_core::summarize::ConnectionTestResult, String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let api_key = slackless_core::auth::SecretStore::new().ok().and_then(|s| {
+                        s.get(slackless_core::auth::AI_SUMMARY_API_KEY_ACCOUNT)
+                            .ok()
+                            .flatten()
+                    });
+                    let cfg = ai_settings.to_runtime_config(api_key);
+                    slackless_core::summarize::test_connection_blocking(&cfg)
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+
+            let _ = this.update(cx, |prefs, cx| {
+                prefs.ai_test_running = false;
+                prefs.ai_test_status = Some(match outcome {
+                    Ok(res) => (true, res.detail),
+                    Err(err) => (false, err),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }

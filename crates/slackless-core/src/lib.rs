@@ -39,6 +39,7 @@ pub mod privacy;
 mod reducer;
 pub mod search;
 pub mod semantic_index;
+pub mod summarize;
 mod unfurl;
 
 pub use backend::{
@@ -98,6 +99,12 @@ pub use semantic_index::{
     hybrid_search_disk_archives, hybrid_search_huddle_transcripts_across_stores,
     hybrid_search_huddle_transcripts_in_disk_archives, hybrid_search_stores, index_disk_archives,
     index_store_documents, open_default_semantic_index, open_existing_semantic_index,
+};
+pub use summarize::{
+    AiProvider, AiSummaryConfig, ConnectionTestResult, SummarizeError, SummaryMessage,
+    SummaryPrompt, SummaryResult, SummaryTarget, build_prompt, load_channel_target,
+    load_thread_target, load_transcript_target, summarize, summarize_blocking, test_connection,
+    test_connection_blocking, validate_base_url,
 };
 
 /// Transcribe a local video or audio file with `preferred` (or any ready local provider), store

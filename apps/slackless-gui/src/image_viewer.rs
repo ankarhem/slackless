@@ -151,6 +151,12 @@ pub struct ImageEntry {
 /// root itself).
 pub enum ViewerEvent {
     Close,
+    SummarizeTranscript {
+        file_id: FileId,
+        title: String,
+        text: String,
+        cues: Vec<TranscriptCue>,
+    },
 }
 
 /// The message's images in body order: the image urls of its Block Kit payloads, its file
@@ -1729,6 +1735,7 @@ impl Render for ImageViewer {
             let transcribing = crate::media::is_transcribing(&fid, cx);
             let copied = self.transcript_copied;
             let copy_text = transcript_text.clone();
+            let summarize_cues = transcript_cues.clone();
             let can_transcribe = transcript_text.is_none()
                 && transcript_cues.is_empty()
                 && !loading_vtt
@@ -1901,6 +1908,15 @@ impl Render for ImageViewer {
                     .into_any_element()
             };
 
+            let summarize_payload = copy_text.as_ref().map(|text| {
+                (
+                    fid.clone(),
+                    image.name.clone(),
+                    text.clone(),
+                    summarize_cues,
+                )
+            });
+
             Some(
                 v_flex()
                     .id("viewer-transcript-panel")
@@ -1941,6 +1957,41 @@ impl Render for ImageViewer {
                                 h_flex()
                                     .items_center()
                                     .gap_1()
+                                    .when_some(
+                                        summarize_payload,
+                                        |row, (sum_fid, sum_title, sum_text, sum_cues)| {
+                                            row.child(
+                                                h_flex()
+                                                    .id("viewer-transcript-summarize")
+                                                    .items_center()
+                                                    .gap_1()
+                                                    .px_1p5()
+                                                    .py(px(2.))
+                                                    .rounded_sm()
+                                                    .text_xs()
+                                                    .text_color(chrome.text)
+                                                    .cursor_pointer()
+                                                    .hover(move |b| b.bg(chrome.button_hover))
+                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                        cx.stop_propagation()
+                                                    })
+                                                    .child(
+                                                        Icon::new(IconName::Sparkles)
+                                                            .size(px(12.))
+                                                            .text_color(chrome.text),
+                                                    )
+                                                    .child("Summarize")
+                                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                                        cx.emit(ViewerEvent::SummarizeTranscript {
+                                                            file_id: sum_fid.clone(),
+                                                            title: sum_title.clone(),
+                                                            text: sum_text.clone(),
+                                                            cues: sum_cues.clone(),
+                                                        });
+                                                    })),
+                                            )
+                                        },
+                                    )
                                     .when_some(copy_text, |row, text| {
                                         row.child(
                                             h_flex()

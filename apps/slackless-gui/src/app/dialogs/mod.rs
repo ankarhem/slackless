@@ -4,6 +4,7 @@ mod channels;
 pub(super) mod modal;
 pub(super) mod profile;
 pub(super) mod storage;
+pub(super) mod summary;
 mod usergroups;
 pub(super) mod workflow;
 
@@ -627,6 +628,21 @@ impl App {
             window,
             |this: &mut App, _, event: &ViewerEvent, window, cx| match event {
                 ViewerEvent::Close => this.close_image_viewer(window, cx),
+                ViewerEvent::SummarizeTranscript {
+                    file_id,
+                    title,
+                    text,
+                    cues,
+                } => {
+                    this.open_summary_for_transcript(
+                        file_id.clone(),
+                        title.clone(),
+                        text.clone(),
+                        cues.clone(),
+                        window,
+                        cx,
+                    );
+                }
             },
         );
         // Replacing or closing the viewer drops its subscription immediately (no Vec leak).

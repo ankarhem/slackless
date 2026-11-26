@@ -202,12 +202,23 @@ impl App {
                     );
                 }
                 if let Some(ch_id) = channel.clone() {
+                    let this_sum = this.clone();
                     let this_md = this.clone();
                     let this_json = this.clone();
                     let this_bf = this.clone();
                     let this_storage = this.clone();
                     let ch_bf = ch_id.clone();
                     menu = menu
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("Summarize channel")
+                                .icon(IconName::Sparkles)
+                                .on_click(move |_, window, cx| {
+                                    let _ = this_sum.update(cx, |app, cx| {
+                                        app.open_summary_for_channel(window, cx);
+                                    });
+                                }),
+                        )
                         .separator()
                         .item(
                             PopupMenuItem::new("Backfill channel history")

@@ -1140,6 +1140,9 @@ fn wire_feature_view_subscriptions(
                 CatchUpEvent::MarkCaughtUp => {
                     this.mark_catchup_visited(window, cx);
                 }
+                CatchUpEvent::Summarize => {
+                    this.open_summary_for_catchup(window, cx);
+                }
             },
         ),
         cx.subscribe_in(

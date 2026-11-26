@@ -32,6 +32,7 @@ pub use slackless_types as types;
 
 mod embedded;
 mod error;
+mod secrets;
 mod session;
 mod store;
 mod validate;
@@ -40,6 +41,7 @@ mod validate;
 pub use embedded::embedded_sign_in;
 pub use embedded::{SignInRequest, WebviewCapture, capture_sessions};
 pub use error::{AuthError, Result};
+pub use secrets::{AI_SUMMARY_API_KEY_ACCOUNT, SecretStore};
 pub use session::Session;
 pub use store::SessionStore;
 pub use validate::validate;

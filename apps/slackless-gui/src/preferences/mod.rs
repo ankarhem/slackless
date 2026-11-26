@@ -32,8 +32,8 @@ pub use prefs_globals::{
     active_quick_reactions, display_prefs, matches_highlight_keyword, set_display_prefs,
 };
 pub use settings::{
-    AppearanceMode, HOURS, MESSAGE_VERBOSITY, MOBILE_HANDOFF, NOTIFY_LEVELS, SCHEDULE_DAYS,
-    SOUND_FILES, Section, Settings, StorageInfo, TRANSCRIPTION_PROVIDERS,
+    AiSummarySettings, AppearanceMode, HOURS, MESSAGE_VERBOSITY, MOBILE_HANDOFF, NOTIFY_LEVELS,
+    SCHEDULE_DAYS, SOUND_FILES, Section, Settings, StorageInfo, TRANSCRIPTION_PROVIDERS,
     format_accessible_message, format_cross_workspace_summary,
 };
 pub(crate) use slackless_core::types::time::format_bytes;
@@ -125,6 +125,14 @@ pub struct Preferences {
     pub(super) semantic_indexing: bool,
     pub(super) semantic_status_note: Option<String>,
     pub(super) semantic_snapshot: Option<SemanticStorageSnapshot>,
+    pub(super) ai_base_url_input: Entity<TextareaState>,
+    pub(super) ai_model_input: Entity<TextareaState>,
+    pub(super) ai_api_key_input: Entity<TextareaState>,
+    /// Whether an AI API key is currently stored in the OS Keychain (`None` until probed off-thread).
+    pub(super) ai_api_key_stored: Option<bool>,
+    pub(super) ai_key_status_note: Option<String>,
+    pub(super) ai_test_running: bool,
+    pub(super) ai_test_status: Option<(bool, String)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -199,6 +207,27 @@ impl Preferences {
                     .placeholder("#3F0E40,#350D36,#1164A3,#FFFFFF,...")
                     .auto_grow(1, 2)
             });
+            let ai_base_url_input = cx.new(|cx| {
+                let mut state = TextareaState::new(window, cx)
+                    .placeholder("http://localhost:11434/v1")
+                    .auto_grow(1, 1);
+                state.set_value(settings.ai_summary.base_url.clone(), window, cx);
+                state
+            });
+            let ai_model_input = cx.new(|cx| {
+                let mut state = TextareaState::new(window, cx)
+                    .placeholder("llama3.2")
+                    .auto_grow(1, 1);
+                state.set_value(settings.ai_summary.model.clone(), window, cx);
+                state
+            });
+            let ai_api_key_input = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder(
+                        "Paste API key to store in Keychain (optional for Ollama/LM Studio)",
+                    )
+                    .auto_grow(1, 1)
+            });
             let mut subscriptions = vec![
                 cx.subscribe_in(
                     &keywords,
@@ -246,6 +275,30 @@ impl Preferences {
                     |this: &mut Preferences, field, event: &InputEvent, _, cx| {
                         if let InputEvent::Change = event {
                             this.settings.proxy_url = field.read(cx).value().trim().to_owned();
+                            cx.emit(PreferencesEvent::Changed);
+                        }
+                    },
+                ),
+                cx.subscribe_in(
+                    &ai_base_url_input,
+                    window,
+                    |this: &mut Preferences, field, event: &InputEvent, _, cx| {
+                        if let InputEvent::Change = event {
+                            this.settings.ai_summary.base_url =
+                                field.read(cx).value().trim().to_owned();
+                            this.ai_test_status = None;
+                            cx.emit(PreferencesEvent::Changed);
+                        }
+                    },
+                ),
+                cx.subscribe_in(
+                    &ai_model_input,
+                    window,
+                    |this: &mut Preferences, field, event: &InputEvent, _, cx| {
+                        if let InputEvent::Change = event {
+                            this.settings.ai_summary.model =
+                                field.read(cx).value().trim().to_owned();
+                            this.ai_test_status = None;
                             cx.emit(PreferencesEvent::Changed);
                         }
                     },
@@ -301,6 +354,13 @@ impl Preferences {
                 semantic_indexing: false,
                 semantic_status_note: None,
                 semantic_snapshot: None,
+                ai_base_url_input,
+                ai_model_input,
+                ai_api_key_input,
+                ai_api_key_stored: None,
+                ai_key_status_note: None,
+                ai_test_running: false,
+                ai_test_status: None,
                 _subscriptions: subscriptions,
             }
         })
@@ -384,6 +444,8 @@ impl Preferences {
         let excluded = settings.excluded_channels.clone();
         let protocols = settings.protocol_allowlist.clone();
         let proxy = settings.proxy_url.clone();
+        let ai_base_url = settings.ai_summary.base_url.clone();
+        let ai_model = settings.ai_summary.model.clone();
         let quick_emojis = settings.quick_reaction_emojis.clone();
         slackless_core::api::set_proxy_url(Some(proxy.clone()));
         slackless_core::api::set_net_log_enabled(settings.net_log_enabled);
@@ -399,6 +461,10 @@ impl Preferences {
             .update(cx, |state, cx| state.set_value(protocols, window, cx));
         self.proxy_input
             .update(cx, |state, cx| state.set_value(proxy, window, cx));
+        self.ai_base_url_input
+            .update(cx, |state, cx| state.set_value(ai_base_url, window, cx));
+        self.ai_model_input
+            .update(cx, |state, cx| state.set_value(ai_model, window, cx));
         for (ix, val) in quick_emojis.into_iter().enumerate() {
             self.quick_reaction_inputs[ix].update(cx, |state, cx| state.set_value(val, window, cx));
         }
@@ -440,8 +506,35 @@ impl Preferences {
         }
         if section == Section::Advanced {
             self.refresh_semantic_snapshot(cx);
+            self.refresh_ai_api_key_status(cx);
         }
         cx.notify();
+    }
+
+    /// Check off-thread whether an AI summary API key is stored in the OS Keychain.
+    pub fn refresh_ai_api_key_status(&self, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            let _ = cx;
+        }
+        #[cfg(not(test))]
+        {
+            cx.spawn(async move |this, cx| {
+                let has_key = cx
+                    .background_executor()
+                    .spawn(async move {
+                        slackless_core::auth::SecretStore::new()
+                            .and_then(|s| s.has(slackless_core::auth::AI_SUMMARY_API_KEY_ACCOUNT))
+                            .unwrap_or(false)
+                    })
+                    .await;
+                let _ = this.update(cx, |prefs, cx| {
+                    prefs.ai_api_key_stored = Some(has_key);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     /// Show zoom level `level` (Cmd+= / Cmd+- / Cmd+0, or the remembered one) and apply it.

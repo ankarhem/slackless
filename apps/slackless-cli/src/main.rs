@@ -42,6 +42,7 @@ use crate::commands::messages::{
     ExportCmdOpts, SearchAllOpts, SemanticSearchCmdOpts, cmd_export, cmd_read, cmd_search,
     cmd_search_all_workspaces, cmd_search_semantic, cmd_thread,
 };
+use crate::commands::summarize::cmd_summarize;
 use crate::live::{HuddleJoinArgs, HuddleTranscriptsArgs};
 use crate::session::resolve_workspace;
 use crate::write::{
@@ -299,6 +300,7 @@ async fn dispatch(
         Commands::Update(args) => {
             update::run_update(ctx, args.check, args.force, args.restart, args.beta).await
         }
+        Commands::Summarize(args) => cmd_summarize(ctx, workspace, &args).await,
         Commands::Mcp => mcp::run_mcp(flag).await,
         Commands::Auth { command } => dispatch_auth(ctx, flag, *command),
     }
