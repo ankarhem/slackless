@@ -31,6 +31,8 @@ pub enum SidebarEvent {
     OpenThreads,
     /// The Home list's "Unreads" row: open the All Unreads view (Slack's `p-unreads_view`).
     OpenUnreads,
+    /// The Home list's "Catch-Up" row: open the Local Catch-Up / Daily Briefing view.
+    OpenCatchUp,
     /// The "Huddles" row: open the Huddles page.
     OpenHuddles,
     /// The "Directories" row: open the directory.
@@ -145,6 +147,7 @@ impl NavItem {
 /// Which Home sidebar shortcut page currently owns the main column (`None` = a conversation).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HomePage {
+    CatchUp,
     Unreads,
     Threads,
     Huddles,

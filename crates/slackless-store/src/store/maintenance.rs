@@ -22,7 +22,8 @@ impl Store {
             let conversations = count("SELECT count(*) FROM conversation WHERE workspace_id = ?1")?;
             let users = count("SELECT count(*) FROM \"user\" WHERE workspace_id = ?1")?;
             let offline_queued =
-                count("SELECT count(*) FROM offline_queue WHERE workspace_id = ?1")?;
+                count("SELECT count(*) FROM offline_queue WHERE workspace_id = ?1")?
+                    + count("SELECT count(*) FROM outbox WHERE workspace_id = ?1")?;
             let page_count: i64 = tx.pragma_query_value(None, "page_count", |r| r.get(0))?;
             let page_size: i64 = tx.pragma_query_value(None, "page_size", |r| r.get(0))?;
             Ok(StoreStats {
@@ -65,6 +66,10 @@ impl Store {
                 (
                     "offline_queue",
                     "SELECT count(*) FROM offline_queue WHERE workspace_id = ?1",
+                ),
+                (
+                    "outbox",
+                    "SELECT count(*) FROM outbox WHERE workspace_id = ?1",
                 ),
                 (
                     "bot_profile",

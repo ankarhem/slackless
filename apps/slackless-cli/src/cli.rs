@@ -231,6 +231,19 @@ pub(crate) struct DigestArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct CatchupArgs {
+    /// Time window (`24h`, `7d`, `since-last-visit`, or any duration/date cutoff; defaults to since last visit).
+    #[arg(long, value_name = "WHEN")]
+    pub(crate) since: Option<String>,
+    /// Aggregate catch-up briefing across every locally archived workspace at once.
+    #[arg(long)]
+    pub(crate) all_workspaces: bool,
+    /// Maximum items to include per briefing section.
+    #[arg(long, value_name = "N", default_value_t = 25)]
+    pub(crate) limit: usize,
+}
+
+#[derive(Args)]
 pub(crate) struct FilesArgs {
     /// Optional channel id, #name, or @handle to filter by.
     #[arg(long, value_name = "CHANNEL")]
@@ -378,6 +391,8 @@ pub(crate) enum Commands {
     Users(Box<UsersArgs>),
     /// Summarize recent archived activity per conversation (offline).
     Digest(Box<DigestArgs>),
+    /// Local Catch-Up / Daily Briefing: mentions, unread channels, active threads, and new transcripts (offline).
+    Catchup(Box<CatchupArgs>),
     /// Mark a conversation read (`conversations.mark`; defaults to newest archived message ts).
     MarkRead {
         /// Channel id, #name, or @handle.

@@ -233,6 +233,7 @@ impl App {
     /// The currently visible place for Back/Forward navigation history.
     pub(super) fn current_place(&self, cx: &gpui::App) -> NavPlace {
         match self.page {
+            MainPage::CatchUp => NavPlace::CatchUp,
             MainPage::Threads => NavPlace::Threads,
             MainPage::Unreads => NavPlace::Unreads,
             MainPage::Huddles => NavPlace::Huddles,
@@ -290,6 +291,7 @@ impl App {
     fn go_to_place(&mut self, place: NavPlace, window: &mut Window, cx: &mut Context<Self>) {
         match place {
             NavPlace::Channel(ch) => self.navigate(ch, cx),
+            NavPlace::CatchUp => self.show_catchup(window, cx),
             NavPlace::Threads => self.show_threads(cx),
             NavPlace::Unreads => self.show_unreads(window, cx),
             NavPlace::Huddles => self.show_huddles(cx),
@@ -729,6 +731,12 @@ impl App {
         if self.right_pane.is_pins() {
             self.load_tab_data(&ConversationTab::Pins);
         }
+        let ws_outbox = self.ws.outbox.clone();
+        let ws_offline = self.is_connection_offline();
+        self.thread.update(cx, |panel, cx| {
+            panel.set_outbox(ws_outbox, cx);
+            panel.set_offline(ws_offline, cx);
+        });
         self.load_draft(cx);
         self.sync_composer_placeholder(cx);
         self.sync_window_title(cx);
@@ -858,6 +866,12 @@ impl App {
                         .sidebar
                         .update(cx, |sidebar, cx| sidebar.restore_section_prefs(prefs, cx));
                 }
+                let initial_outbox = self.bridge.outbox_sync();
+                if !initial_outbox.is_empty() {
+                    views
+                        .thread
+                        .update(cx, |panel, cx| panel.set_outbox(initial_outbox.clone(), cx));
+                }
                 let subscriptions = subscribe_workspace(&views, window, cx);
                 Parked {
                     fixtures,
@@ -867,6 +881,7 @@ impl App {
                     state: WorkspaceState {
                         counts: bg_counts,
                         chosen,
+                        outbox: initial_outbox,
                         ..Default::default()
                     },
                 }
@@ -915,6 +930,12 @@ impl App {
                 .send(ChannelCommand::OpenConversation(channel.clone()));
             self.load_history(&channel, cx);
         }
+        let ws_outbox = self.ws.outbox.clone();
+        let ws_offline = self.is_connection_offline();
+        self.thread.update(cx, |panel, cx| {
+            panel.set_outbox(ws_outbox, cx);
+            panel.set_offline(ws_offline, cx);
+        });
         self.load_draft(cx);
         self.sync_composer_placeholder(cx);
         // Apply per-workspace color theme palette (`F-SHELL-076`).
@@ -1072,6 +1093,221 @@ impl App {
             });
         })
         .detach();
+    }
+
+    /// Open the Local Catch-Up / Daily Briefing view (`Cmd+Shift+B` / sidebar / Go menu).
+    pub(super) fn open_catchup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.record_nav(&NavPlace::CatchUp, cx);
+        self.show_catchup(window, cx);
+    }
+
+    pub(super) fn show_catchup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_draft(cx);
+        self.close_full_column_views(cx);
+        self.page = MainPage::CatchUp;
+        self.sidebar.update(cx, |s, cx| {
+            s.set_home_page(Some(crate::sidebar::HomePage::CatchUp), cx)
+        });
+        self.focus.focus(window, cx);
+        self.refresh_catchup(cx);
+        cx.notify();
+    }
+
+    /// Build the list of workspace store targets for Catch-Up (`This workspace` or `All workspaces`).
+    fn catchup_workspace_targets(
+        &self,
+        all_workspaces: bool,
+    ) -> (Vec<slackless_core::catchup::WorkspaceCatchUpTarget>, bool) {
+        use slackless_core::catchup::WorkspaceCatchUpTarget;
+
+        let mut targets = Vec::new();
+        let total_workspaces = if !self.fixtures.sample {
+            self.live_teams.len().max(1)
+        } else {
+            self.fixtures.workspaces.len().max(1)
+        };
+        let indices: Vec<usize> = if all_workspaces {
+            (0..total_workspaces).collect()
+        } else {
+            vec![self.workspace]
+        };
+
+        if !self.fixtures.sample {
+            for idx in indices {
+                let team = self
+                    .live_teams
+                    .get(idx)
+                    .or_else(|| self.fixtures.workspaces.get(idx));
+                let bridge = if idx == self.workspace {
+                    Some(&self.bridge)
+                } else {
+                    self.parked_bridges.get(idx).and_then(Option::as_ref)
+                };
+                if let Some(bridge) = bridge
+                    && let (Some(store), Some(tid)) =
+                        (bridge.read_store_clone(), bridge.team_id().cloned())
+                {
+                    let name = team
+                        .map(|t| t.name.clone())
+                        .filter(|n| !n.trim().is_empty());
+                    targets.push(WorkspaceCatchUpTarget {
+                        workspace: tid,
+                        workspace_name: name,
+                        self_user: bridge.self_user_id().cloned(),
+                        store,
+                    });
+                }
+            }
+        } else {
+            for idx in indices {
+                let Some(team) = self.fixtures.workspaces.get(idx) else {
+                    continue;
+                };
+                let fx = if idx == self.workspace {
+                    self.fixtures.clone()
+                } else if let Some(parked) = self.parked.get(idx).and_then(Option::as_ref) {
+                    parked.fixtures.clone()
+                } else {
+                    Arc::new(fixtures::workspace(idx))
+                };
+                if let Some(store) = fixture_archive_for(&fx, &team.id) {
+                    targets.push(WorkspaceCatchUpTarget {
+                        workspace: team.id.clone(),
+                        workspace_name: Some(team.name.clone()),
+                        self_user: Some(fx.self_user.clone()),
+                        store,
+                    });
+                }
+            }
+        }
+        (targets, total_workspaces > 1)
+    }
+
+    /// Recompute the Local Catch-Up briefing off the UI thread against SQLite read-only stores.
+    pub(super) fn refresh_catchup(&mut self, cx: &mut Context<Self>) {
+        let window = self.catchup.read(cx).window();
+        let all_workspaces = self.catchup.read(cx).all_workspaces();
+        let (targets, multi_available) = self.catchup_workspace_targets(all_workspaces);
+        self.catchup.update(cx, |view, cx| {
+            view.set_multi_workspace_available(multi_available, cx);
+            view.set_loading(true, cx);
+        });
+        self.catchup_generation = self.catchup_generation.wrapping_add(1);
+        let generation = self.catchup_generation;
+        let now_secs = slackless_core::types::time::now_epoch_secs();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    slackless_core::catchup::build_catchup_across_stores(
+                        &targets,
+                        window,
+                        now_secs,
+                        slackless_core::catchup::DEFAULT_CATCHUP_LIMIT,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                if app.catchup_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(briefing) => {
+                        app.catchup
+                            .update(cx, |view, cx| view.set_briefing(briefing, cx));
+                    }
+                    Err(err) => {
+                        app.catchup
+                            .update(cx, |view, cx| view.set_error(err.to_string(), cx));
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Persist the current timestamp as the Catch-Up visit watermark for the scoped workspace(s)
+    /// and refresh the briefing.
+    pub(super) fn mark_catchup_visited(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let all_workspaces = self.catchup.read(cx).all_workspaces();
+        let now_secs = slackless_core::types::time::now_epoch_secs();
+        if !self.fixtures.sample {
+            if let Some(write) = self.bridge.record_catchup_visit(now_secs) {
+                cx.background_executor().spawn(write).detach();
+            }
+            if all_workspaces {
+                for slot in &self.parked_bridges {
+                    if let Some(bg) = slot.as_ref()
+                        && let Some(write) = bg.record_catchup_visit(now_secs)
+                    {
+                        cx.background_executor().spawn(write).detach();
+                    }
+                }
+            }
+        }
+        notify(
+            "Marked caught up",
+            "Updated Catch-Up visit timestamp.",
+            window,
+            cx,
+        );
+        self.refresh_catchup(cx);
+    }
+
+    /// Jump from Catch-Up into a channel (switching workspaces if needed) and optionally reveal `ts`.
+    pub(super) fn open_catchup_channel(
+        &mut self,
+        workspace: &slackless_core::types::TeamId,
+        channel: ChannelId,
+        ts: Option<Ts>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(idx) = self.workspace_index_for(workspace)
+            && idx != self.workspace
+        {
+            self.switch_workspace(idx, window, cx);
+        }
+        self.select(channel, cx);
+        if let Some(ts) = ts {
+            self.messages.update(cx, |list, cx| list.reveal(&ts, cx));
+        }
+    }
+
+    /// Jump from Catch-Up into a thread (switching workspaces if needed) and opening the thread panel.
+    pub(super) fn open_catchup_thread(
+        &mut self,
+        workspace: &slackless_core::types::TeamId,
+        channel: ChannelId,
+        thread_ts: Ts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(idx) = self.workspace_index_for(workspace)
+            && idx != self.workspace
+        {
+            self.switch_workspace(idx, window, cx);
+        }
+        self.select(channel.clone(), cx);
+        self.open_thread(channel, thread_ts, cx);
+    }
+
+    /// Jump from Catch-Up into a huddle transcript modal (switching workspaces if needed).
+    pub(super) fn open_catchup_huddle(
+        &mut self,
+        workspace: &slackless_core::types::TeamId,
+        call_id: String,
+        channel: Option<ChannelId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(idx) = self.workspace_index_for(workspace)
+            && idx != self.workspace
+        {
+            self.switch_workspace(idx, window, cx);
+        }
+        let target_channel = channel.unwrap_or_else(|| self.channel.clone());
+        self.open_huddle_transcript(call_id, target_channel, None, None, window, cx);
     }
 
     /// The All Unreads view (Slack's `p-unreads_view`, Cmd+Shift+A): the sidebar's unread

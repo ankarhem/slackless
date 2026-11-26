@@ -176,7 +176,14 @@ impl App {
                     self.ws.connection,
                     Some(slackless_core::rtm::ConnectionState::Connected { .. })
                 );
+                let offline = matches!(
+                    state,
+                    slackless_core::rtm::ConnectionState::Reconnecting { .. }
+                        | slackless_core::rtm::ConnectionState::Disconnected { .. }
+                );
                 self.ws.connection = Some(state.clone());
+                self.thread
+                    .update(cx, |panel, cx| panel.set_offline(offline, cx));
                 if became_connected && !self.fixtures.sample {
                     self.bridge.send(MessagingCommand::LoadScheduledMessages);
                 }
@@ -184,6 +191,39 @@ impl App {
             }
             Event::OfflineQueueChanged(count) => {
                 self.ws.offline_queued = *count;
+                cx.notify();
+            }
+            Event::OutboxUpdated(items) => {
+                let prev_ids: HashSet<i64> = self.ws.outbox.iter().map(|i| i.id).collect();
+                let new_in_open_channel = items.iter().any(|i| {
+                    !prev_ids.contains(&i.id)
+                        && i.channel_id == self.channel
+                        && i.thread_ts.is_none()
+                });
+                let open_thread = self.thread.read(cx).open_thread();
+                let new_in_open_thread = open_thread.as_ref().is_some_and(|(ch, ts)| {
+                    items.iter().any(|i| {
+                        !prev_ids.contains(&i.id)
+                            && i.channel_id == *ch
+                            && i.thread_ts.as_ref() == Some(ts)
+                    })
+                });
+                self.ws.outbox = items.clone();
+                self.thread
+                    .update(cx, |panel, cx| panel.set_outbox(items.clone(), cx));
+                // If an online send transiently failed and moved into the durable outbox, reload
+                // the channel/thread from SQLite so the unsaved optimistic echo does not duplicate
+                // the inline outbox card.
+                if new_in_open_channel && !self.fixtures.sample {
+                    let ch = self.channel.clone();
+                    self.load_history(&ch, cx);
+                }
+                if new_in_open_thread
+                    && !self.fixtures.sample
+                    && let Some((ch, ts)) = open_thread
+                {
+                    self.load_thread(&ch, &ts, cx);
+                }
                 cx.notify();
             }
             Event::OfflineMutationFailed(failed) => {

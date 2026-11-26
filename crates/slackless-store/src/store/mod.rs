@@ -2,21 +2,25 @@
 
 mod archive;
 mod bots;
+mod catchup;
 mod file_transcripts;
 mod maintenance;
 mod memberships;
 mod messages;
 mod offline;
+mod outbox;
 mod search;
 #[cfg(test)]
 mod tests;
 mod transcripts;
 
 pub use archive::{ALL_CONVERSATION_KINDS, ConversationSummary, DigestChannel, UserSummary};
+pub use catchup::RecentFileTranscript;
 pub use file_transcripts::{
     StoredFileTranscript, WorkspaceFileTranscript, extract_inline_file_body,
     extract_inline_file_transcript,
 };
+pub use outbox::{NewOutboxItem, OutboxItem, OutboxKind, OutboxStatus};
 pub use search::WorkspaceStoredMessage;
 pub use transcripts::{
     HuddleTranscriptSegment, HuddleTranscriptSession, NewHuddleTranscriptSegment,

@@ -90,13 +90,13 @@ fn migrate_is_idempotent() {
             "SELECT count(*) FROM sqlite_master WHERE name IN
              ('message_revision','message_current','message_fts','conversation','user',
               'team','channel_section','custom_emoji','prefs','local_state','offline_queue',
-              'bot_profile','huddle_transcript','huddle_transcript_fts',
+              'outbox','bot_profile','huddle_transcript','huddle_transcript_fts',
               'file_transcript','message_file')",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 16);
+    assert_eq!(tables, 17);
     let legacy_reaction: i64 = store
         .conn
         .query_row(
@@ -3574,4 +3574,238 @@ fn cross_workspace_search_covers_messages_snippets_canvases_and_file_transcripts
     );
     let counts = store.channel_message_counts(&ws1).unwrap();
     assert_eq!(counts.get(&c1), Some(&2));
+}
+
+#[test]
+fn outbox_crud_status_transitions_filtering_and_workspace_isolation() {
+    let mut store = Store::open_in_memory().unwrap();
+    let ws1 = TeamId::from("T1");
+    let ws2 = TeamId::from("T2");
+    let c1 = ChannelId::from("C1");
+    let c2 = ChannelId::from("C2");
+    let thread_ts = Ts::from("1700000100.000100");
+
+    // Enqueue all 4 kinds across channels/threads/workspaces.
+    let item1 = store
+        .enqueue_outbox(
+            &ws1,
+            &NewOutboxItem {
+                channel_id: &c1,
+                thread_ts: None,
+                kind: OutboxKind::Message,
+                payload_json: r#"{"type":"message","text":"first"}"#,
+                last_error: None,
+            },
+        )
+        .unwrap();
+    let item2 = store
+        .enqueue_outbox(
+            &ws1,
+            &NewOutboxItem {
+                channel_id: &c1,
+                thread_ts: Some(&thread_ts),
+                kind: OutboxKind::Reply,
+                payload_json: r#"{"type":"reply","text":"thread reply"}"#,
+                last_error: Some("network timeout"),
+            },
+        )
+        .unwrap();
+    let item3 = store
+        .enqueue_outbox(
+            &ws1,
+            &NewOutboxItem {
+                channel_id: &c2,
+                thread_ts: None,
+                kind: OutboxKind::ReactionAdd,
+                payload_json: r#"{"type":"reaction_add","name":"tada"}"#,
+                last_error: None,
+            },
+        )
+        .unwrap();
+    let item4 = store
+        .enqueue_outbox(
+            &ws2,
+            &NewOutboxItem {
+                channel_id: &c1,
+                thread_ts: None,
+                kind: OutboxKind::ReactionRemove,
+                payload_json: r#"{"type":"reaction_remove","name":"eyes"}"#,
+                last_error: None,
+            },
+        )
+        .unwrap();
+
+    assert!(item1.id < item2.id && item2.id < item3.id);
+    assert_eq!(item1.status, OutboxStatus::Pending);
+    assert_eq!(item1.attempts, 0);
+    assert_eq!(item2.last_error.as_deref(), Some("network timeout"));
+    assert_eq!(store.outbox_counts(&ws1).unwrap(), (3, 0));
+    assert_eq!(store.outbox_counts(&ws2).unwrap(), (1, 0));
+
+    // Channel/thread scoped queries isolate channel messages vs thread replies.
+    let ch1_top = store.list_outbox_for_channel(&ws1, &c1, None).unwrap();
+    assert_eq!(ch1_top.len(), 1);
+    assert_eq!(ch1_top[0].id, item1.id);
+
+    let ch1_thread = store
+        .list_outbox_for_channel(&ws1, &c1, Some(&thread_ts))
+        .unwrap();
+    assert_eq!(ch1_thread.len(), 1);
+    assert_eq!(ch1_thread[0].id, item2.id);
+
+    // Atomic mark_outbox_sending claims once and rejects double-claim.
+    assert!(store.mark_outbox_sending(item1.id).unwrap());
+    assert!(!store.mark_outbox_sending(item1.id).unwrap());
+    let claimed = store.get_outbox_item(item1.id).unwrap().unwrap();
+    assert_eq!(claimed.status, OutboxStatus::Sending);
+    assert_eq!(claimed.attempts, 1);
+
+    // Crash recovery resets `'sending'` rows back to `'pending'`.
+    assert_eq!(store.reset_outbox_sending_to_pending(&ws1).unwrap(), 1);
+    let recovered = store.get_outbox_item(item1.id).unwrap().unwrap();
+    assert_eq!(recovered.status, OutboxStatus::Pending);
+    assert_eq!(recovered.attempts, 1);
+
+    // Fail item2 -> excluded from list_outbox_pending, counted as failed.
+    assert!(store.mark_outbox_sending(item2.id).unwrap());
+    assert!(store.mark_outbox_failed(item2.id, "http 503").unwrap());
+    let failed = store.get_outbox_item(item2.id).unwrap().unwrap();
+    assert_eq!(failed.status, OutboxStatus::Failed);
+    assert_eq!(failed.attempts, 1);
+    assert_eq!(failed.last_error.as_deref(), Some("http 503"));
+    assert_eq!(store.outbox_counts(&ws1).unwrap(), (2, 1));
+    let pending_ids: Vec<i64> = store
+        .list_outbox_pending(&ws1)
+        .unwrap()
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(pending_ids, vec![item1.id, item3.id]);
+
+    // Reset item2 back to pending clears last_error and restores pending list order.
+    assert!(store.reset_outbox_item_pending(item2.id).unwrap());
+    let reset = store.get_outbox_item(item2.id).unwrap().unwrap();
+    assert_eq!(reset.status, OutboxStatus::Pending);
+    assert_eq!(reset.last_error, None);
+    assert_eq!(store.outbox_counts(&ws1).unwrap(), (3, 0));
+
+    // Stats and storage breakdown include outbox rows.
+    let stats = store.stats(&ws1).unwrap();
+    assert_eq!(stats.offline_queued, 3);
+    let breakdown = store.storage_breakdown(&ws1, 5).unwrap();
+    assert!(
+        breakdown
+            .tables
+            .iter()
+            .any(|(name, cnt)| name == "outbox" && *cnt == 3)
+    );
+
+    // Delete & clear respect workspace isolation.
+    assert!(store.delete_outbox_item(item1.id).unwrap());
+    assert!(!store.delete_outbox_item(item1.id).unwrap());
+    assert_eq!(store.list_outbox(&ws1).unwrap().len(), 2);
+    assert_eq!(store.clear_outbox(&ws1).unwrap(), 2);
+    assert!(store.list_outbox(&ws1).unwrap().is_empty());
+    assert_eq!(store.list_outbox(&ws2).unwrap().len(), 1);
+    assert_eq!(store.list_outbox(&ws2).unwrap()[0].id, item4.id);
+}
+
+#[test]
+fn catchup_store_queries_filter_by_cutoff_and_exclude_deleted() {
+    let mut store = Store::open_in_memory().unwrap();
+    let ws = TeamId::from("T1");
+    let c1 = ChannelId::from("C1");
+
+    let old_msg = msg("1700000100.000100", "U1", "before cutoff");
+    let new_msg = msg("1700000500.000100", "U2", "after cutoff");
+    let mut del_msg = msg("1700000600.000100", "U2", "will be deleted");
+    del_msg.files.push(File {
+        id: FileId::from("F_CLIP"),
+        name: Some("standup.mp4".into()),
+        title: Some("Standup Recording".into()),
+        ..Default::default()
+    });
+    let mut live_clip_msg = msg("1700000550.000100", "U1", "check clip");
+    live_clip_msg.files.push(File {
+        id: FileId::from("F_LIVE"),
+        name: Some("demo.mp4".into()),
+        ..Default::default()
+    });
+
+    store
+        .upsert_messages(&ws, &c1, &[old_msg, new_msg, del_msg, live_clip_msg])
+        .unwrap();
+    store
+        .record_deletion(
+            &ws,
+            &c1,
+            &Ts::from("1700000600.000100"),
+            Some(&Ts::from("1700000601.000100")),
+            None,
+        )
+        .unwrap();
+
+    let recent = store.messages_since(&ws, 1_700_000_400, 10).unwrap();
+    assert_eq!(recent.len(), 2);
+    assert_eq!(recent[0].message.ts.as_str(), "1700000550.000100");
+    assert_eq!(recent[1].message.ts.as_str(), "1700000500.000100");
+
+    let by_key = store
+        .messages_by_keys(
+            &ws,
+            &[
+                (c1.clone(), Ts::from("1700000100.000100")),
+                (c1.clone(), Ts::from("1700000600.000100")),
+            ],
+        )
+        .unwrap();
+    assert_eq!(by_key.len(), 1);
+    assert!(by_key.contains_key(&(c1.clone(), Ts::from("1700000100.000100"))));
+
+    store
+        .upsert_file_transcript(&ws, &FileId::from("F_LIVE"), "parakeet", "demo transcript")
+        .unwrap();
+    let clips = store.recent_file_transcripts_since(&ws, 0, 10).unwrap();
+    assert_eq!(clips.len(), 1);
+    assert_eq!(clips[0].file_id, FileId::from("F_LIVE"));
+    assert_eq!(clips[0].channel, Some(c1.clone()));
+    assert_eq!(clips[0].message_ts, Some(Ts::from("1700000550.000100")));
+    assert_eq!(clips[0].title.as_deref(), Some("demo.mp4"));
+
+    store
+        .insert_huddle_transcript_segment(
+            &ws,
+            &NewHuddleTranscriptSegment {
+                channel: &c1,
+                call_id: "R_OLD",
+                thread_root_ts: None,
+                speaker_id: Some(&UserId::from("U1")),
+                lang: Some("en"),
+                source: "chime",
+                text: "old huddle",
+                at_ms: 1_700_000_100_000,
+            },
+        )
+        .unwrap();
+    store
+        .insert_huddle_transcript_segment(
+            &ws,
+            &NewHuddleTranscriptSegment {
+                channel: &c1,
+                call_id: "R_NEW",
+                thread_root_ts: Some(&Ts::from("1700000550.000100")),
+                speaker_id: Some(&UserId::from("U2")),
+                lang: Some("sv"),
+                source: "parakeet-v3",
+                text: "new huddle sync",
+                at_ms: 1_700_000_700_000,
+            },
+        )
+        .unwrap();
+    let huddles = store
+        .recent_huddle_sessions_since(&ws, 1_700_000_400, 10)
+        .unwrap();
+    assert_eq!(huddles.len(), 1);
+    assert_eq!(huddles[0].call_id, "R_NEW");
+    assert_eq!(huddles[0].preview, "new huddle sync");
 }

@@ -734,9 +734,35 @@ impl App {
             }
             // The Pins tab keeps the transcript under it; its panel is the right column.
             ConversationTab::Messages | ConversationTab::Pins => {
+                let outbox_strip = crate::outbox::inline_outbox_strip(
+                    &self.ws.outbox,
+                    &self.channel,
+                    None,
+                    crate::outbox::OutboxActions {
+                        on_retry: {
+                            let this = cx.weak_entity();
+                            Rc::new(move |id, _window, cx| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(MessagingCommand::RetryOutboxItem(id));
+                                });
+                            })
+                        },
+                        on_discard: {
+                            let this = cx.weak_entity();
+                            Rc::new(move |id, _window, cx| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(MessagingCommand::DiscardOutboxItem(id));
+                                });
+                            })
+                        },
+                    },
+                    "channel",
+                    cx,
+                );
                 let column = column
                     .children(self.app_dm_banner(conversation, cx))
-                    .child(div().flex_1().min_h_0().child(self.messages.clone()));
+                    .child(div().flex_1().min_h_0().child(self.messages.clone()))
+                    .children(outbox_strip);
                 // In a public channel the user is not in, Slack's Join card takes the
                 // composer's place.
                 match conversation.filter(|c| joinable(c)) {
@@ -825,6 +851,7 @@ impl App {
         cx: &mut Context<Self>,
     ) -> Div {
         match self.page {
+            MainPage::CatchUp => v_flex().size_full().child(self.catchup.clone()),
             MainPage::Search => v_flex().size_full().child(self.results.clone()),
             MainPage::Drafts => v_flex().size_full().child(self.drafts.clone()),
             MainPage::Later => v_flex().size_full().child(self.later.clone()),
@@ -913,6 +940,7 @@ impl App {
             cx.listener(|this, _: &OpenActivity, _, cx| this.show_nav(NavItem::Activity, cx)),
         )
         .on_action(cx.listener(|this, _: &OpenDrafts, _, cx| this.open_drafts(cx)))
+        .on_action(cx.listener(|this, _: &OpenCatchUp, window, cx| this.open_catchup(window, cx)))
         .on_action(
             cx.listener(|this, _: &OpenChannelBrowser, window, cx| this.open_browser(window, cx)),
         )

@@ -337,3 +337,142 @@ pub(crate) fn cmd_digest(
     );
     Ok(ExitCode::SUCCESS)
 }
+
+/// Parse CLI `--since` into a [`slackless_core::catchup::CatchUpWindow`].
+pub(crate) fn parse_catchup_window(
+    since: Option<&str>,
+    now_secs: i64,
+) -> Result<slackless_core::catchup::CatchUpWindow, String> {
+    use slackless_core::catchup::CatchUpWindow;
+
+    let Some(raw) = since.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(CatchUpWindow::SinceLastVisit);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "since-last-visit" | "last-visit" | "last_visit" => Ok(CatchUpWindow::SinceLastVisit),
+        "24h" | "1d" => Ok(CatchUpWindow::Last24h),
+        "7d" | "1w" => Ok(CatchUpWindow::Last7d),
+        _ => {
+            parse_since_cutoff(raw, now_secs).map(|since_secs| CatchUpWindow::Custom { since_secs })
+        }
+    }
+}
+
+/// Build a [`slackless_core::catchup::CatchUpBriefing`] from explicit `(workspace, self_user, archive)`
+/// slices — shared between `cmd_catchup` and deterministic offline CLI tests.
+pub(crate) fn build_catchup_for_archives(
+    archives: &[(&TeamId, Option<&slackless_core::types::UserId>, &Archive)],
+    window: slackless_core::catchup::CatchUpWindow,
+    now_secs: i64,
+    limit: usize,
+) -> Result<slackless_core::catchup::CatchUpBriefing> {
+    use slackless_core::catchup::{CatchUpBriefing, build_workspace_catchup};
+
+    if archives.is_empty() || limit == 0 {
+        return Ok(CatchUpBriefing::empty(window, now_secs));
+    }
+    let mut merged = CatchUpBriefing::empty(window, now_secs);
+    let mut min_cutoff: Option<i64> = None;
+    for (ws, self_user, archive) in archives {
+        let part = build_workspace_catchup(
+            archive.store(),
+            ws,
+            None,
+            *self_user,
+            window,
+            now_secs,
+            limit,
+        )
+        .with_context(|| format!("building catch-up briefing for {ws}"))?;
+        min_cutoff = Some(min_cutoff.map_or(part.cutoff_secs, |p| p.min(part.cutoff_secs)));
+        merged.workspaces.extend(part.workspaces);
+        merged.mentions.extend(part.mentions);
+        merged.unread_channels.extend(part.unread_channels);
+        merged.active_threads.extend(part.active_threads);
+        merged.transcripts.extend(part.transcripts);
+    }
+    if let Some(cutoff) = min_cutoff {
+        merged.cutoff_secs = cutoff;
+    }
+    merged.mentions.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.ts.cmp(&a.ts))
+    });
+    merged.mentions.truncate(limit);
+    merged.unread_channels.sort_by(|a, b| {
+        b.mention_count
+            .cmp(&a.mention_count)
+            .then_with(|| b.latest_at.cmp(&a.latest_at))
+            .then_with(|| b.message_count.cmp(&a.message_count))
+    });
+    merged.unread_channels.truncate(limit);
+    merged.active_threads.sort_by(|a, b| {
+        b.latest_reply_at
+            .cmp(&a.latest_reply_at)
+            .then_with(|| b.new_reply_count.cmp(&a.new_reply_count))
+    });
+    merged.active_threads.truncate(limit);
+    merged
+        .transcripts
+        .sort_by_key(|a| std::cmp::Reverse(a.updated_at));
+    merged.transcripts.truncate(limit);
+    Ok(merged)
+}
+
+pub(crate) fn cmd_catchup(
+    ctx: &Ctx,
+    workspace: Option<&TeamId>,
+    since: Option<&str>,
+    all_workspaces: bool,
+    limit: usize,
+) -> Result<ExitCode> {
+    use slackless_core::auth::SessionStore;
+    use slackless_core::catchup::{CatchUpBriefing, format_catchup_human};
+
+    let now_secs = now_epoch_secs();
+    let window = match parse_catchup_window(since, now_secs) {
+        Ok(w) => w,
+        Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
+    };
+    let team_ids: Vec<TeamId> = if all_workspaces {
+        all_workspace_ids()
+    } else {
+        workspace.into_iter().cloned().collect()
+    };
+    if team_ids.is_empty() {
+        let empty = CatchUpBriefing::empty(window, now_secs);
+        return Ok(empty_local(
+            ctx,
+            serde_json::to_value(&empty).unwrap_or_default(),
+            "building catch-up briefing",
+        ));
+    }
+
+    let session_users: HashMap<TeamId, slackless_core::types::UserId> = SessionStore::new()
+        .and_then(|s| s.load())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| (s.team_id, s.user_id))
+        .collect();
+
+    let mut opened: Vec<(TeamId, Option<slackless_core::types::UserId>, Archive)> = Vec::new();
+    for ws in team_ids {
+        let Some(archive) =
+            Archive::open(&ws).with_context(|| format!("opening local archive for {ws}"))?
+        else {
+            continue;
+        };
+        let self_user = session_users.get(&ws).cloned();
+        opened.push((ws, self_user, archive));
+    }
+
+    let refs: Vec<(&TeamId, Option<&slackless_core::types::UserId>, &Archive)> = opened
+        .iter()
+        .map(|(ws, user, arch)| (ws, user.as_ref(), arch))
+        .collect();
+    let briefing = build_catchup_for_archives(&refs, window, now_secs, limit)?;
+    let human = format_catchup_human(&briefing, all_workspaces || briefing.workspaces.len() > 1);
+    output::emit(ctx.json, &briefing, &human);
+    Ok(ExitCode::SUCCESS)
+}

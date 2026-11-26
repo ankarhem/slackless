@@ -26,8 +26,9 @@ pub use query::{Date, Has, SearchFilters, SearchQuery, SearchSort};
 pub use schema::SCHEMA_VERSION;
 pub use store::{
     ALL_CONVERSATION_KINDS, ConversationSummary, DigestChannel, HuddleTranscriptSegment,
-    HuddleTranscriptSession, MemberCounts, NewHuddleTranscriptSegment, Revision, StorageBreakdown,
-    Store, StoreStats, StoredFileTranscript, StoredMessage, UserSummary, WorkspaceFileTranscript,
+    HuddleTranscriptSession, MemberCounts, NewHuddleTranscriptSegment, NewOutboxItem, OutboxItem,
+    OutboxKind, OutboxStatus, RecentFileTranscript, Revision, StorageBreakdown, Store, StoreStats,
+    StoredFileTranscript, StoredMessage, UserSummary, WorkspaceFileTranscript,
     WorkspaceHuddleTranscriptSegment, WorkspaceStoredMessage, extract_inline_file_body,
     extract_inline_file_transcript,
 };

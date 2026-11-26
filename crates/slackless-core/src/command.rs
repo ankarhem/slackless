@@ -71,6 +71,13 @@ pub enum MessagingCommand {
         thread_ts: Option<Ts>,
         broadcast: bool,
     },
+    /// Post a reply inside an existing thread (`thread_ts`), optionally broadcasting to the channel.
+    ReplyThread {
+        channel: ChannelId,
+        thread_ts: Ts,
+        content: MessageContent,
+        broadcast: bool,
+    },
     /// Replace a message's content (its blocks, with mrkdwn text as fallback).
     EditMessage {
         channel: ChannelId,
@@ -222,6 +229,12 @@ pub enum MessagingCommand {
     RetryOfflineMutation(i64),
     /// Discard a persisted offline mutation from SQLite.
     DiscardOfflineMutation(i64),
+    /// Flush all pending items in the durable V13 `outbox` table in FIFO order.
+    FlushOutbox,
+    /// Retry a specific durable `outbox` item (resets to pending if offline, or sends immediately).
+    RetryOutboxItem(i64),
+    /// Discard a specific durable `outbox` item from SQLite.
+    DiscardOutboxItem(i64),
 }
 
 /// Conversation lifecycle, channel administration, sidebar sections, and conversation tabs.

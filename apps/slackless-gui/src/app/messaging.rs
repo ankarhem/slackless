@@ -1088,6 +1088,18 @@ impl App {
         }
     }
 
+    /// Returns `true` when the live workspace RTM connection is currently disconnected or
+    /// reconnecting (so outgoing messages will land directly in the durable V13 outbox).
+    pub(super) fn is_connection_offline(&self) -> bool {
+        matches!(
+            self.ws.connection,
+            Some(
+                slackless_core::rtm::ConnectionState::Reconnecting { .. }
+                    | slackless_core::rtm::ConnectionState::Disconnected { .. }
+            )
+        )
+    }
+
     /// Send a thread reply with pre-send secret leak guard and tracking-param stripping.
     pub(super) fn send_thread_reply(
         &mut self,
@@ -1114,10 +1126,10 @@ impl App {
                     move |app, _window, cx| {
                         let mut c = content.clone();
                         app.sanitize_outgoing_content(&mut c, cx);
-                        app.bridge.send(MessagingCommand::SendMessage {
+                        app.bridge.send(MessagingCommand::ReplyThread {
                             channel: channel.clone(),
+                            thread_ts: thread_ts.clone(),
                             content: c,
-                            thread_ts: Some(thread_ts.clone()),
                             broadcast,
                         });
                         if sync_threads_view {
@@ -1131,10 +1143,10 @@ impl App {
             }
         }
         self.sanitize_outgoing_content(&mut content, cx);
-        self.bridge.send(MessagingCommand::SendMessage {
+        self.bridge.send(MessagingCommand::ReplyThread {
             channel,
+            thread_ts,
             content,
-            thread_ts: Some(thread_ts),
             broadcast,
         });
         if sync_threads_view {
@@ -1151,14 +1163,18 @@ impl App {
             }
         }
         let channel = self.channel.clone();
-        // The local echo shows the same blocks & attachments the message posts with.
-        let mut message = self
-            .fixtures
-            .local_message(&channel, content.text.clone(), None);
-        message.blocks = content.blocks.clone();
-        message.attachments = content.attachments.clone();
-        self.messages
-            .update(cx, |list, cx| list.append(channel.clone(), message, cx));
+        // When offline in live mode, skip the synthetic optimistic echo so the durable V13
+        // inline outbox card ("Queued — will send when online") renders cleanly without
+        // duplicating the message.
+        if self.fixtures.sample || !self.is_connection_offline() {
+            let mut message = self
+                .fixtures
+                .local_message(&channel, content.text.clone(), None);
+            message.blocks = content.blocks.clone();
+            message.attachments = content.attachments.clone();
+            self.messages
+                .update(cx, |list, cx| list.append(channel.clone(), message, cx));
+        }
         let sent_text = if content.text.is_empty() {
             content
                 .attachments

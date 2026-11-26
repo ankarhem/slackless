@@ -1388,3 +1388,214 @@ fn cmd_search_all_workspaces_and_export_and_archive_status_end_to_end() {
     drop(archive1);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[test]
+fn cli_catchup_flag_parsing_and_multi_workspace_briefing() {
+    use slackless_core::catchup::{CatchUpWindow, format_catchup_human};
+    use slackless_core::store::Store;
+    use slackless_core::types::{
+        ChannelId, Conversation, FileId, Message, Team, TeamId, Ts, User, UserId,
+    };
+
+    use crate::archive::Archive;
+    use crate::commands::browse::{build_catchup_for_archives, parse_catchup_window};
+
+    // 1. Clap flag parsing for `slackless catchup [--since 24h|7d] [--all-workspaces] [--json]`.
+    let parsed = Cli::try_parse_from([
+        "slackless",
+        "--json",
+        "catchup",
+        "--since",
+        "7d",
+        "--all-workspaces",
+    ])
+    .expect("parse catchup");
+    assert!(parsed.json);
+    match parsed.command {
+        Commands::Catchup(args) => {
+            assert_eq!(args.since.as_deref(), Some("7d"));
+            assert!(args.all_workspaces);
+            assert_eq!(args.limit, 25);
+        }
+        _ => panic!("expected Commands::Catchup"),
+    }
+
+    let now = 1_750_000_000_i64;
+    assert_eq!(
+        parse_catchup_window(None, now).unwrap(),
+        CatchUpWindow::SinceLastVisit
+    );
+    assert_eq!(
+        parse_catchup_window(Some("24h"), now).unwrap(),
+        CatchUpWindow::Last24h
+    );
+    assert_eq!(
+        parse_catchup_window(Some("7d"), now).unwrap(),
+        CatchUpWindow::Last7d
+    );
+    assert_eq!(
+        parse_catchup_window(Some("6h"), now).unwrap(),
+        CatchUpWindow::Custom {
+            since_secs: now - 6 * 3600
+        }
+    );
+    assert!(parse_catchup_window(Some("bogus"), now).is_err());
+
+    // 2. End-to-end single & multi-workspace catchup across two temporary SQLite archives.
+    let tmp_dir =
+        std::env::temp_dir().join(format!("slackless-cli-catchup-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+
+    let ws1 = TeamId::from("T_CATCH1");
+    let ws2 = TeamId::from("T_CATCH2");
+    let db1 = tmp_dir.join("T_CATCH1.sqlite");
+    let db2 = tmp_dir.join("T_CATCH2.sqlite");
+
+    {
+        let mut s1 = Store::open(&db1).unwrap();
+        s1.upsert_team(
+            &ws1,
+            &Team {
+                id: ws1.clone(),
+                name: "Acme".into(),
+                ..Team::default()
+            },
+        )
+        .unwrap();
+        s1.upsert_user(
+            &ws1,
+            &User {
+                id: UserId::from("U_ALICE"),
+                name: "alice".into(),
+                ..User::default()
+            },
+        )
+        .unwrap();
+        s1.upsert_conversations(
+            &ws1,
+            &[Conversation {
+                id: ChannelId::from("C1"),
+                name: Some("general".into()),
+                is_channel: true,
+                is_member: true,
+                last_read: Some(Ts::from(format!("{}.000000", now - 3600))),
+                ..Conversation::default()
+            }],
+        )
+        .unwrap();
+        s1.upsert_messages(
+            &ws1,
+            &ChannelId::from("C1"),
+            &[
+                Message {
+                    ts: Ts::from(format!("{}.000000", now - 1200)),
+                    user: Some(UserId::from("U_ALICE")),
+                    text: "Hey <@U_ME> please review the release checklist".into(),
+                    reply_count: Some(1),
+                    ..Message::default()
+                },
+                Message {
+                    ts: Ts::from(format!("{}.000000", now - 600)),
+                    thread_ts: Some(Ts::from(format!("{}.000000", now - 1200))),
+                    user: Some(UserId::from("U_ALICE")),
+                    text: "Added benchmark numbers".into(),
+                    ..Message::default()
+                },
+            ],
+        )
+        .unwrap();
+        s1.upsert_file_transcript(
+            &ws1,
+            &FileId::from("F_DEMO"),
+            "whisper",
+            "Quick architecture demo walkthrough",
+        )
+        .unwrap();
+    }
+
+    {
+        let mut s2 = Store::open(&db2).unwrap();
+        s2.upsert_team(
+            &ws2,
+            &Team {
+                id: ws2.clone(),
+                name: "Beta".into(),
+                ..Team::default()
+            },
+        )
+        .unwrap();
+        s2.upsert_user(
+            &ws2,
+            &User {
+                id: UserId::from("U_BOB"),
+                name: "bob".into(),
+                ..User::default()
+            },
+        )
+        .unwrap();
+        s2.upsert_conversations(
+            &ws2,
+            &[Conversation {
+                id: ChannelId::from("C2"),
+                name: Some("incidents".into()),
+                is_channel: true,
+                is_member: true,
+                ..Conversation::default()
+            }],
+        )
+        .unwrap();
+        s2.upsert_messages(
+            &ws2,
+            &ChannelId::from("C2"),
+            &[Message {
+                ts: Ts::from(format!("{}.000000", now - 300)),
+                user: Some(UserId::from("U_BOB")),
+                text: "<!here> database failover complete".into(),
+                ..Message::default()
+            }],
+        )
+        .unwrap();
+    }
+
+    let arch1 = Archive::open_path(&db1).unwrap().unwrap();
+    let arch2 = Archive::open_path(&db2).unwrap().unwrap();
+    let me = UserId::from("U_ME");
+
+    // Single workspace catchup (`--since 24h`)
+    let single = build_catchup_for_archives(
+        &[(&ws1, Some(&me), &arch1)],
+        CatchUpWindow::Last24h,
+        now,
+        25,
+    )
+    .unwrap();
+    assert_eq!(single.workspaces.len(), 1);
+    assert_eq!(single.mentions.len(), 1);
+    assert_eq!(single.unread_channels.len(), 1);
+    assert_eq!(single.active_threads.len(), 1);
+    let single_json = serde_json::to_value(&single).unwrap();
+    assert!(single_json["mentions"].is_array());
+    assert!(single_json["unread_channels"].is_array());
+    assert!(single_json["active_threads"].is_array());
+    assert!(single_json["transcripts"].is_array());
+
+    // Multi-workspace catchup (`--all-workspaces`)
+    let all = build_catchup_for_archives(
+        &[(&ws1, Some(&me), &arch1), (&ws2, Some(&me), &arch2)],
+        CatchUpWindow::Last24h,
+        now,
+        25,
+    )
+    .unwrap();
+    assert_eq!(all.workspaces.len(), 2);
+    assert_eq!(all.mentions.len(), 2);
+    let human = format_catchup_human(&all, true);
+    assert!(human.contains("MENTIONS (2)"));
+    assert!(human.contains("#general"));
+    assert!(human.contains("#incidents"));
+
+    drop(arch1);
+    drop(arch2);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

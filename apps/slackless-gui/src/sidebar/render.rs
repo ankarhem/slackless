@@ -77,6 +77,18 @@ impl Render for Sidebar {
                 for row in [
                     self.nav_row(
                         super::home::NavRowArgs {
+                            id: "catchup",
+                            icon: IconName::Sparkles,
+                            label: "Catch-Up",
+                            bold: false,
+                            active: self.active_home_page == Some(HomePage::CatchUp),
+                            trailing: None,
+                        },
+                        cx,
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenCatchUp))),
+                    self.nav_row(
+                        super::home::NavRowArgs {
                             id: "unreads",
                             icon: IconName::Inbox,
                             label: "Unreads",

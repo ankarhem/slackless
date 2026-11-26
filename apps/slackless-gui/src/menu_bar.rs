@@ -18,10 +18,10 @@ use slackless_platform::{self as platform, AboutPanel as _, FullScreenItem as _}
 
 use crate::app::{
     ActualSize, CreateChannelAction, FocusSearch, JumpToUnread, NavigateBack, NavigateForward,
-    NewMessage, NextWorkspace, OpenActivity, OpenChannelBrowser, OpenDms, OpenDownloads,
-    OpenDrafts, OpenFiles, OpenHome, OpenLater, OpenOwnProfile, OpenPeople, OpenPreferences,
-    OpenRecent, OpenThreads, OpenUnreads, PopOutConversation, PreviousWorkspace, QuickSwitch,
-    SearchConversation, ShowShortcuts, SignOut, SwitchWorkspace, ToggleRightPane,
+    NewMessage, NextWorkspace, OpenActivity, OpenCatchUp, OpenChannelBrowser, OpenDms,
+    OpenDownloads, OpenDrafts, OpenFiles, OpenHome, OpenLater, OpenOwnProfile, OpenPeople,
+    OpenPreferences, OpenRecent, OpenThreads, OpenUnreads, PopOutConversation, PreviousWorkspace,
+    QuickSwitch, SearchConversation, ShowShortcuts, SignOut, SwitchWorkspace, ToggleRightPane,
     ToggleWorkspaceRail, UnsendLastMessage, ZoomIn, ZoomOut,
 };
 
@@ -162,6 +162,7 @@ pub fn set(bar: &MenuBar, cx: &mut App) {
             MenuItem::submenu(Menu::new("History").items(back_forward())),
             MenuItem::separator(),
             MenuItem::action("Home", OpenHome),
+            MenuItem::action("Catch-Up", OpenCatchUp),
             MenuItem::action("Threads", OpenThreads),
             MenuItem::action("All Unreads", OpenUnreads),
             MenuItem::action("All DMs", OpenDms),

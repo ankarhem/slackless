@@ -2,7 +2,9 @@
 //! scheduled messages, pins, bookmarks, and saved/Later command handlers.
 
 use super::super::*;
+use super::offline::enqueue_outbox_with_ctx;
 use crate::api::{ActionContainer, ActivityEntry, MessageContent, SavedMark};
+use crate::outbox::{OutboxPayload, is_transient_send_error};
 use crate::reducer::update_conversation_last_read;
 
 /// Prune idle `draft_locks` entries once the per-channel lock map exceeds this threshold.
@@ -25,7 +27,34 @@ impl<B: Backend> Core<B> {
     ) {
         let ctx = self.ctx();
         self.spawn("chat.postMessage", async move {
-            post_message_and_store(&ctx, channel, content, thread_ts, broadcast).await
+            let outcome = post_message_and_store(
+                &ctx,
+                channel.clone(),
+                content.clone(),
+                thread_ts.clone(),
+                broadcast,
+            )
+            .await;
+            match outcome {
+                Ok(()) => Ok(()),
+                Err(CoreError::Api(ref err)) if is_transient_send_error(err) => {
+                    let payload = if thread_ts.is_some() {
+                        OutboxPayload::Reply { content, broadcast }
+                    } else {
+                        OutboxPayload::Message { content }
+                    };
+                    enqueue_outbox_with_ctx(
+                        &ctx,
+                        channel,
+                        thread_ts,
+                        payload,
+                        Some(err.to_string()),
+                    )
+                    .await?;
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            }
         });
     }
 
@@ -49,14 +78,50 @@ impl<B: Backend> Core<B> {
     pub(super) fn add_reaction(&self, channel: ChannelId, ts: Ts, name: String) {
         let ctx = self.ctx();
         self.spawn("reactions.add", async move {
-            Ok(ctx.backend.add_reaction(channel, ts, name).await?)
+            match ctx
+                .backend
+                .add_reaction(channel.clone(), ts.clone(), name.clone())
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(ref err) if is_transient_send_error(err) => {
+                    enqueue_outbox_with_ctx(
+                        &ctx,
+                        channel,
+                        None,
+                        OutboxPayload::ReactionAdd { ts, name },
+                        Some(err.to_string()),
+                    )
+                    .await?;
+                    Ok(())
+                }
+                Err(err) => Err(err.into()),
+            }
         });
     }
 
     pub(super) fn remove_reaction(&self, channel: ChannelId, ts: Ts, name: String) {
         let ctx = self.ctx();
         self.spawn("reactions.remove", async move {
-            Ok(ctx.backend.remove_reaction(channel, ts, name).await?)
+            match ctx
+                .backend
+                .remove_reaction(channel.clone(), ts.clone(), name.clone())
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(ref err) if is_transient_send_error(err) => {
+                    enqueue_outbox_with_ctx(
+                        &ctx,
+                        channel,
+                        None,
+                        OutboxPayload::ReactionRemove { ts, name },
+                        Some(err.to_string()),
+                    )
+                    .await?;
+                    Ok(())
+                }
+                Err(err) => Err(err.into()),
+            }
         });
     }
 

@@ -23,6 +23,7 @@ pub use slackless_types as types;
 
 mod backend;
 pub mod backfill;
+pub mod catchup;
 mod client;
 pub mod command;
 pub mod diff;
@@ -31,6 +32,7 @@ pub mod event;
 pub mod export;
 mod fetcher;
 mod notify;
+pub mod outbox;
 pub mod paths;
 pub mod privacy;
 mod reducer;
@@ -44,6 +46,13 @@ pub use backend::{
 pub use backfill::{
     BACKFILL_SYNCED_KEY, BackfillStatus, ChannelBackfillProgress, Synced,
     WorkspaceBackfillProgress, decode_synced_spans, read_synced_spans, write_synced_spans,
+};
+pub use catchup::{
+    CATCHUP_LAST_VISIT_KEY, CatchUpBriefing, CatchUpExcerpt, CatchUpMention, CatchUpThread,
+    CatchUpTranscript, CatchUpUnreadChannel, CatchUpWindow, CatchUpWorkspaceSummary,
+    DEFAULT_CATCHUP_LIMIT, MentionKind, TranscriptKind, WorkspaceCatchUpTarget,
+    build_catchup_across_stores, build_catchup_disk_archives, build_workspace_catchup,
+    format_catchup_human, read_catchup_last_visit, record_catchup_visit,
 };
 pub use client::{
     Client, ClientHandle, ClientHandles, Closed, CommandSender, EventReceiver, HuddleMediaReceiver,
@@ -65,6 +74,7 @@ pub use export::{
 };
 pub use fetcher::Fetcher;
 pub use notify::{NotifyLevel, notify_levels};
+pub use outbox::{OutboxPayload, decode_outbox_payload, is_transient_send_error};
 pub use privacy::{
     SecretMatch, detect_secrets, strip_tracking_params, strip_tracking_params_in_text,
 };

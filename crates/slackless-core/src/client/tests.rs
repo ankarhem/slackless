@@ -19,6 +19,31 @@ fn test_media_tx() -> HuddleMediaSender {
     mpsc::channel(HUDDLE_MEDIA_CHANNEL_CAPACITY).0
 }
 
+/// Cloneable factory for injecting `ApiError` failures in `FakeBackend` tests.
+#[derive(Clone)]
+enum FakeSendError {
+    Status(u16, &'static str),
+    RateLimited(u64),
+    Slack(&'static str),
+    AuthExpired(&'static str),
+}
+
+impl FakeSendError {
+    fn to_api_error(&self) -> ApiError {
+        match *self {
+            Self::Status(status, body) => ApiError::Status {
+                status,
+                body: body.to_owned(),
+            },
+            Self::RateLimited(secs) => ApiError::RateLimited {
+                retry_after: Duration::from_secs(secs),
+            },
+            Self::Slack(code) => ApiError::Slack(code.to_owned()),
+            Self::AuthExpired(code) => ApiError::AuthExpired(code.to_owned()),
+        }
+    }
+}
+
 /// In-process stand-in for Slack: a fixed channel history paged by index cursors.
 #[derive(Clone, Default)]
 pub(crate) struct FakeBackend {
@@ -64,10 +89,20 @@ struct FakeState {
     thread_mark_calls: Vec<(ChannelId, Ts, Ts)>,
     /// `chat.postMessage` asks, in order.
     posted_messages: Vec<(ChannelId, String)>,
+    /// `chat.postMessage` thread replies: `(channel, thread_ts, text, broadcast)`.
+    posted_thread_replies: Vec<(ChannelId, Ts, String, bool)>,
     /// When true, `post_message` fails with a Slack error (for offline retry tests).
     fail_post_message: bool,
+    /// Optional explicit error override returned by `post_message`.
+    post_message_error: Option<FakeSendError>,
+    /// Optional gate blocking `post_message` to test concurrent `FlushOutbox` idempotency.
+    post_message_gate: Option<Arc<tokio::sync::Notify>>,
     /// `reactions.add` asks, in order.
     reaction_adds: Vec<(ChannelId, Ts, String)>,
+    /// Optional explicit error override returned by `add_reaction`.
+    add_reaction_error: Option<FakeSendError>,
+    /// Optional explicit error override returned by `remove_reaction`.
+    remove_reaction_error: Option<FakeSendError>,
     /// `client.dms` answer.
     dms: Vec<Conversation>,
     /// How often `client.dms` was asked.
@@ -735,21 +770,37 @@ impl crate::backend::MessagingBackend for FakeBackend {
         &self,
         channel: ChannelId,
         content: MessageContent,
-        _thread_ts: Option<Ts>,
-        _broadcast: bool,
+        thread_ts: Option<Ts>,
+        broadcast: bool,
     ) -> api::Result<PostedMessage> {
+        let gate = self.state.lock().unwrap().post_message_gate.clone();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         {
             let mut state = self.state.lock().unwrap();
+            if let Some(ref err) = state.post_message_error {
+                return Err(err.to_api_error());
+            }
             if state.fail_post_message {
                 return Err(ApiError::Slack("ratelimited".into()));
             }
             state
                 .posted_messages
                 .push((channel.clone(), content.text.clone()));
+            if let Some(ref root) = thread_ts {
+                state.posted_thread_replies.push((
+                    channel.clone(),
+                    root.clone(),
+                    content.text.clone(),
+                    broadcast,
+                ));
+            }
         }
         let ts = Ts::from("100.0");
         let message = Message {
             ts: ts.clone(),
+            thread_ts,
             text: content.text,
             blocks: content.blocks,
             attachments: content.attachments,
@@ -764,20 +815,20 @@ impl crate::backend::MessagingBackend for FakeBackend {
     }
 
     async fn add_reaction(&self, ch: ChannelId, ts: Ts, name: String) -> api::Result<()> {
-        self.state
-            .lock()
-            .unwrap()
-            .reaction_adds
-            .push((ch, ts, name));
+        let mut state = self.state.lock().unwrap();
+        if let Some(ref err) = state.add_reaction_error {
+            return Err(err.to_api_error());
+        }
+        state.reaction_adds.push((ch, ts, name));
         Ok(())
     }
 
     async fn remove_reaction(&self, ch: ChannelId, ts: Ts, name: String) -> api::Result<()> {
-        self.state
-            .lock()
-            .unwrap()
-            .reaction_removes
-            .push((ch, ts, name));
+        let mut state = self.state.lock().unwrap();
+        if let Some(ref err) = state.remove_reaction_error {
+            return Err(err.to_api_error());
+        }
+        state.reaction_removes.push((ch, ts, name));
         Ok(())
     }
 
@@ -4074,7 +4125,7 @@ async fn offline_queue_buffers_and_flushes_on_reconnect() {
     core.on_rtm(RtmEvent::State(reconnecting.clone())).await;
     assert_eq!(next(&mut rx).await, Event::Connection(reconnecting));
 
-    // Queue a message, reaction, and read-mark while offline.
+    // Queue a message, reaction (V13 outbox), and read-mark (offline_queue) while offline.
     core.handle(Command::Messaging(MessagingCommand::SendMessage {
         channel: c1(),
         content: MessageContent::plain("first offline"),
@@ -4082,7 +4133,14 @@ async fn offline_queue_buffers_and_flushes_on_reconnect() {
         broadcast: false,
     }))
     .await;
-    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
+    match next(&mut rx).await {
+        Event::OutboxUpdated(items) => {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].kind, crate::store::OutboxKind::Message);
+            assert_eq!(items[0].status, crate::store::OutboxStatus::Pending);
+        }
+        other => panic!("expected OutboxUpdated(1), got {other:?}"),
+    }
 
     core.handle(Command::Messaging(MessagingCommand::AddReaction {
         channel: c1(),
@@ -4090,14 +4148,20 @@ async fn offline_queue_buffers_and_flushes_on_reconnect() {
         name: "thumbsup".into(),
     }))
     .await;
-    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(2));
+    match next(&mut rx).await {
+        Event::OutboxUpdated(items) => {
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[1].kind, crate::store::OutboxKind::ReactionAdd);
+        }
+        other => panic!("expected OutboxUpdated(2), got {other:?}"),
+    }
 
     core.handle(Command::Messaging(MessagingCommand::MarkRead {
         channel: c1(),
         ts: Ts::from("100.0"),
     }))
     .await;
-    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(3));
+    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
 
     // Nothing should have hit the backend yet.
     {
@@ -4107,25 +4171,32 @@ async fn offline_queue_buffers_and_flushes_on_reconnect() {
         assert!(state.mark_calls.is_empty());
     }
 
-    // Reconnect: queue drains in FIFO order and notifies 0 queued.
+    // Reconnect: both queues drain in FIFO order and outbox empties.
     let connected = ConnectionState::Connected {
         fast_reconnect: false,
     };
     core.on_rtm(RtmEvent::State(connected.clone())).await;
     assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(0));
     assert_eq!(next(&mut rx).await, Event::Connection(connected));
-    // Wait for the spawned SendMessage (`StoreChanged`) and `MarkRead` (`AuthExpired`).
+    // Wait for the spawned SendMessage (`StoreChanged`), `MarkRead` (`AuthExpired`),
+    // and final empty `OutboxUpdated([])`.
     let mut saw_store_changed = false;
     let mut saw_auth_expired = false;
-    for _ in 0..2 {
+    let mut saw_empty_outbox = false;
+    for _ in 0..16 {
         match next(&mut rx).await {
             Event::StoreChanged { channel } if channel == c1() => saw_store_changed = true,
             Event::AuthExpired(code) if code == "invalid_auth" => saw_auth_expired = true,
+            Event::OutboxUpdated(items) if items.is_empty() => saw_empty_outbox = true,
             _ => {}
+        }
+        if saw_store_changed && saw_auth_expired && saw_empty_outbox {
+            break;
         }
     }
     assert!(saw_store_changed);
     assert!(saw_auth_expired);
+    assert!(saw_empty_outbox);
     wait_until("offline flush tasks complete", || {
         let state = fake.state.lock().unwrap();
         state.posted_messages.len() == 1
@@ -4173,7 +4244,13 @@ async fn offline_queue_persists_across_restart_and_retries_or_discards() {
         broadcast: false,
     }))
     .await;
-    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
+    let outbox_id = match next(&mut rx).await {
+        Event::OutboxUpdated(items) => {
+            assert_eq!(items.len(), 1);
+            items[0].id
+        }
+        other => panic!("expected OutboxUpdated, got {other:?}"),
+    };
 
     // Simulate app restart sharing the same SQLite store.
     drop(core);
@@ -4186,48 +4263,72 @@ async fn offline_queue_persists_across_restart_and_retries_or_discards() {
         test_media_tx(),
     )
     .await;
-    // Core::new announces the restored persisted queue count immediately.
-    assert_eq!(next(&mut rx2).await, Event::OfflineQueueChanged(1));
+    // Core::new announces the restored persisted outbox immediately.
+    match next(&mut rx2).await {
+        Event::OutboxUpdated(items) => {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].id, outbox_id);
+            assert_eq!(items[0].status, crate::store::OutboxStatus::Pending);
+        }
+        other => panic!("expected initial OutboxUpdated on restart, got {other:?}"),
+    }
 
-    // Reconnect while post_message is still failing -> emits OfflineMutationFailed and keeps row.
+    // Reconnect while post_message is still failing -> marks outbox item `failed` and keeps row.
     let connected = ConnectionState::Connected {
         fast_reconnect: false,
     };
     core2.on_rtm(RtmEvent::State(connected.clone())).await;
-    assert_eq!(next(&mut rx2).await, Event::OfflineQueueChanged(0));
     assert_eq!(next(&mut rx2).await, Event::Connection(connected));
-    let failed = match next(&mut rx2).await {
-        Event::OfflineMutationFailed(f) => f,
-        other => panic!("expected OfflineMutationFailed, got {other:?}"),
-    };
-    assert!(failed.summary.contains("survives restart"));
+    let mut failed_item = None;
+    for _ in 0..8 {
+        if let Event::OutboxUpdated(items) = next(&mut rx2).await
+            && let Some(item) = items
+                .into_iter()
+                .find(|i| i.id == outbox_id && i.status == crate::store::OutboxStatus::Failed)
+        {
+            failed_item = Some(item);
+            break;
+        }
+    }
+    let failed = failed_item.expect("expected outbox item to transition to Failed");
+    assert_eq!(failed.attempts, 1);
+    assert!(
+        failed
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("ratelimited")
+    );
     assert_eq!(
         store
             .lock()
             .unwrap()
-            .list_offline(&TeamId::from("T1"))
+            .list_outbox(&TeamId::from("T1"))
             .unwrap()
             .len(),
         1
     );
 
-    // Now backend recovers -> RetryOfflineMutation succeeds and removes the SQLite row.
+    // Now backend recovers -> RetryOutboxItem succeeds and removes the SQLite row.
     fake.state.lock().unwrap().fail_post_message = false;
     core2
-        .handle(Command::Messaging(MessagingCommand::RetryOfflineMutation(
-            failed.id,
+        .handle(Command::Messaging(MessagingCommand::RetryOutboxItem(
+            outbox_id,
         )))
         .await;
-    assert_eq!(next(&mut rx2).await, Event::StoreChanged { channel: c1() });
-    wait_until("offline queue row removed after retry", || {
+    wait_until("outbox row removed after retry", || {
         store
             .lock()
             .unwrap()
-            .list_offline(&TeamId::from("T1"))
+            .list_outbox(&TeamId::from("T1"))
             .unwrap()
             .is_empty()
     })
     .await;
+    assert_eq!(
+        fake.state.lock().unwrap().posted_messages,
+        vec![(c1(), "survives restart".to_owned())]
+    );
 }
 
 /// Poll `pred` until true (5ms cadence, 2s ceiling) to avoid flaky fixed sleeps on busy CI runners.
@@ -5048,13 +5149,18 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
         broadcast: false,
     }))
     .await;
-    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(3));
-    let discard_id = core.offline_queue.back().unwrap().0;
-    core.handle(Command::Messaging(
-        MessagingCommand::DiscardOfflineMutation(discard_id),
-    ))
+    let discard_id = match next(&mut rx).await {
+        Event::OutboxUpdated(items) => {
+            assert_eq!(items.len(), 1);
+            items[0].id
+        }
+        other => panic!("expected OutboxUpdated, got {other:?}"),
+    };
+    core.handle(Command::Messaging(MessagingCommand::DiscardOutboxItem(
+        discard_id,
+    )))
     .await;
-    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(2));
+    assert_eq!(next(&mut rx).await, Event::OutboxUpdated(Vec::new()));
 
     // RetryOfflineMutation while offline does NOT fire a network call immediately.
     let mark_id = core.offline_queue.back().unwrap().0;
@@ -5101,7 +5207,7 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
         .unwrap();
     assert_eq!(stored_conv.last_read, Some(Ts::from("99.0")));
 
-    // 3. DiscardOfflineMutation after a failed flush deletes the SQLite row.
+    // 3. DiscardOutboxItem after a failed flush deletes the SQLite outbox row.
     fake.state.lock().unwrap().fail_post_message = true;
     core.on_rtm(RtmEvent::State(ConnectionState::Disconnected {
         reason: "down2".into(),
@@ -5115,32 +5221,41 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
         broadcast: false,
     }))
     .await;
-    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
+    let queued_id = match next(&mut rx).await {
+        Event::OutboxUpdated(items) => {
+            assert_eq!(items.len(), 1);
+            items[0].id
+        }
+        other => panic!("expected OutboxUpdated, got {other:?}"),
+    };
     core.on_rtm(RtmEvent::State(ConnectionState::Connected {
         fast_reconnect: false,
     }))
     .await;
-    let mut failed_id = None;
-    for _ in 0..4 {
-        if let Event::OfflineMutationFailed(f) = next(&mut rx).await {
-            failed_id = Some(f.id);
+    let mut saw_failed = false;
+    for _ in 0..8 {
+        if let Event::OutboxUpdated(items) = next(&mut rx).await
+            && items
+                .iter()
+                .any(|i| i.id == queued_id && i.status == crate::store::OutboxStatus::Failed)
+        {
+            saw_failed = true;
             break;
         }
     }
-    let failed_id = failed_id.expect("expected OfflineMutationFailed");
-    core.handle(Command::Messaging(
-        MessagingCommand::DiscardOfflineMutation(failed_id),
-    ))
+    assert!(saw_failed, "expected outbox item to fail");
+    core.handle(Command::Messaging(MessagingCommand::DiscardOutboxItem(
+        queued_id,
+    )))
     .await;
-    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(0));
+    assert_eq!(next(&mut rx).await, Event::OutboxUpdated(Vec::new()));
     assert!(
         store
             .lock()
             .unwrap()
-            .list_offline(&TeamId::from("T1"))
+            .list_outbox(&TeamId::from("T1"))
             .unwrap()
-            .iter()
-            .all(|(id, _)| *id != failed_id)
+            .is_empty()
     );
 }
 
@@ -7310,4 +7425,304 @@ async fn workspace_backfill_commands_report_progress_and_honor_pause_resume() {
         saw_ch_complete,
         "BackfillChannel after PauseBackfill must clear stale pause and complete"
     );
+}
+
+#[tokio::test]
+async fn outbox_enqueues_on_transient_errors_and_rejects_permanent_slack_and_auth_errors() {
+    use crate::store::{OutboxKind, OutboxStatus};
+
+    let fake = FakeBackend::default();
+    let (store, events, mut rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    // 1. Transient 503 on SendMessage, ReplyThread, AddReaction, RemoveReaction -> enqueues all 4.
+    {
+        let mut st = fake.state.lock().unwrap();
+        st.post_message_error = Some(FakeSendError::Status(503, "service unavailable"));
+        st.add_reaction_error = Some(FakeSendError::RateLimited(1));
+        st.remove_reaction_error = Some(FakeSendError::Status(502, "bad gateway"));
+    }
+
+    core.handle(Command::Messaging(MessagingCommand::SendMessage {
+        channel: c1(),
+        content: MessageContent::plain("transient msg"),
+        thread_ts: None,
+        broadcast: false,
+    }))
+    .await;
+    core.handle(Command::Messaging(MessagingCommand::ReplyThread {
+        channel: c1(),
+        thread_ts: Ts::from("1700000001.000100"),
+        content: MessageContent::plain("transient reply"),
+        broadcast: true,
+    }))
+    .await;
+    core.handle(Command::Messaging(MessagingCommand::AddReaction {
+        channel: c1(),
+        ts: Ts::from("1700000001.000100"),
+        name: "rocket".into(),
+    }))
+    .await;
+    core.handle(Command::Messaging(MessagingCommand::RemoveReaction {
+        channel: c1(),
+        ts: Ts::from("1700000001.000100"),
+        name: "eyes".into(),
+    }))
+    .await;
+
+    wait_until("all 4 transient mutations persisted in outbox", || {
+        store.lock().unwrap().list_outbox(&ws).unwrap().len() == 4
+    })
+    .await;
+
+    let items = store.lock().unwrap().list_outbox(&ws).unwrap();
+    let kinds: HashSet<OutboxKind> = items.iter().map(|i| i.kind).collect();
+    assert!(kinds.contains(&OutboxKind::Message));
+    assert!(kinds.contains(&OutboxKind::Reply));
+    assert!(kinds.contains(&OutboxKind::ReactionAdd));
+    assert!(kinds.contains(&OutboxKind::ReactionRemove));
+    assert!(items.iter().all(|i| i.status == OutboxStatus::Pending));
+    assert!(items.iter().all(|i| i.last_error.is_some()));
+
+    // Drain events emitted so far.
+    while rx.try_recv().is_ok() {}
+
+    // 2. Permanent Slack errors (`channel_not_found`, `not_in_channel`, `invalid_auth`) MUST NOT
+    //    enqueue into outbox.
+    for perm_err in [
+        FakeSendError::Slack("channel_not_found"),
+        FakeSendError::Slack("not_in_channel"),
+        FakeSendError::AuthExpired("invalid_auth"),
+    ] {
+        let expect_auth = matches!(perm_err, FakeSendError::AuthExpired(_));
+        fake.state.lock().unwrap().post_message_error = Some(perm_err);
+        core.handle(Command::Messaging(MessagingCommand::SendMessage {
+            channel: c1(),
+            content: MessageContent::plain("should never queue"),
+            thread_ts: None,
+            broadcast: false,
+        }))
+        .await;
+        let ev = next(&mut rx).await;
+        if expect_auth {
+            assert!(
+                matches!(ev, Event::AuthExpired(ref code) if code == "invalid_auth"),
+                "expected AuthExpired, got {ev:?}"
+            );
+        } else {
+            assert!(
+                matches!(ev, Event::Error(_)),
+                "expected Event::Error for permanent Slack error, got {ev:?}"
+            );
+        }
+    }
+    assert_eq!(
+        store.lock().unwrap().list_outbox(&ws).unwrap().len(),
+        4,
+        "permanent errors must not add rows to outbox"
+    );
+
+    // 3. Clear errors -> explicit FlushOutbox drains all 4 items idempotently.
+    {
+        let mut st = fake.state.lock().unwrap();
+        st.post_message_error = None;
+        st.add_reaction_error = Some(FakeSendError::Slack("already_reacted"));
+        st.remove_reaction_error = Some(FakeSendError::Slack("no_reaction"));
+    }
+    core.handle(Command::Messaging(MessagingCommand::FlushOutbox))
+        .await;
+    wait_until("outbox drained after FlushOutbox", || {
+        store.lock().unwrap().list_outbox(&ws).unwrap().is_empty()
+    })
+    .await;
+
+    let st = fake.state.lock().unwrap();
+    assert_eq!(st.posted_messages.len(), 2);
+    assert_eq!(
+        st.posted_thread_replies,
+        vec![(
+            c1(),
+            Ts::from("1700000001.000100"),
+            "transient reply".to_owned(),
+            true
+        )]
+    );
+}
+
+#[tokio::test]
+async fn outbox_concurrent_flush_is_idempotent_and_recovers_sending_rows_on_restart() {
+    use crate::store::{NewOutboxItem, OutboxKind, OutboxStatus};
+
+    let fake = FakeBackend::default();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    fake.state.lock().unwrap().post_message_gate = Some(Arc::clone(&gate));
+
+    let (store, events, mut rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+
+    // Pre-seed two FIFO messages AND one row stuck in `sending` from a simulated crash.
+    {
+        let mut s = store.lock().unwrap();
+        let p1 = crate::outbox::OutboxPayload::Message {
+            content: MessageContent::plain("first fifo"),
+        }
+        .encode();
+        let item1 = s
+            .enqueue_outbox(
+                &ws,
+                &NewOutboxItem {
+                    channel_id: &c1(),
+                    thread_ts: None,
+                    kind: OutboxKind::Message,
+                    payload_json: &p1,
+                    last_error: None,
+                },
+            )
+            .unwrap();
+        assert!(s.mark_outbox_sending(item1.id).unwrap());
+
+        let p2 = crate::outbox::OutboxPayload::Message {
+            content: MessageContent::plain("second fifo"),
+        }
+        .encode();
+        s.enqueue_outbox(
+            &ws,
+            &NewOutboxItem {
+                channel_id: &c1(),
+                thread_ts: None,
+                kind: OutboxKind::Message,
+                payload_json: &p2,
+                last_error: None,
+            },
+        )
+        .unwrap();
+    }
+
+    // Core::new resets stuck `sending` -> `pending` and emits initial OutboxUpdated.
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+    match next(&mut rx).await {
+        Event::OutboxUpdated(items) => {
+            assert_eq!(items.len(), 2);
+            assert!(items.iter().all(|i| i.status == OutboxStatus::Pending));
+        }
+        other => panic!("expected restored OutboxUpdated, got {other:?}"),
+    }
+
+    // Fire two overlapping FlushOutbox commands while post_message is gated.
+    core.handle(Command::Messaging(MessagingCommand::FlushOutbox))
+        .await;
+    core.handle(Command::Messaging(MessagingCommand::FlushOutbox))
+        .await;
+
+    // Wait until item 1 is claimed (`sending`), then release both sends.
+    wait_until("first item claimed as sending", || {
+        store
+            .lock()
+            .unwrap()
+            .list_outbox(&ws)
+            .unwrap()
+            .first()
+            .is_some_and(|i| i.status == OutboxStatus::Sending)
+    })
+    .await;
+    gate.notify_one();
+    wait_until("second item claimed as sending", || {
+        store.lock().unwrap().list_outbox(&ws).unwrap().len() == 1
+    })
+    .await;
+    gate.notify_one();
+
+    wait_until("both FIFO items sent once each", || {
+        store.lock().unwrap().list_outbox(&ws).unwrap().is_empty()
+    })
+    .await;
+
+    // Give the second queued flush task a moment to acquire the lock and see empty pending list.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let posted = fake.state.lock().unwrap().posted_messages.clone();
+    assert_eq!(
+        posted,
+        vec![
+            (c1(), "first fifo".to_owned()),
+            (c1(), "second fifo".to_owned()),
+        ],
+        "concurrent flushes must preserve strict FIFO order and never double-send"
+    );
+}
+
+#[tokio::test]
+async fn outbox_retry_offline_resets_to_pending_and_discard_removes_row() {
+    use crate::store::OutboxStatus;
+
+    let fake = FakeBackend::default();
+    fake.state.lock().unwrap().post_message_error = Some(FakeSendError::Status(503, "down"));
+    let (store, events, mut rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    core.handle(Command::Messaging(MessagingCommand::SendMessage {
+        channel: c1(),
+        content: MessageContent::plain("retry offline test"),
+        thread_ts: None,
+        broadcast: false,
+    }))
+    .await;
+    wait_until("enqueued", || {
+        store.lock().unwrap().list_outbox(&ws).unwrap().len() == 1
+    })
+    .await;
+    let id = store.lock().unwrap().list_outbox(&ws).unwrap()[0].id;
+
+    // Explicit flush while still returning 503 -> marks item Failed.
+    core.handle(Command::Messaging(MessagingCommand::FlushOutbox))
+        .await;
+    wait_until("marked failed", || {
+        store
+            .lock()
+            .unwrap()
+            .get_outbox_item(id)
+            .unwrap()
+            .is_some_and(|i| i.status == OutboxStatus::Failed)
+    })
+    .await;
+
+    // Go offline and click Retry -> resets to Pending without calling backend.
+    core.on_rtm(RtmEvent::State(ConnectionState::Disconnected {
+        reason: "offline".into(),
+    }))
+    .await;
+    core.handle(Command::Messaging(MessagingCommand::RetryOutboxItem(id)))
+        .await;
+    let item = store.lock().unwrap().get_outbox_item(id).unwrap().unwrap();
+    assert_eq!(item.status, OutboxStatus::Pending);
+    assert!(fake.state.lock().unwrap().posted_messages.is_empty());
+
+    // Discard removes it and emits empty OutboxUpdated.
+    while rx.try_recv().is_ok() {}
+    core.handle(Command::Messaging(MessagingCommand::DiscardOutboxItem(id)))
+        .await;
+    assert_eq!(next(&mut rx).await, Event::OutboxUpdated(Vec::new()));
+    assert!(store.lock().unwrap().list_outbox(&ws).unwrap().is_empty());
 }

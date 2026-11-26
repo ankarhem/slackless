@@ -78,6 +78,7 @@ pub(super) fn subscribe_workspace(
                 SidebarEvent::OpenLater => this.open_later(cx),
                 SidebarEvent::OpenThreads => this.open_threads(cx),
                 SidebarEvent::OpenUnreads => this.open_unreads(window, cx),
+                SidebarEvent::OpenCatchUp => this.open_catchup(window, cx),
                 SidebarEvent::OpenActivity => this.open_activity(cx),
                 SidebarEvent::LeftActivity => {
                     if this.page == MainPage::Activity {
@@ -557,6 +558,12 @@ pub(super) fn subscribe_workspace(
                     ts,
                 } => {
                     this.mark_thread_unread(channel.clone(), thread_ts.clone(), ts.clone(), cx);
+                }
+                ThreadPanelEvent::RetryOutbox(id) => {
+                    this.bridge.send(MessagingCommand::RetryOutboxItem(*id));
+                }
+                ThreadPanelEvent::DiscardOutbox(id) => {
+                    this.bridge.send(MessagingCommand::DiscardOutboxItem(*id));
                 }
             },
         ),

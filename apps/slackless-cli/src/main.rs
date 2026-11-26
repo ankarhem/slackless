@@ -32,7 +32,7 @@ use crate::cli::{
 pub(crate) use crate::cli::{CLI_VERSION, CanvasAccessArg, ListReadFormat};
 use crate::commands::auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
 use crate::commands::browse::{
-    cmd_channels, cmd_digest, cmd_dms, cmd_revisions, cmd_threads, cmd_users,
+    cmd_catchup, cmd_channels, cmd_digest, cmd_dms, cmd_revisions, cmd_threads, cmd_users,
 };
 use crate::commands::maintenance::{cmd_archive_status, cmd_stats, cmd_vacuum};
 use crate::commands::messages::{
@@ -167,6 +167,13 @@ async fn dispatch(
         Commands::Digest(args) => {
             cmd_digest(ctx, workspace, &args.since, args.all_workspaces, args.limit)
         }
+        Commands::Catchup(args) => cmd_catchup(
+            ctx,
+            workspace,
+            args.since.as_deref(),
+            args.all_workspaces,
+            args.limit,
+        ),
         Commands::MarkRead { channel, ts } => {
             run_mark_read(ctx, flag, &channel, ts.as_deref()).await
         }
