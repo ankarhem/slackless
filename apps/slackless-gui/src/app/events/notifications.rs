@@ -589,16 +589,8 @@ impl App {
         wanted
     }
 
-    /// Play the notification sound chosen in Preferences, unless muted or in quiet hours / DND (`F-SHELL-180`).
-    #[allow(dead_code)]
-    pub(in crate::app) fn play_notification_sound_kind(
-        &mut self,
-        is_direct_or_mention: bool,
-        cx: &mut Context<Self>,
-    ) {
-        self.play_notification_sound_with_breakthrough(is_direct_or_mention, false, cx);
-    }
-
+    /// Play the notification sound chosen in Preferences, unless muted or in quiet hours / DND
+    /// (`F-SHELL-180`); `breakthrough` skips the focus, pause and schedule checks.
     pub(in crate::app) fn play_notification_sound_with_breakthrough(
         &mut self,
         is_direct_or_mention: bool,
