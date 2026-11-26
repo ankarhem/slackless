@@ -420,7 +420,7 @@ impl UsersBackend for SlackApi {
         SlackApi::team_profile_get_detailed(self).await
     }
     async fn users_set_photo(&self, filename: String, bytes: Vec<u8>) -> api::Result<()> {
-        SlackApi::users_set_photo(self, &filename, &bytes).await
+        SlackApi::users_set_photo(self, &filename, bytes.into()).await
     }
     async fn set_notification_pref(
         &self,

@@ -751,7 +751,7 @@ impl SlackApi {
     }
 
     /// `users.setPhoto`: upload a new profile photo (`F-SHELL-004`).
-    pub async fn users_set_photo(&self, filename: &str, bytes: &[u8]) -> Result<()> {
+    pub async fn users_set_photo(&self, filename: &str, photo: bytes::Bytes) -> Result<()> {
         let lower = filename.to_ascii_lowercase();
         let ct = if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
             "image/jpeg"
@@ -763,7 +763,7 @@ impl SlackApi {
             "image/png"
         };
         let _ = self
-            .post_multipart_file(method::USERS_SET_PHOTO, "image", filename, ct, bytes)
+            .post_multipart_file(method::USERS_SET_PHOTO, "image", filename, ct, photo)
             .await?;
         Ok(())
     }

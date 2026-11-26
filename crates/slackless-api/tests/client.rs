@@ -1787,7 +1787,9 @@ async fn users_set_photo_multipart_framing_sanitization_mime_and_errors() {
         ("avatar.bin", "avatar.bin", "image/png"),
     ];
     for (filename, _, _) in &cases {
-        api.users_set_photo(filename, b"\x89PNGDATA").await.unwrap();
+        api.users_set_photo(filename, bytes::Bytes::from_static(b"\x89PNGDATA"))
+            .await
+            .unwrap();
     }
 
     let requests = server.received_requests().await.unwrap();
@@ -1832,7 +1834,10 @@ async fn users_set_photo_multipart_framing_sanitization_mime_and_errors() {
             )
             .mount(&server)
             .await;
-        let err = api.users_set_photo("a.png", b"x").await.unwrap_err();
+        let err = api
+            .users_set_photo("a.png", bytes::Bytes::from_static(b"x"))
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, ApiError::Slack(ref e) if e == "bad_image"),
             "{err:?}"
@@ -1845,7 +1850,10 @@ async fn users_set_photo_multipart_framing_sanitization_mime_and_errors() {
             .respond_with(ResponseTemplate::new(500).set_body_string("server boom"))
             .mount(&server)
             .await;
-        let err = api.users_set_photo("a.png", b"x").await.unwrap_err();
+        let err = api
+            .users_set_photo("a.png", bytes::Bytes::from_static(b"x"))
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, ApiError::Status { status: 500, .. }),
             "{err:?}"
@@ -1858,7 +1866,10 @@ async fn users_set_photo_multipart_framing_sanitization_mime_and_errors() {
             .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
             .mount(&server)
             .await;
-        let err = api.users_set_photo("a.png", b"x").await.unwrap_err();
+        let err = api
+            .users_set_photo("a.png", bytes::Bytes::from_static(b"x"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ApiError::Decode(_)), "{err:?}");
     }
 }

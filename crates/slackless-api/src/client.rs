@@ -479,18 +479,17 @@ impl SlackApi {
     }
 
     /// Posts a `multipart/form-data` API method carrying `token` and a binary file field
-    /// (used by `users.setPhoto`, `F-SHELL-004`).
+    /// (used by `users.setPhoto`, `F-SHELL-004`); each attempt shares `payload`'s buffer.
     pub(crate) async fn post_multipart_file(
         &self,
         api_method: &str,
         field_name: &str,
         filename: &str,
         content_type: &str,
-        bytes: &[u8],
+        payload: Bytes,
     ) -> Result<serde_json::Value> {
         let url = self.base.join(api_method)?;
         let safe_name = filename.replace(['"', '\r', '\n'], "_");
-        let payload = Bytes::copy_from_slice(bytes);
         let payload_len = payload.len() as u64;
         let resp = self
             .send_with_retry(|| {
