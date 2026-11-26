@@ -9882,6 +9882,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "slackless-api",
  "slackless-types",
  "sonora",
  "thiserror 2.0.21",

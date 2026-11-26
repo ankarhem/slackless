@@ -11,7 +11,6 @@
 //!   code-switching with `-l auto`; server stays hot during active huddles and exits on hangup).
 
 use std::future::Future;
-use std::io::Write as _;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -45,6 +44,8 @@ const PARAKEET_V3_FILES: &[&str] = &[
 const WHISPER_TURBO_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin";
 const WHISPER_TURBO_FILENAME: &str = "ggml-large-v3-turbo-q5_0.bin";
+/// Largest model file accepted; the biggest (Parakeet's encoder, Whisper Turbo) are ~600 MB.
+const MAX_MODEL_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Selectable transcription provider for huddles (opt-in local models; default is Slack built-in).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -365,6 +366,7 @@ async fn download_provider_model_async(
         .user_agent("slackless/1.0")
         .build()
         .map_err(|e| format!("http client error: {e}"))?;
+    let assets = slackless_api::AssetClient::with_http_client(client);
 
     let (dest_dir, files): (PathBuf, Vec<(String, String)>) = match provider {
         TranscriptionProvider::SlackBuiltIn => return Ok(PathBuf::new()),
@@ -393,70 +395,26 @@ async fn download_provider_model_async(
 
     let file_count = files.len();
     for (idx, (url, name)) in files.into_iter().enumerate() {
+        let progress = |downloaded_bytes, total_bytes| {
+            on_progress(ModelDownloadProgress {
+                file_name: name.clone(),
+                file_index: idx + 1,
+                file_count,
+                downloaded_bytes,
+                total_bytes,
+            });
+        };
         let final_path = dest_dir.join(&name);
         if final_path.is_file() && final_path.metadata().is_ok_and(|m| m.len() > 0) {
             let len = final_path.metadata().map_or(0, |m| m.len());
-            on_progress(ModelDownloadProgress {
-                file_name: name,
-                file_index: idx + 1,
-                file_count,
-                downloaded_bytes: len,
-                total_bytes: Some(len),
-            });
+            progress(len, Some(len));
             continue;
         }
-        let part_path = dest_dir.join(format!("{name}.part"));
-        let mut resp = client
-            .get(&url)
-            .send()
+        let downloaded = assets
+            .download_to_path(&url, &final_path, MAX_MODEL_FILE_BYTES, &progress)
             .await
             .map_err(|e| format!("download failed for {name}: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {} downloading {name}", resp.status()));
-        }
-        let total_bytes = resp.content_length();
-        let mut file = std::fs::File::create(&part_path)
-            .map_err(|e| format!("cannot create {}: {e}", part_path.display()))?;
-        let mut downloaded: u64 = 0;
-        let mut last_emit: u64 = 0;
-        on_progress(ModelDownloadProgress {
-            file_name: name.clone(),
-            file_index: idx + 1,
-            file_count,
-            downloaded_bytes: 0,
-            total_bytes,
-        });
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| format!("stream error downloading {name}: {e}"))?
-        {
-            file.write_all(&chunk)
-                .map_err(|e| format!("write error for {name}: {e}"))?;
-            downloaded = downloaded.saturating_add(chunk.len() as u64);
-            if downloaded.saturating_sub(last_emit) >= 512 * 1024 {
-                last_emit = downloaded;
-                on_progress(ModelDownloadProgress {
-                    file_name: name.clone(),
-                    file_index: idx + 1,
-                    file_count,
-                    downloaded_bytes: downloaded,
-                    total_bytes,
-                });
-            }
-        }
-        file.flush()
-            .map_err(|e| format!("flush error for {name}: {e}"))?;
-        drop(file);
-        std::fs::rename(&part_path, &final_path)
-            .map_err(|e| format!("rename error for {name}: {e}"))?;
-        on_progress(ModelDownloadProgress {
-            file_name: name,
-            file_index: idx + 1,
-            file_count,
-            downloaded_bytes: downloaded,
-            total_bytes: total_bytes.or(Some(downloaded)),
-        });
+        progress(downloaded, Some(downloaded));
     }
 
     Ok(dest_dir)

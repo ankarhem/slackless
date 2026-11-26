@@ -2,13 +2,15 @@
 //! resolver, code-signature verification and app-bundle swap used by both CLI (`slackless
 //! update`) and GUI (`Check for Updates`).
 
-use std::io::{BufWriter, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+use crate::api::AssetClient;
 
 /// GitHub repository hosting official Slackless releases.
 pub const RELEASES_REPO: &str = "ankarhem/slackless";
@@ -48,6 +50,8 @@ const DEFAULT_USER_AGENT: &str = concat!("Slackless/", env!("CARGO_PKG_VERSION")
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// Largest release archive accepted; current archives are tens of MB.
+const MAX_RELEASE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Metadata for an available GitHub Release.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -440,47 +444,10 @@ pub fn fetch_latest_release_for_channel_blocking(
         .map_err(|e| format!("failed to start async runtime: {e}"))?
 }
 
-/// Stream `url` directly to `dest` via `reqwest` (15s connect / 300s request timeout), returning
-/// the number of bytes written. Removes any partial file if an error occurs mid-transfer.
-pub async fn download_to_file(url: &str, dest: &Path, user_agent: &str) -> Result<u64, String> {
-    let client = build_updater_client(user_agent, DOWNLOAD_TIMEOUT)?;
-    let mut resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("download failed: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("download failed with HTTP {}", status.as_u16()));
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-    }
-    let file = std::fs::File::create(dest)
-        .map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
-    let mut writer = BufWriter::new(file);
-    let mut total = 0u64;
-    while let Some(chunk) = resp.chunk().await.map_err(|e| {
-        let _ = std::fs::remove_file(dest);
-        format!("download stream interrupted: {e}")
-    })? {
-        writer.write_all(&chunk).map_err(|e| {
-            let _ = std::fs::remove_file(dest);
-            format!("failed writing {}: {e}", dest.display())
-        })?;
-        total = total.saturating_add(chunk.len() as u64);
-    }
-    writer.flush().map_err(|e| {
-        let _ = std::fs::remove_file(dest);
-        format!("failed flushing {}: {e}", dest.display())
-    })?;
-    Ok(total)
-}
-
-/// Download `release`'s archive and `SHA256SUMS.txt` into `staging_dir` via `reqwest`, verify the
-/// SHA-256 checksum in pure Rust via [`sha256_file`] and [`find_sha256_entry`], and return the
-/// verified tarball path. Refuses unverified updates if `sha256_url` is missing.
+/// Download `release`'s archive (streamed through a `.part` file, 15s connect / 300s request
+/// timeout) and `SHA256SUMS.txt` into `staging_dir`, verify the archive's SHA-256 checksum in pure
+/// Rust via [`sha256_file`] and [`find_sha256_entry`], and return the verified tarball path.
+/// Refuses unverified updates if `sha256_url` is missing.
 pub async fn download_and_verify_release(
     release: &ReleaseInfo,
     staging_dir: &Path,
@@ -504,7 +471,15 @@ pub async fn download_and_verify_release(
     })?;
 
     let tarball_path = staging_dir.join(&release.asset_name);
-    download_to_file(&release.download_url, &tarball_path, user_agent).await?;
+    AssetClient::with_http_client(build_updater_client(user_agent, DOWNLOAD_TIMEOUT)?)
+        .download_to_path(
+            &release.download_url,
+            &tarball_path,
+            MAX_RELEASE_BYTES,
+            |_, _| {},
+        )
+        .await
+        .map_err(|e| format!("download failed: {e}"))?;
 
     let client = build_updater_client(user_agent, METADATA_TIMEOUT)?;
     let sums_resp = client
@@ -963,6 +938,7 @@ pub fn dir_in_path(dir: &Path) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);

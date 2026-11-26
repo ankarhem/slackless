@@ -2,12 +2,11 @@
 //! WordPiece tokenizer, deterministic hash-projection fallback/test embedder, and opt-in
 //! Hugging Face model download/status management.
 //!
-//! Follows the exact streaming download + atomic `.part` -> rename pattern from
-//! `crates/slackless-huddle/src/transcribe.rs`. Zero external binaries, zero telemetry, and
-//! zero network calls during unit/integration tests.
+//! Model files stream to disk through [`AssetClient::download_to_path`] (atomic `.part` ->
+//! rename). Zero external binaries, zero telemetry, and zero network calls during
+//! unit/integration tests.
 
 use std::collections::HashMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -18,8 +17,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use slackless_store::l2_normalize;
 
+use crate::api::AssetClient;
 use crate::paths;
 use crate::runtime::block_on;
+
+/// Largest model file accepted; the INT8 weights are ~23-33 MB.
+const MAX_MODEL_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Supported local ONNX sentence embedding models (quantized INT8 for compact disk & fast CPU).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -221,100 +224,37 @@ async fn download_files_to_dir(
         .user_agent("slackless/1.0")
         .build()
         .map_err(|e| format!("http client error: {e}"))?;
+    let assets = AssetClient::with_http_client(client);
 
     std::fs::create_dir_all(dest_dir)
         .map_err(|e| format!("failed to create {}: {e}", dest_dir.display()))?;
 
     let file_count = files.len();
     for (idx, (url, name)) in files.into_iter().enumerate() {
+        let progress = |downloaded_bytes, total_bytes| {
+            on_progress(EmbeddingDownloadProgress {
+                file_name: name.to_owned(),
+                file_index: idx + 1,
+                file_count,
+                downloaded_bytes,
+                total_bytes,
+            });
+        };
         let final_path = dest_dir.join(name);
         if final_path.is_file() && final_path.metadata().is_ok_and(|m| m.len() > 0) {
             let len = final_path.metadata().map_or(0, |m| m.len());
-            on_progress(EmbeddingDownloadProgress {
-                file_name: name.to_owned(),
-                file_index: idx + 1,
-                file_count,
-                downloaded_bytes: len,
-                total_bytes: Some(len),
-            });
+            progress(len, Some(len));
             continue;
         }
-        let part_path = dest_dir.join(format!("{name}.part"));
-        let download_res: std::result::Result<(u64, Option<u64>), String> = async {
-            let mut resp = client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| format!("download failed for {name}: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("HTTP {} downloading {name}", resp.status()));
-            }
-            let total_bytes = resp.content_length();
-            if total_bytes == Some(0) {
-                return Err(format!("empty 0-byte response downloading {name}"));
-            }
-            let mut file = std::fs::File::create(&part_path)
-                .map_err(|e| format!("cannot create {}: {e}", part_path.display()))?;
-            let mut downloaded: u64 = 0;
-            let mut last_emit: u64 = 0;
-            on_progress(EmbeddingDownloadProgress {
-                file_name: name.to_owned(),
-                file_index: idx + 1,
-                file_count,
-                downloaded_bytes: 0,
-                total_bytes,
-            });
-            while let Some(chunk) = resp
-                .chunk()
-                .await
-                .map_err(|e| format!("stream error downloading {name}: {e}"))?
-            {
-                file.write_all(&chunk)
-                    .map_err(|e| format!("write error for {name}: {e}"))?;
-                downloaded = downloaded.saturating_add(chunk.len() as u64);
-                if downloaded.saturating_sub(last_emit) >= 256 * 1024 {
-                    last_emit = downloaded;
-                    on_progress(EmbeddingDownloadProgress {
-                        file_name: name.to_owned(),
-                        file_index: idx + 1,
-                        file_count,
-                        downloaded_bytes: downloaded,
-                        total_bytes,
-                    });
-                }
-            }
-            file.flush()
-                .map_err(|e| format!("flush error for {name}: {e}"))?;
-            drop(file);
-            if downloaded == 0 {
-                return Err(format!("downloaded 0 bytes for {name}"));
-            }
-            if let Some(expected) = total_bytes
-                && downloaded != expected
-            {
-                return Err(format!(
-                    "truncated download for {name}: got {downloaded} of {expected} bytes"
-                ));
-            }
-            std::fs::rename(&part_path, &final_path)
-                .map_err(|e| format!("rename error for {name}: {e}"))?;
-            Ok((downloaded, total_bytes))
+        let downloaded = assets
+            .download_to_path(&url, &final_path, MAX_MODEL_FILE_BYTES, &progress)
+            .await
+            .map_err(|e| format!("download failed for {name}: {e}"))?;
+        if downloaded == 0 {
+            // An empty file counts as missing, so the next attempt downloads it again.
+            return Err(format!("downloaded 0 bytes for {name}"));
         }
-        .await;
-        let (downloaded, total_bytes) = match download_res {
-            Ok(ok) => ok,
-            Err(err) => {
-                let _ = std::fs::remove_file(&part_path);
-                return Err(err);
-            }
-        };
-        on_progress(EmbeddingDownloadProgress {
-            file_name: name.to_owned(),
-            file_index: idx + 1,
-            file_count,
-            downloaded_bytes: downloaded,
-            total_bytes: total_bytes.or(Some(downloaded)),
-        });
+        progress(downloaded, Some(downloaded));
     }
     Ok(())
 }
