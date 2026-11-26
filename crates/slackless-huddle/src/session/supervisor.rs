@@ -8,7 +8,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use super::connected::run_connected_loop;
-use crate::metrics::HuddlePerfSnapshot;
 use crate::{
     HuddleAudioConfig, HuddleControl, HuddleCredentials, HuddleError, HuddleHandle, HuddlePhase,
     HuddleSessionSnapshot, HuddleUpdate,
@@ -220,18 +219,7 @@ async fn run_session(
         call_id: creds.call_id.clone(),
         attendee_id: creds.attendee_id.clone(),
         muted: config.muted,
-        video: false,
         blur_background: config.blur_background,
-        audio_only: false,
-        sharing: false,
-        share_source_id: None,
-        screen_audio_device: None,
-        hand_raised: false,
-        sticky_emoji: None,
-        captions_enabled: false,
-        topic: None,
-        background_id: None,
-        jukebox_song: None,
         started_at_secs: now_secs(),
         thread_root_ts: creds.thread_root_ts.clone(),
         canvas_file_id: creds.canvas_file_id.clone(),
@@ -241,15 +229,7 @@ async fn run_session(
         aec: config.aec,
         ns: config.ns,
         agc: config.agc,
-        active_video_codec: None,
-        error: None,
-        udp_blocked: false,
-        packets_sent: 0,
-        packets_received: 0,
-        bytes_sent: 0,
-        bytes_received: 0,
-        pongs_sent: 0,
-        perf: HuddlePerfSnapshot::default(),
+        ..Default::default()
     };
     let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
 
