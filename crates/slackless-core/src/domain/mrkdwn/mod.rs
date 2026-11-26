@@ -122,6 +122,39 @@ mod tests {
             mrkdwn_to_plain(raw),
             "Hello world & @alice in #general @here Slack :wave::skin-tone-3: Nov 14"
         );
+
+        // A link label wrapped whole in markers takes their style, as Slack draws
+        // `<url|*TypeError*>` as a bold link; partly styled labels stay literal.
+        let link = |label: &str, style: Style| MrkdwnSpan::Link {
+            url: "https://x.dev".into(),
+            label: Some(label.into()),
+            style,
+        };
+        for (raw, span) in [
+            (
+                "<https://x.dev|*TypeError*>",
+                link("TypeError", Style::BOLD),
+            ),
+            (
+                "<https://x.dev|_*both*_>",
+                link("both", Style::ITALIC.with(Style::BOLD)),
+            ),
+            (
+                "_<https://x.dev|*:rocket: go*>_",
+                link(":rocket: go", Style::ITALIC.with(Style::BOLD)),
+            ),
+            (
+                "<https://x.dev|a *b* &amp; c>",
+                link("a *b* & c", Style::NONE),
+            ),
+            (
+                "<https://x.dev|*a* and *b*>",
+                link("*a* and *b*", Style::NONE),
+            ),
+        ] {
+            assert_eq!(parse_mrkdwn_spans(raw), vec![span], "{raw}");
+        }
+        assert_eq!(mrkdwn_to_plain("<https://x.dev|*TypeError*>"), "TypeError");
     }
 
     /// A directory names the references it knows; one it does not know (it echoes the id)

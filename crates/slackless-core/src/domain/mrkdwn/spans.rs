@@ -330,15 +330,64 @@ fn parse_span_reference(
             style: active,
         });
     } else if target.contains("://") || target.starts_with("mailto:") {
+        let (label, style) =
+            styled_link_label(label.map(|l| unescape_mrkdwn(l).into_owned()), active);
         out.push(MrkdwnSpan::Link {
             url: unescape_mrkdwn(target).into_owned(),
-            label: label.map(|l| unescape_mrkdwn(l).into_owned()),
-            style: active,
+            label,
+            style,
         });
     } else {
         return None;
     }
     Some(close + 1)
+}
+
+/// A link label wrapped whole in `*` / `_` / `~` markers (`<url|*TypeError*>`) loses them and
+/// lends its style to the link, as Slack draws a bold link; a label styled any other way (or
+/// not at all) stays as written.
+fn styled_link_label(label: Option<String>, active: Style) -> (Option<String>, Style) {
+    const WRAPPED: Style = Style::BOLD.with(Style::ITALIC).with(Style::STRIKE);
+    let Some(raw) = label else {
+        return (None, active);
+    };
+    let spans = parse_mrkdwn_spans(&raw);
+    let mut style = Style::NONE;
+    let mut text = String::with_capacity(raw.len());
+    for span in &spans {
+        match span {
+            MrkdwnSpan::Text {
+                text: chunk,
+                style: own,
+            } => {
+                style = style.with(*own);
+                text.push_str(chunk);
+            }
+            MrkdwnSpan::Emoji {
+                shortcode,
+                style: own,
+            } => {
+                style = style.with(*own);
+                text.push(':');
+                text.push_str(shortcode);
+                text.push(':');
+            }
+            _ => return (Some(raw), active),
+        }
+    }
+    let whole = !spans.is_empty()
+        && WRAPPED.contains(style)
+        && spans.iter().all(|span| match span {
+            MrkdwnSpan::Text { style: own, .. } | MrkdwnSpan::Emoji { style: own, .. } => {
+                *own == style
+            }
+            _ => false,
+        });
+    if whole {
+        (Some(text), active.with(style))
+    } else {
+        (Some(raw), active)
+    }
 }
 
 fn parse_span_entity(rest: &str, active: Style, out: &mut Vec<MrkdwnSpan>) -> Option<usize> {
