@@ -67,13 +67,12 @@ pub(super) struct ParagraphState {
 impl SelectableParagraph {
     pub(super) fn new(
         id: ElementId,
-        text: String,
+        text: SharedString,
         mut runs: Vec<TextRun>,
         links: Vec<(Range<usize>, LinkTarget)>,
         document_order: u64,
         theme: &RunTheme,
     ) -> Self {
-        let text: SharedString = text.into();
         // Inline code is the inline-code run with a wash; code blocks carry no run
         // background. An app chip's icon slot is its own run on the link wash.
         let mut code: Vec<(Range<usize>, Hsla)> = Vec::new();

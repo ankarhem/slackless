@@ -308,7 +308,13 @@ pub(super) fn transcript_row(
             div()
                 .min_w_0()
                 .when(deleted_ghost, |el| el.opacity(0.65))
-                .child(message_body(message, &kcx, cx)),
+                .child(message_body_cached(
+                    message,
+                    &store.bodies,
+                    &store.fixtures,
+                    &kcx,
+                    cx,
+                )),
         );
         if prefs.inline_media {
             if let Some(files) = crate::files::attachments_in_channel(

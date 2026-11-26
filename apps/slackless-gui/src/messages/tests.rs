@@ -1,6 +1,7 @@
 use super::render::*;
 use super::rows::membership_run;
 use gpui_kit::gpui::TextLayout;
+use slackless_core::domain::mrkdwn::parse_mrkdwn_spans;
 use std::cell::RefCell;
 
 use gpui_kit::base::TextSelection;
@@ -263,19 +264,6 @@ fn mrkdwn_fences_split_pre_blocks_out_of_the_text() {
     assert_eq!(mrkdwn_fences("a ``` b"), vec![(false, "a ``` b")]);
 }
 
-#[test]
-fn link_labels_take_the_styles_wrapping_them() {
-    let (label, run) = styled_label("*TypeError*", RunFlags::default());
-    assert_eq!(label, "TypeError");
-    assert!(run.bold && !run.italic);
-    let (label, run) = styled_label("_*both*_", RunFlags::default());
-    assert_eq!(label, "both");
-    assert!(run.bold && run.italic);
-    let (label, run) = styled_label("a *b*", RunFlags::default());
-    assert_eq!(label, "a *b*");
-    assert!(!run.bold);
-}
-
 #[gpui::test]
 fn blank_lines_render_as_a_short_paragraph_break(cx: &mut TestAppContext) {
     // Slack's blank line is an 8px `c-mrkdwn__br` block, not an empty text line
@@ -340,6 +328,53 @@ fn clicking_a_mention_routes_to_the_profile(cx: &mut TestAppContext) {
         );
         // The click that opened the link left no selection behind.
         assert_eq!(selected_text(cx), "");
+    });
+}
+
+/// The transcript reads mrkdwn as Slack (and core's parser) does: a marker styles only when a
+/// closing one ends a word later on the line, so unbalanced markers stay literal.
+#[gpui::test]
+fn unbalanced_markers_render_literally(cx: &mut TestAppContext) {
+    let rows = [
+        (
+            "1900000000.000100",
+            "*nix and *BSD systems",
+            "*nix and *BSD systems",
+        ),
+        (
+            "1900000000.000200",
+            "set _foo to my_var",
+            "set _foo to my_var",
+        ),
+        ("1900000000.000300", "a *bold* claim", "a bold claim"),
+    ];
+    with_transcript("C0RANDOM", cx, |harness, cx| {
+        harness.update(cx, |harness, cx| {
+            harness.list.update(cx, |list, cx| {
+                for (ts, text, _) in rows {
+                    let message = Message {
+                        ts: Ts::from(ts),
+                        user: Some(UserId::from("U0BOB")),
+                        text: text.into(),
+                        ..Default::default()
+                    };
+                    list.append(ChannelId::from("C0RANDOM"), message, cx);
+                }
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let _ = window.draw(cx);
+        });
+        for (_, text, shown) in rows {
+            let painted = PAINTED.with(|painted| {
+                painted
+                    .borrow()
+                    .iter()
+                    .any(|(painted, _)| painted.as_ref() == shown)
+            });
+            assert!(painted, "{text:?} paints as {shown:?}");
+        }
     });
 }
 
@@ -927,7 +962,7 @@ fn video_transcript_text_is_selectable(cx: &mut TestAppContext) {
     assert_eq!(selected_text(cx), "video transcripts with");
 }
 
-fn test_run_theme(verbatim: bool) -> RunTheme {
+fn test_run_theme() -> RunTheme {
     let fg = Hsla::default();
     RunTheme {
         base_font: Font::default(),
@@ -945,9 +980,7 @@ fn test_run_theme(verbatim: bool) -> RunTheme {
         order: None,
         links: None,
         underline_links: false,
-        emoji_text_mode: false,
         dark: true,
-        verbatim,
         paragraphs: std::cell::Cell::new(0),
         key: SharedString::from("unit"),
     }
@@ -995,225 +1028,297 @@ fn jumbomoji_elements_accepts_one_to_five_standard_and_custom_and_rejects_others
     assert!(jumbomoji_elements("::", &fixtures).is_none());
 }
 
-#[test]
-fn angle_token_parses_users_channels_specials_dates_links_and_mailto() {
-    let fixtures = crate::fixtures::load();
-    let theme = test_run_theme(false);
-
-    // <@U0ME>
-    let mut b = ParagraphBuilder::new();
-    let consumed = angle_token(&mut b, "<@U0ME> rest", &fixtures, &theme, DEFAULT_FLAGS);
-    assert_eq!(consumed, Some(7));
-    assert_eq!(
-        b.text,
-        format!("@{}", fixtures.mention_name(&UserId::from("U0ME")))
-    );
-    assert_eq!(b.links.len(), 1);
-    assert_eq!(b.links[0].1, LinkTarget::Profile(UserId::from("U0ME")));
-
-    // <#C0ENG|eng> and <#C0ENG>
-    let mut b = ParagraphBuilder::new();
-    assert_eq!(
-        angle_token(&mut b, "<#C0ENG|eng>", &fixtures, &theme, DEFAULT_FLAGS),
-        Some(12)
-    );
-    assert_eq!(b.text, "#eng");
-    assert_eq!(b.links[0].1, LinkTarget::Channel(ChannelId::from("C0ENG")));
-
-    let mut b = ParagraphBuilder::new();
-    assert_eq!(
-        angle_token(&mut b, "<#C0ENG>", &fixtures, &theme, DEFAULT_FLAGS),
-        Some(8)
-    );
-    assert!(b.text.contains("engineering"));
-
-    // <!here>, <!subteam^S1|@eng>, <!date^...|fallback>
-    let mut b = ParagraphBuilder::new();
-    assert_eq!(
-        angle_token(&mut b, "<!here>", &fixtures, &theme, DEFAULT_FLAGS),
-        Some(7)
-    );
-    assert_eq!(b.text, "@here");
-
-    let mut b = ParagraphBuilder::new();
-    assert_eq!(
-        angle_token(
-            &mut b,
-            "<!subteam^S1|@eng>",
-            &fixtures,
-            &theme,
-            DEFAULT_FLAGS
-        ),
-        Some(18)
-    );
-    assert_eq!(b.text, "@eng");
-
-    let mut b = ParagraphBuilder::new();
-    assert_eq!(
-        angle_token(
-            &mut b,
-            "<!date^1700000000^{date_short}|Nov 14>",
-            &fixtures,
-            &theme,
-            DEFAULT_FLAGS
-        ),
-        Some(38)
-    );
-    assert_eq!(b.text, "Nov 14");
-
-    // <https://example.com|label> and <mailto:...>
-    let mut b = ParagraphBuilder::new();
-    assert_eq!(
-        angle_token(
-            &mut b,
-            "<https://example.com/a&amp;b|*Docs*>",
-            &fixtures,
-            &theme,
-            DEFAULT_FLAGS
-        ),
-        Some(36)
-    );
-    assert_eq!(b.text, "Docs");
-    assert_eq!(b.runs[0].font.weight, FontWeight::BOLD);
-    assert_eq!(
-        b.links[0].1,
-        LinkTarget::Url(SharedString::from("https://example.com/a&b"))
-    );
-
-    // A link label with a shortcode (a bot alert) or a multi-byte character before a colon.
-    let mut b = ParagraphBuilder::new();
-    angle_token(
-        &mut b,
-        "<https://example.com|:bar_chart: Panel>",
-        &fixtures,
-        &theme,
-        DEFAULT_FLAGS,
-    );
-    assert_eq!(b.text, "📊 Panel");
-
-    let mut b = ParagraphBuilder::new();
-    angle_token(
-        &mut b,
-        "<https://example.com|Översikt: Q3>",
-        &fixtures,
-        &theme,
-        DEFAULT_FLAGS,
-    );
-    assert_eq!(b.text, "Översikt: Q3");
-
-    let mut b = ParagraphBuilder::new();
-    assert_eq!(
-        angle_token(
-            &mut b,
-            "<mailto:alice@example.com|Email>",
-            &fixtures,
-            &theme,
-            DEFAULT_FLAGS
-        ),
-        Some(32)
-    );
-    assert_eq!(b.text, "Email");
-    assert_eq!(
-        b.links[0].1,
-        LinkTarget::Url(SharedString::from("mailto:alice@example.com"))
-    );
-
-    // Unclosed or unknown angle brackets return None.
-    let mut b = ParagraphBuilder::new();
-    assert_eq!(
-        angle_token(&mut b, "<unclosed", &fixtures, &theme, DEFAULT_FLAGS),
-        None
-    );
-    assert_eq!(
-        angle_token(&mut b, "<plain>", &fixtures, &theme, DEFAULT_FLAGS),
-        None
-    );
+/// One modeled mrkdwn line, flattened for assertions: its text, its links as `(label,
+/// target)`, and its runs as `(text, style)` with plain runs left out.
+struct Flat {
+    text: String,
+    links: Vec<(String, LinkTarget)>,
+    runs: Vec<(String, RunStyle)>,
 }
 
-#[test]
-fn push_mrkdwn_text_and_toggle_marker_enforce_verbatim_code_and_word_boundaries() {
-    let normal_theme = test_run_theme(false);
-    let verbatim_theme = test_run_theme(true);
+fn flat(text: &str, opts: TextOpts) -> Flat {
+    let fixtures = crate::fixtures::load();
+    let segments = line_segments(&parse_mrkdwn_spans(text), &fixtures, opts, false);
+    let [
+        Segment::Text {
+            pieces,
+            lead,
+            trail,
+        },
+    ] = segments.as_slice()
+    else {
+        panic!("one text segment")
+    };
+    assert!(!lead && !trail, "a lone paragraph keeps its edge breaks");
+    let [piece] = pieces.as_slice() else {
+        panic!("one blank-line-free piece")
+    };
+    let text = piece.text.to_string();
+    let links = piece
+        .links
+        .iter()
+        .map(|(range, target)| (text[range.clone()].to_owned(), target.clone()))
+        .collect();
+    let mut at = 0;
+    let runs = piece
+        .runs
+        .iter()
+        .filter_map(|&(len, style)| {
+            let run = text[at..at + len].to_owned();
+            at += len;
+            (style != RunStyle::plain()).then_some((run, style))
+        })
+        .collect();
+    assert_eq!(at, text.len(), "runs cover the text");
+    Flat { text, links, runs }
+}
 
-    // Auto-links bare URLs, unescapes entities, and trims trailing punctuation.
-    let mut b = ParagraphBuilder::new();
-    push_mrkdwn_text(
-        &mut b,
-        "See https://example.com/a&amp;b, and http://test.dev).",
-        &normal_theme,
-        DEFAULT_FLAGS,
+fn plain() -> TextOpts {
+    TextOpts {
+        emoji_text: false,
+        verbatim: false,
+    }
+}
+
+fn code_style() -> RunStyle {
+    RunStyle::plain().with_flags(RunFlags {
+        code: true,
+        ..DEFAULT_FLAGS
+    })
+}
+
+/// A line's model, as the transcript paints it: references named through the workspace and
+/// routing to their targets, links styled as Slack draws them, bare URLs auto-linked under
+/// linkify's boundary rules (not in verbatim text or inline code), markers literal unless
+/// they close, emoji as glyphs, custom images or literal text.
+#[test]
+fn mrkdwn_lines_model_references_links_styles_and_emoji() {
+    let fixtures = crate::fixtures::load();
+    let me = UserId::from("U0ME");
+    let me_name = format!("@{}", fixtures.mention_name(&me));
+    let line = flat(
+        "<@U0ME> and <@U0NOPE|zoe> in <#C0ENG|eng> or <#C0ENG>, <!here>, <!subteam^S1|@eng>, <!date^1700000000^{date_short}|Nov 14>:",
+        plain(),
     );
-    assert_eq!(b.text, "See https://example.com/a&b, and http://test.dev).");
-    assert_eq!(b.links.len(), 2);
     assert_eq!(
-        b.links[0].1,
+        line.text,
+        format!("{me_name} and @zoe in #eng or #engineering, @here, @eng, Nov 14:"),
+        "a user the workspace does not know goes by the label the text carries"
+    );
+    let link = |label: &str, target: LinkTarget| (label.to_owned(), target);
+    assert_eq!(
+        line.links,
+        [
+            link(&me_name, LinkTarget::Profile(me.clone())),
+            link("@zoe", LinkTarget::Profile(UserId::from("U0NOPE"))),
+            link("#eng", LinkTarget::Channel(ChannelId::from("C0ENG"))),
+            link(
+                "#engineering",
+                LinkTarget::Channel(ChannelId::from("C0ENG"))
+            ),
+        ]
+    );
+    assert_eq!(
+        line.runs
+            .iter()
+            .map(|(text, style)| (text.as_str(), style.tone))
+            .collect::<Vec<_>>(),
+        [
+            (me_name.as_str(), Tone::Mention),
+            ("@zoe", Tone::Mention),
+            ("#eng", Tone::Reference),
+            ("#engineering", Tone::Reference),
+            ("@here", Tone::Mention),
+            ("@eng", Tone::Mention),
+        ]
+    );
+    assert!(line.runs.iter().all(|(_, style)| style.flags.semibold));
+
+    // Links: a label styled whole takes its style (core carries it), other labels stay as
+    // written (backticks included), emoji in a label expand, and a link labelled with its own
+    // address is a chip.
+    let line = flat(
+        "<https://example.com/a&amp;b|*Docs*> and <https://example.com/x|`code`> <mailto:alice@example.com|Email> <https://example.com|:bar_chart: Panel>",
+        plain(),
+    );
+    assert_eq!(line.text, "Docs and `code` Email 📊 Panel");
+    assert_eq!(
+        line.links
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>(),
+        ["Docs", "`code`", "Email", "📊 Panel"]
+    );
+    assert_eq!(
+        line.links[0].1,
         LinkTarget::Url(SharedString::from("https://example.com/a&b"))
     );
     assert_eq!(
-        b.links[1].1,
-        LinkTarget::Url(SharedString::from("http://test.dev"))
+        line.links[2].1,
+        LinkTarget::Url(SharedString::from("mailto:alice@example.com"))
     );
+    let link_style = |flags: RunFlags| {
+        RunStyle {
+            tone: Tone::Link,
+            ..RunStyle::plain()
+        }
+        .with_flags(flags)
+    };
+    assert_eq!(
+        line.runs[0].1,
+        link_style(RunFlags {
+            bold: true,
+            ..DEFAULT_FLAGS
+        })
+    );
+    assert_eq!(line.runs[1].1, link_style(DEFAULT_FLAGS));
+    assert_eq!(line.runs[2].1, link_style(DEFAULT_FLAGS));
+    assert_eq!(line.runs[3].1, link_style(DEFAULT_FLAGS));
+    let segments = line_segments(
+        &parse_mrkdwn_spans("see <https://grafana.example/d/1|grafana.example/d/1>"),
+        &fixtures,
+        plain(),
+        false,
+    );
+    assert!(matches!(
+        segments.as_slice(),
+        [Segment::Text { .. }, Segment::Chip { label, icon: IconName::Link, .. }] if label == "grafana.example/d/1"
+    ));
 
-    // linkify's boundary rules: balanced brackets stay in the URL, stray trailing punctuation
-    // does not, and only `http(s)://` URLs link (no `www.` hosts, emails or `file.rs`).
-    let cases: &[(&str, &[&str])] = &[
+    // Bare `http(s)://` URLs auto-link under linkify's boundary rules: balanced brackets stay
+    // in the URL, stray trailing punctuation does not, and nothing else links.
+    for (text, urls) in [
+        (
+            "See https://example.com/a&amp;b, and http://test.dev).",
+            vec!["https://example.com/a&b", "http://test.dev"],
+        ),
         (
             "(https://example.com/a_(b))",
-            &["https://example.com/a_(b)"],
+            vec!["https://example.com/a_(b)"],
         ),
-        ("https://example.com/q?x=1.", &["https://example.com/q?x=1"]),
-        ("https://", &[]),
-        ("www.example.com, alice@example.com and file.rs", &[]),
-    ];
-    for (text, urls) in cases {
-        let mut b = ParagraphBuilder::new();
-        push_mrkdwn_text(&mut b, text, &normal_theme, DEFAULT_FLAGS);
-        assert_eq!(b.text, *text);
-        let linked: Vec<&str> = b
-            .links
-            .iter()
-            .map(|(range, _)| &b.text[range.clone()])
-            .collect();
-        assert_eq!(linked, *urls, "{text}");
+        (
+            "https://example.com/q?x=1.",
+            vec!["https://example.com/q?x=1"],
+        ),
+        ("https://", vec![]),
+        ("www.example.com, alice@example.com and file.rs", vec![]),
+    ] {
+        let line = flat(text, plain());
+        let linked: Vec<&str> = line.links.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(linked, urls, "{text}");
+        assert_eq!(
+            line.text,
+            text.replace("&amp;", "&"),
+            "entities decode, nothing else changes"
+        );
     }
-
-    // Verbatim mode and inline code skip auto-linking.
-    let mut b_verb = ParagraphBuilder::new();
-    push_mrkdwn_text(
-        &mut b_verb,
-        "visit https://example.com",
-        &verbatim_theme,
-        DEFAULT_FLAGS,
+    // Verbatim text (Block Kit `verbatim: true`) and inline code skip auto-linking.
+    assert!(
+        flat(
+            "visit https://example.com",
+            TextOpts {
+                emoji_text: false,
+                verbatim: true,
+            }
+        )
+        .links
+        .is_empty()
     );
-    assert!(b_verb.links.is_empty());
+    let code = flat("`https://example.com`", plain());
+    assert!(code.links.is_empty());
+    assert_eq!(code.runs[0].1, code_style());
 
-    let mut b_code = ParagraphBuilder::new();
-    push_mrkdwn_text(
-        &mut b_code,
-        "https://example.com",
-        &normal_theme,
-        RunFlags {
-            code: true,
+    // Markers style only when a closer ends a word later on the line, as in Slack; the rest
+    // of the line stays literal, and inline code keeps its markers.
+    for literal in ["*nix and *BSD systems", "set _foo to my_var"] {
+        let line = flat(literal, plain());
+        assert_eq!(line.text, literal);
+        assert!(line.runs.is_empty(), "{literal:?} carries no style");
+    }
+    let line = flat("a *bold* _italic_ ~strike~ `*code*` b", plain());
+    assert_eq!(line.text, "a bold italic strike *code* b");
+    assert_eq!(
+        line.runs
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>(),
+        ["bold", "italic", "strike", "*code*"]
+    );
+    let styled = |flags| RunStyle::plain().with_flags(flags);
+    assert_eq!(
+        line.runs[0].1,
+        styled(RunFlags {
+            bold: true,
             ..DEFAULT_FLAGS
-        },
+        })
     );
-    assert!(b_code.links.is_empty());
+    assert_eq!(
+        line.runs[1].1,
+        styled(RunFlags {
+            italic: true,
+            ..DEFAULT_FLAGS
+        })
+    );
+    assert_eq!(
+        line.runs[2].1,
+        styled(RunFlags {
+            strike: true,
+            ..DEFAULT_FLAGS
+        })
+    );
+    assert_eq!(line.runs[3].1, code_style());
 
-    // toggle_marker word boundaries and code isolation
-    let mut flags = DEFAULT_FLAGS;
-    assert!(toggle_marker(&mut flags, '*', None, "bold*"));
-    assert!(flags.bold);
-    // Mid-word close is rejected, end-of-word close succeeds.
-    assert!(!toggle_marker(&mut flags, '*', Some('d'), "more"));
-    assert!(toggle_marker(&mut flags, '*', Some('d'), " rest"));
-    assert!(!flags.bold);
-    // Mid-word open is rejected.
-    assert!(!toggle_marker(&mut flags, '_', Some('a'), "b_"));
-    // Inside inline code, non-backtick markers do not toggle.
-    flags.code = true;
-    assert!(!toggle_marker(&mut flags, '*', None, "bold*"));
-    assert!(toggle_marker(&mut flags, '`', Some('x'), " "));
-    assert!(!flags.code);
+    // Emoji: a glyph, a custom emoji's image, or the literal shortcode (always in emoji text mode).
+    assert_eq!(flat(":rocket: ships", plain()).text, "🚀 ships");
+    let image = line_segments(
+        &parse_mrkdwn_spans("go :partyparrot: now"),
+        &fixtures,
+        plain(),
+        false,
+    );
+    assert!(matches!(
+        image.as_slice(),
+        [
+            Segment::Text { .. },
+            Segment::Image(_),
+            Segment::Text { .. }
+        ]
+    ));
+    assert_eq!(
+        flat(":definitely_not_a_real_emoji_xyz:", plain()).text,
+        ":definitely_not_a_real_emoji_xyz:"
+    );
+    assert_eq!(
+        flat(
+            ":rocket:",
+            TextOpts {
+                emoji_text: true,
+                verbatim: false,
+            }
+        )
+        .text,
+        ":rocket:"
+    );
+
+    // The edit marker rides the paragraph's end, muted.
+    let edited = line_segments(&parse_mrkdwn_spans("done"), &fixtures, plain(), true);
+    let [Segment::Text { pieces, .. }] = edited.as_slice() else {
+        panic!("one text segment")
+    };
+    assert_eq!(pieces[0].text, "done (edited)");
+    assert_eq!(
+        pieces[0].runs,
+        [
+            (4, RunStyle::plain()),
+            (
+                9,
+                RunStyle {
+                    tone: Tone::Muted,
+                    ..RunStyle::plain()
+                }
+            )
+        ]
+    );
 }
 
 #[test]
@@ -1357,10 +1462,15 @@ fn classify_author_badge_distinguishes_human_bot_and_via_app() {
 #[test]
 #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
 fn benchmark_highlight_mrkdwn_and_time_1000_messages() {
+    use std::hint::black_box;
     use std::time::Instant;
 
     let fixtures = crate::fixtures::load();
-    let theme = test_run_theme(false);
+    let theme = test_run_theme();
+    let opts = TextOpts {
+        emoji_text: false,
+        verbatim: false,
+    };
     let now = time::CivilTime::from_unix_with_offset(1_764_000_000, 0);
     let code_sample = "pub fn handle(req: &Request) -> Result<Response, Error> {\n\
                        \tlet id = req.param(\"id\")?.parse::<u64>()?;\n\
@@ -1376,22 +1486,34 @@ fn benchmark_highlight_mrkdwn_and_time_1000_messages() {
     let start = Instant::now();
     let mut total_tokens = 0usize;
     let mut total_chars = 0usize;
+    let mut models = Vec::with_capacity(count);
     for i in 0..count {
         // 1. Syntax highlighting
         let lang = crate::syntax::Lang::detect(Some("rust"), None, code_sample);
         total_tokens += crate::syntax::highlight(lang, code_sample).len();
 
-        // 2. Mrkdwn fence splitting + inline parsing
-        for (is_code, segment) in mrkdwn_fences(mrkdwn_sample) {
-            if is_code {
-                total_tokens += crate::syntax::highlight(crate::syntax::Lang::Rust, segment).len();
-            } else {
-                let mut b = ParagraphBuilder::new();
-                push_mrkdwn_text(&mut b, segment, &theme, DEFAULT_FLAGS);
-                let _ = angle_token(&mut b, "<@U0ALICE>", &fixtures, &theme, DEFAULT_FLAGS);
-                total_chars += b.text.len();
+        // 2. The message's body model: fence splitting, spans, segments, code highlighting
+        let message = Message {
+            text: format!("{mrkdwn_sample} #{i}"),
+            ..Default::default()
+        };
+        let model = BodyModel::new(&message, &fixtures, opts);
+        let blocks = model.fallback(&fixtures, opts);
+        for block in blocks.iter() {
+            match block {
+                MrkdwnBlock::Code(code) => total_tokens += code.tokens.len(),
+                MrkdwnBlock::Line(segments) => {
+                    for segment in segments {
+                        if let Segment::Text { pieces, .. } = segment {
+                            total_chars +=
+                                pieces.iter().map(|piece| piece.text.len()).sum::<usize>();
+                        }
+                    }
+                }
+                _ => {}
             }
         }
+        models.push(blocks);
 
         // 3. Time & date formatting
         let msg_time =
@@ -1400,11 +1522,23 @@ fn benchmark_highlight_mrkdwn_and_time_1000_messages() {
         total_chars += time::list_stamp_at(&msg_time, &now).len();
         total_chars += time::format_clock_civil(&msg_time, false).len();
     }
-    let elapsed = start.elapsed();
-    let ms = elapsed.as_secs_f64() * 1_000.0;
-    let per_sec = (count as f64) / elapsed.as_secs_f64().max(1e-9);
+    let cold = start.elapsed();
+    // 4. Warm frames: 50 visible rows rendered from their cached models, elements only.
+    let warm = Instant::now();
+    for _ in 0..20 {
+        for blocks in &models[..50] {
+            theme.paragraphs.set(0);
+            black_box(render_mrkdwn(black_box(blocks), &theme));
+        }
+    }
+    let warm = warm.elapsed();
+    let ms = |elapsed: std::time::Duration| elapsed.as_secs_f64() * 1_000.0;
+    let per_sec = (count as f64) / cold.as_secs_f64().max(1e-9);
     eprintln!(
-        "bench 1000 messages (syntax + mrkdwn + time): {ms:.2} ms ({per_sec:.0} msgs/s; tokens={total_tokens}, chars={total_chars})"
+        "bench 1000 messages, cold model (syntax + mrkdwn + time): {:.2} ms ({per_sec:.0} msgs/s; tokens={total_tokens}, chars={total_chars}); warm 50 rows x 20 frames: {:.2} ms ({:.3} ms/frame)",
+        ms(cold),
+        ms(warm),
+        ms(warm) / 20.
     );
     assert!(total_tokens > 0 && total_chars > 0);
 }

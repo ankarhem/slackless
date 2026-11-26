@@ -1,6 +1,5 @@
-//! Syntax-highlighted code blocks and the hover Copy button: a block's highlight and copy text
-//! are modeled once per render ([`CodeModel`]); snippet lines highlight through a bounded LRU
-//! cache.
+//! Syntax-highlighted code blocks (their model cached with the message) and the hover Copy
+//! button; snippet lines highlight through a bounded LRU cache.
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -15,27 +14,25 @@ use gpui_kit::gpui::{
 };
 use slackless_core::types::rich_text::{RichTextElement, RichTextPreformatted};
 
-use super::render::{DEFAULT_FLAGS, RunFlags, RunTheme, paragraph_id};
+use super::render::{DEFAULT_FLAGS, RunFlags, RunTheme, paragraph_id, text_hash};
 use super::selectable::SelectableParagraph;
+use crate::syntax::{Lang, TokenKind};
 
-/// A code block's model: the text the copy button and the selection read, its language label
-/// and its highlighted tokens, built once so rendering reads them.
+/// A code block modeled once with its message: the text the copy button and the selection
+/// read, its language label, and its highlighted tokens (any size: the model lives as long
+/// as the message is shown).
 pub(in crate::messages) struct CodeModel {
-    pub(super) code: SharedString,
-    pub(super) language: Option<SharedString>,
-    tokens: Vec<(usize, crate::syntax::TokenKind)>,
+    pub(in crate::messages) code: SharedString,
+    pub(in crate::messages) language: Option<SharedString>,
+    pub(in crate::messages) tokens: Vec<(usize, TokenKind)>,
+    hash: u64,
 }
 
 impl CodeModel {
     /// A fenced mrkdwn block: its language detected from the `language` hint and the code.
     pub(super) fn new(code: String, language: Option<String>) -> Self {
-        let lang = crate::syntax::Lang::detect(language.as_deref(), None, &code);
-        let tokens = crate::syntax::highlight(lang, &code);
-        Self {
-            code: code.into(),
-            language: language.map(SharedString::from),
-            tokens,
-        }
+        let lang = Lang::detect(language.as_deref(), None, &code);
+        Self::highlighted(code, lang, language)
     }
 
     /// A Block Kit `rich_text_preformatted` block: its text elements joined, trailing line
@@ -58,13 +55,24 @@ impl CodeModel {
         )
     }
 
+    fn highlighted(code: String, lang: Lang, language: Option<String>) -> Self {
+        let tokens = crate::syntax::highlight(lang, &code);
+        let hash = text_hash(&code);
+        Self {
+            code: code.into(),
+            language: language.map(SharedString::from),
+            tokens,
+            hash,
+        }
+    }
+
     fn runs(&self, theme: &RunTheme) -> Vec<TextRun> {
         code_runs(&self.tokens, theme)
     }
 }
 
 /// A highlighted block's tokens as mono runs in the theme's token colors.
-fn code_runs(tokens: &[(usize, crate::syntax::TokenKind)], theme: &RunTheme) -> Vec<TextRun> {
+fn code_runs(tokens: &[(usize, TokenKind)], theme: &RunTheme) -> Vec<TextRun> {
     tokens
         .iter()
         .map(|&(len, kind)| {
@@ -84,7 +92,7 @@ fn code_runs(tokens: &[(usize, crate::syntax::TokenKind)], theme: &RunTheme) -> 
         .collect()
 }
 
-fn highlight_hash(code: &str, lang: crate::syntax::Lang) -> u64 {
+fn highlight_hash(code: &str, lang: Lang) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ (lang as u64);
     for &b in code.as_bytes() {
         h ^= u64::from(b);
@@ -93,15 +101,13 @@ fn highlight_hash(code: &str, lang: crate::syntax::Lang) -> u64 {
     h
 }
 
-fn cached_highlight(
-    code: &str,
-    lang: crate::syntax::Lang,
-) -> Vec<(usize, crate::syntax::TokenKind)> {
+/// The highlighted tokens of a snippet line (`selectable_code`), the last 64 kept.
+fn cached_highlight(code: &str, lang: Lang) -> Vec<(usize, TokenKind)> {
     struct Entry {
         hash: u64,
-        lang: crate::syntax::Lang,
+        lang: Lang,
         code: String,
-        tokens: Vec<(usize, crate::syntax::TokenKind)>,
+        tokens: Vec<(usize, TokenKind)>,
     }
     thread_local! {
         static CACHE: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
@@ -135,7 +141,7 @@ fn cached_highlight(
     })
 }
 
-fn highlighted_code_runs(code: &str, lang: crate::syntax::Lang, theme: &RunTheme) -> Vec<TextRun> {
+fn highlighted_code_runs(code: &str, lang: Lang, theme: &RunTheme) -> Vec<TextRun> {
     if code.is_empty() {
         return Vec::new();
     }
@@ -155,8 +161,8 @@ pub(crate) fn selectable_code(
     let theme = RunTheme::body(cx, SharedString::from(key.to_owned()), document_order, None);
     let runs = highlighted_code_runs(&text, lang, &theme);
     SelectableParagraph::new(
-        paragraph_id(&theme.key, line_ix, 0, &text),
-        text,
+        paragraph_id(&theme.key, line_ix, 0, text_hash(&text)),
+        text.into(),
         runs,
         Vec::new(),
         document_order,
@@ -184,8 +190,8 @@ pub(crate) fn selectable_text(
         vec![theme.run(DEFAULT_FLAGS, color, None, text.len())]
     };
     SelectableParagraph::new(
-        paragraph_id(&theme.key, paragraph_ix, 0, &text),
-        text,
+        paragraph_id(&theme.key, paragraph_ix, 0, text_hash(&text)),
+        text.into(),
         runs,
         Vec::new(),
         document_order,
@@ -195,7 +201,8 @@ pub(crate) fn selectable_text(
 }
 
 /// Slack's pre block: 12px code on an 18px line, 8px in from a 13% foreground ring with 4px
-/// corners, 32px kept clear at the right for the copy button a hover shows there.
+/// corners, 32px kept clear at the right for the copy button a hover shows there. Reads the
+/// block's [`CodeModel`]: no concatenating, detecting or highlighting at paint.
 pub(super) fn code_block(model: &CodeModel, theme: &RunTheme) -> Div {
     // Code blocks select like the paragraphs around them: one participant, its own order.
     let paragraph = theme.paragraphs.get();
@@ -206,12 +213,12 @@ pub(super) fn code_block(model: &CodeModel, theme: &RunTheme) -> Div {
     let copy = CopyCode {
         id: ElementId::Name(format!("copy-{}-{paragraph}", theme.key).into()),
         group: group.clone(),
-        code: model.code.to_string(),
+        code: model.code.clone(),
     };
     let text = match order {
         Some(order) => SelectableParagraph::new(
-            paragraph_id(&theme.key, paragraph, 0, &model.code),
-            model.code.to_string(),
+            paragraph_id(&theme.key, paragraph, 0, model.hash),
+            model.code.clone(),
             runs,
             Vec::new(),
             order,
@@ -256,7 +263,7 @@ pub(super) struct CopyCode {
     pub(super) id: ElementId,
     /// The pre block's hover group, which reveals the button.
     pub(super) group: SharedString,
-    pub(super) code: String,
+    pub(super) code: SharedString,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -323,7 +330,9 @@ impl RenderOnce for CopyCode {
                 }
             })
             .on_click(move |_, window, cx| {
-                cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(self.code.clone()));
+                cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(
+                    self.code.to_string(),
+                ));
                 let copy = state.update(cx, |state, _| {
                     state.copied = true;
                     state.copies += 1;
@@ -432,9 +441,7 @@ mod tests {
             order: None,
             links: None,
             underline_links: false,
-            emoji_text_mode: false,
             dark: true,
-            verbatim: false,
             paragraphs: Cell::new(0),
             key: SharedString::from("test"),
         }

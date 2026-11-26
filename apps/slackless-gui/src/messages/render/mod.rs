@@ -1,31 +1,41 @@
 //! Message body, rich-text / mrkdwn layout, and attachment / huddle-card rendering.
 
 mod blocks;
+mod body;
 mod cards;
 mod inline;
+mod model;
 #[cfg(test)]
 mod tests;
 
-pub(super) use super::code_block::{CodeModel, code_block};
+pub(super) use super::code_block::CodeModel;
 pub(crate) use super::code_block::{selectable_code, selectable_text};
 pub(super) use super::selectable::SelectableParagraph;
 pub(super) use super::time::{
-    CivilTime, card_stamp, date_label, date_label_absolute, day_index, format_clock,
-    format_clock_with,
+    CivilTime, card_stamp, date_label, day_index, format_clock, format_clock_with,
 };
 pub(crate) use super::time::{
     clock, day_and_time, day_label, file_day, iso_date, list_stamp, local_offset_now, now_secs,
     short_date,
 };
 
-pub(super) use blocks::message_body;
-pub(crate) use blocks::{is_deleted_ghost, mrkdwn, mrkdwn_with_verbatim, render_block};
+#[cfg(test)]
+pub(super) use blocks::render_mrkdwn;
+pub(super) use blocks::{message_body, message_body_cached};
+pub(crate) use blocks::{mrkdwn, mrkdwn_with_verbatim, render_block};
+pub(in crate::messages) use body::BodyCache;
+#[cfg(test)]
+pub(in crate::messages) use body::BodyModel;
+#[cfg(test)]
+pub(in crate::messages) use body::MrkdwnBlock;
+pub(crate) use body::is_deleted_ghost;
 #[cfg(test)]
 pub(crate) use cards::format_huddle_duration;
-pub(super) use inline::{DEFAULT_FLAGS, RunFlags, RunTheme, paragraph_id};
 #[cfg(test)]
-pub(super) use inline::{
-    ParagraphBuilder, angle_token, jumbomoji_elements, mrkdwn_fences, push_mrkdwn_text,
-    strip_quote_prefix, styled_label, toggle_marker,
-};
+pub(super) use inline::jumbomoji_elements;
+pub(super) use inline::{DEFAULT_FLAGS, RunFlags, RunTheme, paragraph_id, text_hash};
 pub(crate) use inline::{hex_color, mrkdwn_preview, plain_text};
+#[cfg(test)]
+pub(super) use model::{
+    RunStyle, Segment, TextOpts, Tone, line_segments, mrkdwn_fences, strip_quote_prefix,
+};

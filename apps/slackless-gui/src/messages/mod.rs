@@ -22,6 +22,7 @@
 //! own padding. Typography: body at `text_sm`, meta text (timestamps, labels, counts) at
 //! `text_xs`.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -57,7 +58,8 @@ mod selectable;
 mod time;
 pub(crate) use render::is_deleted_ghost;
 use render::{
-    CivilTime, card_stamp, date_label, day_index, format_clock, format_clock_with, message_body,
+    BodyCache, CivilTime, card_stamp, date_label, day_index, format_clock, format_clock_with,
+    message_body, message_body_cached,
 };
 pub(crate) use render::{
     clock, day_and_time, day_label, file_day, hex_color, iso_date, list_stamp, local_offset_now,
@@ -289,6 +291,9 @@ struct MessageData {
     /// The message being edited in place; its WYSIWYG draft is `edit_composer`.
     editing: Option<Ts>,
     edit_composer: Entity<Composer>,
+    /// Body models of the messages rendered so far, keyed by message allocation (see
+    /// [`BodyCache`]): a frame builds elements without parsing the message again.
+    bodies: RefCell<BodyCache>,
 }
 
 impl MessageData {
@@ -445,6 +450,7 @@ impl MessageList {
                     highlighted: None,
                     editing: None,
                     edit_composer,
+                    bodies: RefCell::default(),
                 };
                 data.recompute_first_unread();
                 data

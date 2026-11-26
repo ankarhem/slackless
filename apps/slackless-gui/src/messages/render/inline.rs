@@ -1,25 +1,24 @@
-//! Inline text runs, paragraph building, mrkdwn tokenization, and shortcode/color helpers.
+//! Inline text themes and the elements built from a paragraph's segments
+//! ([`super::model`]); shortcode and color helpers.
 
 use std::cell::Cell;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::ops::Range;
+use std::hash::{Hash, Hasher};
 
-use gpui_kit::assets::IconName;
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, h_flex};
 use gpui_kit::gpui::{
-    AnyElement, App, Div, ElementId, Font, FontStyle, FontWeight, Hsla, ImageSource,
-    InteractiveElement as _, InteractiveText, IntoElement, ParentElement as _, SharedString,
+    AnyElement, App, Div, ElementId, Font, FontStyle, FontWeight, Hsla, InteractiveElement as _,
+    InteractiveText, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, StrikethroughStyle, Styled as _, StyledText, TextRun,
     UnderlineStyle, div, px, relative, rgb,
 };
-use linkify::{LinkFinder, LinkKind};
 use slackless_core::domain::mrkdwn::{
-    Directory, mrkdwn_to_plain_with, replace_shortcodes_with, unescape_mrkdwn,
+    Directory, mrkdwn_to_plain_with, parse_mrkdwn_spans, replace_shortcodes_with,
 };
-use slackless_core::types::{ChannelId, TextStyle, UserId};
+use slackless_core::types::TextStyle;
 
-use super::super::{APP_ICON_SLOT, INLINE_EMOJI, LinkHandler, LinkTarget, route_link};
+use super::super::{INLINE_EMOJI, LinkHandler, LinkTarget, route_link};
 use super::SelectableParagraph;
+use super::model::{RunStyle, Segment, TextOpts, TextPiece, Tone, line_segments};
 use crate::emoji;
 use crate::fixtures::Fixtures;
 
@@ -41,7 +40,7 @@ pub(in crate::messages) fn mention_flags() -> RunFlags {
 }
 
 /// Inline style flags one text run carries.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(in crate::messages) struct RunFlags {
     pub(in crate::messages) bold: bool,
     pub(in crate::messages) semibold: bool,
@@ -78,13 +77,8 @@ pub(in crate::messages) struct RunTheme {
     pub(in crate::messages) links: Option<LinkHandler>,
     /// Always underline website links (Preferences > Accessibility > Underline links).
     pub(in crate::messages) underline_links: bool,
-    /// Render emoji as plain `:shortcode:` text (Preferences > Messages & media).
-    pub(in crate::messages) emoji_text_mode: bool,
     /// Active dark/light appearance mode (used for syntax-highlighted code runs).
     pub(in crate::messages) dark: bool,
-    /// When `true` (Block Kit `mrkdwn` `verbatim: true`, `F-COLLAB-758`), skip auto-linking
-    /// raw un-bracketed URLs.
-    pub(in crate::messages) verbatim: bool,
     /// Paragraphs rendered with this theme so far: keeps each paragraph's element id unique
     /// within its message (GPUI keys interaction and accessibility state by the id path)
     /// and counts its selection document order.
@@ -126,9 +120,7 @@ impl RunTheme {
             order,
             links,
             underline_links: crate::preferences::display_prefs(cx).underline_links,
-            emoji_text_mode: crate::preferences::display_prefs(cx).emoji_text_mode,
             dark: theme.mode.is_dark(),
-            verbatim: false,
             base_font,
             paragraphs: Cell::new(0),
             key,
@@ -191,6 +183,27 @@ impl RunTheme {
             }),
         }
     }
+
+    /// A model run in this theme: its tone picks the colors (inline code its wash, links the
+    /// link color and the underline preference), its flags the font.
+    pub(super) fn styled(&self, style: RunStyle, len: usize) -> TextRun {
+        let mut flags = style.flags;
+        let (color, bg) = match style.tone {
+            Tone::Text => (
+                flags.code.then_some(self.code_fg),
+                flags.code.then_some(self.code_bg),
+            ),
+            Tone::Link => {
+                flags.underline |= self.underline_links;
+                (Some(self.link), None)
+            }
+            Tone::Reference => (Some(self.link), None),
+            Tone::Mention => (Some(self.link), Some(self.mention_bg)),
+            Tone::App => (Some(self.link), Some(self.link_wash)),
+            Tone::Muted => (Some(self.muted), None),
+        };
+        self.run(flags, color, bg, len)
+    }
 }
 
 pub(in crate::messages) fn flags(style: Option<&TextStyle>) -> RunFlags {
@@ -207,298 +220,40 @@ pub(in crate::messages) fn flags(style: Option<&TextStyle>) -> RunFlags {
     }
 }
 
-/// One inline chunk of a paragraph: styled text (with its clickable link ranges), a custom
-/// emoji image, or a link chip.
-pub(in crate::messages) enum Segment {
-    Text {
-        text: String,
-        runs: Vec<TextRun>,
-        links: Vec<(Range<usize>, LinkTarget)>,
-    },
-    Image(ImageSource),
-    /// Slack's chip for a link labelled with its own address (a link icon) or for a link to a
-    /// message (a speech bubble): the icon and the label on a tinted pill.
-    Chip {
-        url: SharedString,
-        label: String,
-        icon: IconName,
-        icon_size: f32,
-    },
-    /// Slack's inline hex color swatch (`#RRGGBB` + rounded color square, `F-SHELL-087`).
-    ColorSwatch {
-        hex: String,
-        color: Hsla,
-    },
-}
-
-/// Accumulates a paragraph's styled text and link ranges, split only at inline images.
-pub(in crate::messages) struct ParagraphBuilder {
-    pub(in crate::messages) text: String,
-    pub(in crate::messages) runs: Vec<TextRun>,
-    pub(in crate::messages) links: Vec<(Range<usize>, LinkTarget)>,
-    pub(in crate::messages) segments: Vec<Segment>,
-}
-
-impl ParagraphBuilder {
-    pub(in crate::messages) fn new() -> Self {
-        Self {
-            text: String::new(),
-            runs: Vec::new(),
-            links: Vec::new(),
-            segments: Vec::new(),
-        }
-    }
-
-    pub(super) fn push_text(
-        &mut self,
-        text: &str,
-        theme: &RunTheme,
-        run_flags: RunFlags,
-        color: Option<Hsla>,
-        bg: Option<Hsla>,
-    ) {
-        if text.is_empty() {
-            return;
-        }
-        self.runs.push(theme.run(run_flags, color, bg, text.len()));
-        self.text.push_str(text);
-    }
-
-    /// Slack's edit marker: a muted run at the paragraph's end that flows and wraps with the
-    /// text. (A per-run font size is not expressible: one `StyledText` carries a single text
-    /// size from its element, so the marker is muted at body size.)
-    pub(super) fn push_edited(&mut self, theme: &RunTheme) {
-        self.push_text(
-            " (edited)",
-            theme,
-            RunFlags::default(),
-            Some(theme.muted),
-            None,
-        );
-    }
-
-    /// A link inside the paragraph's text: a link-colored run, clickable through its range.
-    /// Like Slack, a URL posted bare shows as itself, scheme and all, while a link labelled
-    /// with its own address minus the scheme (`github.com/…`) gets the tinted chip look.
-    /// `run` is the label's styling (Slack bolds `<url|*Error*>` and links inside `*…*`).
-    /// Expands `:shortcode:` unicode emojis inside link labels (`<url|:bar_chart: Panel>`) so
-    /// Slack alert/bot links render crisp glyphs instead of raw `:shortcode:` text.
-    pub(super) fn push_link(
-        &mut self,
-        url: String,
-        label: String,
-        run: RunFlags,
-        theme: &RunTheme,
-    ) {
-        let address = |s: &str| {
-            s.split_once("://")
-                .map_or(s, |(_, rest)| rest)
-                .trim_end_matches('/')
-                .to_owned()
-        };
-        if label != url && address(&label) == address(&url) {
-            self.push_chip(url.into(), label, IconName::Link, 12.);
-            return;
-        }
-        let expanded = if theme.emoji_text_mode {
-            label
-        } else {
-            replace_shortcodes_with(&label, &emoji::display_glyph)
-        };
-        let target = LinkTarget::Url(url.into());
-        let start = self.text.len();
-        let mut link_run = run;
-        if theme.underline_links {
-            link_run.underline = true;
-        }
-        self.push_text(&expanded, theme, link_run, Some(theme.link), None);
-        self.links.push((start..self.text.len(), target));
-    }
-
-    /// An in-app mention (an @user or #channel chip): the mention look, clickable through
-    /// its range like a link.
-    pub(super) fn push_mention(
-        &mut self,
-        label: &str,
-        target: LinkTarget,
-        theme: &RunTheme,
-        bg: Option<Hsla>,
-    ) {
-        let start = self.text.len();
-        self.push_text(label, theme, mention_flags(), Some(theme.link), bg);
-        self.links.push((start..self.text.len(), target));
-    }
-
-    /// An app's inline link chip (`attachment_mention`, e.g. a Jira issue): its title on the
-    /// link wash after a slot the paragraph paints the app icon into, one clickable range.
-    pub(super) fn push_attachment(&mut self, url: String, label: &str, theme: &RunTheme) {
-        let start = self.text.len();
-        for text in [APP_ICON_SLOT, label] {
-            self.push_text(
-                text,
-                theme,
-                RunFlags::default(),
-                Some(theme.link),
-                Some(theme.link_wash),
-            );
-        }
-        self.links
-            .push((start..self.text.len(), LinkTarget::Url(url.into())));
-    }
-
-    pub(super) fn push_image(&mut self, image: ImageSource) {
-        self.flush();
-        self.segments.push(Segment::Image(image));
-    }
-
-    pub(super) fn push_chip(
-        &mut self,
-        url: SharedString,
-        label: String,
-        icon: IconName,
-        icon_size: f32,
-    ) {
-        self.flush();
-        self.segments.push(Segment::Chip {
-            url,
-            label,
-            icon,
-            icon_size,
-        });
-    }
-
-    pub(super) fn push_color_swatch(&mut self, hex: String, color: Hsla) {
-        self.flush();
-        self.segments.push(Segment::ColorSwatch { hex, color });
-    }
-
-    fn flush(&mut self) {
-        if self.text.is_empty() {
-            return;
-        }
-        let text = std::mem::take(&mut self.text);
-        let runs = std::mem::take(&mut self.runs);
-        let links = std::mem::take(&mut self.links);
-        self.segments.push(Segment::Text { text, runs, links });
-    }
-
-    /// Drop the line breaks the paragraph ends with: Slack starts what follows (a code
-    /// block, a quote, a list or the message's end) on its own line without them.
-    pub(super) fn trim_trailing_breaks(&mut self) {
-        while self.text.ends_with('\n') {
-            self.text.pop();
-            if let Some(last) = self.runs.last_mut() {
-                last.len -= 1;
-                if last.len == 0 {
-                    self.runs.pop();
-                }
-            }
-        }
-    }
-
-    pub(super) fn finish(mut self) -> Vec<Segment> {
-        self.flush();
-        self.segments
-    }
-}
-
-/// One block of a paragraph after splitting at blank-line runs: its text, runs and links
-/// (the same shape [`Segment::Text`] carries).
-type ParagraphBlock = (String, Vec<TextRun>, Vec<(Range<usize>, LinkTarget)>);
-
-/// Slack renders a run of one or more blank lines inside message text as a single short
-/// paragraph break, not an empty text line: the web client emits an 8px block
-/// (`.c-mrkdwn__br { height: 8px; display: block }`) between the pieces. Splits one
-/// paragraph's text (with its byte-offset runs and link ranges) at those runs so the
-/// pieces can stack with the break between them; text without blank lines comes back as
-/// the single block it always was.
-pub(in crate::messages) fn paragraph_break_split(
-    text: &str,
-    runs: &[TextRun],
-    links: &[(Range<usize>, LinkTarget)],
-) -> Vec<ParagraphBlock> {
-    let slice_block = |range: Range<usize>| {
-        let block_text = text[range.clone()].to_owned();
-        let mut block_runs = Vec::new();
-        let mut at = 0;
-        for run in runs {
-            let run_range = at..at + run.len;
-            at = run_range.end;
-            let start = run_range.start.max(range.start);
-            let end = run_range.end.min(range.end);
-            if start < end {
-                block_runs.push(TextRun {
-                    len: end - start,
-                    ..run.clone()
-                });
-            }
-        }
-        let block_links = links
-            .iter()
-            .filter_map(|(link, target)| {
-                let start = link.start.max(range.start);
-                let end = link.end.min(range.end);
-                (start < end).then(|| ((start - range.start)..(end - range.start), target.clone()))
-            })
-            .collect();
-        (block_text, block_runs, block_links)
-    };
-
-    let bytes = text.as_bytes();
-    let mut blocks = Vec::new();
-    let mut start = 0;
-    let mut ix = 0;
-    while ix < bytes.len() {
-        if bytes[ix] != b'\n' {
-            ix += 1;
-            continue;
-        }
-        let mut end = ix;
-        while end < bytes.len() && bytes[end] == b'\n' {
-            end += 1;
-        }
-        if end - ix >= 2 {
-            blocks.push(slice_block(start..ix));
-            start = end;
-        }
-        ix = end;
-    }
-    blocks.push(slice_block(start..text.len()));
-    blocks
-}
-
-/// One text piece of a paragraph: selectable in the transcript when `order_base` is set,
-/// plain (links still clickable) otherwise. Takes its own slot of the theme's paragraph
-/// counter, so its id and document order stay unique however many pieces a paragraph
-/// splits into.
+/// One text piece of a paragraph: selectable in the transcript when the theme has an order,
+/// plain (links still clickable) otherwise.
 pub(in crate::messages) fn text_element(
-    text: String,
-    runs: Vec<TextRun>,
-    links: Vec<(Range<usize>, LinkTarget)>,
+    piece: &TextPiece,
     n: usize,
     theme: &RunTheme,
-    order_base: Option<u64>,
     routed: &Option<LinkHandler>,
 ) -> AnyElement {
     let paragraph = theme.paragraphs.get();
     theme.paragraphs.set(paragraph + 1);
-    if let Some(base) = order_base {
+    let runs = piece
+        .runs
+        .iter()
+        .map(|&(len, style)| theme.styled(style, len))
+        .collect();
+    let id = paragraph_id(&theme.key, paragraph, n, piece.hash);
+    if let Some(base) = theme.order {
         return SelectableParagraph::new(
-            paragraph_id(&theme.key, paragraph, n, &text),
-            text,
+            id,
+            piece.text.clone(),
             runs,
-            links,
+            piece.links.clone(),
             base + paragraph as u64,
             theme,
         )
         .into_any_element();
     }
-    if links.is_empty() {
-        return StyledText::new(text).with_runs(runs).into_any_element();
+    if piece.links.is_empty() {
+        return StyledText::new(piece.text.clone())
+            .with_runs(runs)
+            .into_any_element();
     }
-    let id = paragraph_id(&theme.key, paragraph, n, &text);
-    let (ranges, targets): (Vec<_>, Vec<_>) = links.into_iter().unzip();
-    let styled = StyledText::new(text).with_runs(runs);
+    let (ranges, targets): (Vec<_>, Vec<_>) = piece.links.iter().cloned().unzip();
+    let styled = StyledText::new(piece.text.clone()).with_runs(runs);
     let routed = routed.clone();
     InteractiveText::new(id, styled)
         .on_click(ranges, move |ix, window, cx| {
@@ -507,54 +262,46 @@ pub(in crate::messages) fn text_element(
         .into_any_element()
 }
 
-pub(in crate::messages) fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
-    // Message text participates in the window selection (one participant per paragraph,
-    // ordered with the transcript's reading order); preview text stays plain.
-    let order_base = theme.order;
+/// A paragraph: its segments in a wrap row. Message text participates in the window selection
+/// (one participant per paragraph, ordered with the transcript's reading order); preview text
+/// stays plain. Text wraps only inside a width-constrained block: a lone text piece (most
+/// paragraphs) renders in a full-width block; pieces mixed with inline images or chips shrink
+/// to wrap in the row, the pieces of one text separated by Slack's 8px `c-mrkdwn__br` block.
+pub(in crate::messages) fn render_segments(segments: &[Segment], theme: &RunTheme) -> Div {
     let routed = theme.links.clone();
-    // Text wraps only inside a width-constrained block: a lone text run (most paragraphs)
-    // renders in a full-width block; runs mixed with inline images shrink to wrap in the row.
     let single = segments.len() == 1;
     let mut row = h_flex().min_w_0().flex_wrap();
-    for (n, segment) in segments.into_iter().enumerate() {
+    for (n, segment) in segments.iter().enumerate() {
         match segment {
             Segment::Text {
-                mut text,
-                mut runs,
-                mut links,
+                pieces,
+                lead,
+                trail,
             } => {
-                // In a row mixed with chips or images, a line break at a text's edge must end
-                // the row: inside the text it would only add an empty line to its own box.
-                let (lead, trail) = if single {
-                    (false, false)
-                } else {
-                    trim_breaks(&mut text, &mut runs, &mut links)
-                };
-                let mut blocks = paragraph_break_split(&text, &runs, &links);
-                if single
-                    && blocks.len() == 1
-                    && let Some((text, runs, links)) = blocks.pop()
+                if let [piece] = pieces.as_slice()
+                    && single
                 {
-                    return div().w_full().min_w_0().child(text_element(
-                        text, runs, links, n, theme, order_base, &routed,
-                    ));
+                    return div()
+                        .w_full()
+                        .min_w_0()
+                        .child(text_element(piece, n, theme, &routed));
                 }
-                if lead {
+                if *lead {
                     row = row.child(div().w_full().h_0());
                 }
-                for (b, (text, runs, links)) in blocks.into_iter().enumerate() {
-                    // The break between the pieces: Slack's 8px `c-mrkdwn__br` block, which
-                    // the wrap row stacks between the two texts.
+                for (b, piece) in pieces.iter().enumerate() {
                     if b > 0 {
                         row = row.child(div().w_full().h(px(8.)));
                     }
-                    if !text.is_empty() {
-                        let element =
-                            text_element(text, runs, links, n, theme, order_base, &routed);
-                        row = row.child(div().min_w_0().child(element));
+                    if !piece.text.is_empty() {
+                        row = row.child(
+                            div()
+                                .min_w_0()
+                                .child(text_element(piece, n, theme, &routed)),
+                        );
                     }
                 }
-                if trail {
+                if *trail {
                     row = row.child(div().w_full().h_0());
                 }
             }
@@ -564,9 +311,8 @@ pub(in crate::messages) fn render_segments(segments: Vec<Segment>, theme: &RunTh
                     div()
                         .flex_none()
                         .size(px(INLINE_EMOJI))
-                        .child(crate::media::Picture::new(image).radius(px(2.))),
+                        .child(crate::media::Picture::new(image.clone()).radius(px(2.))),
                 );
-                continue;
             }
             Segment::Chip {
                 url,
@@ -594,12 +340,12 @@ pub(in crate::messages) fn render_segments(segments: Vec<Segment>, theme: &RunTh
                             route_link(routed.as_ref(), target.clone(), window, cx)
                         })
                         .child(
-                            Icon::new(icon)
+                            Icon::new(*icon)
                                 .flex_none()
-                                .size(px(icon_size))
+                                .size(px(*icon_size))
                                 .text_color(theme.link),
                         )
-                        .child(label),
+                        .child(label.clone()),
                 );
             }
             Segment::ColorSwatch { hex, color } => {
@@ -612,13 +358,13 @@ pub(in crate::messages) fn render_segments(segments: Vec<Segment>, theme: &RunTh
                         .px_1()
                         .rounded_sm()
                         .bg(theme.code_bg)
-                        .child(div().text_color(theme.foreground).child(hex))
+                        .child(div().text_color(theme.foreground).child(hex.clone()))
                         .child(
                             div()
                                 .flex_none()
                                 .size(px(11.))
                                 .rounded(px(2.))
-                                .bg(color)
+                                .bg(*color)
                                 .border_1()
                                 .border_color(theme.foreground.opacity(0.22)),
                         ),
@@ -635,351 +381,18 @@ pub(in crate::messages) fn paragraph_id(
     key: &SharedString,
     paragraph: usize,
     n: usize,
-    text: &str,
+    hash: u64,
 ) -> ElementId {
-    let mut hasher = DefaultHasher::new();
-    text.hash(&mut hasher);
     ElementId::Name(SharedString::from(format!(
-        "text-{key}-{paragraph}-{n}-{:x}",
-        hasher.finish()
+        "text-{key}-{paragraph}-{n}-{hash:x}"
     )))
 }
 
-/// Strip one line break from each edge of a text segment (keeping its runs and link ranges in
-/// step) and report which edges had one.
-pub(in crate::messages) fn trim_breaks(
-    text: &mut String,
-    runs: &mut Vec<TextRun>,
-    links: &mut [(Range<usize>, LinkTarget)],
-) -> (bool, bool) {
-    let trail = text.ends_with('\n');
-    if trail {
-        text.pop();
-        if let Some(last) = runs.last_mut() {
-            last.len -= 1;
-        }
-    }
-    let lead = text.starts_with('\n');
-    if lead {
-        text.remove(0);
-        if let Some(first) = runs.first_mut() {
-            first.len -= 1;
-        }
-        for (range, _) in links.iter_mut() {
-            *range = range.start.saturating_sub(1)..range.end.saturating_sub(1);
-        }
-    }
-    runs.retain(|run| run.len > 0);
-    (lead, trail)
-}
-
-/// mrkdwn split at its ``` fences into `(fenced, text)` pieces: Slack renders fenced text
-/// as a pre block, raw, dropping the line break just inside and outside each fence. An
-/// unclosed fence stays literal; empty text pieces are left out.
-pub(in crate::messages) fn mrkdwn_fences(text: &str) -> Vec<(bool, &str)> {
-    let mut pieces = Vec::new();
-    let mut rest = text;
-    while let Some(open) = rest.find("```") {
-        let inner = &rest[open + 3..];
-        let Some(close) = inner.find("```") else {
-            break;
-        };
-        let before = &rest[..open];
-        pieces.push((false, before.strip_suffix('\n').unwrap_or(before)));
-        let code = &inner[..close];
-        let code = code.strip_prefix('\n').unwrap_or(code);
-        pieces.push((true, code.strip_suffix('\n').unwrap_or(code)));
-        let after = &inner[close + 3..];
-        rest = after.strip_prefix('\n').unwrap_or(after);
-    }
-    pieces.push((false, rest));
-    pieces.retain(|(fenced, piece)| *fenced || !piece.is_empty());
-    pieces
-}
-
-/// Strip a Slack mrkdwn blockquote prefix (`>` or `&gt;`) and one optional following space.
-pub(in crate::messages) fn strip_quote_prefix(line: &str) -> Option<&str> {
-    let rest = line
-        .strip_prefix("&gt;")
-        .or_else(|| line.strip_prefix('>'))?;
-    Some(rest.strip_prefix(' ').unwrap_or(rest))
-}
-
-/// Lines of mrkdwn text into `column`, grouping consecutive `>` / `&gt;` blockquote lines
-/// behind a Slack-style left quote bar; with `edited`, the edit marker rides inline at the
-/// end of the last line that renders text.
-pub(in crate::messages) fn mrkdwn_lines(
-    mut column: Div,
-    text: &str,
-    fixtures: &Fixtures,
-    theme: &RunTheme,
-    edited: bool,
-) -> Div {
-    let lines: Vec<&str> = text.split('\n').collect();
-    let last_text_line = lines.iter().rposition(|line| !line.is_empty());
-    let mut blank = false;
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        // A run of blank lines is one 8px break, like the rich-text path's `c-mrkdwn__br`.
-        if line.is_empty() {
-            if !blank {
-                column = column.child(div().h(px(8.)));
-            }
-            blank = true;
-            i += 1;
-            continue;
-        }
-        blank = false;
-        if strip_quote_prefix(line).is_some() {
-            let mut quote_col = v_flex().flex_1().min_w_0();
-            while i < lines.len() {
-                let Some(inner) = strip_quote_prefix(lines[i]) else {
-                    break;
-                };
-                if inner.is_empty() {
-                    quote_col = quote_col.child(div().h(px(6.)));
-                } else if let Some(row) =
-                    mrkdwn_line(inner, fixtures, theme, edited && Some(i) == last_text_line)
-                {
-                    quote_col = quote_col.child(row);
-                }
-                i += 1;
-            }
-            column = column.child(
-                h_flex()
-                    .my_0p5()
-                    .gap_2p5()
-                    .items_stretch()
-                    .min_w_0()
-                    .child(div().flex_none().w(px(4.)).rounded_full().bg(theme.border))
-                    .child(quote_col),
-            );
-            continue;
-        }
-        if let Some(row) = mrkdwn_line(line, fixtures, theme, edited && Some(i) == last_text_line) {
-            column = column.child(row);
-        }
-        i += 1;
-    }
-    column
-}
-
-/// A one-paragraph mrkdwn preview (the DM list): formatting, links and emoji as the
-/// transcript renders them, plain runs in `color`, line breaks flattened. Preview text is
-/// not selectable; links open as URLs.
-pub(crate) fn mrkdwn_preview(
-    text: &str,
-    fixtures: &Fixtures,
-    color: Hsla,
-    key: String,
-    cx: &App,
-) -> Div {
-    let mut theme = RunTheme::plain(cx, key.into());
-    theme.foreground = color;
-    mrkdwn_line(&text.replace('\n', " "), fixtures, &theme, false).unwrap_or_else(div)
-}
-
-pub(in crate::messages) fn mrkdwn_line(
-    line: &str,
-    fixtures: &Fixtures,
-    theme: &RunTheme,
-    edited: bool,
-) -> Option<Div> {
-    let mut builder = ParagraphBuilder::new();
-    let mut run = RunFlags::default();
-    let mut rest = line;
-    let mut prev: Option<char> = None;
-    while let Some(start) = rest.find(['<', ':', '*', '_', '~', '`']) {
-        let (before, tail) = rest.split_at(start);
-        push_mrkdwn_text(&mut builder, before, theme, run);
-        prev = before.chars().last().or(prev);
-        rest = tail;
-        let marker = rest.as_bytes()[0] as char;
-        let handled = if matches!(marker, '*' | '_' | '~' | '`') {
-            toggle_marker(&mut run, marker, prev, &rest[1..]).then_some(1)
-        } else if run.code {
-            None
-        } else if marker == '<' {
-            angle_token(&mut builder, rest, fixtures, theme, run)
-        } else {
-            emoji_token(&mut builder, rest, fixtures, theme, run)
-        };
-        let len = handled.unwrap_or_else(|| {
-            push_mrkdwn_text(&mut builder, &rest[..1], theme, run);
-            1
-        });
-        prev = rest[..len].chars().last();
-        rest = &rest[len..];
-    }
-    push_mrkdwn_text(&mut builder, rest, theme, run);
-    if edited {
-        builder.push_edited(theme);
-    }
-    let segments = builder.finish();
-    if segments.is_empty() {
-        return None;
-    }
-    Some(render_segments(segments, theme))
-}
-
-/// Plain mrkdwn text with Slack's HTML escapes undone; inline code gets its wash.
-/// Unless `theme.verbatim` is set (Block Kit `verbatim: true`, `F-COLLAB-758`) or inside inline
-/// code, bare `https://` / `http://` URLs are auto-linked.
-pub(in crate::messages) fn push_mrkdwn_text(
-    builder: &mut ParagraphBuilder,
-    text: &str,
-    theme: &RunTheme,
-    run: RunFlags,
-) {
-    let unescaped = unescape_mrkdwn(text);
-    if run.code || theme.verbatim {
-        let bg = run.code.then_some(theme.code_bg);
-        builder.push_text(&unescaped, theme, run, None, bg);
-        return;
-    }
-    // Slack auto-links `http(s)://` URLs only, so other linkify hits (`www.` hosts, `ftp://`,
-    // emails: the `<mailto:…>` form is explicit) stay plain text.
-    let mut finder = LinkFinder::new();
-    finder.kinds(&[LinkKind::Url]);
-    let mut plain_from = 0;
-    for link in finder.links(&unescaped) {
-        let url = link.as_str();
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            continue;
-        }
-        builder.push_text(&unescaped[plain_from..link.start()], theme, run, None, None);
-        builder.push_link(url.to_owned(), url.to_owned(), run, theme);
-        plain_from = link.end();
-    }
-    builder.push_text(&unescaped[plain_from..], theme, run, None, None);
-}
-
-/// Open or close the style `marker` stands for. A marker opens at a word start when a closing
-/// marker follows, and closes at a word end; anything else is literal.
-pub(in crate::messages) fn toggle_marker(
-    run: &mut RunFlags,
-    marker: char,
-    prev: Option<char>,
-    after: &str,
-) -> bool {
-    if run.code && marker != '`' {
-        return false;
-    }
-    let flag = match marker {
-        '*' => &mut run.bold,
-        '_' => &mut run.italic,
-        '~' => &mut run.strike,
-        _ => &mut run.code,
-    };
-    if *flag {
-        let ends_word = after.chars().next().is_none_or(|c| !c.is_alphanumeric());
-        if ends_word && prev.is_some_and(|c| !c.is_whitespace()) {
-            *flag = false;
-            return true;
-        }
-        return false;
-    }
-    let starts_word = prev.is_none_or(|c| !c.is_alphanumeric());
-    let opens = after.chars().next().is_some_and(|c| !c.is_whitespace()) && after.contains(marker);
-    if starts_word && opens {
-        *flag = true;
-    }
-    starts_word && opens
-}
-
-/// A `<...>` token at the start of `rest`: user / channel / special mentions and links. A
-/// link takes the surrounding styling `run` plus its label's own.
-pub(in crate::messages) fn angle_token(
-    builder: &mut ParagraphBuilder,
-    rest: &str,
-    fixtures: &Fixtures,
-    theme: &RunTheme,
-    run: RunFlags,
-) -> Option<usize> {
-    let close = rest.find('>')?;
-    let inner = &rest[1..close];
-    let (target, label) = match inner.split_once('|') {
-        Some((target, label)) => (target, Some(label)),
-        None => (inner, None),
-    };
-    if let Some(user) = target.strip_prefix('@') {
-        let name = format!("@{}", fixtures.mention_name(&UserId::from(user)));
-        builder.push_mention(
-            &name,
-            LinkTarget::Profile(UserId::from(user)),
-            theme,
-            Some(theme.mention_bg),
-        );
-    } else if let Some(channel) = target.strip_prefix('#') {
-        let name = label
-            .map(|label| format!("#{label}"))
-            .or_else(|| {
-                fixtures
-                    .conversation(&ChannelId::from(channel))
-                    .map(|conversation| fixtures.conversation_label(conversation))
-            })
-            .unwrap_or_else(|| format!("#{channel}"));
-        builder.push_mention(
-            &name,
-            LinkTarget::Channel(ChannelId::from(channel)),
-            theme,
-            None,
-        );
-    } else if let Some(special) = target.strip_prefix('!') {
-        if special.starts_with("date") {
-            builder.push_text(
-                label.unwrap_or(special),
-                theme,
-                RunFlags::default(),
-                None,
-                None,
-            );
-        } else {
-            let name = label
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("@{}", special.split('^').next().unwrap_or(special)));
-            builder.push_text(
-                &name,
-                theme,
-                mention_flags(),
-                Some(theme.link),
-                Some(theme.mention_bg),
-            );
-        }
-    } else if target.contains("://") || target.starts_with("mailto:") {
-        let (label, run) = styled_label(label.unwrap_or(target), run);
-        builder.push_link(
-            unescape_mrkdwn(target).into_owned(),
-            unescape_mrkdwn(label).into_owned(),
-            run,
-            theme,
-        );
-    } else {
-        return None;
-    }
-    Some(close + 1)
-}
-
-/// A link label's own styling: Slack renders `<url|*TypeError*>` as a bold link. Markers
-/// wrapping the whole label add their style to `run`; any others stay literal.
-pub(in crate::messages) fn styled_label(mut label: &str, mut run: RunFlags) -> (&str, RunFlags) {
-    while let Some(marker) = label
-        .chars()
-        .next()
-        .filter(|c| matches!(c, '*' | '_' | '~'))
-    {
-        if label.len() < 3 || !label.ends_with(marker) {
-            break;
-        }
-        match marker {
-            '*' => run.bold = true,
-            '_' => run.italic = true,
-            _ => run.strike = true,
-        }
-        label = &label[1..label.len() - 1];
-    }
-    (label, run)
+/// The hash a paragraph's element id carries.
+pub(in crate::messages) fn text_hash(text: &str) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// `text` as the plain text the clipboard, notifications and list previews show: `@mentions`,
@@ -990,23 +403,38 @@ pub(crate) fn plain_text(text: &str, names: &dyn Directory) -> String {
     replace_shortcodes_with(&mrkdwn_to_plain_with(text, names), &emoji::display_glyph)
 }
 
-/// A `:shortcode:` at the start of `rest`: a glyph run, or a custom emoji image.
-pub(in crate::messages) fn emoji_token(
-    builder: &mut ParagraphBuilder,
-    rest: &str,
+/// A one-paragraph mrkdwn preview (the DM list, the Activity feed, headers): formatting, links
+/// and emoji as the transcript renders them, plain runs in `color`, line breaks flattened.
+/// Preview text is not selectable; links open as URLs.
+pub(crate) fn mrkdwn_preview(
+    text: &str,
     fixtures: &Fixtures,
-    theme: &RunTheme,
-    run: RunFlags,
-) -> Option<usize> {
-    if theme.emoji_text_mode {
-        return None;
-    }
-    let (len, code) = emoji::parse_shortcode(rest)?;
-    match emoji::display_glyph(&code) {
-        Some(glyph) => builder.push_text(&glyph, theme, run, None, None),
-        None => builder.push_image(fixtures.custom_emoji(&code)?.source()),
-    }
-    Some(len)
+    color: Hsla,
+    key: String,
+    cx: &App,
+) -> Div {
+    let emoji_text = crate::preferences::display_prefs(cx).emoji_text_mode;
+    render_preview(&preview_model(text, fixtures, emoji_text), color, key, cx)
+}
+
+/// A preview's model: one paragraph with its line breaks flattened, to render every frame
+/// through [`render_preview`] without parsing again.
+pub(crate) fn preview_model(text: &str, fixtures: &Fixtures, emoji_text: bool) -> Vec<Segment> {
+    line_segments(
+        &parse_mrkdwn_spans(&text.replace('\n', " ")),
+        fixtures,
+        TextOpts {
+            emoji_text,
+            verbatim: false,
+        },
+        false,
+    )
+}
+
+pub(crate) fn render_preview(segments: &[Segment], color: Hsla, key: String, cx: &App) -> Div {
+    let mut theme = RunTheme::plain(cx, key.into());
+    theme.foreground = color;
+    render_segments(segments, &theme)
 }
 
 /// Slack packs emoji code points as hex joined by `-` (`1f389`, skin tones appended).
