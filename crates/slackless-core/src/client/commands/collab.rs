@@ -278,51 +278,20 @@ impl<B: Backend> Core<B> {
     ) {
         let ctx = self.ctx();
         self.spawn("canvases.access.set", async move {
-            let summary = if !channel_ids.is_empty() {
-                format!(
-                    "Granted {} access to {} channel(s)",
-                    access_level.as_str(),
-                    channel_ids.len()
-                )
-            } else if !user_ids.is_empty() {
-                format!(
-                    "Granted {} access to {} user(s)",
-                    access_level.as_str(),
-                    user_ids.len()
-                )
-            } else {
-                format!("Updated {} access", access_level.as_str())
-            };
-            let api_res = ctx
-                .backend
-                .canvases_access_set(
-                    canvas_id.clone(),
-                    access_level,
-                    channel_ids.clone(),
-                    user_ids,
-                )
-                .await;
-            let result = map_canvas_result(&ctx.events, api_res);
-            if result.is_ok()
-                && let Some(url) = post_permalink.filter(|u| !u.trim().is_empty())
-                && !channel_ids.is_empty()
-            {
-                for channel in &channel_ids {
-                    if let Err(err) = ctx
-                        .backend
-                        .post_message(
-                            channel.clone(),
-                            MessageContent::plain(url.clone()),
-                            None,
-                            false,
-                            None,
-                        )
-                        .await
-                    {
-                        emit_if_auth_expired(&ctx.events, &err);
-                        tracing::warn!(%channel, %err, "failed to post shared canvas permalink");
-                    }
-                }
+            let summary = access_summary(
+                Some(access_level.as_str()),
+                channel_ids.len(),
+                user_ids.len(),
+            );
+            let shared = channel_ids.clone();
+            let api_res = per_access_side(channel_ids, user_ids, |channels, users| {
+                ctx.backend
+                    .canvases_access_set(canvas_id.clone(), access_level, channels, users)
+            })
+            .await;
+            let result = map_canvas_result(&ctx.events, api_res.map(drop));
+            if result.is_ok() {
+                post_permalink_to(&ctx, post_permalink, &shared).await;
             }
             ctx.events.emit(Event::CanvasAccessUpdated {
                 canvas_id,
@@ -341,19 +310,13 @@ impl<B: Backend> Core<B> {
     ) {
         let ctx = self.ctx();
         self.spawn("canvases.access.delete", async move {
-            let summary = if !channel_ids.is_empty() {
-                format!("Revoked access for {} channel(s)", channel_ids.len())
-            } else if !user_ids.is_empty() {
-                format!("Revoked access for {} user(s)", user_ids.len())
-            } else {
-                "Revoked access".to_owned()
-            };
-            let result = map_canvas_result(
-                &ctx.events,
+            let summary = access_summary(None, channel_ids.len(), user_ids.len());
+            let api_res = per_access_side(channel_ids, user_ids, |channels, users| {
                 ctx.backend
-                    .canvases_access_delete(canvas_id.clone(), channel_ids, user_ids)
-                    .await,
-            );
+                    .canvases_access_delete(canvas_id.clone(), channels, users)
+            })
+            .await;
+            let result = map_canvas_result(&ctx.events, api_res.map(drop));
             ctx.events.emit(Event::CanvasAccessUpdated {
                 canvas_id,
                 summary,
@@ -542,69 +505,20 @@ impl<B: Backend> Core<B> {
     ) {
         let ctx = self.ctx();
         self.spawn("slackLists.access.set", async move {
-            let summary = match (!channel_ids.is_empty(), !user_ids.is_empty()) {
-                (true, true) => format!(
-                    "Granted {} access to {} channel(s) and {} user(s)",
-                    access_level.as_str(),
-                    channel_ids.len(),
-                    user_ids.len()
-                ),
-                (true, false) => format!(
-                    "Granted {} access to {} channel(s)",
-                    access_level.as_str(),
-                    channel_ids.len()
-                ),
-                (false, true) => format!(
-                    "Granted {} access to {} user(s)",
-                    access_level.as_str(),
-                    user_ids.len()
-                ),
-                (false, false) => format!("Updated {} access", access_level.as_str()),
-            };
-            // Slack requires `channel_ids` XOR `user_ids` per call; split mixed requests cleanly.
-            let mut api_res: api::Result<()> = Ok(());
-            if channel_ids.is_empty() && user_ids.is_empty() {
-                api_res = Err(ApiError::Slack("invalid_parameters".to_owned()));
-            } else {
-                if !channel_ids.is_empty() {
-                    api_res = ctx
-                        .backend
-                        .lists_access_set(
-                            list_id.clone(),
-                            access_level,
-                            channel_ids.clone(),
-                            Vec::new(),
-                        )
-                        .await;
-                }
-                if api_res.is_ok() && !user_ids.is_empty() {
-                    api_res = ctx
-                        .backend
-                        .lists_access_set(list_id.clone(), access_level, Vec::new(), user_ids)
-                        .await;
-                }
-            }
-            let result = map_list_result(&ctx.events, api_res);
-            if result.is_ok()
-                && let Some(url) = post_permalink.filter(|u| !u.trim().is_empty())
-                && !channel_ids.is_empty()
-            {
-                for channel in &channel_ids {
-                    if let Err(err) = ctx
-                        .backend
-                        .post_message(
-                            channel.clone(),
-                            MessageContent::plain(url.clone()),
-                            None,
-                            false,
-                            None,
-                        )
-                        .await
-                    {
-                        emit_if_auth_expired(&ctx.events, &err);
-                        tracing::warn!(%channel, %err, "failed to post shared list permalink");
-                    }
-                }
+            let summary = access_summary(
+                Some(access_level.as_str()),
+                channel_ids.len(),
+                user_ids.len(),
+            );
+            let shared = channel_ids.clone();
+            let api_res = per_access_side(channel_ids, user_ids, |channels, users| {
+                ctx.backend
+                    .lists_access_set(list_id.clone(), access_level, channels, users)
+            })
+            .await;
+            let result = map_list_result(&ctx.events, api_res.map(drop));
+            if result.is_ok() {
+                post_permalink_to(&ctx, post_permalink, &shared).await;
             }
             ctx.events.emit(Event::ListAccessUpdated {
                 list_id,
@@ -623,59 +537,26 @@ impl<B: Backend> Core<B> {
     ) {
         let ctx = self.ctx();
         self.spawn("slackLists.access.delete", async move {
-            let summary = match (!channel_ids.is_empty(), !user_ids.is_empty()) {
-                (true, true) => format!(
-                    "Revoked access for {} channel(s) and {} user(s)",
-                    channel_ids.len(),
-                    user_ids.len()
-                ),
-                (true, false) => format!("Revoked access for {} channel(s)", channel_ids.len()),
-                (false, true) => format!("Revoked access for {} user(s)", user_ids.len()),
-                (false, false) => "Revoked access".to_owned(),
-            };
-            let mut failed_channels = Vec::new();
-            let mut failed_users = Vec::new();
-            let mut api_res: api::Result<()> = Ok(());
-            if channel_ids.is_empty() && user_ids.is_empty() {
-                api_res = Err(ApiError::Slack("invalid_parameters".to_owned()));
-            } else {
-                if !channel_ids.is_empty() {
-                    match ctx
-                        .backend
-                        .lists_access_delete(list_id.clone(), channel_ids, Vec::new())
-                        .await
-                    {
-                        Ok(report) => failed_channels.extend(report.failed_to_update_channel_ids),
-                        Err(err) => api_res = Err(err),
-                    }
-                }
-                if api_res.is_ok() && !user_ids.is_empty() {
-                    match ctx
-                        .backend
-                        .lists_access_delete(list_id.clone(), Vec::new(), user_ids)
-                        .await
-                    {
-                        Ok(report) => failed_users.extend(report.failed_to_update_user_ids),
-                        Err(err) => api_res = Err(err),
-                    }
-                }
-            }
-            let result = match map_list_result(&ctx.events, api_res) {
-                Ok(()) if !failed_channels.is_empty() || !failed_users.is_empty() => {
-                    let mut parts = Vec::new();
-                    if !failed_channels.is_empty() {
-                        parts.push(format!("{} channel(s)", failed_channels.len()));
-                    }
-                    if !failed_users.is_empty() {
-                        parts.push(format!("{} user(s)", failed_users.len()));
-                    }
-                    Err(format!(
-                        "Slack could not revoke access for {}.",
-                        parts.join(" and ")
-                    ))
-                }
-                other => other,
-            };
+            let summary = access_summary(None, channel_ids.len(), user_ids.len());
+            let api_res = per_access_side(channel_ids, user_ids, |channels, users| {
+                ctx.backend
+                    .lists_access_delete(list_id.clone(), channels, users)
+            })
+            .await;
+            // Slack answers `ok` while reporting the ids it could not update.
+            let result = map_list_result(&ctx.events, api_res).and_then(|reports| {
+                let channels = reports
+                    .iter()
+                    .map(|r| r.failed_to_update_channel_ids.len())
+                    .sum();
+                let users = reports
+                    .iter()
+                    .map(|r| r.failed_to_update_user_ids.len())
+                    .sum();
+                access_targets(channels, users).map_or(Ok(()), |targets| {
+                    Err(format!("Slack could not revoke access for {targets}."))
+                })
+            });
             ctx.events.emit(Event::ListAccessUpdated {
                 list_id,
                 summary,
@@ -923,6 +804,77 @@ impl<B: Backend> Core<B> {
             }
             Ok(())
         });
+    }
+}
+
+/// "2 channel(s) and 1 user(s)": who an access change covers (`None` for nobody).
+fn access_targets(channels: usize, users: usize) -> Option<String> {
+    match (channels, users) {
+        (0, 0) => None,
+        (channels, 0) => Some(format!("{channels} channel(s)")),
+        (0, users) => Some(format!("{users} user(s)")),
+        (channels, users) => Some(format!("{channels} channel(s) and {users} user(s)")),
+    }
+}
+
+/// The share dialog's line for an access change: a grant of `level`, or a revoke when `None`.
+fn access_summary(level: Option<&str>, channels: usize, users: usize) -> String {
+    match (level, access_targets(channels, users)) {
+        (Some(level), Some(targets)) => format!("Granted {level} access to {targets}"),
+        (Some(level), None) => format!("Updated {level} access"),
+        (None, Some(targets)) => format!("Revoked access for {targets}"),
+        (None, None) => "Revoked access".to_owned(),
+    }
+}
+
+/// Runs a canvas/List access call once per non-empty side, channels first: Slack takes
+/// `channel_ids` XOR `user_ids` per call. Stops at the first failure.
+async fn per_access_side<T, Fut>(
+    channel_ids: Vec<ChannelId>,
+    user_ids: Vec<UserId>,
+    mut call: impl FnMut(Vec<ChannelId>, Vec<UserId>) -> Fut,
+) -> api::Result<Vec<T>>
+where
+    Fut: Future<Output = api::Result<T>>,
+{
+    if channel_ids.is_empty() && user_ids.is_empty() {
+        return Err(ApiError::Slack("invalid_parameters".to_owned()));
+    }
+    let mut answers = Vec::new();
+    if !channel_ids.is_empty() {
+        answers.push(call(channel_ids, Vec::new()).await?);
+    }
+    if !user_ids.is_empty() {
+        answers.push(call(Vec::new(), user_ids).await?);
+    }
+    Ok(answers)
+}
+
+/// Posts a shared canvas's or List's `permalink` into each channel it was shared with. A failed
+/// post is logged (an expired session reported) without failing the share.
+async fn post_permalink_to<B: Backend>(
+    ctx: &TaskCtx<B>,
+    permalink: Option<String>,
+    channels: &[ChannelId],
+) {
+    let Some(url) = permalink.filter(|u| !u.trim().is_empty()) else {
+        return;
+    };
+    for channel in channels {
+        if let Err(err) = ctx
+            .backend
+            .post_message(
+                channel.clone(),
+                MessageContent::plain(url.clone()),
+                None,
+                false,
+                None,
+            )
+            .await
+        {
+            emit_if_auth_expired(&ctx.events, &err);
+            tracing::warn!(%channel, %err, "failed to post a shared permalink");
+        }
     }
 }
 

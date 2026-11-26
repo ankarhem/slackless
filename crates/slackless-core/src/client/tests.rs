@@ -6289,22 +6289,30 @@ async fn canvas_delete_access_and_comments_command_event_round_trips() {
     );
     fake.state.lock().unwrap().canvases_delete_error = None;
 
-    // 2. SetCanvasAccess with post_permalink shares permalink into each channel
+    // 2. SetCanvasAccess to channels and users makes one call per side (Slack takes channels XOR
+    //    users) and shares the permalink into each channel.
     core.handle(Command::Collab(CollabCommand::SetCanvasAccess {
         canvas_id: "F0SHARE".into(),
         access_level: api::CanvasAccessLevel::Write,
         channel_ids: vec![ChannelId::from("C1"), ChannelId::from("C2")],
-        user_ids: vec![],
+        user_ids: vec![UserId::from("U9")],
         post_permalink: Some("https://acme.slack.com/docs/T1/F0SHARE".into()),
     }))
     .await;
     assert!(matches!(
         next(&mut rx).await,
-        Event::CanvasAccessUpdated { canvas_id, result: Ok(()), .. } if canvas_id == "F0SHARE"
+        Event::CanvasAccessUpdated { canvas_id, summary, result: Ok(()) }
+            if canvas_id == "F0SHARE"
+                && summary == "Granted write access to 2 channel(s) and 1 user(s)"
     ));
     {
         let st = fake.state.lock().unwrap();
-        assert_eq!(st.canvases_access_set_calls.len(), 1);
+        let sides: Vec<(usize, usize)> = st
+            .canvases_access_set_calls
+            .iter()
+            .map(|(_, _, channels, users)| (channels.len(), users.len()))
+            .collect();
+        assert_eq!(sides, [(2, 0), (0, 1)]);
         assert_eq!(
             st.posted_messages,
             vec![
