@@ -353,7 +353,7 @@ pub fn placeholder(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slackless_core::types::{Message, Ts, UserId};
+    use slackless_core::types::{FileId, Message, Ts, User, UserId};
 
     #[test]
     fn indexed_lookups_plain_text_and_o1_with_counts_work() {
@@ -426,6 +426,37 @@ mod tests {
         // Blank transcript clears the entry cleanly.
         let cleared = with_tr.with_file_transcript(fid.clone(), "   ".into());
         assert_eq!(cleared.file_transcript(&fid), None);
+    }
+
+    #[test]
+    fn people_and_transcript_updates_share_the_workspace_data() {
+        let base = load();
+        let alice = UserId::from("U0ALICE");
+        let mut away = base.user(&alice).cloned().expect("alice");
+        away.profile.status_text = Some("Lunch".into());
+        let patched = base.with_users(vec![away]);
+        assert!(
+            Arc::ptr_eq(&base.data, &patched.data),
+            "a status change copies no workspace data"
+        );
+        let fid = FileId::from("F_CLIP_2");
+        let transcribed = patched.with_file_transcript(fid.clone(), "hello".into());
+        assert!(
+            Arc::ptr_eq(&base.data, &transcribed.data),
+            "a transcript copies no workspace data"
+        );
+        let status = |f: &Fixtures| f.user(&alice).and_then(|u| u.profile.status_text.clone());
+        assert_eq!(status(&transcribed).as_deref(), Some("Lunch"));
+        assert_eq!(transcribed.file_transcript(&fid), Some("hello"));
+        // A stranger joins the people member lists and org lines walk; the updates stay.
+        let stranger = User {
+            id: UserId::from("U0STRANGER"),
+            ..Default::default()
+        };
+        let met = transcribed.with_users(vec![stranger]);
+        assert!(met.users.iter().any(|u| u.id.as_str() == "U0STRANGER"));
+        assert_eq!(status(&met).as_deref(), Some("Lunch"));
+        assert_eq!(met.file_transcript(&fid), Some("hello"));
     }
 
     #[test]

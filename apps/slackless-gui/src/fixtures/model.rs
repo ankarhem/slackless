@@ -148,12 +148,25 @@ fn index_users(users: &[User]) -> HashMap<UserId, usize> {
 }
 
 /// Snapshot of a workspace rendered by views: `Arc`-shared [`WorkspaceData`] paired with the
-/// latest per-conversation read/unread `counts`.
+/// latest per-conversation read/unread `counts` and what changed since the data was read.
 pub struct Fixtures {
     pub(super) data: Arc<WorkspaceData>,
     /// Live mode: Slack's own read and unread state per conversation (`client.counts`). Empty
     /// in the sample workspace, whose unreads come from its history.
     pub counts: HashMap<ChannelId, ConversationCounts>,
+    /// Fresh records of people already in `users` (a status or profile change), looked up
+    /// before them: such a change copies no workspace data.
+    fresh_people: Arc<HashMap<UserId, User>>,
+    /// Transcripts that landed after the data was read, looked up before its own.
+    transcripts: Arc<HashMap<FileId, Transcript>>,
+}
+
+/// A transcript that landed after the snapshot was read: its trimmed text (empty clears the
+/// stored one) and its timed cues.
+#[derive(Clone)]
+struct Transcript {
+    text: String,
+    cues: Vec<slackless_core::types::TranscriptCue>,
 }
 
 impl Deref for Fixtures {
@@ -182,6 +195,8 @@ impl Fixtures {
         Self {
             data: Arc::new(data),
             counts,
+            fresh_people: Arc::default(),
+            transcripts: Arc::default(),
         }
     }
 
@@ -192,15 +207,18 @@ impl Fixtures {
         Self {
             data: Arc::clone(&self.data),
             counts,
+            fresh_people: Arc::clone(&self.fresh_people),
+            transcripts: Arc::clone(&self.transcripts),
         }
     }
 
     /// Locally persisted transcript for an audio or video file, if available.
     pub fn file_transcript(&self, id: &FileId) -> Option<&str> {
-        self.file_transcripts
-            .get(id)
-            .map(String::as_str)
-            .filter(|s| !s.is_empty())
+        match self.transcripts.get(id) {
+            Some(landed) => Some(landed.text.as_str()),
+            None => self.file_transcripts.get(id).map(String::as_str),
+        }
+        .filter(|s| !s.is_empty())
     }
 
     /// Timed transcript cues for an audio or video file, if available.
@@ -208,9 +226,10 @@ impl Fixtures {
         &self,
         id: &FileId,
     ) -> Option<&[slackless_core::types::TranscriptCue]> {
-        self.file_transcript_cues
-            .get(id)
-            .map(Vec::as_slice)
+        let landed = self.transcripts.get(id).map(|t| t.cues.as_slice());
+        landed
+            .filter(|cues| !cues.is_empty())
+            .or_else(|| self.file_transcript_cues.get(id).map(Vec::as_slice))
             .filter(|cues| !cues.is_empty())
     }
 
@@ -227,33 +246,37 @@ impl Fixtures {
         text: String,
         cues: Vec<slackless_core::types::TranscriptCue>,
     ) -> Self {
-        let mut data = (*self.data).clone();
-        let trimmed = text.trim().to_owned();
-        if trimmed.is_empty() {
-            data.file_transcripts.remove(&file_id);
-        } else {
-            data.file_transcripts.insert(file_id.clone(), trimmed);
-        }
-        if !cues.is_empty() {
-            data.file_transcript_cues.insert(file_id, cues);
-        }
-        Self {
-            data: Arc::new(data),
-            counts: self.counts.clone(),
-        }
+        let mut next = self.with_counts(self.counts.clone());
+        let transcripts = Arc::make_mut(&mut next.transcripts);
+        // Text alone keeps the cues already known.
+        let cues = match transcripts.remove(&file_id) {
+            Some(earlier) if cues.is_empty() => earlier.cues,
+            _ => cues,
+        };
+        let text = text.trim().to_owned();
+        transcripts.insert(file_id, Transcript { text, cues });
+        next
     }
 
     /// A copy of this snapshot with `users` (fresh store records) in place of the people of
     /// the same ids and the others added: a status or profile change reaches the views without
-    /// re-reading the rest of the workspace. The people index is carried over and extended,
-    /// not rebuilt.
+    /// re-reading the rest of the workspace. People already listed are only looked up anew;
+    /// someone new joins `users` itself, which member lists and org lines walk, so that copy
+    /// takes the earlier updates along (the people index is carried over and extended).
     pub fn with_users(&self, users: Vec<User>) -> Self {
+        let mut next = self.with_counts(self.counts.clone());
+        let known = self.user_map();
+        if users.iter().all(|user| known.contains_key(&user.id)) {
+            Arc::make_mut(&mut next.fresh_people)
+                .extend(users.into_iter().map(|user| (user.id.clone(), user)));
+            return next;
+        }
         let mut data = (*self.data).clone();
         let mut index = data
             .user_index
             .take()
             .unwrap_or_else(|| index_users(&data.users));
-        for user in users {
+        for user in self.fresh_people.values().cloned().chain(users) {
             if let Some(slot) = index.get(&user.id).and_then(|&ix| data.users.get_mut(ix)) {
                 *slot = user;
             } else {
@@ -262,16 +285,24 @@ impl Fixtures {
             }
         }
         data.user_index = OnceLock::from(index);
-        Self {
-            data: Arc::new(data),
-            counts: self.counts.clone(),
-        }
+        next.data = Arc::new(data);
+        next.fresh_people = Arc::default();
+        next
     }
 
-    /// Whether `other` holds this snapshot's workspace data: it is this snapshot or one of its
-    /// [`Fixtures::with_counts`] copies.
+    /// Whether `other` holds this snapshot's workspace data and updates: it is this snapshot
+    /// or one of its [`Fixtures::with_counts`] copies.
     pub fn shares_data(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.data, &other.data)
+            && Arc::ptr_eq(&self.fresh_people, &other.fresh_people)
+            && Arc::ptr_eq(&self.transcripts, &other.transcripts)
+    }
+
+    /// Everyone in `users`, each by their freshest record.
+    pub fn people(&self) -> impl Iterator<Item = &User> {
+        self.users
+            .iter()
+            .map(|user| self.fresh_people.get(&user.id).unwrap_or(user))
     }
 
     /// Effective read cursor for `id`: prefers live `counts[id].last_read`, falling back to
@@ -376,6 +407,9 @@ impl Fixtures {
     }
 
     pub fn user(&self, id: &UserId) -> Option<&User> {
+        if let Some(fresh) = self.fresh_people.get(id) {
+            return Some(fresh);
+        }
         let map = self.user_map();
         if let Some(&ix) = map.get(id)
             && let Some(user) = self.users.get(ix).filter(|u| u.id == *id)

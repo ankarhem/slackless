@@ -403,7 +403,8 @@ fn candidates(fixtures: &Fixtures) -> Vec<Candidate> {
             }),
     );
     all.extend(
-        (fixtures.users.iter())
+        fixtures
+            .people()
             .filter(|u| !u.deleted && !with_dm.contains(&u.id))
             .map(|u| {
                 let name = if u.id == fixtures.self_user {
