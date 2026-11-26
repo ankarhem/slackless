@@ -14,7 +14,7 @@ use slackless_core::huddle::{
     HuddleAudioLevels, HuddleDataEvent, HuddleDrawMessage, HuddleDrawSegment, HuddlePhase,
     HuddleReactionKind, HuddleSessionSnapshot, VideoFrame, VideoTileKey,
 };
-use slackless_core::types::{ChannelId, UserId};
+use slackless_core::types::{ChannelId, Ts, UserId};
 #[cfg(target_os = "macos")]
 use slackless_platform::{
     DesktopDrawOverlay, OverlayCursorState, OverlayDrawStroke, OverlayPenEvent,
@@ -95,10 +95,31 @@ pub enum HuddleStateEvent {
     OpenAudioSettings,
 }
 
+/// The room fields of a core session snapshot. `sh_room_*` updates (a peer's background, a
+/// huddle thread created after joining) also write them, but the core never sees those and
+/// re-emits its snapshot on every mute, topic and perf change.
+struct RoomMeta {
+    topic: Option<String>,
+    background_id: Option<String>,
+    thread_root_ts: Option<Ts>,
+}
+
+impl RoomMeta {
+    fn of(session: &HuddleSessionSnapshot) -> Self {
+        Self {
+            topic: session.topic.clone(),
+            background_id: session.background_id.clone(),
+            thread_root_ts: session.thread_root_ts.clone(),
+        }
+    }
+}
+
 /// Single source of truth for the active native huddle's UI state.
 pub struct HuddleState {
     fixtures: Arc<Fixtures>,
     session: HuddleSessionSnapshot,
+    /// The room fields of the core's last snapshot (see [`HuddleState::update_session`]).
+    core_room_meta: RoomMeta,
     participants: Vec<UserId>,
     levels: HuddleAudioLevels,
     elapsed_secs: u64,
@@ -230,6 +251,7 @@ impl HuddleState {
             let started = session.started_at_secs;
             Self {
                 fixtures,
+                core_room_meta: RoomMeta::of(&session),
                 session,
                 participants,
                 levels: HuddleAudioLevels::default(),
@@ -662,7 +684,23 @@ impl HuddleState {
     #[cfg(not(target_os = "macos"))]
     fn sync_desktop_draw_overlay(&mut self, _cx: &mut Context<Self>) {}
 
-    pub fn update_session(&mut self, session: HuddleSessionSnapshot, cx: &mut Context<Self>) {
+    pub fn update_session(&mut self, mut session: HuddleSessionSnapshot, cx: &mut Context<Self>) {
+        let core_room_meta = RoomMeta::of(&session);
+        if session.call_id == self.session.call_id {
+            // Keep a room field shown from `sh_room_*` (or a local pick) unless the core itself
+            // changed it: its re-emitted snapshot would revert it within one perf tick.
+            let (last, shown) = (&self.core_room_meta, &self.session);
+            if core_room_meta.topic == last.topic {
+                session.topic.clone_from(&shown.topic);
+            }
+            if core_room_meta.background_id == last.background_id {
+                session.background_id.clone_from(&shown.background_id);
+            }
+            if core_room_meta.thread_root_ts == last.thread_root_ts {
+                session.thread_root_ts.clone_from(&shown.thread_root_ts);
+            }
+        }
+        self.core_room_meta = core_room_meta;
         if session.started_at_secs > 0 {
             self.elapsed_secs = now_secs().saturating_sub(session.started_at_secs);
         }
@@ -1312,6 +1350,43 @@ mod tests {
                     s.session().thread_root_ts.as_ref().map(|t| t.as_str()),
                     Some("1700000001.000100")
                 );
+
+                // 6. The core re-emits its snapshot on every mute/perf tick without seeing room
+                // updates: the room meta above must survive it.
+                let core_snap = HuddleSessionSnapshot {
+                    phase: HuddlePhase::Connected,
+                    channel: ChannelId::from("C0ENG"),
+                    call_id: "R0TEST".into(),
+                    muted: true,
+                    ..Default::default()
+                };
+                s.update_session(core_snap.clone(), cx);
+                assert_eq!(s.session().topic.as_deref(), Some("Updated topic"));
+                assert_eq!(s.session().background_id.as_deref(), Some("bg-1"));
+                assert_eq!(
+                    s.session().thread_root_ts.as_ref().map(|t| t.as_str()),
+                    Some("1700000001.000100")
+                );
+                // A field the core itself changes (a local background pick) wins, and a later
+                // peer change still survives the core's next re-emit of its own value.
+                let local_bg = HuddleSessionSnapshot {
+                    background_id: Some("bg-local".into()),
+                    ..core_snap.clone()
+                };
+                s.update_session(local_bg.clone(), cx);
+                assert_eq!(s.session().background_id.as_deref(), Some("bg-local"));
+                s.apply_room_meta(None, Some("bg-peer".into()), None, cx);
+                s.update_session(local_bg, cx);
+                assert_eq!(s.session().background_id.as_deref(), Some("bg-peer"));
+                // Another call starts from the core's snapshot alone.
+                s.update_session(
+                    HuddleSessionSnapshot {
+                        call_id: "R0NEXT".into(),
+                        ..core_snap
+                    },
+                    cx,
+                );
+                assert_eq!(s.session().thread_root_ts, None);
             });
         });
     }
