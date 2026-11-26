@@ -67,6 +67,20 @@ pub enum ExportTarget {
     HuddleTranscript { call_id: String },
 }
 
+/// An export as a caller states it, with at most one target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportRequest<'a> {
+    /// A channel by id, `#name`, or `@handle`, optionally narrowed to one thread in it.
+    Channel {
+        channel: &'a str,
+        thread_ts: Option<&'a Ts>,
+    },
+    /// A stored audio/video file transcript.
+    FileTranscript { file_id: &'a FileId },
+    /// A stored huddle transcript.
+    HuddleTranscript { call_id: &'a str },
+}
+
 /// Rendered export output plus metadata for saving or printing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportArtifact {
@@ -469,6 +483,48 @@ pub fn export_huddle_transcript(
         item_count: doc.count,
         content,
     }))
+}
+
+/// Resolve `req` against `store` and export it through [`export_target`]. A channel or thread
+/// always exports, from an empty archive at worst; a transcript or huddle that is not stored is
+/// `Ok(None)`. The id a `Channel` request resolved to comes back with the artifact.
+pub fn export_request(
+    store: &Store,
+    workspace: &TeamId,
+    req: &ExportRequest<'_>,
+    opts: &ExportOptions,
+) -> StoreResult<Option<(ExportArtifact, Option<ChannelId>)>> {
+    let (target, resolved) = match *req {
+        ExportRequest::FileTranscript { file_id } => (
+            ExportTarget::FileTranscript {
+                file_id: file_id.clone(),
+            },
+            None,
+        ),
+        ExportRequest::HuddleTranscript { call_id } => (
+            ExportTarget::HuddleTranscript {
+                call_id: call_id.to_owned(),
+            },
+            None,
+        ),
+        ExportRequest::Channel { channel, thread_ts } => {
+            let id = store.resolve_channel(workspace, channel)?.map_or_else(
+                || ChannelId::from(channel.strip_prefix('#').unwrap_or(channel)),
+                |row| row.id,
+            );
+            let target = match thread_ts {
+                Some(ts) => ExportTarget::Thread {
+                    channel: id.clone(),
+                    thread_ts: (*ts).clone(),
+                },
+                None => ExportTarget::Channel {
+                    channel: id.clone(),
+                },
+            };
+            (target, Some(id))
+        }
+    };
+    Ok(export_target(store, workspace, &target, opts)?.map(|artifact| (artifact, resolved)))
 }
 
 /// Dispatch any [`ExportTarget`] through the shared export engine.
@@ -1209,6 +1265,15 @@ mod tests {
                 ..base
             }),
             vec!["msg 7", "msg 8", "msg 9"]
+        );
+    }
+
+    #[test]
+    fn format_utc_timestamp_handles_the_epoch_and_leap_days() {
+        assert_eq!(format_utc_timestamp(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(
+            format_utc_timestamp(1_709_208_000),
+            "2024-02-29 12:00:00 UTC"
         );
     }
 
