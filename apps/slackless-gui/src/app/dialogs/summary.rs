@@ -391,6 +391,7 @@ impl Render for SummaryDialogView {
                                     .icon(IconName::RefreshCw)
                                     .label("Regenerate")
                                     .on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
                                         let _ = app_retry.update(cx, |app, cx| {
                                             app.run_summary_request(
                                                 retry_request.clone(),
@@ -458,7 +459,16 @@ impl Render for SummaryDialogView {
                                     .child("Could not generate summary"),
                             ),
                     )
-                    .child(div().text_sm().text_color(fg).child(message.clone()))
+                    .child(
+                        div()
+                            .id("summary-error-scroll")
+                            .w_full()
+                            .max_h(px(220.))
+                            .overflow_y_scroll()
+                            .text_sm()
+                            .text_color(fg)
+                            .child(message.clone()),
+                    )
                     .into_any_element();
 
                 let footer = h_flex()
@@ -491,6 +501,7 @@ impl Render for SummaryDialogView {
                                     .icon(IconName::RefreshCw)
                                     .label("Retry")
                                     .on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
                                         let _ = app_retry.update(cx, |app, cx| {
                                             app.run_summary_request(
                                                 retry_request.clone(),
@@ -663,16 +674,15 @@ impl App {
             .map(|c| self.fixtures.conversation_label(c))
             .unwrap_or_else(|| channel.as_str().to_owned());
 
-        if let Some(store) = self.bridge.store()
-            && let Some(workspace) = self
-                .fixtures
-                .workspaces
-                .get(self.workspace)
-                .map(|t| t.id.clone())
+        if let Some(store) = self
+            .bridge
+            .read_store_clone()
+            .or_else(|| self.bridge.store().cloned())
+            && let Some(workspace) = self.bridge.team_id().cloned()
         {
             self.run_summary_request(
                 SummaryRequest::LiveChannel {
-                    store: store.clone(),
+                    store,
                     workspace,
                     channel,
                     channel_label,
@@ -728,16 +738,15 @@ impl App {
             .map(|c| self.fixtures.conversation_label(c))
             .unwrap_or_else(|| channel.as_str().to_owned());
 
-        if let Some(store) = self.bridge.store()
-            && let Some(workspace) = self
-                .fixtures
-                .workspaces
-                .get(self.workspace)
-                .map(|t| t.id.clone())
+        if let Some(store) = self
+            .bridge
+            .read_store_clone()
+            .or_else(|| self.bridge.store().cloned())
+            && let Some(workspace) = self.bridge.team_id().cloned()
         {
             self.run_summary_request(
                 SummaryRequest::LiveThread {
-                    store: store.clone(),
+                    store,
                     workspace,
                     channel,
                     thread_ts,

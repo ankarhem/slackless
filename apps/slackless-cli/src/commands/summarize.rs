@@ -16,6 +16,30 @@ use crate::commands::browse::{build_catchup_for_archives, parse_catchup_window};
 use crate::commands::{all_workspace_ids, empty_local, open_archive_with_hint, raw_channel_id};
 use crate::{Ctx, fail, output};
 
+fn infer_provider_from_endpoint(endpoint: Option<&str>) -> AiProvider {
+    let Some(raw) = endpoint else {
+        return AiProvider::Ollama;
+    };
+    let Ok(parsed) = slackless_core::summarize::validate_base_url(raw) else {
+        return AiProvider::Custom;
+    };
+    if parsed.scheme() == "https"
+        && parsed
+            .host_str()
+            .is_some_and(|h| h.eq_ignore_ascii_case("api.openai.com"))
+    {
+        return AiProvider::OpenAi;
+    }
+    if slackless_core::summarize::is_loopback_url(&parsed) {
+        match parsed.port() {
+            Some(1234) => return AiProvider::LmStudio,
+            Some(11434) => return AiProvider::Ollama,
+            _ => {}
+        }
+    }
+    AiProvider::Custom
+}
+
 fn resolve_ai_config(args: &SummarizeArgs) -> Result<AiSummaryConfig, String> {
     let endpoint_trimmed = args
         .endpoint
@@ -25,13 +49,7 @@ fn resolve_ai_config(args: &SummarizeArgs) -> Result<AiSummaryConfig, String> {
 
     let provider = match args.provider {
         Some(p) => AiProvider::from(p),
-        None => match endpoint_trimmed {
-            Some(url) if url.contains("api.openai.com") => AiProvider::OpenAi,
-            Some(url) if url.contains("1234") => AiProvider::LmStudio,
-            Some(url) if url.contains("11434") => AiProvider::Ollama,
-            Some(_) => AiProvider::Custom,
-            None => AiProvider::Ollama,
-        },
+        None => infer_provider_from_endpoint(endpoint_trimmed),
     };
 
     let base_url = endpoint_trimmed
@@ -406,6 +424,59 @@ mod tests {
         };
         let err = resolve_ai_config(&missing_env).expect_err("unset env must error");
         assert!(err.contains("SLACKLESS_DEFINITELY_UNSET_KEY_987654"));
+    }
+
+    #[test]
+    fn provider_inference_rejects_openai_lookalike_hosts_and_does_not_auto_attach_key() {
+        assert_eq!(
+            infer_provider_from_endpoint(Some("https://api.openai.com/v1")),
+            AiProvider::OpenAi
+        );
+        assert_eq!(
+            infer_provider_from_endpoint(Some("http://api.openai.com/v1")),
+            AiProvider::Custom
+        );
+        assert_eq!(
+            infer_provider_from_endpoint(Some("https://evil.com/api.openai.com/v1")),
+            AiProvider::Custom
+        );
+        assert_eq!(
+            infer_provider_from_endpoint(Some("https://api.openai.com.evil.com/v1")),
+            AiProvider::Custom
+        );
+        assert_eq!(
+            infer_provider_from_endpoint(Some("http://localhost:11434/v1")),
+            AiProvider::Ollama
+        );
+        assert_eq!(
+            infer_provider_from_endpoint(Some("http://127.0.0.1:1234/v1")),
+            AiProvider::LmStudio
+        );
+        assert_eq!(
+            infer_provider_from_endpoint(Some("https://evil.com/11434/v1")),
+            AiProvider::Custom
+        );
+
+        let lookalike = SummarizeArgs {
+            channel: Some("#eng".to_owned()),
+            thread: None,
+            transcript: None,
+            catchup: false,
+            since: None,
+            all_workspaces: false,
+            limit: 50,
+            provider: None,
+            endpoint: Some("https://evil.com/api.openai.com/v1".to_owned()),
+            model: Some("custom-model".to_owned()),
+            api_key_env: None,
+            timeout: 30,
+        };
+        let cfg = resolve_ai_config(&lookalike).expect("custom endpoint resolves");
+        assert_eq!(cfg.provider, AiProvider::Custom);
+        assert!(
+            cfg.api_key.is_none(),
+            "lookalike URL must never auto-attach OPENAI_API_KEY or Keychain key"
+        );
     }
 
     #[tokio::test]

@@ -36,6 +36,8 @@ pub const MAX_MAX_INPUT_CHARS: usize = 128_000;
 pub const DEFAULT_MAX_TOKENS: u32 = 1_024;
 /// Default message window loaded for channel/thread summarization.
 pub const DEFAULT_SUMMARY_MESSAGE_LIMIT: usize = 80;
+/// Hard byte cap on HTTP response bodies buffered from AI endpoints (2 MiB).
+pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 const USER_AGENT: &str = concat!("slackless/", env!("CARGO_PKG_VERSION"));
 
@@ -230,19 +232,45 @@ impl AiSummaryConfig {
             .clamp(MIN_MAX_INPUT_CHARS, MAX_MAX_INPUT_CHARS)
     }
 
-    /// Validate endpoint URL, model name, and required API key (for presets that require one).
+    /// Validate endpoint URL, model name, API key characters, transport security (no cleartext
+    /// `http://` to non-loopback hosts when an API key is used or OpenAI is selected), and
+    /// required API key presence.
     pub fn validate(&self) -> Result<(Url, String), SummarizeError> {
         let base = validate_base_url(self.effective_base_url())?;
         let model = self.effective_model().trim().to_owned();
         if model.is_empty() {
             return Err(SummarizeError::MissingModel);
         }
-        if self.provider.requires_api_key() && self.normalized_api_key().is_none() {
+        let key = self.normalized_api_key();
+        if let Some(k) = key
+            && k.chars().any(|c| c.is_control())
+        {
+            return Err(SummarizeError::InvalidApiKey);
+        }
+        if self.provider.requires_api_key() && key.is_none() {
             return Err(SummarizeError::MissingApiKey {
                 provider: self.provider.short_label(),
             });
         }
+        if base.scheme() == "http"
+            && !is_loopback_url(&base)
+            && (key.is_some() || self.provider == AiProvider::OpenAi)
+        {
+            return Err(SummarizeError::InvalidUrl(
+                "plain http:// is only allowed for localhost/loopback when using an API key or OpenAI; use https://".to_owned(),
+            ));
+        }
         Ok((base, model))
+    }
+}
+
+/// Returns `true` iff `url`'s host is `localhost` or a loopback IP (`127.0.0.0/8`, `::1`).
+pub fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
     }
 }
 
@@ -325,6 +353,8 @@ pub enum SummarizeError {
     MissingModel,
     #[error("{provider} requires an API key — configure one in Preferences or via --api-key-env")]
     MissingApiKey { provider: &'static str },
+    #[error("API key contains invalid control characters")]
+    InvalidApiKey,
     #[error("nothing to summarize: {0}")]
     EmptyInput(String),
     #[error("request timed out after {secs}s")]
@@ -746,6 +776,11 @@ fn pack_lines_keep_head_and_tail(
         return (full, false);
     }
 
+    if lines.len() == 1 {
+        let (clipped, _) = truncate_chars(&lines[0], budget.saturating_sub(1));
+        return (format!("{clipped}…"), true);
+    }
+
     let marker = "[... earlier messages omitted to fit context budget ...]";
     let marker_chars = marker.chars().count() + 2;
 
@@ -868,11 +903,52 @@ fn build_http_client(timeout: Duration) -> Result<reqwest::Client, SummarizeErro
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(timeout)
+        .connect_timeout(timeout.min(Duration::from_secs(15)))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| SummarizeError::Transport(err.to_string()))
 }
 
-fn extract_error_detail(status: u16, body: &[u8]) -> String {
+async fn read_bounded_bytes(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+    timeout_secs: u64,
+) -> Result<Vec<u8>, SummarizeError> {
+    if let Some(len) = resp.content_length()
+        && len > max_bytes as u64
+    {
+        return Err(SummarizeError::InvalidResponse(format!(
+            "response body ({len} bytes) exceeded {max_bytes} byte safety cap"
+        )));
+    }
+    let mut buf = Vec::with_capacity(
+        resp.content_length()
+            .and_then(|l| usize::try_from(l).ok())
+            .map_or(4096, |l| l.min(max_bytes)),
+    );
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|err| map_reqwest_error(err, timeout_secs))?
+    {
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(SummarizeError::InvalidResponse(format!(
+                "response body exceeded {max_bytes} byte safety cap"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+fn scrub_secret(text: &str, api_key: Option<&str>) -> String {
+    match api_key.filter(|k| !k.is_empty()) {
+        Some(secret) => text.replace(secret, "[REDACTED]"),
+        None => text.to_owned(),
+    }
+}
+
+fn extract_error_detail(status: u16, body: &[u8], api_key: Option<&str>) -> String {
     if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) {
         if let Some(msg) = val
             .get("error")
@@ -881,7 +957,8 @@ fn extract_error_detail(status: u16, body: &[u8]) -> String {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            return truncate_chars(msg, 300).0.to_owned();
+            let scrubbed = scrub_secret(msg, api_key);
+            return truncate_chars(&scrubbed, 300).0.to_owned();
         }
         if let Some(msg) = val
             .get("message")
@@ -889,7 +966,8 @@ fn extract_error_detail(status: u16, body: &[u8]) -> String {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            return truncate_chars(msg, 300).0.to_owned();
+            let scrubbed = scrub_secret(msg, api_key);
+            return truncate_chars(&scrubbed, 300).0.to_owned();
         }
     }
     let text = String::from_utf8_lossy(body);
@@ -897,7 +975,8 @@ fn extract_error_detail(status: u16, body: &[u8]) -> String {
     if trimmed.is_empty() {
         format!("HTTP {status}")
     } else {
-        truncate_chars(trimmed, 300).0.to_owned()
+        let scrubbed = scrub_secret(trimmed, api_key);
+        truncate_chars(&scrubbed, 300).0.to_owned()
     }
 }
 
@@ -993,16 +1072,13 @@ pub async fn summarize(
         .await
         .map_err(|err| map_reqwest_error(err, timeout_secs))?;
     let status = resp.status();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|err| map_reqwest_error(err, timeout_secs))?;
+    let bytes = read_bounded_bytes(resp, MAX_RESPONSE_BYTES, timeout_secs).await?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     if !status.is_success() {
         return Err(SummarizeError::HttpStatus {
             status: status.as_u16(),
-            message: extract_error_detail(status.as_u16(), &bytes),
+            message: extract_error_detail(status.as_u16(), &bytes, config.normalized_api_key()),
         });
     }
 
@@ -1064,10 +1140,7 @@ pub async fn test_connection(
         .await
         .map_err(|err| map_reqwest_error(err, timeout_secs))?;
     let status = resp.status();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|err| map_reqwest_error(err, timeout_secs))?;
+    let bytes = read_bounded_bytes(resp, MAX_RESPONSE_BYTES, timeout_secs).await?;
     let latency_ms = started.elapsed().as_millis() as u64;
     let endpoint = base_url.to_string().trim_end_matches('/').to_owned();
 
@@ -1140,15 +1213,16 @@ pub async fn test_connection(
             .await
             .map_err(|err| map_reqwest_error(err, timeout_secs))?;
         let ping_status = ping_resp.status();
-        let ping_bytes = ping_resp
-            .bytes()
-            .await
-            .map_err(|err| map_reqwest_error(err, timeout_secs))?;
+        let ping_bytes = read_bounded_bytes(ping_resp, MAX_RESPONSE_BYTES, timeout_secs).await?;
         let ping_ms = ping_started.elapsed().as_millis() as u64;
         if !ping_status.is_success() {
             return Err(SummarizeError::HttpStatus {
                 status: ping_status.as_u16(),
-                message: extract_error_detail(ping_status.as_u16(), &ping_bytes),
+                message: extract_error_detail(
+                    ping_status.as_u16(),
+                    &ping_bytes,
+                    config.normalized_api_key(),
+                ),
             });
         }
         let parsed: ChatCompletionResponse = serde_json::from_slice(&ping_bytes)
@@ -1171,7 +1245,7 @@ pub async fn test_connection(
 
     Err(SummarizeError::HttpStatus {
         status: status.as_u16(),
-        message: extract_error_detail(status.as_u16(), &bytes),
+        message: extract_error_detail(status.as_u16(), &bytes, config.normalized_api_key()),
     })
 }
 
@@ -1824,5 +1898,154 @@ mod tests {
         let res2 = test_connection(&cfg_custom).await.expect("fallback ok");
         assert_eq!(res2.model_listed, Some(true));
         assert!(res2.detail.contains("completion probe"));
+    }
+
+    #[test]
+    fn rejects_plain_http_to_non_loopback_with_api_key_or_openai() {
+        let remote_with_key = AiSummaryConfig {
+            provider: AiProvider::Custom,
+            base_url: "http://remote.example.com/v1".to_owned(),
+            model: "custom".to_owned(),
+            api_key: Some("sk-secret".to_owned()),
+            ..AiSummaryConfig::default()
+        };
+        assert!(matches!(
+            remote_with_key.validate(),
+            Err(SummarizeError::InvalidUrl(_))
+        ));
+
+        let openai_http = AiSummaryConfig {
+            provider: AiProvider::OpenAi,
+            base_url: "http://api.openai.com/v1".to_owned(),
+            model: "gpt-4o-mini".to_owned(),
+            api_key: Some("sk-secret".to_owned()),
+            ..AiSummaryConfig::default()
+        };
+        assert!(matches!(
+            openai_http.validate(),
+            Err(SummarizeError::InvalidUrl(_))
+        ));
+
+        // Loopback http:// (localhost / 127.0.0.1 / [::1]) stays allowed even with an API key.
+        for loopback in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://[::1]:1234/v1",
+        ] {
+            let ok_cfg = AiSummaryConfig {
+                provider: AiProvider::Custom,
+                base_url: loopback.to_owned(),
+                model: "local".to_owned(),
+                api_key: Some("local-key".to_owned()),
+                ..AiSummaryConfig::default()
+            };
+            assert!(ok_cfg.validate().is_ok(), "{loopback} should be allowed");
+        }
+
+        // Control chars in API key are rejected cleanly.
+        let bad_key = AiSummaryConfig {
+            provider: AiProvider::OpenAi,
+            base_url: "https://api.openai.com/v1".to_owned(),
+            model: "gpt-4o-mini".to_owned(),
+            api_key: Some("sk-bad\r\nX-Inject: 1".to_owned()),
+            ..AiSummaryConfig::default()
+        };
+        assert!(matches!(
+            bad_key.validate(),
+            Err(SummarizeError::InvalidApiKey)
+        ));
+    }
+
+    #[tokio::test]
+    async fn wiremock_does_not_follow_redirects_caps_response_size_and_scrubs_echoed_key() {
+        let server = MockServer::start().await;
+
+        // 1. 307 redirect must NOT be followed.
+        Mock::given(method("POST"))
+            .and(path("/redir/chat/completions"))
+            .respond_with(ResponseTemplate::new(307).insert_header(
+                "location",
+                format!("{}/target/chat/completions", server.uri()),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/target/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        // 2. Echoed API key in error body must be scrubbed to [REDACTED].
+        let secret = "sk-echo-secret-123456";
+        Mock::given(method("POST"))
+            .and(path("/echo/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": { "message": format!("Rejected key {secret}") }
+            })))
+            .mount(&server)
+            .await;
+
+        // 3. Oversized response body must be rejected before buffering unboundedly.
+        let oversized = vec![b'a'; MAX_RESPONSE_BYTES + 1024];
+        Mock::given(method("POST"))
+            .and(path("/huge/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized))
+            .mount(&server)
+            .await;
+
+        let target = SummaryTarget::Channel {
+            channel_label: "#ops".to_owned(),
+            topic: None,
+            messages: vec![SummaryMessage {
+                author: "Alice".to_owned(),
+                timestamp: None,
+                text: "Sensitive Slack content".to_owned(),
+                is_thread_root: false,
+            }],
+        };
+
+        let cfg_redir = AiSummaryConfig {
+            provider: AiProvider::Custom,
+            base_url: format!("{}/redir", server.uri()),
+            model: "m".to_owned(),
+            api_key: None,
+            ..AiSummaryConfig::default()
+        };
+        assert!(matches!(
+            summarize(&cfg_redir, &target).await,
+            Err(SummarizeError::HttpStatus { status: 307, .. })
+        ));
+
+        let cfg_echo = AiSummaryConfig {
+            provider: AiProvider::Custom,
+            base_url: format!("{}/echo", server.uri()),
+            model: "m".to_owned(),
+            api_key: Some(secret.to_owned()),
+            ..AiSummaryConfig::default()
+        };
+        match summarize(&cfg_echo, &target).await {
+            Err(SummarizeError::HttpStatus {
+                status: 401,
+                message,
+            }) => {
+                assert!(!message.contains(secret), "key leaked in error: {message}");
+                assert!(message.contains("[REDACTED]"));
+            }
+            other => panic!("expected HttpStatus(401), got {other:?}"),
+        }
+
+        let cfg_huge = AiSummaryConfig {
+            provider: AiProvider::Custom,
+            base_url: format!("{}/huge", server.uri()),
+            model: "m".to_owned(),
+            api_key: None,
+            ..AiSummaryConfig::default()
+        };
+        assert!(matches!(
+            summarize(&cfg_huge, &target).await,
+            Err(SummarizeError::InvalidResponse(_))
+        ));
     }
 }

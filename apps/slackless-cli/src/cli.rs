@@ -296,6 +296,7 @@ impl From<AiProviderArg> for slackless_core::summarize::AiProvider {
 #[derive(Args)]
 pub(crate) struct SummarizeArgs {
     /// Channel id, #name, or @handle (required unless `--transcript` or `--catchup` is set).
+    #[arg(conflicts_with_all = ["transcript", "catchup"])]
     pub(crate) channel: Option<String>,
     /// Summarize a single thread (root + replies) by its root `ts` inside `channel`.
     #[arg(long, value_name = "TS", conflicts_with_all = ["transcript", "catchup"])]

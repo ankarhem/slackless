@@ -202,6 +202,7 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 fn validate_account(account: &str) -> Result<&str> {
     if !account.is_empty()
         && account.len() <= 64
+        && !account.starts_with('-')
         && account
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -239,8 +240,17 @@ fn keychain_secret_set(account: &str, value: &str) -> Result<()> {
     }
     let output = child.wait_with_output()?;
     let errors = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() || !errors.trim().is_empty() {
-        return Err(AuthError::Keychain(errors.trim().to_owned()));
+    let detail = errors.trim();
+    if !output.status.success() || !detail.is_empty() {
+        let msg = if detail.is_empty() {
+            format!(
+                "add-generic-password failed (exit {:?})",
+                output.status.code()
+            )
+        } else {
+            detail.to_owned()
+        };
+        return Err(AuthError::Keychain(msg));
     }
     Ok(())
 }
@@ -389,6 +399,7 @@ mod tests {
     #[test]
     fn rejects_unsafe_account_names() {
         assert!(validate_account("").is_err());
+        assert!(validate_account("-w").is_err());
         assert!(validate_account("bad account").is_err());
         assert!(validate_account("bad;rm -rf").is_err());
         assert!(validate_account("ai-summary-api-key").is_ok());
