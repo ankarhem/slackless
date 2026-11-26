@@ -11,7 +11,7 @@ description: This skill should be used when an AI agent needs to search, read, s
 
 Two kinds of commands exist.
 
-- **Offline archive commands** (`search`, `read`, `thread`, `channels`, `dms`, `users`, `digest`, `threads`, `revisions`, `export`, `stats`, `vacuum`, `huddle devices`, `huddle cameras`, `huddle screens`, `auth status`) work offline against the local SQLite archive (or local host media devices). Archive read commands always exit 0; with no known workspace they print empty results (plus a stderr hint in human mode) instead of failing.
+- **Offline archive commands** (`search`, `read`, `thread`, `channels`, `dms`, `users`, `digest`, `threads`, `revisions`, `export`, `stats`, `vacuum`, `huddle devices`, `huddle cameras`, `huddle screens`, `auth status`) work offline against the local SQLite archive (or local host media devices). Archive read commands always exit 0; with no known workspace they print empty results (plus a stderr hint in human mode) instead of failing. Archive actions (`vacuum`, `archive check`, `archive backup`, `archive index-semantic --single-workspace`, `summarize`) fail instead, with `no_workspace` or `no_archive`, when there is nothing to act on.
 - **Live Slack commands** (`send`, `reply`, `edit`, `delete`, `react`, `unreact`, `upload`, `thread --live`, `mark-read`, `mark-thread`, `pins`, `pin`, `unpin`, `schedule`, `scheduled`, `saved`, `files`, `download`, `canvas`, `list`, `status`, `unread`, `watch`, `backfill`, `huddle join|link|invite`) talk to Slack using a stored session (`slackless auth login` or the desktop app). Every REST command is one deterministic invocation; `send`, `reply`, `edit`, `schedule`, and `canvas comment` accept `-` as `<TEXT>` to read multi-line bodies from stdin. `watch` opens a live websocket and streams NDJSON events until interrupted (or `--count N`); `huddle join` connects natively to Amazon Chime audio until interrupted or `--duration N`. `slackless update` checks for and installs new Slackless releases from GitHub Releases (updating both `Slackless.app` and the CLI).
 
 - **MCP server** (`slackless mcp`) exposes the local archive and live messaging actions over standard JSON-RPC 2.0 stdio for MCP-compatible AI clients (Claude Desktop, Claude Code, Cursor, etc.).
@@ -326,7 +326,7 @@ JSON output:
 slackless vacuum
 ```
 
-Compress legacy uncompressed JSON rows, checkpoint WAL, compact unused pages (`VACUUM`), and optimize FTS5 indexes.
+Compress legacy uncompressed JSON rows, checkpoint WAL, compact unused pages (`VACUUM`), and optimize FTS5 indexes. With no workspace or no archive to compact it fails with `no_workspace` or `no_archive`.
 
 JSON output:
 
@@ -952,7 +952,7 @@ When installed (`updated: true`), also includes `"restarted"`, `"app_path"`, and
 
 ## Errors and exit codes
 
-Success exits 0, and so do local archive commands that found nothing to read. Any failure exits 1 and prints one of these shapes:
+Success exits 0, and so do read commands that found nothing to read: they print empty results, never `ok: false`. Any failure exits 1 and prints this shape, including an archive action with no workspace (`no_workspace`) or no archive (`no_archive`) to act on:
 
 ```json
 { "ok": false, "error": "<code>", "message": "<what to do about it>" }

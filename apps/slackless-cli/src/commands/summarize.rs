@@ -12,7 +12,7 @@ use slackless_core::types::{FileId, TeamId, Ts};
 use crate::archive::Archive;
 use crate::cli::SummarizeArgs;
 use crate::commands::browse::{build_catchup_for_archives, parse_catchup_window};
-use crate::commands::{all_workspace_ids, empty_local, open_archive_with_hint, raw_channel_id};
+use crate::commands::{all_workspace_ids, fail_no_archive, fail_no_workspace, raw_channel_id};
 use crate::{Ctx, fail, output};
 
 fn infer_provider_from_endpoint(endpoint: Option<&str>) -> AiProvider {
@@ -125,11 +125,7 @@ pub(crate) async fn cmd_summarize(
             workspace.into_iter().cloned().collect()
         };
         if team_ids.is_empty() {
-            return Ok(empty_local(
-                ctx,
-                serde_json::json!({"ok": false, "error": "no_workspace"}),
-                "summarizing catch-up",
-            ));
+            return Ok(fail_no_workspace(ctx, "summarizing the catch-up"));
         }
         let mut opened = Vec::new();
         for ws in team_ids {
@@ -150,13 +146,10 @@ pub(crate) async fn cmd_summarize(
     }
 
     let Some(workspace) = workspace else {
-        return Ok(empty_local(
-            ctx,
-            serde_json::json!({"ok": false, "error": "no_workspace"}),
-            "summarizing",
-        ));
+        return Ok(fail_no_workspace(ctx, "summarizing"));
     };
-    let archive = open_archive_with_hint(ctx, workspace)?;
+    let archive = Archive::open(workspace)
+        .with_context(|| format!("opening local archive for {workspace}"))?;
     cmd_summarize_in_archive(ctx, workspace, archive.as_ref(), &config, args).await
 }
 
@@ -169,13 +162,7 @@ pub(crate) async fn cmd_summarize_in_archive(
 ) -> Result<ExitCode> {
     if let Some(file_id) = args.transcript.as_deref() {
         let Some(archive) = archive else {
-            return Ok(fail(
-                ctx,
-                "not_found",
-                &format!(
-                    "no local archive for workspace {workspace}; transcript {file_id} not found"
-                ),
-            ));
+            return Ok(fail_no_archive(ctx, workspace));
         };
         let fid = FileId::from(file_id);
         let target = match load_transcript_target(archive.store(), workspace, &fid) {
@@ -194,11 +181,7 @@ pub(crate) async fn cmd_summarize_in_archive(
     };
 
     let Some(archive) = archive else {
-        return Ok(fail(
-            ctx,
-            "not_found",
-            &format!("no local archive for workspace {workspace}; cannot summarize {channel_arg}"),
-        ));
+        return Ok(fail_no_archive(ctx, workspace));
     };
 
     let resolved = archive

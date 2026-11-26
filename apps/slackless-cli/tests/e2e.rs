@@ -219,6 +219,55 @@ fn invalid_arguments_fail_locally_with_invalid_args() {
     );
 }
 
+/// With nothing to act on, reads succeed with empty results while archive actions fail with the
+/// error envelope: `ok: false` always comes with exit 1, `error`, and `message`.
+#[test]
+fn soft_empty_reads_succeed_and_archive_actions_fail_with_the_error_envelope() {
+    let dir = TempArchiveDir::new("soft-empty");
+    let backup = dir.path.join("backup.sqlite");
+    let backup = backup.to_str().unwrap();
+    // No stored session and no archive: no workspace is known. `T0NONE` has no archive.
+    for (args, error) in [
+        (vec!["read", "C0X"], None),
+        (vec!["stats"], None),
+        (vec!["archive", "status"], None),
+        (vec!["vacuum"], Some("no_workspace")),
+        (vec!["archive", "check"], Some("no_workspace")),
+        (vec!["archive", "backup", backup], Some("no_workspace")),
+        (vec!["summarize", "C0X"], Some("no_workspace")),
+        (vec!["summarize", "--catchup"], Some("no_workspace")),
+        (vec!["--workspace", "T0NONE", "vacuum"], Some("no_archive")),
+        (
+            vec!["--workspace", "T0NONE", "archive", "check"],
+            Some("no_archive"),
+        ),
+        (
+            vec!["--workspace", "T0NONE", "archive", "backup", backup],
+            Some("no_archive"),
+        ),
+        (
+            vec!["--workspace", "T0NONE", "summarize", "C0X"],
+            Some("no_archive"),
+        ),
+    ] {
+        let (code, json) = run_json(&dir, &args);
+        match error {
+            None => assert!(
+                code == Some(0) && json["ok"] != false,
+                "{args:?}: exit {code:?}: {json}"
+            ),
+            Some(error) => {
+                assert_eq!(
+                    (code, &json["ok"], &json["error"]),
+                    (Some(1), &json!(false), &json!(error)),
+                    "{args:?}: {json}"
+                );
+                assert!(json["message"].is_string(), "{args:?}: {json}");
+            }
+        }
+    }
+}
+
 #[test]
 fn cli_archive_commands_json_contract_export_and_error_envelopes() {
     let dir = TempArchiveDir::new("archive");

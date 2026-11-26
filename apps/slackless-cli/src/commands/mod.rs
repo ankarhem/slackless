@@ -15,7 +15,7 @@ use slackless_core::types::{ChannelId, TeamId};
 
 use crate::archive::{self, Archive};
 use crate::write::parse_duration_secs;
-use crate::{Ctx, output};
+use crate::{Ctx, fail, output};
 
 /// Opens a workspace archive read-only, propagating genuine SQLite errors while printing a
 /// stderr hint in human mode when no archive file exists yet.
@@ -80,24 +80,42 @@ pub(crate) fn raw_channel_id(arg: &str) -> ChannelId {
     ChannelId::from(arg.strip_prefix('#').unwrap_or(arg))
 }
 
-/// Prints empty `--json` results (or a human hint) when no workspace is known: local commands
-/// succeed with empty output rather than failing hard offline.
+/// Prints empty `--json` results (or a human hint) when no workspace is known: local read
+/// commands succeed with empty output rather than failing hard offline.
 pub(crate) fn empty_local(ctx: &Ctx, empty: serde_json::Value, action: &str) -> ExitCode {
     if ctx.json {
         output::emit_json(&empty);
     } else {
-        eprintln!(
-            "slackless: no workspace known for {action}; pass --workspace TEAM_ID (run `slackless auth login` first)"
-        );
+        eprintln!("slackless: {}", no_workspace_message(action));
     }
     ExitCode::SUCCESS
 }
 
+/// Fails an archive action (vacuum, check, backup, summarize) when no workspace is known.
+pub(crate) fn fail_no_workspace(ctx: &Ctx, action: &str) -> ExitCode {
+    fail(ctx, "no_workspace", &no_workspace_message(action))
+}
+
+fn no_workspace_message(action: &str) -> String {
+    format!(
+        "no workspace known for {action}; pass --workspace TEAM_ID (run `slackless auth login` first)"
+    )
+}
+
 /// A note on stderr when a workspace has no local archive to read.
 pub(crate) fn archive_hint(workspace: &TeamId) {
-    eprintln!(
-        "slackless: no local archive for workspace {workspace} yet; it fills up once the desktop app syncs"
-    );
+    eprintln!("slackless: {}", no_archive_message(workspace));
+}
+
+/// Fails an archive action when the workspace has no local archive file yet.
+pub(crate) fn fail_no_archive(ctx: &Ctx, workspace: &TeamId) -> ExitCode {
+    fail(ctx, "no_archive", &no_archive_message(workspace))
+}
+
+fn no_archive_message(workspace: &TeamId) -> String {
+    format!(
+        "no local archive for workspace {workspace} yet; it fills up once the desktop app syncs"
+    )
 }
 
 /// Parse a `--since` cutoff (`30m`, `24h`, `7d`, `2w`, `YYYY-MM-DD`, or unix seconds) into

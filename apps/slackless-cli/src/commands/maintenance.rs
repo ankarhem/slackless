@@ -16,7 +16,7 @@ use slackless_core::store::SemanticIndex;
 use slackless_core::types::time::format_bytes;
 use slackless_core::types::{ChannelId, TeamId};
 
-use super::{all_workspace_ids, archive_hint, empty_local};
+use super::{all_workspace_ids, archive_hint, empty_local, fail_no_archive, fail_no_workspace};
 use crate::archive::{self, Archive, format_channel_name};
 use crate::cli::{ArchiveIndexSemanticArgs, ArchivePruneArgs, SemanticModelCommand};
 use crate::{Ctx, fail, output};
@@ -146,25 +146,12 @@ pub(crate) fn cmd_stats(
 
 pub(crate) fn cmd_vacuum(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode> {
     let Some(workspace) = workspace else {
-        return Ok(empty_local(
-            ctx,
-            serde_json::json!({"ok": false, "reason": "no_workspace"}),
-            "compacting archive",
-        ));
+        return Ok(fail_no_workspace(ctx, "compacting the archive"));
     };
     let Some(mut archive) = Archive::open_rw(workspace)
         .with_context(|| format!("opening local archive for {workspace}"))?
     else {
-        if ctx.json {
-            output::emit_json(&serde_json::json!({
-                "ok": false,
-                "reason": "no_archive",
-                "workspace": workspace.as_str(),
-            }));
-        } else {
-            archive_hint(workspace);
-        }
-        return Ok(ExitCode::SUCCESS);
+        return Ok(fail_no_archive(ctx, workspace));
     };
     let store = archive.store_mut();
     let before = store.stats(workspace).map(|s| s.db_bytes()).unwrap_or(0);
@@ -215,14 +202,10 @@ pub(crate) fn cmd_archive_check(
     full: bool,
 ) -> Result<ExitCode> {
     let Some(workspace) = workspace else {
-        return Ok(empty_local(
-            ctx,
-            serde_json::json!({"ok": false, "reason": "no_workspace"}),
-            "checking archive integrity",
-        ));
+        return Ok(fail_no_workspace(ctx, "checking archive integrity"));
     };
     let Some(path) = archive::store_path(workspace).filter(|p| p.is_file()) else {
-        return Ok(no_archive(ctx, workspace));
+        return Ok(fail_no_archive(ctx, workspace));
     };
     let mode = if full {
         IntegrityMode::Full
@@ -236,19 +219,6 @@ pub(crate) fn cmd_archive_check(
     } else {
         ExitCode::FAILURE
     })
-}
-
-fn no_archive(ctx: &Ctx, workspace: &TeamId) -> ExitCode {
-    if ctx.json {
-        output::emit_json(&serde_json::json!({
-            "ok": false,
-            "reason": "no_archive",
-            "workspace": workspace.as_str(),
-        }));
-    } else {
-        archive_hint(workspace);
-    }
-    ExitCode::SUCCESS
 }
 
 /// Integrity report for the archive at `path` as `(json, human, ok)`. An archive SQLite cannot
@@ -314,14 +284,10 @@ pub(crate) fn cmd_archive_backup(
     output: &Path,
 ) -> Result<ExitCode> {
     let Some(workspace) = workspace else {
-        return Ok(empty_local(
-            ctx,
-            serde_json::json!({"ok": false, "reason": "no_workspace"}),
-            "backing up the archive",
-        ));
+        return Ok(fail_no_workspace(ctx, "backing up the archive"));
     };
     let Some(path) = archive::store_path(workspace).filter(|p| p.is_file()) else {
-        return Ok(no_archive(ctx, workspace));
+        return Ok(fail_no_archive(ctx, workspace));
     };
     let (json, human) = archive_backup_report(workspace, &path, output)?;
     output::emit(ctx.json, &json, &human);
@@ -774,16 +740,12 @@ pub(crate) async fn cmd_archive_index_semantic(
 
     let archives: Vec<(TeamId, PathBuf)> = if args.single_workspace {
         let Some(ws) = workspace else {
-            return Ok(empty_local(
-                ctx,
-                serde_json::json!({"ok": false, "reason": "no_workspace"}),
-                "indexing semantic vectors",
-            ));
+            return Ok(fail_no_workspace(ctx, "indexing semantic vectors"));
         };
-        archive::store_path(ws)
-            .filter(|p| p.is_file())
-            .map(|p| vec![(ws.clone(), p)])
-            .unwrap_or_default()
+        let Some(path) = archive::store_path(ws).filter(|p| p.is_file()) else {
+            return Ok(fail_no_archive(ctx, ws));
+        };
+        vec![(ws.clone(), path)]
     } else {
         all_workspace_ids(ctx.sessions())
             .into_iter()
