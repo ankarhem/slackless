@@ -2028,3 +2028,90 @@ fn archive_check_and_backup_reports_cover_healthy_corrupt_and_unsafe_targets() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Agents branch on the `error` code of a failure, so SKILL.md's error table must list every
+/// code a `fail(ctx, "<code>", ..)` or MCP `tool_err("<code>", ..)` emits, and nothing else.
+#[test]
+fn skill_error_table_lists_exactly_the_emitted_error_codes() {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    fn read_sources(dir: &Path, out: &mut String) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                read_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push_str(&std::fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let skill = std::fs::read_to_string(manifest.join("../../skill/SKILL.md")).unwrap();
+    let table = skill
+        .split("## Errors and exit codes")
+        .nth(1)
+        .expect("SKILL.md has an `Errors and exit codes` section");
+    let documented: BTreeSet<&str> = table
+        .lines()
+        .skip_while(|line| !line.starts_with('|'))
+        .take_while(|line| line.starts_with('|'))
+        .filter_map(|line| line.split('`').nth(1))
+        .collect();
+
+    let mut sources = String::new();
+    read_sources(&manifest.join("src"), &mut sources);
+    let compact: String = sources.split_whitespace().collect();
+    let mut emitted = BTreeSet::new();
+    for (helper, code_arg) in [("fail(", 1), ("tool_err(", 0)] {
+        for (at, _) in compact.match_indices(helper) {
+            // `api_fail(` and friends are other functions.
+            if compact[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            // Skip to the code argument; commas inside nested calls do not count.
+            let mut rest = &compact[at + helper.len()..];
+            for _ in 0..code_arg {
+                let mut depth = 0u32;
+                let comma = rest.find(|c: char| {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => depth = depth.saturating_sub(1),
+                        ',' if depth == 0 => return true,
+                        _ => {}
+                    }
+                    false
+                });
+                rest = comma.map_or("", |i| &rest[i + 1..]);
+            }
+            if let Some(code) = rest.strip_prefix('"').and_then(|r| r.split('"').next())
+                && !code.is_empty()
+                && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+            {
+                emitted.insert(code.to_owned());
+            }
+        }
+    }
+    // The scan itself works for both helpers and for `fail(&ctx, ..)`.
+    for code in ["invalid_args", "command_failed", "transcript_not_found"] {
+        assert!(emitted.contains(code), "scanner missed {code}: {emitted:?}");
+    }
+
+    let undocumented: Vec<&String> = emitted
+        .iter()
+        .filter(|code| !documented.contains(code.as_str()))
+        .collect();
+    assert!(
+        undocumented.is_empty(),
+        "error codes missing from SKILL.md's error table: {undocumented:?}"
+    );
+    let stale: Vec<&&str> = documented
+        .iter()
+        .filter(|code| !sources.contains(&format!("\"{code}\"")))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "SKILL.md lists error codes nothing emits: {stale:?}"
+    );
+}

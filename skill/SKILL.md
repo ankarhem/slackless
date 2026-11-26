@@ -969,21 +969,37 @@ Success exits 0, and so do read commands that found nothing to read: they print 
 
 Human mode prints `slackless: <message>` on stderr instead. Error codes:
 
-| Code                    | When it happens                                                                                |
-| ----------------------- | ---------------------------------------------------------------------------------------------- |
-| `not_signed_in`         | a live command ran with no stored session holding credentials                                  |
-| `client_error`          | building the Slack API/RTM client failed                                                       |
-| `session_rejected`      | Slack rejected the stored session; ask the user to run `slackless auth login`, then retry      |
-| `request_failed`        | the Slack API call failed for another reason                                                   |
-| `invalid_args`          | malformed CLI argument (e.g. invalid `--workspace`, `--since`, `--at`, or canvas flags)        |
-| `missing_ts`            | `mark-read` omitted `[TS]` and the local archive has no messages for the channel               |
-| `disconnected`          | `watch` websocket disconnected                                                                 |
-| `no_download_url`       | `download` target file has no private download URL                                             |
-| `write_failed`          | `download` could not write destination file                                                    |
-| `no_store_path`         | `backfill` could not resolve the local archive path                                            |
-| `update_check_failed`   | `update` could not query GitHub Releases                                                       |
-| `update_install_failed` | `update` download, checksum verification, or bundle swap failed                                |
-| `command_failed`        | anything else, such as an unexpected I/O or runtime error                                      |
+| Code                     | When it happens                                                                                                            |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| `not_signed_in`          | a live command ran with no stored session holding credentials                                                              |
+| `session_rejected`       | Slack rejected the stored session; ask the user to run `slackless auth login`, then retry                                  |
+| `client_error`           | building the Slack API/RTM client failed                                                                                   |
+| `request_failed`         | the Slack API call failed for another reason                                                                               |
+| `disconnected`           | `watch` websocket disconnected                                                                                             |
+| `invalid_args`           | malformed argument (e.g. invalid `--workspace`, `--since`, `--at`, or canvas flags) or a blank message body                |
+| `secret_detected`        | the text to send looks like it holds a secret; resend with `--allow-secrets` (MCP: `allow_secrets: true`) only if intended |
+| `missing_ts`             | `mark-read` omitted `[TS]` and the local archive has no messages for the channel                                           |
+| `no_workspace`           | no workspace is known for an archive action, `transcribe --file`, or an MCP tool; pass `--workspace TEAM_ID`               |
+| `no_archive`             | the workspace has no local archive yet for `vacuum`, `archive check`/`backup`/`index-semantic`, or `summarize`             |
+| `not_found`              | the transcript, huddle transcript, or thread to export or summarize is not in the local archive                            |
+| `transcript_not_found`   | MCP `get_transcript`: no stored transcript for that `file_id`                                                              |
+| `store_error`            | reading the local archive failed                                                                                           |
+| `no_download_url`        | `download` target file has no private download URL                                                                         |
+| `no_media_url`           | `transcribe` target file has no downloadable audio or video                                                                |
+| `file_not_found`         | `transcribe --file` names a file that does not exist                                                                       |
+| `write_failed`           | `download` or `transcribe` could not write a file                                                                          |
+| `transcribe_failed`      | local transcription failed (e.g. no transcription model is downloaded)                                                     |
+| `invalid_model`          | unknown embedding model (expected `minilm` or `bge-small`)                                                                 |
+| `semantic_model_missing` | `--semantic`/`--hybrid` search or `archive index-semantic` ran without the embedding model downloaded                      |
+| `semantic_index_missing` | semantic search ran before `slackless archive index-semantic` built the index                                              |
+| `invalid_config`         | `summarize` provider, endpoint, model, or API key settings are invalid                                                     |
+| `empty_input`            | `summarize` found nothing to summarize in the channel or thread                                                            |
+| `summarize_failed`       | the LLM request behind `summarize` failed                                                                                  |
+| `update_check_failed`    | `update` could not query GitHub Releases                                                                                   |
+| `update_install_failed`  | `update` download, checksum verification, or bundle swap failed                                                            |
+| `command_failed`         | anything else, such as an unexpected I/O or runtime error                                                                  |
+
+MCP tools fail with the same codes: an `isError: true` result whose text is `{"error": "<code>", "message": ...}`.
 
 ## Worked examples
 
