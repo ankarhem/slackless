@@ -2348,7 +2348,11 @@ fn try_parse_bare_broadcast(text: &str, idx: usize) -> Option<(CanvasInlineSegme
     }
     for kw in ["channel", "here"] {
         let candidate = &rest[1..];
-        if candidate.len() >= kw.len() && candidate[..kw.len()].eq_ignore_ascii_case(kw) {
+        // `get`: `kw.len()` is a byte count, which may fall inside a multi-byte char.
+        if candidate
+            .get(..kw.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(kw))
+        {
             let after = &candidate[kw.len()..];
             let boundary = after
                 .chars()
@@ -2622,25 +2626,50 @@ mod tests {
             vec![CanvasBlock::Paragraph("Ping <@U01ALICE|Alice> 🚀".into())]
         );
 
-        let segs = parse_inline_canvas_segments("Hi <@U01ALICE|Alice> in <#C01ENG|eng> @here!");
-        assert_eq!(
-            segs,
-            vec![
-                CanvasInlineSegment::Text("Hi ".into()),
-                CanvasInlineSegment::UserMention {
-                    user_id: "U01ALICE".into(),
-                    label: Some("Alice".into()),
-                },
-                CanvasInlineSegment::Text(" in ".into()),
-                CanvasInlineSegment::ChannelMention {
-                    channel_id: "C01ENG".into(),
-                    name: Some("eng".into()),
-                },
-                CanvasInlineSegment::Text(" ".into()),
-                CanvasInlineSegment::BroadcastMention("here".into()),
-                CanvasInlineSegment::Text("!".into()),
-            ]
-        );
+        use CanvasInlineSegment::{BroadcastMention, ChannelMention, Text, UserMention};
+        let cases: &[(&str, Vec<CanvasInlineSegment>)] = &[
+            (
+                "Hi <@U01ALICE|Alice> in <#C01ENG|eng> @here!",
+                vec![
+                    Text("Hi ".into()),
+                    UserMention {
+                        user_id: "U01ALICE".into(),
+                        label: Some("Alice".into()),
+                    },
+                    Text(" in ".into()),
+                    ChannelMention {
+                        channel_id: "C01ENG".into(),
+                        name: Some("eng".into()),
+                    },
+                    Text(" ".into()),
+                    BroadcastMention("here".into()),
+                    Text("!".into()),
+                ],
+            ),
+            (
+                "@channel!",
+                vec![BroadcastMention("channel".into()), Text("!".into())],
+            ),
+            // Keyword match is case-insensitive; a word character after it blocks the match.
+            (
+                "@HERE @channels mail@here",
+                vec![
+                    BroadcastMention("here".into()),
+                    Text(" @channels mail@here".into()),
+                ],
+            ),
+            // `@` followed by multi-byte text must not split a UTF-8 char when probing the keyword.
+            (
+                "@me🎉 @Smörgåsbord 🎉@here",
+                vec![
+                    Text("@me🎉 @Smörgåsbord 🎉".into()),
+                    BroadcastMention("here".into()),
+                ],
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(&parse_inline_canvas_segments(text), expected, "{text}");
+        }
     }
 
     #[test]
