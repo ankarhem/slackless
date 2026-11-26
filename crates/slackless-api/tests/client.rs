@@ -5,7 +5,9 @@
 use futures::TryStreamExt;
 use serde_json::json;
 use slackless_api::types::{Block, ChannelId, MessageSubtype, SectionKind, Ts, UserId};
-use slackless_api::{ApiError, FilesFilter, HistoryOpts, MessageContent, SlackApi, paginate};
+use slackless_api::{
+    ApiError, DownloadError, FilesFilter, HistoryOpts, MessageContent, SlackApi, paginate,
+};
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -381,7 +383,7 @@ async fn download_file_sends_only_the_cookie() {
                 .insert_header("content-type", "image/png")
                 .set_body_bytes(b"\x89PNG".to_vec()),
         )
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -398,8 +400,6 @@ async fn download_file_sends_only_the_cookie() {
         .await
         .unwrap();
     assert_eq!(&bytes[..], b"\x89PNG");
-    let requests = server.received_requests().await.unwrap();
-    assert!(requests[0].headers.get("authorization").is_none());
 
     let err = api
         .download_file(&format!("{}/files-pri/T1-F2/b.png", server.uri()))
@@ -412,6 +412,55 @@ async fn download_file_sends_only_the_cookie() {
         .await
         .unwrap_err();
     assert!(matches!(err, ApiError::UntrustedUrl(_)), "{err:?}");
+
+    // Streamed to disk: the same checks, and a refused download leaves no file behind.
+    let dir = std::env::temp_dir().join(format!(
+        "slackless-api-file-download-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let written = api
+        .download_file_to_path(
+            &format!("{}/files-pri/T1-F1/a.png", server.uri()),
+            &dir.join("a.png"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(written, 4);
+    assert_eq!(std::fs::read(dir.join("a.png")).unwrap(), b"\x89PNG");
+    let err = api
+        .download_file_to_path(
+            &format!("{}/files-pri/T1-F2/b.png", server.uri()),
+            &dir.join("b.png"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DownloadError::Api(ApiError::FileAuthRejected)),
+        "{err:?}"
+    );
+    let err = api
+        .download_file_to_path("https://evil.example/x.png", &dir.join("x.png"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DownloadError::Api(ApiError::UntrustedUrl(_))),
+        "{err:?}"
+    );
+    let names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["a.png"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|req| req.headers.get("authorization").is_none())
+    );
 }
 
 #[tokio::test]

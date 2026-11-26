@@ -1,13 +1,13 @@
 //! `files` listing, `download`, and `transcribe` commands.
 
 use std::fs::OpenOptions;
-use std::io::{ErrorKind, Write as _};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use slackless_core::api::FilesFilter;
+use slackless_core::api::{DownloadError, FilesFilter};
 use slackless_core::huddle::{TranscriptionProvider, resolve_local_file_provider};
 use slackless_core::types::{File, FileId, TeamId};
 
@@ -106,14 +106,10 @@ pub(crate) fn sanitize_download_name(
         .unwrap_or_else(|| format!("{file_id}.bin"))
 }
 
-/// Writes `bytes` to a new file named `name` in `dir`, numbering the name like a browser
-/// (`report (1).pdf`) while it is taken, so a download never replaces or writes through an
-/// existing file or symlink. Returns the path written.
-pub(crate) fn create_numbered_file(
-    dir: &Path,
-    name: &str,
-    bytes: &[u8],
-) -> std::io::Result<PathBuf> {
+/// Creates an empty file named `name` in `dir` to download into, numbering the name like a
+/// browser (`report (1).pdf`) while it is taken, so a download never replaces or writes through
+/// an existing file or symlink. Returns the path created.
+pub(crate) fn create_numbered_file(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
     let (stem, ext) = match name.rsplit_once('.') {
         Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
         _ => (name, String::new()),
@@ -122,10 +118,7 @@ pub(crate) fn create_numbered_file(
     let mut n: u64 = 0;
     loop {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                file.write_all(bytes)?;
-                return Ok(path);
-            }
+            Ok(_) => return Ok(path),
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {
                 n += 1;
                 path = dir.join(format!("{stem} ({n}){ext}"));
@@ -157,18 +150,14 @@ pub async fn run_download(
             "file has no downloadable private URL",
         ));
     };
-    let bytes = match session.api.download_file(url).await {
-        Ok(b) => b,
-        Err(err) => return Ok(api_fail(ctx, &err)),
-    };
     let safe_name = sanitize_download_name(file_id, file.name.as_deref(), file.title.as_deref());
     // `--out` names the exact destination; otherwise the uploader's name lands in the current
     // directory without replacing anything already there.
-    let written = match out {
-        Some(path) => std::fs::write(path, &bytes).map(|()| path.to_path_buf()),
-        None => create_numbered_file(Path::new(""), &safe_name, &bytes),
+    let reserved = match out {
+        Some(path) => Ok(path.to_path_buf()),
+        None => create_numbered_file(Path::new(""), &safe_name),
     };
-    let dest = match written {
+    let dest = match reserved {
         Ok(dest) => dest,
         Err(err) => {
             let target = out.unwrap_or(Path::new(&safe_name));
@@ -179,18 +168,46 @@ pub async fn run_download(
             ));
         }
     };
+    let written = match session.api.download_file_to_path(url, &dest).await {
+        Ok(written) => written,
+        Err(err) => {
+            // The numbered name was only held for this download: give it back.
+            if out.is_none()
+                && let Err(remove_err) = std::fs::remove_file(&dest)
+            {
+                eprintln!(
+                    "slackless: could not remove the empty {} ({remove_err})",
+                    dest.display()
+                );
+            }
+            return Ok(download_fail(ctx, &err, &dest));
+        }
+    };
     output::emit(
         ctx.json,
         &serde_json::json!({
             "ok": true,
             "file_id": file_id,
             "name": safe_name,
-            "bytes": bytes.len(),
+            "bytes": written,
             "path": dest.display().to_string(),
         }),
-        &format!("downloaded {} ({} bytes)\n", dest.display(), bytes.len()),
+        &format!("downloaded {} ({written} bytes)\n", dest.display()),
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// Reports a failed streamed download: a refusal from Slack or the network as [`api_fail`], a
+/// local write failure as `write_failed`.
+fn download_fail(ctx: &Ctx, err: &DownloadError, dest: &Path) -> ExitCode {
+    match err {
+        DownloadError::Api(err) => api_fail(ctx, err),
+        DownloadError::Write(err) => fail(
+            ctx,
+            "write_failed",
+            &format!("writing {}: {err}", dest.display()),
+        ),
+    }
 }
 
 /// Parse `--provider` for `slackless transcribe` into a preferred local [`TranscriptionProvider`].
@@ -368,10 +385,6 @@ pub async fn run_transcribe(
                     "file has no downloadable video/audio URL",
                 ));
             };
-            let bytes = match session.api.download_file(url).await {
-                Ok(b) => b,
-                Err(err) => return Ok(api_fail(ctx, &err)),
-            };
             let ext = infer_media_extension(&file, url);
             let safe_id: String = file_id
                 .chars()
@@ -383,12 +396,8 @@ pub async fn run_transcribe(
                 std::process::id(),
                 if safe_id.is_empty() { "file" } else { &safe_id },
             ));
-            if let Err(err) = std::fs::write(&tmp_path, &bytes) {
-                return Ok(fail(
-                    ctx,
-                    "write_failed",
-                    &format!("writing temporary media file {}: {err}", tmp_path.display()),
-                ));
+            if let Err(err) = session.api.download_file_to_path(url, &tmp_path).await {
+                return Ok(download_fail(ctx, &err, &tmp_path));
             }
             (
                 session.workspace,

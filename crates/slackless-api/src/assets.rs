@@ -184,7 +184,7 @@ async fn read_capped(response: reqwest::Response, limit: u64) -> Result<Vec<u8>>
 /// Streams `response`'s body, capped like [`CappedBody`], into a `.part` file beside `dest` and
 /// renames it over `dest`. The `.part` name is unique per call, so two downloads of one file
 /// never write into each other; on any failure it is removed and `dest` is left as it was.
-async fn stream_to_path(
+pub(crate) async fn stream_to_path(
     response: reqwest::Response,
     dest: &Path,
     max_bytes: u64,

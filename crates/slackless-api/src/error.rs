@@ -53,10 +53,11 @@ pub enum ApiError {
     UnsupportedHuddleBackend(String),
 }
 
-/// Errors from streaming a response body into a file ([`crate::AssetClient::download_to_path`]).
+/// Errors from streaming a response body into a file ([`crate::AssetClient::download_to_path`],
+/// [`crate::SlackApi::download_file_to_path`]).
 #[derive(Debug, Error)]
 pub enum DownloadError {
-    /// The request failed or its body was refused (status, transport, size cap).
+    /// The request failed or its body was refused (status, transport, size cap, sign-in page).
     #[error(transparent)]
     Api(#[from] ApiError),
     /// The body could not be written to disk.

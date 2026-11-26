@@ -3,7 +3,7 @@
 
 use std::fs::OpenOptions;
 use std::future::Future;
-use std::io::{ErrorKind, Write as _};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
@@ -48,7 +48,7 @@ pub struct DownloadRecord {
     pub id: usize,
     pub name: String,
     pub url: String,
-    pub bytes: Option<usize>,
+    pub bytes: Option<u64>,
     pub status: DownloadStatus,
 }
 
@@ -76,7 +76,7 @@ impl DownloadRegistry {
         id
     }
 
-    fn complete(&mut self, id: usize, path: PathBuf, len: usize) {
+    fn complete(&mut self, id: usize, path: PathBuf, len: u64) {
         if let Some(item) = self.items.iter_mut().find(|i| i.id == id) {
             item.bytes = Some(len);
             item.status = DownloadStatus::Completed(path);
@@ -177,19 +177,41 @@ enum DownloadDestination {
 }
 
 impl DownloadDestination {
-    fn write(&self, bytes: &[u8]) -> Result<(PathBuf, usize), String> {
-        let path = match self {
-            DownloadDestination::DefaultFolder { dir, name } => {
-                save_download(dir.clone(), name, bytes)?
+    /// The path to download into: a new numbered file in the folder, created empty so no other
+    /// download takes the name, or the path picked in the Save dialog.
+    fn reserve(&self) -> Result<PathBuf, String> {
+        match self {
+            DownloadDestination::DefaultFolder { dir, name } => reserve_download(dir.clone(), name),
+            DownloadDestination::ExplicitPath(dest) => Ok(dest.clone()),
+        }
+    }
+
+    /// Quarantines a finished download, or gives back the name a failed one reserved (a failed
+    /// download never touches the path itself).
+    fn finish(
+        &self,
+        path: PathBuf,
+        written: Result<u64, String>,
+    ) -> Result<(PathBuf, u64), String> {
+        match written {
+            Ok(len) => {
+                #[cfg(target_os = "macos")]
+                quarantine(&path);
+                Ok((path, len))
             }
-            DownloadDestination::ExplicitPath(dest) => {
-                std::fs::write(dest, bytes).map_err(|e| e.to_string())?;
-                dest.clone()
+            Err(err) => {
+                if matches!(self, DownloadDestination::DefaultFolder { .. })
+                    && let Err(remove_err) = std::fs::remove_file(&path)
+                {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %remove_err,
+                        "could not remove a failed download's empty file"
+                    );
+                }
+                Err(err)
             }
-        };
-        #[cfg(target_os = "macos")]
-        quarantine(&path);
-        Ok((path, bytes.len()))
+        }
     }
 
     fn success_notification(&self, path: &Path) -> (&'static str, String) {
@@ -215,8 +237,8 @@ impl DownloadDestination {
     }
 }
 
-/// Shared download execution pipeline used by both [`download`] and [`download_as`]:
-/// fetches bytes via `fetcher`, writes them to `destination` on the background executor, updates
+/// Shared download execution pipeline used by both [`download`] and [`download_as`]: streams
+/// `url` via `fetcher` into `destination` from the background executor, updates
 /// `DownloadRegistry`, notifies the user, and refreshes the window.
 async fn execute_download(
     fetcher: Fetcher,
@@ -226,21 +248,23 @@ async fn execute_download(
     cx: &mut AsyncWindowContext,
 ) {
     let fail_title = destination.failure_title();
-    let saved = match fetcher.get(url).await {
-        Ok(bytes) => {
-            cx.background_executor()
-                .spawn(async move {
-                    let res = destination.write(&bytes);
-                    let success_msg = res
-                        .as_ref()
-                        .ok()
-                        .map(|(path, _)| destination.success_notification(path));
-                    (res, success_msg)
-                })
-                .await
-        }
-        Err(e) => (Err(e), None),
-    };
+    let saved = cx
+        .background_executor()
+        .spawn(async move {
+            let res = match destination.reserve() {
+                Ok(path) => {
+                    let written = fetcher.download_to_path(url, path.clone()).await;
+                    destination.finish(path, written)
+                }
+                Err(e) => Err(e),
+            };
+            let success_msg = res
+                .as_ref()
+                .ok()
+                .map(|(path, _)| destination.success_notification(path));
+            (res, success_msg)
+        })
+        .await;
     cx.update(|window, cx| {
         let reg = cx.default_global::<DownloadRegistry>();
         match saved {
@@ -392,8 +416,9 @@ fn set_quarantine(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Writes `bytes` to `dir`/`name` (or ~/Downloads/`name`), numbering the name like a browser when it is taken.
-fn save_download(dir: Option<PathBuf>, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+/// Creates an empty `dir`/`name` (or ~/Downloads/`name`) to download into, numbering the name
+/// like a browser when it is taken, and returns its path.
+fn reserve_download(dir: Option<PathBuf>, name: &str) -> Result<PathBuf, String> {
     let dir = match dir {
         Some(dir) => dir,
         None => {
@@ -414,10 +439,7 @@ fn save_download(dir: Option<PathBuf>, name: &str, bytes: &[u8]) -> Result<PathB
     let mut path = dir.join(&name);
     for n in 1.. {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                file.write_all(bytes).map_err(|e| e.to_string())?;
-                return Ok(path);
-            }
+            Ok(_) => return Ok(path),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                 path = dir.join(format!("{stem} ({n}){ext}"));
             }
@@ -432,25 +454,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn save_download_sanitizes_traversal_and_numbers_collisions() {
+    fn download_names_are_sanitized_numbered_and_freed_on_failure() {
         let dir = std::env::temp_dir().join(format!("slackless-dl-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let p1 = save_download(Some(dir.clone()), "../../secret/report.pdf", b"v1").unwrap();
+        let p1 = reserve_download(Some(dir.clone()), "../../secret/report.pdf").unwrap();
         assert_eq!(p1, dir.join("report.pdf"));
-        assert_eq!(std::fs::read(&p1).unwrap(), b"v1");
+        assert!(p1.is_file(), "the name is held while the download runs");
 
-        let p2 = save_download(Some(dir.clone()), "report.pdf", b"v2").unwrap();
+        let p2 = reserve_download(Some(dir.clone()), "report.pdf").unwrap();
         assert_eq!(p2, dir.join("report (1).pdf"));
-        assert_eq!(std::fs::read(&p2).unwrap(), b"v2");
 
-        let p3 = save_download(Some(dir.clone()), "report.pdf", b"v3").unwrap();
+        let p3 = reserve_download(Some(dir.clone()), "report.pdf").unwrap();
         assert_eq!(p3, dir.join("report (2).pdf"));
 
-        let no_ext = save_download(Some(dir.clone()), "README", b"hi").unwrap();
+        let no_ext = reserve_download(Some(dir.clone()), "README").unwrap();
         assert_eq!(no_ext, dir.join("README"));
-        let no_ext_2 = save_download(Some(dir.clone()), "README", b"hi2").unwrap();
+        let no_ext_2 = reserve_download(Some(dir.clone()), "README").unwrap();
         assert_eq!(no_ext_2, dir.join("README (1)"));
+
+        // A failed download gives its name back instead of leaving an empty file.
+        let failing = DownloadDestination::DefaultFolder {
+            dir: Some(dir.clone()),
+            name: "report.pdf".to_owned(),
+        };
+        let reserved = failing.reserve().unwrap();
+        assert_eq!(reserved, dir.join("report (3).pdf"));
+        assert!(
+            failing
+                .finish(reserved.clone(), Err("connection reset".to_owned()))
+                .is_err()
+        );
+        assert!(!reserved.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -492,18 +527,24 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let start = now();
-        let (in_folder, _) = DownloadDestination::DefaultFolder {
-            dir: Some(dir.clone()),
-            name: "Installer.zip".to_owned(),
-        }
-        .write(b"PK")
-        .unwrap();
-        let (saved_as, _) = DownloadDestination::ExplicitPath(dir.join("Chosen.zip"))
-            .write(b"PK")
-            .unwrap();
+        let saved: Vec<PathBuf> = [
+            DownloadDestination::DefaultFolder {
+                dir: Some(dir.clone()),
+                name: "Installer.zip".to_owned(),
+            },
+            DownloadDestination::ExplicitPath(dir.join("Chosen.zip")),
+        ]
+        .iter()
+        .map(|destination| {
+            let path = destination.reserve().unwrap();
+            // Stands in for the streamed body.
+            std::fs::write(&path, b"PK").unwrap();
+            destination.finish(path, Ok(2)).unwrap().0
+        })
+        .collect();
         let end = now();
 
-        for path in [in_folder, saved_as] {
+        for path in saved {
             let value = quarantine_of(&path);
             let fields: Vec<&str> = value.split(';').collect();
             let flags = u32::from_str_radix(fields[0], 16).unwrap();

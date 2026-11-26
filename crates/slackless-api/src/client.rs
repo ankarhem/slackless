@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,9 +14,10 @@ use reqwest::{Request, Response, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use url::Url;
 
+use crate::assets::stream_to_path;
 use crate::types::ApiResponse;
 use crate::types::endpoints;
-use crate::{ApiError, Result};
+use crate::{ApiError, DownloadError, Result};
 
 /// Maximum entries retained in the in-memory diagnostic net-log ring buffer (`F-SHELL-158`).
 const MAX_NET_LOG_ENTRIES: usize = 500;
@@ -135,6 +137,9 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Extended timeout for file uploads and downloads.
 const UPLOAD_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// Largest Slack-hosted file [`SlackApi::download_file_to_path`] writes: Slack caps uploads at
+/// 1 GB, and the headroom covers transcoded copies such as `mp4` renditions.
+pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Installs `rustls`'s `ring` `CryptoProvider` as the process-wide default (no-op if one is
 /// already installed).
@@ -357,6 +362,23 @@ impl SlackApi {
     /// File hosts authenticate the browser way, with the `d` cookie only. The cookie is sent only
     /// to `https` Slack hosts (or this client's own API host); anything else is refused.
     pub async fn download_file(&self, url_private: &str) -> Result<Bytes> {
+        Ok(self.file_response(url_private).await?.bytes().await?)
+    }
+
+    /// Streams a Slack-hosted file into `dest` with [`SlackApi::download_file`]'s host and
+    /// sign-in checks, through a `.part` file renamed into place, and returns its length. Files
+    /// over [`MAX_FILE_BYTES`] are refused.
+    pub async fn download_file_to_path(
+        &self,
+        url_private: &str,
+        dest: &Path,
+    ) -> Result<u64, DownloadError> {
+        let resp = self.file_response(url_private).await?;
+        stream_to_path(resp, dest, MAX_FILE_BYTES, |_, _| {}).await
+    }
+
+    /// The 2xx answer for a Slack-hosted file, before its body is read.
+    async fn file_response(&self, url_private: &str) -> Result<Response> {
         let resp = self.fetch_trusted_file(url_private).await?;
         let status = resp.status();
         if !status.is_success() {
@@ -376,7 +398,7 @@ impl SlackApi {
         if is_html {
             return Err(ApiError::FileAuthRejected);
         }
-        Ok(resp.bytes().await?)
+        Ok(resp)
     }
 
     /// Downloads a Slack-hosted HTML document (such as a Canvas `url_private` export), sending

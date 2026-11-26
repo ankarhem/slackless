@@ -650,16 +650,16 @@ fn default_download_never_replaces_existing_files_or_creates_dotfiles() {
     std::os::unix::fs::symlink(path("target.txt"), path("notes.txt")).expect("seed symlink");
 
     // A taken name gets the next free browser-style number; the original is left alone.
-    let first = create_numbered_file(dir.path(), "Makefile", b"upload").expect("save once");
-    let second = create_numbered_file(dir.path(), "Makefile", b"upload").expect("save twice");
+    let first = create_numbered_file(dir.path(), "Makefile").expect("reserve once");
+    let second = create_numbered_file(dir.path(), "Makefile").expect("reserve twice");
     assert_eq!(first, path("Makefile (1)"));
     assert_eq!(second, path("Makefile (2)"));
     assert_eq!(std::fs::read(path("Makefile")).expect("read"), b"mine");
 
     // A symlink under the uploader's name is never written through.
-    let saved = create_numbered_file(dir.path(), "notes.txt", b"upload").expect("save notes");
+    let saved = create_numbered_file(dir.path(), "notes.txt").expect("reserve notes");
     assert_eq!(saved, path("notes (1).txt"));
-    assert_eq!(std::fs::read(&saved).expect("read saved"), b"upload");
+    assert!(std::fs::read(&saved).expect("read reserved").is_empty());
     assert_eq!(std::fs::read(path("target.txt")).expect("read"), b"secret");
 
     // Uploader-chosen names never become dot-files.

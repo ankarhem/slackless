@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::runtime::Handle;
 
-use crate::api::{AssetClient, SlackApi};
+use crate::api::{AssetClient, MAX_FILE_BYTES, SlackApi};
 use crate::types::time::now_epoch_secs;
 
 /// Where Slack serves workspace files and their thumbnails; these need the session cookie and are
@@ -372,6 +372,33 @@ impl Fetcher {
         futures::future::Either::Right(Box::pin(
             async move { task.await.map_err(|e| e.to_string())? },
         ) as FetchFuture)
+    }
+
+    /// Streams the file at `url` into `dest` without holding it in memory and resolves to its
+    /// length. URLs route as in [`Fetcher::get`], bypassing the caches; the file arrives through
+    /// a `.part` file renamed into place, so `dest` only ever holds a whole file.
+    pub fn download_to_path(
+        &self,
+        url: String,
+        dest: PathBuf,
+    ) -> impl Future<Output = Result<u64, String>> + Send + 'static + use<> {
+        let assets = self.assets.clone();
+        let files = self
+            .files
+            .clone()
+            .filter(|_| url.starts_with(self.private_prefix.as_ref()));
+        let task = self.runtime.spawn(async move {
+            match files {
+                Some(api) => api.download_file_to_path(&url, &dest).await,
+                None => {
+                    assets
+                        .download_to_path(&url, &dest, MAX_FILE_BYTES, |_, _| {})
+                        .await
+                }
+            }
+            .map_err(|e| e.to_string())
+        });
+        async move { task.await.map_err(|e| e.to_string())? }
     }
 }
 
