@@ -152,6 +152,148 @@ impl App {
             .and_then(|c| c.user.clone());
         // Channels: the name tile opens the details dialog, as in Slack.
         let details_channel = channel.map(|c| c.id.clone());
+        // Slack Connect / Enterprise Grid external-org & channel-owner header badges
+        // (`F-COLLAB-800`, `806`, `828`).
+        let connect_badge: Option<AnyElement> = if let Some(c) = channel {
+            if c.is_external_connect() {
+                let ext_teams = self.fixtures.shared_teams(c);
+                let owner = self.fixtures.channel_owner_team(c);
+                let org_summary = match ext_teams.as_slice() {
+                    [] => "External".to_owned(),
+                    [only] => only.name.clone(),
+                    [first, rest @ ..] => format!("{} +{}", first.name, rest.len()),
+                };
+                let label = match owner {
+                    Some(host) => format!("{org_summary} · Owned by {}", host.name),
+                    None => format!("External · {org_summary}"),
+                };
+                let ch_id = c.id.clone();
+                let secondary = cx.theme().secondary;
+                let border = cx.theme().border;
+                Some(
+                    h_flex()
+                        .id("hdr-connect-badge")
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(border)
+                        .bg(secondary.opacity(0.6))
+                        .cursor_pointer()
+                        .hover(|el| el.bg(accent))
+                        .child(if let Some(first) = ext_teams.first() {
+                            crate::channel_details::org_chip(first, 14.).into_any_element()
+                        } else {
+                            Icon::new(IconName::Building2)
+                                .size(px(12.))
+                                .text_color(muted_foreground)
+                                .into_any_element()
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(muted_foreground)
+                                .child(label),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_channel_details(
+                                &ch_id,
+                                channel_details::DetailsTab::About,
+                                window,
+                                cx,
+                            );
+                        }))
+                        .into_any_element(),
+                )
+            } else if c.is_org_shared {
+                let border = cx.theme().border;
+                let secondary = cx.theme().secondary;
+                let text = if c.is_org_mandatory {
+                    "Org-wide · Mandatory"
+                } else {
+                    "Org-wide"
+                };
+                Some(
+                    h_flex()
+                        .id("hdr-org-badge")
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(border)
+                        .bg(secondary.opacity(0.5))
+                        .child(
+                            Icon::new(IconName::Building2)
+                                .size(px(12.))
+                                .text_color(muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(muted_foreground)
+                                .child(text),
+                        )
+                        .into_any_element(),
+                )
+            } else {
+                None
+            }
+        } else if let Some(ref uid) = peer_user
+            && self.fixtures.is_external_user(uid)
+        {
+            let ext_team = self.fixtures.external_team(uid);
+            let label = match ext_team {
+                Some(team) => format!("External · {}", team.name),
+                None => "External".to_owned(),
+            };
+            let border = cx.theme().border;
+            let secondary = cx.theme().secondary;
+            let open_uid = uid.clone();
+            Some(
+                h_flex()
+                    .id("hdr-external-dm-badge")
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(border)
+                    .bg(secondary.opacity(0.6))
+                    .cursor_pointer()
+                    .hover(|el| el.bg(accent))
+                    .child(if let Some(team) = ext_team {
+                        crate::channel_details::org_chip(team, 14.).into_any_element()
+                    } else {
+                        Icon::new(IconName::Building2)
+                            .size(px(12.))
+                            .text_color(muted_foreground)
+                            .into_any_element()
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(muted_foreground)
+                            .child(label),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_profile(open_uid.clone(), cx);
+                    }))
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
         // Slack offers no huddle with yourself.
         let can_huddle = peer_user.as_ref() != Some(&self.fixtures.self_user);
         // Slack keeps the whole name; the topic after it truncates instead.
@@ -197,6 +339,7 @@ impl App {
             .h(px(50.))
             .flex_none()
             .child(name)
+            .children(connect_badge)
             .when(!topic.is_empty(), |header| {
                 // Slack renders the topic's mrkdwn: mentions by name, links, emoji.
                 header.child(

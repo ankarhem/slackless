@@ -203,8 +203,18 @@ impl Render for ToolsPage {
                     );
                 } else {
                     for (ix, (uid_opt, name, title)) in apps.into_iter().take(60).enumerate() {
+                        let ext_team = uid_opt
+                            .as_ref()
+                            .and_then(|uid| self.fixtures.external_team(uid));
                         let avatar = match &uid_opt {
-                            Some(uid) => user_chip(&self.fixtures, uid, 32.).into_any_element(),
+                            Some(uid) => crate::avatars::with_external_badge(
+                                &self.fixtures,
+                                Some(uid),
+                                user_chip(&self.fixtures, uid, 32.),
+                                32.,
+                                theme.background,
+                            )
+                            .into_any_element(),
                             None => div()
                                 .size(px(32.))
                                 .rounded_md()
@@ -256,7 +266,28 @@ impl Render for ToolsPage {
                                                                 .font_weight(FontWeight::SEMIBOLD)
                                                                 .text_color(muted)
                                                                 .child("APP"),
-                                                        ),
+                                                        )
+                                                        .when_some(ext_team, |row, team| {
+                                                            row.child(
+                                                                h_flex()
+                                                                    .items_center()
+                                                                    .gap_1()
+                                                                    .px_1p5()
+                                                                    .py(px(1.))
+                                                                    .rounded(px(3.))
+                                                                    .border_1()
+                                                                    .border_color(border)
+                                                                    .bg(theme.secondary.opacity(0.6))
+                                                                    .text_size(px(10.))
+                                                                    .text_color(muted)
+                                                                    .child(
+                                                                        crate::channel_details::org_chip(
+                                                                            team, 11.,
+                                                                        ),
+                                                                    )
+                                                                    .child(team.name.clone()),
+                                                            )
+                                                        }),
                                                 )
                                                 .child(
                                                     div()
@@ -444,15 +475,20 @@ impl Render for ToolsPage {
                                     .border_1()
                                     .border_color(border)
                                     .bg(theme.secondary.opacity(0.35))
-                                    .child(
-                                        Icon::new(IconName::Globe).size(px(13.)).text_color(link),
-                                    )
+                                    .child(crate::channel_details::org_chip(org, 16.))
                                     .child(
                                         div()
                                             .text_xs()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .child(org.name.clone()),
                                     )
+                                    .when(org.is_verified, |chip| {
+                                        chip.child(
+                                            Icon::new(IconName::Check)
+                                                .size(px(11.))
+                                                .text_color(link),
+                                        )
+                                    })
                             },
                         )));
                 }
@@ -491,6 +527,33 @@ impl Render for ToolsPage {
                         } else {
                             IconName::Hash
                         };
+                        let ext_teams = self.fixtures.shared_teams(ch);
+                        let owner = self.fixtures.channel_owner_team(ch);
+                        let detail_note = if ch.is_external_connect() {
+                            let mut parts = Vec::new();
+                            if !ext_teams.is_empty() {
+                                let names: Vec<&str> =
+                                    ext_teams.iter().take(2).map(|t| t.name.as_str()).collect();
+                                let extra = ext_teams.len().saturating_sub(2);
+                                if extra > 0 {
+                                    parts.push(format!("{} +{extra}", names.join(", ")));
+                                } else {
+                                    parts.push(names.join(", "));
+                                }
+                            }
+                            if let Some(host) = owner {
+                                parts.push(format!("Owned by {}", host.name));
+                            }
+                            if parts.is_empty() {
+                                "External".to_owned()
+                            } else {
+                                parts.join(" · ")
+                            }
+                        } else if ch.is_org_shared {
+                            "Org-wide".to_owned()
+                        } else {
+                            "Shared".to_owned()
+                        };
                         col = col.child(
                             h_flex()
                                 .id(("tools-connect-ch", ix))
@@ -519,7 +582,17 @@ impl Render for ToolsPage {
                                                 .child(label),
                                         ),
                                 )
-                                .child(div().text_xs().text_color(muted).child("External")),
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .when_some(ext_teams.first(), |row, first| {
+                                            row.child(crate::channel_details::org_chip(first, 14.))
+                                        })
+                                        .child(
+                                            div().text_xs().text_color(muted).child(detail_note),
+                                        ),
+                                ),
                         );
                     }
                 }

@@ -625,6 +625,18 @@ impl CollabBackend for SlackApi {
     async fn fetch_list(&self, file_id: String) -> api::Result<api::SlackListData> {
         SlackApi::fetch_list(self, &file_id).await
     }
+    async fn fetch_list_with_meta(
+        &self,
+        file_id: String,
+    ) -> api::Result<(api::SlackListData, api::ListMeta)> {
+        SlackApi::fetch_list_with_meta(self, &file_id).await
+    }
+    async fn team_connections(
+        &self,
+        channel: ChannelId,
+    ) -> api::Result<api::TeamConnectionsResponse> {
+        SlackApi::conversations_team_connections(self, &channel).await
+    }
     async fn lists_create(
         &self,
         name: String,
@@ -665,10 +677,19 @@ impl CollabBackend for SlackApi {
     async fn lists_access_set(
         &self,
         list_id: String,
-        access_level: String,
-        channel: Option<ChannelId>,
+        access_level: api::ListAccessLevel,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
     ) -> api::Result<()> {
-        SlackApi::lists_access_set(self, &list_id, &access_level, channel.as_ref()).await
+        SlackApi::lists_access_set(self, &list_id, access_level, &channel_ids, &user_ids).await
+    }
+    async fn lists_access_delete(
+        &self,
+        list_id: String,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
+    ) -> api::Result<api::ListAccessDeleteResult> {
+        SlackApi::lists_access_delete(self, &list_id, &channel_ids, &user_ids).await
     }
     async fn lists_get_threads_for_record(
         &self,

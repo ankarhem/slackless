@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::gpui::{
     AnyElement, Div, FontWeight, Hsla, ParentElement as _, SharedString, Styled as _, div, img, px,
 };
@@ -55,16 +56,32 @@ pub(super) fn card(label: &str, action: Option<AnyElement>, border: Hsla) -> Div
 }
 
 /// One connected-organization row of the About tab's Organizations section: the org icon,
-/// name, its member count here, and Slack's Channel owner / Private notes.
+/// name, verified indicator, its member count here, and Channel owner / Your workspace /
+/// Limited access / Private notes (`F-COLLAB-806`, `828`, `855`).
 pub(super) fn org_row(
     team: &Team,
     members: u32,
+    is_own: bool,
     is_host: bool,
+    is_limited: bool,
     conversation: &Conversation,
     muted: Hsla,
 ) -> Div {
+    let badge = |label: &'static str| {
+        div()
+            .px_1p5()
+            .py_0p5()
+            .rounded_sm()
+            .border_1()
+            .border_color(muted.opacity(0.35))
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(muted)
+            .child(label)
+    };
     let mut row = h_flex()
         .flex_none()
+        .flex_wrap()
         .items_center()
         .gap_2()
         .px_1()
@@ -75,28 +92,26 @@ pub(super) fn org_row(
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(team.name.clone()),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child(format!("{members} members")),
         );
-    if is_host {
-        row = row.child(
-            div()
-                .px_1p5()
-                .py_0p5()
-                .rounded_sm()
-                .border_1()
-                .border_color(muted.opacity(0.35))
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(muted)
-                .child("Channel owner"),
-        );
+    if team.is_verified {
+        row = row.child(Icon::new(IconName::Check).size(px(12.)).text_color(muted));
     }
-    if conversation.is_private {
+    if members > 0 {
+        row = row.child(div().text_xs().text_color(muted).child(format!(
+            "{members} {}",
+            if members == 1 { "member" } else { "members" }
+        )));
+    }
+    if is_own {
+        row = row.child(badge("Your workspace"));
+    }
+    if is_host {
+        row = row.child(badge("Channel owner"));
+    }
+    if is_limited {
+        row = row.child(badge("Limited access"));
+    }
+    if conversation.is_private && !is_own {
         row = row.child(div().text_xs().text_color(muted).child("Private"));
     }
     row
@@ -312,16 +327,10 @@ pub(crate) fn external_orgs(
         .collect()
 }
 
-/// The team hosting the conversation: the host id the boot payloads carry (a Slack Connect
-/// channel another organization hosts), else `context_team_id`, which names the viewing
-/// workspace rather than the host.
+/// The team hosting the conversation: the typed `conversation_host_id` (or raw `extra` fallback),
+/// else `context_team_id`, which names the viewing workspace rather than the host.
 pub(crate) fn host_team(conversation: &Conversation) -> Option<TeamId> {
-    conversation
-        .extra
-        .get("conversation_host_id")
-        .and_then(|host| host.as_str())
-        .map(TeamId::from)
-        .or_else(|| conversation.context_team_id.clone())
+    conversation.host_team_id()
 }
 
 /// The smallest icon URL of a team record (`icon.image_34`, then the larger sizes).

@@ -819,19 +819,33 @@ struct AvatarGutterSpec<'a> {
 }
 
 fn avatar_gutter(spec: AvatarGutterSpec<'_>, cx: &App) -> AnyElement {
-    let avatar = crate::avatars::with_external_badge(
+    let base_avatar = crate::avatars::author_avatar(
         spec.fixtures,
-        spec.message.user.as_ref(),
-        crate::avatars::author_avatar(
-            spec.fixtures,
-            spec.message,
-            spec.author_key,
-            spec.author,
-            spec.size,
-        ),
+        spec.message,
+        spec.author_key,
+        spec.author,
         spec.size,
-        cx.theme().background,
     );
+    let ring = cx.theme().background;
+    let avatar = if spec
+        .message
+        .user
+        .as_ref()
+        .and_then(|u| spec.fixtures.external_team(u))
+        .is_some()
+    {
+        crate::avatars::with_external_badge(
+            spec.fixtures,
+            spec.message.user.as_ref(),
+            base_avatar,
+            spec.size,
+            ring,
+        )
+    } else if let Some(bot_team) = spec.fixtures.external_bot_team(spec.message) {
+        crate::avatars::with_external_team_badge(bot_team, base_avatar, spec.size, ring)
+    } else {
+        base_avatar
+    };
     let top = if spec.size < AVATAR_SIZE {
         3.
     } else {
@@ -866,6 +880,28 @@ fn app_badge(cx: &App) -> Div {
         .child("APP")
 }
 
+/// Slack's external-app ownership chip (`F-COLLAB-804`): displays the external workspace's icon
+/// and name beside the `APP` badge so users can tell which external org owns a bot posting in a
+/// Slack Connect channel.
+fn external_app_chip(team: &slackless_core::types::Team, cx: &App) -> Div {
+    let theme = cx.theme();
+    h_flex()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .h(px(16.))
+        .px_1p5()
+        .rounded(px(3.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary.opacity(0.65))
+        .text_size(px(10.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme.muted_foreground)
+        .child(crate::channel_details::org_chip(team, 11.))
+        .child(team.name.clone())
+}
+
 fn message_header(
     message: &Message,
     author: &str,
@@ -895,6 +931,15 @@ fn message_header(
         .map(|code| code.trim_matches(':'))
         .filter(|code| !code.is_empty())
         .map(|code| crate::emoji::emoji_element(code, fixtures, px(14.)));
+    let is_app_post = message.bot_id.is_some()
+        && message
+            .user
+            .as_ref()
+            .and_then(|user| fixtures.user(user))
+            .is_none_or(|user| user.is_bot);
+    let external_bot_team = is_app_post
+        .then(|| fixtures.external_bot_team(message))
+        .flatten();
     h_flex()
         .items_baseline()
         .gap_2()
@@ -912,15 +957,10 @@ fn message_header(
                 ))
                 // An app's own post; a person's post made through an app (`/giphy`) keeps
                 // their name unbadged, as in Slack.
-                .when(
-                    message.bot_id.is_some()
-                        && message
-                            .user
-                            .as_ref()
-                            .and_then(|user| fixtures.user(user))
-                            .is_none_or(|user| user.is_bot),
-                    |name| name.child(app_badge(cx)),
-                )
+                .when(is_app_post, |name| name.child(app_badge(cx)))
+                .when_some(external_bot_team, |name, team| {
+                    name.child(external_app_chip(team, cx))
+                })
                 .children(status),
         )
         .child(div().text_xs().text_color(muted).child(stamp))

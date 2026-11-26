@@ -83,6 +83,7 @@ pub mod method {
     pub const CONVERSATIONS_REPLIES: &str = "conversations.replies";
     pub const CONVERSATIONS_SET_PURPOSE: &str = "conversations.setPurpose";
     pub const CONVERSATIONS_SET_TOPIC: &str = "conversations.setTopic";
+    pub const CONVERSATIONS_TEAM_CONNECTIONS: &str = "conversations.teamConnections";
     pub const CONVERSATIONS_UNARCHIVE: &str = "conversations.unarchive";
     pub const CONVERSATIONS_VIEW: &str = "conversations.view";
     pub const DND_END_DND: &str = "dnd.endDnd";
@@ -148,6 +149,7 @@ pub mod method {
     pub const SEARCH_MESSAGES: &str = "search.messages";
     pub const SEARCH_MODULES_FILES: &str = "search.modules.files";
     pub const SEARCH_MODULES_MESSAGES: &str = "search.modules.messages";
+    pub const SLACK_LISTS_ACCESS_DELETE: &str = "slackLists.access.delete";
     pub const SLACK_LISTS_ACCESS_SET: &str = "slackLists.access.set";
     pub const SLACK_LISTS_ITEMS_CREATE: &str = "slackLists.items.create";
     pub const SLACK_LISTS_ITEMS_DELETE: &str = "slackLists.items.delete";

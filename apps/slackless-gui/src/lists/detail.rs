@@ -56,6 +56,24 @@ pub(super) fn render_live_detail_drawer(
                             h_flex()
                                 .items_center()
                                 .gap_1()
+                                .child({
+                                    let key_share = list_key.clone();
+                                    let rec_id_share = rec.id.clone();
+                                    Button::new("list-live-detail-share")
+                                        .ghost()
+                                        .with_size(Size::XSmall)
+                                        .icon(IconName::UserPlus)
+                                        .tooltip("Share item (grants list access)")
+                                        .on_click(move |_, window, cx| {
+                                            share::open_share_panel(
+                                                &key_share,
+                                                share::ListShareTab::Share,
+                                                Some(rec_id_share.clone()),
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                })
                                 .when_some(on_archive, |row, arch| {
                                     row.child(
                                         Button::new("list-live-detail-archive")
@@ -487,7 +505,13 @@ pub(super) fn render_live_detail_drawer(
                 panel = panel.child(sub_section);
             }
             panel = panel.child(render_record_comments_section(
-                &list_key, &rec.id, state, fixtures, cx,
+                &list_key,
+                &rec.id,
+                state,
+                fixtures,
+                actions.on_open_in_threads.as_ref(),
+                actions.on_update_cell.is_none(),
+                cx,
             ));
             panel
         })

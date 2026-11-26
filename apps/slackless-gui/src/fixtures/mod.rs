@@ -180,12 +180,7 @@ pub fn live(
     // (`users.conversations`) also covers channels joined since, but over-reports Slack Connect
     // channels the sidebar leaves out, so a shared channel needs counts too - unless another
     // organization hosts it, as it then never appears in this workspace's counts.
-    let hosted_elsewhere = |c: &Conversation| {
-        c.extra
-            .get("conversation_host_id")
-            .and_then(|host| host.as_str())
-            .is_some_and(|host| host != team.as_str())
-    };
+    let hosted_elsewhere = |c: &Conversation| c.host_team_id().is_some_and(|host| host != *team);
     let (channels, directory) = rooms.into_iter().partition(|c| {
         counts.is_empty()
             || counts.contains_key(&c.id)
@@ -400,5 +395,48 @@ mod tests {
         // Blank transcript clears the entry cleanly.
         let cleared = with_tr.with_file_transcript(fid.clone(), "   ".into());
         assert_eq!(cleared.file_transcript(&fid), None);
+    }
+
+    #[test]
+    fn slack_connect_helpers_detect_external_users_bots_and_channel_owner() {
+        let fixtures = load();
+        let partner = fixtures
+            .conversation(&ChannelId::from("C0PARTNER"))
+            .expect("sample workspace includes C0PARTNER");
+        assert!(partner.is_external_connect());
+        assert_eq!(
+            fixtures
+                .channel_owner_team(partner)
+                .map(|t| t.name.as_str()),
+            Some("Klarna")
+        );
+        let shared_names: Vec<&str> = fixtures
+            .shared_teams(partner)
+            .into_iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(shared_names, vec!["Klarna"]);
+
+        assert!(fixtures.is_external_user(&UserId::from("U0KLA1")));
+        assert_eq!(
+            fixtures
+                .external_team(&UserId::from("U0KLA1"))
+                .map(|t| t.name.as_str()),
+            Some("Klarna")
+        );
+        assert!(!fixtures.is_external_user(&fixtures.self_user));
+
+        let partner_msgs = fixtures
+            .messages
+            .get(&ChannelId::from("C0PARTNER"))
+            .expect("C0PARTNER messages");
+        let bot_msg = partner_msgs
+            .iter()
+            .find(|m| m.bot_id.as_ref().map(|b| b.as_str()) == Some("B0KLARNA"))
+            .expect("external bot message in C0PARTNER");
+        assert_eq!(
+            fixtures.external_bot_team(bot_msg).map(|t| t.name.as_str()),
+            Some("Klarna")
+        );
     }
 }

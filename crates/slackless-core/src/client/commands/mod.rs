@@ -315,8 +315,15 @@ impl<B: Backend> Core<B> {
             CollabCommand::SetListAccess {
                 list_id,
                 access_level,
-                channel,
-            } => self.set_list_access(list_id, access_level, channel),
+                channel_ids,
+                user_ids,
+                post_permalink,
+            } => self.set_list_access(list_id, access_level, channel_ids, user_ids, post_permalink),
+            CollabCommand::DeleteListAccess {
+                list_id,
+                channel_ids,
+                user_ids,
+            } => self.delete_list_access(list_id, channel_ids, user_ids),
             CollabCommand::FetchListRecordComments { list_id, record_id } => {
                 self.fetch_list_record_comments(list_id, record_id);
             }

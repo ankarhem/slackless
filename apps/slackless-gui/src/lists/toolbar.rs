@@ -394,45 +394,37 @@ pub(super) fn render_live_toolbar(
                 })
         })
         .when(!can_edit, |row| row.child(read_only_badge(cx)))
-        .when_some(actions.on_set_access.clone(), |row, set_access| {
-            row.child(
-                Button::new("list-share-access")
-                    .outline()
-                    .with_size(Size::XSmall)
-                    .icon(IconName::Users)
-                    .label("Share")
-                    .tooltip("Manage workspace access for this list")
-                    .dropdown_menu(move |menu, _, _| {
-                        let sa_owner = set_access.clone();
-                        let sa_read = set_access.clone();
-                        let sa_write = set_access.clone();
-                        let sa_none = set_access.clone();
-                        menu.item(
-                            PopupMenuItem::new("Workspace: Owner (full control)").on_click(
-                                move |_, window, cx| {
-                                    sa_owner("owner".to_owned(), window, cx);
-                                },
-                            ),
-                        )
-                        .item(PopupMenuItem::new("Workspace: Can edit").on_click(
-                            move |_, window, cx| {
-                                sa_write("write".to_owned(), window, cx);
+        .child({
+            let key_share = list_key.clone();
+            let open = state.share_open;
+            Button::new("list-share-access")
+                .when(open, |b| b.primary())
+                .when(!open, |b| b.outline())
+                .with_size(Size::XSmall)
+                .icon(IconName::Users)
+                .label("Share")
+                .tooltip("Share list and manage permissions")
+                .on_click(move |_, window, cx| {
+                    if open {
+                        mutate_panel(
+                            &key_share,
+                            |s| {
+                                s.share_open = false;
+                                s.share_item_id = None;
                             },
-                        ))
-                        .item(PopupMenuItem::new("Workspace: View only").on_click(
-                            move |_, window, cx| {
-                                sa_read("read".to_owned(), window, cx);
-                            },
-                        ))
-                        .item(
-                            PopupMenuItem::new("Restrict workspace access").on_click(
-                                move |_, window, cx| {
-                                    sa_none("none".to_owned(), window, cx);
-                                },
-                            ),
-                        )
-                    }),
-            )
+                            window,
+                            cx,
+                        );
+                    } else {
+                        share::open_share_panel(
+                            &key_share,
+                            share::ListShareTab::Share,
+                            None,
+                            window,
+                            cx,
+                        );
+                    }
+                })
         })
         .when_some(actions.on_add_tab.clone(), |row, add_tab| {
             row.child(

@@ -831,6 +831,18 @@ fn wire_feature_view_subscriptions(
                     this.select(channel.clone(), cx);
                     this.open_thread(channel.clone(), thread_ts.clone(), cx);
                 }
+                ThreadsEvent::OpenListItem { list_id, record_id } => {
+                    if this.fixtures.sample || list_id == "fixture" {
+                        crate::lists::select_fixture_record(record_id, cx);
+                        this.page = MainPage::Channel;
+                        this.select_tab(ConversationTab::List, cx);
+                    } else {
+                        if let Some(Ok(data)) = this.ws.lists.get(list_id) {
+                            crate::lists::select_list_record(list_id, record_id, data, cx);
+                        }
+                        this.open_live_list(list_id.clone(), cx);
+                    }
+                }
                 ThreadsEvent::OpenLink(target) => {
                     this.open_link(target.clone(), window, cx);
                 }

@@ -2631,3 +2631,238 @@ async fn lists_do_not_swallow_auth_expired_and_search_modules_files_uses_files_f
         assert_eq!(opts, vec![("Item 1".to_owned(), "v1".to_owned())]);
     }
 }
+
+#[tokio::test]
+async fn slack_lists_access_meta_threads_and_team_connections() {
+    use slackless_api::types::UserId;
+    use slackless_api::{ListAccessLevel, format_list_error, list_comment_channel_id};
+
+    // 1. slackLists.access.set & slackLists.access.delete (XOR validation + JSON array encoding + partial failures)
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/slackLists.access.set"))
+            .and(body_string_contains("list_id=F0LIST1"))
+            .and(body_string_contains("access_level=write"))
+            .and(body_string_contains("channel_ids=%5B%22C01%22%5D"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/slackLists.access.set"))
+            .and(body_string_contains("list_id=F0LIST1"))
+            .and(body_string_contains("access_level=owner"))
+            .and(body_string_contains("user_ids=%5B%22U01%22%5D"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/slackLists.access.delete"))
+            .and(body_string_contains("list_id=F0LIST1"))
+            .and(body_string_contains("user_ids=%5B%22U01%22%2C%22U02%22%5D"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "failed_to_update_user_ids": ["U02"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        api.lists_access_set(
+            "F0LIST1",
+            ListAccessLevel::Write,
+            &[ChannelId::from("C01")],
+            &[],
+        )
+        .await
+        .unwrap();
+        api.lists_access_set(
+            "F0LIST1",
+            ListAccessLevel::Owner,
+            &[],
+            &[UserId::from("U01")],
+        )
+        .await
+        .unwrap();
+
+        // Passing both channel_ids and user_ids (or neither) violates XOR client-side before hitting Slack.
+        let xor_err = api
+            .lists_access_set(
+                "F0LIST1",
+                ListAccessLevel::Read,
+                &[ChannelId::from("C01")],
+                &[UserId::from("U01")],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(xor_err, ApiError::Slack(ref s) if s == "invalid_parameters"));
+        let empty_err = api
+            .lists_access_delete("F0LIST1", &[], &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(empty_err, ApiError::Slack(ref s) if s == "invalid_parameters"));
+
+        let del = api
+            .lists_access_delete("F0LIST1", &[], &[UserId::from("U01"), UserId::from("U02")])
+            .await
+            .unwrap();
+        assert_eq!(del.failed_to_update_user_ids, vec![UserId::from("U02")]);
+        assert!(del.has_failures());
+        assert!(format_list_error("list_not_found").contains("not found"));
+    }
+
+    // 2. fetch_list_with_meta extracts permissions, owners/editors, channels & item limits
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/files.info"))
+            .and(body_string_contains("file=F0LISTMETA"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "file": {
+                    "id": "F0LISTMETA",
+                    "title": "Q4 Launch",
+                    "permalink": "https://acme.slack.com/lists/T1/F0LISTMETA",
+                    "editable": true,
+                    "access": "owner",
+                    "org_or_workspace_access": "read",
+                    "editors": ["U1", "U2"],
+                    "channels": ["C1"],
+                    "list_limits": {
+                        "row_count": 42,
+                        "row_count_limit": 5000,
+                        "column_count": 6,
+                        "column_count_limit": 40,
+                        "over_row_maximum": false
+                    },
+                    "list_metadata": {
+                        "description": "Launch tracker",
+                        "schema": [
+                            { "id": "col_name", "key": "name", "name": "Task", "type": "text", "is_primary_column": true }
+                        ]
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/lists.records.list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "records": [
+                    { "id": "Rec01", "fields": [{ "column_id": "col_name", "text": "Ship it" }] }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (data, meta) = api.fetch_list_with_meta("F0LISTMETA").await.unwrap();
+        assert_eq!(data.title, "Q4 Launch");
+        assert_eq!(data.rows.len(), 1);
+        assert_eq!(meta.file_id, "F0LISTMETA");
+        assert_eq!(meta.access.as_deref(), Some("owner"));
+        assert_eq!(meta.org_or_workspace_access.as_deref(), Some("read"));
+        assert_eq!(meta.editors, vec![UserId::from("U1"), UserId::from("U2")]);
+        assert_eq!(meta.shared_channels, vec![ChannelId::from("C1")]);
+        assert_eq!(meta.row_count, Some(42));
+        assert_eq!(meta.row_count_limit, Some(5000));
+        assert_eq!(
+            meta.comment_channel_id,
+            list_comment_channel_id("F0LISTMETA")
+        );
+    }
+
+    // 3. lists.getThreadsForRecord: nested threads + fallback to conversations.replies on C-channel
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/lists.getThreadsForRecord"))
+            .and(body_string_contains("record_id=Rec01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "threads": [{
+                    "root": { "ts": "1700.1", "user": "U1", "text": "Root comment" },
+                    "latest_replies": [
+                        { "ts": "1700.2", "thread_ts": "1700.1", "user": "U2", "text": "Reply 1" }
+                    ]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let msgs = api
+            .lists_get_threads_for_record("F0LIST1", "Rec01")
+            .await
+            .unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].text, "Root comment");
+        assert_eq!(msgs[1].text, "Reply 1");
+
+        // Fallback when lists.getThreadsForRecord errors -> conversations.replies on C0LIST1.
+        Mock::given(method("POST"))
+            .and(path("/api/lists.getThreadsForRecord"))
+            .and(body_string_contains("record_id=RecFallback"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": false,
+                "error": "unknown_method"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/conversations.replies"))
+            .and(body_string_contains("channel=C0LIST1"))
+            .and(body_string_contains("ts=F0LIST1-RecFallback"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "messages": [
+                    { "ts": "1701.1", "user": "U3", "text": "Fallback comment" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let fb = api
+            .lists_get_threads_for_record("F0LIST1", "RecFallback")
+            .await
+            .unwrap();
+        assert_eq!(fb.len(), 1);
+        assert_eq!(fb[0].text, "Fallback comment");
+    }
+
+    // 4. conversations.teamConnections parses connected and pending organizations
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/conversations.teamConnections"))
+            .and(body_string_contains("channel=C0PARTNER"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "connections": [
+                    { "id": "T0KLARNA", "name": "Klarna", "domain": "klarna", "is_verified": true }
+                ],
+                "pending_connections": [
+                    { "id": "T0PEND", "name": "Pending Org", "domain": "pending" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let conns = api
+            .conversations_team_connections(&ChannelId::from("C0PARTNER"))
+            .await
+            .unwrap();
+        assert_eq!(conns.connections.len(), 1);
+        assert!(conns.connections[0].is_verified);
+        assert_eq!(conns.connections[0].name, "Klarna");
+        assert_eq!(conns.pending_connections.len(), 1);
+        assert_eq!(conns.pending_connections[0].name, "Pending Org");
+    }
+}

@@ -283,3 +283,15 @@ pub(in crate::methods) fn listing_params(opts: &ListOpts, cursor: Option<String>
     }
     params
 }
+
+/// Response of `conversations.teamConnections`: connected, pending, and previous organizations
+/// for a Slack Connect channel (`docs/research/api-channels.md`).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct TeamConnectionsResponse {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub connections: Vec<crate::types::Team>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub pending_connections: Vec<crate::types::Team>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub previous_connections: Vec<crate::types::Team>,
+}

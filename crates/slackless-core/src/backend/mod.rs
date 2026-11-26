@@ -842,6 +842,31 @@ pub trait CollabBackend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<api::SlackListData>> + Send {
         async { Ok(api::SlackListData::default()) }
     }
+    /// Fetch a live Slack List together with its [`api::ListMeta`].
+    fn fetch_list_with_meta(
+        &self,
+        file_id: String,
+    ) -> impl Future<Output = api::Result<(api::SlackListData, api::ListMeta)>> + Send {
+        async move {
+            let data = self.fetch_list(file_id.clone()).await?;
+            let meta = api::ListMeta {
+                file_id: data.file_id.clone(),
+                title: data.title.clone(),
+                row_count: u32::try_from(data.rows.len()).ok(),
+                comment_channel_id: api::list_comment_channel_id(&file_id),
+                ..Default::default()
+            };
+            Ok((data, meta))
+        }
+    }
+    /// Fetch connected external organizations for a Slack Connect channel
+    /// (`conversations.teamConnections`).
+    fn team_connections(
+        &self,
+        _channel: ChannelId,
+    ) -> impl Future<Output = api::Result<api::TeamConnectionsResponse>> + Send {
+        async { Ok(api::TeamConnectionsResponse::default()) }
+    }
     /// Create a new Slack List (`lists.create`).
     fn lists_create(
         &self,
@@ -893,14 +918,24 @@ pub trait CollabBackend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<()>> + Send {
         async { Ok(()) }
     }
-    /// Update sharing/access permissions on a Slack List (`slackLists.access.set`).
+    /// Grant or update sharing/access permissions on a Slack List (`slackLists.access.set`).
     fn lists_access_set(
         &self,
         _list_id: String,
-        _access_level: String,
-        _channel: Option<ChannelId>,
+        _access_level: api::ListAccessLevel,
+        _channel_ids: Vec<ChannelId>,
+        _user_ids: Vec<UserId>,
     ) -> impl Future<Output = api::Result<()>> + Send {
         async { Ok(()) }
+    }
+    /// Revoke sharing/access permissions on a Slack List (`slackLists.access.delete`).
+    fn lists_access_delete(
+        &self,
+        _list_id: String,
+        _channel_ids: Vec<ChannelId>,
+        _user_ids: Vec<UserId>,
+    ) -> impl Future<Output = api::Result<api::ListAccessDeleteResult>> + Send {
+        async { Ok(api::ListAccessDeleteResult::default()) }
     }
     /// Load comment thread messages for a List item (`lists.getThreadsForRecord`).
     fn lists_get_threads_for_record(

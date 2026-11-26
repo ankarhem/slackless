@@ -1,4 +1,5 @@
 use super::*;
+use gpui_kit::gpui;
 use slackless_core::api::SlackListChoice;
 use std::collections::HashMap;
 
@@ -483,4 +484,93 @@ fn subtask_archiving_and_view_level_archive_helpers_work_cleanly() {
         completed_row_ids(&data, &archived),
         vec!["R_DONE_SEL".to_owned()]
     );
+}
+
+#[gpui::test]
+fn list_share_drawer_and_ui_store_round_trip(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::init(cx);
+
+        let meta = ListMeta {
+            file_id: "F0SHARE".into(),
+            title: "Launch Tracker".into(),
+            permalink: Some("https://acme.slack.com/lists/T1/F0SHARE".into()),
+            editable: true,
+            access: Some("owner".into()),
+            org_or_workspace_access: Some("read".into()),
+            editors: vec![UserId::from("U0ME")],
+            shared_channels: vec![ChannelId::from("C0ENG")],
+            row_count: Some(12),
+            row_count_limit: Some(5000),
+            over_row_maximum: false,
+            comment_channel_id: ChannelId::from("C0SHARE"),
+            ..Default::default()
+        };
+        set_list_meta("F0SHARE", meta.clone(), cx);
+        assert_eq!(list_meta("F0SHARE", cx), Some(meta));
+
+        set_list_status("F0SHARE", false, "Shared with #engineering".into(), cx);
+        assert_eq!(
+            list_status("F0SHARE", cx),
+            Some((false, "Shared with #engineering".to_owned()))
+        );
+
+        let data = SlackListData {
+            file_id: "F0SHARE".into(),
+            title: "Launch Tracker".into(),
+            description: String::new(),
+            columns: vec![SlackListColumn {
+                id: "C1".into(),
+                key: "task".into(),
+                name: "Task".into(),
+                kind: "text".into(),
+                is_primary: true,
+                choices: Vec::new(),
+            }],
+            rows: vec![
+                SlackListRow {
+                    id: "RecA".into(),
+                    cells: HashMap::new(),
+                },
+                SlackListRow {
+                    id: "RecB".into(),
+                    cells: HashMap::new(),
+                },
+            ],
+        };
+        select_list_record("F0SHARE", "RecB", &data, cx);
+        assert_eq!(panel_state("F0SHARE", cx).selected_row, Some(1));
+
+        select_fixture_record("fix_2", cx);
+        assert_eq!(panel_state("fixture", cx).selected_row, Some(1));
+
+        // Render live_list_view with share drawer open across all three share tabs.
+        let fixtures = crate::fixtures::load();
+        for tab in [
+            ListShareTab::Share,
+            ListShareTab::Access,
+            ListShareTab::Settings,
+        ] {
+            cx.default_global::<ListUiStore>()
+                .panels
+                .entry("F0SHARE".to_owned())
+                .or_default()
+                .share_open = true;
+            cx.default_global::<ListUiStore>()
+                .panels
+                .entry("F0SHARE".to_owned())
+                .or_default()
+                .share_tab = tab;
+            let _ = live_list_view(
+                Some(&Ok(data.clone())),
+                &fixtures,
+                "",
+                None,
+                None,
+                ListActions::default(),
+                cx,
+            );
+        }
+    });
 }

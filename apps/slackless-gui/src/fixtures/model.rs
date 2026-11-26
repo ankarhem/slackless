@@ -420,35 +420,107 @@ impl Fixtures {
         self.plain_text(message).replace('\n', " ")
     }
 
-    /// The organization of `user` when it is not the signed-in workspace's own and its record
-    /// is known: Slack badges such people's avatars with its icon.
-    pub fn external_team(&self, user: &UserId) -> Option<&Team> {
-        let team = self.user(user)?.team_id.as_ref()?;
-        if self.workspaces.first().is_some_and(|own| own.id == *team) {
+    /// The signed-in workspace's own team ID, if present.
+    pub fn own_team_id(&self) -> Option<&TeamId> {
+        self.workspaces.first().map(|team| &team.id)
+    }
+
+    /// Look up any known external organization record by team ID (returns `None` for own workspace).
+    pub fn external_team_by_id(&self, team_id: &TeamId) -> Option<&Team> {
+        if self.own_team_id().is_some_and(|own| own == team_id) {
             return None;
         }
-        let &ix = self.team_map().get(team)?;
+        let &ix = self.team_map().get(team_id)?;
         self.teams.get(ix)
     }
 
+    /// The organization of `user` when it is not the signed-in workspace's own and its record
+    /// is known: Slack badges such people's avatars with its icon.
+    pub fn external_team(&self, user: &UserId) -> Option<&Team> {
+        let team = self.user(user)?.effective_team_id()?;
+        self.external_team_by_id(team)
+    }
+
+    /// True when `user` belongs to an external organization (`is_stranger` or a different team
+    /// ID, even before `team.info` finishes resolving).
+    pub fn is_external_user(&self, user: &UserId) -> bool {
+        let Some(own) = self.own_team_id() else {
+            return false;
+        };
+        self.user(user).is_some_and(|u| u.is_external_to(own))
+    }
+
+    /// The external organization that owns the bot/app authoring `message`, when it belongs to
+    /// another organization (`F-COLLAB-804`).
+    pub fn external_bot_team(&self, message: &Message) -> Option<&Team> {
+        if let Some(team_id) = message
+            .bot_profile
+            .as_ref()
+            .and_then(|b| b.team_id.as_ref())
+            .filter(|id| !id.as_str().is_empty())
+            && let Some(team) = self.external_team_by_id(team_id)
+        {
+            return Some(team);
+        }
+        if let Some(bot_id) = message.bot_id.as_ref()
+            && let Some(cached) = self.bot_profile(bot_id)
+            && let Some(team_id) = cached.team_id.as_ref().filter(|id| !id.as_str().is_empty())
+            && let Some(team) = self.external_team_by_id(team_id)
+        {
+            return Some(team);
+        }
+        if let Some(user_id) = message.user.as_ref()
+            && self.user(user_id).is_some_and(|u| u.is_bot)
+        {
+            return self.external_team(user_id);
+        }
+        None
+    }
+
+    /// The hosting/owning organization of `conversation` (`conversation_host_id`, else
+    /// `context_team_id`), resolved against known teams and workspaces (`F-COLLAB-798`, `828`).
+    pub fn channel_owner_team(&self, conversation: &Conversation) -> Option<&Team> {
+        let host_id = conversation.host_team_id()?;
+        self.team_map()
+            .get(&host_id)
+            .and_then(|&ix| self.teams.get(ix))
+            .or_else(|| self.workspaces.iter().find(|t| t.id == host_id))
+    }
+
     /// The other organizations a Slack Connect conversation is shared with, in Slack's own
-    /// order (`shared_team_ids`), as far as their team records are known.
+    /// order (`shared_team_ids` / `connected_team_ids` / `connected_limited_team_ids`, with
+    /// member/host fallback), as far as their team records are known.
     pub fn shared_teams(&self, conversation: &Conversation) -> Vec<&Team> {
-        let own = self.workspaces.first().map(|team| team.id.as_str());
+        let own = self.own_team_id();
         let team_map = self.team_map();
-        conversation
-            .extra
-            .get("shared_team_ids")
-            .and_then(|ids| ids.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|id| id.as_str())
-            .filter(|id| Some(*id) != own)
-            .filter_map(|id| {
-                let &ix = team_map.get(&TeamId::from(id))?;
-                self.teams.get(ix)
-            })
-            .collect()
+        let mut out: Vec<&Team> = Vec::new();
+        let mut push_id = |id: &TeamId| {
+            if own.is_some_and(|o| o == id) {
+                return;
+            }
+            if let Some(&ix) = team_map.get(id)
+                && let Some(team) = self.teams.get(ix)
+                && !out.iter().any(|existing| existing.id == team.id)
+            {
+                out.push(team);
+            }
+        };
+        for id in conversation.external_team_ids(own) {
+            push_id(&id);
+        }
+        if let Some(host) = conversation.host_team_id() {
+            push_id(&host);
+        }
+        if out.is_empty() && conversation.is_external_connect() {
+            for member in &conversation.members {
+                if let Some(team) = self.external_team(member)
+                    && !out.iter().any(|existing| existing.id == team.id)
+                {
+                    out.push(team);
+                }
+            }
+        }
+        out
     }
 
     /// Sidebar/header label: `# name` for channels, the other parties' names for DMs.

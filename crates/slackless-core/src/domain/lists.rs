@@ -3,10 +3,118 @@
 use serde_json::{Map, Number, Value, json};
 
 use crate::api::{
-    ListCellInput, ListCellInputValue, SlackListCellValue, SlackListColumn, SlackListData,
-    SlackListRow,
+    ApiError, ListAccessLevel, ListCellInput, ListCellInputValue, ListMeta, SlackListCellValue,
+    SlackListColumn, SlackListData, SlackListRow, format_list_error,
 };
-use crate::types::UserId;
+use crate::domain::canvas::parse_share_targets;
+use crate::types::{ChannelId, UserId};
+
+/// Active tab inside the List Share dialog (`F-COLLAB-275`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ListShareTab {
+    #[default]
+    Share,
+    Access,
+    Settings,
+}
+
+/// Validated share/access-grant request for a Slack List (`F-COLLAB-243..245`, `F-COLLAB-274..278`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListShareAccessRequest {
+    pub access_level: ListAccessLevel,
+    pub channel_ids: Vec<ChannelId>,
+    pub user_ids: Vec<UserId>,
+    /// `Some(permalink)` posts the list link to shared channels; `None` grants silent access
+    /// (`F-COLLAB-274`).
+    pub post_permalink: Option<String>,
+    /// Optional record ID when sharing from an item (`F-COLLAB-276`: sharing an item grants list
+    /// access).
+    pub item_record_id: Option<String>,
+}
+
+/// Validate and build a [`ListShareAccessRequest`] from raw target IDs and share options.
+pub fn build_list_share_request(
+    raw_targets: &str,
+    access_level: ListAccessLevel,
+    share_without_posting: bool,
+    permalink: Option<&str>,
+    item_record_id: Option<&str>,
+) -> Result<ListShareAccessRequest, String> {
+    let (channel_ids, user_ids) = parse_share_targets(raw_targets);
+    if channel_ids.is_empty() && user_ids.is_empty() {
+        return Err(
+            "Enter at least one Slack channel ID (C…) or user ID (U…) to share this list with."
+                .to_owned(),
+        );
+    }
+    if access_level == ListAccessLevel::Owner && !channel_ids.is_empty() && user_ids.is_empty() {
+        return Err(
+            "Owner access can only be granted to individual users (U…), not channels.".to_owned(),
+        );
+    }
+    let post_permalink = if share_without_posting || channel_ids.is_empty() {
+        None
+    } else {
+        permalink
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let item_record_id = item_record_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    Ok(ListShareAccessRequest {
+        access_level,
+        channel_ids,
+        user_ids,
+        post_permalink,
+        item_record_id,
+    })
+}
+
+/// Summarize a list's general workspace access badge and description (`F-COLLAB-244`,
+/// `F-COLLAB-247`, `F-COLLAB-277`, `F-COLLAB-278`).
+pub fn list_general_access_summary(
+    meta: Option<&ListMeta>,
+    local_override: Option<&str>,
+    limit_sharing: bool,
+) -> (&'static str, String) {
+    let raw = local_override
+        .filter(|s| !s.is_empty())
+        .or_else(|| meta.and_then(|m| m.org_or_workspace_access.as_deref()))
+        .or_else(|| meta.and_then(|m| m.access.as_deref()))
+        .unwrap_or("private")
+        .to_ascii_lowercase();
+
+    let (badge, mut desc) = match raw.as_str() {
+        "write" | "edit" | "workspace_edit" => (
+            "Workspace can edit",
+            "Anyone in this workspace with the link can view, comment, and edit items.".to_owned(),
+        ),
+        "read" | "view" | "workspace_view" => (
+            "Workspace can view",
+            "Anyone in this workspace with the link can view items and comment on item threads."
+                .to_owned(),
+        ),
+        _ => (
+            "Invite only",
+            "Only people and channels explicitly added can open this list.".to_owned(),
+        ),
+    };
+    if limit_sharing {
+        desc.push_str(" Re-sharing is limited to list owners.");
+    }
+    (badge, desc)
+}
+
+/// Translate a Slack [`ApiError`] from a list endpoint into clear user-facing guidance.
+pub fn format_list_api_error(err: &ApiError) -> String {
+    match err {
+        ApiError::Slack(code) | ApiError::AuthExpired(code) => format_list_error(code),
+        other => format_list_error(&other.to_string()),
+    }
+}
 
 /// Look up a cell in `row` by column ID first, falling back to column key.
 pub fn row_cell<'a>(
@@ -428,5 +536,55 @@ mod tests {
         assert_eq!(cells[1].column_id, "C_DONE");
         assert!(matches!(cells[1].value, ListCellInputValue::Checkbox(true)));
         assert_eq!(cells[2].column_id, "C_PTS");
+    }
+
+    #[test]
+    fn list_share_request_parses_targets_enforces_owner_rule_and_silent_mode() {
+        let req = build_list_share_request(
+            "#C01ENG, @U01ALICE",
+            ListAccessLevel::Write,
+            false,
+            Some("https://acme.slack.com/lists/T1/F1"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.channel_ids, vec![ChannelId::from("C01ENG")]);
+        assert_eq!(req.user_ids, vec![UserId::from("U01ALICE")]);
+        assert_eq!(
+            req.post_permalink.as_deref(),
+            Some("https://acme.slack.com/lists/T1/F1")
+        );
+
+        // Silent share omits post_permalink (`F-COLLAB-274`).
+        let silent = build_list_share_request(
+            "C01ENG",
+            ListAccessLevel::Read,
+            true,
+            Some("https://acme.slack.com/lists/T1/F1"),
+            Some("Rec1"),
+        )
+        .unwrap();
+        assert!(silent.post_permalink.is_none());
+
+        // Owner access cannot be assigned to channels.
+        let err = build_list_share_request("C01ENG", ListAccessLevel::Owner, true, None, None)
+            .unwrap_err();
+        assert!(err.contains("Owner"));
+
+        // Empty targets rejected.
+        assert!(build_list_share_request("   ", ListAccessLevel::Read, true, None, None).is_err());
+
+        let (read_label, read_desc) = list_general_access_summary(None, Some("read"), false);
+        assert!(read_label.contains("view") || read_desc.contains("view"));
+        let (write_label, write_desc) = list_general_access_summary(None, Some("write"), true);
+        assert!(write_label.contains("edit") || write_desc.contains("edit"));
+        assert!(write_desc.to_lowercase().contains("owner"));
+        let (priv_label, _) = list_general_access_summary(None, None, false);
+        assert!(!priv_label.is_empty());
+        assert!(
+            format_list_api_error(&slackless_api::ApiError::Slack("access_denied".into()))
+                .to_lowercase()
+                .contains("permission")
+        );
     }
 }

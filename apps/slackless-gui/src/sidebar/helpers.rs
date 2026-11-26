@@ -73,9 +73,13 @@ pub(super) const SCROLL_ANIM: Duration = Duration::from_millis(300);
 
 /// Slack's tooltip over a Slack Connect row, centered above the name with its arrow pointing
 /// down at it: the other organizations' icons in framed tiles (three, then a "+N" tile) over
-/// "A, B, C, and N other external organizations are in this channel", in Slack's inverse
-/// tooltip colors and caption type. `None` while no organization record is known.
-pub(super) fn org_tooltip(teams: &[&Team], cx: &gpui_kit::gpui::App) -> Option<Div> {
+/// "A, B, C, and N other external organizations are in this channel" plus the channel owner when
+/// known (`F-COLLAB-798`, `828`), in Slack's inverse tooltip colors and caption type.
+pub(super) fn org_tooltip(
+    teams: &[&Team],
+    owner: Option<&Team>,
+    cx: &gpui_kit::gpui::App,
+) -> Option<Div> {
     let text = match teams {
         [] => return None,
         [a] => format!("{} is in this channel", a.name),
@@ -121,6 +125,7 @@ pub(super) fn org_tooltip(teams: &[&Team], cx: &gpui_kit::gpui::App) -> Option<D
                     }),
             ))
         });
+    let owner_line = owner.map(|host| format!("Owned by {}", host.name));
     Some(
         div()
             .absolute()
@@ -135,7 +140,7 @@ pub(super) fn org_tooltip(teams: &[&Team], cx: &gpui_kit::gpui::App) -> Option<D
                     .items_center()
                     .child(
                         v_flex()
-                            .max_w(px(200.))
+                            .max_w(px(220.))
                             .px_3()
                             .py_2()
                             .rounded(px(8.))
@@ -146,7 +151,17 @@ pub(super) fn org_tooltip(teams: &[&Team], cx: &gpui_kit::gpui::App) -> Option<D
                             .font_weight(FontWeight::BOLD)
                             .text_center()
                             .child(tiles)
-                            .child(text),
+                            .child(text)
+                            .when_some(owner_line, |box_el, line| {
+                                box_el.child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .font_weight(FontWeight::NORMAL)
+                                        .text_color(ink.opacity(0.8))
+                                        .child(line),
+                                )
+                            }),
                     )
                     .child(tooltip_arrow(surface, false)),
             ),

@@ -524,17 +524,40 @@ impl App {
         });
         let on_set_access = file_id.as_ref().map(|id| {
             let lid = id.clone();
-            let ch = self.channel.clone();
             let this = cx.weak_entity();
-            Rc::new(move |access_level, _: &mut Window, cx: &mut gpui::App| {
-                let _ = this.update(cx, |app, _| {
-                    app.bridge.send(CollabCommand::SetListAccess {
-                        list_id: lid.clone(),
-                        channel: Some(ch.clone()),
-                        access_level,
+            Rc::new(
+                move |req: crate::lists::ListShareAccessRequest,
+                      _: &mut Window,
+                      cx: &mut gpui::App| {
+                    let _ = this.update(cx, |app, _| {
+                        app.bridge.send(CollabCommand::SetListAccess {
+                            list_id: lid.clone(),
+                            access_level: req.access_level,
+                            channel_ids: req.channel_ids,
+                            user_ids: req.user_ids,
+                            post_permalink: req.post_permalink,
+                        });
                     });
-                });
-            }) as crate::lists::SetListAccessFn
+                },
+            ) as crate::lists::ListAccessSetFn
+        });
+        let on_delete_access = file_id.as_ref().map(|id| {
+            let lid = id.clone();
+            let this = cx.weak_entity();
+            Rc::new(
+                move |channel_ids: Vec<ChannelId>,
+                      user_ids: Vec<UserId>,
+                      _: &mut Window,
+                      cx: &mut gpui::App| {
+                    let _ = this.update(cx, |app, _| {
+                        app.bridge.send(CollabCommand::DeleteListAccess {
+                            list_id: lid.clone(),
+                            channel_ids,
+                            user_ids,
+                        });
+                    });
+                },
+            ) as crate::lists::ListAccessDeleteFn
         });
         let on_load_comments = file_id.as_ref().map(|id| {
             let lid = id.clone();
@@ -544,6 +567,22 @@ impl App {
                     app.bridge.send(CollabCommand::FetchListRecordComments {
                         list_id: lid.clone(),
                         record_id,
+                    });
+                });
+            }) as crate::lists::DeleteListItemFn
+        });
+        let on_open_in_threads = file_id.as_ref().map(|id| {
+            let lid = id.clone();
+            let this = cx.weak_entity();
+            Rc::new(move |record_id, _: &mut Window, cx: &mut gpui::App| {
+                let _ = this.update(cx, |app, cx| {
+                    app.bridge.send(CollabCommand::FetchListRecordComments {
+                        list_id: lid.clone(),
+                        record_id,
+                    });
+                    app.open_threads(cx);
+                    app.threads.update(cx, |view, cx| {
+                        view.set_filter(crate::threads_view::ThreadsFilter::ListItems, cx);
                     });
                 });
             }) as crate::lists::DeleteListItemFn
@@ -597,7 +636,9 @@ impl App {
                 on_delete_item,
                 on_archive_item,
                 on_set_access,
+                on_delete_access,
                 on_load_comments,
+                on_open_in_threads,
                 on_add_tab,
                 on_delete_list,
                 open_browser,
