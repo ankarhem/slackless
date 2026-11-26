@@ -2983,9 +2983,9 @@ fn v10_to_v11_migration_backfills_message_file_and_inline_clip_transcripts() {
         .unwrap();
     }
 
-    // Opening via Store::open migrates V10 -> V11 and runs the post-V11 backfill.
+    // Opening via Store::open migrates V10 -> latest and runs the post-V11 backfill.
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 11);
+    assert_eq!(store.schema_version().unwrap(), crate::SCHEMA_VERSION);
 
     // Inline `transcription.preview.content` from compressed BLOB JSON is searchable immediately!
     let hits = store
@@ -3305,5 +3305,81 @@ fn extract_inline_file_transcript_precedence_and_empty_filtering() {
     assert_eq!(
         extract_inline_file_transcript(&file).as_deref(),
         Some("fallback text")
+    );
+}
+
+#[test]
+fn file_transcripts_preserve_timed_cues_while_indexing_plain_text_in_fts5() {
+    let mut store = Store::open_in_memory().unwrap();
+    let video_id = FileId::from("F_TIMED_VID");
+    let msg = Message {
+        ts: Ts::from("1700001000.000100"),
+        user: Some(UserId::from("U1")),
+        text: "Check out this demo".into(),
+        files: vec![File {
+            id: video_id.clone(),
+            name: Some("demo.mp4".into()),
+            mimetype: Some("video/mp4".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    store
+        .upsert_message(&ws(), &ChannelId::from("C1"), &msg)
+        .unwrap();
+
+    let cues = vec![
+        crate::types::TranscriptCue {
+            start_secs: 0.5,
+            end_secs: 3.25,
+            text: "Welcome to the checkout demo.".into(),
+        },
+        crate::types::TranscriptCue {
+            start_secs: 3.5,
+            end_secs: 7.0,
+            text: "Latency dropped by half.".into(),
+        },
+    ];
+    let updated = store
+        .upsert_file_transcript_with_cues(
+            &ws(),
+            &video_id,
+            "parakeet-v3",
+            "Welcome to the checkout demo. Latency dropped by half.",
+            &cues,
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    let stored = store.file_transcript(&ws(), &video_id).unwrap().unwrap();
+    assert_eq!(stored.source, "parakeet-v3");
+    assert_eq!(
+        stored.text,
+        "Welcome to the checkout demo. Latency dropped by half."
+    );
+    assert_eq!(stored.cues, cues);
+
+    let all_cues = store.all_file_transcript_cues(&ws()).unwrap();
+    assert_eq!(all_cues.get(&video_id), Some(&cues));
+    assert!(
+        store
+            .all_file_transcript_cues(&TeamId::from("T_OTHER"))
+            .unwrap()
+            .is_empty()
+    );
+
+    // Plain transcript words are searchable in FTS5, while JSON cue metadata keys are NOT indexed.
+    assert_eq!(
+        store
+            .search(&ws(), &SearchQuery::parse("checkout latency"), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .search(&ws(), &SearchQuery::parse("start_secs"), 10)
+            .unwrap()
+            .is_empty()
     );
 }

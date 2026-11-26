@@ -69,10 +69,16 @@ pub fn transcribe_and_index_file(
     local_path: &std::path::Path,
     preferred: huddle::TranscriptionProvider,
 ) -> std::result::Result<(huddle::TranscriptionProvider, String, usize), String> {
-    let (used, text) = huddle::transcribe_media_file(local_path, preferred)?;
-    let trimmed = text.trim().to_owned();
+    let timed = huddle::transcribe_media_file_timed(local_path, preferred)?;
+    let trimmed = timed.text.trim().to_owned();
     let updated = store
-        .upsert_file_transcript(workspace, file_id, used.source_tag(), &trimmed)
+        .upsert_file_transcript_with_cues(
+            workspace,
+            file_id,
+            timed.provider.source_tag(),
+            &trimmed,
+            &timed.cues,
+        )
         .map_err(|e| format!("failed to index transcript in local store: {e}"))?;
-    Ok((used, trimmed, updated))
+    Ok((timed.provider, trimmed, updated))
 }

@@ -1,15 +1,24 @@
 //! Persisted audio/video file transcripts (`file_transcript`) and message-file FTS5 indexing.
 
 use super::*;
-use crate::types::{File, FileId};
+use crate::types::{File, FileId, TranscriptCue};
 
 /// A persisted transcript for an audio or video file attached to one or more messages.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StoredFileTranscript {
     pub file_id: FileId,
     pub source: String,
     pub text: String,
+    pub cues: Vec<TranscriptCue>,
     pub updated_at: i64,
+}
+
+fn decode_cues_json(raw: &str) -> Vec<TranscriptCue> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str::<Vec<TranscriptCue>>(trimmed).unwrap_or_default()
 }
 
 /// Extract Slack's inline clip transcript text from a [`File`]'s metadata
@@ -127,26 +136,61 @@ impl Store {
         source: &str,
         text: &str,
     ) -> Result<usize> {
+        self.upsert_file_transcript_with_cues(workspace, file_id, source, text, &[])
+    }
+
+    /// Persist a video/audio file transcript together with timed [`TranscriptCue`] entries. Plain
+    /// `text` stays indexed in `message_current.file_transcripts` / `message_fts` while `cues` are
+    /// preserved in `file_transcript.cues_json` for clickable seek & live highlighting.
+    pub fn upsert_file_transcript_with_cues(
+        &mut self,
+        workspace: &TeamId,
+        file_id: &FileId,
+        source: &str,
+        text: &str,
+        cues: &[TranscriptCue],
+    ) -> Result<usize> {
         self.ensure_writable()?;
         let trimmed = text.trim();
-        if trimmed.is_empty() {
+        let fallback_from_cues = if trimmed.is_empty() && !cues.is_empty() {
+            TranscriptCue::plain_text(cues)
+        } else {
+            String::new()
+        };
+        let effective_text = if trimmed.is_empty() {
+            fallback_from_cues.as_str()
+        } else {
+            trimmed
+        };
+        if effective_text.is_empty() {
             return Ok(0);
         }
+        let cues_json = if cues.is_empty() {
+            String::new()
+        } else {
+            serde_json::to_string(cues).unwrap_or_default()
+        };
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT INTO file_transcript (workspace_id, file_id, source, text, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO file_transcript (workspace_id, file_id, source, text, cues_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (workspace_id, file_id) DO UPDATE SET
                      source = excluded.source,
                      text = excluded.text,
+                     cues_json = CASE
+                         WHEN excluded.cues_json != '' THEN excluded.cues_json
+                         WHEN excluded.text = file_transcript.text THEN file_transcript.cues_json
+                         ELSE ''
+                     END,
                      updated_at = excluded.updated_at",
             )?;
             stmt.execute(params![
                 workspace.as_str(),
                 file_id.as_str(),
                 source,
-                trimmed,
+                effective_text,
+                cues_json,
                 now_secs(),
             ])?;
         }
@@ -163,17 +207,19 @@ impl Store {
         file_id: &FileId,
     ) -> Result<Option<StoredFileTranscript>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT file_id, source, text, updated_at FROM file_transcript
+            "SELECT file_id, source, text, cues_json, updated_at FROM file_transcript
              WHERE workspace_id = ?1 AND file_id = ?2",
         )?;
         Ok(stmt
             .query_row(params![workspace.as_str(), file_id.as_str()], |r| {
                 let id: String = r.get(0)?;
+                let cues_raw: String = r.get(3)?;
                 Ok(StoredFileTranscript {
                     file_id: FileId::from(id),
                     source: r.get(1)?,
                     text: r.get(2)?,
-                    updated_at: r.get(3)?,
+                    cues: decode_cues_json(&cues_raw),
+                    updated_at: r.get(4)?,
                 })
             })
             .optional()?)
@@ -191,6 +237,29 @@ impl Store {
         for row in rows {
             let (id, text) = row?;
             out.insert(id, text);
+        }
+        Ok(out)
+    }
+
+    /// Load timed transcript cues for every file in `workspace` that has stored cue timestamps.
+    pub fn all_file_transcript_cues(
+        &self,
+        workspace: &TeamId,
+    ) -> Result<HashMap<FileId, Vec<TranscriptCue>>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT file_id, cues_json FROM file_transcript
+             WHERE workspace_id = ?1 AND cues_json != ''",
+        )?;
+        let rows = stmt.query_map(params![workspace.as_str()], |r| {
+            Ok((FileId::from(r.get::<_, String>(0)?), r.get::<_, String>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (id, raw) = row?;
+            let cues = decode_cues_json(&raw);
+            if !cues.is_empty() {
+                out.insert(id, cues);
+            }
         }
         Ok(out)
     }

@@ -14,6 +14,8 @@
 //! modes (the reference screenshot is a light workspace under the same dark viewer), like
 //! the avatar identity chips [`crate::theme`] keeps constant.
 
+use std::cell::Cell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -24,11 +26,12 @@ use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity, EventEmitter,
     FontWeight, Image, ImageFormat, ImageSource, InteractiveElement as _, IntoElement, MouseButton,
-    ObjectFit, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window, div, px, relative,
+    MouseDownEvent, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div,
+    px, relative,
 };
 use slackless_core::huddle::NativeVideoPlayer;
-use slackless_core::types::{Block, FileId, Message, UserId, time};
+use slackless_core::types::{Block, FileId, Message, TranscriptCue, UserId, time};
 
 use crate::avatars;
 use crate::fixtures::Fixtures;
@@ -77,8 +80,18 @@ pub struct ViewerVideo {
     pub vtt_url: Option<String>,
 }
 
-/// One image or video the viewer can show: the rendition (fixture pixels or a live url the app's
-/// HTTP client loads only while the viewer paints it) plus the header's metadata.
+/// Metadata for a PDF document displayed page-by-page inside [`ImageViewer`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewerPdf {
+    pub file_id: String,
+    pub url: String,
+    /// Optional local file path (used by tests or already-local PDFs without network fetch).
+    pub local_path: Option<PathBuf>,
+    pub page_count: Option<u32>,
+}
+
+/// One image, video, or PDF the viewer can show: the rendition (fixture pixels or a live url the
+/// app's HTTP client loads only while the viewer paints it) plus the header's metadata.
 pub struct ViewerImage {
     pub source: ImageSource,
     /// The file name under the header ("<file name>").
@@ -91,6 +104,42 @@ pub struct ViewerImage {
     pub download: Option<(String, String)>,
     /// Present when this viewer item is a playable video rather than a static/animated image.
     pub video: Option<ViewerVideo>,
+    /// Present when this viewer item is a multi-page PDF document rendered natively.
+    pub pdf: Option<ViewerPdf>,
+}
+
+impl ViewerImage {
+    /// Build a standalone [`ViewerImage`] from an active inline video's [`InlineVideoMeta`] so
+    /// the floating mini-player / picture-in-picture dock can expand directly into [`ImageViewer`].
+    pub fn from_inline_video_meta(
+        fixtures: &Fixtures,
+        meta: &crate::media::InlineVideoMeta,
+    ) -> Self {
+        let fid = FileId::from(meta.file_id.clone());
+        let source = match fixtures.thumbnails.get(&fid) {
+            Some(image) => ImageSource::Image(image.clone()),
+            None => match meta.poster_url.as_ref() {
+                Some(poster) => ImageSource::from(SharedString::from(poster.clone())),
+                None => empty_placeholder_source(),
+            },
+        };
+        Self {
+            source,
+            name: meta.title.clone(),
+            user: meta.user.clone(),
+            taken_at: meta.taken_at,
+            download: meta.download.clone(),
+            video: Some(ViewerVideo {
+                file_id: meta.file_id.clone(),
+                url: meta.url.clone(),
+                ext: meta.ext.clone(),
+                duration_ms: meta.duration_ms,
+                inline_transcript: meta.inline_transcript.clone(),
+                vtt_url: meta.vtt_url.clone(),
+            }),
+            pdf: None,
+        }
+    }
 }
 
 /// A conversation image paired with the click identity that opened it.
@@ -163,6 +212,37 @@ pub fn message_images(fixtures: &Fixtures, message: &Message) -> Vec<ImageEntry>
                         inline_transcript: crate::files::inline_clip_transcript(file),
                         vtt_url: crate::files::clip_vtt_url(file),
                     }),
+                    pdf: None,
+                },
+            });
+            continue;
+        }
+        if crate::files::is_pdf(file) {
+            let Some(pdf_url) = crate::files::download_url(file) else {
+                continue;
+            };
+            let source = match fixtures.thumbnails.get(&file.id) {
+                Some(image) => ImageSource::Image(image.clone()),
+                None => match crate::files::pdf_thumb_url(file) {
+                    Some(thumb) => ImageSource::from(SharedString::from(thumb)),
+                    None => empty_placeholder_source(),
+                },
+            };
+            entries.push(ImageEntry {
+                origin: ImageOrigin::File(ix),
+                image: ViewerImage {
+                    source,
+                    download: Some((pdf_url.clone(), name.clone())),
+                    name,
+                    user: file.user.clone().or_else(|| author.clone()),
+                    taken_at: file.timestamp.or(taken_at),
+                    video: None,
+                    pdf: Some(ViewerPdf {
+                        file_id: file.id.to_string(),
+                        url: pdf_url,
+                        local_path: None,
+                        page_count: None,
+                    }),
                 },
             });
             continue;
@@ -206,6 +286,7 @@ pub fn message_images(fixtures: &Fixtures, message: &Message) -> Vec<ImageEntry>
                 user: file.user.clone().or_else(|| author.clone()),
                 taken_at: file.timestamp.or(taken_at),
                 video: None,
+                pdf: None,
             },
         });
     }
@@ -283,6 +364,7 @@ fn url_image(
         taken_at,
         download: Some((url.to_owned(), url_tail(url))),
         video: None,
+        pdf: None,
     })
 }
 
@@ -385,6 +467,9 @@ pub fn collect_viewer_images<'a>(
 
 /// Number of post-pause/seek ticks before the viewer's video timer idles at 0% CPU.
 const VIEWER_SETTLE_TICKS: u32 = 15;
+/// Target max pixel box for native macOS PDF page rendering inside [`ImageViewer`].
+const VIEWER_PDF_MAX_W: u32 = 1600;
+const VIEWER_PDF_MAX_H: u32 = 2200;
 
 struct ViewerVideoPlayback {
     generation: u64,
@@ -395,13 +480,21 @@ struct ViewerVideoPlayback {
     fallback_duration_secs: f64,
 }
 
+struct ViewerPdfPlayback {
+    loading: bool,
+    page_index: u32,
+    page_count: Option<u32>,
+    rendered_page: Option<Arc<Image>>,
+    error: Option<String>,
+}
+
 /// The viewer overlay: an entity so the root can mount it like the other overlays and
 /// drop it (and the large rendition / video player it holds) on close.
 pub struct ImageViewer {
     fixtures: Arc<Fixtures>,
     /// The conversation label the header shows ("# design").
     channel: String,
-    /// Every image/video in the conversation (transcript order); only the shown one is painted,
+    /// Every image/video/PDF in the conversation (transcript order); only the shown one is painted,
     /// so only it loads.
     images: Rc<Vec<ViewerImage>>,
     index: usize,
@@ -412,6 +505,9 @@ pub struct ImageViewer {
     video_playback: Option<ViewerVideoPlayback>,
     video_load_task: Option<Task<()>>,
     video_tick_task: Option<Task<()>>,
+    pdf_gen: u64,
+    pdf_playback: Option<ViewerPdfPlayback>,
+    pdf_load_task: Option<Task<()>>,
     show_transcript: bool,
     transcript_copied: bool,
 }
@@ -419,6 +515,7 @@ pub struct ImageViewer {
 impl Drop for ImageViewer {
     fn drop(&mut self) {
         self.stop_video();
+        self.stop_pdf();
     }
 }
 
@@ -426,10 +523,10 @@ impl EventEmitter<ViewerEvent> for ImageViewer {}
 
 impl ImageViewer {
     /// Evict decoded full-resolution image textures loaded by this viewer from GPUI's window &
-    /// asset caches and immediately stop any active video playback so audio never leaks after
-    /// close.
+    /// asset caches and immediately stop any active video playback or PDF render tasks.
     pub fn evict_assets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_video();
+        self.stop_pdf();
         for entry in self.images.iter() {
             if let ImageSource::Resource(ref resource) = entry.source {
                 if let Some(Ok(data)) =
@@ -480,6 +577,9 @@ impl ImageViewer {
                 video_playback: None,
                 video_load_task: None,
                 video_tick_task: None,
+                pdf_gen: 0,
+                pdf_playback: None,
+                pdf_load_task: None,
                 show_transcript: false,
                 transcript_copied: false,
             }
@@ -493,6 +593,11 @@ impl ImageViewer {
         &self.images[self.index]
     }
 
+    /// Total number of items in the viewer's gallery list.
+    pub fn item_count(&self) -> usize {
+        self.images.len()
+    }
+
     /// Update workspace fixtures (e.g. when a newly transcribed video's transcript lands live).
     pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
         self.fixtures = fixtures;
@@ -502,6 +607,171 @@ impl ImageViewer {
     /// Whether the currently shown item is a playable video.
     pub fn is_video(&self) -> bool {
         self.current().video.is_some()
+    }
+
+    /// Whether the currently shown item is a multi-page PDF document.
+    pub fn is_pdf(&self) -> bool {
+        self.current().pdf.is_some()
+    }
+
+    /// Current zero-based page index when viewing a PDF document.
+    pub fn pdf_page(&self) -> u32 {
+        self.pdf_playback.as_ref().map_or(0, |p| p.page_index)
+    }
+
+    /// Known total page count for the currently shown PDF document.
+    pub fn pdf_page_count(&self) -> Option<u32> {
+        self.pdf_playback
+            .as_ref()
+            .and_then(|p| p.page_count)
+            .or_else(|| self.current().pdf.as_ref().and_then(|p| p.page_count))
+    }
+
+    /// Step previous (`-1`) or next (`+1`) page inside the currently displayed PDF document.
+    /// Returns `true` if the page changed.
+    pub fn step_pdf_page(
+        &mut self,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.is_pdf() {
+            return false;
+        }
+        let Some(total) = self.pdf_page_count() else {
+            return false;
+        };
+        if total <= 1 {
+            return false;
+        }
+        let cur = self.pdf_page() as isize;
+        let next = (cur + delta).clamp(0, total.saturating_sub(1) as isize) as u32;
+        if next == self.pdf_page() {
+            return false;
+        }
+        self.load_pdf_page(next, window, cx);
+        true
+    }
+
+    /// Stop and drop any active PDF render task and page state immediately.
+    pub fn stop_pdf(&mut self) {
+        self.pdf_gen = self.pdf_gen.wrapping_add(1);
+        self.pdf_load_task = None;
+        self.pdf_playback = None;
+    }
+
+    fn load_pdf_page(&mut self, page_index: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pdf) = self.current().pdf.clone() else {
+            return;
+        };
+        self.pdf_gen = self.pdf_gen.wrapping_add(1);
+        let generation = self.pdf_gen;
+        let prev_count = self
+            .pdf_playback
+            .as_ref()
+            .and_then(|p| p.page_count)
+            .or(pdf.page_count)
+            .or_else(|| crate::media::cached_pdf_page_count(&pdf.file_id, cx));
+        let prev_page = self
+            .pdf_playback
+            .as_ref()
+            .and_then(|p| p.rendered_page.clone());
+
+        if let Some(cached) = crate::media::cached_pdf_page(
+            &pdf.file_id,
+            page_index,
+            VIEWER_PDF_MAX_W,
+            VIEWER_PDF_MAX_H,
+            cx,
+        ) {
+            self.pdf_load_task = None;
+            self.pdf_playback = Some(ViewerPdfPlayback {
+                loading: false,
+                page_index,
+                page_count: prev_count.or(Some(page_index + 1)),
+                rendered_page: Some(cached.image),
+                error: None,
+            });
+            cx.notify();
+            return;
+        }
+
+        let fetcher = if pdf.local_path.is_some() {
+            None
+        } else {
+            let Some(fetcher) = crate::media::active_fetcher(cx) else {
+                self.pdf_load_task = None;
+                self.pdf_playback = Some(ViewerPdfPlayback {
+                    loading: false,
+                    page_index,
+                    page_count: prev_count,
+                    rendered_page: prev_page,
+                    error: Some("PDF preview requires a signed-in workspace.".to_owned()),
+                });
+                cx.notify();
+                return;
+            };
+            Some(fetcher)
+        };
+
+        self.pdf_playback = Some(ViewerPdfPlayback {
+            loading: true,
+            page_index,
+            page_count: prev_count,
+            rendered_page: prev_page,
+            error: None,
+        });
+        cx.notify();
+
+        let file_id = pdf.file_id;
+        let url = pdf.url;
+        let local_path = pdf.local_path;
+        self.pdf_load_task = Some(cx.spawn_in(window, async move |weak, cx| {
+            let bg = cx.background_executor().clone();
+            let res = crate::media::fetch_and_render_pdf_page(
+                fetcher,
+                file_id.clone(),
+                url,
+                local_path,
+                page_index,
+                (VIEWER_PDF_MAX_W, VIEWER_PDF_MAX_H),
+                bg,
+            )
+            .await;
+            let _ = weak.update_in(cx, |viewer, _, cx| {
+                if viewer.pdf_gen != generation {
+                    return;
+                }
+                match res {
+                    Ok((page_count, rendered)) => {
+                        let clamped = page_index.min(page_count.saturating_sub(1));
+                        crate::media::store_cached_pdf_page(
+                            file_id,
+                            clamped,
+                            VIEWER_PDF_MAX_W,
+                            VIEWER_PDF_MAX_H,
+                            page_count,
+                            rendered.clone(),
+                            cx,
+                        );
+                        viewer.pdf_playback = Some(ViewerPdfPlayback {
+                            loading: false,
+                            page_index: clamped,
+                            page_count: Some(page_count),
+                            rendered_page: Some(rendered.image),
+                            error: None,
+                        });
+                    }
+                    Err(err) => {
+                        if let Some(pb) = viewer.pdf_playback.as_mut() {
+                            pb.loading = false;
+                            pb.error = Some(err);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        }));
     }
 
     /// Toggle visibility of the right-side video transcript drawer; lazily fetches WebVTT when
@@ -523,9 +793,13 @@ impl ImageViewer {
             return;
         };
         let fid = FileId::from(video.file_id.clone());
-        let has_local_or_inline =
-            self.fixtures.file_transcript(&fid).is_some() || video.inline_transcript.is_some();
-        if !has_local_or_inline && let Some(vtt_url) = video.vtt_url.as_ref() {
+        let has_timed_cues = self.fixtures.file_transcript_cues(&fid).is_some()
+            || !crate::files::clip_transcript_status(&fid, cx)
+                .cues
+                .is_empty();
+        // Fetch VTT whenever we do not yet have timed cues (upgrading plain inline previews to
+        // clickable timestamped cues).
+        if !has_timed_cues && let Some(vtt_url) = video.vtt_url.as_ref() {
             crate::files::fetch_clip_vtt_if_needed(fid, vtt_url.clone(), window, cx);
         }
     }
@@ -534,16 +808,22 @@ impl ImageViewer {
         &self,
         video: &ViewerVideo,
         cx: &App,
-    ) -> (Option<String>, bool, Option<String>) {
+    ) -> (Option<String>, Vec<TranscriptCue>, bool, Option<String>) {
         let fid = FileId::from(video.file_id.clone());
         let cached = crate::files::clip_transcript_status(&fid, cx);
+        let cues = self
+            .fixtures
+            .file_transcript_cues(&fid)
+            .map(|s| s.to_vec())
+            .unwrap_or(cached.cues);
         let text = self
             .fixtures
             .file_transcript(&fid)
             .map(str::to_owned)
             .or(cached.text)
+            .or_else(|| (!cues.is_empty()).then(|| TranscriptCue::plain_text(&cues)))
             .or_else(|| video.inline_transcript.clone());
-        (text, cached.loading, cached.error)
+        (text, cues, cached.loading, cached.error)
     }
 
     /// Stop and drop any active video player and background tasks immediately.
@@ -554,11 +834,15 @@ impl ImageViewer {
         self.video_playback = None;
     }
 
-    /// Sync video playback to `self.current()`: stops any previous video, and if the current
-    /// item is a video, hands off from inline playback, fetches/caches, opens `NativeVideoPlayer`,
-    /// and starts playback.
+    /// Sync video or PDF playback to `self.current()`: stops any previous video/PDF, and starts
+    /// loading the current item if it is a video or PDF.
     fn sync_current_media(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_video();
+        self.stop_pdf();
+        if self.current().pdf.is_some() {
+            self.load_pdf_page(0, window, cx);
+            return;
+        }
         let Some(video) = self.current().video.clone() else {
             return;
         };
@@ -753,6 +1037,19 @@ impl ImageViewer {
         };
         let muted = !player.state().muted;
         player.set_muted(muted);
+        cx.notify();
+    }
+
+    /// Adjust playback volume by `delta` (`-1.0..=1.0`, e.g. `±0.1`) on the viewer's open video.
+    pub fn adjust_video_volume(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let Some(player) = self
+            .video_playback
+            .as_ref()
+            .and_then(|pb| pb.player.as_ref())
+        else {
+            return;
+        };
+        player.adjust_volume(delta);
         cx.notify();
     }
 
@@ -1000,6 +1297,7 @@ impl Render for ImageViewer {
             );
 
         let is_video = image.video.is_some();
+        let is_pdf = image.pdf.is_some();
         let (
             vid_loading,
             vid_playing,
@@ -1008,6 +1306,7 @@ impl Render for ImageViewer {
             vid_pos,
             vid_dur,
             vid_rate,
+            vid_volume,
             vid_surface,
             vid_err,
         ) = if is_video {
@@ -1027,6 +1326,11 @@ impl Render for ImageViewer {
                     } else {
                         1.0
                     };
+                    let vol = if st.volume.is_finite() {
+                        st.volume.clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
                     (
                         pb.loading,
                         st.playing,
@@ -1035,6 +1339,7 @@ impl Render for ImageViewer {
                         crate::media::sanitize_secs(st.position_secs),
                         effective_dur,
                         rate,
+                        vol,
                         surface,
                         pb.error.clone(),
                     )
@@ -1047,15 +1352,16 @@ impl Render for ImageViewer {
                         0.0,
                         pb.fallback_duration_secs,
                         1.0,
+                        1.0,
                         pb.last_frame.clone(),
                         pb.error.clone(),
                     )
                 }
             } else {
-                (false, false, false, false, 0.0, 0.0, 1.0, None, None)
+                (false, false, false, false, 0.0, 0.0, 1.0, 1.0, None, None)
             }
         } else {
-            (false, false, false, false, 0.0, 0.0, 1.0, None, None)
+            (false, false, false, false, 0.0, 0.0, 1.0, 1.0, None, None)
         };
 
         let stage_content = if is_video {
@@ -1144,6 +1450,74 @@ impl Render for ImageViewer {
                 ))
                 .children(overlay)
                 .into_any_element()
+        } else if is_pdf {
+            let fg = theme::media_overlay_foreground();
+            let (pdf_loading, pdf_page_img, pdf_err) = match self.pdf_playback.as_ref() {
+                Some(pb) => (pb.loading, pb.rendered_page.clone(), pb.error.clone()),
+                None => (false, None, None),
+            };
+            let page_source = pdf_page_img
+                .map(ImageSource::Image)
+                .or_else(|| poster_source_if_present(&image.source));
+            let pdf_overlay = if pdf_loading {
+                Some(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1p5()
+                                .rounded_full()
+                                .bg(theme::media_overlay_scrim_strong())
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(fg)
+                                .child("Rendering PDF\u{2026}"),
+                        ),
+                )
+            } else {
+                pdf_err.map(|err| {
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .rounded_lg()
+                                .bg(theme::media_overlay_scrim_strong())
+                                .border_1()
+                                .border_color(chrome.border)
+                                .text_xs()
+                                .text_color(fg)
+                                .child(err),
+                        )
+                })
+            };
+            div()
+                .id("viewer-pdf-stage")
+                .relative()
+                .w(relative(zoom))
+                .h(relative(zoom))
+                .flex()
+                .items_center()
+                .justify_center()
+                .when_some(page_source, |el, src| {
+                    el.child(
+                        crate::media::Picture::new(src)
+                            .fit(ObjectFit::Contain)
+                            .radius(px(6.)),
+                    )
+                })
+                .children(pdf_overlay)
+                .into_any_element()
         } else {
             div()
                 .w(relative(zoom))
@@ -1163,17 +1537,117 @@ impl Render for ImageViewer {
             && let Some(video) = image.video.clone()
         {
             let fid = FileId::from(video.file_id.clone());
-            let (transcript_text, loading_vtt, vtt_error) =
+            let (transcript_text, transcript_cues, loading_vtt, vtt_error) =
                 self.resolve_video_transcript(&video, cx);
             let transcribing = crate::media::is_transcribing(&fid, cx);
             let copied = self.transcript_copied;
             let copy_text = transcript_text.clone();
             let can_transcribe = transcript_text.is_none()
+                && transcript_cues.is_empty()
                 && !loading_vtt
                 && !transcribing
                 && !video.url.is_empty()
                 && !crate::media::is_hls_url(&video.url);
-            let body_el: AnyElement = if let Some(text) = transcript_text {
+            let active_cue_idx = if vid_playing || vid_pos > 0.0 {
+                TranscriptCue::active_index(&transcript_cues, vid_pos)
+            } else {
+                None
+            };
+            let body_el: AnyElement = if !transcript_cues.is_empty() {
+                v_flex()
+                    .gap_1()
+                    .children(transcript_cues.into_iter().enumerate().map(|(idx, cue)| {
+                        let is_active = active_cue_idx == Some(idx);
+                        let start_secs = cue.start_secs;
+                        let stamp_label = TranscriptCue::format_timestamp(start_secs);
+                        let down_pos: Rc<Cell<Option<Point<Pixels>>>> = Rc::new(Cell::new(None));
+                        let down_pos_up = Rc::clone(&down_pos);
+                        let text_el = crate::messages::selectable_text(
+                            &format!("viewer-transcript-{}-{idx}", video.file_id),
+                            0,
+                            cue.text,
+                            Some(if is_active {
+                                chrome.text
+                            } else {
+                                chrome.text_muted
+                            }),
+                            VIEWER_TRANSCRIPT_ORDER + (idx as u64 + 1) * 16,
+                            cx,
+                        );
+                        h_flex()
+                            .id(SharedString::from(format!("viewer-cue-{idx}")))
+                            .items_start()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_l_2()
+                            .border_color(if is_active {
+                                chrome.text
+                            } else {
+                                gpui_kit::gpui::transparent_black()
+                            })
+                            .when(is_active, |row| row.bg(chrome.button_hover))
+                            .hover(move |row| row.bg(chrome.button))
+                            .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _, _| {
+                                if ev.click_count == 1 {
+                                    down_pos.set(Some(ev.position));
+                                } else {
+                                    down_pos.set(None);
+                                }
+                            })
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |viewer, ev: &MouseUpEvent, window, cx| {
+                                    if let Some(origin) = down_pos_up.take() {
+                                        let dx: f32 = (ev.position.x - origin.x).into();
+                                        let dy: f32 = (ev.position.y - origin.y).into();
+                                        if dx.abs() < 4.0 && dy.abs() < 4.0 {
+                                            viewer.seek_video(start_secs, window, cx);
+                                        }
+                                    }
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("viewer-cue-ts-{idx}")))
+                                    .flex_none()
+                                    .px_1p5()
+                                    .py(px(1.))
+                                    .rounded_sm()
+                                    .bg(if is_active {
+                                        chrome.button
+                                    } else {
+                                        gpui_kit::gpui::transparent_black()
+                                    })
+                                    .text_size(px(11.))
+                                    .font_weight(if is_active {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::MEDIUM
+                                    })
+                                    .text_color(if is_active {
+                                        chrome.text
+                                    } else {
+                                        chrome.text_dim
+                                    })
+                                    .cursor_pointer()
+                                    .hover(move |b| {
+                                        b.bg(chrome.button_hover).text_color(chrome.text)
+                                    })
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(move |viewer, _, window, cx| {
+                                        cx.stop_propagation();
+                                        viewer.seek_video(start_secs, window, cx);
+                                    }))
+                                    .child(stamp_label),
+                            )
+                            .child(div().flex_1().min_w_0().child(text_el))
+                    }))
+                    .into_any_element()
+            } else if let Some(text) = transcript_text {
                 crate::messages::selectable_text(
                     &format!("viewer-transcript-{}", video.file_id),
                     0,
@@ -1463,18 +1937,19 @@ impl Render for ImageViewer {
                         })),
                 )
                 .child(
-                    div()
+                    h_flex()
                         .id("viewer-video-mute")
                         .flex_none()
-                        .size(px(28.))
+                        .h(px(28.))
+                        .px_1p5()
+                        .gap_1()
                         .rounded_md()
-                        .flex()
                         .items_center()
                         .justify_center()
                         .cursor_pointer()
                         .hover(move |b| b.bg(chrome.button_hover))
                         .child(
-                            Icon::new(if vid_muted {
+                            Icon::new(if vid_muted || vid_volume <= 0.001 {
                                 IconName::VolumeX
                             } else {
                                 IconName::Volume2
@@ -1482,6 +1957,15 @@ impl Render for ImageViewer {
                             .text_color(chrome.text)
                             .size(px(15.)),
                         )
+                        .when(!vid_muted && (vid_volume - 1.0).abs() > 0.01, |row| {
+                            row.child(
+                                div()
+                                    .text_size(px(10.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(chrome.text_muted)
+                                    .child(format!("{}%", (vid_volume * 100.0).round() as u32)),
+                            )
+                        })
                         .on_click(cx.listener(|viewer, _, _, cx| {
                             viewer.toggle_video_mute(cx);
                         })),
@@ -1607,6 +2091,79 @@ impl Render for ImageViewer {
             }
         };
 
+        let pdf_pager = is_pdf.then(|| {
+            let page_ix = self.pdf_page();
+            let page_count = self.pdf_page_count();
+            let prev_page_enabled = page_ix > 0;
+            let next_page_enabled = page_count.is_some_and(|n| page_ix + 1 < n);
+            let page_label = match page_count {
+                Some(total) => format!("Page {} / {}", page_ix + 1, total),
+                None => format!("Page {}", page_ix + 1),
+            };
+            h_flex()
+                .id("viewer-pdf-pager")
+                .items_center()
+                .gap_1()
+                .px_1p5()
+                .h(px(CONTROL_BUTTON))
+                .rounded_lg()
+                .bg(chrome.glass)
+                .border_1()
+                .border_color(chrome.border)
+                .child(
+                    div()
+                        .id("viewer-pdf-prev")
+                        .flex_none()
+                        .size(px(26.))
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(prev_page_enabled, |b| {
+                            b.cursor_pointer().hover(move |h| h.bg(chrome.button_hover))
+                        })
+                        .when(!prev_page_enabled, |b| b.opacity(0.35))
+                        .child(
+                            Icon::new(IconName::ChevronLeft)
+                                .size(px(15.))
+                                .text_color(chrome.text),
+                        )
+                        .on_click(cx.listener(|viewer, _, window, cx| {
+                            viewer.step_pdf_page(-1, window, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .px_1p5()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(chrome.text)
+                        .child(page_label),
+                )
+                .child(
+                    div()
+                        .id("viewer-pdf-next")
+                        .flex_none()
+                        .size(px(26.))
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(next_page_enabled, |b| {
+                            b.cursor_pointer().hover(move |h| h.bg(chrome.button_hover))
+                        })
+                        .when(!next_page_enabled, |b| b.opacity(0.35))
+                        .child(
+                            Icon::new(IconName::ChevronRight)
+                                .size(px(15.))
+                                .text_color(chrome.text),
+                        )
+                        .on_click(cx.listener(|viewer, _, window, cx| {
+                            viewer.step_pdf_page(1, window, cx);
+                        })),
+                )
+        });
+
         let footer = if is_video {
             h_flex()
                 .items_center()
@@ -1617,6 +2174,23 @@ impl Render for ImageViewer {
                 .pt(px(4.))
                 .child(div().flex_1().min_w_0())
                 .child(div().flex_none().child(bottom_controls))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .justify_end()
+                        .child(download_control),
+                )
+        } else if let Some(pager) = pdf_pager {
+            h_flex()
+                .items_center()
+                .gap_2()
+                .flex_none()
+                .px(px(12.))
+                .pb(px(12.))
+                .pt(px(4.))
+                .child(div().flex_1().min_w_0().child(bottom_controls))
+                .child(div().flex_none().child(pager))
                 .child(
                     h_flex()
                         .flex_1()
@@ -1900,6 +2474,7 @@ mod tests {
                 taken_at: None,
                 download: None,
                 video: None,
+                pdf: None,
             },
             ViewerImage {
                 source: empty_placeholder_source(),
@@ -1918,6 +2493,7 @@ mod tests {
                     inline_transcript: Some("Welcome to the walkthrough clip.".into()),
                     vtt_url: None,
                 }),
+                pdf: None,
             },
         ]);
         let (viewer, cx) = cx.add_window_view(|window, cx| {
@@ -1967,5 +2543,205 @@ mod tests {
             assert!(iv.read(cx).video_playback.is_none());
         });
         cx.run_until_parked();
+    }
+
+    #[test]
+    fn message_images_collects_pdfs_alongside_images_and_videos() {
+        let fixtures = crate::fixtures::load();
+        let pdf_file = File {
+            id: FileId::from("F_PDF1"),
+            name: Some("architecture.pdf".into()),
+            mimetype: Some("application/pdf".into()),
+            filetype: Some("pdf".into()),
+            thumb_pdf: Some("https://files.slack.com/tmb/architecture.png".into()),
+            url_private: Some("https://files.slack.com/pri/architecture.pdf".into()),
+            url_private_download: Some("https://files.slack.com/dl/architecture.pdf".into()),
+            ..Default::default()
+        };
+        let msg = Message {
+            ts: Ts::from("1700000001.000100"),
+            user: Some(UserId::from("U_ALICE")),
+            files: vec![pdf_file],
+            ..Default::default()
+        };
+        let entries = message_images(&fixtures, &msg);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].origin, ImageOrigin::File(0));
+        assert_eq!(entries[0].image.name, "architecture.pdf");
+        assert!(entries[0].image.video.is_none());
+        assert_eq!(
+            entries[0].image.pdf,
+            Some(ViewerPdf {
+                file_id: "F_PDF1".into(),
+                url: "https://files.slack.com/dl/architecture.pdf".into(),
+                local_path: None,
+                page_count: None,
+            })
+        );
+    }
+
+    #[gpui::test]
+    fn viewer_renders_timestamped_clickable_transcript_cues(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let cues = vec![
+            TranscriptCue {
+                start_secs: 0.0,
+                end_secs: 3.0,
+                text: "First spoken segment.".into(),
+            },
+            TranscriptCue {
+                start_secs: 3.5,
+                end_secs: 7.0,
+                text: "Second spoken segment.".into(),
+            },
+        ];
+        let fixtures = Arc::new(crate::fixtures::load().with_file_transcript_cues(
+            FileId::from("F_TIMED"),
+            "First spoken segment. Second spoken segment.".into(),
+            cues.clone(),
+        ));
+        let items = Rc::new(vec![ViewerImage {
+            source: empty_placeholder_source(),
+            name: "walkthrough.mp4".into(),
+            user: None,
+            taken_at: None,
+            download: None,
+            video: Some(ViewerVideo {
+                file_id: "F_TIMED".into(),
+                url: "https://files.slack.com/pri/walkthrough.mp4".into(),
+                ext: "mp4".into(),
+                duration_ms: Some(10_000),
+                inline_transcript: None,
+                vtt_url: None,
+            }),
+            pdf: None,
+        }]);
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let entity = ImageViewer::new(fixtures, "#eng".into(), items, 0, window, cx);
+            struct Host(Entity<ImageViewer>);
+            impl Render for Host {
+                fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                    self.0.clone()
+                }
+            }
+            Host(entity)
+        });
+        cx.update(|window, cx| {
+            let iv = host.read(cx).0.clone();
+            iv.update(cx, |v, cx| v.toggle_transcript(window, cx));
+            assert!(iv.read(cx).showing_transcript());
+            let (text, resolved_cues, _, _) = iv
+                .read(cx)
+                .resolve_video_transcript(iv.read(cx).current().video.as_ref().unwrap(), cx);
+            assert_eq!(
+                text.as_deref(),
+                Some("First spoken segment. Second spoken segment.")
+            );
+            assert_eq!(resolved_cues, cues);
+            let _ = window.draw(cx);
+            iv.update(cx, |v, cx| v.evict_assets(window, cx));
+        });
+        cx.run_until_parked();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn viewer_renders_and_steps_multipage_local_pdf(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let path = std::env::temp_dir().join(format!(
+            "slackless-viewer-pdf-test-{}.pdf",
+            std::process::id()
+        ));
+        let pdf_bytes = {
+            let mut out = Vec::new();
+            out.extend_from_slice(b"%PDF-1.4\n");
+            let mut offs = Vec::new();
+            offs.push(out.len());
+            out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+            offs.push(out.len());
+            out.extend_from_slice(
+                b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+            );
+            offs.push(out.len());
+            out.extend_from_slice(
+                b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] >>\nendobj\n",
+            );
+            offs.push(out.len());
+            out.extend_from_slice(
+                b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] >>\nendobj\n",
+            );
+            let xref = out.len();
+            out.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+            for o in offs {
+                out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+            }
+            out.extend_from_slice(
+                format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            out
+        };
+        std::fs::write(&path, pdf_bytes).expect("write test PDF");
+
+        let items = Rc::new(vec![ViewerImage {
+            source: empty_placeholder_source(),
+            name: "spec.pdf".into(),
+            user: None,
+            taken_at: None,
+            download: None,
+            video: None,
+            pdf: Some(ViewerPdf {
+                file_id: "F_LOCAL_PDF".into(),
+                url: String::new(),
+                local_path: Some(path.clone()),
+                page_count: None,
+            }),
+        }]);
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let entity = ImageViewer::new(
+                Arc::new(crate::fixtures::load()),
+                "#eng".into(),
+                items,
+                0,
+                window,
+                cx,
+            );
+            struct Host(Entity<ImageViewer>);
+            impl Render for Host {
+                fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                    self.0.clone()
+                }
+            }
+            Host(entity)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let iv = host.read(cx).0.clone();
+            assert!(iv.read(cx).is_pdf());
+            assert_eq!(iv.read(cx).pdf_page(), 0);
+            assert_eq!(iv.read(cx).pdf_page_count(), Some(2));
+            let _ = window.draw(cx);
+            assert!(iv.update(cx, |v, cx| v.step_pdf_page(1, window, cx)));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let iv = host.read(cx).0.clone();
+            assert_eq!(iv.read(cx).pdf_page(), 1);
+            assert!(!iv.update(cx, |v, cx| v.step_pdf_page(1, window, cx)));
+            let _ = window.draw(cx);
+            // Stepping back to page 0 hits the LRU cache synchronously.
+            assert!(iv.update(cx, |v, cx| v.step_pdf_page(-1, window, cx)));
+            assert_eq!(iv.read(cx).pdf_page(), 0);
+            iv.update(cx, |v, cx| v.evict_assets(window, cx));
+            assert!(iv.read(cx).pdf_playback.is_none());
+        });
+        cx.run_until_parked();
+        let _ = std::fs::remove_file(&path);
     }
 }

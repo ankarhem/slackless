@@ -24,7 +24,7 @@ use gpui_kit::gpui::{
 use slackless_core::huddle::{
     NativeVideoPlayer, TranscriptionProvider, resolve_local_file_provider,
 };
-use slackless_core::types::FileId;
+use slackless_core::types::{ChannelId, FileId, Ts, UserId};
 
 use super::audio_player::fetch_cached_media;
 use super::downloads::active_fetcher;
@@ -57,6 +57,33 @@ pub struct InlineVideoSnapshot {
     pub surface: Option<Arc<VideoSurface>>,
 }
 
+/// Metadata describing the currently playing inline video so the floating mini-player /
+/// picture-in-picture dock can show its title, jump back to its source message, or expand cleanly
+/// into [`crate::image_viewer::ImageViewer`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InlineVideoMeta {
+    pub file_id: String,
+    pub title: String,
+    pub channel: Option<ChannelId>,
+    pub message_ts: Option<Ts>,
+    pub url: String,
+    pub ext: String,
+    pub duration_ms: Option<u64>,
+    pub poster_url: Option<String>,
+    pub inline_transcript: Option<String>,
+    pub vtt_url: Option<String>,
+    pub download: Option<(String, String)>,
+    pub user: Option<UserId>,
+    pub taken_at: Option<i64>,
+}
+
+/// Snapshot rendered by the floating mini-player / picture-in-picture dock.
+#[derive(Clone, Debug)]
+pub struct PipVideoSnapshot {
+    pub meta: InlineVideoMeta,
+    pub snapshot: InlineVideoSnapshot,
+}
+
 /// Carried-over inline playback state when expanding a video into [`crate::image_viewer::ImageViewer`].
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct InlineVideoHandoff {
@@ -68,14 +95,19 @@ struct ActiveInlineVideo {
     generation: u64,
     tick_gen: u64,
     file_id: String,
+    meta: InlineVideoMeta,
     loading: bool,
     player: Option<NativeVideoPlayer>,
     last_frame: Option<Arc<VideoSurface>>,
+    last_rendered_epoch: u64,
+    inline_in_viewport: bool,
+    pip_engaged: bool,
 }
 
 #[derive(Default)]
 struct InlineVideoManager {
     next_generation: u64,
+    frame_epoch: u64,
     active: Option<ActiveInlineVideo>,
     /// One-shot `(file_id, handoff)` stashed when expanding from inline playback into
     /// [`crate::image_viewer::ImageViewer`] so the viewer resumes at the exact timestamp and speed.
@@ -169,12 +201,7 @@ pub(crate) fn copy_player_surface(_player: &NativeVideoPlayer) -> Option<Arc<Vid
     None
 }
 
-/// Current inline video playback snapshot for `file_id`, if it is loading, playing, or paused.
-pub fn inline_video_snapshot(file_id: &str, cx: &App) -> Option<InlineVideoSnapshot> {
-    let active = cx.try_global::<InlineVideoManager>()?.active.as_ref()?;
-    if active.file_id != file_id {
-        return None;
-    }
+fn snapshot_from_active(active: &ActiveInlineVideo) -> Option<InlineVideoSnapshot> {
     if active.loading {
         return Some(InlineVideoSnapshot {
             loading: true,
@@ -183,7 +210,7 @@ pub fn inline_video_snapshot(file_id: &str, cx: &App) -> Option<InlineVideoSnaps
             ended: false,
             failed: false,
             position_secs: 0.0,
-            duration_secs: 0.0,
+            duration_secs: active.meta.duration_ms.map_or(0.0, |ms| ms as f64 / 1000.0),
             rate: 1.0,
             width: 0,
             height: 0,
@@ -198,6 +225,12 @@ pub fn inline_video_snapshot(file_id: &str, cx: &App) -> Option<InlineVideoSnaps
     } else {
         1.0
     };
+    let dur = sanitize_secs(st.duration_secs);
+    let duration_secs = if dur > 0.0 {
+        dur
+    } else {
+        active.meta.duration_ms.map_or(0.0, |ms| ms as f64 / 1000.0)
+    };
     Some(InlineVideoSnapshot {
         loading: false,
         playing: st.playing,
@@ -205,12 +238,121 @@ pub fn inline_video_snapshot(file_id: &str, cx: &App) -> Option<InlineVideoSnaps
         ended: st.ended,
         failed: st.failed,
         position_secs: sanitize_secs(st.position_secs),
-        duration_secs: sanitize_secs(st.duration_secs),
+        duration_secs,
         rate,
         width: st.width,
         height: st.height,
         surface,
     })
+}
+
+/// Current inline video playback snapshot for `file_id`, if it is loading, playing, or paused.
+pub fn inline_video_snapshot(file_id: &str, cx: &App) -> Option<InlineVideoSnapshot> {
+    let active = cx.try_global::<InlineVideoManager>()?.active.as_ref()?;
+    if active.file_id != file_id {
+        return None;
+    }
+    snapshot_from_active(active)
+}
+
+/// Advance the per-frame visibility epoch at the start of `App::render` so unmounted inline video
+/// cards are detected immediately on channel/page navigation or virtualized list scroll.
+pub fn inline_video_begin_frame(cx: &mut App) {
+    if cx.has_global::<InlineVideoManager>() {
+        let mgr = cx.global_mut::<InlineVideoManager>();
+        mgr.frame_epoch = mgr.frame_epoch.wrapping_add(1);
+    }
+}
+
+/// Record that the inline video card for `file_id` rendered in the current frame.
+pub fn mark_inline_video_rendered(file_id: &str, cx: &mut App) {
+    if cx.has_global::<InlineVideoManager>() {
+        let mgr = cx.global_mut::<InlineVideoManager>();
+        let epoch = mgr.frame_epoch;
+        if let Some(active) = mgr.active.as_mut().filter(|a| a.file_id == file_id) {
+            active.last_rendered_epoch = epoch;
+        }
+    }
+}
+
+/// Update whether the rendered inline video card's painted bounds intersect the visible viewport.
+/// Triggers a window refresh only on visibility transitions so scrolling past a mounted card opens
+/// or dismisses the floating mini-player immediately.
+pub fn update_inline_video_viewport_visibility(
+    file_id: &str,
+    in_viewport: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let changed = if cx.has_global::<InlineVideoManager>() {
+        cx.global_mut::<InlineVideoManager>()
+            .active
+            .as_mut()
+            .filter(|a| a.file_id == file_id)
+            .is_some_and(|active| {
+                let prev = active.inline_in_viewport;
+                active.inline_in_viewport = in_viewport;
+                prev != in_viewport
+            })
+    } else {
+        false
+    };
+    if changed {
+        window.refresh();
+    }
+}
+
+/// Evaluate whether the floating mini-player / picture-in-picture dock should be shown for the
+/// active inline video right now.
+///
+/// Engages when the active inline video is playing (or loading) and its inline card is scrolled out
+/// of view or navigated away from; stays engaged while the user pauses inside the dock so they can
+/// resume, expand, jump to the message, or close it; automatically hides when the inline card
+/// scrolls back into view or when [`crate::image_viewer::ImageViewer`] opens.
+pub fn active_pip_video(image_viewer_open: bool, cx: &mut App) -> Option<PipVideoSnapshot> {
+    if !cx.has_global::<InlineVideoManager>() {
+        return None;
+    }
+    let mgr = cx.global_mut::<InlineVideoManager>();
+    let epoch = mgr.frame_epoch;
+    let active = mgr.active.as_mut()?;
+    if image_viewer_open {
+        active.pip_engaged = false;
+        return None;
+    }
+    let inline_visible = active.last_rendered_epoch == epoch && active.inline_in_viewport;
+    if inline_visible {
+        active.pip_engaged = false;
+        return None;
+    }
+    let snap = snapshot_from_active(active)?;
+    if snap.failed {
+        active.pip_engaged = false;
+        return None;
+    }
+    if snap.playing || snap.loading {
+        active.pip_engaged = true;
+    }
+    if active.pip_engaged {
+        Some(PipVideoSnapshot {
+            meta: active.meta.clone(),
+            snapshot: snap,
+        })
+    } else {
+        None
+    }
+}
+
+/// Stop whichever inline video is currently active (used by the floating mini-player close button).
+pub fn stop_active_inline_video(window: &mut Window, cx: &mut App) {
+    let had = if cx.has_global::<InlineVideoManager>() {
+        cx.global_mut::<InlineVideoManager>().stop_all().is_some()
+    } else {
+        false
+    };
+    if had {
+        window.refresh();
+    }
 }
 
 /// Whether `url` points to an HLS playlist (`.m3u8`) that `AVPlayer` must stream directly via
@@ -243,6 +385,31 @@ pub fn play_inline_video(
     window: &mut Window,
     cx: &mut App,
 ) {
+    play_inline_video_with_meta(
+        InlineVideoMeta {
+            title: file_id.clone(),
+            file_id,
+            url,
+            ext,
+            ..Default::default()
+        },
+        start_pos_secs,
+        window,
+        cx,
+    );
+}
+
+/// Start native inline video playback with rich source metadata so the floating mini-player dock
+/// can display its title, jump back to its message, or expand into [`crate::image_viewer::ImageViewer`].
+pub fn play_inline_video_with_meta(
+    meta: InlineVideoMeta,
+    start_pos_secs: Option<f64>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let file_id = meta.file_id.clone();
+    let url = meta.url.clone();
+    let ext = meta.ext.clone();
     let hls = is_hls_url(&url);
     let fetcher = if hls {
         active_fetcher(cx)
@@ -260,14 +427,19 @@ pub fn play_inline_video(
     };
     let mgr = cx.default_global::<InlineVideoManager>();
     let generation = mgr.next_gen();
+    let epoch = mgr.frame_epoch;
     mgr.pending_handoff = None;
     mgr.active = Some(ActiveInlineVideo {
         generation,
         tick_gen: 0,
         file_id: file_id.clone(),
+        meta,
         loading: true,
         player: None,
         last_frame: None,
+        last_rendered_epoch: epoch,
+        inline_in_viewport: true,
+        pip_engaged: false,
     });
     window.refresh();
 
@@ -866,8 +1038,46 @@ pub fn format_video_time(secs: f64) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn seed_inline_video_for_test(
+    meta: InlineVideoMeta,
+    loading: bool,
+    in_viewport: bool,
+    cx: &mut App,
+) {
+    let mgr = cx.default_global::<InlineVideoManager>();
+    let generation = mgr.next_gen();
+    let epoch = mgr.frame_epoch;
+    mgr.active = Some(ActiveInlineVideo {
+        generation,
+        tick_gen: 0,
+        file_id: meta.file_id.clone(),
+        meta,
+        loading,
+        player: None,
+        last_frame: None,
+        last_rendered_epoch: if in_viewport {
+            epoch
+        } else {
+            epoch.wrapping_sub(1)
+        },
+        inline_in_viewport: in_viewport,
+        pip_engaged: false,
+    });
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_meta(file_id: &str) -> InlineVideoMeta {
+        InlineVideoMeta {
+            file_id: file_id.to_owned(),
+            title: format!("{file_id}.mp4"),
+            url: format!("https://files.slack.com/{file_id}.mp4"),
+            ext: "mp4".into(),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn video_time_and_scrub_math_helpers() {
@@ -897,9 +1107,13 @@ mod tests {
             generation: g1,
             tick_gen: 0,
             file_id: "F_VID_1".into(),
+            meta: test_meta("F_VID_1"),
             loading: true,
             player: None,
             last_frame: None,
+            last_rendered_epoch: 0,
+            inline_in_viewport: true,
+            pip_engaged: false,
         });
         assert_eq!(mgr.active.as_ref().unwrap().file_id, "F_VID_1");
 
@@ -910,9 +1124,13 @@ mod tests {
             generation: g2,
             tick_gen: 0,
             file_id: "F_VID_2".into(),
+            meta: test_meta("F_VID_2"),
             loading: false,
             player: None,
             last_frame: None,
+            last_rendered_epoch: 0,
+            inline_in_viewport: true,
+            pip_engaged: false,
         });
         assert_eq!(mgr.stop_matching("F_VID_1"), None);
         assert_eq!(mgr.active.as_ref().unwrap().file_id, "F_VID_2");
@@ -1005,9 +1223,13 @@ mod tests {
             generation: g,
             tick_gen: 0,
             file_id: "F_SYNTH".into(),
+            meta: test_meta("F_SYNTH"),
             loading: false,
             player: Some(player),
             last_frame: None,
+            last_rendered_epoch: 0,
+            inline_in_viewport: true,
+            pip_engaged: false,
         });
 
         let stopped_pos = mgr.stop_matching("F_SYNTH");
@@ -1019,5 +1241,34 @@ mod tests {
             "expected stopped position >= 0.25s, got {stopped_pos:?}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[gpui::test]
+    fn pip_dock_engages_when_scrolled_or_navigated_away_and_clears_when_visible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            inline_video_begin_frame(cx);
+            seed_inline_video_for_test(test_meta("F_PIP"), true, true, cx);
+            // Visible inline -> no PiP dock.
+            assert!(active_pip_video(false, cx).is_none());
+
+            // Advance frame without rendering the inline card (simulates navigating away / virtualized scroll out).
+            inline_video_begin_frame(cx);
+            let pip = active_pip_video(false, cx).expect("PiP must engage when inline card leaves");
+            assert_eq!(pip.meta.file_id, "F_PIP");
+
+            // Opening ImageViewer suppresses PiP.
+            assert!(active_pip_video(true, cx).is_none());
+
+            // Re-engage when viewer closes and card is still absent.
+            let pip2 = active_pip_video(false, cx).expect("PiP re-engages while loading/playing");
+            assert_eq!(pip2.meta.file_id, "F_PIP");
+
+            // Returning to the message marks the card rendered -> PiP clears.
+            inline_video_begin_frame(cx);
+            mark_inline_video_rendered("F_PIP", cx);
+            assert!(active_pip_video(false, cx).is_none());
+        });
     }
 }

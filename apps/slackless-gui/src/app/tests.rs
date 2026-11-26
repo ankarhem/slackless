@@ -1215,6 +1215,7 @@ fn qa_image_viewer_keyboard_zoom_step_and_zero_subscription_leak(cx: &mut gpui::
             taken_at: None,
             download: None,
             video: None,
+            pdf: None,
         };
         std::rc::Rc::new(vec![img("one.png"), img("two.png")])
     };
@@ -1276,6 +1277,106 @@ fn qa_image_viewer_keyboard_zoom_step_and_zero_subscription_leak(cx: &mut gpui::
     cx.run_until_parked();
     assert!(app.read_with(cx, |app, _| app.image_viewer.is_none()));
     assert!(app.read_with(cx, |app, _| app._viewer_sub.is_none()));
+
+    // Video viewer shortcuts: `c` toggles transcript drawer while `cmd-c` does NOT intercept copy.
+    let video_items = std::rc::Rc::new(vec![ViewerImage {
+        name: "clip.mp4".into(),
+        source: gpui::ImageSource::Image(Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            Vec::new(),
+        ))),
+        user: None,
+        taken_at: None,
+        download: None,
+        video: Some(crate::image_viewer::ViewerVideo {
+            file_id: "F_KEY_VID".into(),
+            url: "https://files.slack.com/pri/clip.mp4".into(),
+            ext: "mp4".into(),
+            duration_ms: Some(15_000),
+            inline_transcript: Some("Sample spoken words.".into()),
+            vtt_url: None,
+        }),
+        pdf: None,
+    }]);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            let ch = app.channel.clone();
+            app.open_image_viewer(ch, video_items, 0, window, cx);
+        });
+        let _ = window.draw(cx);
+    });
+    assert!(!app.read_with(cx, |app, cx| {
+        app.image_viewer
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .showing_transcript()
+    }));
+    cx.simulate_keystrokes("c");
+    cx.run_until_parked();
+    assert!(
+        app.read_with(cx, |app, cx| app
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .showing_transcript()),
+        "`c` must open the transcript drawer on a video"
+    );
+    cx.simulate_keystrokes("cmd-c");
+    cx.run_until_parked();
+    assert!(
+        app.read_with(cx, |app, cx| app
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .showing_transcript()),
+        "`cmd-c` must NOT toggle the transcript drawer so selected text copy still works"
+    );
+    cx.simulate_keystrokes("up");
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("c");
+    cx.run_until_parked();
+    assert!(
+        !app.read_with(cx, |app, cx| app
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .showing_transcript()),
+        "second `c` must close the transcript drawer"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(app.read_with(cx, |app, _| app.image_viewer.is_none()));
+
+    // Floating mini-player / PiP dock renders cleanly when an inline video is playing off-screen.
+    cx.update(|window, cx| {
+        let ch = app.read(cx).channel.clone();
+        crate::media::seed_inline_video_for_test(
+            crate::media::InlineVideoMeta {
+                file_id: "F_PIP_APP".into(),
+                title: "standup-demo.mp4".into(),
+                channel: Some(ch),
+                message_ts: Some(slackless_core::types::Ts::from("1700000001.000100")),
+                url: "https://files.slack.com/pri/standup-demo.mp4".into(),
+                ext: "mp4".into(),
+                duration_ms: Some(30_000),
+                ..Default::default()
+            },
+            true,
+            false,
+            cx,
+        );
+        let _ = window.draw(cx);
+        assert!(
+            crate::media::active_pip_video(false, cx).is_some(),
+            "floating mini-player dock should be active when inline video is off-screen"
+        );
+        crate::media::stop_active_inline_video(window, cx);
+        assert!(crate::media::active_pip_video(false, cx).is_none());
+    });
 }
 
 #[gpui::test]

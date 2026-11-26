@@ -103,6 +103,8 @@ pub struct WorkspaceData {
     pub thumbnails: HashMap<FileId, Arc<Image>>,
     /// Locally persisted audio/video transcripts keyed by `FileId`.
     pub file_transcripts: HashMap<FileId, String>,
+    /// Timed transcript cues keyed by `FileId` (populated from local transcription or WebVTT).
+    pub file_transcript_cues: HashMap<FileId, Vec<slackless_core::types::TranscriptCue>>,
     /// Profile data the typed `Profile` does not model (pronouns, custom fields).
     pub profile_extras: HashMap<UserId, ProfileExtras>,
     /// The workspace's custom emoji by name.
@@ -192,14 +194,38 @@ impl Fixtures {
             .filter(|s| !s.is_empty())
     }
 
+    /// Timed transcript cues for an audio or video file, if available.
+    pub fn file_transcript_cues(
+        &self,
+        id: &FileId,
+    ) -> Option<&[slackless_core::types::TranscriptCue]> {
+        self.file_transcript_cues
+            .get(id)
+            .map(Vec::as_slice)
+            .filter(|cues| !cues.is_empty())
+    }
+
     /// Return a new [`Fixtures`] snapshot with `file_id`'s transcript inserted or updated.
     pub fn with_file_transcript(&self, file_id: FileId, text: String) -> Self {
+        self.with_file_transcript_cues(file_id, text, Vec::new())
+    }
+
+    /// Return a new [`Fixtures`] snapshot with `file_id`'s transcript text and timed cues updated.
+    pub fn with_file_transcript_cues(
+        &self,
+        file_id: FileId,
+        text: String,
+        cues: Vec<slackless_core::types::TranscriptCue>,
+    ) -> Self {
         let mut data = (*self.data).clone();
         let trimmed = text.trim().to_owned();
         if trimmed.is_empty() {
             data.file_transcripts.remove(&file_id);
         } else {
-            data.file_transcripts.insert(file_id, trimmed);
+            data.file_transcripts.insert(file_id.clone(), trimmed);
+        }
+        if !cues.is_empty() {
+            data.file_transcript_cues.insert(file_id, cues);
         }
         Self {
             data: Arc::new(data),

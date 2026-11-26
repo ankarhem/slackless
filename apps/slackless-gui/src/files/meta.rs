@@ -146,6 +146,40 @@ pub(crate) fn is_video(file: &File) -> bool {
     )
 }
 
+pub(crate) fn is_pdf(file: &File) -> bool {
+    if file
+        .mimetype
+        .as_deref()
+        .is_some_and(|m| m.eq_ignore_ascii_case("application/pdf"))
+    {
+        return true;
+    }
+    if file
+        .filetype
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case("pdf"))
+    {
+        return true;
+    }
+    file.name
+        .as_deref()
+        .is_some_and(|n| n.to_ascii_lowercase().ends_with(".pdf"))
+}
+
+/// Static preview thumbnail URL for a PDF file when Slack provides a rasterized PNG/JPG thumb.
+pub(crate) fn pdf_thumb_url(file: &File) -> Option<String> {
+    [
+        file.thumb_pdf.as_deref(),
+        file.thumb_480.as_deref(),
+        file.thumb_360.as_deref(),
+        file.thumb_720.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|url| is_decodable_image_url(url))
+    .map(str::to_owned)
+}
+
 pub(super) fn is_snippet(file: &File) -> bool {
     let has_preview = file
         .preview
@@ -186,7 +220,7 @@ pub(super) fn file_name(file: &File) -> String {
 }
 
 pub(crate) use slackless_core::domain::webvtt::{
-    clip_vtt_url, inline_clip_transcript, parse_webvtt,
+    clip_vtt_url, inline_clip_transcript, parse_webvtt, parse_webvtt_cues,
 };
 
 /// Normalized waveform samples (`0.12..=1.0`) from Slack's `audio_wave_samples` metadata.

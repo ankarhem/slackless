@@ -265,9 +265,13 @@ pub(super) fn transcript_row(
                 .child(message_body(message, &kcx, cx)),
         );
         if prefs.inline_media {
-            if let Some(files) =
-                crate::files::attachments(fixtures, message, kcx.image_open.as_ref(), cx)
-            {
+            if let Some(files) = crate::files::attachments_in_channel(
+                fixtures,
+                Some(&store.channel),
+                message,
+                kcx.image_open.as_ref(),
+                cx,
+            ) {
                 body = body.child(files);
             }
         } else if !message.files.is_empty() {

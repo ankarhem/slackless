@@ -19,10 +19,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use slackless_types::UserId;
+use slackless_types::{TranscriptCue, UserId};
 use tokio::sync::mpsc as tokio_mpsc;
 use transcribe_rs::onnx::Quantization;
-use transcribe_rs::onnx::parakeet::{ParakeetModel, ParakeetParams};
+use transcribe_rs::onnx::parakeet::{ParakeetModel, ParakeetParams, TimestampGranularity};
 
 use crate::{HuddleDataEvent, HuddleUpdate};
 
@@ -644,36 +644,134 @@ pub fn encode_wav_16khz_mono(samples: &[i16]) -> Vec<u8> {
     crate::clips::encode_wav_pcm16(samples, TARGET_RATE as u32, 1)
 }
 
-/// Parse `whisper-cli -oj` or `whisper-server` JSON output into `(detected_language, cleaned_text)`.
-pub fn parse_whisper_json(raw: &str) -> Option<(Option<String>, String)> {
+fn parse_whisper_timestamp_str(raw: &str) -> Option<f64> {
+    let trimmed = raw.trim().replace(',', ".");
+    let parts: Vec<&str> = trimmed.split(':').collect();
+    let (h, m, s) = match parts.as_slice() {
+        [m, s] => (0.0, m.parse::<f64>().ok()?, s.parse::<f64>().ok()?),
+        [h, m, s] => (
+            h.parse::<f64>().ok()?,
+            m.parse::<f64>().ok()?,
+            s.parse::<f64>().ok()?,
+        ),
+        _ => return None,
+    };
+    if h.is_finite() && m.is_finite() && s.is_finite() && h >= 0.0 && m >= 0.0 && s >= 0.0 {
+        Some(h * 3600.0 + m * 60.0 + s)
+    } else {
+        None
+    }
+}
+
+/// Parse `whisper-cli -oj` or `whisper-server` (`verbose_json`) JSON output into
+/// `(detected_language, cleaned_text, timed_cues)`, shifting all cue timestamps by `offset_secs`.
+pub fn parse_whisper_json_cues(
+    raw: &str,
+    offset_secs: f64,
+    fallback_dur_secs: f64,
+) -> Option<(Option<String>, String, Vec<TranscriptCue>)> {
     let val: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let offset = if offset_secs.is_finite() && offset_secs >= 0.0 {
+        offset_secs
+    } else {
+        0.0
+    };
+    let fallback_dur = if fallback_dur_secs.is_finite() && fallback_dur_secs > 0.0 {
+        fallback_dur_secs
+    } else {
+        0.0
+    };
     let lang = normalize_lang_tag(
         val.pointer("/result/language")
             .or_else(|| val.get("language"))
             .and_then(|v| v.as_str()),
     );
     let mut parts = Vec::new();
+    let mut cues = Vec::new();
     if let Some(items) = val.get("transcription").and_then(|v| v.as_array()) {
         for item in items {
             if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                 let t = text.trim();
                 if !t.is_empty() && !is_stt_artifact(t) {
-                    parts.push(t);
+                    parts.push(t.to_owned());
+                    let start = item
+                        .pointer("/offsets/from")
+                        .and_then(|v| v.as_f64())
+                        .map(|ms| ms / 1000.0)
+                        .or_else(|| {
+                            item.pointer("/timestamps/from")
+                                .and_then(|v| v.as_str())
+                                .and_then(parse_whisper_timestamp_str)
+                        });
+                    let end = item
+                        .pointer("/offsets/to")
+                        .and_then(|v| v.as_f64())
+                        .map(|ms| ms / 1000.0)
+                        .or_else(|| {
+                            item.pointer("/timestamps/to")
+                                .and_then(|v| v.as_str())
+                                .and_then(parse_whisper_timestamp_str)
+                        });
+                    if let Some(s) = start.filter(|v| v.is_finite() && *v >= 0.0) {
+                        let start_secs = offset + s;
+                        let end_secs = end
+                            .filter(|v| v.is_finite() && *v >= 0.0)
+                            .map_or(start_secs, |e| (offset + e).max(start_secs));
+                        cues.push(TranscriptCue {
+                            start_secs,
+                            end_secs,
+                            text: t.to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+    } else if let Some(segments) = val.get("segments").and_then(|v| v.as_array()) {
+        for seg in segments {
+            if let Some(text) = seg.get("text").and_then(|v| v.as_str()) {
+                let t = text.trim();
+                if !t.is_empty() && !is_stt_artifact(t) {
+                    parts.push(t.to_owned());
+                    let start = seg.get("start").and_then(|v| v.as_f64());
+                    let end = seg.get("end").and_then(|v| v.as_f64());
+                    if let Some(s) = start.filter(|v| v.is_finite() && *v >= 0.0) {
+                        let start_secs = offset + s;
+                        let end_secs = end
+                            .filter(|v| v.is_finite() && *v >= 0.0)
+                            .map_or(start_secs, |e| (offset + e).max(start_secs));
+                        cues.push(TranscriptCue {
+                            start_secs,
+                            end_secs,
+                            text: t.to_owned(),
+                        });
+                    }
                 }
             }
         }
     } else if let Some(text) = val.get("text").and_then(|v| v.as_str()) {
         let t = text.trim();
         if !t.is_empty() && !is_stt_artifact(t) {
-            parts.push(t);
+            parts.push(t.to_owned());
         }
     }
     let combined = parts.join(" ").trim().to_owned();
     if combined.is_empty() {
         return None;
     }
+    if cues.is_empty() && fallback_dur > 0.0 {
+        cues.push(TranscriptCue {
+            start_secs: offset,
+            end_secs: offset + fallback_dur,
+            text: combined.clone(),
+        });
+    }
     let resolved_lang = lang.or_else(|| detect_spoken_lang(&combined).map(str::to_owned));
-    Some((resolved_lang, combined))
+    Some((resolved_lang, combined, cues))
+}
+
+/// Parse `whisper-cli -oj` or `whisper-server` JSON output into `(detected_language, cleaned_text)`.
+pub fn parse_whisper_json(raw: &str) -> Option<(Option<String>, String)> {
+    parse_whisper_json_cues(raw, 0.0, 0.0).map(|(lang, text, _)| (lang, text))
 }
 
 fn is_stt_artifact(text: &str) -> bool {
@@ -726,19 +824,37 @@ impl Drop for ActiveSttBackend {
 
 impl ActiveSttBackend {
     fn transcribe(&mut self, seq: u64, pcm_16k: &[i16]) -> Option<(Option<String>, String)> {
+        self.transcribe_timed(seq, pcm_16k, 0.0)
+            .map(|(lang, text, _)| (lang, text))
+    }
+
+    fn transcribe_timed(
+        &mut self,
+        seq: u64,
+        pcm_16k: &[i16],
+        offset_secs: f64,
+    ) -> Option<(Option<String>, String, Vec<TranscriptCue>)> {
+        let chunk_dur = pcm_16k.len() as f64 / TARGET_RATE as f64;
         match self {
             ActiveSttBackend::Parakeet(model) => {
                 let samples_f32: Vec<f32> =
                     pcm_16k.iter().map(|&s| f32::from(s) / 32_768.0).collect();
-                let res = model
-                    .transcribe_with(&samples_f32, &ParakeetParams::default())
-                    .ok()?;
-                let text = res.text.trim().to_owned();
+                let params = ParakeetParams {
+                    language: None,
+                    timestamp_granularity: Some(TimestampGranularity::Segment),
+                };
+                let res = model.transcribe_with(&samples_f32, &params).ok()?;
+                let cues = parakeet_segments_to_cues(&res, offset_secs, chunk_dur);
+                let text = if !cues.is_empty() {
+                    TranscriptCue::plain_text(&cues)
+                } else {
+                    res.text.trim().to_owned()
+                };
                 if text.is_empty() || is_stt_artifact(&text) {
                     return None;
                 }
                 let lang = detect_spoken_lang(&text).map(str::to_owned);
-                Some((lang, text))
+                Some((lang, text, cues))
             }
             ActiveSttBackend::WhisperServer { url, http, .. } => {
                 let wav_bytes = encode_wav_16khz_mono(pcm_16k);
@@ -759,14 +875,66 @@ impl ActiveSttBackend {
                         return None;
                     }
                     let body = resp.text().await.ok()?;
-                    parse_whisper_json(&body)
+                    parse_whisper_json_cues(&body, offset_secs, chunk_dur)
                 })
             }
             ActiveSttBackend::WhisperCli { bin, model } => {
-                run_whisper_cli_utterance(bin, model, seq, pcm_16k)
+                run_whisper_cli_utterance_timed(bin, model, seq, pcm_16k, offset_secs, chunk_dur)
             }
         }
     }
+}
+
+fn parakeet_segments_to_cues(
+    res: &transcribe_rs::TranscriptionResult,
+    offset_secs: f64,
+    chunk_dur_secs: f64,
+) -> Vec<TranscriptCue> {
+    let offset = if offset_secs.is_finite() && offset_secs >= 0.0 {
+        offset_secs
+    } else {
+        0.0
+    };
+    let mut cues = Vec::new();
+    if let Some(segments) = res.segments.as_ref() {
+        for seg in segments {
+            let text = seg.text.trim();
+            if text.is_empty() || is_stt_artifact(text) {
+                continue;
+            }
+            let start = if seg.start.is_finite() && seg.start >= 0.0 {
+                offset + f64::from(seg.start)
+            } else {
+                offset
+            };
+            let end = if seg.end.is_finite() && seg.end >= 0.0 {
+                (offset + f64::from(seg.end)).max(start)
+            } else {
+                start
+            };
+            cues.push(TranscriptCue {
+                start_secs: start,
+                end_secs: end,
+                text: text.to_owned(),
+            });
+        }
+    }
+    if cues.is_empty() {
+        let fallback = res.text.trim();
+        if !fallback.is_empty() && !is_stt_artifact(fallback) {
+            let dur = if chunk_dur_secs.is_finite() && chunk_dur_secs > 0.0 {
+                chunk_dur_secs
+            } else {
+                0.0
+            };
+            cues.push(TranscriptCue {
+                start_secs: offset,
+                end_secs: offset + dur,
+                text: fallback.to_owned(),
+            });
+        }
+    }
+    cues
 }
 
 /// Background opt-in local multilingual transcriber for a live huddle.
@@ -988,12 +1156,14 @@ fn emit_transcribed(
     }));
 }
 
-fn run_whisper_cli_utterance(
+fn run_whisper_cli_utterance_timed(
     bin: &Path,
     model: &Path,
     seq: u64,
     pcm_16k: &[i16],
-) -> Option<(Option<String>, String)> {
+    offset_secs: f64,
+    chunk_dur_secs: f64,
+) -> Option<(Option<String>, String, Vec<TranscriptCue>)> {
     let pid = std::process::id();
     let stem = std::env::temp_dir().join(format!("slackless-stt-{pid}-{seq}"));
     let wav_path = stem.with_extension("wav");
@@ -1031,7 +1201,7 @@ fn run_whisper_cli_utterance(
     }
 
     let raw_json = std::fs::read_to_string(&json_path).ok()?;
-    parse_whisper_json(&raw_json)
+    parse_whisper_json_cues(&raw_json, offset_secs, chunk_dur_secs)
 }
 
 // ---------------------------------------------------------------------------
@@ -1265,9 +1435,17 @@ pub fn resolve_local_file_provider(
     .find(|&candidate| candidate != preferred && detect_provider_setup(candidate).is_ready())
 }
 
-/// Split 16 kHz mono audio into chunks of at most 28 seconds, preferring the lowest-energy
-/// silence boundary between 20s and 28s so words are not cut in half.
-pub fn chunk_audio_for_transcription(samples: &[f32]) -> Vec<&[f32]> {
+/// Result of offline media transcription preserving both plain searchable text and timed cues.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedTranscription {
+    pub provider: TranscriptionProvider,
+    pub text: String,
+    pub cues: Vec<TranscriptCue>,
+}
+
+/// Split 16 kHz mono audio into `(start_sample, chunk)` slices of at most 28 seconds, preferring
+/// the lowest-energy silence boundary between 20s and 28s so words are not cut in half.
+pub fn chunk_audio_for_transcription_with_offsets(samples: &[f32]) -> Vec<(usize, &[f32])> {
     if samples.is_empty() {
         return Vec::new();
     }
@@ -1277,7 +1455,7 @@ pub fn chunk_audio_for_transcription(samples: &[f32]) -> Vec<&[f32]> {
     while start < samples.len() {
         let remaining = samples.len() - start;
         if remaining <= MAX_CHUNK_SAMPLES {
-            chunks.push(&samples[start..]);
+            chunks.push((start, &samples[start..]));
             break;
         }
 
@@ -1297,11 +1475,20 @@ pub fn chunk_audio_for_transcription(samples: &[f32]) -> Vec<&[f32]> {
             win_start += SPLIT_HOP_SAMPLES;
         }
 
-        chunks.push(&samples[start..best_split]);
+        chunks.push((start, &samples[start..best_split]));
         start = best_split;
     }
 
     chunks
+}
+
+/// Split 16 kHz mono audio into chunks of at most 28 seconds, preferring the lowest-energy
+/// silence boundary between 20s and 28s so words are not cut in half.
+pub fn chunk_audio_for_transcription(samples: &[f32]) -> Vec<&[f32]> {
+    chunk_audio_for_transcription_with_offsets(samples)
+        .into_iter()
+        .map(|(_, slice)| slice)
+        .collect()
 }
 
 fn is_effectively_silent(samples: &[f32]) -> bool {
@@ -1309,12 +1496,13 @@ fn is_effectively_silent(samples: &[f32]) -> bool {
 }
 
 /// Transcribe an offline audio or video file using a locally downloaded STT model (`ParakeetV3`
-/// or `WhisperTurbo`). Loads model weights only for the duration of this call (0 MB idle RAM) and
-/// tears down any spawned `whisper-server` cleanly before returning.
-pub fn transcribe_media_file(
+/// or `WhisperTurbo`), preserving per-segment cue timestamps (`start_secs`, `end_secs`, `text`)
+/// alongside the combined plain text. Loads model weights only for the duration of this call
+/// (0 MB idle RAM) and tears down any spawned `whisper-server` cleanly before returning.
+pub fn transcribe_media_file_timed(
     path: &Path,
     preferred: TranscriptionProvider,
-) -> std::result::Result<(TranscriptionProvider, String), String> {
+) -> std::result::Result<TimedTranscription, String> {
     let Some(provider) = resolve_local_file_provider(preferred) else {
         return Err(
             "No local transcription model is downloaded yet. Download Parakeet v3 or Whisper Turbo in Preferences → Audio & Video."
@@ -1324,28 +1512,44 @@ pub fn transcribe_media_file(
 
     let samples = extract_audio_16k_mono(path)?;
     if samples.is_empty() || is_effectively_silent(&samples) {
-        return Ok((provider, String::new()));
+        return Ok(TimedTranscription {
+            provider,
+            text: String::new(),
+            cues: Vec::new(),
+        });
     }
 
-    let chunks = chunk_audio_for_transcription(&samples);
+    let chunks = chunk_audio_for_transcription_with_offsets(&samples);
     let setup = detect_provider_setup(provider);
     let mut parts: Vec<String> = Vec::with_capacity(chunks.len());
+    let mut cues: Vec<TranscriptCue> = Vec::new();
 
     match provider {
         TranscriptionProvider::ParakeetV3 => {
             let mut model = ParakeetModel::load(&setup.model_path, &Quantization::Int8)
                 .map_err(|e| format!("failed to load Parakeet v3 model: {e}"))?;
-            let params = ParakeetParams::default();
-            for chunk in chunks {
+            let params = ParakeetParams {
+                language: None,
+                timestamp_granularity: Some(TimestampGranularity::Segment),
+            };
+            for (start_sample, chunk) in chunks {
                 if is_effectively_silent(chunk) {
                     continue;
                 }
+                let offset_secs = start_sample as f64 / TARGET_RATE as f64;
+                let chunk_dur_secs = chunk.len() as f64 / TARGET_RATE as f64;
                 let res = model
                     .transcribe_with(chunk, &params)
                     .map_err(|e| format!("Parakeet transcription failed: {e}"))?;
-                let text = res.text.trim();
-                if !text.is_empty() && !is_stt_artifact(text) {
-                    parts.push(text.to_owned());
+                let chunk_cues = parakeet_segments_to_cues(&res, offset_secs, chunk_dur_secs);
+                if !chunk_cues.is_empty() {
+                    parts.push(TranscriptCue::plain_text(&chunk_cues));
+                    cues.extend(chunk_cues);
+                } else {
+                    let text = res.text.trim();
+                    if !text.is_empty() && !is_stt_artifact(text) {
+                        parts.push(text.to_owned());
+                    }
                 }
             }
             drop(model);
@@ -1356,18 +1560,21 @@ pub fn transcribe_media_file(
                 init_stt_backend(provider, &setup, server_child).ok_or_else(|| {
                     "failed to initialize local Whisper transcription backend".to_owned()
                 })?;
-            for (idx, chunk) in chunks.into_iter().enumerate() {
+            for (idx, (start_sample, chunk)) in chunks.into_iter().enumerate() {
                 if is_effectively_silent(chunk) {
                     continue;
                 }
+                let offset_secs = start_sample as f64 / TARGET_RATE as f64;
                 let pcm_16k: Vec<i16> = chunk
                     .iter()
                     .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
                     .collect();
-                if let Some((_, text)) = backend.transcribe(idx as u64 + 1, &pcm_16k)
+                if let Some((_, text, chunk_cues)) =
+                    backend.transcribe_timed(idx as u64 + 1, &pcm_16k, offset_secs)
                     && !text.is_empty()
                 {
                     parts.push(text);
+                    cues.extend(chunk_cues);
                 }
             }
             drop(backend);
@@ -1379,7 +1586,27 @@ pub fn transcribe_media_file(
         }
     }
 
-    Ok((provider, parts.join(" ")))
+    let text = if !cues.is_empty() {
+        TranscriptCue::plain_text(&cues)
+    } else {
+        parts.join(" ")
+    };
+    Ok(TimedTranscription {
+        provider,
+        text,
+        cues,
+    })
+}
+
+/// Transcribe an offline audio or video file using a locally downloaded STT model (`ParakeetV3`
+/// or `WhisperTurbo`). Loads model weights only for the duration of this call (0 MB idle RAM) and
+/// tears down any spawned `whisper-server` cleanly before returning.
+pub fn transcribe_media_file(
+    path: &Path,
+    preferred: TranscriptionProvider,
+) -> std::result::Result<(TranscriptionProvider, String), String> {
+    let timed = transcribe_media_file_timed(path, preferred)?;
+    Ok((timed.provider, timed.text))
 }
 
 #[cfg(test)]
@@ -1479,6 +1706,86 @@ mod tests {
         let blank_only =
             r#"{ "result": { "language": "en" }, "transcription": [{ "text": "[BLANK_AUDIO]" }] }"#;
         assert_eq!(parse_whisper_json(blank_only), None);
+    }
+
+    #[test]
+    fn parse_whisper_json_cues_extracts_cli_and_server_timestamps_with_offset() {
+        let cli_json = r#"{
+            "result": { "language": "en" },
+            "transcription": [
+                { "offsets": { "from": 0, "to": 1800 }, "text": " First sentence." },
+                { "offsets": { "from": 1800, "to": 3200 }, "text": " [MUSIC] " },
+                { "timestamps": { "from": "00:00:03,200", "to": "00:00:05,700" }, "text": " Second sentence." }
+            ]
+        }"#;
+        let (lang, text, cues) =
+            parse_whisper_json_cues(cli_json, 20.0, 6.0).expect("parse whisper-cli JSON");
+        assert_eq!(lang.as_deref(), Some("en"));
+        assert_eq!(text, "First sentence. Second sentence.");
+        assert_eq!(cues.len(), 2);
+        assert!((cues[0].start_secs - 20.0).abs() < 1e-6);
+        assert!((cues[0].end_secs - 21.8).abs() < 1e-6);
+        assert_eq!(cues[0].text, "First sentence.");
+        assert!((cues[1].start_secs - 23.2).abs() < 1e-6);
+        assert!((cues[1].end_secs - 25.7).abs() < 1e-6);
+        assert_eq!(cues[1].text, "Second sentence.");
+
+        let server_verbose = r#"{
+            "language": "sv",
+            "segments": [
+                { "start": 0.25, "end": 2.5, "text": " Hej alla!" },
+                { "start": 2.5, "end": 5.0, "text": " Nu kör vi." }
+            ]
+        }"#;
+        let (lang, text, cues) =
+            parse_whisper_json_cues(server_verbose, 10.0, 5.0).expect("parse whisper-server JSON");
+        assert_eq!(lang.as_deref(), Some("sv"));
+        assert_eq!(text, "Hej alla! Nu kör vi.");
+        assert_eq!(cues.len(), 2);
+        assert!((cues[0].start_secs - 10.25).abs() < 1e-6);
+        assert!((cues[0].end_secs - 12.5).abs() < 1e-6);
+        assert!((cues[1].start_secs - 12.5).abs() < 1e-6);
+        assert!((cues[1].end_secs - 15.0).abs() < 1e-6);
+
+        let plain_only = r#"{ "language": "en", "text": "Fallback line" }"#;
+        let (_, _, cues) = parse_whisper_json_cues(plain_only, 4.0, 3.0).expect("fallback cue");
+        assert_eq!(cues.len(), 1);
+        assert!((cues[0].start_secs - 4.0).abs() < 1e-6);
+        assert!((cues[0].end_secs - 7.0).abs() < 1e-6);
+        assert_eq!(cues[0].text, "Fallback line");
+    }
+
+    #[test]
+    fn parakeet_segments_and_chunk_offsets_preserve_timestamps() {
+        let res = transcribe_rs::TranscriptionResult {
+            text: "Hello world. Ship it.".into(),
+            segments: Some(vec![
+                transcribe_rs::TranscriptionSegment {
+                    start: 0.2,
+                    end: 1.4,
+                    text: "Hello world.".into(),
+                },
+                transcribe_rs::TranscriptionSegment {
+                    start: 1.5,
+                    end: 2.9,
+                    text: "Ship it.".into(),
+                },
+            ]),
+        };
+        let cues = parakeet_segments_to_cues(&res, 25.0, 4.0);
+        assert_eq!(cues.len(), 2);
+        assert!((cues[0].start_secs - 25.2).abs() < 1e-4);
+        assert!((cues[0].end_secs - 26.4).abs() < 1e-4);
+        assert!((cues[1].start_secs - 26.5).abs() < 1e-4);
+        assert!((cues[1].end_secs - 27.9).abs() < 1e-4);
+
+        // 40 seconds of audio splits into 2 chunks with contiguous sample offsets.
+        let samples = vec![0.1f32; TARGET_RATE * 40];
+        let chunks = chunk_audio_for_transcription_with_offsets(&samples);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].0, 0);
+        assert_eq!(chunks[1].0, chunks[0].1.len());
+        assert_eq!(chunks[0].1.len() + chunks[1].1.len(), samples.len());
     }
 
     #[test]

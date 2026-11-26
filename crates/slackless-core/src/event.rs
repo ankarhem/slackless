@@ -326,6 +326,7 @@ pub enum Event {
     FileTranscriptReady {
         file_id: crate::types::FileId,
         text: String,
+        cues: Vec<crate::types::TranscriptCue>,
     },
     /// Local transcription of a video or audio file failed.
     FileTranscriptFailed {

@@ -243,6 +243,7 @@ unsafe extern "C" {
     pub(crate) fn slackless_video_player_play(player: *mut SlacklessVideoPlayer);
     pub(crate) fn slackless_video_player_pause(player: *mut SlacklessVideoPlayer);
     pub(crate) fn slackless_video_player_set_muted(player: *mut SlacklessVideoPlayer, muted: bool);
+    pub(crate) fn slackless_video_player_set_volume(player: *mut SlacklessVideoPlayer, volume: f32);
     pub(crate) fn slackless_video_player_set_rate(player: *mut SlacklessVideoPlayer, rate: f32);
     pub(crate) fn slackless_video_player_seek(player: *mut SlacklessVideoPlayer, secs: f64);
     pub(crate) fn slackless_video_player_state(
@@ -256,6 +257,7 @@ unsafe extern "C" {
         out_h: *mut u32,
         is_failed: *mut bool,
         out_rate: *mut f32,
+        out_volume: *mut f32,
     );
     pub(crate) fn slackless_video_player_copy_frame(
         player: *mut SlacklessVideoPlayer,
@@ -270,6 +272,18 @@ unsafe extern "C" {
         out_len: *mut usize,
     ) -> bool;
     pub(crate) fn slackless_free_f32_buf(buf: *mut f32);
+
+    pub(crate) fn slackless_pdf_page_count(path: *const c_char) -> u32;
+    pub(crate) fn slackless_pdf_render_page_png(
+        path: *const c_char,
+        page_index: u32,
+        max_w: u32,
+        max_h: u32,
+        out_buf: *mut *mut u8,
+        out_len: *mut usize,
+        out_w: *mut u32,
+        out_h: *mut u32,
+    ) -> bool;
 }
 
 pub(crate) struct CaptureCallbackCtx {
