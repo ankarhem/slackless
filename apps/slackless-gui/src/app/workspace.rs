@@ -15,6 +15,14 @@ pub(super) fn build_workspace(
     let messages = MessageList::new(fixtures.clone(), channel.clone(), window, cx);
     let thread = ThreadPanel::new(fixtures.clone(), window, cx);
     let results = SearchView::new(fixtures.clone(), archive, cx);
+    if let Some(team) = fixtures
+        .workspaces
+        .get(index)
+        .or_else(|| fixtures.workspaces.first())
+    {
+        let ws_id = team.id.clone();
+        results.update(cx, |view, cx| view.set_workspace(ws_id, cx));
+    }
     let browser = ChannelBrowser::new(fixtures.clone(), window, cx);
     let huddle_map: HashMap<ChannelId, Vec<slackless_core::types::UserId>> =
         huddle_state::fixture_huddle(fixtures)
@@ -187,6 +195,19 @@ pub(super) fn subscribe_workspace(
                     this.select(channel.clone(), cx);
                     this.messages.update(cx, |list, cx| list.reveal(ts, cx));
                 }
+                SearchEvent::OpenInWorkspace {
+                    workspace,
+                    channel,
+                    ts,
+                } => {
+                    this.open_message_in_workspace(
+                        workspace,
+                        channel.clone(),
+                        ts.clone(),
+                        window,
+                        cx,
+                    );
+                }
                 SearchEvent::OpenChannel(channel) => {
                     this.select(channel.clone(), cx);
                 }
@@ -207,6 +228,37 @@ pub(super) fn subscribe_workspace(
                         window,
                         cx,
                     );
+                }
+                SearchEvent::OpenTranscriptInWorkspace {
+                    workspace,
+                    call_id,
+                    channel,
+                    highlight_segment_id,
+                    highlight_query,
+                } => {
+                    if let Some(idx) = this.workspace_index_for(workspace) {
+                        if idx != this.workspace {
+                            this.switch_workspace(idx, window, cx);
+                        }
+                        this.open_huddle_transcript(
+                            call_id.clone(),
+                            channel.clone(),
+                            *highlight_segment_id,
+                            highlight_query.clone(),
+                            window,
+                            cx,
+                        );
+                    } else {
+                        notify(
+                            "Workspace not loaded",
+                            format!(
+                                "Sign in to workspace {} to open its huddle transcript.",
+                                workspace
+                            ),
+                            window,
+                            cx,
+                        );
+                    }
                 }
                 SearchEvent::RemoteMessages { query, sort, page } => {
                     this.bridge.send(CollabCommand::SearchRemoteMessages {
@@ -391,6 +443,19 @@ pub(super) fn subscribe_workspace(
                 }
                 ThreadPanelEvent::AddToList { channel, ts } => {
                     this.open_add_to_list_dialog(channel.clone(), ts.clone(), window, cx)
+                }
+                ThreadPanelEvent::Export {
+                    channel,
+                    thread_ts,
+                    markdown,
+                } => {
+                    this.export_thread_transcript(
+                        channel.clone(),
+                        thread_ts.clone(),
+                        *markdown,
+                        window,
+                        cx,
+                    );
                 }
                 ThreadPanelEvent::SendToChannel {
                     channel,

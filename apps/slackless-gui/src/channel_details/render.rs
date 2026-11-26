@@ -401,12 +401,34 @@ impl ChannelDetails {
         });
         let mut c = card("Channel name", edit_name, border);
         if conversation.is_private {
+            let privacy_note = if conversation.is_external_connect() {
+                "Private · Shared with external organizations"
+            } else if conversation.is_org_shared {
+                "Private · Shared across your organization"
+            } else {
+                "Only visible to your organization"
+            };
             c = c.child(
                 div()
                     .text_xs()
                     .text_color(muted_foreground)
-                    .child("Only visible to your organization"),
+                    .child(privacy_note),
             );
+        } else if conversation.is_external_connect() {
+            c = c.child(
+                div()
+                    .text_xs()
+                    .text_color(muted_foreground)
+                    .child("Slack Connect · Shared with external organizations"),
+            );
+        } else if conversation.is_org_shared {
+            c = c.child(div().text_xs().text_color(muted_foreground).child(
+                if conversation.is_org_mandatory {
+                    "Org-wide mandatory channel"
+                } else {
+                    "Shared across your organization"
+                },
+            ));
         }
         c.child(
             h_flex()
@@ -521,26 +543,95 @@ impl ChannelDetails {
         let danger = crate::theme::danger_text(cx);
 
         let channel = self.channel.clone();
-        let mut actions = v_flex().flex_none().gap_2().child(
-            h_flex()
-                .id("details-leave")
-                .flex_none()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .cursor_pointer()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(danger)
-                .hover(move |row| row.bg(danger.alpha(0.12)))
-                .child(Icon::new(IconName::LogOut).size(px(16.)))
-                .child("Leave channel")
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    cx.emit(ChannelDetailsEvent::Leave(channel.clone()))
-                })),
-        );
+        let backfill_ch = self.channel.clone();
+        let export_md_ch = self.channel.clone();
+        let export_json_ch = self.channel.clone();
+        let mut actions = v_flex()
+            .flex_none()
+            .gap_2()
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Local archive & export"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_foreground)
+                            .child("Backfill full channel + thread history into SQLite, or export archived messages."),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .flex_wrap()
+                            .gap_2()
+                            .pt_1()
+                            .child(
+                                Button::new("details-backfill-channel")
+                                    .outline()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::RotateCcw)
+                                    .label("Backfill history")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(ChannelDetailsEvent::Backfill(backfill_ch.clone()));
+                                    })),
+                            )
+                            .child(
+                                Button::new("details-export-md")
+                                    .outline()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::Download)
+                                    .label("Export Markdown\u{2026}")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(ChannelDetailsEvent::Export {
+                                            channel: export_md_ch.clone(),
+                                            markdown: true,
+                                        });
+                                    })),
+                            )
+                            .child(
+                                Button::new("details-export-json")
+                                    .outline()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::FileCode)
+                                    .label("Export JSON\u{2026}")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(ChannelDetailsEvent::Export {
+                                            channel: export_json_ch.clone(),
+                                            markdown: false,
+                                        });
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .id("details-leave")
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(danger)
+                    .hover(move |row| row.bg(danger.alpha(0.12)))
+                    .child(Icon::new(IconName::LogOut).size(px(16.)))
+                    .child("Leave channel")
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(ChannelDetailsEvent::Leave(channel.clone()))
+                    })),
+            );
 
         // Convert public channel or group DM to private channel (`F-CORE-049`, `F-CORE-072`).
         if (!conversation.is_private && !conversation.is_general && !conversation.is_im)
@@ -690,34 +781,128 @@ impl ChannelDetails {
         actions
     }
 
-    /// Connected organizations section on Slack Connect channels.
+    /// Connected organizations & channel ownership section on Slack Connect channels
+    /// (`F-COLLAB-800`, `806`, `828`, `855`).
     fn render_organizations_section(
         &self,
         conversation: &Conversation,
         cx: &Context<Self>,
     ) -> Option<Div> {
-        if self.orgs.is_empty() {
+        let has_connect = !self.orgs.is_empty()
+            || conversation.is_external_connect()
+            || !conversation.pending_connected_team_ids.is_empty();
+        if !has_connect {
             return None;
         }
         let muted_foreground = cx.theme().muted_foreground;
+        let border = cx.theme().border;
         let host = host_team(conversation);
-        let mut section = v_flex().flex_none().gap_1().mt_2().child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child("Organizations"),
-        );
-        // Slack lists the other organizations only, not the viewer's own.
         let own = own_team(&self.fixtures);
-        for org in self.orgs.iter().filter(|org| org.team.id != own) {
+        let owner_team = self.fixtures.channel_owner_team(conversation);
+        let mut section = v_flex()
+            .flex_none()
+            .gap_1()
+            .mt_2()
+            .p_3()
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                Icon::new(IconName::Building2)
+                                    .size(px(14.))
+                                    .text_color(muted_foreground),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Organizations"),
+                            ),
+                    )
+                    .when_some(owner_team, |row, owner| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(muted_foreground)
+                                .child(format!("Owned by {}", owner.name)),
+                        )
+                    }),
+            );
+        let mut shown_ids = std::collections::HashSet::new();
+        for org in &self.orgs {
+            let is_own = org.team.id == own;
             let is_host = Some(&org.team.id) == host.as_ref();
+            let is_limited = conversation.is_limited_external_team(&org.team.id);
+            shown_ids.insert(org.team.id.clone());
             section = section.child(org_row(
                 &org.team,
                 org.members,
+                is_own,
                 is_host,
+                is_limited,
                 conversation,
                 muted_foreground,
             ));
+        }
+        // Include connected external teams reported on the conversation even before member
+        // profiles load.
+        for team in self.fixtures.shared_teams(conversation) {
+            if shown_ids.insert(team.id.clone()) {
+                let is_host = Some(&team.id) == host.as_ref();
+                let is_limited = conversation.is_limited_external_team(&team.id);
+                section = section.child(org_row(
+                    team,
+                    0,
+                    false,
+                    is_host,
+                    is_limited,
+                    conversation,
+                    muted_foreground,
+                ));
+            }
+        }
+        for pending_id in &conversation.pending_connected_team_ids {
+            if shown_ids.contains(pending_id) {
+                continue;
+            }
+            let pending_name = self
+                .fixtures
+                .external_team_by_id(pending_id)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| pending_id.as_str().to_owned());
+            section = section.child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .px_1()
+                    .py_1()
+                    .child(
+                        Icon::new(IconName::Clock)
+                            .size(px(14.))
+                            .text_color(muted_foreground),
+                    )
+                    .child(div().text_sm().child(pending_name))
+                    .child(
+                        div()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(muted_foreground.opacity(0.35))
+                            .text_xs()
+                            .text_color(muted_foreground)
+                            .child("Pending invitation"),
+                    ),
+            );
         }
         Some(section)
     }
@@ -885,6 +1070,13 @@ impl ChannelDetails {
             .emoji
             .as_deref()
             .map(|code| crate::emoji::emoji_element(code, &self.fixtures, px(14.)));
+        let external_org_name = row
+            .team
+            .as_ref()
+            .and_then(|tid| self.fixtures.external_team_by_id(tid))
+            .map(|team| team.name.clone());
+        let border = theme.border;
+        let secondary = theme.secondary;
         h_flex()
             .id(("details-member", ix))
             .flex_none()
@@ -924,6 +1116,21 @@ impl ChannelDetails {
                                 muted_foreground,
                                 success,
                             ))
+                            .when_some(external_org_name, |name_row, org_name| {
+                                name_row.child(
+                                    div()
+                                        .flex_none()
+                                        .px_1p5()
+                                        .py(px(1.))
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(border)
+                                        .bg(secondary.opacity(0.6))
+                                        .text_xs()
+                                        .text_color(muted_foreground)
+                                        .child(org_name),
+                                )
+                            })
                             .children(row.handle.as_ref().map(|handle| {
                                 div()
                                     .truncate()

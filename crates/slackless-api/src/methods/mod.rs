@@ -606,6 +606,19 @@ impl SlackApi {
             .team)
     }
 
+    /// `conversations.teamConnections`: connected, pending, and previous organizations for a
+    /// Slack Connect channel (`F-COLLAB-798`, `F-COLLAB-828`).
+    pub async fn conversations_team_connections(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<TeamConnectionsResponse> {
+        let params = vec![("channel", channel.to_string())];
+        Ok(self
+            .call(method::CONVERSATIONS_TEAM_CONNECTIONS, params)
+            .await?
+            .data)
+    }
+
     /// `subscriptions.thread.getView`: the followed threads of the Threads view, newest
     /// activity first (the web client's `fetch_threads_state` / `priority_mode` parameters;
     /// `limit` is the page size, `has_more` says older threads exist).

@@ -68,6 +68,28 @@ impl User {
         .find(|s| !s.is_empty())
         .unwrap_or(&self.name)
     }
+
+    /// Effective workspace/organization team ID (`team_id`, falling back to `profile.team`).
+    pub fn effective_team_id(&self) -> Option<&TeamId> {
+        self.team_id
+            .as_ref()
+            .filter(|id| !id.as_str().is_empty())
+            .or_else(|| {
+                self.profile
+                    .team
+                    .as_ref()
+                    .filter(|id| !id.as_str().is_empty())
+            })
+    }
+
+    /// True when this user belongs to another organization relative to `own_team` (`is_stranger`
+    /// or a different team ID).
+    pub fn is_external_to(&self, own_team: &TeamId) -> bool {
+        self.is_stranger
+            || self
+                .effective_team_id()
+                .is_some_and(|team| team != own_team)
+    }
 }
 
 /// A user profile. Also used for the trimmed `user_profile` embedded in messages, so every field
@@ -227,6 +249,11 @@ pub struct Team {
     pub domain: String,
     #[serde(default)]
     pub enterprise_id: Option<TeamId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enterprise_name: Option<String>,
+    /// True when Slack marks this connected organization as verified.
+    #[serde(default, deserialize_with = "null_default")]
+    pub is_verified: bool,
     #[serde(default)]
     pub icon: Option<Value>,
     #[serde(flatten)]
@@ -274,5 +301,52 @@ mod tests {
             ..Default::default()
         };
         assert!(!disabled.paused(1500));
+    }
+
+    #[test]
+    fn user_effective_team_and_external_detection_and_team_verified_flag() {
+        use super::{Profile, Team, TeamId, User, UserId};
+
+        let own = TeamId::from("T0ACME");
+        let internal = User {
+            id: UserId::from("U1"),
+            team_id: Some(own.clone()),
+            ..Default::default()
+        };
+        assert_eq!(internal.effective_team_id(), Some(&own));
+        assert!(!internal.is_external_to(&own));
+
+        let ext_via_profile = User {
+            id: UserId::from("U2"),
+            team_id: None,
+            profile: Profile {
+                team: Some(TeamId::from("T0KLARNA")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            ext_via_profile.effective_team_id(),
+            Some(&TeamId::from("T0KLARNA"))
+        );
+        assert!(ext_via_profile.is_external_to(&own));
+
+        let stranger = User {
+            id: UserId::from("U3"),
+            is_stranger: true,
+            ..Default::default()
+        };
+        assert!(stranger.is_external_to(&own));
+
+        let team: Team = serde_json::from_value(serde_json::json!({
+            "id": "T0KLARNA",
+            "name": "Klarna",
+            "domain": "klarna",
+            "enterprise_name": "Klarna Group",
+            "is_verified": true
+        }))
+        .unwrap();
+        assert_eq!(team.enterprise_name.as_deref(), Some("Klarna Group"));
+        assert!(team.is_verified);
     }
 }

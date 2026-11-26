@@ -174,12 +174,23 @@ pub fn load() -> Fixtures {
     .collect();
 
     // The two members of the connected organization in the Slack Connect channel.
-    for (id, name, real) in [
-        ("U0KLA1", "elin", "Elin Ekman"),
-        ("U0KLA2", "johannes", "Johannes Jonsson"),
+    for (id, name, real, title) in [
+        ("U0KLA1", "elin", "Elin Ekman", "Partner Operations Lead"),
+        (
+            "U0KLA2",
+            "johannes",
+            "Johannes Jonsson",
+            "Disputes Specialist",
+        ),
     ] {
         let mut external = user(id, name, real);
         external.team_id = Some("T0KLARNA".into());
+        external.is_stranger = true;
+        external.tz = Some("Europe/Stockholm".into());
+        external.tz_label = Some("Central European Time".into());
+        external.tz_offset = Some(3_600);
+        external.profile.title = Some(title.into());
+        external.profile.email = Some(format!("{name}@klarna.example"));
         users.push(external);
     }
 
@@ -231,6 +242,9 @@ pub fn load() -> Fixtures {
     partner.creator = Some("U0KLA1".into());
     partner.created = Some(1_593_043_200); // 2020-06-25
     partner.context_team_id = Some("T0KLARNA".into());
+    partner.conversation_host_id = Some("T0KLARNA".into());
+    partner.shared_team_ids = vec!["T0ACME".into(), "T0KLARNA".into()];
+    partner.connected_team_ids = vec!["T0KLARNA".into()];
     partner.members = vec![
         "U0ME".into(),
         "U0ALICE".into(),
@@ -238,12 +252,6 @@ pub fn load() -> Fixtures {
         "U0KLA1".into(),
         "U0KLA2".into(),
     ];
-    let mut partner_extra = serde_json::Map::new();
-    partner_extra.insert(
-        "conversation_host_id".to_owned(),
-        serde_json::Value::String("T0KLARNA".to_owned()),
-    );
-    partner.extra = partner_extra;
     channels.push(partner);
 
     // A dormant channel ("No messages in at least 30 days"): Slack's "Active only" default
@@ -696,7 +704,23 @@ pub fn load() -> Fixtures {
     ];
 
     // The Slack Connect channel's history: a question from the connected org, answered in
-    // kind, so external authors render with their profiles.
+    // kind, plus an external partner app notification so external app ownership chips render.
+    let mut klarna_bot_msg = msg(
+        "C0PARTNER",
+        DAY + 680,
+        "U0KLA2",
+        "Dispute #4812 status updated to Under Review.",
+    );
+    klarna_bot_msg.user = None;
+    klarna_bot_msg.username = Some("Klarna Desk".into());
+    klarna_bot_msg.bot_id = Some(slackless_core::types::BotId::from("B0KLARNA"));
+    klarna_bot_msg.bot_profile = Some(slackless_core::types::BotProfile {
+        id: slackless_core::types::BotId::from("B0KLARNA"),
+        app_id: Some("A0KLARNA".into()),
+        name: "Klarna Desk".into(),
+        team_id: Some("T0KLARNA".into()),
+        ..Default::default()
+    });
     let partner = vec![
         msg(
             "C0PARTNER",
@@ -716,6 +740,7 @@ pub fn load() -> Fixtures {
             "U0KLA2",
             "Tack! We'll keep the dispute open until then.",
         ),
+        klarna_bot_msg,
     ];
 
     let messages = HashMap::from([
@@ -738,6 +763,7 @@ pub fn load() -> Fixtures {
             id: "T0KLARNA".into(),
             name: "Klarna".into(),
             domain: "klarna".into(),
+            is_verified: true,
             ..Default::default()
         },
     ];
@@ -786,6 +812,7 @@ pub fn load() -> Fixtures {
             skin_tone: 1,
             thumbnails,
             file_transcripts: HashMap::new(),
+            file_transcript_cues: HashMap::new(),
             profile_extras,
             custom_emoji,
             block_images,

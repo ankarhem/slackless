@@ -38,13 +38,30 @@ use crate::fixtures::Fixtures;
 use crate::image_viewer::{self, ImageOrigin, ViewerImage};
 use crate::messages::LinkTarget;
 use crate::slash::{Invocation, SlashKind};
-use crate::threads_cards::{ThreadCard, card_view, remote_cards};
+use crate::threads_cards::{
+    ListItemThreadMeta, ThreadCard, card_view, list_item_thread_card, remote_cards, sort_cards,
+};
+
+/// Filter tabs in the Threads header allowing users to view all followed threads, channel/DM
+/// message threads, or Slack List item threads (`F-COLLAB-250`, `F-COLLAB-251`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThreadsFilter {
+    #[default]
+    All,
+    Messages,
+    ListItems,
+}
 
 pub enum ThreadsEvent {
     /// A card's channel header was clicked: open the conversation with the thread panel on `thread_ts`.
     Open {
         channel: ChannelId,
         thread_ts: Ts,
+    },
+    /// A list item thread header was clicked: open the parent Slack List on `record_id`.
+    OpenListItem {
+        list_id: String,
+        record_id: String,
     },
     /// A link inside a thread card message (@mention, #channel, URL) was activated.
     OpenLink(LinkTarget),
@@ -111,6 +128,8 @@ pub struct ThreadsView {
     saved: HashSet<Ts>,
     /// Active inline message edit `(channel, ts, textarea)`.
     editing: Option<(ChannelId, Ts, Entity<TextareaState>)>,
+    /// Filter pills in the Threads header (`All`, `Messages`, `List items`).
+    filter: ThreadsFilter,
     composer: Entity<Composer>,
     _subscriptions: Vec<Subscription>,
 }
@@ -169,6 +188,7 @@ impl ThreadsView {
                 expanded: HashSet::new(),
                 saved: HashSet::new(),
                 editing: None,
+                filter: ThreadsFilter::All,
                 composer,
                 _subscriptions: subscriptions,
             }
@@ -179,6 +199,7 @@ impl ThreadsView {
         let target = self
             .active
             .and_then(|ix| self.cards.get(ix))
+            .filter(|card| card.list_item.is_none())
             .and_then(|card| AlsoSendTarget::for_channel(&self.fixtures, &card.channel));
         self.composer
             .update(cx, |composer, cx| composer.set_also_send(target, cx));
@@ -216,9 +237,50 @@ impl ThreadsView {
         self.cards.clear();
         self.expanded.clear();
         self.editing = None;
+        self.filter = ThreadsFilter::All;
         self.active = None;
         self.sync_also_send(cx);
         cx.notify();
+    }
+
+    /// Switch the header filter (`All` / `Messages` / `List items`).
+    pub fn set_filter(&mut self, filter: ThreadsFilter, cx: &mut Context<Self>) {
+        if self.filter != filter {
+            self.filter = filter;
+            cx.notify();
+        }
+    }
+
+    /// Merge or insert a Slack List item comment thread fetched via `lists.getThreadsForRecord`
+    /// (`F-COLLAB-250`, `F-COLLAB-251`) so it appears cleanly alongside message threads.
+    pub fn upsert_list_item_thread(
+        &mut self,
+        meta: ListItemThreadMeta,
+        messages: Vec<Message>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(card) = list_item_thread_card(meta, messages) else {
+            return false;
+        };
+        if let Some(existing) = self.cards.iter_mut().find(|c| {
+            c.list_item.as_ref().is_some_and(|m| {
+                card.list_item
+                    .as_ref()
+                    .is_some_and(|n| m.list_id == n.list_id && m.record_id == n.record_id)
+            })
+        }) {
+            *existing = card;
+        } else {
+            self.cards.push(card);
+        }
+        sort_cards(&mut self.cards);
+        self.active = self
+            .active
+            .filter(|&ix| ix < self.cards.len())
+            .or_else(|| (!self.cards.is_empty()).then_some(0));
+        self.sync_also_send(cx);
+        cx.notify();
+        true
     }
 
     /// Replace the set of saved-for-later message timestamps (synced from `LaterView`).
@@ -445,11 +507,33 @@ impl ThreadsView {
         cx.notify();
     }
 
-    /// Replace the cards with Slack's own followed threads (`subscriptions.thread.getView`).
+    /// Replace the cards with Slack's own followed threads (`subscriptions.thread.getView`),
+    /// preserving any list item comment threads fetched via `lists.getThreadsForRecord` that
+    /// Slack's subscription endpoint did not include directly.
     pub fn set_remote(&mut self, view: SlackThreads, cx: &mut Context<Self>) {
         self.remote = true;
         self.loading = false;
-        self.cards = remote_cards(view);
+        let preserved_list_cards: Vec<ThreadCard> = self
+            .cards
+            .iter()
+            .filter(|c| c.list_item.is_some())
+            .cloned()
+            .collect();
+        let mut next = remote_cards(view);
+        for card in preserved_list_cards {
+            let dup = card.list_item.as_ref().is_some_and(|meta| {
+                next.iter().any(|c| {
+                    c.list_item
+                        .as_ref()
+                        .is_some_and(|m| m.list_id == meta.list_id && m.record_id == meta.record_id)
+                })
+            });
+            if !dup {
+                next.push(card);
+            }
+        }
+        sort_cards(&mut next);
+        self.cards = next;
         self.active = self
             .active
             .filter(|&ix| ix < self.cards.len())
@@ -729,9 +813,28 @@ impl ThreadsView {
 impl Render for ThreadsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, muted, background) = (theme.border, theme.muted_foreground, theme.background);
+        let (border, muted, background, secondary, foreground) = (
+            theme.border,
+            theme.muted_foreground,
+            theme.background,
+            theme.secondary,
+            theme.foreground,
+        );
         let unread: u32 = self.cards.iter().map(|card| card.unread).sum();
-        let cards: Vec<(usize, ThreadCard)> = self.cards.iter().cloned().enumerate().collect();
+        let list_count = self.cards.iter().filter(|c| c.list_item.is_some()).count();
+        let msg_count = self.cards.len().saturating_sub(list_count);
+        let filter = self.filter;
+        let cards: Vec<(usize, ThreadCard)> = self
+            .cards
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(_, card)| match filter {
+                ThreadsFilter::All => true,
+                ThreadsFilter::Messages => card.list_item.is_none(),
+                ThreadsFilter::ListItems => card.list_item.is_some(),
+            })
+            .collect();
         let mut inner = v_flex().w_full().px_5().py_4().gap_6();
         let editing = self.editing.clone();
         for (ix, card) in &cards {
@@ -762,17 +865,41 @@ impl Render for ThreadsView {
                     .text_sm()
                     .text_color(muted)
                     .child(
-                        Icon::new(IconName::MessageSquareText)
-                            .text_color(muted)
-                            .size(px(28.)),
+                        Icon::new(if filter == ThreadsFilter::ListItems {
+                            IconName::ListChecks
+                        } else {
+                            IconName::MessageSquareText
+                        })
+                        .text_color(muted)
+                        .size(px(28.)),
                     )
                     .child(if loading {
                         "Loading threads…"
+                    } else if filter == ThreadsFilter::ListItems {
+                        "No list item threads yet. Open a list item and comment to see it here."
                     } else {
                         "No followed threads yet. Reply in one to follow it."
                     }),
             )
         });
+        let filter_pill = |id: &'static str, label: String, target: ThreadsFilter| {
+            let active = filter == target;
+            div()
+                .id(id)
+                .px_2()
+                .py(px(3.))
+                .rounded_sm()
+                .text_xs()
+                .cursor_pointer()
+                .when(active, |el| {
+                    el.bg(secondary)
+                        .text_color(foreground)
+                        .font_weight(FontWeight::SEMIBOLD)
+                })
+                .when(!active, |el| el.text_color(muted))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_filter(target, cx)))
+        };
 
         v_flex()
             .size_full()
@@ -809,6 +936,32 @@ impl Render for ThreadsView {
                                         .font_weight(FontWeight::NORMAL)
                                         .text_color(muted)
                                         .child(format!("{unread} unread")),
+                                )
+                            })
+                            .when(list_count > 0 || filter != ThreadsFilter::All, |title| {
+                                title.child(
+                                    h_flex()
+                                        .ml_2()
+                                        .p(px(2.))
+                                        .gap_0p5()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(border)
+                                        .child(filter_pill(
+                                            "threads-filter-all",
+                                            format!("All ({})", self.cards.len()),
+                                            ThreadsFilter::All,
+                                        ))
+                                        .child(filter_pill(
+                                            "threads-filter-messages",
+                                            format!("Messages ({msg_count})"),
+                                            ThreadsFilter::Messages,
+                                        ))
+                                        .child(filter_pill(
+                                            "threads-filter-lists",
+                                            format!("List items ({list_count})"),
+                                            ThreadsFilter::ListItems,
+                                        )),
                                 )
                             }),
                     )
@@ -1122,5 +1275,79 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[gpui::test]
+    fn threads_view_upserts_preserves_and_filters_list_item_threads(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let fixtures = Arc::new(crate::fixtures::load());
+        let view_cell = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let cell = view_cell.clone();
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = ThreadsView::new(fixtures.clone(), window, cx);
+            *cell.borrow_mut() = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let view = view_cell.borrow_mut().take().unwrap();
+
+        cx.update(|_, cx| {
+            let meta = ListItemThreadMeta {
+                list_id: "F0LIST1".into(),
+                list_title: "Launch tasks".into(),
+                record_id: "Rec42".into(),
+                item_title: "Ship v2".into(),
+            };
+            let inserted = view.update(cx, |v, cx| {
+                v.upsert_list_item_thread(
+                    meta.clone(),
+                    vec![
+                        Message {
+                            ts: Ts::from("1760000010.000100"),
+                            text: "First list comment".into(),
+                            ..Default::default()
+                        },
+                        Message {
+                            ts: Ts::from("1760000011.000100"),
+                            text: "Second list comment".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    cx,
+                )
+            });
+            assert!(inserted);
+            assert_eq!(view.read(cx).cards.len(), 1);
+            assert_eq!(view.read(cx).cards[0].list_item.as_ref(), Some(&meta));
+
+            // Subsequent remote message-thread refresh preserves fetched list item threads.
+            let remote = SlackThreads {
+                threads: vec![ThreadSubscription {
+                    root: Message {
+                        channel: Some(ChannelId::from("C0ENG")),
+                        ts: Ts::from("1760000001.000100"),
+                        text: "Channel thread".into(),
+                        reply_count: Some(1),
+                        ..Default::default()
+                    },
+                    latest_replies: vec![],
+                    unread_replies: vec![],
+                }],
+                has_more: false,
+                total_unread_replies: 0,
+            };
+            view.update(cx, |v, cx| v.set_remote(remote, cx));
+            assert_eq!(view.read(cx).cards.len(), 2);
+            assert!(view.read(cx).cards.iter().any(|c| c.list_item.is_some()));
+            assert!(view.read(cx).cards.iter().any(|c| c.list_item.is_none()));
+
+            // Filter toggles cleanly between All, Messages, and ListItems.
+            view.update(cx, |v, cx| v.set_filter(ThreadsFilter::ListItems, cx));
+            assert_eq!(view.read(cx).filter, ThreadsFilter::ListItems);
+            view.update(cx, |v, cx| v.set_filter(ThreadsFilter::Messages, cx));
+            assert_eq!(view.read(cx).filter, ThreadsFilter::Messages);
+        });
     }
 }

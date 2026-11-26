@@ -523,11 +523,7 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
         Cli::try_parse_from(["slackless", "update", "--check"])
             .unwrap()
             .command,
-        Commands::Update {
-            check: true,
-            force: false,
-            restart: false
-        }
+        Commands::Update(args) if args.check && !args.force && !args.restart
     ));
     let transcribe_cli = Cli::try_parse_from([
         "slackless",
@@ -937,6 +933,7 @@ fn cmd_search_finds_message_by_spoken_word_from_video_transcript() {
         "zephyrgate",
         SearchCmdOpts {
             limit: 20,
+            sort: slackless_core::store::SearchSort::Recent,
             format: Some(ExportFormat::Json),
             out: Some(&hit_out),
             include_deleted: false,
@@ -959,6 +956,7 @@ fn cmd_search_finds_message_by_spoken_word_from_video_transcript() {
         "unrelatedtoken",
         SearchCmdOpts {
             limit: 20,
+            sort: slackless_core::store::SearchSort::Recent,
             format: Some(ExportFormat::Json),
             out: Some(&miss_out),
             include_deleted: false,
@@ -973,5 +971,420 @@ fn cmd_search_finds_message_by_spoken_word_from_video_transcript() {
     assert_eq!(miss_payload["count"], 0);
 
     drop(archive);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn parses_unified_search_export_and_archive_cli_flags() {
+    use crate::cli::{ArchiveCommand, SearchSortArg};
+
+    let cli = Cli::try_parse_from([
+        "slackless",
+        "--json",
+        "search",
+        "--all-workspaces",
+        "--sort",
+        "relevant",
+        "--limit",
+        "15",
+        "canary",
+    ])
+    .expect("parse unified search");
+    match cli.command {
+        Commands::Search(args) => {
+            assert!(args.all_workspaces);
+            assert_eq!(args.sort, SearchSortArg::Relevant);
+            assert_eq!(args.limit, 15);
+            assert_eq!(args.query, "canary");
+        }
+        _ => panic!("expected Search"),
+    }
+
+    let cli_thread = Cli::try_parse_from([
+        "slackless",
+        "export",
+        "#eng",
+        "--thread",
+        "1700000001.000100",
+        "--format",
+        "json",
+        "--exclude-deleted",
+    ])
+    .expect("parse thread export");
+    match cli_thread.command {
+        Commands::Export(args) => {
+            assert_eq!(args.channel.as_deref(), Some("#eng"));
+            assert_eq!(args.thread.as_deref(), Some("1700000001.000100"));
+            assert_eq!(args.format, ExportFormat::Json);
+            assert!(args.exclude_deleted);
+        }
+        _ => panic!("expected Export"),
+    }
+
+    let cli_transcript = Cli::try_parse_from([
+        "slackless",
+        "export",
+        "--transcript",
+        "FCLIP9",
+        "--format",
+        "md",
+    ])
+    .expect("parse transcript export");
+    match cli_transcript.command {
+        Commands::Export(args) => {
+            assert!(args.channel.is_none());
+            assert_eq!(args.transcript.as_deref(), Some("FCLIP9"));
+        }
+        _ => panic!("expected Export"),
+    }
+
+    let cli_huddle = Cli::try_parse_from(["slackless", "export", "--huddle", "R123"])
+        .expect("parse huddle export");
+    match cli_huddle.command {
+        Commands::Export(args) => {
+            assert_eq!(args.huddle.as_deref(), Some("R123"));
+        }
+        _ => panic!("expected Export"),
+    }
+
+    let cli_bf = Cli::try_parse_from([
+        "slackless",
+        "archive",
+        "backfill",
+        "--all",
+        "--threads",
+        "--pages",
+        "3",
+        "--page-size",
+        "50",
+    ])
+    .expect("parse archive backfill");
+    match cli_bf.command {
+        Commands::Archive { command } => match *command {
+            ArchiveCommand::Backfill(args) => {
+                assert!(args.all);
+                assert!(args.threads);
+                assert_eq!(args.pages, 3);
+                assert_eq!(args.page_size, 50);
+            }
+            _ => panic!("expected ArchiveCommand::Backfill"),
+        },
+        _ => panic!("expected Archive"),
+    }
+
+    let cli_status =
+        Cli::try_parse_from(["slackless", "--json", "archive", "status"]).expect("parse status");
+    assert!(matches!(
+        cli_status.command,
+        Commands::Archive { command } if matches!(*command, ArchiveCommand::Status)
+    ));
+}
+
+#[test]
+fn cmd_search_all_workspaces_and_export_and_archive_status_end_to_end() {
+    use std::collections::HashMap;
+    use std::process::ExitCode;
+
+    use slackless_core::store::{SearchSort, Store};
+    use slackless_core::types::{
+        ChannelId, Conversation, File, FileId, FileMode, Message, Team, TeamId, Ts, User, UserId,
+    };
+    use slackless_core::{Synced, write_synced_spans};
+
+    use crate::archive::Archive;
+    use crate::commands::maintenance::build_archive_status_report;
+    use crate::commands::messages::{
+        ExportCmdOpts, SearchAllOpts, cmd_export_in_archive, cmd_search_all_in_archives,
+    };
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "slackless-cli-unified-export-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+
+    let ws1 = TeamId::from("T_ALPHA");
+    let ws2 = TeamId::from("T_BETA");
+    let db1 = tmp_dir.join("T_ALPHA.sqlite");
+    let db2 = tmp_dir.join("T_BETA.sqlite");
+
+    // Seed workspace 1: channel, thread, snippet, file transcript, huddle transcript, synced span.
+    {
+        let mut s1 = Store::open(&db1).expect("open db1");
+        s1.upsert_team(
+            &ws1,
+            &Team {
+                id: ws1.clone(),
+                name: "Alpha Corp".into(),
+                ..Team::default()
+            },
+        )
+        .unwrap();
+        s1.upsert_user(
+            &ws1,
+            &User {
+                id: UserId::from("U1"),
+                name: "alice".into(),
+                ..User::default()
+            },
+        )
+        .unwrap();
+        s1.upsert_conversations(
+            &ws1,
+            &[Conversation {
+                id: ChannelId::from("C1"),
+                name: Some("ops".into()),
+                is_channel: true,
+                is_member: true,
+                ..Conversation::default()
+            }],
+        )
+        .unwrap();
+        s1.upsert_messages(
+            &ws1,
+            &ChannelId::from("C1"),
+            &[
+                Message {
+                    ts: Ts::from("1700000100.000000"),
+                    user: Some(UserId::from("U1")),
+                    text: "Deploying quantumbridge v1".into(),
+                    reply_count: Some(1),
+                    ..Message::default()
+                },
+                Message {
+                    ts: Ts::from("1700000105.000000"),
+                    thread_ts: Some(Ts::from("1700000100.000000")),
+                    user: Some(UserId::from("U1")),
+                    text: "Thread reply confirmed".into(),
+                    ..Message::default()
+                },
+            ],
+        )
+        .unwrap();
+        s1.upsert_file_transcript(
+            &ws1,
+            &FileId::from("F_CLIP"),
+            "whisper",
+            "Spoken quantumbridge walkthrough notes",
+        )
+        .unwrap();
+        s1.insert_huddle_transcript_segment(
+            &ws1,
+            &slackless_core::store::NewHuddleTranscriptSegment {
+                channel: &ChannelId::from("C1"),
+                call_id: "R_HUDDLE_1",
+                thread_root_ts: None,
+                speaker_id: Some(&UserId::from("U1")),
+                lang: Some("en"),
+                source: "local",
+                text: "Discussed quantumbridge rollout",
+                at_ms: 1_700_000_200_000,
+            },
+        )
+        .unwrap();
+        let mut spans = HashMap::new();
+        spans.insert(
+            ChannelId::from("C1"),
+            Synced {
+                newest: Ts::from("1700000105.000000"),
+                oldest: Ts::from("1700000100.000000"),
+                complete: true,
+            },
+        );
+        write_synced_spans(&mut s1, &ws1, &spans).unwrap();
+    }
+
+    // Seed workspace 2: snippet attachment matching the same term.
+    {
+        let mut s2 = Store::open(&db2).expect("open db2");
+        s2.upsert_team(
+            &ws2,
+            &Team {
+                id: ws2.clone(),
+                name: "Beta Labs".into(),
+                ..Team::default()
+            },
+        )
+        .unwrap();
+        s2.upsert_conversations(
+            &ws2,
+            &[Conversation {
+                id: ChannelId::from("C2"),
+                name: Some("release".into()),
+                is_channel: true,
+                is_member: true,
+                ..Conversation::default()
+            }],
+        )
+        .unwrap();
+        s2.upsert_messages(
+            &ws2,
+            &ChannelId::from("C2"),
+            &[Message {
+                ts: Ts::from("1700000300.000000"),
+                text: "Config snippet".into(),
+                files: vec![File {
+                    id: FileId::from("F_SNIP"),
+                    name: Some("bridge.toml".into()),
+                    mode: Some(FileMode::Snippet),
+                    preview: Some("quantumbridge = true".into()),
+                    ..File::default()
+                }],
+                ..Message::default()
+            }],
+        )
+        .unwrap();
+    }
+
+    let ctx_json = crate::Ctx { json: true };
+    let search_out = tmp_dir.join("all_search.json");
+    let code = cmd_search_all_in_archives(
+        &ctx_json,
+        &[(ws1.clone(), db1.clone()), (ws2.clone(), db2.clone())],
+        "quantumbridge",
+        SearchAllOpts {
+            limit: 20,
+            sort: SearchSort::Recent,
+            format: Some(ExportFormat::Json),
+            out: Some(&search_out),
+            include_deleted: false,
+        },
+    )
+    .expect("cross-workspace search");
+    assert_eq!(code, ExitCode::SUCCESS);
+    let search_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&search_out).unwrap()).unwrap();
+    assert_eq!(search_json["all_workspaces"], true);
+    assert_eq!(search_json["count"], 3); // T_BETA snippet + T_ALPHA msg + T_ALPHA standalone transcript
+    let msgs = search_json["messages"].as_array().unwrap();
+    assert!(
+        msgs.iter()
+            .any(|m| m["workspace"] == "T_BETA" && m["kind"] == "snippet")
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m["workspace"] == "T_ALPHA" && m["kind"] == "message")
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m["workspace"] == "T_ALPHA" && m["kind"] == "file_transcript")
+    );
+
+    // Export channel (Markdown with threads), thread (JSON), file transcript (MD), huddle (JSON).
+    let archive1 = Archive::open_path(&db1).unwrap().unwrap();
+    let ch_md_path = tmp_dir.join("ops.md");
+    assert_eq!(
+        cmd_export_in_archive(
+            &crate::Ctx { json: false },
+            &ws1,
+            Some(&archive1),
+            ExportCmdOpts {
+                channel: Some("#ops"),
+                thread_ts: None,
+                transcript_file_id: None,
+                huddle_call_id: None,
+                include_threads: true,
+                include_deleted: true,
+                format: ExportFormat::Md,
+                limit: 100,
+                out: Some(&ch_md_path),
+            },
+        )
+        .unwrap(),
+        ExitCode::SUCCESS
+    );
+    let ch_md = std::fs::read_to_string(&ch_md_path).unwrap();
+    assert!(ch_md.contains("# #ops"));
+    assert!(ch_md.contains("Deploying quantumbridge v1"));
+    assert!(ch_md.contains("Thread reply confirmed"));
+
+    let thread_json_path = tmp_dir.join("thread.json");
+    assert_eq!(
+        cmd_export_in_archive(
+            &ctx_json,
+            &ws1,
+            Some(&archive1),
+            ExportCmdOpts {
+                channel: Some("C1"),
+                thread_ts: Some("1700000100.000000"),
+                transcript_file_id: None,
+                huddle_call_id: None,
+                include_threads: false,
+                include_deleted: true,
+                format: ExportFormat::Json,
+                limit: 100,
+                out: Some(&thread_json_path),
+            },
+        )
+        .unwrap(),
+        ExitCode::SUCCESS
+    );
+    let thread_val: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&thread_json_path).unwrap()).unwrap();
+    assert_eq!(thread_val["kind"], "thread");
+    assert_eq!(thread_val["count"], 2);
+
+    let clip_md_path = tmp_dir.join("clip.md");
+    assert_eq!(
+        cmd_export_in_archive(
+            &crate::Ctx { json: false },
+            &ws1,
+            Some(&archive1),
+            ExportCmdOpts {
+                channel: None,
+                thread_ts: None,
+                transcript_file_id: Some("F_CLIP"),
+                huddle_call_id: None,
+                include_threads: false,
+                include_deleted: true,
+                format: ExportFormat::Md,
+                limit: 100,
+                out: Some(&clip_md_path),
+            },
+        )
+        .unwrap(),
+        ExitCode::SUCCESS
+    );
+    assert!(
+        std::fs::read_to_string(&clip_md_path)
+            .unwrap()
+            .contains("Spoken quantumbridge walkthrough notes")
+    );
+
+    let huddle_json_path = tmp_dir.join("huddle.json");
+    assert_eq!(
+        cmd_export_in_archive(
+            &ctx_json,
+            &ws1,
+            Some(&archive1),
+            ExportCmdOpts {
+                channel: None,
+                thread_ts: None,
+                transcript_file_id: None,
+                huddle_call_id: Some("R_HUDDLE_1"),
+                include_threads: false,
+                include_deleted: true,
+                format: ExportFormat::Json,
+                limit: 100,
+                out: Some(&huddle_json_path),
+            },
+        )
+        .unwrap(),
+        ExitCode::SUCCESS
+    );
+    let huddle_val: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&huddle_json_path).unwrap()).unwrap();
+    assert_eq!(huddle_val["kind"], "huddle_transcript");
+    assert_eq!(huddle_val["count"], 1);
+
+    // Archive status report verifies synced spans + counts.
+    let (status_json, status_human) = build_archive_status_report(&ws1, &archive1).unwrap();
+    assert_eq!(status_json["completed_channels"], 1);
+    assert_eq!(status_json["total_channels"], 1);
+    assert!(status_human.contains("#ops"));
+    assert!(status_human.contains("complete"));
+
+    drop(archive1);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

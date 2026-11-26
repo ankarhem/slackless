@@ -13,9 +13,14 @@ mod tests;
 mod transcripts;
 
 pub use archive::{ALL_CONVERSATION_KINDS, ConversationSummary, DigestChannel, UserSummary};
-pub use file_transcripts::{StoredFileTranscript, extract_inline_file_transcript};
+pub use file_transcripts::{
+    StoredFileTranscript, WorkspaceFileTranscript, extract_inline_file_body,
+    extract_inline_file_transcript,
+};
+pub use search::WorkspaceStoredMessage;
 pub use transcripts::{
     HuddleTranscriptSegment, HuddleTranscriptSession, NewHuddleTranscriptSegment,
+    WorkspaceHuddleTranscriptSegment,
 };
 
 pub(crate) use messages::decode_json_value;

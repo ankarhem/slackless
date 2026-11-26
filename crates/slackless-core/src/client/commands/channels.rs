@@ -677,6 +677,107 @@ impl<B: Backend> Core<B> {
             Ok(())
         });
     }
+
+    pub(super) fn backfill_channel(&mut self, channel: ChannelId, include_threads: bool) {
+        if let Some(prev) = self.backfills.remove(&channel) {
+            prev.abort();
+        }
+        // Clear any stale paused state when explicitly starting a single-channel backfill.
+        if self.backfill.control.is_paused() {
+            let _ = self.backfill.control.resume();
+        }
+        let backfill = self.backfill.clone();
+        let store = Arc::clone(&self.store);
+        let ws = self.workspace.clone();
+        let ch_lookup = channel.clone();
+        let ch_run = channel.clone();
+        if let Some(abort) = self.tasks.spawn(async move {
+            let name = with_store(&store, move |s| {
+                Ok(s.conversation_summary(&ws, &ch_lookup)?
+                    .and_then(|c| c.name))
+            })
+            .await
+            .ok()
+            .flatten();
+            backfill
+                .run_with_options(ch_run, name, include_threads)
+                .await;
+        }) {
+            self.backfills.insert(channel, abort);
+        }
+    }
+
+    pub(super) fn backfill_workspace(&mut self, include_threads: bool) {
+        if self
+            .workspace_backfill
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
+        {
+            if self.backfill.control.is_paused() {
+                let snap = self.backfill.control.resume();
+                self.events.emit(Event::BackfillProgress(snap));
+            }
+            return;
+        }
+        // Clear any stale paused state when explicitly starting a new workspace backfill.
+        if self.backfill.control.is_paused() {
+            let _ = self.backfill.control.resume();
+        }
+        let backfill = self.backfill.clone();
+        let store = Arc::clone(&self.store);
+        let ws = self.workspace.clone();
+        self.workspace_backfill = self.tasks.spawn(async move {
+            let channels = with_store(&store, move |s| {
+                let mut convs = s.conversations(&ws)?;
+                convs.retain(|c| c.is_member || c.is_im || c.is_mpim);
+                convs.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+                Ok(convs
+                    .into_iter()
+                    .map(|c| (c.id, c.name))
+                    .collect::<Vec<_>>())
+            })
+            .await
+            .unwrap_or_default();
+            backfill.run_workspace(channels, include_threads).await;
+        });
+    }
+
+    pub(super) fn pause_backfill(&mut self) {
+        let snap = self.backfill.control.pause();
+        self.events.emit(Event::BackfillProgress(snap));
+    }
+
+    pub(super) fn resume_backfill(&mut self) {
+        let snap = self.backfill.control.resume();
+        self.events.emit(Event::BackfillProgress(snap));
+    }
+
+    pub(super) fn query_backfill_progress(&self) {
+        let store = Arc::clone(&self.store);
+        let ws = self.workspace.clone();
+        let control = self.backfill.control.clone();
+        let synced = Arc::clone(&self.backfill.synced);
+        let events = self.events.clone();
+        self.tasks.spawn(async move {
+            let (channels, msg_counts) = with_store(&store, move |s| {
+                let mut convs = s.conversations(&ws)?;
+                convs.retain(|c| c.is_member || c.is_im || c.is_mpim);
+                convs.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+                let list: Vec<(ChannelId, Option<String>)> =
+                    convs.into_iter().map(|c| (c.id, c.name)).collect();
+                let counts = s.channel_message_counts(&ws)?;
+                Ok((list, counts))
+            })
+            .await
+            .unwrap_or_default();
+            let spans = synced
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            let snap = control.sync_inventory(&channels, &spans, &msg_counts, false);
+            events.emit(Event::BackfillProgress(snap));
+        });
+    }
 }
 
 async fn refresh_usergroups<B: Backend>(backend: &B, events: &Emitter) -> Result<(), CoreError> {

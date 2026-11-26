@@ -17,10 +17,11 @@ use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     Anchor, App, Bounds, Context, Div, Entity, FontWeight, Global, InteractiveElement as _,
-    MouseDownEvent, ParentElement as _, Pixels, Point, SharedString, Size, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div, point, px,
+    IntoElement as _, MouseDownEvent, ParentElement as _, Pixels, Point, SharedString, Size,
+    Stateful, StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div, point,
+    px,
 };
-use slackless_core::types::UserId;
+use slackless_core::types::{Team, UserId};
 
 use crate::app::App as Root;
 use crate::fixtures::Fixtures;
@@ -143,6 +144,10 @@ pub(crate) struct Profile {
     pub is_self: bool,
     /// Another, undeleted member with a resolved record: the "Message" button.
     pub can_message: bool,
+    /// True when the member belongs to an external Slack Connect organization (`F-COLLAB-800`).
+    pub is_external: bool,
+    /// Resolved external organization record when available.
+    pub external_team: Option<Team>,
 }
 
 /// A custom status line: emoji shortcode (colons trimmed) and text.
@@ -162,6 +167,8 @@ pub(crate) fn derive(fixtures: &Fixtures, self_state: &SelfState, user_id: &User
         local_time: derived.local_time.map(|(time, _)| time),
         is_self: derived.is_self,
         can_message: derived.can_message,
+        is_external: derived.is_external,
+        external_team: derived.external_team,
     }
 }
 
@@ -215,14 +222,25 @@ pub(crate) fn card(
         56.,
         popover,
     );
-    let presence = profile.active.map(|active| {
-        div()
-            .flex_none()
-            .size(px(10.))
-            .rounded_full()
-            .when(active, |dot| dot.bg(success))
-            .when(!active, |dot| dot.border_1().border_color(muted))
-    });
+    let presence = if profile.is_external {
+        Some(
+            div()
+                .flex_none()
+                .size(px(10.))
+                .rounded(px(2.5))
+                .border_1()
+                .border_color(muted),
+        )
+    } else {
+        profile.active.map(|active| {
+            div()
+                .flex_none()
+                .size(px(10.))
+                .rounded_full()
+                .when(active, |dot| dot.bg(success))
+                .when(!active, |dot| dot.border_1().border_color(muted))
+        })
+    };
     let open_profile = actions.open_profile.clone();
     let name_row = h_flex()
         .items_center()
@@ -248,11 +266,51 @@ pub(crate) fn card(
         }))
         .children(presence);
     let open_profile = actions.open_profile.clone();
+    let external_badge = profile.is_external.then(|| {
+        let label = profile
+            .external_team
+            .as_ref()
+            .map(|t| format!("External · {}", t.name))
+            .unwrap_or_else(|| "External organization".to_owned());
+        h_flex()
+            .items_center()
+            .gap_1()
+            .mt_0p5()
+            .px_1p5()
+            .py(px(1.))
+            .rounded_sm()
+            .border_1()
+            .border_color(border)
+            .bg(theme.secondary.opacity(0.6))
+            .child(if let Some(ref team) = profile.external_team {
+                crate::channel_details::org_chip(team, 13.).into_any_element()
+            } else {
+                Icon::new(IconName::Building2)
+                    .size(px(12.))
+                    .text_color(muted)
+                    .into_any_element()
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(muted)
+                    .child(label),
+            )
+            .when(
+                profile
+                    .external_team
+                    .as_ref()
+                    .is_some_and(|t| t.is_verified),
+                |chip| chip.child(Icon::new(IconName::Check).size(px(10.)).text_color(link)),
+            )
+    });
     let identity = v_flex()
         .flex_1()
         .min_w_0()
         .gap_0p5()
         .child(name_row)
+        .children(external_badge)
         .children(profile.title.map(|title| {
             div()
                 .min_w_0()
@@ -271,36 +329,44 @@ pub(crate) fn card(
                 .child("View full profile")
                 .on_click(move |_, window, cx| open_profile(window, cx)),
         );
-    let details = (profile.status.is_some() || profile.local_time.is_some()).then(|| {
-        v_flex()
-            .gap_1p5()
-            .mt_3()
-            .children(profile.status.map(|status| {
-                h_flex()
-                    .items_center()
-                    .gap_1p5()
-                    .child(crate::emoji::emoji_element(
-                        &status.emoji,
-                        fixtures,
-                        px(20.),
-                    ))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_size(px(13.))
-                            .child(status.text),
+    let details = (profile.status.is_some() || profile.local_time.is_some() || profile.is_external)
+        .then(|| {
+            v_flex()
+                .gap_1p5()
+                .mt_3()
+                .when(profile.is_external, |col| {
+                    col.child(
+                        div().text_xs().text_color(muted).child(
+                            "External person · Profile details managed by their organization",
+                        ),
                     )
-            }))
-            .children(profile.local_time.map(|time| {
-                h_flex()
-                    .items_center()
-                    .gap_1p5()
-                    .child(Icon::new(IconName::Clock).text_color(muted).size(px(14.)))
-                    .child(div().text_size(px(13.)).child(time))
-            }))
-    });
+                })
+                .children(profile.status.map(|status| {
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(crate::emoji::emoji_element(
+                            &status.emoji,
+                            fixtures,
+                            px(20.),
+                        ))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_size(px(13.))
+                                .child(status.text),
+                        )
+                }))
+                .children(profile.local_time.map(|time| {
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(Icon::new(IconName::Clock).text_color(muted).size(px(14.)))
+                        .child(div().text_size(px(13.)).child(time))
+                }))
+        });
     let action = if profile.is_self {
         let set_status = actions.set_status.clone();
         Some(
@@ -479,5 +545,21 @@ mod tests {
         let (anchor, position) = anchor_for(&high, viewport);
         assert_eq!(anchor, Anchor::TopLeft);
         assert_eq!(position, point(px(100.), px(100. + 20. + 4.)));
+    }
+
+    #[test]
+    fn external_user_profile_derives_external_flag_and_organization() {
+        let fixtures = crate::fixtures::load();
+        let ext = derive(&fixtures, &SelfState::default(), &UserId::from("U0KLA1"));
+        assert!(ext.is_external);
+        assert_eq!(
+            ext.external_team.as_ref().map(|t| t.name.as_str()),
+            Some("Klarna")
+        );
+        assert!(ext.external_team.as_ref().is_some_and(|t| t.is_verified));
+
+        let own = derive(&fixtures, &SelfState::default(), &fixtures.self_user);
+        assert!(!own.is_external);
+        assert!(own.external_team.is_none());
     }
 }

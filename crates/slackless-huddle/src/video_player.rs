@@ -20,6 +20,7 @@ pub struct VideoPlayerState {
     pub width: u32,
     pub height: u32,
     pub rate: f32,
+    pub volume: f32,
 }
 
 impl Default for VideoPlayerState {
@@ -34,7 +35,17 @@ impl Default for VideoPlayerState {
             width: 0,
             height: 0,
             rate: 1.0,
+            volume: 1.0,
         }
+    }
+}
+
+/// Clamp volume into the supported `0.0..=1.0` range (defaulting non-finite values to `1.0`).
+pub(crate) fn clamp_volume(volume: f32) -> f32 {
+    if !volume.is_finite() {
+        1.0
+    } else {
+        volume.clamp(0.0, 1.0)
     }
 }
 
@@ -69,11 +80,12 @@ mod imp {
         SlacklessVideoPlayer, slackless_video_player_copy_frame, slackless_video_player_destroy,
         slackless_video_player_open, slackless_video_player_open_url, slackless_video_player_pause,
         slackless_video_player_play, slackless_video_player_seek, slackless_video_player_set_muted,
-        slackless_video_player_set_rate, slackless_video_player_state,
+        slackless_video_player_set_rate, slackless_video_player_set_volume,
+        slackless_video_player_state,
     };
     use crate::{HuddleError, Result};
 
-    use super::{VideoPlayerState, clamp_playback_rate, next_playback_rate};
+    use super::{VideoPlayerState, clamp_playback_rate, clamp_volume, next_playback_rate};
 
     /// Thread-safe handle to a native macOS `AVPlayer` + `AVPlayerItemVideoOutput` media player
     /// supporting local video/audio files as well as authenticated HTTP/HLS URLs.
@@ -179,6 +191,28 @@ mod imp {
             }
         }
 
+        /// Set playback volume (`0.0..=1.0`, unmuting when raised above zero).
+        pub fn set_volume(&self, volume: f32) {
+            if !self.handle.is_null() {
+                let clamped = clamp_volume(volume);
+                // SAFETY: `self.handle` is valid for the lifetime of `self`.
+                unsafe { slackless_video_player_set_volume(self.handle, clamped) };
+            }
+        }
+
+        /// Adjust playback volume by `delta` (`-1.0..=1.0`) and return the resulting clamped level.
+        pub fn adjust_volume(&self, delta: f32) -> f32 {
+            let st = self.state();
+            let base = if st.muted && delta > 0.0 {
+                0.0
+            } else {
+                st.volume
+            };
+            let next = clamp_volume(base + delta);
+            self.set_volume(next);
+            next
+        }
+
         /// Set playback rate (clamped to `0.5..=2.0`, preserving audio pitch via time-domain
         /// scaling). Takes effect immediately if playing and is preserved across pause/resume.
         pub fn set_rate(&self, rate: f32) {
@@ -223,6 +257,7 @@ mod imp {
                     &mut st.height,
                     &mut st.failed,
                     &mut st.rate,
+                    &mut st.volume,
                 );
             }
             st
@@ -288,6 +323,12 @@ mod imp {
         pub fn toggle_play(&self) {}
 
         pub fn set_muted(&self, _muted: bool) {}
+
+        pub fn set_volume(&self, _volume: f32) {}
+
+        pub fn adjust_volume(&self, _delta: f32) -> f32 {
+            1.0
+        }
 
         pub fn set_rate(&self, _rate: f32) {}
 
@@ -391,6 +432,19 @@ mod tests {
 
         player.set_muted(true);
         assert!(player.state().muted);
+
+        // Volume controls clamp and unmute when raised from muted.
+        player.set_volume(0.4);
+        assert!(!player.state().muted);
+        assert!((player.state().volume - 0.4).abs() < 1e-4);
+        assert!((player.adjust_volume(0.2) - 0.6).abs() < 1e-4);
+        assert!((player.state().volume - 0.6).abs() < 1e-4);
+        assert!((player.adjust_volume(1.0) - 1.0).abs() < 1e-4);
+        assert!((player.adjust_volume(-2.0) - 0.0).abs() < 1e-4);
+        player.set_muted(true);
+        assert!(player.state().muted);
+        assert!((player.adjust_volume(0.1) - 0.1).abs() < 1e-4);
+        assert!(!player.state().muted);
         player.set_muted(false);
         assert!(!player.state().muted);
 
@@ -436,6 +490,12 @@ mod tests {
         assert_eq!(next_playback_rate(1.5), 2.0);
         assert_eq!(next_playback_rate(2.0), 1.0);
         assert_eq!(next_playback_rate(0.5), 1.5);
+
+        assert_eq!(VideoPlayerState::default().volume, 1.0);
+        assert_eq!(clamp_volume(-0.25), 0.0);
+        assert_eq!(clamp_volume(1.5), 1.0);
+        assert_eq!(clamp_volume(f32::NAN), 1.0);
+        assert_eq!(clamp_volume(0.6), 0.6);
     }
 
     #[test]
@@ -493,6 +553,19 @@ mod tests {
 
         player.set_muted(true);
         assert!(player.state().muted);
+
+        // Volume controls clamp and unmute when raised from muted.
+        player.set_volume(0.4);
+        assert!(!player.state().muted);
+        assert!((player.state().volume - 0.4).abs() < 1e-4);
+        assert!((player.adjust_volume(0.2) - 0.6).abs() < 1e-4);
+        assert!((player.state().volume - 0.6).abs() < 1e-4);
+        assert!((player.adjust_volume(1.0) - 1.0).abs() < 1e-4);
+        assert!((player.adjust_volume(-2.0) - 0.0).abs() < 1e-4);
+        player.set_muted(true);
+        assert!(player.state().muted);
+        assert!((player.adjust_volume(0.1) - 0.1).abs() < 1e-4);
+        assert!(!player.state().muted);
 
         // Speed controls work while paused and persist across play/pause.
         player.set_rate(1.5);

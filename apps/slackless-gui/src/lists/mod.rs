@@ -20,9 +20,10 @@ use gpui_kit::gpui::{
     Styled as _, Window, div, px, rgb,
 };
 use slackless_core::api::{
-    ListCellInput, ListCellInputValue, SlackListCellValue, SlackListColumn, SlackListData,
-    SlackListRow,
+    ListAccessLevel, ListCellInput, ListCellInputValue, ListMeta, SlackListCellValue,
+    SlackListColumn, SlackListData, SlackListRow,
 };
+use slackless_core::types::{ChannelId, UserId};
 
 use crate::canvas::{OpenBrowserFn, read_only_badge};
 use crate::fixtures::Fixtures;
@@ -37,7 +38,7 @@ pub enum ListLayout {
     Board,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ListPanelState {
     layout: ListLayout,
     hidden_cols: HashSet<String>,
@@ -56,6 +57,59 @@ struct ListPanelState {
     comment_input: Option<Entity<TextareaState>>,
     /// Locally posted comments per `(list_id, record_id)` appended alongside server comments.
     local_comments: HashMap<String, Vec<(String, String)>>,
+    /// Whether the List Share & Access dialog drawer is open (`F-COLLAB-274..278`).
+    share_open: bool,
+    /// Active tab in the List Share dialog (`F-COLLAB-275`).
+    share_tab: share::ListShareTab,
+    /// Share target input (`#C01ENG, @U01ALICE`).
+    share_target_input: Option<Entity<TextareaState>>,
+    /// Selected access level in the Share tab (`Read` / `Write` / `Owner`).
+    share_access_level: ListAccessLevel,
+    /// Grant access silently without posting a channel message (`F-COLLAB-274`).
+    share_without_posting: bool,
+    /// Restrict re-sharing to list owners (`F-COLLAB-278`).
+    share_limit_sharing: bool,
+    /// Local workspace general access override (`private` / `read` / `write`).
+    share_general_access: String,
+    /// Optional record ID when sharing from an item (`F-COLLAB-276`).
+    share_item_id: Option<String>,
+    /// Inline share status banner `(is_error, message)`.
+    share_status: Option<(bool, String)>,
+    /// Optimistic/fixture-mode editors and channels granted access.
+    share_local_editors: Vec<UserId>,
+    share_local_channels: Vec<ChannelId>,
+    /// Confirmation flag after copying list permalink.
+    link_copied: bool,
+}
+
+impl Default for ListPanelState {
+    fn default() -> Self {
+        Self {
+            layout: ListLayout::Table,
+            hidden_cols: HashSet::new(),
+            selected_row: None,
+            adding: false,
+            new_item_input: None,
+            editing_cell: None,
+            fixture_data: None,
+            archived_rows: HashSet::new(),
+            show_archived: false,
+            comment_input: None,
+            local_comments: HashMap::new(),
+            share_open: false,
+            share_tab: share::ListShareTab::Share,
+            share_target_input: None,
+            share_access_level: ListAccessLevel::Write,
+            share_without_posting: false,
+            share_limit_sharing: false,
+            share_general_access: String::new(),
+            share_item_id: None,
+            share_status: None,
+            share_local_editors: Vec::new(),
+            share_local_channels: Vec::new(),
+            link_copied: false,
+        }
+    }
 }
 
 /// Shared render context passed across list table/board, toolbar, and detail-drawer builders.
@@ -74,6 +128,8 @@ struct ListUiStore {
     panels: HashMap<String, ListPanelState>,
     /// Server-fetched record comment threads keyed by `(list_id, record_id)` (`F-COLLAB-250`).
     record_comments: HashMap<(String, String), Vec<(String, String)>>,
+    /// Server-fetched list access/sharing/limit metadata keyed by `file_id`.
+    list_meta: HashMap<String, ListMeta>,
 }
 
 impl Global for ListUiStore {}
@@ -88,6 +144,50 @@ pub fn set_record_comments(
     cx.default_global::<ListUiStore>()
         .record_comments
         .insert((list_id.to_owned(), record_id.to_owned()), comments);
+}
+
+/// Store parsed list metadata loaded from `files.info` (`Event::ListMetaLoaded`).
+pub fn set_list_meta(file_id: &str, meta: ListMeta, cx: &mut App) {
+    cx.default_global::<ListUiStore>()
+        .list_meta
+        .insert(file_id.to_owned(), meta);
+}
+
+/// Store the latest sharing/access operation banner for `list_id` (`Event::ListAccessUpdated`).
+/// Unified with [`ListPanelState::share_status`] so server responses and local validation/settings
+/// feedback never shadow each other.
+pub fn set_list_status(list_id: &str, is_err: bool, msg: String, cx: &mut App) {
+    cx.default_global::<ListUiStore>()
+        .panels
+        .entry(list_id.to_owned())
+        .or_default()
+        .share_status = Some((is_err, msg));
+}
+
+/// Pre-select a list row by `record_id` (e.g., when navigating from a list item thread in
+/// Threads view).
+pub fn select_list_record(list_id: &str, record_id: &str, data: &SlackListData, cx: &mut App) {
+    if let Some(ix) = data.rows.iter().position(|r| r.id == record_id) {
+        let entry = cx
+            .default_global::<ListUiStore>()
+            .panels
+            .entry(list_id.to_owned())
+            .or_default();
+        entry.selected_row = Some(ix);
+    }
+}
+
+pub(super) fn list_meta(file_id: &str, cx: &App) -> Option<ListMeta> {
+    cx.try_global::<ListUiStore>()
+        .and_then(|s| s.list_meta.get(file_id))
+        .cloned()
+}
+
+#[cfg(test)]
+pub(super) fn list_status(list_id: &str, cx: &App) -> Option<(bool, String)> {
+    cx.try_global::<ListUiStore>()
+        .and_then(|s| s.panels.get(list_id))
+        .and_then(|p| p.share_status.clone())
 }
 
 fn record_comments(list_id: &str, record_id: &str, cx: &App) -> Vec<(String, String)> {
@@ -126,7 +226,7 @@ pub type UpdateListCellFn = Rc<dyn Fn(String, ListCellInput, &mut Window, &mut A
 /// Callback invoked when deleting, archiving, or loading comments for a row.
 pub type DeleteListItemFn = Rc<dyn Fn(String, &mut Window, &mut App)>;
 /// Callback invoked when updating list sharing access (`slackLists.access.set`, `F-COLLAB-243`).
-pub type SetListAccessFn = Rc<dyn Fn(String, &mut Window, &mut App)>;
+pub use share::{ListAccessDeleteFn, ListAccessSetFn};
 /// Callback invoked for list-level actions (`F-COLLAB-259` delete list, `F-COLLAB-261` add tab).
 pub type ListCommandFn = Rc<dyn Fn(&mut Window, &mut App)>;
 
@@ -138,8 +238,10 @@ pub struct ListActions {
     pub on_update_cell: Option<UpdateListCellFn>,
     pub on_delete_item: Option<DeleteListItemFn>,
     pub on_archive_item: Option<DeleteListItemFn>,
-    pub on_set_access: Option<SetListAccessFn>,
+    pub on_set_access: Option<ListAccessSetFn>,
+    pub on_delete_access: Option<ListAccessDeleteFn>,
     pub on_load_comments: Option<DeleteListItemFn>,
+    pub on_open_in_threads: Option<DeleteListItemFn>,
     pub on_add_tab: Option<ListCommandFn>,
     pub on_delete_list: Option<ListCommandFn>,
     pub open_browser: Option<OpenBrowserFn>,
@@ -241,14 +343,16 @@ mod detail;
 mod fixture;
 mod helpers;
 mod live;
+mod share;
 #[cfg(test)]
 mod tests;
 mod toolbar;
 
-pub use fixture::list_view;
+pub use fixture::{list_view, select_fixture_record};
 use helpers::*;
 pub(crate) use helpers::{filter_and_sort_rows, parse_csv_rows};
 pub use helpers::{list_to_csv, list_to_json};
 #[cfg(test)]
 pub(crate) use live::group_live_rows;
 pub use live::live_list_view;
+pub use share::{ListShareAccessRequest, ListShareTab};

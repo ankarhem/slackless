@@ -429,11 +429,21 @@ pub enum CollabCommand {
     },
     /// Archive an item in a Slack List (`lists.records.archive`, `F-COLLAB-255`).
     ArchiveListItem { list_id: String, row_id: String },
-    /// Update sharing/access permissions on a Slack List (`slackLists.access.set`).
+    /// Grant or update sharing/access permissions on a Slack List (`slackLists.access.set`,
+    /// `F-COLLAB-243..245`, `F-COLLAB-274..278`).
     SetListAccess {
         list_id: String,
-        access_level: String,
-        channel: Option<ChannelId>,
+        access_level: api::ListAccessLevel,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
+        post_permalink: Option<String>,
+    },
+    /// Revoke sharing/access permissions on a Slack List (`slackLists.access.delete`,
+    /// `F-COLLAB-243..245`, `F-COLLAB-274..278`).
+    DeleteListAccess {
+        list_id: String,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
     },
     /// Fetch comment thread messages attached to a List item (`lists.getThreadsForRecord`).
     FetchListRecordComments { list_id: String, record_id: String },
@@ -672,6 +682,19 @@ pub enum WorkspaceCommand {
     SetSaveHuddleTranscripts(bool),
     /// Write a single user preference key/value back to Slack (`users.prefs.set`).
     SetUserPref { name: String, value: String },
+    /// Explicitly backfill one conversation's history (and optionally thread replies) into SQLite.
+    BackfillChannel {
+        channel: ChannelId,
+        include_threads: bool,
+    },
+    /// Backfill every stored conversation in the workspace into SQLite sequentially.
+    BackfillWorkspace { include_threads: bool },
+    /// Pause active background archive backfill workers cleanly between pages.
+    PauseBackfill,
+    /// Resume paused archive backfill workers.
+    ResumeBackfill,
+    /// Request a fresh [`crate::Event::BackfillProgress`] snapshot from SQLite & running workers.
+    QueryBackfillProgress,
     /// Revoke the workspace token server-side (`auth.revoke`, `F-CORE-009`).
     SignOut,
 }

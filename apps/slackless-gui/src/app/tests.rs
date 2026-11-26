@@ -1215,6 +1215,7 @@ fn qa_image_viewer_keyboard_zoom_step_and_zero_subscription_leak(cx: &mut gpui::
             taken_at: None,
             download: None,
             video: None,
+            pdf: None,
         };
         std::rc::Rc::new(vec![img("one.png"), img("two.png")])
     };
@@ -1276,6 +1277,110 @@ fn qa_image_viewer_keyboard_zoom_step_and_zero_subscription_leak(cx: &mut gpui::
     cx.run_until_parked();
     assert!(app.read_with(cx, |app, _| app.image_viewer.is_none()));
     assert!(app.read_with(cx, |app, _| app._viewer_sub.is_none()));
+
+    // Video viewer shortcuts: `c` toggles transcript drawer while `cmd-c` does NOT intercept copy.
+    let video_items = std::rc::Rc::new(vec![ViewerImage {
+        name: "clip.mp4".into(),
+        source: gpui::ImageSource::Image(Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            Vec::new(),
+        ))),
+        user: None,
+        taken_at: None,
+        download: None,
+        video: Some(crate::image_viewer::ViewerVideo {
+            file_id: "F_KEY_VID".into(),
+            url: "https://files.slack.com/pri/clip.mp4".into(),
+            ext: "mp4".into(),
+            duration_ms: Some(15_000),
+            inline_transcript: Some("Sample spoken words.".into()),
+            vtt_url: None,
+        }),
+        pdf: None,
+    }]);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            let ch = app.channel.clone();
+            app.open_image_viewer(ch, video_items, 0, window, cx);
+        });
+        let _ = window.draw(cx);
+    });
+    assert!(!app.read_with(cx, |app, cx| {
+        app.image_viewer
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .showing_transcript()
+    }));
+    cx.simulate_keystrokes("c");
+    cx.run_until_parked();
+    assert!(
+        app.read_with(cx, |app, cx| app
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .showing_transcript()),
+        "`c` must open the transcript drawer on a video"
+    );
+    cx.simulate_keystrokes("cmd-c");
+    cx.run_until_parked();
+    assert!(
+        app.read_with(cx, |app, cx| app
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .showing_transcript()),
+        "`cmd-c` must NOT toggle the transcript drawer so selected text copy still works"
+    );
+    cx.simulate_keystrokes("up");
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("c");
+    cx.run_until_parked();
+    assert!(
+        !app.read_with(cx, |app, cx| app
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .showing_transcript()),
+        "second `c` must close the transcript drawer"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(app.read_with(cx, |app, _| app.image_viewer.is_none()));
+
+    // Floating mini-player / PiP dock renders cleanly when an inline video is playing off-screen.
+    cx.update(|window, cx| {
+        let ch = app.read(cx).channel.clone();
+        crate::media::seed_inline_video_for_test(
+            crate::media::InlineVideoMeta {
+                file_id: "F_PIP_APP".into(),
+                title: "standup-demo.mp4".into(),
+                channel: Some(ch),
+                message_ts: Some(slackless_core::types::Ts::from("1700000001.000100")),
+                url: "https://files.slack.com/pri/standup-demo.mp4".into(),
+                ext: "mp4".into(),
+                duration_ms: Some(30_000),
+                ..Default::default()
+            },
+            true,
+            false,
+            cx,
+        );
+        let _ = window.draw(cx);
+        assert!(
+            crate::media::active_pip_video(false, cx).is_some(),
+            "floating mini-player dock should be active when inline video is off-screen"
+        );
+        // Switching workspaces cleanly stops any active inline video / PiP from the outgoing workspace.
+        app.update(cx, |app, cx| app.switch_workspace(1, window, cx));
+        assert!(
+            crate::media::active_pip_video(false, cx).is_none(),
+            "switching workspaces must stop outgoing inline video / PiP"
+        );
+    });
 }
 
 #[gpui::test]
@@ -2367,5 +2472,233 @@ fn modal_stack_lifecycle_inline_errors_suggestions_workflows_and_calling_apps(
         });
     });
     cx.run_until_parked();
+    drop(root);
+}
+
+#[gpui::test]
+fn cross_workspace_search_jump_storage_backfill_progress_and_export_engine(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui_kit::base::Root;
+    use slackless_core::{BackfillStatus, ChannelBackfillProgress, WorkspaceBackfillProgress};
+    use std::cell::RefCell;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let fx = Arc::new(fixtures::workspace(0));
+        let app = App::new(fx, CoreBridge::offline(), window, cx);
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            assert_eq!(app.workspace, 0);
+            assert!(
+                app.fixtures.workspaces.len() >= 2,
+                "fixture mode should provide at least two workspaces for cross-workspace jump test"
+            );
+
+            // 1. Cross-workspace search jump switches workspace and selects the target channel.
+            let target_ws_id = app.fixtures.workspaces[1].id.clone();
+            let ws1_fx = fixtures::workspace(1);
+            let target_ch = ws1_fx.channels[0].id.clone();
+            let target_ts = ws1_fx
+                .messages
+                .get(&target_ch)
+                .and_then(|msgs| msgs.first())
+                .map(|m| m.ts.clone())
+                .unwrap_or_else(|| Ts::from("1700000001.000000"));
+
+            app.open_message_in_workspace(&target_ws_id, target_ch.clone(), target_ts, window, cx);
+            assert_eq!(app.workspace, 1);
+            assert_eq!(app.channel, target_ch);
+
+            // 2. Event::BackfillProgress updates workspace state, preferences, and storage dialog opens cleanly.
+            let progress = WorkspaceBackfillProgress {
+                workspace: target_ws_id.clone(),
+                status: BackfillStatus::Running,
+                paused: false,
+                active_channel: Some(target_ch.clone()),
+                total_channels: 2,
+                completed_channels: 1,
+                pages_fetched: 3,
+                messages_stored: 120,
+                threads_fetched: 2,
+                replies_stored: 8,
+                channels: vec![ChannelBackfillProgress {
+                    channel: target_ch.clone(),
+                    channel_name: Some("#general".into()),
+                    status: BackfillStatus::Running,
+                    pages_fetched: 3,
+                    messages_stored: 120,
+                    threads_fetched: 2,
+                    replies_stored: 8,
+                    oldest_ts: None,
+                    newest_ts: None,
+                    complete: false,
+                    last_error: None,
+                }],
+            };
+            app.on_core_event(&Event::BackfillProgress(progress.clone()), window, cx);
+            assert_eq!(app.ws.backfill_progress.as_ref(), Some(&progress));
+
+            app.open_storage_dialog(window, cx);
+            window.close_dialog(cx);
+
+            // 3. Searching from workspace index 1 works in both CurrentWorkspace and AllWorkspaces
+            //    scopes, and jumping back to workspace 0 switches workspaces accurately.
+            let ws0_id = app.fixtures.workspaces[0].id.clone();
+            let ws0_fx = fixtures::workspace(0);
+            let ws0_ch = ws0_fx.channels[0].id.clone();
+            let ws0_ts = ws0_fx
+                .messages
+                .get(&ws0_ch)
+                .and_then(|msgs| msgs.first())
+                .map(|m| m.ts.clone())
+                .unwrap_or_else(|| Ts::from("1700000001.000000"));
+            let ws1_word = ws1_fx
+                .messages
+                .values()
+                .flatten()
+                .flat_map(|m| m.text.split_whitespace())
+                .find(|w| w.len() >= 5 && w.chars().all(|c| c.is_ascii_alphabetic()))
+                .expect("workspace 1 should contain a searchable word")
+                .to_owned();
+
+            app.run_message_search(ws1_word.clone(), cx);
+            let results_entity = app.results.clone();
+            assert_eq!(
+                results_entity.read(cx).active_workspace_for_test(),
+                target_ws_id
+            );
+
+            // 4. Fixture channel & thread export on workspace 1 uses workspace 1's ID/name and
+            //    includes file transcripts in thread exports.
+            let mut fx1_export = fixtures::workspace(1);
+            let fid = slackless_core::types::FileId::from("F_CLIP_WS1");
+            fx1_export
+                .file_transcripts
+                .insert(fid.clone(), "Spoken note in ws1 thread".into());
+            let export_ch = fx1_export.channels[0].id.clone();
+            let root_ts = Ts::from("1700999000.000100");
+            fx1_export
+                .messages
+                .entry(export_ch.clone())
+                .or_default()
+                .push(Message {
+                    ts: root_ts.clone(),
+                    text: "Clip root".into(),
+                    files: vec![File {
+                        id: fid,
+                        name: Some("clip.mp4".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+            let ch_doc = super::dialogs::storage::build_fixture_channel_export(
+                &fx1_export,
+                1,
+                &export_ch,
+                "#ch",
+            );
+            assert_eq!(ch_doc.workspace, target_ws_id.as_str());
+            assert_eq!(
+                ch_doc.workspace_name.as_deref(),
+                Some(fx1_export.workspaces[1].name.as_str())
+            );
+            let th_doc = super::dialogs::storage::build_fixture_thread_export(
+                &fx1_export,
+                1,
+                &export_ch,
+                "#ch",
+                &root_ts,
+            );
+            assert_eq!(th_doc.workspace, target_ws_id.as_str());
+            assert_eq!(
+                th_doc.messages[0].files[0].transcript.as_deref(),
+                Some("Spoken note in ws1 thread")
+            );
+
+            // Jump from workspace 1 back to workspace 0 via open_message_in_workspace.
+            app.open_message_in_workspace(&ws0_id, ws0_ch.clone(), ws0_ts, window, cx);
+            assert_eq!(app.workspace, 0);
+            assert_eq!(app.channel, ws0_ch);
+        });
+    });
+    cx.run_until_parked();
+
+    // Verify workspace-1 search actually produced workspace-1 hits in CurrentWorkspace scope,
+    // and switching to AllWorkspaces returns hits attributed to their respective workspaces.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            let ws1_id = app.fixtures.workspaces[1].id.clone();
+            app.switch_workspace(1, window, cx);
+            let ws1_word = app
+                .fixtures
+                .messages
+                .values()
+                .flatten()
+                .flat_map(|m| m.text.split_whitespace())
+                .find(|w| w.len() >= 5 && w.chars().all(|c| c.is_ascii_alphabetic()))
+                .unwrap()
+                .to_owned();
+            app.run_message_search(ws1_word, cx);
+            app.results.update(cx, |v, cx| {
+                v.set_scope(crate::search::SearchScope::CurrentWorkspace, cx);
+            });
+            assert_eq!(app.results.read(cx).active_workspace_for_test(), ws1_id);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        app.read_with(cx, |app, cx| {
+            let ws1_id = &app.fixtures.workspaces[1].id;
+            let hits = app.results.read(cx).local_hits_for_test();
+            assert!(
+                !hits.is_empty(),
+                "CurrentWorkspace search on workspace index 1 must return hits"
+            );
+            assert!(hits.iter().all(|h| h.workspace == *ws1_id));
+        });
+    });
+
+    // Now test AllWorkspaces scope from workspace 1 with a word present in workspace 0.
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            let ws0_fx = fixtures::workspace(0);
+            let ws0_word = ws0_fx
+                .messages
+                .values()
+                .flatten()
+                .flat_map(|m| m.text.split_whitespace())
+                .find(|w| w.len() >= 6 && w.chars().all(|c| c.is_ascii_alphabetic()))
+                .expect("workspace 0 searchable word")
+                .to_owned();
+            app.run_message_search(ws0_word, cx);
+            app.results.update(cx, |v, cx| {
+                v.set_scope(crate::search::SearchScope::AllWorkspaces, cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        app.read_with(cx, |app, cx| {
+            let ws0_id = &app.fixtures.workspaces[0].id;
+            let hits = app.results.read(cx).local_hits_for_test();
+            assert!(
+                hits.iter().any(|h| h.workspace == *ws0_id),
+                "AllWorkspaces search from workspace 1 must find workspace 0 hits"
+            );
+        });
+    });
     drop(root);
 }

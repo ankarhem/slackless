@@ -275,12 +275,24 @@ impl<B: Backend> Core<B> {
             };
             let mut members = Vec::new();
             let mut num_apps = None;
-            let mut external_teams = Vec::new();
+            let mut external_teams: Vec<TeamId> = fresh.external_team_ids(Some(&ctx.workspace));
+            if let Some(host) = fresh.host_team_id()
+                && host != ctx.workspace
+                && !external_teams.contains(&host)
+            {
+                external_teams.push(host);
+            }
+            for pending in &fresh.pending_connected_team_ids {
+                if *pending != ctx.workspace && !external_teams.contains(pending) {
+                    external_teams.push(pending.clone());
+                }
+            }
+            let is_shared_channel = fresh.is_external_connect() || fresh.is_org_shared;
             if let Ok(listed) = ctx.backend.conversation_members(channel.clone()).await {
-                let (ws2, shared) = (ctx.workspace.clone(), fresh.is_ext_shared);
+                let ws2 = ctx.workspace.clone();
                 let (counts, teams, listed) = with_store(&ctx.store, move |s| {
                     let counts = s.member_counts(&ws2, &listed)?;
-                    let teams = if shared {
+                    let teams = if is_shared_channel {
                         s.member_team_ids(&ws2, &listed)?
                     } else {
                         Vec::new()
@@ -290,12 +302,40 @@ impl<B: Backend> Core<B> {
                 .await?;
                 fresh.num_members = Some(counts.humans);
                 num_apps = Some(counts.apps);
-                external_teams = teams;
+                for team in teams {
+                    if team != ctx.workspace && !external_teams.contains(&team) {
+                        external_teams.push(team);
+                    }
+                }
                 members = listed;
+            }
+            // Enrich connected organization records via `conversations.teamConnections` when
+            // available; non-fatal if Slack restricts or omits it on the current workspace.
+            let mut resolved_conn_teams = Vec::new();
+            if fresh.is_external_connect()
+                && let Ok(conns) = ctx.backend.team_connections(channel.clone()).await
+            {
+                for team in conns
+                    .connections
+                    .into_iter()
+                    .chain(conns.pending_connections)
+                {
+                    if !team.id.as_str().is_empty() {
+                        external_teams.retain(|id| id != &team.id);
+                        resolved_conn_teams.push(team);
+                    }
+                }
             }
             let num_members = fresh.num_members;
             let ws2 = ctx.workspace.clone();
-            with_store(&ctx.store, move |s| s.merge_conversation(&ws2, &fresh)).await?;
+            with_store(&ctx.store, move |s| {
+                s.merge_conversation(&ws2, &fresh)?;
+                for team in &resolved_conn_teams {
+                    s.upsert_team(&ws2, team)?;
+                }
+                Ok(())
+            })
+            .await?;
             ctx.events.emit(Event::ConversationInfo {
                 channel,
                 num_members,

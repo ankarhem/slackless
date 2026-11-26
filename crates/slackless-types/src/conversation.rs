@@ -20,6 +20,8 @@ const FLAG_IS_OPEN: u16 = 1 << 8;
 const FLAG_IS_SHARED: u16 = 1 << 9;
 const FLAG_IS_EXT_SHARED: u16 = 1 << 10;
 const FLAG_IS_ORG_SHARED: u16 = 1 << 11;
+const FLAG_IS_ORG_DEFAULT: u16 = 1 << 12;
+const FLAG_IS_ORG_MANDATORY: u16 = 1 << 13;
 
 /// Tracks which `is_*` boolean keys were explicitly present when deserializing a [`Conversation`]
 /// from JSON so [`Conversation::merge`] can distinguish an explicit `false` (e.g. unarchiving or
@@ -87,6 +89,10 @@ pub struct Conversation {
     #[serde(default)]
     pub is_org_shared: bool,
     #[serde(default)]
+    pub is_org_default: bool,
+    #[serde(default)]
+    pub is_org_mandatory: bool,
+    #[serde(default)]
     pub topic: Option<TopicPurpose>,
     #[serde(default)]
     pub purpose: Option<TopicPurpose>,
@@ -115,13 +121,34 @@ pub struct Conversation {
     pub updated: Option<i64>,
     #[serde(default)]
     pub context_team_id: Option<TeamId>,
+    /// Hosting/owning organization team ID for a Slack Connect channel (`F-COLLAB-798`, `828`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_host_id: Option<TeamId>,
+    /// Enterprise Grid organization ID, if this conversation belongs to an Enterprise Grid org.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enterprise_id: Option<TeamId>,
+    /// All team IDs sharing this conversation (Slack Connect and Enterprise Grid org-shared).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_team_ids: Vec<TeamId>,
+    /// External team IDs connected to this channel via Slack Connect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connected_team_ids: Vec<TeamId>,
+    /// External team IDs with limited posting/invite permissions in this Slack Connect channel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connected_limited_team_ids: Vec<TeamId>,
+    /// External team IDs with pending invitations to this Slack Connect channel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_connected_team_ids: Vec<TeamId>,
+    /// Internal workspaces sharing an Enterprise Grid org-wide channel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub internal_team_ids: Vec<TeamId>,
     /// IM sidebar priority.
     #[serde(default)]
     pub priority: Option<f64>,
     /// The conversation's `properties` object: tab configuration and the channel canvas.
     #[serde(default)]
     pub properties: Option<ConversationProperties>,
-    /// Fields this crate does not model (`shared_team_ids`, ...), preserved verbatim.
+    /// Fields this crate does not model, preserved verbatim.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
     /// Bitmask of `is_*` flags explicitly present in the deserialized JSON payload.
@@ -162,6 +189,10 @@ struct ConversationWire {
     #[serde(default)]
     is_org_shared: Option<bool>,
     #[serde(default)]
+    is_org_default: Option<bool>,
+    #[serde(default)]
+    is_org_mandatory: Option<bool>,
+    #[serde(default)]
     topic: Option<TopicPurpose>,
     #[serde(default)]
     purpose: Option<TopicPurpose>,
@@ -187,6 +218,20 @@ struct ConversationWire {
     updated: Option<i64>,
     #[serde(default)]
     context_team_id: Option<TeamId>,
+    #[serde(default)]
+    conversation_host_id: Option<TeamId>,
+    #[serde(default)]
+    enterprise_id: Option<TeamId>,
+    #[serde(default, deserialize_with = "null_default")]
+    shared_team_ids: Vec<TeamId>,
+    #[serde(default, deserialize_with = "null_default")]
+    connected_team_ids: Vec<TeamId>,
+    #[serde(default, deserialize_with = "null_default")]
+    connected_limited_team_ids: Vec<TeamId>,
+    #[serde(default, deserialize_with = "null_default")]
+    pending_connected_team_ids: Vec<TeamId>,
+    #[serde(default, deserialize_with = "null_default")]
+    internal_team_ids: Vec<TeamId>,
     #[serde(default)]
     priority: Option<f64>,
     #[serde(default)]
@@ -219,6 +264,8 @@ impl<'de> Deserialize<'de> for Conversation {
         let is_shared = unpack(w.is_shared, FLAG_IS_SHARED);
         let is_ext_shared = unpack(w.is_ext_shared, FLAG_IS_EXT_SHARED);
         let is_org_shared = unpack(w.is_org_shared, FLAG_IS_ORG_SHARED);
+        let is_org_default = unpack(w.is_org_default, FLAG_IS_ORG_DEFAULT);
+        let is_org_mandatory = unpack(w.is_org_mandatory, FLAG_IS_ORG_MANDATORY);
 
         Ok(Self {
             id: w.id,
@@ -236,6 +283,8 @@ impl<'de> Deserialize<'de> for Conversation {
             is_shared,
             is_ext_shared,
             is_org_shared,
+            is_org_default,
+            is_org_mandatory,
             topic: w.topic,
             purpose: w.purpose,
             user: w.user,
@@ -249,6 +298,13 @@ impl<'de> Deserialize<'de> for Conversation {
             created: w.created,
             updated: w.updated,
             context_team_id: w.context_team_id,
+            conversation_host_id: w.conversation_host_id.filter(|id| !id.as_str().is_empty()),
+            enterprise_id: w.enterprise_id.filter(|id| !id.as_str().is_empty()),
+            shared_team_ids: w.shared_team_ids,
+            connected_team_ids: w.connected_team_ids,
+            connected_limited_team_ids: w.connected_limited_team_ids,
+            pending_connected_team_ids: w.pending_connected_team_ids,
+            internal_team_ids: w.internal_team_ids,
             priority: w.priority,
             properties: w.properties,
             extra: w.extra,
@@ -277,6 +333,82 @@ impl Conversation {
         } else {
             ConversationKind::PublicChannel
         }
+    }
+
+    /// True when this conversation is shared externally via Slack Connect (`is_ext_shared` or
+    /// carrying external `connected_team_ids` / `connected_limited_team_ids`).
+    pub fn is_external_connect(&self) -> bool {
+        self.is_ext_shared
+            || !self.connected_team_ids.is_empty()
+            || !self.connected_limited_team_ids.is_empty()
+    }
+
+    /// The hosting/owning organization team ID of this conversation: explicit
+    /// `conversation_host_id` (falling back to any legacy `extra["conversation_host_id"]`), else
+    /// `context_team_id`.
+    pub fn host_team_id(&self) -> Option<TeamId> {
+        self.conversation_host_id
+            .as_ref()
+            .filter(|id| !id.as_str().is_empty())
+            .cloned()
+            .or_else(|| {
+                self.extra
+                    .get("conversation_host_id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(TeamId::from)
+            })
+            .or_else(|| {
+                self.context_team_id
+                    .as_ref()
+                    .filter(|id| !id.as_str().is_empty())
+                    .cloned()
+            })
+    }
+
+    /// External team IDs participating in this conversation, preserving Slack order
+    /// (`shared_team_ids`, `connected_team_ids`, `connected_limited_team_ids`, plus legacy
+    /// `extra` arrays), deduplicated and excluding `own_team`.
+    pub fn external_team_ids(&self, own_team: Option<&TeamId>) -> Vec<TeamId> {
+        let mut out = Vec::new();
+        let mut push_unique = |id: &TeamId| {
+            if id.as_str().is_empty() || own_team.is_some_and(|own| own == id) {
+                return;
+            }
+            if !out.contains(id) {
+                out.push(id.clone());
+            }
+        };
+        for id in self
+            .shared_team_ids
+            .iter()
+            .chain(&self.connected_team_ids)
+            .chain(&self.connected_limited_team_ids)
+        {
+            push_unique(id);
+        }
+        for key in [
+            "shared_team_ids",
+            "connected_team_ids",
+            "connected_limited_team_ids",
+        ] {
+            if let Some(arr) = self.extra.get(key).and_then(Value::as_array) {
+                for raw in arr.iter().filter_map(Value::as_str) {
+                    push_unique(&TeamId::from(raw));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `team_id` has limited external permissions (`connected_limited_team_ids`).
+    pub fn is_limited_external_team(&self, team_id: &TeamId) -> bool {
+        self.connected_limited_team_ids.contains(team_id)
+            || self
+                .extra
+                .get("connected_limited_team_ids")
+                .and_then(Value::as_array)
+                .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(team_id.as_str())))
     }
 
     /// Overlays a fresher copy from Slack on this stored one. Endpoints return partial
@@ -309,6 +441,8 @@ impl Conversation {
             created,
             updated,
             context_team_id,
+            conversation_host_id,
+            enterprise_id,
             priority,
             properties,
         );
@@ -335,10 +469,26 @@ impl Conversation {
             (is_shared, FLAG_IS_SHARED),
             (is_ext_shared, FLAG_IS_EXT_SHARED),
             (is_org_shared, FLAG_IS_ORG_SHARED),
+            (is_org_default, FLAG_IS_ORG_DEFAULT),
+            (is_org_mandatory, FLAG_IS_ORG_MANDATORY),
         );
         if !fresh.members.is_empty() {
             self.members = fresh.members.clone();
         }
+        macro_rules! carried_vec {
+            ($($field:ident),* $(,)?) => {$(
+                if !fresh.$field.is_empty() {
+                    self.$field = fresh.$field.clone();
+                }
+            )*};
+        }
+        carried_vec!(
+            shared_team_ids,
+            connected_team_ids,
+            connected_limited_team_ids,
+            pending_connected_team_ids,
+            internal_team_ids,
+        );
         for (key, value) in &fresh.extra {
             self.extra.insert(key.clone(), value.clone());
         }
@@ -813,5 +963,58 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(stored, programmatic);
+    }
+
+    #[test]
+    fn slack_connect_fields_deserialize_merge_and_compute_helpers() {
+        let mut stored: Conversation = serde_json::from_value(serde_json::json!({
+            "id": "C0CONNECT",
+            "name": "partner-ops",
+            "is_channel": true,
+            "is_ext_shared": true,
+            "is_org_shared": true,
+            "is_org_default": true,
+            "is_org_mandatory": false,
+            "context_team_id": "T0ACME",
+            "conversation_host_id": "T0KLARNA",
+            "enterprise_id": "E0ENT",
+            "shared_team_ids": ["T0ACME", "T0KLARNA"],
+            "connected_team_ids": ["T0KLARNA", "T0ZETA"],
+            "connected_limited_team_ids": ["T0ZETA"],
+            "pending_connected_team_ids": ["T0PEND"],
+            "internal_team_ids": ["T0ACME"]
+        }))
+        .unwrap();
+
+        assert!(stored.is_external_connect());
+        assert!(stored.is_org_default);
+        assert!(!stored.is_org_mandatory);
+        assert_eq!(stored.host_team_id(), Some(TeamId::from("T0KLARNA")));
+        assert_eq!(stored.enterprise_id, Some(TeamId::from("E0ENT")));
+        assert!(stored.is_limited_external_team(&TeamId::from("T0ZETA")));
+        assert!(!stored.is_limited_external_team(&TeamId::from("T0KLARNA")));
+
+        let ext = stored.external_team_ids(Some(&TeamId::from("T0ACME")));
+        assert_eq!(
+            ext,
+            vec![TeamId::from("T0KLARNA"), TeamId::from("T0ZETA")],
+            "external_team_ids should deduplicate and exclude own team"
+        );
+
+        // Merging a minimal update without the team arrays must preserve existing Slack Connect
+        // metadata, while an explicit `is_org_mandatory: true` updates the flag.
+        let patch: Conversation = serde_json::from_value(serde_json::json!({
+            "id": "C0CONNECT",
+            "is_org_mandatory": true
+        }))
+        .unwrap();
+        stored.merge(&patch);
+        assert!(stored.is_org_mandatory);
+        assert!(stored.is_ext_shared);
+        assert_eq!(stored.host_team_id(), Some(TeamId::from("T0KLARNA")));
+        assert_eq!(
+            stored.pending_connected_team_ids,
+            vec![TeamId::from("T0PEND")]
+        );
     }
 }

@@ -3,10 +3,11 @@
 
 use super::super::*;
 use crate::api::{
-    ActionContainer, BlockSuggestionsRequest, CanvasAccessLevel, CanvasEditOp, FilesFilter,
-    ListCellInput, MessageContent, SearchSort, UploadFile,
+    self, ActionContainer, BlockSuggestionsRequest, CanvasAccessLevel, CanvasEditOp, FilesFilter,
+    ListAccessLevel, ListCellInput, MessageContent, SearchSort, UploadFile,
 };
 use crate::domain::canvas::format_canvas_api_error;
+use crate::domain::lists::format_list_api_error;
 
 /// Owned parameters for [`Core::block_suggestions`], avoiding multi-argument sprawl.
 pub(super) struct BlockSuggestionsParams {
@@ -556,14 +557,151 @@ impl<B: Backend> Core<B> {
     pub(super) fn set_list_access(
         &self,
         list_id: String,
-        access_level: String,
-        channel: Option<ChannelId>,
+        access_level: ListAccessLevel,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
+        post_permalink: Option<String>,
     ) {
         let ctx = self.ctx();
         self.spawn("slackLists.access.set", async move {
-            ctx.backend
-                .lists_access_set(list_id, access_level, channel)
-                .await?;
+            let summary = match (!channel_ids.is_empty(), !user_ids.is_empty()) {
+                (true, true) => format!(
+                    "Granted {} access to {} channel(s) and {} user(s)",
+                    access_level.as_str(),
+                    channel_ids.len(),
+                    user_ids.len()
+                ),
+                (true, false) => format!(
+                    "Granted {} access to {} channel(s)",
+                    access_level.as_str(),
+                    channel_ids.len()
+                ),
+                (false, true) => format!(
+                    "Granted {} access to {} user(s)",
+                    access_level.as_str(),
+                    user_ids.len()
+                ),
+                (false, false) => format!("Updated {} access", access_level.as_str()),
+            };
+            // Slack requires `channel_ids` XOR `user_ids` per call; split mixed requests cleanly.
+            let mut api_res: api::Result<()> = Ok(());
+            if channel_ids.is_empty() && user_ids.is_empty() {
+                api_res = Err(ApiError::Slack("invalid_parameters".to_owned()));
+            } else {
+                if !channel_ids.is_empty() {
+                    api_res = ctx
+                        .backend
+                        .lists_access_set(
+                            list_id.clone(),
+                            access_level,
+                            channel_ids.clone(),
+                            Vec::new(),
+                        )
+                        .await;
+                }
+                if api_res.is_ok() && !user_ids.is_empty() {
+                    api_res = ctx
+                        .backend
+                        .lists_access_set(list_id.clone(), access_level, Vec::new(), user_ids)
+                        .await;
+                }
+            }
+            let result = map_list_result(&ctx.events, api_res);
+            if result.is_ok()
+                && let Some(url) = post_permalink.filter(|u| !u.trim().is_empty())
+                && !channel_ids.is_empty()
+            {
+                for channel in &channel_ids {
+                    if let Err(err) = ctx
+                        .backend
+                        .post_message(
+                            channel.clone(),
+                            MessageContent::plain(url.clone()),
+                            None,
+                            false,
+                        )
+                        .await
+                    {
+                        emit_if_auth_expired(&ctx.events, &err);
+                        tracing::warn!(%channel, %err, "failed to post shared list permalink");
+                    }
+                }
+            }
+            ctx.events.emit(Event::ListAccessUpdated {
+                list_id,
+                summary,
+                result,
+            });
+            Ok(())
+        });
+    }
+
+    pub(super) fn delete_list_access(
+        &self,
+        list_id: String,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
+    ) {
+        let ctx = self.ctx();
+        self.spawn("slackLists.access.delete", async move {
+            let summary = match (!channel_ids.is_empty(), !user_ids.is_empty()) {
+                (true, true) => format!(
+                    "Revoked access for {} channel(s) and {} user(s)",
+                    channel_ids.len(),
+                    user_ids.len()
+                ),
+                (true, false) => format!("Revoked access for {} channel(s)", channel_ids.len()),
+                (false, true) => format!("Revoked access for {} user(s)", user_ids.len()),
+                (false, false) => "Revoked access".to_owned(),
+            };
+            let mut failed_channels = Vec::new();
+            let mut failed_users = Vec::new();
+            let mut api_res: api::Result<()> = Ok(());
+            if channel_ids.is_empty() && user_ids.is_empty() {
+                api_res = Err(ApiError::Slack("invalid_parameters".to_owned()));
+            } else {
+                if !channel_ids.is_empty() {
+                    match ctx
+                        .backend
+                        .lists_access_delete(list_id.clone(), channel_ids, Vec::new())
+                        .await
+                    {
+                        Ok(report) => failed_channels.extend(report.failed_to_update_channel_ids),
+                        Err(err) => api_res = Err(err),
+                    }
+                }
+                if api_res.is_ok() && !user_ids.is_empty() {
+                    match ctx
+                        .backend
+                        .lists_access_delete(list_id.clone(), Vec::new(), user_ids)
+                        .await
+                    {
+                        Ok(report) => failed_users.extend(report.failed_to_update_user_ids),
+                        Err(err) => api_res = Err(err),
+                    }
+                }
+            }
+            let result = match map_list_result(&ctx.events, api_res) {
+                Ok(()) if !failed_channels.is_empty() || !failed_users.is_empty() => {
+                    let mut parts = Vec::new();
+                    if !failed_channels.is_empty() {
+                        parts.push(format!("{} channel(s)", failed_channels.len()));
+                    }
+                    if !failed_users.is_empty() {
+                        parts.push(format!("{} user(s)", failed_users.len()));
+                    }
+                    Err(format!(
+                        "Slack could not revoke access for {}.",
+                        parts.join(" and ")
+                    ))
+                }
+                other => other,
+            };
+            ctx.events.emit(Event::ListAccessUpdated {
+                list_id,
+                summary,
+                result,
+            });
             Ok(())
         });
     }
@@ -765,25 +903,30 @@ impl<B: Backend> Core<B> {
                 ctx.events.emit(Event::FileTranscriptReady {
                     file_id,
                     text: existing.text,
+                    cues: existing.cues,
                 });
                 return Ok(());
             }
 
             let path_for_task = local_path.clone();
             let transcribed = tokio::task::spawn_blocking(move || {
-                crate::huddle::transcribe_media_file(&path_for_task, provider)
+                crate::huddle::transcribe_media_file_timed(&path_for_task, provider)
             })
             .await;
 
             match transcribed {
-                Ok(Ok((used_provider, text))) => {
-                    let trimmed = text.trim().to_owned();
+                Ok(Ok(timed)) => {
+                    let trimmed = timed.text.trim().to_owned();
+                    let cues = timed.cues;
                     let ws_save = ctx.workspace.clone();
                     let fid_save = file_id.clone();
                     let text_save = trimmed.clone();
-                    let source = used_provider.source_tag().to_owned();
+                    let cues_save = cues.clone();
+                    let source = timed.provider.source_tag().to_owned();
                     if let Err(err) = with_store(&ctx.store, move |s| {
-                        s.upsert_file_transcript(&ws_save, &fid_save, &source, &text_save)
+                        s.upsert_file_transcript_with_cues(
+                            &ws_save, &fid_save, &source, &text_save, &cues_save,
+                        )
                     })
                     .await
                     {
@@ -796,6 +939,7 @@ impl<B: Backend> Core<B> {
                     ctx.events.emit(Event::FileTranscriptReady {
                         file_id,
                         text: trimmed,
+                        cues,
                     });
                 }
                 Ok(Err(error)) => {
@@ -854,15 +998,35 @@ async fn emit_canvas_html<B: Backend>(backend: &B, events: &Emitter, file_id: St
     }
 }
 
-async fn emit_list<B: Backend>(backend: &B, events: &Emitter, file_id: String) {
-    let list = match backend.fetch_list(file_id.clone()).await {
-        Ok(list) => Ok(Box::new(list)),
+fn map_list_result<T>(events: &Emitter, res: api::Result<T>) -> Result<T, String> {
+    match res {
+        Ok(value) => Ok(value),
         Err(err) => {
             emit_if_auth_expired(events, &err);
-            Err(err.to_string())
+            Err(format_list_api_error(&err))
         }
-    };
-    events.emit(Event::ListLoaded { file_id, list });
+    }
+}
+
+async fn emit_list<B: Backend>(backend: &B, events: &Emitter, file_id: String) {
+    match map_list_result(events, backend.fetch_list_with_meta(file_id.clone()).await) {
+        Ok((list, meta)) => {
+            events.emit(Event::ListLoaded {
+                file_id: file_id.clone(),
+                list: Ok(Box::new(list)),
+            });
+            events.emit(Event::ListMetaLoaded {
+                file_id,
+                meta: Box::new(meta),
+            });
+        }
+        Err(err) => {
+            events.emit(Event::ListLoaded {
+                file_id,
+                list: Err(err),
+            });
+        }
+    }
 }
 
 async fn reload_files_extras<B: Backend>(backend: &B, events: &Emitter) -> Result<(), CoreError> {

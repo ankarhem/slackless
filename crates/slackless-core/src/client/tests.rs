@@ -214,7 +214,13 @@ struct FakeState {
     quip_archive_error: Option<String>,
     fail_canvas_html: bool,
     list_data: api::SlackListData,
+    list_meta: Option<api::ListMeta>,
     list_create_item_calls: Vec<String>,
+    list_access_set_calls: Vec<(String, api::ListAccessLevel, Vec<ChannelId>, Vec<UserId>)>,
+    list_access_delete_calls: Vec<(String, Vec<ChannelId>, Vec<UserId>)>,
+    list_access_delete_result: api::ListAccessDeleteResult,
+    list_access_error: Option<String>,
+    list_record_threads: Vec<Message>,
     files_favorites: Vec<String>,
     files_collections: Vec<api::FileCollection>,
     files_deleted: Vec<api::DeletedFile>,
@@ -1778,6 +1784,57 @@ impl crate::backend::CollabBackend for FakeBackend {
         Ok(state.list_data.clone())
     }
 
+    async fn fetch_list_with_meta(
+        &self,
+        file_id: String,
+    ) -> api::Result<(api::SlackListData, api::ListMeta)> {
+        let state = self.state.lock().unwrap();
+        if state.auth_expired_collab {
+            return Err(ApiError::AuthExpired("token_revoked".into()));
+        }
+        let meta = state.list_meta.clone().unwrap_or_else(|| api::ListMeta {
+            file_id: file_id.clone(),
+            title: state.list_data.title.clone(),
+            editable: true,
+            comment_channel_id: api::list_comment_channel_id(&file_id),
+            ..Default::default()
+        });
+        Ok((state.list_data.clone(), meta))
+    }
+
+    async fn lists_access_set(
+        &self,
+        list_id: String,
+        access_level: api::ListAccessLevel,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
+    ) -> api::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .list_access_set_calls
+            .push((list_id, access_level, channel_ids, user_ids));
+        if let Some(err) = state.list_access_error.clone() {
+            return Err(ApiError::Slack(err));
+        }
+        Ok(())
+    }
+
+    async fn lists_access_delete(
+        &self,
+        list_id: String,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
+    ) -> api::Result<api::ListAccessDeleteResult> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .list_access_delete_calls
+            .push((list_id, channel_ids, user_ids));
+        if let Some(err) = state.list_access_error.clone() {
+            return Err(ApiError::Slack(err));
+        }
+        Ok(state.list_access_delete_result.clone())
+    }
+
     async fn lists_records_create(
         &self,
         list_id: String,
@@ -1796,10 +1853,11 @@ impl crate::backend::CollabBackend for FakeBackend {
         _list_id: String,
         _record_id: String,
     ) -> api::Result<Vec<Message>> {
-        if self.state.lock().unwrap().auth_expired_collab {
+        let state = self.state.lock().unwrap();
+        if state.auth_expired_collab {
             return Err(ApiError::AuthExpired("token_revoked".into()));
         }
-        Ok(Vec::new())
+        Ok(state.list_record_threads.clone())
     }
 
     async fn load_app_home(&self, _channel: ChannelId) -> api::Result<api::AppHomeResponse> {
@@ -5884,6 +5942,10 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
         next(&mut rx).await,
         Event::ListLoaded { file_id, list: Ok(ref l) } if file_id == "FLIST1" && l.title == "Tasks"
     ));
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::ListMetaLoaded { file_id, .. } if file_id == "FLIST1"
+    ));
     core.handle(Command::Collab(CollabCommand::CreateListItem {
         list_id: "FLIST1".into(),
         initial_fields: vec![],
@@ -5892,6 +5954,10 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
     assert!(matches!(
         next(&mut rx).await,
         Event::ListLoaded { file_id, list: Ok(_) } if file_id == "FLIST1"
+    ));
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::ListMetaLoaded { file_id, .. } if file_id == "FLIST1"
     ));
 
     // LoadFilesExtras.
@@ -6844,5 +6910,404 @@ async fn block_suggestions_error_still_emits_empty_event_to_clear_loading() {
             key: "modal-V1/b_ext/a_ext".to_owned(),
             options: Vec::new(),
         }
+    );
+}
+
+#[tokio::test]
+async fn lists_sharing_meta_delete_access_and_record_threads_flow_through_core() {
+    let fake = FakeBackend::default();
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.list_data = api::SlackListData {
+            file_id: "F0LIST".into(),
+            title: "Launch Plan".into(),
+            ..Default::default()
+        };
+        state.list_meta = Some(api::ListMeta {
+            file_id: "F0LIST".into(),
+            title: "Launch Plan".into(),
+            permalink: Some("https://acme.slack.com/lists/T1/F0LIST".into()),
+            editable: true,
+            access: Some("owner".into()),
+            org_or_workspace_access: Some("read".into()),
+            editors: vec![UserId::from("U1")],
+            shared_channels: vec![ChannelId::from("C1")],
+            row_count: Some(5),
+            row_count_limit: Some(5000),
+            over_row_maximum: false,
+            comment_channel_id: ChannelId::from("C0LIST"),
+            ..Default::default()
+        });
+        state.list_record_threads = vec![
+            Message {
+                ts: Ts::from("1700.1"),
+                user: Some(UserId::from("U1")),
+                text: "List comment root".into(),
+                ..Default::default()
+            },
+            Message {
+                ts: Ts::from("1700.2"),
+                thread_ts: Some(Ts::from("1700.1")),
+                user: Some(UserId::from("U2")),
+                text: "List comment reply".into(),
+                ..Default::default()
+            },
+        ];
+    }
+    let (store, events, mut rx) = fake_core_parts();
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    // 1. LoadList emits both ListLoaded and ListMetaLoaded.
+    core.handle(Command::Collab(CollabCommand::LoadList {
+        file_id: "F0LIST".into(),
+    }))
+    .await;
+    match next(&mut rx).await {
+        Event::ListLoaded { file_id, list } => {
+            assert_eq!(file_id, "F0LIST");
+            assert_eq!(list.unwrap().title, "Launch Plan");
+        }
+        other => panic!("expected Event::ListLoaded, got {other:?}"),
+    }
+    match next(&mut rx).await {
+        Event::ListMetaLoaded { file_id, meta } => {
+            assert_eq!(file_id, "F0LIST");
+            assert_eq!(meta.access.as_deref(), Some("owner"));
+            assert_eq!(meta.row_count, Some(5));
+        }
+        other => panic!("expected Event::ListMetaLoaded, got {other:?}"),
+    }
+
+    // 2. SetListAccess with mixed channel + user targets splits into two XOR API calls and posts permalink.
+    core.handle(Command::Collab(CollabCommand::SetListAccess {
+        list_id: "F0LIST".into(),
+        access_level: api::ListAccessLevel::Write,
+        channel_ids: vec![ChannelId::from("C1")],
+        user_ids: vec![UserId::from("U2")],
+        post_permalink: Some("https://acme.slack.com/lists/T1/F0LIST".into()),
+    }))
+    .await;
+    match next(&mut rx).await {
+        Event::ListAccessUpdated {
+            list_id, result, ..
+        } => {
+            assert_eq!(list_id, "F0LIST");
+            assert!(result.is_ok());
+        }
+        other => panic!("expected Event::ListAccessUpdated, got {other:?}"),
+    }
+
+    // 3. Silent SetListAccess does NOT post a permalink message to the channel.
+    core.handle(Command::Collab(CollabCommand::SetListAccess {
+        list_id: "F0LIST".into(),
+        access_level: api::ListAccessLevel::Read,
+        channel_ids: vec![ChannelId::from("C2")],
+        user_ids: Vec::new(),
+        post_permalink: None,
+    }))
+    .await;
+    match next(&mut rx).await {
+        Event::ListAccessUpdated { result, .. } => assert!(result.is_ok()),
+        other => panic!("expected Event::ListAccessUpdated, got {other:?}"),
+    }
+
+    // 4. DeleteListAccess surfaces partial failure details from failed_to_update_user_ids.
+    fake.state.lock().unwrap().list_access_delete_result = api::ListAccessDeleteResult {
+        failed_to_update_channel_ids: Vec::new(),
+        failed_to_update_user_ids: vec![UserId::from("U9")],
+    };
+    core.handle(Command::Collab(CollabCommand::DeleteListAccess {
+        list_id: "F0LIST".into(),
+        channel_ids: Vec::new(),
+        user_ids: vec![UserId::from("U2"), UserId::from("U9")],
+    }))
+    .await;
+    match next(&mut rx).await {
+        Event::ListAccessUpdated {
+            list_id,
+            result: Err(err),
+            ..
+        } => {
+            assert_eq!(list_id, "F0LIST");
+            assert!(
+                err.contains("1 user(s)"),
+                "partial failure should be reported: {err}"
+            );
+        }
+        other => panic!("expected Event::ListAccessUpdated with partial failure, got {other:?}"),
+    }
+
+    // 5. FetchListRecordComments returns list item thread messages.
+    core.handle(Command::Collab(CollabCommand::FetchListRecordComments {
+        list_id: "F0LIST".into(),
+        record_id: "Rec1".into(),
+    }))
+    .await;
+    match next(&mut rx).await {
+        Event::ListRecordComments {
+            list_id,
+            record_id,
+            messages,
+        } => {
+            assert_eq!(list_id, "F0LIST");
+            assert_eq!(record_id, "Rec1");
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].text, "List comment root");
+        }
+        other => panic!("expected Event::ListRecordComments, got {other:?}"),
+    }
+
+    let state = fake.state.lock().unwrap();
+    // 2 calls from mixed share (channel XOR user) + 1 call from silent share = 3 calls.
+    assert_eq!(state.list_access_set_calls.len(), 3);
+    assert_eq!(
+        state.list_access_set_calls[0].2,
+        vec![ChannelId::from("C1")]
+    );
+    assert!(state.list_access_set_calls[0].3.is_empty());
+    assert!(state.list_access_set_calls[1].2.is_empty());
+    assert_eq!(state.list_access_set_calls[1].3, vec![UserId::from("U2")]);
+    assert_eq!(
+        state.posted_messages,
+        vec![(
+            ChannelId::from("C1"),
+            "https://acme.slack.com/lists/T1/F0LIST".to_owned()
+        )],
+        "only the non-silent channel share should post the permalink"
+    );
+    assert_eq!(state.list_access_delete_calls.len(), 1);
+}
+
+#[tokio::test]
+async fn hydrate_resolves_slack_connect_external_teams_from_boot_channels() {
+    let fake = FakeBackend::default();
+    let partner_team = Team {
+        id: TeamId::from("T0PARTNER"),
+        name: "Partner Co".into(),
+        domain: "partner".into(),
+        is_verified: true,
+        ..Default::default()
+    };
+    fake.set_team(partner_team.clone());
+    fake.state.lock().unwrap().user_boot_override = Some(UserBoot {
+        channels: vec![Conversation {
+            id: ChannelId::from("C0EXT"),
+            name: Some("ext-partner".into()),
+            is_channel: true,
+            is_ext_shared: true,
+            conversation_host_id: Some(TeamId::from("T0PARTNER")),
+            connected_team_ids: vec![TeamId::from("T0PARTNER"), TeamId::from("T1")],
+            ..Default::default()
+        }],
+        team: Some(Team {
+            id: TeamId::from("T1"),
+            name: "Acme".into(),
+            domain: "acme".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    let (store, events, mut rx) = fake_core_parts();
+    let core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
+    core.hydrate().await;
+
+    // Wait briefly for the spawned external-team resolution task to complete.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let persisted = store
+            .lock()
+            .unwrap()
+            .teams(&TeamId::from("T1"))
+            .unwrap_or_default()
+            .into_iter()
+            .any(|t| t.id == TeamId::from("T0PARTNER"));
+        if fake.team_info_calls().contains(&TeamId::from("T0PARTNER")) && persisted {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for hydrate to resolve Slack Connect external team T0PARTNER"
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+    }
+
+    let saved = store
+        .lock()
+        .unwrap()
+        .teams(&TeamId::from("T1"))
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == TeamId::from("T0PARTNER"))
+        .expect("external team persisted in store");
+    assert_eq!(saved.name, "Partner Co");
+    assert!(saved.is_verified);
+}
+
+#[tokio::test]
+async fn workspace_backfill_commands_report_progress_and_honor_pause_resume() {
+    use crate::{BackfillStatus, WorkspaceCommand};
+
+    let fake = FakeBackend::default();
+    let ws = TeamId::from("T1");
+    let c1 = ChannelId::from("C_BF_1");
+    let c2 = ChannelId::from("C_BF_2");
+
+    let (store, events, mut rx) = fake_core_parts();
+    {
+        let mut s = store.lock().unwrap();
+        s.upsert_conversations(
+            &ws,
+            &[
+                Conversation {
+                    id: c1.clone(),
+                    name: Some("general".into()),
+                    is_channel: true,
+                    is_member: true,
+                    ..Conversation::default()
+                },
+                Conversation {
+                    id: c2.clone(),
+                    name: Some("ops".into()),
+                    is_channel: true,
+                    is_member: true,
+                    ..Conversation::default()
+                },
+            ],
+        )
+        .unwrap();
+    }
+    {
+        let mut st = fake.state.lock().unwrap();
+        st.history = vec![Message {
+            ts: Ts::from("1700000100.000100"),
+            text: "root in general".into(),
+            reply_count: Some(1),
+            ..Message::default()
+        }];
+        st.thread = vec![
+            Message {
+                ts: Ts::from("1700000100.000100"),
+                text: "root in general".into(),
+                reply_count: Some(1),
+                ..Message::default()
+            },
+            Message {
+                ts: Ts::from("1700000101.000100"),
+                thread_ts: Some(Ts::from("1700000100.000100")),
+                text: "reply in general".into(),
+                ..Message::default()
+            },
+        ];
+    }
+
+    let mut core = Core::new(
+        fake,
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    // 1. QueryBackfillProgress before running returns Idle inventory for both channels.
+    core.handle(Command::Workspace(WorkspaceCommand::QueryBackfillProgress))
+        .await;
+    let Event::BackfillProgress(initial) = next(&mut rx).await else {
+        panic!("expected BackfillProgress on query");
+    };
+    assert_eq!(initial.total_channels, 2);
+    assert_eq!(initial.completed_channels, 0);
+    assert_eq!(initial.status, BackfillStatus::Idle);
+
+    // 2. Pause -> Resume toggles paused flag via Event::BackfillProgress.
+    core.handle(Command::Workspace(WorkspaceCommand::PauseBackfill))
+        .await;
+    let Event::BackfillProgress(paused) = next(&mut rx).await else {
+        panic!("expected BackfillProgress on pause");
+    };
+    assert!(paused.paused);
+
+    core.handle(Command::Workspace(WorkspaceCommand::ResumeBackfill))
+        .await;
+    let Event::BackfillProgress(resumed) = next(&mut rx).await else {
+        panic!("expected BackfillProgress on resume");
+    };
+    assert!(!resumed.paused);
+
+    // 3. BackfillWorkspace with include_threads=true walks both channels + thread reply.
+    core.handle(Command::Workspace(WorkspaceCommand::BackfillWorkspace {
+        include_threads: true,
+    }))
+    .await;
+
+    let mut saw_complete = false;
+    for _ in 0..32 {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Ok(Event::BackfillProgress(p))) if p.status == BackfillStatus::Complete => {
+                assert_eq!(p.total_channels, 2);
+                assert_eq!(p.completed_channels, 2);
+                assert!(p.replies_stored >= 1);
+                saw_complete = true;
+                break;
+            }
+            Ok(Ok(_)) => {}
+            other => panic!("unexpected event waiting for workspace backfill: {other:?}"),
+        }
+    }
+    assert!(saw_complete, "workspace backfill should reach Complete");
+
+    let replies = store
+        .lock()
+        .unwrap()
+        .thread_replies(&ws, &c1, &Ts::from("1700000100.000100"))
+        .unwrap();
+    assert_eq!(replies.len(), 2);
+
+    // 4. Pausing then issuing an explicit BackfillChannel clears stale paused state and completes.
+    core.handle(Command::Workspace(WorkspaceCommand::PauseBackfill))
+        .await;
+    let Event::BackfillProgress(paused_again) = next(&mut rx).await else {
+        panic!("expected BackfillProgress on second pause");
+    };
+    assert!(paused_again.paused);
+
+    core.handle(Command::Workspace(WorkspaceCommand::BackfillChannel {
+        channel: c2.clone(),
+        include_threads: false,
+    }))
+    .await;
+    let mut saw_ch_complete = false;
+    for _ in 0..32 {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Ok(Event::BackfillProgress(p)))
+                if !p.paused
+                    && p.status == BackfillStatus::Complete
+                    && p.channels.iter().any(|c| c.channel == c2 && c.complete) =>
+            {
+                saw_ch_complete = true;
+                break;
+            }
+            Ok(Ok(_)) => {}
+            other => panic!("unexpected event waiting for single-channel backfill: {other:?}"),
+        }
+    }
+    assert!(
+        saw_ch_complete,
+        "BackfillChannel after PauseBackfill must clear stale pause and complete"
     );
 }

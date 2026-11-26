@@ -296,6 +296,17 @@ pub enum Event {
         file_id: String,
         list: Result<Box<api::SlackListData>, String>,
     },
+    /// Parsed List access/sharing/limit metadata loaded alongside [`Event::ListLoaded`].
+    ListMetaLoaded {
+        file_id: String,
+        meta: Box<api::ListMeta>,
+    },
+    /// Result of `CollabCommand::SetListAccess` or `DeleteListAccess`.
+    ListAccessUpdated {
+        list_id: String,
+        summary: String,
+        result: Result<(), String>,
+    },
     /// A new Slack List was created via `lists.create` (`F-COLLAB-213`).
     ListCreated { file_id: String, name: String },
     /// A message was added to a Slack List (`lists.addToList`, `F-COLLAB-231`).
@@ -348,12 +359,15 @@ pub enum Event {
     FileTranscriptReady {
         file_id: crate::types::FileId,
         text: String,
+        cues: Vec<crate::types::TranscriptCue>,
     },
     /// Local transcription of a video or audio file failed.
     FileTranscriptFailed {
         file_id: crate::types::FileId,
         error: String,
     },
+    /// Live per-channel & per-workspace archive backfill progress update.
+    BackfillProgress(crate::backfill::WorkspaceBackfillProgress),
     /// A non-fatal failure worth surfacing.
     Error(String),
 }

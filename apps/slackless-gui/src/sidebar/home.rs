@@ -857,14 +857,32 @@ impl Sidebar {
         };
 
         let kind = conversation.kind();
-        // A Slack Connect channel names its other organizations in a tooltip over its name.
-        let shared = conversation.is_ext_shared
-            && matches!(
-                kind,
-                ConversationKind::PublicChannel | ConversationKind::PrivateChannel
-            );
+        // A Slack Connect channel names its other organizations in a tooltip over its name
+        // and carries a compact external-org indicator (`F-COLLAB-798`, `800`, `828`).
+        let is_channel_kind = matches!(
+            kind,
+            ConversationKind::PublicChannel | ConversationKind::PrivateChannel
+        );
+        let shared = conversation.is_external_connect() && is_channel_kind;
+        let org_shared_internal =
+            conversation.is_org_shared && !conversation.is_ext_shared && is_channel_kind;
+        let external_dm = matches!(kind, ConversationKind::Im)
+            && conversation
+                .user
+                .as_ref()
+                .is_some_and(|u| self.fixtures.is_external_user(u));
+        let shared_teams = if shared {
+            self.fixtures.shared_teams(conversation)
+        } else {
+            Vec::new()
+        };
+        let owner_team = if shared {
+            self.fixtures.channel_owner_team(conversation)
+        } else {
+            None
+        };
         let tip = (shared && self.org_tip.as_ref() == Some(&id))
-            .then(|| org_tooltip(&self.fixtures.shared_teams(conversation), cx))
+            .then(|| org_tooltip(&shared_teams, owner_team, cx))
             .flatten();
         // Public rows carry `# name` from the label itself, like the reference list.
         let (leading, label) = match kind {
@@ -927,21 +945,79 @@ impl Sidebar {
             .when(!selected, |row| row.hover(|row| row.bg(row_hover)))
             .child(leading);
         let name = div().truncate().font_weight(weight).child(label);
+        let external_badge_icon = Icon::new(IconName::Building2)
+            .size(px(12.))
+            .text_color(color.opacity(0.8));
         row = if shared {
             // The tooltip centers on the name itself, so the name shrinks to its text.
             let hovered_id = id.clone();
+            let connect_indicator = if let Some(first_org) = shared_teams.first() {
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_0p5()
+                    .child(crate::channel_details::org_chip(first_org, 13.))
+                    .when(shared_teams.len() > 1, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(color.opacity(0.8))
+                                .child(format!("+{}", shared_teams.len() - 1)),
+                        )
+                    })
+                    .into_any_element()
+            } else {
+                external_badge_icon.into_any_element()
+            };
             row.child(
-                h_flex().flex_1().min_w_0().child(
-                    div()
-                        .relative()
-                        .min_w_0()
-                        .child(name)
-                        .children(tip.map(|tip| deferred(tip).with_priority(2))),
-                ),
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .relative()
+                            .min_w_0()
+                            .child(name)
+                            .children(tip.map(|tip| deferred(tip).with_priority(2))),
+                    )
+                    .child(connect_indicator),
             )
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.hover_shared_row(&hovered_id, *hovered, cx);
             }))
+        } else if org_shared_internal {
+            row.child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1p5()
+                    .child(name)
+                    .child(
+                        div()
+                            .flex_none()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(color.opacity(0.35))
+                            .text_size(px(9.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color.opacity(0.85))
+                            .child("Org"),
+                    ),
+            )
+        } else if external_dm {
+            row.child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1()
+                    .child(name)
+                    .child(external_badge_icon),
+            )
         } else {
             row.child(name.flex_1())
         };

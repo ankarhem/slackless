@@ -1,18 +1,25 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use slackless_core::store::{SearchQuery, Store, StoredMessage};
+use slackless_core::domain::mrkdwn::mrkdwn_to_plain;
+use slackless_core::export::{
+    ExportFormat as CoreExportFormat, ExportOptions, export_channel, export_file_transcript,
+    export_huddle_transcript, export_thread,
+};
+use slackless_core::search::{SearchHitKind, UnifiedSearchHit, search_disk_archives};
+use slackless_core::store::{SearchQuery, SearchSort, Store, StoredMessage};
 use slackless_core::types::time::now_epoch_secs;
-use slackless_core::types::{ChannelId, TeamId, Ts};
+use slackless_core::types::{ChannelId, FileId, TeamId, Ts};
 
 use super::{
     all_workspace_ids, empty_local, open_archive_with_hint, parse_since_cutoff, raw_channel_id,
     write_or_print_export,
 };
-use crate::archive::Archive;
+use crate::archive::{self, Archive};
 use crate::cli::ExportFormat;
-use crate::output::{self, MessageRow};
+use crate::output::{self, MessageRow, ReactionRow};
 use crate::{Ctx, fail};
 
 /// Read up to `limit` newest matching messages from `channel`, ordered oldest first.
@@ -73,14 +80,149 @@ pub(crate) fn read_channel_messages(
     Ok(collected)
 }
 
+pub(crate) struct SearchAllOpts<'a> {
+    pub(crate) limit: usize,
+    pub(crate) sort: SearchSort,
+    pub(crate) format: Option<ExportFormat>,
+    pub(crate) out: Option<&'a Path>,
+    pub(crate) include_deleted: bool,
+}
+
+fn unified_hit_to_json(hit: &UnifiedSearchHit) -> serde_json::Value {
+    let inner = &hit.message;
+    let reactions: Vec<ReactionRow> = inner
+        .reactions
+        .iter()
+        .map(|r| ReactionRow {
+            name: r.name.clone(),
+            count: r.count,
+        })
+        .collect();
+    let files: Vec<String> = inner
+        .files
+        .iter()
+        .filter_map(|f| f.name.clone().or_else(|| f.title.clone()))
+        .collect();
+    let mut obj = serde_json::json!({
+        "workspace": hit.workspace.as_str(),
+        "workspace_name": hit.workspace_name,
+        "channel": hit.channel.as_str(),
+        "channel_name": hit.channel_name,
+        "ts": inner.ts.as_str(),
+        "user": inner.user.as_ref().map(|u| u.as_str()),
+        "user_name": hit.user_name,
+        "bot_id": inner.bot_id.as_ref().map(|b| b.as_str()),
+        "text": inner.text,
+        "thread_ts": inner.thread_ts.as_ref().map(|ts| ts.as_str()),
+        "subtype": inner.subtype.as_ref().map(|s| s.as_str()),
+        "deleted": hit.deleted,
+        "edited": inner.edited.is_some(),
+        "reply_count": inner.reply_count,
+        "reactions": reactions,
+        "files": files,
+        "permalink": inner.permalink,
+        "kind": hit.kind,
+    });
+    if let Some(map) = obj.as_object_mut() {
+        if let Some(fid) = &hit.transcript_file_id {
+            map.insert(
+                "transcript_file_id".to_owned(),
+                serde_json::json!(fid.as_str()),
+            );
+        }
+        if let Some(excerpt) = &hit.transcript_excerpt {
+            map.insert("transcript_excerpt".to_owned(), serde_json::json!(excerpt));
+        }
+        if let Some(rank) = hit.rank {
+            map.insert("rank".to_owned(), serde_json::json!(rank));
+        }
+    }
+    obj
+}
+
+fn unified_hit_human_line(hit: &UnifiedSearchHit) -> String {
+    let ws = hit.workspace.as_str();
+    let ch = hit
+        .channel_name
+        .as_deref()
+        .unwrap_or_else(|| hit.channel.as_str());
+    let who = hit
+        .user_name
+        .as_deref()
+        .or_else(|| hit.message.user.as_ref().map(|u| u.as_str()))
+        .or_else(|| hit.message.bot_id.as_ref().map(|b| b.as_str()))
+        .unwrap_or("unknown");
+    let deleted = if hit.deleted { " (deleted)" } else { "" };
+    let kind_tag = match hit.kind {
+        SearchHitKind::Message => "",
+        SearchHitKind::Snippet => " [snippet]",
+        SearchHitKind::Canvas => " [canvas]",
+        SearchHitKind::FileTranscript => " [transcript]",
+    };
+    let plain = mrkdwn_to_plain(&hit.message.text);
+    let body = match (&hit.transcript_excerpt, plain.trim().is_empty()) {
+        (Some(excerpt), true) => excerpt.clone(),
+        (Some(excerpt), false) if hit.kind == SearchHitKind::FileTranscript => {
+            format!("{plain} — {excerpt}")
+        }
+        _ => plain,
+    };
+    format!(
+        "{ws}\t{ch}\t{}\t{who}:{deleted}{kind_tag} {body}\n",
+        hit.message.ts.as_str()
+    )
+}
+
+fn format_unified_markdown_export(query: &str, hits: &[UnifiedSearchHit]) -> String {
+    let mut out = format!("# Search (all workspaces): {query}\n\n");
+    for hit in hits {
+        let ws = hit
+            .workspace_name
+            .as_deref()
+            .map(|n| format!("{n} (`{}`)", hit.workspace.as_str()))
+            .unwrap_or_else(|| format!("`{}`", hit.workspace.as_str()));
+        let ch = hit
+            .channel_name
+            .as_deref()
+            .unwrap_or_else(|| hit.channel.as_str());
+        let author = hit
+            .user_name
+            .as_deref()
+            .or_else(|| hit.message.user.as_ref().map(|u| u.as_str()))
+            .or_else(|| hit.message.bot_id.as_ref().map(|b| b.as_str()))
+            .unwrap_or("unknown");
+        let deleted = if hit.deleted { " _(deleted)_" } else { "" };
+        let kind = match hit.kind {
+            SearchHitKind::Message => String::new(),
+            other => format!(" _[{}]_ ", other.label()),
+        };
+        out.push_str(&format!(
+            "**{author}** in {ch} · {ws} (`{}`){deleted}{kind}\n\n",
+            hit.message.ts.as_str()
+        ));
+        if !hit.message.text.is_empty() {
+            out.push_str(&hit.message.text);
+            out.push_str("\n\n");
+        }
+        if let Some(excerpt) = &hit.transcript_excerpt {
+            out.push_str(&format!("> _Transcript:_ {excerpt}\n\n"));
+        }
+        out.push_str("---\n\n");
+    }
+    out
+}
+
 pub(crate) fn cmd_search_all_workspaces(
     ctx: &Ctx,
     query: &str,
-    limit: usize,
-    include_deleted: bool,
+    opts: SearchAllOpts<'_>,
 ) -> Result<ExitCode> {
     let team_ids = all_workspace_ids();
-    if team_ids.is_empty() {
+    let archives: Vec<(TeamId, PathBuf)> = team_ids
+        .into_iter()
+        .filter_map(|ws| archive::store_path(&ws).map(|path| (ws, path)))
+        .collect();
+    if archives.is_empty() {
         return Ok(empty_local(
             ctx,
             serde_json::json!({
@@ -93,57 +235,64 @@ pub(crate) fn cmd_search_all_workspaces(
             "searching across workspaces",
         ));
     }
+    cmd_search_all_in_archives(ctx, &archives, query, opts)
+}
 
+pub(crate) fn cmd_search_all_in_archives(
+    ctx: &Ctx,
+    archives: &[(TeamId, PathBuf)],
+    query: &str,
+    opts: SearchAllOpts<'_>,
+) -> Result<ExitCode> {
     let mut parsed = SearchQuery::parse(query);
-    parsed.filters.include_deleted = include_deleted;
-    let mut hits: Vec<(String, Option<String>, MessageRow)> = Vec::new();
-    for ws in &team_ids {
-        let Some(archive) =
-            Archive::open(ws).with_context(|| format!("opening local archive for {ws}"))?
-        else {
-            continue;
+    parsed.filters.include_deleted = opts.include_deleted;
+    let results = search_disk_archives(archives, &parsed, opts.sort, opts.limit)
+        .context("searching across local workspace archives")?;
+
+    let searched: Vec<&str> = results
+        .workspaces_searched
+        .iter()
+        .map(|(ws, _)| ws.as_str())
+        .collect();
+    let workspaces_meta: Vec<serde_json::Value> = results
+        .workspaces_searched
+        .iter()
+        .map(|(ws, name)| serde_json::json!({"id": ws.as_str(), "name": name}))
+        .collect();
+    let json_rows: Vec<serde_json::Value> = results.hits.iter().map(unified_hit_to_json).collect();
+
+    if opts.format.is_some() || opts.out.is_some() {
+        let effective = if ctx.json {
+            ExportFormat::Json
+        } else {
+            opts.format.unwrap_or(ExportFormat::Md)
         };
-        let messages = archive
-            .store()
-            .search(ws, &parsed, limit)
-            .with_context(|| format!("searching the local archive of {ws}"))?;
-        if messages.is_empty() {
-            continue;
-        }
-        let names = archive
-            .channel_names(ws)
-            .with_context(|| format!("reading channel names for {ws}"))?;
-        let user_names = archive
-            .user_display_map(ws)
-            .with_context(|| format!("reading user names for {ws}"))?;
-        for message in &messages {
-            let row = MessageRow::from_stored(message, &user_names);
-            let label = names.get(row.channel.as_str()).cloned();
-            hits.push((ws.as_str().to_owned(), label, row));
-        }
+        let rendered = match effective {
+            ExportFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
+                "query": query,
+                "all_workspaces": true,
+                "workspaces_searched": searched,
+                "workspaces": workspaces_meta,
+                "count": json_rows.len(),
+                "messages": json_rows,
+            }))?,
+            ExportFormat::Md => format_unified_markdown_export(query, &results.hits),
+        };
+        write_or_print_export(ctx, &rendered, opts.out, json_rows.len(), "search matches")?;
+        return Ok(ExitCode::SUCCESS);
     }
-    hits.sort_by(|a, b| b.2.ts.cmp(&a.2.ts));
-    hits.truncate(limit);
 
     let mut human = String::new();
-    let json_rows: Vec<serde_json::Value> = hits
-        .iter()
-        .map(|(ws_id, label, row)| {
-            human.push_str(&format!("{ws_id}\t{}", row.human_line(label.as_deref())));
-            let mut val = serde_json::to_value(row).unwrap_or_default();
-            if let Some(obj) = val.as_object_mut() {
-                obj.insert("workspace".to_owned(), serde_json::json!(ws_id));
-            }
-            val
-        })
-        .collect();
-    let searched: Vec<&str> = team_ids.iter().map(TeamId::as_str).collect();
+    for hit in &results.hits {
+        human.push_str(&unified_hit_human_line(hit));
+    }
     output::emit(
         ctx.json,
         &serde_json::json!({
             "query": query,
             "all_workspaces": true,
             "workspaces_searched": searched,
+            "workspaces": workspaces_meta,
             "count": json_rows.len(),
             "messages": json_rows,
         }),
@@ -154,18 +303,21 @@ pub(crate) fn cmd_search_all_workspaces(
 
 pub(crate) struct SearchCmdOpts<'a> {
     pub(crate) limit: usize,
+    pub(crate) sort: SearchSort,
     pub(crate) format: Option<ExportFormat>,
-    pub(crate) out: Option<&'a std::path::Path>,
+    pub(crate) out: Option<&'a Path>,
     pub(crate) include_deleted: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_search(
     ctx: &Ctx,
     workspace: Option<&TeamId>,
     query: &str,
     limit: usize,
+    sort: SearchSort,
     format: Option<ExportFormat>,
-    out: Option<&std::path::Path>,
+    out: Option<&Path>,
     include_deleted: bool,
 ) -> Result<ExitCode> {
     let Some(workspace) = workspace else {
@@ -183,6 +335,7 @@ pub(crate) fn cmd_search(
         query,
         SearchCmdOpts {
             limit,
+            sort,
             format,
             out,
             include_deleted,
@@ -203,7 +356,7 @@ pub(crate) fn cmd_search_in_archive(
         Some(archive) => {
             let messages = archive
                 .store()
-                .search(workspace, &parsed, opts.limit)
+                .search_sorted(workspace, &parsed, opts.sort, opts.limit)
                 .with_context(|| format!("searching the local archive of {workspace}"))?;
             let names = archive
                 .channel_names(workspace)
@@ -404,68 +557,181 @@ pub(crate) fn cmd_thread(
     Ok(ExitCode::SUCCESS)
 }
 
+pub(crate) struct ExportCmdOpts<'a> {
+    pub(crate) channel: Option<&'a str>,
+    pub(crate) thread_ts: Option<&'a str>,
+    pub(crate) transcript_file_id: Option<&'a str>,
+    pub(crate) huddle_call_id: Option<&'a str>,
+    pub(crate) include_threads: bool,
+    pub(crate) include_deleted: bool,
+    pub(crate) format: ExportFormat,
+    pub(crate) limit: usize,
+    pub(crate) out: Option<&'a Path>,
+}
+
 pub(crate) fn cmd_export(
     ctx: &Ctx,
     workspace: Option<&TeamId>,
-    channel_arg: &str,
-    format: ExportFormat,
-    limit: usize,
-    out: Option<&std::path::Path>,
+    opts: ExportCmdOpts<'_>,
 ) -> Result<ExitCode> {
     let Some(workspace) = workspace else {
         return Ok(empty_local(
             ctx,
-            serde_json::json!({"channel": channel_arg, "count": 0, "messages": []}),
+            serde_json::json!({
+                "channel": opts.channel,
+                "thread_ts": opts.thread_ts,
+                "transcript": opts.transcript_file_id,
+                "huddle": opts.huddle_call_id,
+                "count": 0,
+                "messages": [],
+            }),
             "exporting",
         ));
     };
     let archive = open_archive_with_hint(ctx, workspace)?;
-    let (resolved, channel_id, messages, user_names) = match archive.as_ref() {
-        Some(archive) => {
-            let resolved = archive
-                .resolve_channel(workspace, channel_arg)
-                .with_context(|| format!("resolving channel {channel_arg}"))?;
-            let channel_id = resolved
-                .as_ref()
-                .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
-            let messages = archive
-                .store()
-                .channel_history(workspace, &channel_id, None, limit)
-                .with_context(|| format!("exporting the history of {channel_id}"))?;
-            let user_names = archive
-                .user_display_map(workspace)
-                .with_context(|| format!("reading user names for {workspace}"))?;
-            (resolved, channel_id, messages, user_names)
+    cmd_export_in_archive(ctx, workspace, archive.as_ref(), opts)
+}
+
+pub(crate) fn cmd_export_in_archive(
+    ctx: &Ctx,
+    workspace: &TeamId,
+    archive: Option<&Archive>,
+    opts: ExportCmdOpts<'_>,
+) -> Result<ExitCode> {
+    let effective = if ctx.json {
+        CoreExportFormat::Json
+    } else {
+        match opts.format {
+            ExportFormat::Md => CoreExportFormat::Markdown,
+            ExportFormat::Json => CoreExportFormat::Json,
         }
-        None => (
-            None,
-            raw_channel_id(channel_arg),
-            Vec::new(),
-            HashMap::new(),
-        ),
     };
-    let label = resolved
+
+    if let Some(file_id_arg) = opts.transcript_file_id {
+        let Some(archive) = archive else {
+            return Ok(fail(
+                ctx,
+                "not_found",
+                &format!(
+                    "no local archive for workspace {workspace}; transcript {file_id_arg} not found"
+                ),
+            ));
+        };
+        let fid = FileId::from(file_id_arg);
+        let Some(artifact) = export_file_transcript(archive.store(), workspace, &fid, effective)
+            .with_context(|| format!("exporting transcript for file {file_id_arg}"))?
+        else {
+            return Ok(fail(
+                ctx,
+                "not_found",
+                &format!("no local transcript stored for file {file_id_arg}"),
+            ));
+        };
+        write_or_print_export(
+            ctx,
+            &artifact.content,
+            opts.out,
+            artifact.item_count,
+            "transcript",
+        )?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if let Some(call_id) = opts.huddle_call_id {
+        let Some(archive) = archive else {
+            return Ok(fail(
+                ctx,
+                "not_found",
+                &format!(
+                    "no local archive for workspace {workspace}; huddle transcript {call_id} not found"
+                ),
+            ));
+        };
+        let Some(artifact) =
+            export_huddle_transcript(archive.store(), workspace, call_id, effective)
+                .with_context(|| format!("exporting huddle transcript {call_id}"))?
+        else {
+            return Ok(fail(
+                ctx,
+                "not_found",
+                &format!("no local huddle transcript stored for call {call_id}"),
+            ));
+        };
+        write_or_print_export(
+            ctx,
+            &artifact.content,
+            opts.out,
+            artifact.item_count,
+            "huddle transcript lines",
+        )?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let Some(channel_arg) = opts.channel else {
+        return Ok(fail(
+            ctx,
+            "invalid_args",
+            "provide a <CHANNEL> (optionally with --thread <TS>), or pass --transcript <FILE_ID> or --huddle <CALL_ID>",
+        ));
+    };
+
+    let export_opts = ExportOptions {
+        format: effective,
+        limit: opts.limit,
+        include_deleted: opts.include_deleted,
+        include_threads: opts.include_threads,
+        include_transcripts: true,
+    };
+
+    let Some(archive) = archive else {
+        let channel_id = raw_channel_id(channel_arg);
+        let fallback_store = Store::open_in_memory()?;
+        let artifact = match opts.thread_ts {
+            Some(ts) => export_thread(
+                &fallback_store,
+                workspace,
+                &channel_id,
+                &Ts::from(ts),
+                &export_opts,
+            )?,
+            None => export_channel(&fallback_store, workspace, &channel_id, &export_opts)?,
+        };
+        write_or_print_export(
+            ctx,
+            &artifact.content,
+            opts.out,
+            artifact.item_count,
+            "messages",
+        )?;
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    let resolved = archive
+        .resolve_channel(workspace, channel_arg)
+        .with_context(|| format!("resolving channel {channel_arg}"))?;
+    let channel_id = resolved
         .as_ref()
-        .map(|row| row.label())
-        .unwrap_or_else(|| channel_id.as_str().to_owned());
-    let rows: Vec<MessageRow> = messages
-        .iter()
-        .map(|message| MessageRow::from_stored(message, &user_names))
-        .collect();
-    let effective = if ctx.json { ExportFormat::Json } else { format };
-    let rendered = match effective {
-        ExportFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
-            "workspace": workspace.as_str(),
-            "channel": {
-                "id": channel_id.as_str(),
-                "label": label,
-            },
-            "count": rows.len(),
-            "messages": rows,
-        }))?,
-        ExportFormat::Md => format_markdown_export(&label, &rows),
+        .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
+
+    let artifact = match opts.thread_ts {
+        Some(ts) => export_thread(
+            archive.store(),
+            workspace,
+            &channel_id,
+            &Ts::from(ts),
+            &export_opts,
+        )
+        .with_context(|| format!("exporting thread {ts} in {channel_id}"))?,
+        None => export_channel(archive.store(), workspace, &channel_id, &export_opts)
+            .with_context(|| format!("exporting the history of {channel_id}"))?,
     };
-    write_or_print_export(ctx, &rendered, out, rows.len(), "messages")?;
+    write_or_print_export(
+        ctx,
+        &artifact.content,
+        opts.out,
+        artifact.item_count,
+        "messages",
+    )?;
     Ok(ExitCode::SUCCESS)
 }
 

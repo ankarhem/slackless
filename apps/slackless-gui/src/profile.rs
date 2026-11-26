@@ -20,7 +20,7 @@ use gpui_kit::gpui::{
     InteractiveElement as _, IntoElement, ParentElement as _, Render, Stateful,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use slackless_core::types::{Presence, UserId};
+use slackless_core::types::{Presence, Team, UserId};
 
 use crate::emoji::glyph as emoji_glyph;
 use crate::fixtures::Fixtures;
@@ -133,6 +133,10 @@ pub(crate) struct DerivedUserProfile {
     pub local_time: Option<(String, Option<String>)>,
     pub is_self: bool,
     pub can_message: bool,
+    /// True when the user belongs to an external Slack Connect organization (`F-COLLAB-800`).
+    pub is_external: bool,
+    /// Resolved external organization record, when available.
+    pub external_team: Option<Team>,
 }
 
 /// Derive a user's display name, pronouns, title, presence, unexpired status, and local time.
@@ -199,6 +203,10 @@ pub(crate) fn derive_user_profile(
         })
     };
     let local_time = user.and_then(|user| user.tz_offset).map(local_time);
+    let is_external = !is_self && fixtures.is_external_user(user_id);
+    let external_team = (!is_self)
+        .then(|| fixtures.external_team(user_id).cloned())
+        .flatten();
     DerivedUserProfile {
         name,
         pronouns,
@@ -209,6 +217,8 @@ pub(crate) fn derive_user_profile(
         local_time,
         is_self,
         can_message: !is_self && user.is_some_and(|user| !user.deleted),
+        is_external,
+        external_team,
     }
 }
 
@@ -387,8 +397,14 @@ impl Render for ProfilePanel {
             .or(user.real_name.clone())
             .unwrap_or_default();
 
-        // Slack's big profile photo (an initials tile for someone without one).
-        let photo = crate::avatars::user_chip(&self.fixtures, &user.id, 240.);
+        // Slack's big profile photo (badged with external org icon for Slack Connect people).
+        let photo = crate::avatars::with_external_badge(
+            &self.fixtures,
+            Some(&user.id),
+            crate::avatars::user_chip(&self.fixtures, &user.id, 240.),
+            240.,
+            background,
+        );
 
         let status = derived.status.map(|s| {
             let glyph = if is_self {
@@ -403,22 +419,32 @@ impl Render for ProfilePanel {
             (glyph, s.text)
         });
         let away = derived.away;
+        let is_external = derived.is_external;
+        let external_team = derived.external_team.clone();
         let presence = h_flex()
             .items_center()
             .gap_2()
             .text_sm()
-            .child(
+            .child(if is_external && !user.deleted {
+                div()
+                    .size(px(10.))
+                    .rounded(px(2.5))
+                    .border_1()
+                    .border_color(muted)
+            } else {
                 div()
                     .size(px(10.))
                     .rounded_full()
                     .when(!user.deleted && !away, |dot| dot.bg(success))
                     .when(!user.deleted && away, |dot| {
                         dot.border_1().border_color(muted)
-                    }),
-            )
-            // Slack marks a deactivated person instead of showing a presence.
+                    })
+            })
+            // Slack marks deactivated accounts and external members distinctly.
             .child(if user.deleted {
                 "Deactivated account"
+            } else if is_external {
+                "External member"
             } else if away {
                 "Away"
             } else {
@@ -585,6 +611,66 @@ impl Render for ProfilePanel {
                             .map(|title| div().text_sm().child(title)),
                     ),
             )
+            .when(is_external, |col| {
+                let org_label = external_team
+                    .as_ref()
+                    .map(|t| format!("External · {}", t.name))
+                    .unwrap_or_else(|| "External organization".to_owned());
+                let org_domain = external_team
+                    .as_ref()
+                    .filter(|t| !t.domain.is_empty())
+                    .map(|t| format!("{}.slack.com", t.domain));
+                let verified = external_team.as_ref().is_some_and(|t| t.is_verified);
+                col.child(
+                    v_flex()
+                        .gap_1()
+                        .p_2p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .bg(theme.secondary.opacity(0.45))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(if let Some(ref team) = external_team {
+                                    crate::channel_details::org_chip(team, 20.).into_any_element()
+                                } else {
+                                    Icon::new(IconName::Building2)
+                                        .size(px(15.))
+                                        .text_color(muted)
+                                        .into_any_element()
+                                })
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(org_label),
+                                )
+                                .when(verified, |row| {
+                                    row.child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_0p5()
+                                            .px_1()
+                                            .rounded_sm()
+                                            .bg(link.opacity(0.14))
+                                            .text_size(px(10.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(link)
+                                            .child(Icon::new(IconName::Check).size(px(10.)))
+                                            .child("Verified"),
+                                    )
+                                }),
+                        )
+                        .when_some(org_domain, |box_el, domain| {
+                            box_el.child(div().text_xs().text_color(muted).child(domain))
+                        })
+                        .child(div().text_xs().text_color(muted).child(
+                            "External person · Profile details managed by their organization",
+                        )),
+                )
+            })
             .children(status.map(|(glyph, text)| {
                 h_flex()
                     .items_center()

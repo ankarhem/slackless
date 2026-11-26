@@ -315,8 +315,15 @@ impl<B: Backend> Core<B> {
             CollabCommand::SetListAccess {
                 list_id,
                 access_level,
-                channel,
-            } => self.set_list_access(list_id, access_level, channel),
+                channel_ids,
+                user_ids,
+                post_permalink,
+            } => self.set_list_access(list_id, access_level, channel_ids, user_ids, post_permalink),
+            CollabCommand::DeleteListAccess {
+                list_id,
+                channel_ids,
+                user_ids,
+            } => self.delete_list_access(list_id, channel_ids, user_ids),
             CollabCommand::FetchListRecordComments { list_id, record_id } => {
                 self.fetch_list_record_comments(list_id, record_id);
             }
@@ -441,6 +448,16 @@ impl<B: Backend> Core<B> {
                     .store(enabled, Ordering::Relaxed);
             }
             WorkspaceCommand::SetUserPref { name, value } => self.set_user_pref(name, value),
+            WorkspaceCommand::BackfillChannel {
+                channel,
+                include_threads,
+            } => self.backfill_channel(channel, include_threads),
+            WorkspaceCommand::BackfillWorkspace { include_threads } => {
+                self.backfill_workspace(include_threads);
+            }
+            WorkspaceCommand::PauseBackfill => self.pause_backfill(),
+            WorkspaceCommand::ResumeBackfill => self.resume_backfill(),
+            WorkspaceCommand::QueryBackfillProgress => self.query_backfill_progress(),
             WorkspaceCommand::SignOut => self.sign_out(),
         }
     }

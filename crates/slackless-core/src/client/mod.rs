@@ -21,7 +21,8 @@ use crate::api::{ApiError, SlackApi};
 use crate::auth::Session;
 use crate::backend::Backend;
 use crate::backfill::{
-    BACKFILL_SYNCED_KEY, Backfill, PAGE_DELAY, SyncedMap, decode_synced_spans, wait_out_rate_limits,
+    BACKFILL_SYNCED_KEY, Backfill, BackfillControl, PAGE_DELAY, SyncedMap, decode_synced_spans,
+    wait_out_rate_limits,
 };
 use crate::fetcher::Fetcher;
 use crate::rtm::ConnectionState;
@@ -446,6 +447,7 @@ pub(crate) struct Core<B: Backend> {
     huddle_media: HuddleMediaSender,
     backfill: Backfill<B>,
     backfills: HashMap<ChannelId, AbortHandle>,
+    workspace_backfill: Option<AbortHandle>,
     /// Names the foreign channels shared-message unfurls point at (shared with `backfill`).
     unfurls: Unfurls<B>,
     /// Tracks all background tasks spawned by this core so `shutdown` aborts them cleanly.
@@ -535,6 +537,7 @@ impl<B: Backend> Core<B> {
             synced,
             page_delay: PAGE_DELAY,
             unfurls: unfurls.clone(),
+            control: BackfillControl::new(workspace.clone()),
         };
         Self {
             backend,
@@ -544,6 +547,7 @@ impl<B: Backend> Core<B> {
             huddle_media,
             backfill,
             backfills: HashMap::new(),
+            workspace_backfill: None,
             unfurls,
             tasks,
             rtm: None,
@@ -595,6 +599,9 @@ impl<B: Backend> Core<B> {
                 .await;
         }
         for (_, task) in self.backfills.drain() {
+            task.abort();
+        }
+        if let Some(task) = self.workspace_backfill.take() {
             task.abort();
         }
         self.tasks.abort_all();

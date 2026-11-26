@@ -25,6 +25,7 @@ typedef struct SlacklessVideoPlayer {
     void *end_flag_ref; // __bridge_retained SlacklessVideoEndFlag *
     bool force_copy;
     float target_rate;
+    float target_volume;
     CVPixelBufferRef last_pb;
     uint32_t last_w;
     uint32_t last_h;
@@ -37,6 +38,13 @@ static float clamp_playback_rate(float rate) {
     if (rate < 0.5f) return 0.5f;
     if (rate > 2.0f) return 2.0f;
     return rate;
+}
+
+static float clamp_volume(float vol) {
+    if (!isfinite(vol)) return 1.0f;
+    if (vol < 0.0f) return 0.0f;
+    if (vol > 1.0f) return 1.0f;
+    return vol;
 }
 
 static void resolve_video_dimensions(
@@ -129,6 +137,7 @@ static SlacklessVideoPlayer *open_player_with_asset(AVURLAsset *asset) {
     p->end_flag_ref = (__bridge_retained void *)endFlag;
     p->force_copy = true;
     p->target_rate = 1.0f;
+    p->target_volume = 1.0f;
     resolve_video_dimensions(asset, item, &p->track_w, &p->track_h);
     return p;
 }
@@ -238,6 +247,23 @@ void slackless_video_player_set_muted(SlacklessVideoPlayer *p, bool muted) {
     pthread_mutex_unlock(&p->lock);
 }
 
+void slackless_video_player_set_volume(SlacklessVideoPlayer *p, float volume) {
+    if (!p) return;
+    float clamped = clamp_volume(volume);
+    pthread_mutex_lock(&p->lock);
+    @autoreleasepool {
+        p->target_volume = clamped;
+        AVPlayer *player = (__bridge AVPlayer *)p->player_ref;
+        if (player) {
+            player.volume = clamped;
+            if (clamped > 0.0f && player.muted) {
+                player.muted = NO;
+            }
+        }
+    }
+    pthread_mutex_unlock(&p->lock);
+}
+
 void slackless_video_player_set_rate(SlacklessVideoPlayer *p, float rate) {
     if (!p) return;
     float clamped = clamp_playback_rate(rate);
@@ -285,7 +311,8 @@ void slackless_video_player_state(
     uint32_t *out_w,
     uint32_t *out_h,
     bool *is_failed,
-    float *out_rate) {
+    float *out_rate,
+    float *out_volume) {
     if (is_playing) *is_playing = false;
     if (is_muted) *is_muted = false;
     if (has_ended) *has_ended = false;
@@ -295,6 +322,7 @@ void slackless_video_player_state(
     if (out_h) *out_h = 0;
     if (is_failed) *is_failed = false;
     if (out_rate) *out_rate = 1.0f;
+    if (out_volume) *out_volume = 1.0f;
     if (!p) return;
 
     pthread_mutex_lock(&p->lock);
@@ -311,6 +339,7 @@ void slackless_video_player_state(
         bool failed = (player && player.status == AVPlayerStatusFailed) ||
                       (item && item.status == AVPlayerItemStatusFailed);
         float rate = clamp_playback_rate(p->target_rate);
+        float volume = clamp_volume(p->target_volume);
 
         double pos = 0.0;
         if (player) {
@@ -348,6 +377,7 @@ void slackless_video_player_state(
         if (out_h) *out_h = h;
         if (is_failed) *is_failed = failed;
         if (out_rate) *out_rate = rate;
+        if (out_volume) *out_volume = volume;
     }
     pthread_mutex_unlock(&p->lock);
 }

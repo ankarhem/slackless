@@ -14,6 +14,7 @@ impl<B: Backend> Core<B> {
         run_hydrate(
             self.ctx(),
             Arc::clone(&self.self_user_id),
+            Arc::clone(&self.teams_asked),
             self.tasks.clone(),
         )
         .await;
@@ -24,9 +25,10 @@ impl<B: Backend> Core<B> {
     pub(super) fn spawn_hydrate(&self) {
         let ctx = self.ctx();
         let self_user_id = Arc::clone(&self.self_user_id);
+        let teams_asked = Arc::clone(&self.teams_asked);
         let tasks = self.tasks.clone();
         self.tasks.spawn(async move {
-            run_hydrate(ctx, self_user_id, tasks).await;
+            run_hydrate(ctx, self_user_id, teams_asked, tasks).await;
         });
     }
 
@@ -53,6 +55,7 @@ impl<B: Backend> Core<B> {
 async fn run_hydrate<B: Backend>(
     ctx: TaskCtx<B>,
     self_user_id: Arc<Mutex<Option<UserId>>>,
+    teams_asked: Arc<Mutex<HashSet<TeamId>>>,
     tasks: TaskTracker,
 ) {
     let ws = ctx.workspace.clone();
@@ -80,6 +83,7 @@ async fn run_hydrate<B: Backend>(
         ctx.backend.usergroups(),
         ctx.backend.app_commands(),
     );
+    let mut boot_external_teams: Vec<TeamId> = Vec::new();
     match boot_res {
         Ok(boot) => {
             let team = boot.team.clone();
@@ -90,6 +94,22 @@ async fn run_hydrate<B: Backend>(
                 // sync already marked must keep its flag: the front-end rebuilds its
                 // snapshot on this step's event, before `users.conversations` runs.
                 let mut convs: Vec<_> = boot.channels.into_iter().chain(boot.ims).collect();
+                let mut ext_teams = Vec::new();
+                for c in &convs {
+                    if c.is_external_connect() || c.is_org_shared {
+                        for tid in c.external_team_ids(Some(&ws)) {
+                            if !ext_teams.contains(&tid) {
+                                ext_teams.push(tid);
+                            }
+                        }
+                        if let Some(host) = c.host_team_id()
+                            && host != ws
+                            && !ext_teams.contains(&host)
+                        {
+                            ext_teams.push(host);
+                        }
+                    }
+                }
                 let ids: Vec<ChannelId> = convs.iter().map(|c| c.id.clone()).collect();
                 let member = store.member_flags(&ws, &ids)?;
                 for conversation in &mut convs {
@@ -99,11 +119,12 @@ async fn run_hydrate<B: Backend>(
                 if let Some(me) = &boot.self_user {
                     store.upsert_user(&ws, me)?;
                 }
-                Ok((ids, boot.self_user.map(|me| me.id)))
+                Ok((ids, boot.self_user.map(|me| me.id), ext_teams))
             })
             .await;
             match stored {
-                Ok((ids, me)) => {
+                Ok((ids, me, ext_teams)) => {
+                    boot_external_teams = ext_teams;
                     ctx.events.emit(Event::Conversations(ids));
                     if let Some(me) = me {
                         *self_user_id.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -238,6 +259,12 @@ async fn run_hydrate<B: Backend>(
         Err(e) => tracing::warn!(%e, "hydrate client.appCommands failed"),
     }
     ctx.events.emit(Event::SidebarChanged);
+    if !boot_external_teams.is_empty() {
+        let ctx_teams = ctx.clone();
+        tasks.spawn(async move {
+            resolve_teams(ctx_teams, teams_asked, boot_external_teams).await;
+        });
+    }
     spawn_fetch_dm_previews(&tasks, ctx.clone());
     // The Activity badges need the feed's unread state; last, so the boot's own events
     // keep their order. The boot fetch skips the `messages.list` hydration (the view

@@ -331,6 +331,8 @@ impl App {
             | Event::CanvasCommentResolved { .. }
             | Event::CanvasCreated { .. } => self.on_canvas_event(event, window, cx),
             Event::ListLoaded { .. }
+            | Event::ListMetaLoaded { .. }
+            | Event::ListAccessUpdated { .. }
             | Event::ListCreated { .. }
             | Event::MessageAddedToList { .. }
             | Event::ListRecordComments { .. } => self.on_list_event(event, window, cx),
@@ -339,13 +341,18 @@ impl App {
             | Event::FilesExtrasLoaded { .. }
             | Event::FileRestored { .. }
             | Event::FileDeleted { .. } => self.on_files_event(event, window, cx),
-            Event::FileTranscriptReady { file_id, text } => {
+            Event::FileTranscriptReady {
+                file_id,
+                text,
+                cues,
+            } => {
                 let was_manual = crate::media::finish_transcription(file_id, cx);
                 if !text.trim().is_empty() {
-                    let updated = Arc::new(
-                        self.fixtures
-                            .with_file_transcript(file_id.clone(), text.clone()),
-                    );
+                    let updated = Arc::new(self.fixtures.with_file_transcript_cues(
+                        file_id.clone(),
+                        text.clone(),
+                        cues.clone(),
+                    ));
                     self.fixtures = updated.clone();
                     self.sync_all_views_fixtures(updated, cx);
                     if self.page == MainPage::Search {
@@ -378,6 +385,15 @@ impl App {
             }
             Event::AppHomeLoaded { .. } | Event::AppHomeUpdated(_) => {
                 self.on_app_home_event(event, cx)
+            }
+            Event::BackfillProgress(progress) => {
+                self.ws.backfill_progress = Some(progress.clone());
+                let snap = progress.clone();
+                self.preferences.update(cx, |prefs, cx| {
+                    prefs.set_backfill_progress(Some(snap), cx);
+                });
+                window.refresh();
+                cx.notify();
             }
             Event::WorkflowTripped {
                 is_slow_workflow,
@@ -787,6 +803,33 @@ impl App {
                 self.ws.lists.insert(file_id.clone(), value);
                 cx.notify();
             }
+            Event::ListMetaLoaded { file_id, meta } => {
+                crate::lists::set_list_meta(file_id, (**meta).clone(), cx);
+                window.refresh();
+                cx.notify();
+            }
+            Event::ListAccessUpdated {
+                list_id,
+                summary,
+                result,
+            } => {
+                match result {
+                    Ok(()) => {
+                        crate::lists::set_list_status(list_id, false, summary.clone(), cx);
+                        notify("List sharing updated", summary.clone(), window, cx);
+                        self.bridge.send(CollabCommand::LoadList {
+                            file_id: list_id.clone(),
+                        });
+                    }
+                    Err(err) => {
+                        let friendly = slackless_core::api::format_list_error(err);
+                        crate::lists::set_list_status(list_id, true, friendly.clone(), cx);
+                        notify("Could not update list sharing", friendly, window, cx);
+                    }
+                }
+                window.refresh();
+                cx.notify();
+            }
             Event::ListCreated { file_id, name } => {
                 if !file_id.is_empty() {
                     self.open_live_list(file_id.clone(), cx);
@@ -823,6 +866,50 @@ impl App {
                     })
                     .collect();
                 crate::lists::set_record_comments(list_id, record_id, items, cx);
+                if !messages.is_empty() {
+                    let (list_title, item_title) = self
+                        .ws
+                        .lists
+                        .get(list_id)
+                        .and_then(|res| res.as_ref().ok())
+                        .map(|data| {
+                            let list_title = if data.title.is_empty() {
+                                "List".to_owned()
+                            } else {
+                                data.title.clone()
+                            };
+                            let item_title =
+                                data.rows
+                                    .iter()
+                                    .find(|row| row.id == *record_id)
+                                    .and_then(|row| {
+                                        let primary = data
+                                            .columns
+                                            .iter()
+                                            .find(|c| c.is_primary)
+                                            .or_else(|| data.columns.first())?;
+                                        match slackless_core::domain::lists::row_cell(row, primary)
+                                        {
+                                            Some(
+                                                slackless_core::api::SlackListCellValue::Text(s),
+                                            ) if !s.trim().is_empty() => Some(s.clone()),
+                                            _ => None,
+                                        }
+                                    })
+                                    .unwrap_or_else(|| format!("Item {record_id}"));
+                            (list_title, item_title)
+                        })
+                        .unwrap_or_else(|| ("List".to_owned(), format!("Item {record_id}")));
+                    let meta = crate::threads_cards::ListItemThreadMeta {
+                        list_id: list_id.clone(),
+                        list_title,
+                        record_id: record_id.clone(),
+                        item_title,
+                    };
+                    self.threads.update(cx, |view, cx| {
+                        view.upsert_list_item_thread(meta, messages.clone(), cx);
+                    });
+                }
                 window.refresh();
                 cx.notify();
             }

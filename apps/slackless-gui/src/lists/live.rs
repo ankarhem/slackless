@@ -501,7 +501,20 @@ pub(super) fn render_live_list(
         state: &state,
         actions: &actions,
     };
-    let detail_drawer = detail::render_live_detail_drawer(&render_ctx, cx);
+    let share_drawer = share::render_list_share_panel(
+        &list_key,
+        &data.title,
+        data.rows.len(),
+        fixtures,
+        &state,
+        &actions,
+        cx,
+    );
+    let detail_drawer = if share_drawer.is_some() {
+        None
+    } else {
+        detail::render_live_detail_drawer(&render_ctx, cx)
+    };
     let add_bar = toolbar::render_live_add_bar(&render_ctx, cx);
     let find_bar = toolbar::render_live_find_bar(query, search, cx);
     let header_bar = toolbar::render_live_toolbar(
@@ -536,5 +549,6 @@ pub(super) fn render_live_list(
                         .child(body),
                 ),
         )
+        .children(share_drawer)
         .children(detail_drawer)
 }

@@ -15,12 +15,12 @@ mod tests;
 
 use gpui_kit::component::v_flex;
 use gpui_kit::gpui::{App, Div, ParentElement as _, SharedString, Styled as _, div};
-use slackless_core::types::Message;
+use slackless_core::types::{ChannelId, Message};
 
 use crate::fixtures::Fixtures;
 use crate::image_viewer::ImageClick;
 
-use cards::{external_file_card, file_card};
+use cards::{external_file_card, file_card, pdf_card};
 use gallery::{Gallery, GalleryImage, image_attachment, thumbnail};
 use media_cards::{audio_card, video_card};
 use meta::{inline_allowed, is_audio, is_snippet};
@@ -31,7 +31,8 @@ pub(crate) use media_cards::set_clip_transcript_expanded;
 pub(crate) use media_cards::{clip_transcript_status, fetch_clip_vtt_if_needed};
 pub(crate) use meta::{
     clip_vtt_url, download_url, file_ext, file_icon, fit, human_size, inline_clip_transcript,
-    is_decodable_image_url, is_video, media_duration_ms, video_playback_url, video_poster_url,
+    is_decodable_image_url, is_pdf, is_video, media_duration_ms, pdf_thumb_url, video_playback_url,
+    video_poster_url,
 };
 
 /// The message's attachments, or `None` when it has no files. `on_open` makes image
@@ -39,6 +40,18 @@ pub(crate) use meta::{
 /// cards do not). Two or more images and nothing else show as Slack's [`Gallery`].
 pub fn attachments(
     fixtures: &Fixtures,
+    message: &Message,
+    on_open: Option<&ImageClick>,
+    cx: &App,
+) -> Option<Div> {
+    attachments_in_channel(fixtures, None, message, on_open, cx)
+}
+
+/// Same as [`attachments`], additionally tagging inline video cards with their source `channel`
+/// so the floating mini-player / picture-in-picture dock can jump straight back to the message.
+pub fn attachments_in_channel(
+    fixtures: &Fixtures,
+    channel: Option<&ChannelId>,
     message: &Message,
     on_open: Option<&ImageClick>,
     cx: &App,
@@ -77,7 +90,20 @@ pub fn attachments(
         column = column.child(if is_audio(file) {
             audio_card(fixtures, file, order_base, cx)
         } else if is_video(file) {
-            video_card(fixtures, file, ix, order_base, on_open, cx)
+            video_card(
+                fixtures,
+                file,
+                ix,
+                channel.cloned(),
+                Some(message.ts.clone()),
+                message.user.clone(),
+                message.ts.secs(),
+                order_base,
+                on_open,
+                cx,
+            )
+        } else if is_pdf(file) {
+            pdf_card(fixtures, file, ix, on_open)
         } else if is_snippet(file) {
             div().child(SnippetCard {
                 file: file.clone(),

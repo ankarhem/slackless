@@ -1,11 +1,254 @@
 //! Live Slack Lists schema, typed records/cells, and cell mutation wire payloads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::types::UserId;
+use crate::de::value_as_lenient_bool;
+use crate::types::{ChannelId, Message, Ts, UserId};
+
+/// Access level for `slackLists.access.set` (`F-COLLAB-243..245`, `F-COLLAB-274..278`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListAccessLevel {
+    Read,
+    Write,
+    Owner,
+}
+
+impl ListAccessLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Owner => "owner",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "read" | "view" => Some(Self::Read),
+            "write" | "edit" => Some(Self::Write),
+            "owner" => Some(Self::Owner),
+            _ => None,
+        }
+    }
+}
+
+/// Partial-failure report returned by `slackLists.access.delete` (`api-canvases-lists.md`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ListAccessDeleteResult {
+    #[serde(default)]
+    pub failed_to_update_channel_ids: Vec<ChannelId>,
+    #[serde(default)]
+    pub failed_to_update_user_ids: Vec<UserId>,
+}
+
+impl ListAccessDeleteResult {
+    pub fn has_failures(&self) -> bool {
+        !self.failed_to_update_channel_ids.is_empty() || !self.failed_to_update_user_ids.is_empty()
+    }
+}
+
+/// Parsed access, sharing, and limit metadata from `files.info` for a Slack List.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListMeta {
+    pub file_id: String,
+    pub title: String,
+    pub permalink: Option<String>,
+    pub editable: bool,
+    pub access: Option<String>,
+    pub org_or_workspace_access: Option<String>,
+    pub owner_id: Option<UserId>,
+    pub editors: Vec<UserId>,
+    pub shared_channels: Vec<ChannelId>,
+    pub row_count: Option<u32>,
+    pub row_count_limit: Option<u32>,
+    pub archived_row_count: Option<u32>,
+    pub over_row_maximum: bool,
+    pub comment_channel_id: ChannelId,
+}
+
+/// Derive a list's file comment channel id by replacing a leading `'F'` with `'C'`.
+pub fn list_comment_channel_id(file_id: &str) -> ChannelId {
+    if let Some(rest) = file_id.strip_prefix('F') {
+        ChannelId::from(format!("C{rest}"))
+    } else {
+        ChannelId::from(file_id)
+    }
+}
+
+/// Parse [`ListMeta`] from a `files.info` `file` object (or `slackLists.items.list` `list` object).
+pub fn parse_list_meta(file_obj: &Value) -> ListMeta {
+    let raw = file_obj.get("file").unwrap_or(file_obj);
+    let str_field = |key: &str| {
+        raw.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let file_id = str_field("id").unwrap_or_default();
+    let title = str_field("title")
+        .or_else(|| str_field("name"))
+        .unwrap_or_else(|| "List".to_owned());
+    let permalink = str_field("permalink");
+    let editable = raw
+        .get("editable")
+        .and_then(value_as_lenient_bool)
+        .unwrap_or(false);
+    let access = str_field("access");
+    let org_or_workspace_access = str_field("org_or_workspace_access");
+    let owner_id = str_field("user").map(UserId::from);
+    let editors = raw
+        .get("editors")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(UserId::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut shared_channels = Vec::new();
+    for key in ["channels", "groups"] {
+        if let Some(arr) = raw.get(key).and_then(Value::as_array) {
+            for cid in arr
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(ChannelId::from)
+            {
+                if !shared_channels.contains(&cid) {
+                    shared_channels.push(cid);
+                }
+            }
+        }
+    }
+    let limits = raw.get("list_limits");
+    let u32_limit = |key: &str| {
+        limits
+            .and_then(|l| l.get(key))
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+    };
+    let row_count = u32_limit("row_count");
+    let row_count_limit = u32_limit("row_count_limit");
+    let archived_row_count = u32_limit("archived_row_count");
+    let over_row_maximum = limits
+        .and_then(|l| l.get("over_row_maximum"))
+        .and_then(value_as_lenient_bool)
+        .unwrap_or(false);
+    let comment_channel_id = list_comment_channel_id(&file_id);
+    ListMeta {
+        file_id,
+        title,
+        permalink,
+        editable,
+        access,
+        org_or_workspace_access,
+        owner_id,
+        editors,
+        shared_channels,
+        row_count,
+        row_count_limit,
+        archived_row_count,
+        over_row_maximum,
+        comment_channel_id,
+    }
+}
+
+/// Translate Slack server-enforced List errors into clear user-facing guidance
+/// (`F-COLLAB-246`, `F-COLLAB-254`, `F-COLLAB-274..279`).
+pub fn format_list_error(err: &str) -> String {
+    let normalized = err
+        .trim()
+        .strip_prefix("slack api error:")
+        .map(str::trim)
+        .unwrap_or_else(|| err.trim());
+
+    match normalized {
+        "restricted_action" | "permission_denied" | "access_denied" => {
+            "You do not have permission to perform this action on this list (owner or edit access may be required).".to_owned()
+        }
+        "list_not_found" => "List not found or you no longer have access to it.".to_owned(),
+        "over_row_maximum" => {
+            "This list has reached Slack's item limit. Archive or delete old items before adding more."
+                .to_owned()
+        }
+        "paid_only" | "plan_upgrade_required" => {
+            "Slack Lists require a paid Slack workspace plan.".to_owned()
+        }
+        "invalid_parameters" => "Invalid list sharing or request parameters.".to_owned(),
+        "not_allowed_token_type" => {
+            "This list action is not allowed with the current Slack session token.".to_owned()
+        }
+        "missing_scope" => {
+            "Your Slack session is missing the required scope for this list action.".to_owned()
+        }
+        _ => err.to_owned(),
+    }
+}
+
+/// Parse thread messages from `lists.getThreadsForRecord` across Slack's known shapes:
+/// flat `messages: [...]`, flat `threads: [Message...]`, or nested
+/// `threads: [{ root, latest_replies, unread_replies, messages, channel, thread_ts }]`.
+pub fn parse_list_record_threads(data: &Value) -> Vec<Message> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<Ts> = HashSet::new();
+    let mut push_msg = |mut msg: Message, fallback_ch: Option<&ChannelId>| {
+        if msg.channel.is_none() {
+            msg.channel = fallback_ch.cloned();
+        }
+        if msg.ts.as_str().is_empty() {
+            return;
+        }
+        if seen.insert(msg.ts.clone()) {
+            out.push(msg);
+        }
+    };
+
+    if let Some(msgs) = data.get("messages").and_then(Value::as_array) {
+        for item in msgs {
+            if let Ok(m) = serde_json::from_value::<Message>(item.clone()) {
+                push_msg(m, None);
+            }
+        }
+    }
+    if let Some(threads) = data.get("threads").and_then(Value::as_array) {
+        for entry in threads {
+            let entry_ch = entry
+                .get("channel")
+                .or_else(|| entry.get("channel_id"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(ChannelId::from);
+            let mut extracted_nested = false;
+            if let Some(root) = entry.get("root")
+                && let Ok(m) = serde_json::from_value::<Message>(root.clone())
+            {
+                push_msg(m, entry_ch.as_ref());
+                extracted_nested = true;
+            }
+            for arr_key in ["messages", "latest_replies", "unread_replies", "replies"] {
+                if let Some(arr) = entry.get(arr_key).and_then(Value::as_array) {
+                    for sub in arr {
+                        if let Ok(m) = serde_json::from_value::<Message>(sub.clone()) {
+                            push_msg(m, entry_ch.as_ref());
+                            extracted_nested = true;
+                        }
+                    }
+                }
+            }
+            if !extracted_nested && let Ok(m) = serde_json::from_value::<Message>(entry.clone()) {
+                push_msg(m, entry_ch.as_ref());
+            }
+        }
+    }
+    out.sort_by(|a, b| a.ts.cmp(&b.ts));
+    out
+}
 
 /// One select choice option on a Slack List select column.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

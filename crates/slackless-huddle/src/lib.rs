@@ -15,6 +15,7 @@ pub mod macos_audio_tap;
 #[cfg(target_os = "macos")]
 pub use macos as macos_media;
 pub mod metrics;
+pub mod pdf;
 pub mod peer_message;
 pub mod rtc;
 pub mod screen;
@@ -51,14 +52,17 @@ pub use content_share::{detect_system_audio_loopback, system_audio_source_label}
 #[cfg(target_os = "macos")]
 pub use macos_media::MacVideoSurface;
 pub use metrics::{HuddlePerfCounters, HuddlePerfSnapshot, ProcessResourceSampler};
+pub use pdf::{RenderedPdfPage, pdf_page_count, render_pdf_page_png};
 pub use screen::{ScreenCapture, ScreenSource, capture_screen_thumbnails, list_screen_sources};
 pub use session::spawn_huddle_session;
 pub use signaling::install_default_crypto_provider;
 pub use transcribe::{
-    ModelDownloadProgress, ProviderSetupStatus, TranscriptionProvider,
-    chunk_audio_for_transcription, default_parakeet_model_dir, default_whisper_model_dir,
-    delete_provider_model, detect_provider_setup, detect_spoken_lang, download_provider_model,
-    extract_audio_16k_mono, resolve_local_file_provider, transcribe_media_file,
+    ModelDownloadProgress, ProviderSetupStatus, TimedTranscription, TranscriptionProvider,
+    chunk_audio_for_transcription, chunk_audio_for_transcription_with_offsets,
+    default_parakeet_model_dir, default_whisper_model_dir, delete_provider_model,
+    detect_provider_setup, detect_spoken_lang, download_provider_model, extract_audio_16k_mono,
+    parse_whisper_json_cues, resolve_local_file_provider, transcribe_media_file,
+    transcribe_media_file_timed,
 };
 pub use video::{
     CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoFrameData, VideoTileKey, list_cameras,

@@ -30,6 +30,22 @@ pub(crate) struct Cli {
     pub(crate) workspace: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum SearchSortArg {
+    #[default]
+    Recent,
+    Relevant,
+}
+
+impl From<SearchSortArg> for slackless_core::store::SearchSort {
+    fn from(arg: SearchSortArg) -> Self {
+        match arg {
+            SearchSortArg::Recent => Self::Recent,
+            SearchSortArg::Relevant => Self::Relevant,
+        }
+    }
+}
+
 #[derive(Args)]
 pub(crate) struct SearchArgs {
     /// Query text plus modifiers, e.g. "launch in:#eng from:@ana has:file".
@@ -37,9 +53,12 @@ pub(crate) struct SearchArgs {
     /// Maximum number of results.
     #[arg(long, value_name = "N", default_value_t = SEARCH_LIMIT)]
     pub(crate) limit: usize,
-    /// Search across every locally archived workspace at once (merges hits newest first).
+    /// Search across every locally archived workspace at once (messages, snippets, canvases, transcripts).
     #[arg(long)]
     pub(crate) all_workspaces: bool,
+    /// Sort order (`recent` = newest first, `relevant` = FTS5 BM25 relevance).
+    #[arg(long, value_enum, default_value_t = SearchSortArg::Recent)]
+    pub(crate) sort: SearchSortArg,
     /// Optional export format (`md` or `json`) for search results.
     #[arg(long, value_enum)]
     pub(crate) format: Option<ExportFormat>,
@@ -157,8 +176,23 @@ pub(crate) struct ScheduleArgs {
 
 #[derive(Args)]
 pub(crate) struct ExportArgs {
-    /// Channel id, #name, or @handle.
-    pub(crate) channel: String,
+    /// Channel id, #name, or @handle (required unless `--transcript` or `--huddle` is set).
+    pub(crate) channel: Option<String>,
+    /// Export a single thread (root + replies) by its root `ts` inside `channel`.
+    #[arg(long, value_name = "TS", conflicts_with_all = ["transcript", "huddle"])]
+    pub(crate) thread: Option<String>,
+    /// Export a stored audio/video file transcript by Slack file ID (e.g. `F0123ABC`).
+    #[arg(long, value_name = "FILE_ID", conflicts_with_all = ["thread", "huddle"])]
+    pub(crate) transcript: Option<String>,
+    /// Export a stored huddle transcript by call ID.
+    #[arg(long, value_name = "CALL_ID", conflicts_with_all = ["thread", "transcript"])]
+    pub(crate) huddle: Option<String>,
+    /// Nest stored thread replies under thread roots when exporting a channel.
+    #[arg(long)]
+    pub(crate) include_threads: bool,
+    /// Exclude locally preserved deleted messages from channel/thread export.
+    #[arg(long)]
+    pub(crate) exclude_deleted: bool,
     /// Output format (`md` or `json`).
     #[arg(long, value_enum, default_value_t = ExportFormat::Md)]
     pub(crate) format: ExportFormat,
@@ -222,6 +256,32 @@ pub(crate) struct BackfillArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct ArchiveBackfillArgs {
+    /// Channel id, #name, or @handle (omit or pass `--all` to backfill every archived channel).
+    pub(crate) channel: Option<String>,
+    /// Backfill every stored channel and DM in the workspace sequentially.
+    #[arg(long)]
+    pub(crate) all: bool,
+    /// Also walk `conversations.replies` for every thread root encountered.
+    #[arg(long)]
+    pub(crate) threads: bool,
+    /// Maximum number of history pages per channel (0 = walk all history to the beginning).
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub(crate) pages: usize,
+    /// Messages per page (Slack max 200).
+    #[arg(long, value_name = "N", default_value_t = 200)]
+    pub(crate) page_size: u32,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ArchiveCommand {
+    /// Backfill one channel or the whole workspace into the local SQLite archive (needs a stored session).
+    Backfill(Box<ArchiveBackfillArgs>),
+    /// Show per-channel backfill sync status and local archive progress (offline).
+    Status,
+}
+
+#[derive(Args)]
 pub(crate) struct TranscribeArgs {
     /// Slack file ID (e.g. `F0123ABC`) to transcribe and index in the local archive.
     pub(crate) file_id: String,
@@ -231,6 +291,57 @@ pub(crate) struct TranscribeArgs {
     /// Preferred local transcription provider (`parakeet` or `whisper`; defaults to auto-detect).
     #[arg(long, value_name = "PROVIDER")]
     pub(crate) provider: Option<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct UsersArgs {
+    /// Optional case-insensitive filter matching user id, handle, display name, or real name.
+    pub(crate) query: Option<String>,
+    /// Include deactivated/deleted accounts.
+    #[arg(long)]
+    pub(crate) include_deleted: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct ThreadsArgs {
+    /// Optional channel id, #name, or @handle to scope thread listing.
+    #[arg(long, value_name = "CHANNEL")]
+    pub(crate) channel: Option<String>,
+    /// Maximum number of threads (newest first).
+    #[arg(long, value_name = "N", default_value_t = 30)]
+    pub(crate) limit: usize,
+}
+
+#[derive(Args)]
+pub(crate) struct WatchArgs {
+    /// Optional channel id, #name, or @handle to filter events to.
+    #[arg(long, value_name = "CHANNEL")]
+    pub(crate) channel: Option<String>,
+    /// Stop after emitting N matching events.
+    #[arg(long, value_name = "N")]
+    pub(crate) count: Option<usize>,
+}
+
+#[derive(Args)]
+pub(crate) struct DownloadArgs {
+    /// Slack file ID (e.g. `F0123ABC`).
+    pub(crate) file_id: String,
+    /// Optional destination file path (defaults to `./<filename>`).
+    #[arg(short, long, value_name = "PATH")]
+    pub(crate) out: Option<std::path::PathBuf>,
+}
+
+#[derive(Args)]
+pub(crate) struct UpdateArgs {
+    /// Only check whether a newer release is available without installing.
+    #[arg(long)]
+    pub(crate) check: bool,
+    /// Reinstall the latest release even if the current version matches.
+    #[arg(long)]
+    pub(crate) force: bool,
+    /// Quit and relaunch Slackless.app automatically after installing an update.
+    #[arg(long)]
+    pub(crate) restart: bool,
 }
 
 #[derive(Subcommand)]
@@ -264,13 +375,7 @@ pub(crate) enum Commands {
     /// List direct messages and group DMs known to the local archive.
     Dms,
     /// List or search workspace users in the local archive (offline).
-    Users {
-        /// Optional case-insensitive filter matching user id, handle, display name, or real name.
-        query: Option<String>,
-        /// Include deactivated/deleted accounts.
-        #[arg(long)]
-        include_deleted: bool,
-    },
+    Users(Box<UsersArgs>),
     /// Summarize recent archived activity per conversation (offline).
     Digest(Box<DigestArgs>),
     /// Mark a conversation read (`conversations.mark`; defaults to newest archived message ts).
@@ -323,14 +428,7 @@ pub(crate) enum Commands {
     /// Checkpoint WAL, compact unused pages (VACUUM), and optimize FTS5 indexes (offline).
     Vacuum,
     /// List archived thread roots with replies from the local archive (offline).
-    Threads {
-        /// Optional channel id, #name, or @handle to scope thread listing.
-        #[arg(long, value_name = "CHANNEL")]
-        channel: Option<String>,
-        /// Maximum number of threads (newest first).
-        #[arg(long, value_name = "N", default_value_t = 30)]
-        limit: usize,
-    },
+    Threads(Box<ThreadsArgs>),
     /// Show the append-only local revision history (edits & deletions) for one message (offline).
     Revisions {
         /// Channel id, #name, or @handle.
@@ -360,14 +458,7 @@ pub(crate) enum Commands {
         command: Box<ListCommand>,
     },
     /// Stream live Slack messages and events over the realtime websocket (needs a stored session).
-    Watch {
-        /// Optional channel id, #name, or @handle to filter events to.
-        #[arg(long, value_name = "CHANNEL")]
-        channel: Option<String>,
-        /// Stop after emitting N matching events.
-        #[arg(long, value_name = "N")]
-        count: Option<usize>,
-    },
+    Watch(Box<WatchArgs>),
     /// Native Slack Huddles (audio join/smoke-test, shareable link, invite, local audio devices).
     Huddle {
         #[command(subcommand)]
@@ -381,29 +472,20 @@ pub(crate) enum Commands {
     /// Show live unread channels, DMs, mentions, and threads (`client.counts`, needs a stored session).
     Unread,
     /// Download a Slack file by ID (`files.info` + authenticated download, needs a stored session).
-    Download {
-        /// Slack file ID (e.g. `F0123ABC`).
-        file_id: String,
-        /// Optional destination file path (defaults to `./<filename>`).
-        #[arg(short, long, value_name = "PATH")]
-        out: Option<std::path::PathBuf>,
-    },
+    Download(Box<DownloadArgs>),
     /// Transcribe a video/audio file locally (`parakeet` or `whisper`) and index it in local search.
     Transcribe(Box<TranscribeArgs>),
     /// Backfill a conversation's historical messages into the local SQLite archive (needs a stored session).
     Backfill(Box<BackfillArgs>),
-    /// Check for and install Slackless updates from GitHub Releases (updates Slackless.app + CLI).
-    Update {
-        /// Only check whether a newer release is available without installing.
-        #[arg(long)]
-        check: bool,
-        /// Reinstall the latest release even if the current version matches.
-        #[arg(long)]
-        force: bool,
-        /// Quit and relaunch Slackless.app automatically after installing an update.
-        #[arg(long)]
-        restart: bool,
+    /// Manage the durable local SQLite archive (backfill channel/workspace history, inspect sync status).
+    Archive {
+        #[command(subcommand)]
+        command: Box<ArchiveCommand>,
     },
+    /// Check for and install Slackless updates from GitHub Releases (updates Slackless.app + CLI).
+    Update(Box<UpdateArgs>),
+    /// Run a JSON-RPC 2.0 stdio Model Context Protocol (MCP) server for AI agents.
+    Mcp,
     /// Account and session management.
     Auth {
         #[command(subcommand)]

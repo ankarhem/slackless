@@ -11,6 +11,13 @@ use super::*;
 
 const FIXTURE_LIST_KEY: &str = "fixture";
 
+/// Pre-select a record in the sample fixture list by its record ID (e.g., when navigating from
+/// a list item thread card in Threads view).
+pub fn select_fixture_record(record_id: &str, cx: &mut App) {
+    let data = sample_list_data();
+    select_list_record(FIXTURE_LIST_KEY, record_id, &data, cx);
+}
+
 fn sample_list_data() -> SlackListData {
     let columns = vec![
         SlackListColumn {

@@ -39,10 +39,41 @@ fn canvases_access_params(
     Ok(params)
 }
 
+fn lists_access_params(
+    list_id: &str,
+    access_level: Option<ListAccessLevel>,
+    channel_ids: &[ChannelId],
+    user_ids: &[UserId],
+) -> Result<crate::client::Params> {
+    if channel_ids.is_empty() == user_ids.is_empty() {
+        return Err(ApiError::Slack("invalid_parameters".to_owned()));
+    }
+    let mut params = vec![("list_id", list_id.to_owned())];
+    if let Some(level) = access_level {
+        params.push(("access_level", level.as_str().to_owned()));
+    }
+    if !channel_ids.is_empty() {
+        let ids: Vec<&str> = channel_ids.iter().map(ChannelId::as_str).collect();
+        params.push(("channel_ids", serde_json::to_string(&ids)?));
+    } else {
+        let ids: Vec<&str> = user_ids.iter().map(UserId::as_str).collect();
+        params.push(("user_ids", serde_json::to_string(&ids)?));
+    }
+    Ok(params)
+}
+
 impl SlackApi {
     /// Load a live Slack List (`files.info` for schema + `lists.records.list`, with public
-    /// `slackLists.items.list` fallback) for read-only native table rendering.
+    /// `slackLists.items.list` fallback) for native table/board rendering.
     pub async fn fetch_list(&self, list_id: &str) -> Result<SlackListData> {
+        self.fetch_list_with_meta(list_id)
+            .await
+            .map(|(data, _)| data)
+    }
+
+    /// Load a live Slack List together with its parsed [`ListMeta`] (permalink, access level,
+    /// editors, shared channels, and item limits).
+    pub async fn fetch_list_with_meta(&self, list_id: &str) -> Result<(SlackListData, ListMeta)> {
         let info_val: Value = self
             .call(
                 method::FILES_INFO,
@@ -52,6 +83,11 @@ impl SlackApi {
             .data;
         let file_obj = info_val.get("file").unwrap_or(&info_val);
         let (mut title, mut description, mut columns) = parse_list_schema(file_obj);
+        let mut meta = parse_list_meta(file_obj);
+        if meta.file_id.is_empty() {
+            meta.file_id = list_id.to_owned();
+            meta.comment_channel_id = list_comment_channel_id(list_id);
+        }
 
         let private_res = self
             .call::<Value>(
@@ -81,17 +117,44 @@ impl SlackApi {
             Err(err) => return Err(err),
         };
 
-        if columns.is_empty()
-            && let Some(list_obj) = records_val.get("list")
-        {
-            let (t, d, cols) = parse_list_schema(list_obj);
-            if !t.is_empty() {
-                title = t;
+        if let Some(list_obj) = records_val.get("list") {
+            if columns.is_empty() {
+                let (t, d, cols) = parse_list_schema(list_obj);
+                if !t.is_empty() {
+                    title = t;
+                }
+                if !d.is_empty() {
+                    description = d;
+                }
+                columns = cols;
             }
-            if !d.is_empty() {
-                description = d;
+            if meta.permalink.is_none() {
+                let fallback_meta = parse_list_meta(list_obj);
+                if meta.permalink.is_none() {
+                    meta.permalink = fallback_meta.permalink;
+                }
+                if meta.access.is_none() {
+                    meta.access = fallback_meta.access;
+                }
+                if meta.org_or_workspace_access.is_none() {
+                    meta.org_or_workspace_access = fallback_meta.org_or_workspace_access;
+                }
+                if meta.owner_id.is_none() {
+                    meta.owner_id = fallback_meta.owner_id;
+                }
+                if meta.editors.is_empty() {
+                    meta.editors = fallback_meta.editors;
+                }
+                if meta.shared_channels.is_empty() {
+                    meta.shared_channels = fallback_meta.shared_channels;
+                }
+                if meta.row_count.is_none() {
+                    meta.row_count = fallback_meta.row_count;
+                }
+                if meta.row_count_limit.is_none() {
+                    meta.row_count_limit = fallback_meta.row_count_limit;
+                }
             }
-            columns = cols;
         }
 
         let raw_records = records_val
@@ -101,14 +164,23 @@ impl SlackApi {
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let rows = parse_list_records(raw_records);
+        if meta.row_count.is_none() {
+            meta.row_count = u32::try_from(rows.len()).ok();
+        }
+        if meta.title == "List" && !title.is_empty() {
+            meta.title = title.clone();
+        }
 
-        Ok(SlackListData {
-            file_id: list_id.to_owned(),
-            title,
-            description,
-            columns,
-            rows,
-        })
+        Ok((
+            SlackListData {
+                file_id: list_id.to_owned(),
+                title,
+                description,
+                columns,
+                rows,
+            },
+            meta,
+        ))
     }
 
     /// `files.favorites.list`: starred file IDs, newest star first (`F-CORE-133`).
@@ -580,24 +652,37 @@ impl SlackApi {
         self.call_ok(method::LISTS_RECORDS_ARCHIVE, params).await
     }
 
-    /// `slackLists.access.set`: update list sharing/access permissions (`F-COLLAB-243`–`245`).
+    /// `slackLists.access.set`: grant read/write/owner access on a list to channels or users (XOR)
+    /// (`F-COLLAB-243..245`, `F-COLLAB-274..278`).
     pub async fn lists_access_set(
         &self,
         list_id: &str,
-        access_level: &str,
-        channel: Option<&ChannelId>,
+        access_level: ListAccessLevel,
+        channel_ids: &[ChannelId],
+        user_ids: &[UserId],
     ) -> Result<()> {
-        let mut params = vec![
-            ("list_id", list_id.to_owned()),
-            ("access_level", access_level.to_owned()),
-        ];
-        if let Some(ch) = channel {
-            params.push(("channel_ids", ch.to_string()));
-        }
+        let params = lists_access_params(list_id, Some(access_level), channel_ids, user_ids)?;
         self.call_ok(method::SLACK_LISTS_ACCESS_SET, params).await
     }
 
-    /// `lists.getThreadsForRecord`: load comment thread messages attached to a list item (`F-COLLAB-250`, `251`).
+    /// `slackLists.access.delete`: revoke list access from channels or users (XOR)
+    /// (`F-COLLAB-243..245`, `F-COLLAB-274..278`).
+    pub async fn lists_access_delete(
+        &self,
+        list_id: &str,
+        channel_ids: &[ChannelId],
+        user_ids: &[UserId],
+    ) -> Result<ListAccessDeleteResult> {
+        let params = lists_access_params(list_id, None, channel_ids, user_ids)?;
+        Ok(self
+            .call(method::SLACK_LISTS_ACCESS_DELETE, params)
+            .await?
+            .data)
+    }
+
+    /// `lists.getThreadsForRecord`: load comment thread messages attached to a list item
+    /// (`F-COLLAB-250`, `F-COLLAB-251`, `F-COLLAB-272`), falling back to `conversations.replies`
+    /// on the list's file channel (`C…`, `ts = "<list_id>-<record_id>"`) when needed.
     pub async fn lists_get_threads_for_record(
         &self,
         list_id: &str,
@@ -607,20 +692,26 @@ impl SlackApi {
             ("list_id", list_id.to_owned()),
             ("record_id", record_id.to_owned()),
         ];
-        let data: Value = self
-            .call(method::LISTS_GET_THREADS_FOR_RECORD, params)
-            .await?
-            .data;
-        let mut out = Vec::new();
-        if let Some(msgs) = data
-            .get("messages")
-            .and_then(Value::as_array)
-            .or_else(|| data.get("threads").and_then(Value::as_array))
+        let mut out = match self
+            .call::<Value>(method::LISTS_GET_THREADS_FOR_RECORD, params)
+            .await
         {
-            for item in msgs {
-                if let Ok(m) = serde_json::from_value::<Message>(item.clone()) {
-                    out.push(m);
-                }
+            Ok(resp) => parse_list_record_threads(&resp.data),
+            Err(ref err) if should_fallback_list_method(err) => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        if out.is_empty() && !list_id.is_empty() && !record_id.is_empty() {
+            let comment_ch = list_comment_channel_id(list_id);
+            let synthetic_ts = Ts::from(format!("{list_id}-{record_id}"));
+            let opts = HistoryOpts {
+                limit: Some(100),
+                ..Default::default()
+            };
+            if let Ok(page) = self
+                .conversations_replies(&comment_ch, &synthetic_ts, &opts, None)
+                .await
+            {
+                out = page.items;
             }
         }
         Ok(out)

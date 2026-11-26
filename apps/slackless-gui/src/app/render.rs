@@ -524,17 +524,40 @@ impl App {
         });
         let on_set_access = file_id.as_ref().map(|id| {
             let lid = id.clone();
-            let ch = self.channel.clone();
             let this = cx.weak_entity();
-            Rc::new(move |access_level, _: &mut Window, cx: &mut gpui::App| {
-                let _ = this.update(cx, |app, _| {
-                    app.bridge.send(CollabCommand::SetListAccess {
-                        list_id: lid.clone(),
-                        channel: Some(ch.clone()),
-                        access_level,
+            Rc::new(
+                move |req: crate::lists::ListShareAccessRequest,
+                      _: &mut Window,
+                      cx: &mut gpui::App| {
+                    let _ = this.update(cx, |app, _| {
+                        app.bridge.send(CollabCommand::SetListAccess {
+                            list_id: lid.clone(),
+                            access_level: req.access_level,
+                            channel_ids: req.channel_ids,
+                            user_ids: req.user_ids,
+                            post_permalink: req.post_permalink,
+                        });
                     });
-                });
-            }) as crate::lists::SetListAccessFn
+                },
+            ) as crate::lists::ListAccessSetFn
+        });
+        let on_delete_access = file_id.as_ref().map(|id| {
+            let lid = id.clone();
+            let this = cx.weak_entity();
+            Rc::new(
+                move |channel_ids: Vec<ChannelId>,
+                      user_ids: Vec<UserId>,
+                      _: &mut Window,
+                      cx: &mut gpui::App| {
+                    let _ = this.update(cx, |app, _| {
+                        app.bridge.send(CollabCommand::DeleteListAccess {
+                            list_id: lid.clone(),
+                            channel_ids,
+                            user_ids,
+                        });
+                    });
+                },
+            ) as crate::lists::ListAccessDeleteFn
         });
         let on_load_comments = file_id.as_ref().map(|id| {
             let lid = id.clone();
@@ -544,6 +567,22 @@ impl App {
                     app.bridge.send(CollabCommand::FetchListRecordComments {
                         list_id: lid.clone(),
                         record_id,
+                    });
+                });
+            }) as crate::lists::DeleteListItemFn
+        });
+        let on_open_in_threads = file_id.as_ref().map(|id| {
+            let lid = id.clone();
+            let this = cx.weak_entity();
+            Rc::new(move |record_id, _: &mut Window, cx: &mut gpui::App| {
+                let _ = this.update(cx, |app, cx| {
+                    app.bridge.send(CollabCommand::FetchListRecordComments {
+                        list_id: lid.clone(),
+                        record_id,
+                    });
+                    app.open_threads(cx);
+                    app.threads.update(cx, |view, cx| {
+                        view.set_filter(crate::threads_view::ThreadsFilter::ListItems, cx);
                     });
                 });
             }) as crate::lists::DeleteListItemFn
@@ -597,7 +636,9 @@ impl App {
                 on_delete_item,
                 on_archive_item,
                 on_set_access,
+                on_delete_access,
                 on_load_comments,
+                on_open_in_threads,
                 on_add_tab,
                 on_delete_list,
                 open_browser,
@@ -1272,6 +1313,329 @@ impl App {
                 },
             )
         })
+        .when_some(
+            crate::media::active_pip_video(self.image_viewer.is_some(), cx),
+            |root, pip| {
+                let chrome = crate::theme::viewer_chrome();
+                let fg = crate::theme::media_overlay_foreground();
+                let bottom_offset = if self.huddle_dock.is_some() {
+                    px(84.)
+                } else {
+                    px(18.)
+                };
+                let fid = pip.meta.file_id.clone();
+                let fid_play = fid.clone();
+                let fid_mute = fid.clone();
+                let fid_scrub = fid.clone();
+                let fid_expand = fid.clone();
+                let expand_meta = pip.meta.clone();
+                let expand_meta_stage = pip.meta.clone();
+                let fid_expand_stage = fid.clone();
+                let jump_target = pip.meta.channel.clone().zip(pip.meta.message_ts.clone());
+                let jump_target_btn = jump_target.clone();
+                let poster = pip
+                    .meta
+                    .poster_url
+                    .clone()
+                    .map(|u| gpui::ImageSource::from(SharedString::from(u)));
+                let dur = pip.snapshot.duration_secs;
+                let pos = pip.snapshot.position_secs;
+                let progress = crate::media::progress_fraction(pos, dur);
+                let time_label = if dur > 0.0 {
+                    format!(
+                        "{} / {}",
+                        crate::media::format_video_time(pos),
+                        crate::media::format_video_time(dur)
+                    )
+                } else {
+                    crate::media::format_video_time(pos)
+                };
+                let playing = pip.snapshot.playing;
+                let muted = pip.snapshot.muted;
+                let title = SharedString::from(pip.meta.title.clone());
+
+                root.child(
+                    v_flex()
+                        .id("video-pip-dock")
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_scroll(|_, _, cx| cx.stop_propagation())
+                        .absolute()
+                        .right(px(18.))
+                        .bottom(bottom_offset)
+                        .w(px(288.))
+                        .rounded_lg()
+                        .overflow_hidden()
+                        .bg(chrome.panel)
+                        .border_1()
+                        .border_color(chrome.border)
+                        .shadow(vec![shadow(8., 0.35, 24.)])
+                        // Header bar: title (click jumps to message when known) + Expand + Close.
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_1()
+                                .px_2()
+                                .py_1()
+                                .bg(chrome.glass)
+                                .border_b_1()
+                                .border_color(chrome.border)
+                                .child(
+                                    h_flex()
+                                        .id("video-pip-title")
+                                        .flex_1()
+                                        .min_w_0()
+                                        .items_center()
+                                        .gap_1()
+                                        .when(jump_target.is_some(), |el| {
+                                            el.cursor_pointer()
+                                                .hover(move |h| h.text_color(chrome.text))
+                                        })
+                                        .child(
+                                            Icon::new(IconName::Video)
+                                                .size(px(12.))
+                                                .text_color(chrome.text_muted),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_xs()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(chrome.text)
+                                                .child(title),
+                                        )
+                                        .when_some(jump_target, |el, (ch, ts)| {
+                                            el.on_click(cx.listener(move |this, _, _, cx| {
+                                                this.close_full_column_views(cx);
+                                                this.select(ch.clone(), cx);
+                                                this.messages
+                                                    .update(cx, |list, cx| list.reveal(&ts, cx));
+                                            }))
+                                        }),
+                                )
+                                .child(
+                                    h_flex()
+                                        .flex_none()
+                                        .items_center()
+                                        .gap_0p5()
+                                        .when_some(jump_target_btn, |row, (ch, ts)| {
+                                            row.child(
+                                                div()
+                                                    .id("video-pip-jump")
+                                                    .size(px(22.))
+                                                    .rounded_sm()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .cursor_pointer()
+                                                    .hover(move |b| b.bg(chrome.button_hover))
+                                                    .child(
+                                                        Icon::new(IconName::ArrowUpRight)
+                                                            .size(px(12.))
+                                                            .text_color(chrome.text_muted),
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.close_full_column_views(cx);
+                                                            this.select(ch.clone(), cx);
+                                                            this.messages.update(cx, |list, cx| {
+                                                                list.reveal(&ts, cx)
+                                                            });
+                                                        },
+                                                    )),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .id("video-pip-expand")
+                                                .size(px(22.))
+                                                .rounded_sm()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .cursor_pointer()
+                                                .hover(move |b| b.bg(chrome.button_hover))
+                                                .child(
+                                                    Icon::new(IconName::Maximize2)
+                                                        .size(px(12.))
+                                                        .text_color(chrome.text),
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        crate::media::stop_inline_video_for_expand(
+                                                            &fid_expand,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                        let viewer_img =
+                                                            ViewerImage::from_inline_video_meta(
+                                                                &this.fixtures,
+                                                                &expand_meta,
+                                                            );
+                                                        let ch = expand_meta
+                                                            .channel
+                                                            .clone()
+                                                            .unwrap_or_else(|| {
+                                                                this.channel.clone()
+                                                            });
+                                                        this.open_image_viewer(
+                                                            ch,
+                                                            Rc::new(vec![viewer_img]),
+                                                            0,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("video-pip-close")
+                                                .size(px(22.))
+                                                .rounded_sm()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .cursor_pointer()
+                                                .hover(move |b| b.bg(chrome.button_hover))
+                                                .child(
+                                                    Icon::new(IconName::X)
+                                                        .size(px(12.))
+                                                        .text_color(chrome.text_muted),
+                                                )
+                                                .on_click(|_, window, cx| {
+                                                    crate::media::stop_active_inline_video(
+                                                        window, cx,
+                                                    );
+                                                }),
+                                        ),
+                                ),
+                        )
+                        // Video surface stage: clicking expands cleanly into ImageViewer.
+                        .child(
+                            div()
+                                .id("video-pip-stage")
+                                .relative()
+                                .w_full()
+                                .h(px(156.))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    crate::media::stop_inline_video_for_expand(
+                                        &fid_expand_stage,
+                                        window,
+                                        cx,
+                                    );
+                                    let viewer_img = ViewerImage::from_inline_video_meta(
+                                        &this.fixtures,
+                                        &expand_meta_stage,
+                                    );
+                                    let ch = expand_meta_stage
+                                        .channel
+                                        .clone()
+                                        .unwrap_or_else(|| this.channel.clone());
+                                    this.open_image_viewer(
+                                        ch,
+                                        Rc::new(vec![viewer_img]),
+                                        0,
+                                        window,
+                                        cx,
+                                    );
+                                }))
+                                .child(crate::media::render_video_surface(
+                                    pip.snapshot.surface,
+                                    poster,
+                                    px(0.),
+                                )),
+                        )
+                        // Compact bottom transport bar: play/pause, scrub bar, time, mute.
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_1p5()
+                                .px_2()
+                                .py_1()
+                                .bg(chrome.glass)
+                                .border_t_1()
+                                .border_color(chrome.border)
+                                .child(
+                                    div()
+                                        .id("video-pip-play")
+                                        .size(px(24.))
+                                        .flex_none()
+                                        .rounded_sm()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .hover(move |b| b.bg(chrome.button_hover))
+                                        .child(
+                                            Icon::new(if playing {
+                                                IconName::Pause
+                                            } else {
+                                                IconName::Play
+                                            })
+                                            .size(px(13.))
+                                            .text_color(fg),
+                                        )
+                                        .on_click(move |_, window, cx| {
+                                            crate::media::toggle_inline_video_pause(
+                                                &fid_play, window, cx,
+                                            );
+                                        }),
+                                )
+                                .child(crate::media::video_scrub_bar(
+                                    SharedString::from("video-pip-scrub"),
+                                    progress,
+                                    dur,
+                                    chrome.border,
+                                    fg,
+                                    move |secs, window, cx| {
+                                        crate::media::seek_inline_video(
+                                            &fid_scrub, secs, window, cx,
+                                        );
+                                    },
+                                ))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(10.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(chrome.text_muted)
+                                        .child(time_label),
+                                )
+                                .child(
+                                    div()
+                                        .id("video-pip-mute")
+                                        .size(px(24.))
+                                        .flex_none()
+                                        .rounded_sm()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .hover(move |b| b.bg(chrome.button_hover))
+                                        .child(
+                                            Icon::new(if muted {
+                                                IconName::VolumeX
+                                            } else {
+                                                IconName::Volume2
+                                            })
+                                            .size(px(13.))
+                                            .text_color(fg),
+                                        )
+                                        .on_click(move |_, window, cx| {
+                                            crate::media::toggle_inline_video_mute(
+                                                &fid_mute, window, cx,
+                                            );
+                                        }),
+                                ),
+                        ),
+                )
+            },
+        )
         .when_some(self.image_viewer.clone(), |root, viewer| {
             // Slack's image viewer: an opaque gray surface covering the window below
             // the title bar; the panel itself renders the viewer.
@@ -1417,8 +1781,9 @@ impl Render for App {
             .child({
                 let nav_app = cx.weak_entity();
                 canvas(
-                    |_, _, _| {},
-                    move |_, _, window, _| {
+                    |_, _, cx| crate::media::inline_video_begin_paint(cx),
+                    move |_, paint_epoch, window, cx| {
+                        crate::media::inline_video_finish_paint(paint_epoch, window, cx);
                         let nav_app = nav_app.clone();
                         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
                             if phase != DispatchPhase::Capture {

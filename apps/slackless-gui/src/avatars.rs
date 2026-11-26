@@ -8,7 +8,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon};
 use gpui_kit::gpui::{
     App, Div, FontWeight, Hsla, ParentElement as _, SharedString, Styled as _, div, img, px,
 };
-use slackless_core::types::{Conversation, Message, Presence, Profile, UserId};
+use slackless_core::types::{Conversation, Message, Presence, Profile, Team, UserId};
 
 use crate::fixtures::Fixtures;
 use crate::theme;
@@ -32,7 +32,11 @@ pub fn conversation_avatar(
                 .user(peer)
                 .and_then(|u| u.profile.huddle_state.as_deref())
                 == Some("in_a_huddle");
-            let avatar = with_presence(chip, fixtures.presence(peer), size, ring, cx);
+            let avatar = if let Some(team) = fixtures.external_team(peer) {
+                with_external_team_badge(team, chip, size, ring)
+            } else {
+                with_presence(chip, fixtures.presence(peer), size, ring, cx)
+            };
             if in_huddle {
                 with_huddle_badge(avatar, size, ring, cx)
             } else {
@@ -122,6 +126,24 @@ pub fn author_avatar(
     }
 }
 
+/// Overlay an external organization's icon over the bottom-right corner of `avatar`, cut out by
+/// a ring of `ring`. Shared by external users and external apps/bots (`F-COLLAB-800`, `804`).
+pub fn with_external_team_badge(team: &Team, avatar: Div, size: f32, ring: Hsla) -> Div {
+    let badge = (size * 0.44).round().clamp(10., 44.);
+    let pad = if size <= 22. { 1. } else { 2. };
+    let offset = if size <= 22. { -2. } else { -3. };
+    div().relative().flex_none().child(avatar).child(
+        div()
+            .absolute()
+            .right(px(offset))
+            .bottom(px(offset))
+            .p(px(pad))
+            .rounded(px(avatar_radius(badge) + pad))
+            .bg(ring)
+            .child(crate::channel_details::org_chip(team, badge)),
+    )
+}
+
 /// Slack's badge on a member of another organization: `avatar` with that organization's icon
 /// over its bottom-right corner, cut out of the avatar by a ring of `ring` (the surface behind
 /// it). Own-organization people, bots and unknown organizations get `avatar` as is.
@@ -135,17 +157,7 @@ pub fn with_external_badge(
     let Some(team) = user.and_then(|user| fixtures.external_team(user)) else {
         return avatar;
     };
-    let badge = (size * 0.44).round();
-    div().relative().flex_none().child(avatar).child(
-        div()
-            .absolute()
-            .right(px(-3.))
-            .bottom(px(-3.))
-            .p(px(2.))
-            .rounded(px(avatar_radius(badge) + 2.))
-            .bg(ring)
-            .child(crate::channel_details::org_chip(team, badge)),
-    )
+    with_external_team_badge(team, avatar, size, ring)
 }
 
 /// The profile image for an avatar `size` points wide, at twice that for Retina.

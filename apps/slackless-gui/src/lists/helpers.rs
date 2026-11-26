@@ -355,6 +355,8 @@ pub(super) fn render_record_comments_section(
     record_id: &str,
     state: &ListPanelState,
     fixtures: &Fixtures,
+    on_open_in_threads: Option<&DeleteListItemFn>,
+    view_only: bool,
     cx: &App,
 ) -> Div {
     let theme = cx.theme();
@@ -365,6 +367,8 @@ pub(super) fn render_record_comments_section(
     let key_open = list_key.to_owned();
     let key_post = list_key.to_owned();
     let rid_post = record_id.to_owned();
+    let rid_threads = record_id.to_owned();
+    let open_threads_cb = on_open_in_threads.cloned();
 
     let mut section = v_flex()
         .gap_2()
@@ -375,17 +379,47 @@ pub(super) fn render_record_comments_section(
         .child(
             h_flex()
                 .items_center()
+                .justify_between()
                 .gap_1p5()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.muted_foreground)
                 .child(
-                    Icon::new(IconName::MessageSquare)
-                        .size(px(12.))
-                        .text_color(theme.muted_foreground),
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.muted_foreground)
+                        .child(
+                            Icon::new(IconName::MessageSquare)
+                                .size(px(12.))
+                                .text_color(theme.muted_foreground),
+                        )
+                        .child(format!("Comments ({})", all_comments.len())),
                 )
-                .child(format!("Comments ({})", all_comments.len())),
-        );
+                .when_some(
+                    (!all_comments.is_empty())
+                        .then_some(open_threads_cb)
+                        .flatten(),
+                    |row, cb| {
+                        row.child(
+                            Button::new("list-item-open-threads")
+                                .ghost()
+                                .with_size(Size::XSmall)
+                                .label("View in Threads")
+                                .on_click(move |_, window, cx| {
+                                    cb(rid_threads.clone(), window, cx);
+                                }),
+                        )
+                    },
+                ),
+        )
+        .when(view_only, |col| {
+            col.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("View access: you can comment on this item's thread."),
+            )
+        });
 
     if all_comments.is_empty() {
         section = section.child(
