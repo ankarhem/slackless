@@ -224,3 +224,132 @@ fn corrupted_out_of_bounds_settings_indices_never_panic() {
     let _ = corrupted.notifications_allowed_now();
     let _ = corrupted.transcription_provider();
 }
+
+#[test]
+fn settings_smart_rules_and_catchup_reminder_serde_round_trip() {
+    use slackless_core::rules::{NotificationRule, RuleAction};
+
+    let from_empty: Settings = serde_json::from_str("{}").expect("empty json deserializes");
+    assert!(from_empty.smart_notification_rules.is_empty());
+    assert!(!from_empty.catchup_reminder_enabled);
+    assert_eq!(from_empty.catchup_reminder_time, "09:00");
+    assert_eq!(from_empty.catchup_reminder_last_fired_day, None);
+
+    let s = Settings {
+        catchup_reminder_enabled: true,
+        catchup_reminder_time: "08:30".to_owned(),
+        catchup_reminder_last_fired_day: Some("2026-11-26".to_owned()),
+        smart_notification_rules: vec![NotificationRule {
+            id: "r1".into(),
+            name: "SEV-1 page".into(),
+            enabled: true,
+            action: RuleAction::BreakThroughMute,
+            from_users: vec!["@oncall".into()],
+            in_channels: vec!["#incidents".into()],
+            keywords: vec!["sev-1".into()],
+            regex_pattern: Some(r"sev-[01]".into()),
+            only_threads: false,
+            mentions_me: false,
+            semantic_topic: Some("database outage".into()),
+            semantic_threshold: Some(0.55),
+        }],
+        ..Default::default()
+    };
+
+    let encoded = serde_json::to_string(&s).expect("serialize settings");
+    let decoded: Settings = serde_json::from_str(&encoded).expect("deserialize settings");
+    assert!(decoded == s);
+}
+
+#[gpui::test]
+fn preferences_smart_rule_crud_validation_and_catchup_mark(cx: &mut gpui::TestAppContext) {
+    use slackless_core::rules::RuleAction;
+
+    struct PrefsHost(Entity<Preferences>);
+    impl Render for PrefsHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.0.clone()
+        }
+    }
+
+    cx.update(gpui_kit::init);
+    let mut prefs_slot = None;
+    let window = cx.add_window(|window, cx| {
+        let prefs = Preferences::new(window, cx);
+        prefs_slot = Some(prefs.clone());
+        PrefsHost(prefs)
+    });
+    let prefs = prefs_slot.expect("prefs entity");
+
+    window
+        .update(cx, |_, window, cx| {
+            prefs.update(cx, |prefs, cx| {
+                // Empty draft refuses to save.
+                prefs.rule_editor.load_rule(None, window, cx);
+                assert!(!prefs.save_rule_draft(cx));
+                assert!(prefs.settings().smart_notification_rules.is_empty());
+
+                // Invalid regex refuses to save.
+                prefs
+                    .rule_editor
+                    .name
+                    .update(cx, |s, cx| s.set_value("Broken regex", window, cx));
+                prefs
+                    .rule_editor
+                    .regex_pattern
+                    .update(cx, |s, cx| s.set_value("[unclosed(", window, cx));
+                assert!(!prefs.save_rule_draft(cx));
+
+                // Valid rule saves cleanly.
+                prefs
+                    .rule_editor
+                    .name
+                    .update(cx, |s, cx| s.set_value("Escalate SEV-1", window, cx));
+                prefs
+                    .rule_editor
+                    .in_channels
+                    .update(cx, |s, cx| s.set_value("#incidents", window, cx));
+                prefs
+                    .rule_editor
+                    .keywords
+                    .update(cx, |s, cx| s.set_value("sev-1, outage", window, cx));
+                prefs
+                    .rule_editor
+                    .regex_pattern
+                    .update(cx, |s, cx| s.set_value(r"sev-[01]", window, cx));
+                prefs.rule_editor.action = RuleAction::BreakThroughMute;
+                assert!(prefs.save_rule_draft(cx));
+                assert_eq!(prefs.settings().smart_notification_rules.len(), 1);
+                let id = prefs.settings().smart_notification_rules[0].id.clone();
+
+                // Toggle disable/enable.
+                prefs.toggle_rule_enabled(&id, cx);
+                assert!(!prefs.settings().smart_notification_rules[0].enabled);
+                prefs.toggle_rule_enabled(&id, cx);
+                assert!(prefs.settings().smart_notification_rules[0].enabled);
+
+                // Edit existing rule in-place.
+                let existing = prefs.settings().smart_notification_rules[0].clone();
+                prefs.rule_editor.load_rule(Some(&existing), window, cx);
+                prefs.rule_editor.action = RuleAction::Suppress;
+                assert!(prefs.save_rule_draft(cx));
+                assert_eq!(prefs.settings().smart_notification_rules.len(), 1);
+                assert_eq!(
+                    prefs.settings().smart_notification_rules[0].action,
+                    RuleAction::Suppress
+                );
+
+                // Delete rule.
+                prefs.delete_rule(&id, cx);
+                assert!(prefs.settings().smart_notification_rules.is_empty());
+
+                // Mark daily catchup reminder fired.
+                prefs.mark_catchup_reminder_fired("2026-11-26".to_owned(), cx);
+                assert_eq!(
+                    prefs.settings().catchup_reminder_last_fired_day.as_deref(),
+                    Some("2026-11-26")
+                );
+            });
+        })
+        .expect("window update");
+}

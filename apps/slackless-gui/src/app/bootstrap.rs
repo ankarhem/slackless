@@ -1323,6 +1323,16 @@ fn install_os_and_lifecycle_hooks(app: &Entity<App>, window: &mut Window, cx: &m
     let notif_app = app.downgrade();
     let notif_window = window.window_handle();
     cx.on_system_notification_response(move |response, cx| {
+        if is_catchup_notification_tag(&response.tag) {
+            cx.activate(true);
+            let _ = notif_window.update(cx, |_, window, cx| {
+                window.activate_window();
+                let _ = notif_app.update(cx, |app, cx| {
+                    app.open_catchup(window, cx);
+                });
+            });
+            return;
+        }
         let Some((ws_opt, channel, ts)) = parse_notification_target(&response.tag) else {
             return;
         };
@@ -1763,6 +1773,7 @@ impl App {
                     if this
                         .update_in(cx, |app, window, cx| {
                             app.fire_reminders(window, cx);
+                            app.check_daily_catchup_reminder(window, cx);
                             app.expire_focus(window, cx);
                             app.poll_calendar_status(window, cx);
                         })

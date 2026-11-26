@@ -95,6 +95,12 @@ pub(super) fn workspace_badge_from_counts(
     }
 }
 
+/// Whether a system notification tag is a Daily Catch-Up reminder (`catchup:<YYYY-MM-DD>`).
+pub(super) fn is_catchup_notification_tag(tag: &str) -> bool {
+    tag.strip_prefix("catchup:")
+        .is_some_and(|rest| !rest.trim().is_empty())
+}
+
 /// Decode a system notification tag (`msg:<channel>:<ts>`, `later:<channel>:<ts>`, or
 /// `bg:<workspace_index>:<channel>:<ts>`) into `(optional_workspace_index, channel, ts)` (`F-SHELL-171`).
 pub(super) fn parse_notification_target(tag: &str) -> Option<(Option<usize>, ChannelId, Ts)> {
@@ -251,7 +257,10 @@ pub(super) fn mentions_me(text: &str, me: &UserId, keywords: &str) -> bool {
 
 #[cfg(test)]
 mod notification_tag_tests {
-    use super::{civil_from_days, convert_emoticons, is_suspicious_url, parse_notification_target};
+    use super::{
+        civil_from_days, convert_emoticons, is_catchup_notification_tag, is_suspicious_url,
+        parse_notification_target,
+    };
     use crate::messages::parse_local_schedule;
     use slackless_core::types::{ChannelId, Ts};
 
@@ -282,6 +291,9 @@ mod notification_tag_tests {
             ))
         );
         assert_eq!(parse_notification_target("bg:bad:C0:1.0"), None);
+        assert!(is_catchup_notification_tag("catchup:2026-11-26"));
+        assert!(!is_catchup_notification_tag("catchup:"));
+        assert!(!is_catchup_notification_tag("msg:C0:1.0"));
     }
 
     #[test]

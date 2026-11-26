@@ -134,8 +134,9 @@ impl App {
     }
 
     /// Route a `slack://`, `https://app.slack.com/client/...`, or `https://*.slack.com/archives/...`
-    /// deep link into the matching workspace, conversation, thread, or user profile (`F-SHELL-182..187`).
-    /// Returns `true` when the URL was handled in-app.
+    /// deep link into the matching workspace, conversation, thread, message, file, or user profile
+    /// (`F-SHELL-182..187`). Returns `true` when the URL was handled in-app (including when a clear
+    /// "Workspace not signed in" toast was surfaced for an unrecognized target workspace).
     pub fn handle_deep_link(
         &mut self,
         url: &str,
@@ -146,97 +147,129 @@ impl App {
         let Ok(link) = parse_deep_link(url) else {
             return false;
         };
-        let switch_team = |this: &mut Self,
-                           team_id: Option<&str>,
-                           window: &mut Window,
-                           cx: &mut Context<Self>| {
-            let Some(team_id) = team_id else {
-                return;
-            };
-            let idx = this
-                .live_teams
-                .iter()
-                .position(|t| t.id.as_str() == team_id)
-                .or_else(|| {
-                    this.fixtures
-                        .workspaces
-                        .iter()
-                        .position(|t| t.id.as_str() == team_id)
-                });
-            if let Some(ix) = idx
-                && ix != this.workspace
-            {
-                this.switch_workspace(ix, window, cx);
-            }
-        };
         match link {
             DeepLink::Slack(slack) => match slack.kind {
                 SlackLinkKind::Team { team_id } => {
-                    switch_team(self, Some(&team_id), window, cx);
+                    self.resolve_deep_link_workspace(Some(&team_id), None, None, window, cx);
                     true
                 }
                 SlackLinkKind::Channel {
                     channel_id,
                     team_id,
+                    message_ts,
+                    thread_ts,
                 } => {
-                    switch_team(self, team_id.as_deref(), window, cx);
                     let ch = ChannelId::from(channel_id.as_str());
-                    if self.fixtures.conversation(&ch).is_some() {
-                        self.select(ch, cx);
+                    if !self.resolve_deep_link_workspace(
+                        team_id.as_deref(),
+                        None,
+                        Some(&ch),
+                        window,
+                        cx,
+                    ) {
                         return true;
                     }
-                    false
+                    self.navigate_channel_target(
+                        ch,
+                        thread_ts.map(Ts::new),
+                        message_ts.map(Ts::new),
+                        cx,
+                    )
                 }
                 SlackLinkKind::User { user_id, team_id } => {
-                    switch_team(self, team_id.as_deref(), window, cx);
+                    if !self.resolve_deep_link_workspace(team_id.as_deref(), None, None, window, cx)
+                    {
+                        return true;
+                    }
                     let uid = UserId::from(user_id.as_str());
                     self.open_profile(uid, cx);
                     true
                 }
+                SlackLinkKind::File { file_id, team_id } => {
+                    if !self.resolve_deep_link_workspace(team_id.as_deref(), None, None, window, cx)
+                    {
+                        return true;
+                    }
+                    self.navigate_file_target(&file_id, window, cx);
+                    true
+                }
                 SlackLinkKind::Open { team_id, target_id } => {
-                    switch_team(self, team_id.as_deref(), window, cx);
+                    let ch_hint = target_id
+                        .as_deref()
+                        .filter(|t| {
+                            !t.starts_with('U') && !t.starts_with('W') && !t.starts_with('F')
+                        })
+                        .map(ChannelId::from);
+                    if !self.resolve_deep_link_workspace(
+                        team_id.as_deref(),
+                        None,
+                        ch_hint.as_ref(),
+                        window,
+                        cx,
+                    ) {
+                        return true;
+                    }
                     if let Some(target) = target_id {
                         if target.starts_with('U') || target.starts_with('W') {
                             self.open_profile(UserId::from(target.as_str()), cx);
                             return true;
                         }
-                        let ch = ChannelId::from(target.as_str());
-                        if self.fixtures.conversation(&ch).is_some() {
-                            self.select(ch, cx);
+                        if target.starts_with('F') {
+                            self.navigate_file_target(&target, window, cx);
                             return true;
                         }
+                        let ch = ChannelId::from(target.as_str());
+                        let extra_thread = slack
+                            .extra
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("thread_ts"))
+                            .map(|(_, v)| Ts::new(v.clone()));
+                        let extra_msg = slack
+                            .extra
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("message"))
+                            .map(|(_, v)| Ts::new(v.clone()));
+                        return self.navigate_channel_target(ch, extra_thread, extra_msg, cx);
                     }
                     team_id.is_some()
                 }
             },
             DeepLink::WebClient(web) => {
-                switch_team(self, web.team_id.as_deref(), window, cx);
-                let Some(channel_id) = web.channel_id else {
-                    return web.team_id.is_some();
+                let ch_opt = web.channel_id.as_deref().map(ChannelId::from);
+                if !self.resolve_deep_link_workspace(
+                    web.team_id.as_deref(),
+                    web.workspace_domain.as_deref(),
+                    ch_opt.as_ref(),
+                    window,
+                    cx,
+                ) {
+                    return true;
+                }
+                let Some(ch) = ch_opt else {
+                    return web.team_id.is_some() || web.workspace_domain.is_some();
                 };
-                let ch = ChannelId::from(channel_id.as_str());
-                if self.fixtures.conversation(&ch).is_none() {
-                    return false;
-                }
-                self.select(ch.clone(), cx);
-                if let Some(ts_str) = web.thread_ts {
-                    let ts = Ts::from(ts_str.as_str());
-                    if url.contains("thread_ts=") {
-                        self.open_thread(ch, ts.clone(), cx);
-                        self.thread.update(cx, |panel, cx| panel.reveal(ts, cx));
-                    } else {
-                        self.messages.update(cx, |list, cx| list.reveal(&ts, cx));
-                    }
-                }
-                true
+                self.navigate_channel_target(
+                    ch,
+                    web.thread_ts.map(Ts::new),
+                    web.message_ts.map(Ts::new),
+                    cx,
+                )
             }
             DeepLink::Huddle {
                 team_id,
                 channel_id,
                 ..
             } => {
-                switch_team(self, team_id.as_deref(), window, cx);
                 let ch = ChannelId::from(channel_id.as_str());
+                if !self.resolve_deep_link_workspace(
+                    team_id.as_deref(),
+                    None,
+                    Some(&ch),
+                    window,
+                    cx,
+                ) {
+                    return true;
+                }
                 if self.fixtures.conversation(&ch).is_none() {
                     return false;
                 }
@@ -250,7 +283,9 @@ impl App {
                 tab,
                 ..
             } => {
-                switch_team(self, team_id.as_deref(), window, cx);
+                if !self.resolve_deep_link_workspace(team_id.as_deref(), None, None, window, cx) {
+                    return true;
+                }
                 let target_tab = if tab.as_deref() == Some("messages") {
                     ConversationTab::Messages
                 } else {
@@ -284,6 +319,142 @@ impl App {
             }
             DeepLink::Other { .. } => false,
         }
+    }
+
+    /// Resolve the target workspace for a deep link by `team_id` or `<domain>.slack.com` subdomain.
+    /// Switches to the matching workspace when signed in; returns `false` and surfaces a clear
+    /// toast when the target workspace is not signed in.
+    fn resolve_deep_link_workspace(
+        &mut self,
+        team_id: Option<&str>,
+        workspace_domain: Option<&str>,
+        fallback_channel: Option<&ChannelId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if let Some(tid) = team_id {
+            let idx = self
+                .live_teams
+                .iter()
+                .position(|t| t.id.as_str().eq_ignore_ascii_case(tid))
+                .or_else(|| {
+                    self.fixtures
+                        .workspaces
+                        .iter()
+                        .position(|t| t.id.as_str().eq_ignore_ascii_case(tid))
+                });
+            if let Some(ix) = idx {
+                if ix != self.workspace {
+                    self.switch_workspace(ix, window, cx);
+                }
+                return true;
+            }
+            notify(
+                "Workspace not signed in",
+                format!("Sign in to workspace {tid} to open this Slack link."),
+                window,
+                cx,
+            );
+            return false;
+        }
+        if let Some(domain) = workspace_domain {
+            let idx =
+                self.live_teams
+                    .iter()
+                    .position(|t| !t.domain.is_empty() && t.domain.eq_ignore_ascii_case(domain))
+                    .or_else(|| {
+                        self.fixtures.workspaces.iter().position(|t| {
+                            !t.domain.is_empty() && t.domain.eq_ignore_ascii_case(domain)
+                        })
+                    });
+            if let Some(ix) = idx {
+                if ix != self.workspace {
+                    self.switch_workspace(ix, window, cx);
+                }
+                return true;
+            }
+            // If no workspace domain matched, still allow permalinks whose channel exists in the
+            // active workspace (e.g. fixture/offline mode or workspaces with unpopulated domains).
+            if fallback_channel.is_some_and(|ch| self.fixtures.conversation(ch).is_some()) {
+                return true;
+            }
+            notify(
+                "Workspace not signed in",
+                format!("Sign in to {domain}.slack.com to open this Slack link."),
+                window,
+                cx,
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Select `channel` and jump to an exact thread reply, thread root, or message timestamp.
+    fn navigate_channel_target(
+        &mut self,
+        channel: ChannelId,
+        thread_ts: Option<Ts>,
+        message_ts: Option<Ts>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.fixtures.conversation(&channel).is_none() {
+            return false;
+        }
+        self.select(channel.clone(), cx);
+        match (thread_ts, message_ts) {
+            (Some(t_ts), Some(m_ts)) => {
+                self.open_thread(channel, t_ts, cx);
+                self.thread.update(cx, |panel, cx| panel.reveal(m_ts, cx));
+            }
+            (Some(t_ts), None) => {
+                self.open_thread(channel, t_ts.clone(), cx);
+                self.thread.update(cx, |panel, cx| panel.reveal(t_ts, cx));
+            }
+            (None, Some(m_ts)) => {
+                self.messages.update(cx, |list, cx| list.reveal(&m_ts, cx));
+            }
+            (None, None) => {}
+        }
+        true
+    }
+
+    /// Jump to the message carrying `file_id` in the active workspace, or open the Files page.
+    fn navigate_file_target(&mut self, file_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let mut channel_hit: Option<(ChannelId, Ts)> = None;
+        for (ch, msgs) in &self.fixtures.messages {
+            if let Some(msg) = msgs
+                .iter()
+                .find(|m| m.files.iter().any(|f| f.id.as_str() == file_id))
+            {
+                channel_hit = Some((ch.clone(), msg.ts.clone()));
+                break;
+            }
+        }
+        if let Some((ch, ts)) = channel_hit {
+            let _ = self.navigate_channel_target(ch, None, Some(ts), cx);
+            return;
+        }
+        let mut thread_hit: Option<(ChannelId, Ts, Ts)> = None;
+        for ((ch, root_ts), replies) in &self.fixtures.threads {
+            if let Some(msg) = replies
+                .iter()
+                .find(|m| m.files.iter().any(|f| f.id.as_str() == file_id))
+            {
+                thread_hit = Some((ch.clone(), root_ts.clone(), msg.ts.clone()));
+                break;
+            }
+        }
+        if let Some((ch, root_ts, msg_ts)) = thread_hit {
+            let _ = self.navigate_channel_target(ch, Some(root_ts), Some(msg_ts), cx);
+            return;
+        }
+        self.open_files(cx);
+        notify(
+            "Opened Files",
+            format!("Looking up file {file_id} in the active workspace."),
+            window,
+            cx,
+        );
     }
 
     /// Slack's focus mode (the rail's moon): on with Slack's default "Don't turn off", or off.

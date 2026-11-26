@@ -9694,6 +9694,7 @@ dependencies = [
  "dirs 7.0.0",
  "futures",
  "ort",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

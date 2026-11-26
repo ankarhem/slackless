@@ -251,13 +251,45 @@ impl App {
                     return;
                 }
                 let level = bg_ctx.notify_level;
-                if level == Some(NotifyLevel::Muted) {
-                    return;
-                }
                 let Some(conv) = bg_ctx.conversation.as_ref() else {
                     return;
                 };
                 let dm = matches!(conv.kind(), ConversationKind::Im | ConversationKind::Mpim);
+                let mentioned = mentions_me(&message.text, &bg_ctx.self_user, &settings.keywords);
+                let rule_eval = if settings.smart_notification_rules.is_empty() {
+                    slackless_core::rules::RuleEvaluation::default()
+                } else {
+                    let rule_ctx = slackless_core::rules::RuleContext {
+                        sender_id: message
+                            .user
+                            .as_ref()
+                            .map(UserId::as_str)
+                            .or_else(|| message.bot_id.as_ref().map(|b| b.as_str())),
+                        sender_handle: bg_ctx
+                            .sender
+                            .as_ref()
+                            .map(|x| x.name.as_str())
+                            .or(message.username.as_deref())
+                            .or_else(|| message.bot_profile.as_ref().map(|b| b.name.as_str())),
+                        sender_display_name: bg_ctx
+                            .sender
+                            .as_ref()
+                            .map(slackless_core::types::User::display_name)
+                            .or_else(|| message.bot_profile.as_ref().map(|b| b.name.as_str())),
+                        channel_id: channel.as_str(),
+                        channel_name: conv.name.as_deref(),
+                        text: &message.text,
+                        is_thread_reply: reply,
+                        mentions_me: mentioned,
+                    };
+                    slackless_core::rules::evaluate_rules(
+                        &settings.smart_notification_rules,
+                        &rule_ctx,
+                    )
+                };
+                if rule_eval.is_suppressed() {
+                    return;
+                }
                 let sender_is_vip = message.user.as_ref().is_some_and(|u| {
                     let handle = bg_ctx
                         .sender
@@ -271,8 +303,12 @@ impl App {
                         .unwrap_or("");
                     settings.is_vip(u.as_str(), handle, display)
                 });
-                let breakthrough =
-                    sender_is_vip || settings.is_urgent_dm_breakthrough(dm, &message.text);
+                let breakthrough = sender_is_vip
+                    || settings.is_urgent_dm_breakthrough(dm, &message.text)
+                    || rule_eval.breaks_through_mute();
+                if level == Some(NotifyLevel::Muted) && !breakthrough {
+                    return;
+                }
                 if !breakthrough
                     && (self.self_state.paused()
                         || self.self_state.focused()
@@ -280,15 +316,16 @@ impl App {
                 {
                     return;
                 }
-                let mentioned = mentions_me(&message.text, &bg_ctx.self_user, &settings.keywords);
-                let wanted = match (level, settings.notify_level) {
-                    (Some(NotifyLevel::Everything), _) => true,
-                    (Some(NotifyLevel::Mentions), _) => dm || mentioned,
-                    (Some(NotifyLevel::Muted), _) => false,
-                    (None, 0) => true,
-                    (None, 1) => dm || mentioned,
-                    (None, _) => false,
-                };
+                let wanted = breakthrough
+                    || rule_eval.is_priority_highlight()
+                    || match (level, settings.notify_level) {
+                        (Some(NotifyLevel::Everything), _) => true,
+                        (Some(NotifyLevel::Mentions), _) => dm || mentioned,
+                        (Some(NotifyLevel::Muted), _) => false,
+                        (None, 0) => true,
+                        (None, 1) => dm || mentioned,
+                        (None, _) => false,
+                    };
                 if !wanted {
                     return;
                 }
@@ -318,7 +355,7 @@ impl App {
                 } else {
                     "New message".to_owned()
                 };
-                let (title, body) = match conv.kind() {
+                let (raw_title, body) = match conv.kind() {
                     ConversationKind::Im => (format!("{ws_name} — {sender}"), text),
                     ConversationKind::Mpim => (
                         format!("{ws_name} — {}", conv.name.as_deref().unwrap_or("Group DM")),
@@ -329,8 +366,22 @@ impl App {
                         format!("{sender}: {text}"),
                     ),
                 };
+                let title = if rule_eval.is_priority_highlight() {
+                    format!("\u{2605} {raw_title}")
+                } else {
+                    raw_title
+                };
                 let tag = format!("bg:{ws_index}:{channel}:{}", message.ts);
-                self.system_notification_kind(&tag, &title, &body, dm || mentioned, cx);
+                self.system_notification_with_breakthrough(
+                    &tag,
+                    &title,
+                    &body,
+                    dm || mentioned
+                        || rule_eval.breaks_through_mute()
+                        || rule_eval.is_priority_highlight(),
+                    breakthrough,
+                    cx,
+                );
                 if sender_is_vip {
                     let vip_sound = self.preferences.read(cx).settings().vip_sound;
                     self.play_sound(vip_sound, cx);
