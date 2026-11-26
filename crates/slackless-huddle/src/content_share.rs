@@ -17,11 +17,11 @@ use tokio::sync::mpsc;
 use webrtc::peer_connection::RTCPeerConnectionState;
 
 use crate::audio::ring::SpscRing;
-use crate::backend::platform_backend;
+use crate::backend::{ScreenShareConfig, platform_backend};
 use crate::metrics::HuddlePerfCounters;
 use crate::proto::sdk_signal_frame;
 use crate::rtc::{ChimeRtcPeer, VideoSenderFeedback};
-use crate::screen::ScreenCapture;
+use crate::screen::{SCREEN_BITRATE_BPS, SCREEN_MAX_FPS, SCREEN_MAX_H, SCREEN_MAX_W};
 use crate::signaling::{
     ChimeSignalClient, ClientMetricsSnapshot, build_client_metric_frame,
     build_content_subscribe_frame, build_join_frame, decode_sdp_answer,
@@ -162,7 +162,19 @@ impl ContentShareSession {
         let (h264_tx, mut h264_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (video_fb_tx, mut video_fb_rx) = mpsc::unbounded_channel::<VideoSenderFeedback>();
         rtc.attach_video_feedback(video_fb_tx).await;
-        let capture = ScreenCapture::start(source_id, h264_tx, preview_tx, perf)?;
+        let capture = platform_backend().start_screen_share(
+            ScreenShareConfig {
+                source_id,
+                max_w: SCREEN_MAX_W,
+                max_h: SCREEN_MAX_H,
+                max_fps: SCREEN_MAX_FPS,
+                bitrate_bps: SCREEN_BITRATE_BPS,
+            },
+            h264_tx,
+            preview_tx,
+            Arc::clone(&perf),
+        )?;
+        let video = rtc.video_sender();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -301,7 +313,7 @@ impl ContentShareSession {
             metric_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut connected = false;
             let mut sent_first_frame = false;
-            let mut last_abr_bps: u32 = crate::screen::SCREEN_BITRATE_BPS;
+            let mut last_abr_bps: u32 = SCREEN_BITRATE_BPS;
 
             loop {
                 tokio::select! {
@@ -335,7 +347,7 @@ impl ContentShareSession {
                     }
                     Some(annex_b) = h264_rx.recv() => {
                         if connected {
-                            match rtc.write_h264_frame(annex_b, Duration::from_millis(33)).await {
+                            match video.write_h264_frame(annex_b, Duration::from_millis(33)).await {
                                 Ok(()) if !sent_first_frame => {
                                     sent_first_frame = true;
                                     tracing::info!("#content first H.264 screen frame sent");
@@ -370,8 +382,9 @@ impl ContentShareSession {
             }
 
             running.store(false, Ordering::Relaxed);
-            // `ScreenCapture` teardown waits on ScreenCaptureKit (up to 1.5 s): keep it off the executor.
+            // Screen capture teardown waits on ScreenCaptureKit (up to 1.5 s): keep it off the executor.
             let _ = tokio::task::spawn_blocking(move || drop(capture)).await;
+            perf.clear_tx();
             sig.send_leave_and_close(Duration::from_millis(300)).await;
             rtc.close().await;
             let _ = done_tx.send(());

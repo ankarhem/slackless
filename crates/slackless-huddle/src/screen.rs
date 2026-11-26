@@ -6,13 +6,7 @@
 //! - Cross-platform fallback: tuned `xcap` + single-pass integer area-averaged downscaling +
 //!   OpenH264 `ScreenContentRealTime` (`1920x1200` @ 20 fps, 2.8 Mbps, dirty-frame skip).
 
-use std::sync::Arc;
-
-use tokio::sync::mpsc;
-
-use crate::Result;
-use crate::backend::{ScreenShareConfig, ScreenShareHandle, platform_backend};
-use crate::metrics::HuddlePerfCounters;
+use crate::backend::platform_backend;
 use crate::video::VideoFrame;
 
 /// Maximum dimensions for crisp 1080p/16:10 screen share encoding (even dimensions for YUV420).
@@ -245,56 +239,6 @@ fn downscale_rgba_thumbnail(
         },
     );
     Some(VideoFrame::from_bgra(dw, dh, bgra))
-}
-
-/// Active screen/window capture session backed by the active platform [`crate::backend::MediaBackend`].
-pub struct ScreenCapture {
-    backend: Box<dyn ScreenShareHandle>,
-    perf: Arc<HuddlePerfCounters>,
-}
-
-impl ScreenCapture {
-    pub fn start(
-        source_id: String,
-        outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        preview_tx: mpsc::UnboundedSender<VideoFrame>,
-        perf: Arc<HuddlePerfCounters>,
-    ) -> Result<Self> {
-        let backend = platform_backend().start_screen_share(
-            ScreenShareConfig {
-                source_id,
-                max_w: SCREEN_MAX_W,
-                max_h: SCREEN_MAX_H,
-                max_fps: SCREEN_MAX_FPS,
-                bitrate_bps: SCREEN_BITRATE_BPS,
-            },
-            outbound_h264_tx,
-            preview_tx,
-            Arc::clone(&perf),
-        )?;
-        Ok(Self { backend, perf })
-    }
-
-    /// Force an immediate IDR keyframe on the next encoded screen frame.
-    pub fn force_keyframe(&self) {
-        self.backend.force_keyframe();
-    }
-
-    /// Dynamically adjust target encoder bitrate (e.g. from RTCP REMB feedback).
-    pub fn set_target_bitrate(&self, bitrate_bps: u32) {
-        self.backend.set_target_bitrate(bitrate_bps);
-    }
-
-    pub fn stop(&mut self) {
-        self.backend.stop();
-        self.perf.clear_tx();
-    }
-}
-
-impl Drop for ScreenCapture {
-    fn drop(&mut self) {
-        self.stop();
-    }
 }
 
 /// Drains macOS Objective-C autoreleased objects created by `xcap` on plain Rust worker threads.

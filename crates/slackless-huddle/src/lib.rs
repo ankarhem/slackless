@@ -10,8 +10,6 @@ pub mod clips;
 pub mod content_share;
 #[cfg(target_os = "macos")]
 pub mod macos;
-#[cfg(target_os = "macos")]
-pub mod macos_audio_tap;
 pub mod metrics;
 pub mod onnx_runtime;
 pub mod pdf;

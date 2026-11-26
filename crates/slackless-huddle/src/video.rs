@@ -815,67 +815,37 @@ pub fn apply_portrait_blur(rgb: &mut [u8], w: usize, h: usize) {
     }
 }
 
-/// Active webcam capture & H.264 encoder backed by the active platform [`crate::backend::MediaBackend`].
+/// Start webcam capture & H.264 encoding on the active platform [`crate::backend::MediaBackend`]:
 ///
 /// - macOS: hardware `AVCaptureSession` (`420f`) + `VideoToolbox` H.264 High + Vision/Metal blur
 /// - Linux/Windows/fallback: `nokhwa` + `OpenH264`
-pub struct CameraCapture {
-    inner: Box<dyn CameraHandle>,
-}
-
-impl CameraCapture {
-    pub fn start(
-        device_index: Option<usize>,
-        blur_background: bool,
-        compact: bool,
-        outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        preview_tx: mpsc::UnboundedSender<VideoFrame>,
-    ) -> Result<Self> {
-        let (max_w, max_h, bitrate_bps) = if compact {
-            (640, 480, 500_000)
-        } else {
-            (CAMERA_MAX_W, CAMERA_MAX_H, CAMERA_BITRATE_BPS)
-        };
-        let inner = platform_backend().start_camera(
-            CameraConfig {
-                device_index,
-                max_w,
-                max_h,
-                max_fps: CAMERA_MAX_FPS,
-                bitrate_bps,
-                blur_background,
-            },
-            outbound_h264_tx,
-            preview_tx,
-        )?;
-        Ok(Self { inner })
-    }
-
-    pub fn set_blur(&self, enabled: bool) {
-        self.inner.set_blur(enabled);
-    }
-
-    pub fn set_compact(&self, compact: bool) {
-        self.inner.set_compact(compact);
-    }
-
-    pub fn force_keyframe(&self) {
-        self.inner.force_keyframe();
-    }
-
-    pub fn set_target_bitrate(&self, bitrate_bps: u32) {
-        self.inner.set_target_bitrate(bitrate_bps);
-    }
-
-    pub fn stop(&mut self) {
-        self.inner.stop();
-    }
-}
-
-impl Drop for CameraCapture {
-    fn drop(&mut self) {
-        self.stop();
-    }
+///
+/// `compact` caps it at 640x480 / 500 kbps while a screen share runs. The handle stops the
+/// capture when dropped.
+pub(crate) fn start_camera_capture(
+    device_index: Option<usize>,
+    blur_background: bool,
+    compact: bool,
+    outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
+    preview_tx: mpsc::UnboundedSender<VideoFrame>,
+) -> Result<Box<dyn CameraHandle>> {
+    let (max_w, max_h, bitrate_bps) = if compact {
+        (640, 480, 500_000)
+    } else {
+        (CAMERA_MAX_W, CAMERA_MAX_H, CAMERA_BITRATE_BPS)
+    };
+    platform_backend().start_camera(
+        CameraConfig {
+            device_index,
+            max_w,
+            max_h,
+            max_fps: CAMERA_MAX_FPS,
+            bitrate_bps,
+            blur_background,
+        },
+        outbound_h264_tx,
+        preview_tx,
+    )
 }
 
 const PREVIEW_MAX_W: u32 = 320;

@@ -995,13 +995,6 @@ impl ChimeRtcPeer {
         }
     }
 
-    /// Write one Annex-B H.264 video frame onto the local video track.
-    pub async fn write_h264_frame(&self, annex_b: Vec<u8>, duration: Duration) -> Result<()> {
-        self.video_sender()
-            .write_h264_frame(annex_b, duration)
-            .await
-    }
-
     pub fn connection_state(&self) -> RTCPeerConnectionState {
         self.connection_state
             .lock()

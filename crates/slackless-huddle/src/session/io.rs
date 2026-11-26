@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use webrtc::peer_connection::RTCPeerConnectionState;
 
 use crate::audio::{AmbientMusicPlayer, AudioEngine, AudioSharedState};
+use crate::backend::CameraHandle;
 use crate::content_share::ContentShareSession;
 use crate::metrics::HuddlePerfCounters;
 use crate::proto::{
@@ -21,7 +22,7 @@ use crate::rtc::{
     VideoTrackSender,
 };
 use crate::signaling::{ChimeSignalClient, ClientMetricsSnapshot};
-use crate::video::{CameraCapture, VideoFrame};
+use crate::video::{VideoFrame, start_camera_capture};
 use crate::{HuddleAudioConfig, HuddleCredentials, HuddleError, Result};
 
 /// Boxed `Send` future alias keeping trait signatures concise for `clippy::type_complexity`.
@@ -358,7 +359,7 @@ pub(super) struct LiveMediaDevices {
     /// What an audio device switch needs to restart the engine.
     audio_shared: AudioSharedState,
     outbound_opus_tx: mpsc::UnboundedSender<bytes::Bytes>,
-    camera_capture: Option<CameraCapture>,
+    camera_capture: Option<Box<dyn CameraHandle>>,
     content_share: Option<ContentShareSession>,
     music_player: Option<AmbientMusicPlayer>,
 }
@@ -383,7 +384,7 @@ impl LiveMediaDevices {
 impl MediaDevices for LiveMediaDevices {
     type InboundAudio = mpsc::UnboundedReceiver<InboundAudioPacket>;
     type Audio = AudioEngine;
-    type Camera = CameraCapture;
+    type Camera = Box<dyn CameraHandle>;
     type ScreenShare = ContentShareSession;
 
     fn stop_audio(&mut self) {
@@ -455,19 +456,19 @@ impl MediaDevices for LiveMediaDevices {
         compact: bool,
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
         local_cam_tx: mpsc::UnboundedSender<VideoFrame>,
-    ) -> BoxFuture<'static, Result<CameraCapture>> {
+    ) -> BoxFuture<'static, Result<Box<dyn CameraHandle>>> {
         let prev = self.camera_capture.take();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 drop(prev);
-                CameraCapture::start(device_index, blur, compact, outbound_h264_tx, local_cam_tx)
+                start_camera_capture(device_index, blur, compact, outbound_h264_tx, local_cam_tx)
             })
             .await
             .map_err(|e| HuddleError::Video(format!("camera start task panicked: {e}")))?
         })
     }
 
-    fn install_camera(&mut self, camera: CameraCapture) {
+    fn install_camera(&mut self, camera: Box<dyn CameraHandle>) {
         self.camera_capture = Some(camera);
     }
 

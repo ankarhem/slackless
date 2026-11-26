@@ -19,13 +19,12 @@ use super::{
 };
 use crate::audio::ring::SpscRing;
 use crate::macos::{
-    AvVtCameraCapture, CoreAudioDeviceMonitor, MacRoutedAudioLoop, MacVoiceProcessingIo,
-    ScVtScreenCapture, VtAv1Decoder, VtH264Decoder, capture_macos_thumbnails,
+    AvVtCameraCapture, CoreAudioDeviceMonitor, MacRoutedAudioLoop, MacSystemAudioTap,
+    MacVoiceProcessingIo, ScVtScreenCapture, VtAv1Decoder, VtH264Decoder, capture_macos_thumbnails,
     has_screen_capture_permission, list_macos_cameras, measure_audio_file_rms,
     open_screen_capture_settings, play_routed_audio_oneshot, request_screen_capture_permission,
     supports_hw_av1_decode, supports_hw_h264_decode, supports_native_system_audio_tap,
 };
-use crate::macos_audio_tap::SystemAudioTap;
 use crate::metrics::HuddlePerfCounters;
 use crate::video::{CameraDeviceInfo, VideoFrame, select_camera_index};
 use crate::{HuddleError, Result};
@@ -86,7 +85,7 @@ struct MacAudioDeviceMonitor {
 
 impl AudioDeviceMonitorHandle for MacAudioDeviceMonitor {}
 
-impl SystemAudioTapHandle for SystemAudioTap {}
+impl SystemAudioTapHandle for MacSystemAudioTap {}
 
 impl AudioLoopHandle for MacRoutedAudioLoop {
     fn stop(&mut self) {
@@ -422,7 +421,7 @@ impl MediaBackend for MacOsMediaBackend {
         if !supports_native_system_audio_tap() {
             return None;
         }
-        Some(SystemAudioTap::start(ring).map(|t| Box::new(t) as Box<dyn SystemAudioTapHandle>))
+        Some(MacSystemAudioTap::start(ring).map(|t| Box::new(t) as Box<dyn SystemAudioTapHandle>))
     }
 
     fn measure_audio_file_rms(&self, path: &Path) -> Option<f32> {
