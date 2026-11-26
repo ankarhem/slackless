@@ -5,8 +5,12 @@ use rand::RngExt as _;
 use tokio::sync::mpsc;
 use webrtc::peer_connection::RTCPeerConnectionState;
 
+use super::io::{
+    LiveMediaDevices, LiveSessionFactory, MediaDevices, RtcController, RtcSession, SessionFactory,
+    SignalSession, SignalSink,
+};
 use super::supervisor::{LoopExit, classify_handshake_err};
-use crate::audio::{AudioEngine, AudioSharedState};
+use crate::audio::AudioSharedState;
 use crate::backend::platform_backend;
 use crate::proto::{SdkAudioStreamIdInfoFrame, SdkIndexFrame};
 use crate::rtc::{ChimeRtcPeer, InboundVideoPacket, VideoSenderFeedback};
@@ -18,10 +22,10 @@ use crate::{HuddleAudioConfig, HuddleCredentials, HuddleError, HuddleSessionSnap
 
 const HANDSHAKE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub(super) struct HandshakeResult {
-    pub(super) signal: ChimeSignalClient,
-    pub(super) peer: ChimeRtcPeer,
-    pub(super) audio_engine: AudioEngine,
+pub(super) struct HandshakeResult<S = ChimeSignalClient, R = ChimeRtcPeer, M = LiveMediaDevices> {
+    pub(super) signal: S,
+    pub(super) peer: R,
+    pub(super) media: M,
     pub(super) shared: AudioSharedState,
     pub(super) ssrc_to_stream_id: HashMap<u32, u32>,
     pub(super) last_sdp_answer: Option<String>,
@@ -45,61 +49,79 @@ pub(super) struct HandshakeResult {
     pub(super) wants_compressed: bool,
 }
 
-/// Scope guard ensuring the background `AudioEngine::start` task is always stopped if the
+/// Scope guard ensuring the background audio-startup task is always stopped if the
 /// handshake fails or is cancelled before ownership is transferred to `HandshakeResult`.
-struct AudioStartGuard {
-    handle: Option<tokio::task::JoinHandle<Result<AudioEngine>>>,
+struct AudioStartGuard<M: MediaDevices + Send + 'static> {
+    handle: Option<tokio::task::JoinHandle<Result<M>>>,
 }
 
-impl AudioStartGuard {
-    fn new(handle: tokio::task::JoinHandle<Result<AudioEngine>>) -> Self {
+impl<M: MediaDevices + Send + 'static> AudioStartGuard<M> {
+    fn new(handle: tokio::task::JoinHandle<Result<M>>) -> Self {
         Self {
             handle: Some(handle),
         }
     }
 
-    async fn finish(mut self) -> std::result::Result<AudioEngine, LoopExit> {
-        let Some(handle) = self.handle.take() else {
+    async fn finish(mut self) -> std::result::Result<M, LoopExit> {
+        let Some(handle) = self.handle.as_mut() else {
             return Err(LoopExit::Fatal(HuddleError::Audio(
                 "audio start task already consumed".to_owned(),
             )));
         };
-        match handle.await {
-            Ok(Ok(engine)) => Ok(engine),
+        // Await by mutable reference so `self.handle` remains `Some` if this future is cancelled
+        // mid-flight, allowing `Drop` to spawn cleanup and stop the audio engine.
+        let res = handle.await;
+        self.handle = None;
+        match res {
+            Ok(Ok(media)) => Ok(media),
             Ok(Err(e)) => Err(LoopExit::Fatal(e)),
             Err(e) => Err(LoopExit::Fatal(HuddleError::Audio(e.to_string()))),
         }
     }
 
     async fn cancel_and_stop(mut self) {
-        if let Some(handle) = self.handle.take()
-            && let Ok(Ok(mut ae)) = handle.await
-        {
-            ae.stop();
+        if let Some(handle) = self.handle.as_mut() {
+            let res = handle.await;
+            self.handle = None;
+            if let Ok(Ok(mut media)) = res {
+                media.stop_audio();
+            }
         }
     }
 }
 
-impl Drop for AudioStartGuard {
+impl<M: MediaDevices + Send + 'static> Drop for AudioStartGuard<M> {
     fn drop(&mut self) {
         // Fallback when the handshake future is dropped/cancelled mid-flight without calling
         // `finish()` or `cancel_and_stop()`.
         if let Some(handle) = self.handle.take() {
             tokio::spawn(async move {
-                if let Ok(Ok(mut ae)) = handle.await {
-                    ae.stop();
+                if let Ok(Ok(mut media)) = handle.await {
+                    media.stop_audio();
                 }
             });
         }
     }
 }
 
+#[allow(dead_code)]
 pub(super) async fn perform_handshake(
     creds: &HuddleCredentials,
     config: &HuddleAudioConfig,
     snap: &HuddleSessionSnapshot,
     is_reconnect: bool,
 ) -> std::result::Result<HandshakeResult, LoopExit> {
+    let mut factory = LiveSessionFactory;
+    perform_handshake_with(&mut factory, creds, config, snap, is_reconnect).await
+}
+
+pub(super) async fn perform_handshake_with<F: SessionFactory>(
+    factory: &mut F,
+    creds: &HuddleCredentials,
+    config: &HuddleAudioConfig,
+    snap: &HuddleSessionSnapshot,
+    is_reconnect: bool,
+) -> std::result::Result<HandshakeResult<F::Signal, F::Rtc, F::Media>, LoopExit> {
     // 1. Connect Chime signaling WebSocket and send JOIN.
     tracing::info!(
         channel = %creds.channel,
@@ -108,7 +130,7 @@ pub(super) async fn perform_handshake(
         is_reconnect,
         "connecting to Chime huddle signaling"
     );
-    let mut signal = match ChimeSignalClient::connect(creds).await {
+    let mut signal = match factory.connect_signal(creds).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(%e, "Chime signaling connect failed");
@@ -127,25 +149,31 @@ pub(super) async fn perform_handshake(
     let mut pending_audio_info: Vec<SdkAudioStreamIdInfoFrame> = Vec::new();
 
     // 2. Await JOIN_ACK carrying TURN credentials.
-    let join_ack = match signal
-        .wait_for_join_ack(HANDSHAKE_ACK_TIMEOUT, |frame| {
+    let join_ack = {
+        let mut on_other = |frame: &mut crate::proto::SdkSignalFrame| {
             if let Some(idx) = frame.index.take() {
                 pending_index = Some(idx);
             }
             if let Some(info) = frame.audio_stream_id_info.take() {
                 pending_audio_info.push(info);
             }
-        })
-        .await
-    {
-        Ok(ack) => ack,
-        Err(e) => {
-            tracing::error!(%e, "JOIN_ACK failed");
-            return Err(classify_handshake_err(e, is_reconnect));
+        };
+        match signal
+            .wait_for_join_ack(HANDSHAKE_ACK_TIMEOUT, &mut on_other)
+            .await
+        {
+            Ok(ack) => ack,
+            Err(e) => {
+                tracing::error!(%e, "JOIN_ACK failed");
+                return Err(classify_handshake_err(e, is_reconnect));
+            }
         }
     };
 
     let Some(turn) = join_ack.turn_credentials else {
+        signal
+            .send_leave_and_close(Duration::from_millis(400))
+            .await;
         return Err(classify_handshake_err(
             HuddleError::Signaling("JOIN_ACK did not include TURN credentials".to_owned()),
             is_reconnect,
@@ -176,14 +204,12 @@ pub(super) async fn perform_handshake(
     // in parallel with WebRTC ICE gathering & Chime SUBSCRIBE/SUBSCRIBE_ACK so the ~1.5s audio
     // unit startup overlaps completely with network signaling!
     let shared = AudioSharedState::from_config(config);
-    let audio_guard = {
-        let audio_cfg = config.clone();
-        let audio_shared = shared.clone();
-        let audio_out_tx = outbound_opus_tx.clone();
-        AudioStartGuard::new(tokio::task::spawn_blocking(move || {
-            AudioEngine::start(&audio_cfg, audio_shared, audio_out_tx, inbound_opus_rx)
-        }))
-    };
+    let audio_guard = AudioStartGuard::new(factory.spawn_audio_start(
+        config.clone(),
+        shared.clone(),
+        outbound_opus_tx.clone(),
+        inbound_opus_rx,
+    ));
 
     let (cam_fb_tx, cam_fb_rx) = mpsc::unbounded_channel::<VideoSenderFeedback>();
     let backend = platform_backend();
@@ -193,9 +219,23 @@ pub(super) async fn perform_handshake(
         "huddle media backend capabilities"
     );
 
-    // Single fallible block so every WebRTC/SUBSCRIBE failure tears down `audio_guard` once.
-    let rtc_res: Result<(ChimeRtcPeer, HashMap<u32, u32>, Option<String>)> = async {
-        let peer = ChimeRtcPeer::new(&turn, inbound_opus_tx, inbound_video_tx, pc_state_tx).await?;
+    let peer = match factory
+        .create_rtc(&turn, inbound_opus_tx, inbound_video_tx, pc_state_tx)
+        .await
+    {
+        Ok(peer) => peer,
+        Err(e) => {
+            audio_guard.cancel_and_stop().await;
+            signal
+                .send_leave_and_close(Duration::from_millis(400))
+                .await;
+            return Err(classify_handshake_err(e, is_reconnect));
+        }
+    };
+
+    // Single fallible block so every post-peer failure closes `peer`, stops `audio_guard`, and
+    // sends Chime `LEAVE` before returning.
+    let sub_res: Result<(HashMap<u32, u32>, Option<String>)> = async {
         peer.attach_video_feedback(cam_fb_tx).await;
         let sdp_offer = peer.create_gathered_offer().await?;
 
@@ -210,17 +250,20 @@ pub(super) async fn perform_handshake(
         )?;
         signal.send_frame(&sub).await?;
 
-        let sub_ack = signal
-            .wait_for_subscribe_ack(HANDSHAKE_ACK_TIMEOUT, |frame| {
+        let sub_ack = {
+            let mut on_other = |frame: &mut crate::proto::SdkSignalFrame| {
                 if let Some(idx) = frame.index.take() {
                     pending_index = Some(idx);
                 }
                 if let Some(info) = frame.audio_stream_id_info.take() {
                     pending_audio_info.push(info);
                 }
-            })
-            .await
-            .inspect_err(|e| tracing::error!(%e, "initial SUBSCRIBE_ACK failed"))?;
+            };
+            signal
+                .wait_for_subscribe_ack(HANDSHAKE_ACK_TIMEOUT, &mut on_other)
+                .await
+                .inspect_err(|e| tracing::error!(%e, "initial SUBSCRIBE_ACK failed"))?
+        };
 
         let mut ssrc_to_stream_id: HashMap<u32, u32> = HashMap::new();
         for tm in &sub_ack.tracks {
@@ -243,25 +286,40 @@ pub(super) async fn perform_handshake(
             buffered_index = pending_index.is_some(),
             "initial SUBSCRIBE_ACK applied"
         );
-        Ok((peer, ssrc_to_stream_id, last_sdp_answer))
+        Ok((ssrc_to_stream_id, last_sdp_answer))
     }
     .await;
 
-    let (peer, ssrc_to_stream_id, last_sdp_answer) = match rtc_res {
+    let (ssrc_to_stream_id, last_sdp_answer) = match sub_res {
         Ok(ok) => ok,
         Err(e) => {
             audio_guard.cancel_and_stop().await;
+            signal
+                .send_leave_and_close(Duration::from_millis(400))
+                .await;
+            peer.close().await;
             return Err(classify_handshake_err(e, is_reconnect));
         }
     };
 
     // 5. Collect the full-duplex audio engine started in parallel with signaling above.
-    let audio_engine = audio_guard.finish().await?;
+    // If local audio startup fails after WebRTC + Chime JOIN succeeded, tear down both cleanly so
+    // we never leak an open peer connection or leave a ghost attendee in the meeting.
+    let media = match audio_guard.finish().await {
+        Ok(media) => media,
+        Err(exit) => {
+            signal
+                .send_leave_and_close(Duration::from_millis(400))
+                .await;
+            peer.close().await;
+            return Err(exit);
+        }
+    };
 
     Ok(HandshakeResult {
         signal,
         peer,
-        audio_engine,
+        media,
         shared,
         ssrc_to_stream_id,
         last_sdp_answer,

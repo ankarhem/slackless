@@ -4,29 +4,31 @@ use std::sync::atomic::Ordering;
 use slackless_types::UserId;
 
 use super::connected::{SessionRuntime, announce_screen_share_capabilities};
+use super::io::{MediaDevices, RtcController, SignalSink};
 use super::supervisor::LoopExit;
 use super::video_rx::same_remote_video_sources;
 use crate::peer_message::{
     CHIME_TRANSCRIPTION_TOPIC, SLACK_DATA_CHANNEL_TOPIC, decode_chime_transcript_frame,
     decode_slack_peer_message,
 };
-use crate::proto::{SdkDataMessagePayload, SdkIndexFrame, SdkSignalFrame};
-use crate::rtc::ChimeRtcPeer;
+use crate::proto::{
+    SdkAudioStreamIdInfoFrame, SdkDataMessagePayload, SdkIndexFrame, SdkSignalFrame,
+};
 use crate::signaling::{
-    ChimeSignalClient, RemoteVideoSource, build_audio_control_frame,
-    build_remote_video_update_frame, build_subscribe_frame, decode_sdp_answer_with_prev, now_ms,
-    parse_external_user_id, parse_index_sources_with_lookup,
+    RemoteVideoSource, build_audio_control_frame, build_remote_video_update_frame,
+    build_subscribe_frame, decode_sdp_answer_with_prev, now_ms, parse_external_user_id,
+    parse_index_sources_with_lookup,
 };
 use crate::video::VideoTileKey;
 use crate::{HuddleAudioConfig, HuddleDataEvent, HuddleError, HuddleSessionSnapshot, HuddleUpdate};
 
-pub(super) async fn handle_signal_frame(
+pub(super) async fn handle_signal_frame<R: RtcController, S: SignalSink, M: MediaDevices>(
     frame: SdkSignalFrame,
     config: &mut HuddleAudioConfig,
     snap: &mut HuddleSessionSnapshot,
-    peer: &ChimeRtcPeer,
-    signal: &mut ChimeSignalClient,
-    state: &mut SessionRuntime<'_>,
+    peer: &R,
+    signal: &mut S,
+    state: &mut SessionRuntime<'_, M>,
 ) -> Option<LoopExit> {
     if let Some(pp) = frame.ping_pong
         && signal.reply_ping_if_needed(&pp).await
@@ -99,36 +101,7 @@ pub(super) async fn handle_signal_frame(
         }
     }
     if let Some(info) = frame.audio_stream_id_info {
-        let mut new_peer_joined = false;
-        for stream in info.streams {
-            let Some(sid) = stream.audio_stream_id else {
-                continue;
-            };
-            if stream.dropped == Some(true) {
-                if let Some(uid) = state.stream_users.remove(&sid) {
-                    state.muted_peers.remove(&uid);
-                }
-                continue;
-            }
-            if let Some(uid) = stream
-                .external_user_id
-                .as_deref()
-                .and_then(parse_external_user_id)
-            {
-                if let Some(att) = stream.attendee_id.as_deref() {
-                    let base = att.strip_suffix("#content").unwrap_or(att);
-                    state.attendee_to_user.insert(base.to_owned(), uid.clone());
-                }
-                if state.stream_users.insert(sid, uid.clone()).is_none() && uid != state.self_user {
-                    new_peer_joined = true;
-                }
-                if stream.muted == Some(true) {
-                    state.muted_peers.insert(uid);
-                } else {
-                    state.muted_peers.remove(&uid);
-                }
-            }
-        }
+        let new_peer_joined = apply_audio_stream_info(info, state);
         // Re-announce desktop draw capabilities + content source details when
         // a new peer joins while we are already sharing so late joiners can
         // immediately draw on our screen share.
@@ -172,13 +145,61 @@ pub(super) async fn handle_signal_frame(
     None
 }
 
-pub(super) async fn apply_index_frame(
+/// Fold one `AUDIO_STREAM_ID_INFO` frame into `state` (attendee mapping, active stream users,
+/// muted peers, and dropped-stream cleanup). Shared between buffered handshake frames and live
+/// signaling so mute/unmute/drop transitions during handshake never drift.
+///
+/// Returns `true` if at least one new non-self peer joined in this frame.
+pub(super) fn apply_audio_stream_info<M: MediaDevices>(
+    info: SdkAudioStreamIdInfoFrame,
+    state: &mut SessionRuntime<'_, M>,
+) -> bool {
+    let mut new_peer_joined = false;
+    for stream in info.streams {
+        if let (Some(att), Some(uid)) = (
+            stream.attendee_id.as_deref(),
+            stream
+                .external_user_id
+                .as_deref()
+                .and_then(parse_external_user_id),
+        ) {
+            let base = att.strip_suffix("#content").unwrap_or(att);
+            state.attendee_to_user.insert(base.to_owned(), uid);
+        }
+        let Some(sid) = stream.audio_stream_id else {
+            continue;
+        };
+        if stream.dropped == Some(true) {
+            if let Some(uid) = state.stream_users.remove(&sid) {
+                state.muted_peers.remove(&uid);
+            }
+            continue;
+        }
+        if let Some(uid) = stream
+            .external_user_id
+            .as_deref()
+            .and_then(parse_external_user_id)
+        {
+            if state.stream_users.insert(sid, uid.clone()).is_none() && uid != state.self_user {
+                new_peer_joined = true;
+            }
+            if stream.muted == Some(true) {
+                state.muted_peers.insert(uid);
+            } else {
+                state.muted_peers.remove(&uid);
+            }
+        }
+    }
+    new_peer_joined
+}
+
+pub(super) async fn apply_index_frame<R: RtcController, S: SignalSink, M: MediaDevices>(
     index: &SdkIndexFrame,
     config: &HuddleAudioConfig,
     snap: &HuddleSessionSnapshot,
-    peer: &ChimeRtcPeer,
-    signal: &mut ChimeSignalClient,
-    state: &mut SessionRuntime<'_>,
+    peer: &R,
+    signal: &mut S,
+    state: &mut SessionRuntime<'_, M>,
 ) {
     // Ignore our own camera and our own `#content` screen share.
     let next_raw: Vec<RemoteVideoSource> = if snap.audio_only {

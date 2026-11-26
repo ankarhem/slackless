@@ -2,31 +2,29 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::connected::{SessionRuntime, announce_screen_share_capabilities};
+use super::io::{MediaDevices, RtcController, SignalSink};
 use super::supervisor::LoopExit;
-use crate::audio::AudioEngine;
-use crate::content_share::ContentShareSession;
 use crate::peer_message::{
     SLACK_DATA_CHANNEL_TOPIC, build_capabilities_message, build_draw_message,
     build_jukebox_message, build_mute_request_message, build_reacji_message,
     build_sticky_emoji_awareness,
 };
-use crate::rtc::ChimeRtcPeer;
 use crate::signaling::{
-    ChimeSignalClient, build_audio_control_frame, build_data_message_frame,
-    build_remote_video_update_frame, build_subscribe_frame, now_ms,
+    build_audio_control_frame, build_data_message_frame, build_remote_video_update_frame,
+    build_subscribe_frame, now_ms,
 };
-use crate::video::{CameraCapture, VideoTileKey};
+use crate::video::VideoTileKey;
 use crate::{
     HuddleAudioConfig, HuddleControl, HuddleDataEvent, HuddleSessionSnapshot, HuddleUpdate,
 };
 
-pub(super) async fn handle_control(
+pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevices>(
     ctrl: Option<HuddleControl>,
     config: &mut HuddleAudioConfig,
     snap: &mut HuddleSessionSnapshot,
-    peer: &ChimeRtcPeer,
-    signal: &mut ChimeSignalClient,
-    state: &mut SessionRuntime<'_>,
+    peer: &R,
+    signal: &mut S,
+    state: &mut SessionRuntime<'_, M>,
 ) -> Option<LoopExit> {
     match ctrl {
         Some(HuddleControl::SetMuted(muted)) => {
@@ -60,18 +58,17 @@ pub(super) async fn handle_control(
             snap.input_device = input;
             snap.output_device = output;
             let inbound_rx = state
-                .audio_engine
-                .stop()
-                .or_else(|| state.parked_inbound_opus_rx.take());
+                .media
+                .stop_audio()
+                .or_else(|| state.parked_inbound_audio.take());
             if let Some(rx) = inbound_rx {
-                match AudioEngine::start_recoverable(
+                match state.media.start_audio_recoverable(
                     config,
                     state.shared.clone(),
                     state.outbound_opus_tx.clone(),
                     rx,
                 ) {
-                    Ok(restarted) => {
-                        state.audio_engine = restarted;
+                    Ok(()) => {
                         snap.error = None;
                     }
                     Err((err, recovered_rx)) => {
@@ -81,22 +78,17 @@ pub(super) async fn handle_control(
                         config.output_device = prev_output.clone();
                         snap.input_device = prev_input;
                         snap.output_device = prev_output;
-                        match AudioEngine::start_recoverable(
+                        if let Err((revert_err, parked_rx)) = state.media.start_audio_recoverable(
                             config,
                             state.shared.clone(),
                             state.outbound_opus_tx.clone(),
                             recovered_rx,
                         ) {
-                            Ok(reverted) => {
-                                state.audio_engine = reverted;
-                            }
-                            Err((revert_err, parked_rx)) => {
-                                tracing::error!(
-                                    %revert_err,
-                                    "failed to revert huddle audio devices; preserving rx for retry"
-                                );
-                                state.parked_inbound_opus_rx = Some(parked_rx);
-                            }
+                            tracing::error!(
+                                %revert_err,
+                                "failed to revert huddle audio devices; preserving rx for retry"
+                            );
+                            state.parked_inbound_audio = Some(parked_rx);
                         }
                     }
                 }
@@ -114,18 +106,14 @@ pub(super) async fn handle_control(
             config.blur_background = blur;
             snap.blur_background = blur;
             if enabled {
-                if let Some(mut prev) = state.camera_capture.take() {
-                    prev.stop();
-                }
-                match CameraCapture::start(
+                match state.media.start_camera(
                     device_index,
                     blur,
                     snap.sharing,
                     state.outbound_h264_tx.clone(),
                     state.local_cam_tx.clone(),
                 ) {
-                    Ok(cap) => {
-                        state.camera_capture = Some(cap);
+                    Ok(()) => {
                         snap.video = true;
                         snap.error = None;
                         if let Ok(offer) = peer.create_gathered_offer().await
@@ -147,9 +135,7 @@ pub(super) async fn handle_control(
                     }
                 }
             } else {
-                if let Some(mut cap) = state.camera_capture.take() {
-                    cap.stop();
-                }
+                state.media.stop_camera();
                 snap.video = false;
                 let _ = state
                     .updates
@@ -174,9 +160,7 @@ pub(super) async fn handle_control(
         Some(HuddleControl::SetBlurBackground(blur)) => {
             config.blur_background = blur;
             snap.blur_background = blur;
-            if let Some(cap) = &state.camera_capture {
-                cap.set_blur(blur);
-            }
+            state.media.set_camera_blur(blur);
             let _ = state
                 .updates
                 .send(HuddleUpdate::State(Box::new(snap.clone())));
@@ -185,29 +169,26 @@ pub(super) async fn handle_control(
             source_id,
             share_audio,
         }) => {
-            if let Some(mut prev) = state.content_share.take() {
-                prev.stop_and_wait().await;
-            }
+            state.media.stop_screen_share().await;
             if let Some(src_id) = source_id {
                 // Native `#content` second Chime session — runs simultaneously with camera!
-                match ContentShareSession::start(
-                    state.creds.clone(),
-                    src_id.clone(),
-                    share_audio,
-                    state.local_screen_tx.clone(),
-                    Arc::clone(&state.perf),
-                )
-                .await
+                match state
+                    .media
+                    .start_screen_share(
+                        state.creds.clone(),
+                        src_id.clone(),
+                        share_audio,
+                        state.local_screen_tx.clone(),
+                        Arc::clone(&state.perf),
+                    )
+                    .await
                 {
-                    Ok(cs) => {
-                        snap.screen_audio_device = cs.loopback_device().map(ToOwned::to_owned);
-                        state.content_share = Some(cs);
+                    Ok(loopback_device) => {
+                        snap.screen_audio_device = loopback_device;
                         snap.sharing = true;
                         snap.share_source_id = Some(src_id.clone());
                         snap.error = None;
-                        if let Some(cap) = &state.camera_capture {
-                            cap.set_compact(true);
-                        }
+                        state.media.set_camera_compact(true);
                         announce_screen_share_capabilities(
                             &state.creds.attendee_id,
                             signal,
@@ -229,9 +210,7 @@ pub(super) async fn handle_control(
             } else {
                 snap.sharing = false;
                 snap.share_source_id = None;
-                if let Some(cap) = &state.camera_capture {
-                    cap.set_compact(false);
-                }
+                state.media.set_camera_compact(false);
                 let cap_bytes = build_capabilities_message(&state.creds.attendee_id, false);
                 let _ = signal
                     .send_frame(&build_data_message_frame(
@@ -367,8 +346,7 @@ pub(super) async fn handle_control(
             snap.audio_only = audio_only;
             state.vdec_audio_only.store(audio_only, Ordering::Relaxed);
             if audio_only {
-                if let Some(mut cap) = state.camera_capture.take() {
-                    cap.stop();
+                if state.media.stop_camera() {
                     snap.video = false;
                     let _ = state
                         .updates

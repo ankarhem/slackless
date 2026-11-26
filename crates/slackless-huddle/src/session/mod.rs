@@ -10,6 +10,7 @@
 mod connected;
 mod controls;
 mod handshake;
+mod io;
 mod signaling_handlers;
 mod supervisor;
 #[cfg(test)]

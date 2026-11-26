@@ -8,43 +8,42 @@ use tokio::sync::mpsc;
 use webrtc::peer_connection::RTCPeerConnectionState;
 
 use super::controls::handle_control;
-use super::handshake::perform_handshake;
+use super::handshake::perform_handshake_with;
+use super::io::{
+    LiveMediaDevices, LiveSessionFactory, MediaDevices, RtcSession, SessionFactory, SignalSession,
+    SignalSink, VideoTrackOut,
+};
 use super::signaling_handlers::{
-    apply_index_frame, content_share_source_type, handle_signal_frame,
+    apply_audio_stream_info, apply_index_frame, content_share_source_type, handle_signal_frame,
 };
 use super::supervisor::{LoopExit, classify_handshake_err, classify_signal_close, now_secs};
 use super::video_rx::{VideoDecoderThreadArgs, VideoRoutingTable, spawn_video_decoder_thread};
-use crate::audio::{AmbientMusicPlayer, AudioEngine, AudioSharedState};
-use crate::content_share::ContentShareSession;
+use crate::audio::AudioSharedState;
 use crate::metrics::{HuddlePerfCounters, ProcessResourceSampler};
 use crate::peer_message::{
     SLACK_DATA_CHANNEL_TOPIC, build_capabilities_message, build_content_share_details_message,
 };
-use crate::rtc::{InboundAudioPacket, InboundVideoPacket, VideoSenderFeedback};
+use crate::rtc::{InboundVideoPacket, VideoSenderFeedback};
 use crate::signaling::{
-    ChimeSignalClient, RemoteVideoSource, build_client_metric_frame, build_data_message_frame,
-    parse_external_user_id,
+    RemoteVideoSource, build_client_metric_frame, build_data_message_frame, parse_external_user_id,
 };
-use crate::video::{CameraCapture, VideoFrame, VideoTileKey};
+use crate::video::{VideoFrame, VideoTileKey};
 use crate::{
     HuddleAudioConfig, HuddleAudioLevels, HuddleControl, HuddleCredentials, HuddleError,
     HuddlePhase, HuddleSessionSnapshot, HuddleUpdate,
 };
 
-pub(super) struct SessionRuntime<'a> {
+pub(super) struct SessionRuntime<'a, M: MediaDevices = LiveMediaDevices> {
     pub(super) creds: &'a HuddleCredentials,
     pub(super) updates: &'a mpsc::UnboundedSender<HuddleUpdate>,
     pub(super) wants_compressed: bool,
     pub(super) self_user: UserId,
     pub(super) self_content_attendee: String,
-    pub(super) audio_engine: AudioEngine,
-    /// Preserved inbound Opus receiver if an audio hot-swap fails to restart both the new and
+    pub(super) media: M,
+    /// Preserved inbound audio stream if an audio hot-swap fails to restart both the new and
     /// previous devices, so a subsequent `SetAudioDevices` can recover session audio cleanly.
-    pub(super) parked_inbound_opus_rx: Option<mpsc::UnboundedReceiver<InboundAudioPacket>>,
+    pub(super) parked_inbound_audio: Option<M::InboundAudio>,
     pub(super) shared: AudioSharedState,
-    pub(super) camera_capture: Option<CameraCapture>,
-    pub(super) content_share: Option<ContentShareSession>,
-    pub(super) music_player: Option<AmbientMusicPlayer>,
     pub(super) remote_sources: Vec<(String, RemoteVideoSource)>,
     pub(super) active_remote_tiles: HashSet<VideoTileKey>,
     pub(super) stream_users: HashMap<u32, UserId>,
@@ -65,9 +64,9 @@ pub(super) struct SessionRuntime<'a> {
 
 /// Announce desktop draw capability + content source details on official `"data-channel"`
 /// (`desktop:screen` / `desktop:window` is required by Official Slack to enable remote drawing).
-pub(super) async fn announce_screen_share_capabilities(
+pub(super) async fn announce_screen_share_capabilities<S: SignalSink>(
     attendee_id: &str,
-    signal: &mut ChimeSignalClient,
+    signal: &mut S,
     src_id: &str,
 ) {
     let cap_bytes = build_capabilities_message(attendee_id, true);
@@ -89,19 +88,14 @@ pub(super) async fn announce_screen_share_capabilities(
         .await;
 }
 
-impl SessionRuntime<'_> {
+impl<M: MediaDevices> SessionRuntime<'_, M> {
     /// Stop any active ambient jukebox player and optionally start a new track.
     pub(super) fn set_jukebox_player(
         &mut self,
         output_device: Option<String>,
         song_key: Option<&str>,
     ) {
-        if let Some(mut prev) = self.music_player.take() {
-            prev.stop();
-        }
-        if song_key.is_some() {
-            self.music_player = AmbientMusicPlayer::start(output_device, song_key).ok();
-        }
+        self.media.set_jukebox(output_device, song_key);
     }
 }
 
@@ -114,7 +108,32 @@ pub(super) async fn run_connected_loop(
     updates: &mpsc::UnboundedSender<HuddleUpdate>,
     is_reconnect: bool,
 ) -> LoopExit {
-    let hs = match perform_handshake(creds, config, snap, is_reconnect).await {
+    let mut factory = LiveSessionFactory;
+    run_connected_loop_with(
+        &mut factory,
+        creds,
+        config,
+        snap,
+        ctrl_rx,
+        pending_controls,
+        updates,
+        is_reconnect,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_connected_loop_with<F: SessionFactory>(
+    factory: &mut F,
+    creds: &HuddleCredentials,
+    config: &mut HuddleAudioConfig,
+    snap: &mut HuddleSessionSnapshot,
+    ctrl_rx: &mut mpsc::UnboundedReceiver<HuddleControl>,
+    pending_controls: &mut VecDeque<HuddleControl>,
+    updates: &mpsc::UnboundedSender<HuddleUpdate>,
+    is_reconnect: bool,
+) -> LoopExit {
+    let hs = match perform_handshake_with(factory, creds, config, snap, is_reconnect).await {
         Ok(hs) => hs,
         Err(exit) => return exit,
     };
@@ -201,12 +220,9 @@ pub(super) async fn run_connected_loop(
         wants_compressed: hs.wants_compressed,
         self_user,
         self_content_attendee,
-        audio_engine: hs.audio_engine,
-        parked_inbound_opus_rx: None,
+        media: hs.media,
+        parked_inbound_audio: None,
         shared: hs.shared,
-        camera_capture: None,
-        content_share: None,
-        music_player: None,
         remote_sources: Vec::new(),
         active_remote_tiles: HashSet::new(),
         stream_users: HashMap::new(),
@@ -227,26 +243,7 @@ pub(super) async fn run_connected_loop(
 
     // Apply any AUDIO_STREAM_ID_INFO and INDEX frames captured during the initial handshake.
     for info in pending_audio_info.drain(..) {
-        for stream in info.streams {
-            if let (Some(att), Some(uid)) = (
-                stream.attendee_id.as_deref(),
-                stream
-                    .external_user_id
-                    .as_deref()
-                    .and_then(parse_external_user_id),
-            ) {
-                let base = att.strip_suffix("#content").unwrap_or(att);
-                state.attendee_to_user.insert(base.to_owned(), uid.clone());
-                if let Some(sid) = stream.audio_stream_id
-                    && stream.dropped != Some(true)
-                {
-                    state.stream_users.insert(sid, uid.clone());
-                    if stream.muted == Some(true) {
-                        state.muted_peers.insert(uid);
-                    }
-                }
-            }
-        }
+        let _ = apply_audio_stream_info(info, &mut state);
     }
     if let Some(index) = pending_index.take() {
         apply_index_frame(&index, config, snap, &peer, &mut signal, &mut state).await;
@@ -285,12 +282,10 @@ pub(super) async fn run_connected_loop(
                 let _ = peer.write_opus_frame(opus_pkt).await;
             }
             Some(fb) = cam_fb_rx.recv() => {
-                if let Some(cap) = &state.camera_capture {
-                    match fb {
-                        VideoSenderFeedback::ForceKeyframe => cap.force_keyframe(),
-                        VideoSenderFeedback::TargetBitrateBps(bps) => {
-                            cap.set_target_bitrate(bps.clamp(350_000, 1_500_000));
-                        }
+                match fb {
+                    VideoSenderFeedback::ForceKeyframe => state.media.force_camera_keyframe(),
+                    VideoSenderFeedback::TargetBitrateBps(bps) => {
+                        state.media.set_camera_target_bitrate(bps.clamp(350_000, 1_500_000));
                     }
                 }
             }
@@ -483,15 +478,9 @@ pub(super) async fn run_connected_loop(
 
     // 7. Clean teardown: stop captures, content share, music, send Chime LEAVE, close peer & WS.
     tracing::info!("tearing down huddle session cleanly");
-    if let Some(mut cam) = state.camera_capture.take() {
-        cam.stop();
-    }
-    if let Some(mut cs) = state.content_share.take() {
-        cs.stop_and_wait().await;
-    }
-    if let Some(mut mp) = state.music_player.take() {
-        mp.stop();
-    }
+    state.media.stop_camera();
+    state.media.stop_screen_share().await;
+    state.media.set_jukebox(None, None);
     snap.packets_sent = peer.total_packets_sent();
     snap.packets_received = peer.total_packets_received();
     snap.phase = HuddlePhase::Leaving;
@@ -499,7 +488,7 @@ pub(super) async fn run_connected_loop(
     signal
         .send_leave_and_close(Duration::from_millis(800))
         .await;
-    state.audio_engine.stop();
+    state.media.stop_audio();
     video_tx_task.abort();
     vdec_fwd.abort();
     let _ = vdec_tx.send(None);
