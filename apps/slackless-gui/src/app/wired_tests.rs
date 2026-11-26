@@ -559,6 +559,121 @@ fn wired_multi_workspace_event_isolation_and_switching(cx: &mut gpui::TestAppCon
 }
 
 #[gpui::test]
+fn wired_pending_dm_delivers_only_to_the_dm_it_was_addressed_to(cx: &mut gpui::TestAppContext) {
+    let people = [
+        user("U0ME", "me"),
+        user("U0ALICE", "alice"),
+        user("U0BOB", "bob"),
+    ];
+    let (bridge, core) =
+        cx.update(|cx| make_wired_workspace("T0DM", "DM Co", &[("C0GEN", "general")], &people, cx));
+    let fx = bridge.snapshot(&HashMap::new()).expect("snapshot");
+    let (root, app, cx) = mount_wired(fx, vec![bridge], cx);
+    let _ = core.drain_commands();
+    let (alice, bob) = (UserId::from("U0ALICE"), UserId::from("U0BOB"));
+    let pending = |cx: &mut gpui::App| app.read(cx).pending_dm.is_some();
+    // The core stores a DM before announcing that it opened.
+    let announce = |dm: Conversation, cx: &mut gpui::App| {
+        core.store()
+            .lock()
+            .expect("store lock")
+            .upsert_conversation(&TeamId::from("T0DM"), &dm)
+            .expect("upsert DM");
+        core.emit(Event::ConversationOpened(dm.id.clone()), cx);
+    };
+
+    // 1. New message to Alice, who has no IM yet: the text waits while the core opens one.
+    cx.update(|_, cx| {
+        app.read(cx).compose.clone().update(cx, |_, cx| {
+            cx.emit(NewMessageEvent::OpenDm {
+                users: vec![alice.clone()],
+                content: MessageContent::plain("for alice"),
+            });
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        core.drain_commands().iter().any(|c| matches!(
+            c,
+            Command::Channel(ChannelCommand::OpenDm { users }) if users.len() == 1 && users[0] == alice
+        )),
+        "the GUI must ask the core to open Alice's DM"
+    );
+
+    // 2. Meanwhile the hover card opens Bob's DM: Alice's text must not land there.
+    cx.update(|_, cx| {
+        announce(
+            Conversation {
+                id: ChannelId::from("D0BOB"),
+                is_im: true,
+                user: Some(bob.clone()),
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let cmds = core.drain_commands();
+    assert!(
+        !cmds.iter().any(|c| matches!(c, Command::Messaging(_))),
+        "text typed for Alice must never post to the DM that opened meanwhile: {cmds:?}"
+    );
+    assert!(
+        cx.update(|_, cx| pending(cx)),
+        "Alice's text keeps waiting for her DM"
+    );
+
+    // 3. Her DM opens: the text goes there.
+    cx.update(|_, cx| {
+        announce(
+            Conversation {
+                id: ChannelId::from("D0ALICE"),
+                is_im: true,
+                user: Some(alice.clone()),
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let cmds = core.drain_commands();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Messaging(MessagingCommand::SendMessage { channel, content, .. })
+                if channel.as_str() == "D0ALICE" && content.text == "for alice"
+        )),
+        "Alice's DM opening delivers the text to it: {cmds:?}"
+    );
+    assert!(!cx.update(|_, cx| pending(cx)));
+
+    // 4. A failed `conversations.open` drops the waiting text instead of leaving it for the
+    //    next DM that opens.
+    cx.update(|_, cx| {
+        app.read(cx).compose.clone().update(cx, |_, cx| {
+            cx.emit(NewMessageEvent::OpenDm {
+                users: vec![alice.clone()],
+                content: MessageContent::plain("for alice again"),
+            });
+        });
+    });
+    cx.run_until_parked();
+    let _ = core.drain_commands();
+    cx.update(|_, cx| {
+        core.emit(
+            Event::Error("conversations.open: slack api error: user_not_found".into()),
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_, cx| pending(cx)),
+        "an open failure must clear the pending DM"
+    );
+    drop(root);
+}
+
+#[gpui::test]
 fn ui_consistency_all_views_and_dialogs_render_across_themes_densities_and_viewports(
     cx: &mut gpui::TestAppContext,
 ) {

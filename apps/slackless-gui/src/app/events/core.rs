@@ -82,6 +82,11 @@ impl App {
                         drafts.drop_pending_scheduled(workspace, cx)
                     });
                 }
+                if error.starts_with("conversations.open:") {
+                    // The DM a New message waits on will not open: drop its text (toasted below)
+                    // rather than leave it for whichever DM opens next.
+                    self.pending_dm = None;
+                }
                 if let Some(title) = user_facing_error_title(error) {
                     notify(title, error.clone(), window, cx);
                 }
@@ -158,19 +163,13 @@ impl App {
                 }
             },
             Event::ConversationOpened(channel) => {
-                let pending = self.pending_dm.take();
                 self.select(channel.clone(), cx);
-                if let Some(content) = pending {
-                    self.submit(
-                        messaging::OutgoingMessage {
-                            channel: channel.clone(),
-                            thread_ts: None,
-                            broadcast: false,
-                            content,
-                        },
-                        window,
-                        cx,
-                    );
+                let waiting = self
+                    .pending_dm
+                    .as_ref()
+                    .map(|pending| pending.users.clone());
+                if let Some(users) = waiting {
+                    self.deliver_pending_dm(users, channel.clone(), window, cx);
                 }
             }
             Event::ChannelManagers { channel, users } => {
@@ -1090,6 +1089,66 @@ impl App {
     }
 }
 
+impl App {
+    /// The conversation the core just opened, offered to the New message waiting on
+    /// [`ChannelCommand::OpenDm`] for `users`: the text goes through the send pipeline only when
+    /// the stored conversation is the DM with exactly those people, and keeps waiting otherwise
+    /// (something else opened meanwhile). The core stores the conversation before announcing
+    /// it; the snapshot reload lands later.
+    fn deliver_pending_dm(
+        &mut self,
+        users: Vec<UserId>,
+        channel: ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((store, team)) = self
+            .bridge
+            .read_store_clone()
+            .zip(self.bridge.team_id().cloned())
+        else {
+            return;
+        };
+        let fixtures = self.fixtures.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let opened_channel = channel.clone();
+            let opened = cx
+                .background_executor()
+                .spawn(async move {
+                    let store = store.lock().ok()?;
+                    store.conversation(&team, &opened_channel).ok().flatten()
+                })
+                .await;
+            if !opened.is_some_and(|conv| is_dm_with(&fixtures, &conv, &users)) {
+                return;
+            }
+            let _ = this.update_in(cx, |app, window, cx| {
+                // Once, even when the same DM is announced twice.
+                if let Some(pending) = app.pending_dm.take_if(|waiting| waiting.users == users) {
+                    app.submit(
+                        messaging::OutgoingMessage {
+                            channel,
+                            thread_ts: None,
+                            broadcast: false,
+                            content: pending.content,
+                        },
+                        window,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+}
+
+/// Whether `conversation` is the DM or group DM with exactly `users`, by the snapshot's notion of
+/// a DM's peers (an IM's other party, an MPIM's members but the signed-in user).
+fn is_dm_with(fixtures: &Fixtures, conversation: &Conversation, users: &[UserId]) -> bool {
+    let peers = fixtures.peers(conversation);
+    peers.len() == users.len() && users.iter().all(|user| peers.contains(&user))
+}
+
 /// Maps user-triggered mutation error prefixes to a toast title so failures surface in the UI,
 /// while keeping background hydration/sync/presence/websocket errors log-only.
 pub(crate) fn user_facing_error_title(error: &str) -> Option<&'static str> {
@@ -1128,6 +1187,7 @@ pub(crate) fn user_facing_error_title(error: &str) -> Option<&'static str> {
         ("saved.update:", "Could not update saved item"),
         ("saved.delete:", "Could not remove saved item"),
         ("conversations.create:", "Could not create channel"),
+        ("conversations.open:", "Could not open conversation"),
         ("conversations.rename:", "Could not rename channel"),
         ("conversations.archive:", "Could not archive channel"),
         ("conversations.unarchive:", "Could not unarchive channel"),
@@ -1172,6 +1232,10 @@ mod tests {
         assert_eq!(
             user_facing_error_title("rooms.join: slack api error: cannot_huddle_here"),
             Some("Could not join huddle")
+        );
+        assert_eq!(
+            user_facing_error_title("conversations.open: slack api error: user_not_found"),
+            Some("Could not open conversation")
         );
         // Background sync/hydration/presence noise must stay log-only.
         for bg in [

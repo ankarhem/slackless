@@ -848,8 +848,9 @@ pub struct App {
     /// The connect banner's lines for the open conversation, recomputed when its members or
     /// the snapshot change - never per frame.
     connect_orgs: Vec<channel_details::OrgLine>,
-    /// A compose send waiting for its DM to open ([`ChannelCommand::OpenDm`]).
-    pending_dm: Option<MessageContent>,
+    /// A New-message send waiting for its DM to open ([`ChannelCommand::OpenDm`]); delivered
+    /// only to the DM with the picked users.
+    pending_dm: Option<messaging::PendingDm>,
     /// In-canvas Find field (`F-SHELL-266`).
     canvas_search: Entity<TextareaState>,
     /// Current in-canvas Find query.

@@ -1288,7 +1288,10 @@ fn wire_feature_view_subscriptions(
                         return;
                     }
                     if this.bridge.store().is_some() {
-                        this.pending_dm = Some(content.clone());
+                        this.pending_dm = Some(messaging::PendingDm {
+                            users: users.clone(),
+                            content: content.clone(),
+                        });
                         this.bridge.send(ChannelCommand::OpenDm {
                             users: users.clone(),
                         });

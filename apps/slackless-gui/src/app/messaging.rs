@@ -747,6 +747,12 @@ pub(super) struct OutgoingMessage {
     pub content: MessageContent,
 }
 
+/// A New-message send waiting for [`ChannelCommand::OpenDm`] to open the DM with `users`.
+pub(super) struct PendingDm {
+    pub users: Vec<UserId>,
+    pub content: MessageContent,
+}
+
 /// One candidate target when disambiguating a duplicate slash command (`F-COLLAB-686`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SlashCandidate {
