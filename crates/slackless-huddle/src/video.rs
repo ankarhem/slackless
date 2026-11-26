@@ -316,10 +316,6 @@ impl RtpSeqTracker {
         self.last_seq = Some(seq);
     }
 
-    pub(crate) fn next_synthetic_seq(&self) -> u16 {
-        self.last_seq.map_or(0, |prev| prev.wrapping_add(1))
-    }
-
     pub(crate) fn seq_gaps(&self) -> u64 {
         self.seq_gaps
     }
@@ -457,13 +453,6 @@ impl H264VideoDecoder {
         self.annex_b_buf = bitstream;
         self.annex_b_buf.clear();
         frame
-    }
-
-    /// Feed one RTP payload (`marker` = RTP marker bit indicating end of access unit) using
-    /// monotonically synthesized sequence numbers for backwards compatibility.
-    pub fn push_rtp_payload(&mut self, payload: &[u8], marker: bool) -> Option<VideoFrame> {
-        let next_seq = self.seq_tracker.next_synthetic_seq();
-        self.push_rtp_packet(next_seq, payload, marker)
     }
 
     /// Decode a complete Annex-B H.264 access unit into a [`VideoFrame`].
@@ -1068,9 +1057,9 @@ mod tests {
         // 1. Single NAL RTP payloads (one NAL per packet, marker=true on final NAL).
         let mut dec = H264VideoDecoder::new().unwrap();
         let mut decoded = None;
-        for (i, nal) in nals.iter().enumerate() {
-            let marker = i + 1 == nals.len();
-            let out = dec.push_rtp_payload(nal, marker);
+        for (seq, nal) in (0u16..).zip(&nals) {
+            let marker = usize::from(seq) + 1 == nals.len();
+            let out = dec.push_rtp_packet(seq, nal, marker);
             if !marker {
                 assert!(out.is_none());
             } else {
@@ -1079,8 +1068,9 @@ mod tests {
         }
         let frame = decoded.expect("Single NAL sequence must decode");
         assert_eq!((frame.width, frame.height), (w as u32, h as u32));
+        let mut seq = 0u16;
         // Buffer resets after decode: malformed or empty marker must return None.
-        assert!(dec.push_rtp_payload(&[], true).is_none());
+        assert!(dec.push_rtp_packet(nals.len() as u16, &[], true).is_none());
 
         // 2. STAP-A (NAL type 24) aggregating all NALs into a single RTP packet.
         let mut stap_a = vec![24u8];
@@ -1090,14 +1080,15 @@ mod tests {
         }
         let mut dec_stap = H264VideoDecoder::new().unwrap();
         let frame_stap = dec_stap
-            .push_rtp_payload(&stap_a, true)
+            .push_rtp_packet(0, &stap_a, true)
             .expect("STAP-A packet must decode");
         assert_eq!((frame_stap.width, frame_stap.height), (w as u32, h as u32));
 
         // 3. Multi-packet FU-A fragmentation (NAL type 28) on the final IDR NAL.
         let mut dec_fua = H264VideoDecoder::new().unwrap();
         for nal in &nals[..nals.len() - 1] {
-            assert!(dec_fua.push_rtp_payload(nal, false).is_none());
+            assert!(dec_fua.push_rtp_packet(seq, nal, false).is_none());
+            seq += 1;
         }
         let idr = nals[nals.len() - 1];
         assert!(idr.len() > 6, "IDR should be large enough to fragment");
@@ -1121,7 +1112,8 @@ mod tests {
             pkt.push(fu_hdr);
             pkt.extend_from_slice(chunk);
             let marker = i + 1 == chunks.len();
-            let res = dec_fua.push_rtp_payload(&pkt, marker);
+            let res = dec_fua.push_rtp_packet(seq, &pkt, marker);
+            seq += 1;
             if !marker {
                 assert!(res.is_none());
             } else {
@@ -1134,11 +1126,11 @@ mod tests {
         // 4. Malformed payloads (truncated STAP-A, truncated FU-A) never panic.
         assert!(
             dec_fua
-                .push_rtp_payload(&[24, 0x00, 0x20, 0x01], true)
+                .push_rtp_packet(seq, &[24, 0x00, 0x20, 0x01], true)
                 .is_none()
         );
-        assert!(dec_fua.push_rtp_payload(&[28], true).is_none());
-        assert!(dec_fua.push_rtp_payload(&[0xFF], false).is_none());
+        assert!(dec_fua.push_rtp_packet(seq + 1, &[28], true).is_none());
+        assert!(dec_fua.push_rtp_packet(seq + 2, &[0xFF], false).is_none());
     }
 
     #[test]
