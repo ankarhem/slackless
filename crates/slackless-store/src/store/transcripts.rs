@@ -145,7 +145,7 @@ impl Store {
             seg.at_ms,
         ])?;
         let id = self.conn.last_insert_rowid();
-        Self::bump_message_revision();
+        self.bump_message_revision();
         Ok(id)
     }
 
@@ -387,7 +387,7 @@ impl Store {
         )?;
         let deleted = stmt.execute(params![workspace.as_str(), call_id])?;
         if deleted > 0 {
-            Self::bump_message_revision();
+            self.bump_message_revision();
         }
         Ok(deleted)
     }

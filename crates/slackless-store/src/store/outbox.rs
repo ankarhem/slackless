@@ -156,7 +156,7 @@ impl Store {
             now,
         ])?;
         let id = self.conn.last_insert_rowid();
-        Self::bump_message_revision();
+        self.bump_message_revision();
         Ok(OutboxItem {
             id,
             workspace_id: workspace.clone(),
@@ -248,7 +248,7 @@ impl Store {
         )?;
         let changed = stmt.execute(params![id, now_secs()])?;
         if changed > 0 {
-            Self::bump_message_revision();
+            self.bump_message_revision();
             Ok(true)
         } else {
             Ok(false)
@@ -265,7 +265,7 @@ impl Store {
         )?;
         let changed = stmt.execute(params![id, error, now_secs()])?;
         if changed > 0 {
-            Self::bump_message_revision();
+            self.bump_message_revision();
             Ok(true)
         } else {
             Ok(false)
@@ -282,7 +282,7 @@ impl Store {
         )?;
         let changed = stmt.execute(params![id, now_secs()])?;
         if changed > 0 {
-            Self::bump_message_revision();
+            self.bump_message_revision();
             Ok(true)
         } else {
             Ok(false)
@@ -300,7 +300,7 @@ impl Store {
         )?;
         let changed = stmt.execute(params![workspace.as_str(), now_secs()])?;
         if changed > 0 {
-            Self::bump_message_revision();
+            self.bump_message_revision();
         }
         Ok(changed)
     }
@@ -313,7 +313,7 @@ impl Store {
             .prepare_cached("DELETE FROM outbox WHERE id = ?1")?;
         let deleted = stmt.execute(params![id])?;
         if deleted > 0 {
-            Self::bump_message_revision();
+            self.bump_message_revision();
             Ok(true)
         } else {
             Ok(false)
@@ -328,7 +328,7 @@ impl Store {
             .prepare_cached("DELETE FROM outbox WHERE workspace_id = ?1")?;
         let deleted = stmt.execute(params![workspace.as_str()])?;
         if deleted > 0 {
-            Self::bump_message_revision();
+            self.bump_message_revision();
         }
         Ok(deleted)
     }

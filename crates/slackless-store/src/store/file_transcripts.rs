@@ -247,7 +247,7 @@ impl Store {
         }
         let updated = refresh_messages_for_file(&tx, workspace, file_id)?;
         tx.commit()?;
-        Self::bump_message_revision();
+        self.bump_message_revision();
         Ok(updated)
     }
 
@@ -428,7 +428,7 @@ impl Store {
         }
         tx.commit()?;
         if deleted > 0 {
-            Self::bump_message_revision();
+            self.bump_message_revision();
             Ok(true)
         } else {
             Ok(false)

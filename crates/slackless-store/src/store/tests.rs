@@ -3148,11 +3148,10 @@ fn recent_threads_uses_partial_index_and_filters_correctly() {
 
 #[test]
 fn empty_upsert_does_not_bump_revision_while_transcript_insert_does() {
-    let _revision_guard = revision_guard();
     let mut store = Store::open_in_memory().unwrap();
-    let rev = Store::message_revision();
+    let rev = store.local_message_revision();
     store.upsert_messages(&ws(), &general(), &[]).unwrap();
-    assert_eq!(Store::message_revision(), rev);
+    assert_eq!(store.local_message_revision(), rev);
 
     let seg = crate::NewHuddleTranscriptSegment {
         channel: &general(),
@@ -3168,7 +3167,7 @@ fn empty_upsert_does_not_bump_revision_while_transcript_insert_does() {
         store.insert_huddle_transcript_segment(&ws(), &seg).unwrap(),
         0
     );
-    assert_eq!(Store::message_revision(), rev);
+    assert_eq!(store.local_message_revision(), rev);
 
     let seg_non_empty = crate::NewHuddleTranscriptSegment {
         text: "hello huddle",
@@ -3180,7 +3179,7 @@ fn empty_upsert_does_not_bump_revision_while_transcript_insert_does() {
             .unwrap()
             > 0
     );
-    assert!(Store::message_revision() > rev);
+    assert!(store.local_message_revision() > rev);
 }
 
 #[test]
@@ -3428,18 +3427,18 @@ fn file_transcripts_upsert_search_edit_preserve_multi_file_and_delete() {
     assert_eq!(table_map.get("message_file"), Some(&2));
 
     // Deleting a non-existent transcript returns false without bumping revision.
-    let rev_before_noop = Store::message_revision();
+    let rev_before_noop = store.local_message_revision();
     assert!(
         !store
             .delete_file_transcript(&ws(), &FileId::from("F_MISSING"))
             .unwrap()
     );
-    assert_eq!(Store::message_revision(), rev_before_noop);
+    assert_eq!(store.local_message_revision(), rev_before_noop);
 
     // Deleting the stored transcript removes it from `file_transcript` AND `message_fts`,
     // while keeping the second file's inline transcript intact.
     assert!(store.delete_file_transcript(&ws(), &video_id).unwrap());
-    assert!(Store::message_revision() > rev_before_noop);
+    assert!(store.local_message_revision() > rev_before_noop);
     assert!(store.file_transcript(&ws(), &video_id).unwrap().is_none());
     assert!(store.all_file_transcripts(&ws()).unwrap().is_empty());
     assert!(

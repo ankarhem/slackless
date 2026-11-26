@@ -148,7 +148,7 @@ impl Store {
         }
         tx.commit()?;
         if !flipped.is_empty() {
-            Self::bump_message_revision();
+            self.bump_message_revision();
         }
         Ok(flipped)
     }

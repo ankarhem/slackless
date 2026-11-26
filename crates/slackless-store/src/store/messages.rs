@@ -50,7 +50,7 @@ impl Store {
             upsert_message_in_tx(&tx, workspace, channel, message, SameRevision::Replace)?;
         }
         tx.commit()?;
-        Self::bump_message_revision();
+        self.bump_message_revision();
         Ok(())
     }
 
@@ -122,7 +122,7 @@ impl Store {
             0
         };
         tx.commit()?;
-        Self::bump_message_revision();
+        self.bump_message_revision();
         Ok(tombstoned)
     }
 
@@ -138,7 +138,7 @@ impl Store {
             params![workspace.as_str()],
         )?;
         if n > 0 {
-            Self::bump_message_revision();
+            self.bump_message_revision();
         }
         Ok(n)
     }
@@ -159,7 +159,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         record_deletion_in_tx(&tx, workspace, channel, deleted_ts, event_ts, previous)?;
         tx.commit()?;
-        Self::bump_message_revision();
+        self.bump_message_revision();
         Ok(())
     }
 
