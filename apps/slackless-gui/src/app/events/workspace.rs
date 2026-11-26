@@ -35,6 +35,7 @@ impl App {
                 Event::Usergroups(groups) => {
                     crate::directory::reconcile_usergroups_from_server(groups, cx);
                 }
+                Event::Conversations(_) | Event::SidebarChanged => self.ws.notify_levels = None,
                 _ => {}
             }
             self.on_core_event(event, window, cx);
@@ -65,6 +66,8 @@ impl App {
                 self.apply_saved_loaded(ws_index, items, cx);
             }
             Event::Conversations(_) | Event::SidebarChanged => {
+                // Notification levels may have changed: read them again when next needed.
+                slot.state.notify_levels = None;
                 // Refresh this background workspace's team name/icon if hydrate just stored a
                 // richer `team.info` record (O(1) single-row team lookup).
                 let fresh_team = slot.bridge.as_ref().and_then(CoreBridge::team_summary);
@@ -196,10 +199,19 @@ impl App {
                 if message.user.as_ref() == Some(&bg_ctx.self_user) {
                     return;
                 }
-                let level = bg_ctx.notify_level;
                 let Some(conv) = bg_ctx.conversation.as_ref() else {
                     return;
                 };
+                let Some(slot) = self.slots.get_mut(ws_index) else {
+                    return;
+                };
+                let levels = slot.state.notify_levels.get_or_insert_with(|| {
+                    (slot.bridge.as_ref())
+                        .and_then(|bridge| bridge.placeholder(&HashMap::new()))
+                        .map(|mut prefs| mem::take(&mut prefs.notify_levels))
+                        .unwrap_or_default()
+                });
+                let level = levels.get(channel).copied();
                 let dm = matches!(conv.kind(), ConversationKind::Im | ConversationKind::Mpim);
                 let owned_ctx = super::notifications::OwnedRuleContext {
                     sender_id: message

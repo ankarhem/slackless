@@ -616,6 +616,10 @@ pub(super) struct WorkspaceState {
     pub(super) marked_threads: HashMap<(ChannelId, Ts), Ts>,
     /// Live archive backfill progress snapshot for this workspace (`Event::BackfillProgress`).
     pub(super) backfill_progress: Option<slackless_core::WorkspaceBackfillProgress>,
+    /// The notification levels its prefs set, read once for the messages that arrive while
+    /// another workspace is shown (a shown snapshot carries its own); dropped on a sidebar or
+    /// conversations update, which a changed level brings.
+    pub(super) notify_levels: Option<HashMap<ChannelId, NotifyLevel>>,
 }
 
 /// How a posted message moves its conversation's unread state.

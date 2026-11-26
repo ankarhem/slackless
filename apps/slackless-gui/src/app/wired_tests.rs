@@ -591,10 +591,17 @@ fn wired_multi_workspace_event_isolation_and_switching(cx: &mut gpui::TestAppCon
         text: "Ping <@U0ME> in workspace two".into(),
         ..Default::default()
     };
+    // T0TWO's prefs mute #two-chan.
+    let muted = serde_json::json!({
+        "all_notifications_prefs":
+            serde_json::json!({ "channels": { "C0TWO": { "muted": true } } }).to_string(),
+    });
     {
         let mut s = c2.store().lock().expect("store2 lock");
         s.upsert_message(&TeamId::from("T0TWO"), &ChannelId::from("C0TWO"), &bg_msg)
             .expect("upsert ws2");
+        s.replace_prefs(&TeamId::from("T0TWO"), &muted)
+            .expect("store ws2 prefs");
     }
     cx.update(|_, cx| {
         c2.emit(
@@ -619,6 +626,20 @@ fn wired_multi_workspace_event_isolation_and_switching(cx: &mut gpui::TestAppCon
             "background workspace message must never leak into active workspace snapshot"
         );
     });
+    // T0TWO's notification levels were read for that message, and are read again after a
+    // sidebar update, which a changed level brings.
+    cx.update(|_, cx| {
+        assert_eq!(
+            app.read(cx).slots[1].state.notify_levels,
+            Some(HashMap::from([(
+                ChannelId::from("C0TWO"),
+                NotifyLevel::Muted
+            )]))
+        );
+    });
+    cx.update(|_, cx| c2.emit(Event::SidebarChanged, cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(app.read(cx).slots[1].state.notify_levels, None));
 
     // Switch to T0TWO -> off-thread snapshot loads C0TWO cleanly.
     cx.update(|window, cx| {

@@ -50,7 +50,6 @@ pub struct BgMessageContext {
     pub self_user: UserId,
     pub conversation: Option<Conversation>,
     pub sender: Option<User>,
-    pub notify_level: Option<slackless_core::NotifyLevel>,
 }
 
 /// One persisted composer draft in the workspace's local store.
@@ -453,16 +452,10 @@ impl CoreBridge {
         let store = self.read_store()?.lock().ok()?;
         let conversation = store.conversation(team, channel).ok().flatten();
         let sender = sender_id.and_then(|u| store.user(team, u).ok().flatten());
-        let notify_level = store
-            .prefs(team)
-            .ok()
-            .flatten()
-            .and_then(|prefs| slackless_core::notify_levels(&prefs).get(channel).copied());
         Some(BgMessageContext {
             self_user: session.user_id.clone(),
             conversation,
             sender,
-            notify_level,
         })
     }
 
