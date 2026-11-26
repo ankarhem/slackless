@@ -17,7 +17,29 @@ pub struct StorageInfo {
     pub offline_queued: u64,
     pub db_bytes: u64,
     pub media_cache_bytes: u64,
+    /// Current `-wal` write-ahead log size.
+    pub wal_bytes: u64,
+    /// Free (reclaimable by Compact) database pages, in bytes.
+    pub freelist_bytes: u64,
 }
+
+/// Media cache size cap choices for Archive & Storage (`(megabytes, label)`; `0` = unlimited).
+pub const MEDIA_CACHE_SIZE_OPTIONS: [(u32, &str); 6] = [
+    (128, "128 MB"),
+    (256, "256 MB"),
+    (512, "512 MB"),
+    (1024, "1 GB"),
+    (2048, "2 GB"),
+    (0, "Unlimited"),
+];
+/// Media cache max-age choices for Archive & Storage (`(days, label)`; `0` = keep forever).
+pub const MEDIA_CACHE_AGE_OPTIONS: [(u32, &str); 5] = [
+    (7, "7 days"),
+    (14, "14 days"),
+    (30, "30 days"),
+    (90, "90 days"),
+    (0, "Never"),
+];
 
 /// Slack's Color Mode: Light / Dark / System (follow the computer).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
@@ -468,6 +490,11 @@ pub struct Settings {
     pub huddle_music_when_alone: bool,
     // Local / BYO-key AI summaries (API key stays in OS Keychain via `slackless-auth`).
     pub ai_summary: AiSummarySettings,
+    // Archive & storage hygiene
+    /// Per-directory media cache size cap in megabytes (`0` = unlimited).
+    pub media_cache_max_mb: u32,
+    /// Evict cached media files untouched for this many days (`0` = never).
+    pub media_cache_max_days: u32,
 }
 
 impl Default for Settings {
@@ -590,6 +617,8 @@ impl Default for Settings {
             huddle_transcription_provider: 0,
             huddle_music_when_alone: true,
             ai_summary: AiSummarySettings::default(),
+            media_cache_max_mb: slackless_core::maintenance::DEFAULT_MEDIA_CACHE_MAX_MB,
+            media_cache_max_days: slackless_core::maintenance::DEFAULT_MEDIA_CACHE_MAX_DAYS,
         }
     }
 }
@@ -651,6 +680,14 @@ impl Settings {
             || lower.starts_with("urgent ")
             || text.contains('\u{1F6A8}')
             || lower.contains(":rotating_light:")
+    }
+
+    /// Automatic media cache retention policy (size cap + max age).
+    pub fn media_cache_policy(&self) -> slackless_core::maintenance::MediaCachePolicy {
+        slackless_core::maintenance::MediaCachePolicy::from_mb_days(
+            self.media_cache_max_mb,
+            self.media_cache_max_days,
+        )
     }
 
     /// Active GitHub Releases update channel (`F-SHELL-164`).

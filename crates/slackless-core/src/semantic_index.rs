@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use slackless_store::{
@@ -26,6 +27,44 @@ use crate::search::{
 const EMBED_BATCH_SIZE: usize = 32;
 /// Minimum cosine similarity for semantic candidates (filters orthogonal noise).
 const DEFAULT_MIN_SIMILARITY: f32 = 0.08;
+
+/// Cooperative CPU pacing between embedding batches so long background indexing runs never
+/// starve the UI thread, huddle audio, or other background work of CPU time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexPacing {
+    /// Pause after every `yield_every` embedded batches (`0` disables pacing entirely).
+    pub yield_every: usize,
+    /// How long to sleep at each pause point (`Duration::ZERO` only yields the time slice).
+    pub pause: Duration,
+}
+
+impl IndexPacing {
+    /// No pacing: embed as fast as possible (CLI / tests).
+    pub const NONE: Self = Self {
+        yield_every: 0,
+        pause: Duration::ZERO,
+    };
+    /// Background GUI indexing: a short breather after every batch of 32 documents.
+    pub const BACKGROUND: Self = Self {
+        yield_every: 1,
+        pause: Duration::from_millis(8),
+    };
+
+    /// Apply the pause owed after `batches_done` batches (no-op when pacing is disabled).
+    fn after_batch(self, batches_done: usize, more_remaining: bool) {
+        if self.yield_every == 0
+            || !more_remaining
+            || !batches_done.is_multiple_of(self.yield_every)
+        {
+            return;
+        }
+        if self.pause.is_zero() {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(self.pause);
+        }
+    }
+}
 
 /// Incremental progress update emitted during [`index_store_documents`] / [`index_disk_archives`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +190,25 @@ pub fn index_store_documents(
     index: &mut SemanticIndex,
     embedder: &dyn Embedder,
     workspace_filter: Option<&TeamId>,
+    on_progress: impl FnMut(SemanticIndexProgress),
+) -> std::result::Result<SemanticIndexReport, String> {
+    index_store_documents_paced(
+        store,
+        index,
+        embedder,
+        workspace_filter,
+        IndexPacing::NONE,
+        on_progress,
+    )
+}
+
+/// [`index_store_documents`] with cooperative [`IndexPacing`] between embedding batches.
+pub fn index_store_documents_paced(
+    store: &Store,
+    index: &mut SemanticIndex,
+    embedder: &dyn Embedder,
+    workspace_filter: Option<&TeamId>,
+    pacing: IndexPacing,
     mut on_progress: impl FnMut(SemanticIndexProgress),
 ) -> std::result::Result<SemanticIndexReport, String> {
     let model_id = embedder.model_id().to_owned();
@@ -280,7 +338,8 @@ pub fn index_store_documents(
         report.skipped_unchanged += skipped_ws;
 
         let mut embedded_ws = 0usize;
-        for chunk in to_embed.chunks(EMBED_BATCH_SIZE) {
+        let batch_count = to_embed.len().div_ceil(EMBED_BATCH_SIZE);
+        for (batch_ix, chunk) in to_embed.chunks(EMBED_BATCH_SIZE).enumerate() {
             let texts: Vec<&str> = chunk.iter().map(|d| d.text.as_str()).collect();
             let vecs = embedder.embed_batch(&texts)?;
             if vecs.len() != chunk.len() {
@@ -314,6 +373,7 @@ pub fn index_store_documents(
                 embedded: embedded_ws,
                 skipped: skipped_ws,
             });
+            pacing.after_batch(batch_ix + 1, batch_ix + 1 < batch_count);
         }
         if to_embed.is_empty() {
             on_progress(SemanticIndexProgress {
@@ -340,6 +400,17 @@ pub fn index_disk_archives(
     archives: &[(TeamId, PathBuf)],
     index: &mut SemanticIndex,
     embedder: &dyn Embedder,
+    on_progress: impl FnMut(SemanticIndexProgress),
+) -> std::result::Result<SemanticIndexReport, String> {
+    index_disk_archives_paced(archives, index, embedder, IndexPacing::NONE, on_progress)
+}
+
+/// [`index_disk_archives`] with cooperative [`IndexPacing`] between embedding batches.
+pub fn index_disk_archives_paced(
+    archives: &[(TeamId, PathBuf)],
+    index: &mut SemanticIndex,
+    embedder: &dyn Embedder,
+    pacing: IndexPacing,
     mut on_progress: impl FnMut(SemanticIndexProgress),
 ) -> std::result::Result<SemanticIndexReport, String> {
     let mut combined = SemanticIndexReport {
@@ -362,8 +433,14 @@ pub fn index_disk_archives(
             if !seen_ws.insert(inner_ws.clone()) {
                 continue;
             }
-            let part =
-                index_store_documents(&store, index, embedder, Some(&inner_ws), &mut on_progress)?;
+            let part = index_store_documents_paced(
+                &store,
+                index,
+                embedder,
+                Some(&inner_ws),
+                pacing,
+                &mut on_progress,
+            )?;
             combined.workspaces_indexed.extend(part.workspaces_indexed);
             combined.total_seen += part.total_seen;
             combined.embedded += part.embedded;
@@ -1263,6 +1340,64 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn paced_indexing_pauses_between_batches_and_matches_unpaced_results() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ws = TeamId::from("T_PACE");
+        seed_ws(&mut store, "T_PACE", "Acme", "C_ENG", "eng", "U1", "alice");
+        // 3 batches of EMBED_BATCH_SIZE (32): 70 messages -> 32 + 32 + 6.
+        let msgs: Vec<Message> = (0..70)
+            .map(|i| Message {
+                ts: Ts::from(format!("17000{i:05}.000000")),
+                user: Some(UserId::from("U1")),
+                text: format!("pacing document number {i} about deploy pipelines"),
+                ..Default::default()
+            })
+            .collect();
+        store
+            .upsert_messages(&ws, &ChannelId::from("C_ENG"), &msgs)
+            .unwrap();
+        let embedder = HashProjectionEmbedder::new(32);
+
+        let pacing = IndexPacing {
+            yield_every: 1,
+            pause: std::time::Duration::from_millis(25),
+        };
+        let mut paced_idx = SemanticIndex::open_in_memory().unwrap();
+        let mut progress_events = 0usize;
+        let started = std::time::Instant::now();
+        let paced =
+            index_store_documents_paced(&store, &mut paced_idx, &embedder, None, pacing, |_| {
+                progress_events += 1
+            })
+            .unwrap();
+        let elapsed = started.elapsed();
+        // Pauses after batches 1 and 2 only (never after the final batch).
+        assert!(
+            elapsed >= std::time::Duration::from_millis(50),
+            "expected >= 2 pauses, took {elapsed:?}"
+        );
+        assert_eq!(progress_events, 3);
+        assert_eq!(paced.embedded, 70);
+
+        let mut fast_idx = SemanticIndex::open_in_memory().unwrap();
+        let fast = index_store_documents(&store, &mut fast_idx, &embedder, None, |_| {}).unwrap();
+        assert_eq!(fast, paced);
+        assert_eq!(
+            fast_idx.stats().unwrap().total_docs,
+            paced_idx.stats().unwrap().total_docs
+        );
+
+        // Disabled / zero-pause pacing never sleeps.
+        IndexPacing::NONE.after_batch(1, true);
+        IndexPacing {
+            yield_every: 2,
+            pause: std::time::Duration::ZERO,
+        }
+        .after_batch(2, true);
+        assert_eq!(IndexPacing::BACKGROUND.yield_every, 1);
     }
 
     #[test]

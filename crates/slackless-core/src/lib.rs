@@ -32,6 +32,7 @@ pub mod embeddings;
 pub mod event;
 pub mod export;
 mod fetcher;
+pub mod maintenance;
 mod notify;
 pub mod outbox;
 pub mod paths;
@@ -67,10 +68,11 @@ pub use command::{
 };
 pub use diff::{DiffKind, DiffSegment, diff_words};
 pub use embeddings::{
-    Embedder, EmbeddingDownloadProgress, EmbeddingModel, EmbeddingModelStatus,
-    HashProjectionEmbedder, OnnxEmbedder, TokenizedInput, WordPieceTokenizer,
-    default_embedding_model_dir, delete_embedding_model, detect_embedding_model_setup,
-    download_embedding_model, download_embedding_model_async,
+    EMBEDDER_IDLE_TTL, Embedder, EmbeddingDownloadProgress, EmbeddingModel, EmbeddingModelStatus,
+    HashProjectionEmbedder, IdleSlot, OnnxEmbedder, TokenizedInput, WordPieceTokenizer,
+    cached_onnx_embedder, default_embedding_model_dir, delete_embedding_model,
+    detect_embedding_model_setup, download_embedding_model, download_embedding_model_async,
+    embedder_loaded, unload_cached_embedder, unload_idle_embedder,
 };
 pub use event::{
     Event, FailedMutation, HUDDLE_MEDIA_CHANNEL_CAPACITY, HuddleEvent, HuddleMediaEvent,
@@ -82,6 +84,10 @@ pub use export::{
     export_huddle_transcript, export_target, export_thread,
 };
 pub use fetcher::Fetcher;
+pub use maintenance::{
+    MediaCachePolicy, PruneReport, prune_default_media_caches, prune_media_cache_policy,
+    prune_semantic_index_workspaces,
+};
 pub use notify::{NotifyLevel, notify_levels};
 pub use outbox::{OutboxPayload, decode_outbox_payload, is_transient_send_error};
 pub use privacy::{
@@ -95,10 +101,11 @@ pub use search::{
     search_huddle_transcripts_in_disk_archives, search_single_store_all_workspaces,
 };
 pub use semantic_index::{
-    SemanticIndexProgress, SemanticIndexReport, default_semantic_index_stats,
+    IndexPacing, SemanticIndexProgress, SemanticIndexReport, default_semantic_index_stats,
     hybrid_search_disk_archives, hybrid_search_huddle_transcripts_across_stores,
     hybrid_search_huddle_transcripts_in_disk_archives, hybrid_search_stores, index_disk_archives,
-    index_store_documents, open_default_semantic_index, open_existing_semantic_index,
+    index_disk_archives_paced, index_store_documents, index_store_documents_paced,
+    open_default_semantic_index, open_existing_semantic_index,
 };
 pub use summarize::{
     AiProvider, AiSummaryConfig, ConnectionTestResult, SummarizeError, SummaryMessage,

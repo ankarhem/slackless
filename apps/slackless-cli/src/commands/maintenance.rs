@@ -18,8 +18,12 @@ use slackless_core::types::{ChannelId, TeamId};
 
 use super::{all_workspace_ids, archive_hint, empty_local};
 use crate::archive::{self, Archive, format_channel_name};
-use crate::cli::{ArchiveIndexSemanticArgs, SemanticModelCommand};
+use crate::cli::{ArchiveIndexSemanticArgs, ArchivePruneArgs, SemanticModelCommand};
 use crate::{Ctx, fail, output};
+use slackless_core::maintenance::{
+    MediaCachePolicy, PruneReport, prune_default_media_caches, prune_default_semantic_index,
+};
+use slackless_core::store::IntegrityMode;
 
 /// Parameters for formatting archive stats in human-readable form.
 pub(crate) struct StatsSummary<'a> {
@@ -201,6 +205,197 @@ pub(crate) fn format_stats_human(summary: &StatsSummary<'_>) -> String {
         summary.users,
         summary.offline_queued,
     )
+}
+
+/// `archive check`: run `PRAGMA quick_check` (or `integrity_check` with `--full`) on the local
+/// archive. Exits non-zero when SQLite reports problems.
+pub(crate) fn cmd_archive_check(
+    ctx: &Ctx,
+    workspace: Option<&TeamId>,
+    full: bool,
+) -> Result<ExitCode> {
+    let Some(workspace) = workspace else {
+        return Ok(empty_local(
+            ctx,
+            serde_json::json!({"ok": false, "reason": "no_workspace"}),
+            "checking archive integrity",
+        ));
+    };
+    let Some(path) = archive::store_path(workspace).filter(|p| p.is_file()) else {
+        return Ok(no_archive(ctx, workspace));
+    };
+    let mode = if full {
+        IntegrityMode::Full
+    } else {
+        IntegrityMode::Quick
+    };
+    let (json, human, ok) = archive_check_report(workspace, &path, mode);
+    output::emit(ctx.json, &json, &human);
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+fn no_archive(ctx: &Ctx, workspace: &TeamId) -> ExitCode {
+    if ctx.json {
+        output::emit_json(&serde_json::json!({
+            "ok": false,
+            "reason": "no_archive",
+            "workspace": workspace.as_str(),
+        }));
+    } else {
+        archive_hint(workspace);
+    }
+    ExitCode::SUCCESS
+}
+
+/// Integrity report for the archive at `path` as `(json, human, ok)`. An archive SQLite cannot
+/// even open counts as a failed check rather than a command error.
+pub(crate) fn archive_check_report(
+    workspace: &TeamId,
+    path: &Path,
+    mode: IntegrityMode,
+) -> (serde_json::Value, String, bool) {
+    let outcome = Archive::open_path(path)
+        .map_err(|e| e.to_string())
+        .and_then(|a| a.ok_or_else(|| "archive file not found".to_owned()))
+        .and_then(|archive| {
+            let store = archive.store();
+            let report = store
+                .integrity_check_with(mode)
+                .map_err(|e| e.to_string())?;
+            let info = store.file_info().unwrap_or_default();
+            Ok((report, info))
+        });
+    let (ok, problems, elapsed_ms, info) = match outcome {
+        Ok((report, info)) => (report.ok, report.problems, report.elapsed_ms, info),
+        Err(err) => (false, vec![err], 0, Default::default()),
+    };
+    let json = serde_json::json!({
+        "ok": ok,
+        "workspace": workspace.as_str(),
+        "db_path": path.display().to_string(),
+        "mode": mode,
+        "check": mode.pragma(),
+        "problems": problems,
+        "elapsed_ms": elapsed_ms,
+        "db_bytes": info.db_bytes,
+        "wal_bytes": info.wal_bytes,
+        "freelist_bytes": info.freelist_bytes,
+    });
+    let mut human = format!(
+        "Workspace:\t{}\nDatabase:\t{} ({}, WAL {}, {} reclaimable)\nIntegrity:\t{} ({}, {} ms)\n",
+        workspace.as_str(),
+        path.display(),
+        format_bytes(info.db_bytes),
+        format_bytes(info.wal_bytes),
+        format_bytes(info.freelist_bytes),
+        if ok { "ok" } else { "FAILED" },
+        mode.pragma(),
+        elapsed_ms,
+    );
+    for problem in &problems {
+        human.push_str(&format!("  - {problem}\n"));
+    }
+    if !ok {
+        human.push_str(
+            "Back up the archive (`slackless archive backup <path>`), then clear the local cache in the app to re-sync.\n",
+        );
+    }
+    (json, human, ok)
+}
+
+/// `archive backup <output_path>`: consistent online snapshot of the local archive.
+pub(crate) fn cmd_archive_backup(
+    ctx: &Ctx,
+    workspace: Option<&TeamId>,
+    output: &Path,
+) -> Result<ExitCode> {
+    let Some(workspace) = workspace else {
+        return Ok(empty_local(
+            ctx,
+            serde_json::json!({"ok": false, "reason": "no_workspace"}),
+            "backing up the archive",
+        ));
+    };
+    let Some(path) = archive::store_path(workspace).filter(|p| p.is_file()) else {
+        return Ok(no_archive(ctx, workspace));
+    };
+    let (json, human) = archive_backup_report(workspace, &path, output)?;
+    output::emit(ctx.json, &json, &human);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Back up the archive at `source` to `dest`, returning `(json, human)`.
+pub(crate) fn archive_backup_report(
+    workspace: &TeamId,
+    source: &Path,
+    dest: &Path,
+) -> Result<(serde_json::Value, String)> {
+    let archive = Archive::open_path(source)
+        .with_context(|| format!("opening local archive {}", source.display()))?
+        .with_context(|| format!("local archive {} not found", source.display()))?;
+    let started = std::time::Instant::now();
+    let bytes = archive
+        .store()
+        .backup_to(dest)
+        .with_context(|| format!("backing up {workspace} to {}", dest.display()))?;
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let written = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
+    let json = serde_json::json!({
+        "ok": true,
+        "workspace": workspace.as_str(),
+        "source": source.display().to_string(),
+        "output": written.display().to_string(),
+        "bytes": bytes,
+        "elapsed_ms": elapsed_ms,
+    });
+    let human = format!(
+        "Backed up {workspace} to {} ({}, {elapsed_ms} ms)\n",
+        written.display(),
+        format_bytes(bytes),
+    );
+    Ok((json, human))
+}
+
+/// `archive prune`: apply size/age retention to every media cache directory.
+pub(crate) fn cmd_archive_prune(ctx: &Ctx, args: &ArchivePruneArgs) -> Result<ExitCode> {
+    let policy = MediaCachePolicy::from_mb_days(args.max_mb, args.max_days);
+    let report = prune_default_media_caches(policy);
+    let semantic = if args.semantic {
+        Some(prune_default_semantic_index().map_err(|e| anyhow::anyhow!(e))?)
+    } else {
+        None
+    };
+    let (json, human) = prune_report_output(policy, &report, semantic);
+    output::emit(ctx.json, &json, &human);
+    Ok(ExitCode::SUCCESS)
+}
+
+pub(crate) fn prune_report_output(
+    policy: MediaCachePolicy,
+    report: &PruneReport,
+    semantic_pruned: Option<usize>,
+) -> (serde_json::Value, String) {
+    let json = serde_json::json!({
+        "ok": true,
+        "policy": policy,
+        "media": report,
+        "semantic_vectors_pruned": semantic_pruned,
+    });
+    let mut human = format!(
+        "Media cache:\tremoved {} file(s) ({}); {} file(s) ({}) remain\n",
+        report.removed_files,
+        format_bytes(report.removed_bytes),
+        report.remaining_files,
+        format_bytes(report.remaining_bytes),
+    );
+    if let Some(n) = semantic_pruned {
+        human.push_str(&format!("Semantic index:\tpruned {n} orphaned vector(s)\n"));
+    }
+    (json, human)
 }
 
 /// Per-channel archive backfill coverage row for `slackless archive status`.

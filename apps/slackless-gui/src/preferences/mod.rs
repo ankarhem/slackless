@@ -32,9 +32,10 @@ pub use prefs_globals::{
     active_quick_reactions, display_prefs, matches_highlight_keyword, set_display_prefs,
 };
 pub use settings::{
-    AiSummarySettings, AppearanceMode, HOURS, MESSAGE_VERBOSITY, MOBILE_HANDOFF, NOTIFY_LEVELS,
-    SCHEDULE_DAYS, SOUND_FILES, Section, Settings, StorageInfo, TRANSCRIPTION_PROVIDERS,
-    format_accessible_message, format_cross_workspace_summary,
+    AiSummarySettings, AppearanceMode, HOURS, MEDIA_CACHE_AGE_OPTIONS, MEDIA_CACHE_SIZE_OPTIONS,
+    MESSAGE_VERBOSITY, MOBILE_HANDOFF, NOTIFY_LEVELS, SCHEDULE_DAYS, SOUND_FILES, Section,
+    Settings, StorageInfo, TRANSCRIPTION_PROVIDERS, format_accessible_message,
+    format_cross_workspace_summary,
 };
 pub(crate) use slackless_core::types::time::format_bytes;
 pub use window::open_preferences_window;
@@ -77,6 +78,8 @@ pub(super) type Choice = fn(&mut Settings) -> &mut usize;
 pub struct SemanticStorageSnapshot {
     pub setup: slackless_core::embeddings::EmbeddingModelStatus,
     pub stats: slackless_core::store::SemanticIndexStats,
+    /// Whether the ONNX embedding session is currently resident in memory.
+    pub embedder_loaded: bool,
 }
 
 impl SemanticStorageSnapshot {
@@ -86,6 +89,7 @@ impl SemanticStorageSnapshot {
         Self {
             setup: slackless_core::embeddings::detect_embedding_model_setup(model),
             stats: slackless_core::semantic_index::default_semantic_index_stats(),
+            embedder_loaded: slackless_core::embeddings::embedder_loaded(),
         }
     }
 }
@@ -133,6 +137,13 @@ pub struct Preferences {
     pub(super) ai_key_status_note: Option<String>,
     pub(super) ai_test_running: bool,
     pub(super) ai_test_status: Option<(bool, String)>,
+    /// Result of the most recent "Verify integrity" run, keyed by workspace `TeamId`.
+    pub(super) integrity_reports: std::collections::HashMap<
+        slackless_core::types::TeamId,
+        slackless_core::store::IntegrityReport,
+    >,
+    /// Workspaces with an in-flight "Verify integrity" run.
+    pub(super) integrity_running: std::collections::HashSet<slackless_core::types::TeamId>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -361,6 +372,8 @@ impl Preferences {
                 ai_key_status_note: None,
                 ai_test_running: false,
                 ai_test_status: None,
+                integrity_reports: std::collections::HashMap::new(),
+                integrity_running: std::collections::HashSet::new(),
                 _subscriptions: subscriptions,
             }
         })
@@ -404,6 +417,60 @@ impl Preferences {
             });
         })
         .detach();
+    }
+
+    /// Latest SQLite integrity check result and whether a check is currently running for `team`.
+    pub fn integrity_status(
+        &self,
+        team: Option<&slackless_core::types::TeamId>,
+    ) -> (Option<slackless_core::store::IntegrityReport>, bool) {
+        let Some(team) = team else {
+            return (None, false);
+        };
+        (
+            self.integrity_reports.get(team).cloned(),
+            self.integrity_running.contains(team),
+        )
+    }
+
+    /// Mark an integrity check for `team` as started (`running == true`) or record its completion.
+    pub fn set_integrity_status(
+        &mut self,
+        team: slackless_core::types::TeamId,
+        report: Option<slackless_core::store::IntegrityReport>,
+        running: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if running {
+            self.integrity_running.insert(team.clone());
+            if let Some(report) = report {
+                self.integrity_reports.insert(team, report);
+            }
+        } else {
+            self.integrity_running.remove(&team);
+            match report {
+                Some(report) => {
+                    self.integrity_reports.insert(team, report);
+                }
+                None => {
+                    self.integrity_reports.remove(&team);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Update the automatic media cache retention policy (persisted via `Changed`).
+    pub fn set_media_cache_policy(&mut self, max_mb: u32, max_days: u32, cx: &mut Context<Self>) {
+        if (
+            self.settings.media_cache_max_mb,
+            self.settings.media_cache_max_days,
+        ) != (max_mb, max_days)
+        {
+            self.settings.media_cache_max_mb = max_mb;
+            self.settings.media_cache_max_days = max_days;
+            self.changed(cx);
+        }
     }
 
     /// Update the live workspace backfill progress shown in Preferences -> Advanced.

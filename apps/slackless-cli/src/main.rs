@@ -35,8 +35,8 @@ use crate::commands::browse::{
     cmd_catchup, cmd_channels, cmd_digest, cmd_dms, cmd_revisions, cmd_threads, cmd_users,
 };
 use crate::commands::maintenance::{
-    cmd_archive_index_semantic, cmd_archive_semantic_model, cmd_archive_status, cmd_stats,
-    cmd_vacuum,
+    cmd_archive_backup, cmd_archive_check, cmd_archive_index_semantic, cmd_archive_prune,
+    cmd_archive_semantic_model, cmd_archive_status, cmd_stats, cmd_vacuum,
 };
 use crate::commands::messages::{
     ExportCmdOpts, SearchAllOpts, SemanticSearchCmdOpts, cmd_export, cmd_read, cmd_search,
@@ -296,6 +296,9 @@ async fn dispatch(
             ArchiveCommand::SemanticModel { command } => {
                 cmd_archive_semantic_model(ctx, *command).await
             }
+            ArchiveCommand::Check(args) => cmd_archive_check(ctx, workspace, args.full),
+            ArchiveCommand::Backup(args) => cmd_archive_backup(ctx, workspace, &args.output_path),
+            ArchiveCommand::Prune(args) => cmd_archive_prune(ctx, &args),
         },
         Commands::Update(args) => {
             update::run_update(ctx, args.check, args.force, args.restart, args.beta).await

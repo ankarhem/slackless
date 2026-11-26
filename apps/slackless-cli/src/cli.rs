@@ -395,6 +395,32 @@ pub(crate) struct ArchiveIndexSemanticArgs {
     pub(crate) status: bool,
 }
 
+#[derive(Args)]
+pub(crate) struct ArchiveCheckArgs {
+    /// Run the exhaustive `PRAGMA integrity_check` instead of the fast `PRAGMA quick_check`.
+    #[arg(long)]
+    pub(crate) full: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct ArchiveBackupArgs {
+    /// Destination file for the consistent SQLite snapshot (an existing backup file is replaced).
+    pub(crate) output_path: PathBuf,
+}
+
+#[derive(Args)]
+pub(crate) struct ArchivePruneArgs {
+    /// Per-directory media cache size cap in megabytes (0 = unlimited).
+    #[arg(long, value_name = "MB", default_value_t = slackless_core::maintenance::DEFAULT_MEDIA_CACHE_MAX_MB)]
+    pub(crate) max_mb: u32,
+    /// Remove cached media files untouched for this many days (0 = never).
+    #[arg(long, value_name = "DAYS", default_value_t = slackless_core::maintenance::DEFAULT_MEDIA_CACHE_MAX_DAYS)]
+    pub(crate) max_days: u32,
+    /// Also drop semantic vectors for workspaces whose local archive no longer exists.
+    #[arg(long)]
+    pub(crate) semantic: bool,
+}
+
 #[derive(Subcommand)]
 pub(crate) enum SemanticModelCommand {
     /// Show download status, disk usage, and sidecar vector index statistics (offline).
@@ -430,6 +456,12 @@ pub(crate) enum ArchiveCommand {
         #[command(subcommand)]
         command: Box<SemanticModelCommand>,
     },
+    /// Verify the local SQLite archive's integrity (`PRAGMA quick_check`, or `--full`) (offline).
+    Check(Box<ArchiveCheckArgs>),
+    /// Write a consistent online snapshot of the local archive to OUTPUT_PATH (`VACUUM INTO`, offline).
+    Backup(Box<ArchiveBackupArgs>),
+    /// Apply size/age retention to cached media files (and optionally orphaned semantic vectors).
+    Prune(Box<ArchivePruneArgs>),
 }
 
 #[derive(Args)]

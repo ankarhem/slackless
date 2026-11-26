@@ -138,6 +138,13 @@ impl App {
             cx,
         );
         crate::media::set_ask_download_location(settings.ask_download_location, cx);
+        let media_policy = settings.media_cache_policy();
+        let policy_changed = crate::media::media_cache_policy() != media_policy;
+        crate::media::set_media_cache_policy(media_policy);
+        let first_prune = storage::claim_startup_cache_prune();
+        if policy_changed || first_prune {
+            self.auto_prune_caches(media_policy, first_prune, cx);
+        }
         let nav_prefs = crate::sidebar::NavPrefs {
             show_home: settings.show_home,
             show_dms: settings.show_dms,

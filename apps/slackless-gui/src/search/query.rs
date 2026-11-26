@@ -3,22 +3,24 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use gpui_kit::gpui::Context;
 use slackless_core::SharedStore;
 use slackless_core::api::SearchSort as ApiSearchSort;
 use slackless_core::embeddings::{
-    Embedder, EmbeddingModel, OnnxEmbedder, detect_embedding_model_setup,
+    Embedder, EmbeddingModel, OnnxEmbedder, cached_onnx_embedder, detect_embedding_model_setup,
+    unload_cached_embedder,
 };
 use slackless_core::search::{
     WorkspaceSearchTarget, discover_local_archives, search_across_stores, search_disk_archives,
     search_huddle_transcripts_across_stores, search_huddle_transcripts_in_disk_archives,
 };
 use slackless_core::semantic_index::{
-    hybrid_search_disk_archives, hybrid_search_huddle_transcripts_across_stores,
-    hybrid_search_huddle_transcripts_in_disk_archives, hybrid_search_stores, index_disk_archives,
-    index_store_documents, open_default_semantic_index, open_existing_semantic_index,
+    IndexPacing, hybrid_search_disk_archives, hybrid_search_huddle_transcripts_across_stores,
+    hybrid_search_huddle_transcripts_in_disk_archives, hybrid_search_stores,
+    index_disk_archives_paced, index_store_documents_paced, open_default_semantic_index,
+    open_existing_semantic_index,
 };
 use slackless_core::store::{SearchFilters, SearchMode, SearchQuery, SearchSort, Store};
 use slackless_core::types::{Conversation, ConversationKind, TeamId, User};
@@ -26,30 +28,16 @@ use slackless_core::types::{Conversation, ConversationKind, TeamId, User};
 use super::state::{RESULT_LIMIT, SearchEvent, SearchScope, SearchSource, SearchTab, SearchView};
 use crate::fixtures::Fixtures;
 
-fn embedder_cache() -> &'static Mutex<Option<Arc<OnnxEmbedder>>> {
-    static CACHE: OnceLock<Mutex<Option<Arc<OnnxEmbedder>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
-}
-
-/// Load (or reuse) the default local ONNX embedder. Stays 0 MB idle until first semantic use.
+/// Load (or reuse) the default local ONNX embedder. Stays 0 MB idle until first semantic use and
+/// is unloaded automatically after 5 minutes without semantic activity
+/// ([`slackless_core::embeddings::EMBEDDER_IDLE_TTL`]).
 pub(crate) fn load_or_get_onnx_embedder() -> Result<Arc<OnnxEmbedder>, String> {
-    let mut guard = embedder_cache()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    if let Some(cached) = guard.as_ref() {
-        return Ok(Arc::clone(cached));
-    }
-    let loaded = Arc::new(OnnxEmbedder::load_default(EmbeddingModel::default())?);
-    *guard = Some(Arc::clone(&loaded));
-    Ok(loaded)
+    cached_onnx_embedder(EmbeddingModel::default())
 }
 
 /// Release the cached ONNX embedder (called when the user deletes the local embedding model).
 pub(crate) fn clear_cached_onnx_embedder() {
-    let mut guard = embedder_cache()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    *guard = None;
+    unload_cached_embedder();
 }
 
 static SEMANTIC_DOWNLOAD_BUSY: AtomicBool = AtomicBool::new(false);
@@ -488,11 +476,12 @@ impl SearchView {
                                 continue;
                             }
                             let store = shared.lock().unwrap_or_else(PoisonError::into_inner);
-                            let rep = index_store_documents(
+                            let rep = index_store_documents_paced(
                                 &store,
                                 idx,
                                 embedder.as_ref(),
                                 Some(ws),
+                                IndexPacing::BACKGROUND,
                                 |_| {},
                             )?;
                             embedded_total += rep.embedded;
@@ -504,8 +493,13 @@ impl SearchView {
                                 .filter(|(ws, _)| !seen.contains(ws))
                                 .collect();
                             if !extra.is_empty() {
-                                let rep =
-                                    index_disk_archives(&extra, idx, embedder.as_ref(), |_| {})?;
+                                let rep = index_disk_archives_paced(
+                                    &extra,
+                                    idx,
+                                    embedder.as_ref(),
+                                    IndexPacing::BACKGROUND,
+                                    |_| {},
+                                )?;
                                 embedded_total += rep.embedded;
                                 skipped_total += rep.skipped_unchanged;
                             }

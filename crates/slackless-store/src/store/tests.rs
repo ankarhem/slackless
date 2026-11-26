@@ -2875,6 +2875,7 @@ fn recent_threads_uses_partial_index_and_filters_correctly() {
 
 #[test]
 fn empty_upsert_does_not_bump_revision_while_transcript_insert_does() {
+    let _revision_guard = revision_guard();
     let mut store = Store::open_in_memory().unwrap();
     let rev = Store::message_revision();
     store.upsert_messages(&ws(), &general(), &[]).unwrap();
@@ -3037,6 +3038,7 @@ fn v10_to_v11_migration_backfills_message_file_and_inline_clip_transcripts() {
 
 #[test]
 fn file_transcripts_upsert_search_edit_preserve_multi_file_and_delete() {
+    let _revision_guard = revision_guard();
     let mut store = Store::open_in_memory().unwrap();
     let video_id = FileId::from("F_VID_1");
     let audio_id = FileId::from("F_AUD_2");
@@ -3808,4 +3810,249 @@ fn catchup_store_queries_filter_by_cutoff_and_exclude_deleted() {
     assert_eq!(huddles.len(), 1);
     assert_eq!(huddles[0].call_id, "R_NEW");
     assert_eq!(huddles[0].preview, "new huddle sync");
+}
+
+struct MaintTempDir(std::path::PathBuf);
+
+impl MaintTempDir {
+    fn new(label: &str) -> Self {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "slackless-store-maint-{label}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for MaintTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Serializes tests that assert exact global [`Store::message_revision`] values against the
+/// bulk-writing maintenance tests below (the revision counter is process-global).
+fn revision_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn seed_messages(store: &mut Store, n: usize) {
+    let _revision_guard = revision_guard();
+    let msgs: Vec<Message> = (0..n)
+        .map(|i| {
+            msg(
+                &format!("17000{i:05}.000100"),
+                "U1",
+                &format!("backup hygiene message {i} {}", "x".repeat(200)),
+            )
+        })
+        .collect();
+    store.upsert_messages(&ws(), &general(), &msgs).unwrap();
+}
+
+#[test]
+fn integrity_check_quick_and_full_report_ok_on_healthy_store() {
+    let mut store = Store::open_in_memory().unwrap();
+    seed_messages(&mut store, 20);
+    let quick = store.integrity_check().unwrap();
+    assert!(quick.ok, "{quick:?}");
+    assert_eq!(quick.mode, IntegrityMode::Quick);
+    assert!(quick.problems.is_empty());
+    assert_eq!(quick.summary(), "ok");
+    let full = store.integrity_check_with(IntegrityMode::Full).unwrap();
+    assert!(full.ok);
+    assert_eq!(full.mode, IntegrityMode::Full);
+}
+
+#[test]
+fn integrity_report_summary_formats_problems() {
+    let report = IntegrityReport {
+        ok: false,
+        mode: IntegrityMode::Quick,
+        problems: vec!["Tree 4 page 9: bad".into(), "row 3 missing".into()],
+        elapsed_ms: 1,
+    };
+    assert_eq!(report.summary(), "Tree 4 page 9: bad (+1 more)");
+    let single = IntegrityReport {
+        problems: vec!["only one".into()],
+        ..report.clone()
+    };
+    assert_eq!(single.summary(), "only one");
+    let empty = IntegrityReport {
+        problems: Vec::new(),
+        ..report
+    };
+    assert_eq!(empty.summary(), "integrity check failed");
+}
+
+#[test]
+fn integrity_check_flags_corrupted_pages() {
+    let dir = MaintTempDir::new("corrupt");
+    let path = dir.0.join("T1.sqlite");
+    {
+        let mut store = Store::open(&path).unwrap();
+        seed_messages(&mut store, 400);
+        store
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+    }
+    let page_size = 4096usize;
+    let mut bytes = std::fs::read(&path).unwrap();
+    let pages = bytes.len() / page_size;
+    assert!(
+        pages > 8,
+        "expected a multi-page database, got {pages} pages"
+    );
+    // Trash a run of interior data pages (never page 1, which holds the header + schema root).
+    for page in (pages / 2)..(pages / 2 + 3) {
+        let start = page * page_size;
+        bytes[start..start + page_size].fill(0xA5);
+    }
+    std::fs::write(&path, &bytes).unwrap();
+    let store = Store::open_read_only(&path).unwrap();
+    match store.integrity_check() {
+        Ok(report) => {
+            assert!(!report.ok, "corruption must be reported: {report:?}");
+            assert!(!report.problems.is_empty());
+        }
+        // SQLite may also surface SQLITE_CORRUPT directly from the pragma.
+        Err(err) => assert!(err.to_string().to_lowercase().contains("malformed")),
+    }
+}
+
+#[test]
+fn file_info_reports_wal_and_db_bytes() {
+    let mem = Store::open_in_memory().unwrap();
+    let info = mem.file_info().unwrap();
+    assert_eq!(info.path, None);
+    assert_eq!(info.wal_bytes, 0);
+    assert!(info.db_bytes > 0);
+
+    let dir = MaintTempDir::new("fileinfo");
+    let path = dir.0.join("T1.sqlite");
+    let mut store = Store::open(&path).unwrap();
+    seed_messages(&mut store, 50);
+    let info = store.file_info().unwrap();
+    assert_eq!(
+        info.path.as_deref().map(|p| p.canonicalize().unwrap()),
+        Some(path.canonicalize().unwrap())
+    );
+    assert!(info.db_bytes > 0);
+    assert!(info.wal_bytes > 0, "WAL should hold uncheckpointed writes");
+    assert!(info.freelist_bytes <= info.db_bytes);
+}
+
+#[test]
+fn backup_to_writes_consistent_snapshot_and_overwrites_previous_backup() {
+    let dir = MaintTempDir::new("backup");
+    let path = dir.0.join("T1.sqlite");
+    let mut store = Store::open(&path).unwrap();
+    seed_messages(&mut store, 120);
+    let dest = dir.0.join("backup.sqlite");
+
+    let bytes = store.backup_to(&dest).unwrap();
+    assert!(bytes > 0);
+    assert_eq!(bytes, std::fs::metadata(&dest).unwrap().len());
+    {
+        let copy = Store::open_read_only(&dest).unwrap();
+        assert_eq!(copy.message_count(&ws()).unwrap(), 120);
+        assert!(copy.integrity_check().unwrap().ok);
+    }
+
+    // A later backup to the same destination atomically replaces it.
+    seed_messages(&mut store, 130);
+    store.backup_to(&dest).unwrap();
+    let copy = Store::open_read_only(&dest).unwrap();
+    assert_eq!(copy.message_count(&ws()).unwrap(), 130);
+    let leftovers: Vec<_> = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".partial-"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files must be cleaned up");
+    // Source is untouched.
+    assert_eq!(store.message_count(&ws()).unwrap(), 130);
+}
+
+#[test]
+fn backup_to_works_from_read_only_and_in_memory_handles() {
+    let dir = MaintTempDir::new("backup-ro");
+    let path = dir.0.join("T1.sqlite");
+    let mut writer = Store::open(&path).unwrap();
+    seed_messages(&mut writer, 30);
+
+    let reader = Store::open_read_only(&path).unwrap();
+    let dest = dir.0.join("from-reader.sqlite");
+    assert!(reader.backup_to(&dest).unwrap() > 0);
+    assert_eq!(
+        Store::open_read_only(&dest)
+            .unwrap()
+            .message_count(&ws())
+            .unwrap(),
+        30
+    );
+
+    let mut mem = Store::open_in_memory().unwrap();
+    seed_messages(&mut mem, 5);
+    let mem_dest = dir.0.join("from-memory.sqlite");
+    assert!(mem.backup_to(&mem_dest).unwrap() > 0);
+    assert_eq!(
+        Store::open_read_only(&mem_dest)
+            .unwrap()
+            .message_count(&ws())
+            .unwrap(),
+        5
+    );
+}
+
+#[test]
+fn backup_to_rejects_live_database_sidecars_directories_and_missing_parents() {
+    let dir = MaintTempDir::new("backup-reject");
+    let path = dir.0.join("T1.sqlite");
+    let mut store = Store::open(&path).unwrap();
+    seed_messages(&mut store, 10);
+
+    let wal = dir.0.join("T1.sqlite-wal");
+    let shm = dir.0.join("T1.sqlite-shm");
+    let dotted = dir.0.join(".").join("T1.sqlite");
+    for bad in [&path, &wal, &shm, &dotted] {
+        let err = store.backup_to(bad).unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidBackupPath(_)),
+            "{bad:?} -> {err}"
+        );
+    }
+    assert!(matches!(
+        store.backup_to(&dir.0).unwrap_err(),
+        StoreError::InvalidBackupPath(_)
+    ));
+    assert!(matches!(
+        store
+            .backup_to(&dir.0.join("missing").join("x.sqlite"))
+            .unwrap_err(),
+        StoreError::InvalidBackupPath(_)
+    ));
+    assert!(matches!(
+        store.backup_to(Path::new("")).unwrap_err(),
+        StoreError::InvalidBackupPath(_)
+    ));
+    #[cfg(unix)]
+    {
+        let link = dir.0.join("alias.sqlite");
+        std::fs::hard_link(&path, &link).unwrap();
+        assert!(matches!(
+            store.backup_to(&link).unwrap_err(),
+            StoreError::InvalidBackupPath(_)
+        ));
+    }
+    // Live database is intact after every rejected attempt.
+    assert_eq!(store.message_count(&ws()).unwrap(), 10);
+    assert!(store.integrity_check().unwrap().ok);
 }

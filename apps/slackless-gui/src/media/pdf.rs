@@ -12,6 +12,9 @@ use super::downloads::active_fetcher;
 
 /// Maximum rendered PDF page textures kept in memory simultaneously across all open documents.
 const MAX_CACHED_PDF_PAGES: usize = 24;
+/// Maximum total decoded BGRA bytes (`width * height * 4`) of cached PDF pages (64 MiB). A single
+/// 1600x1600 viewer page decodes to ~10 MiB, so the page-count cap alone could pin ~240 MiB.
+const MAX_CACHED_PDF_BYTES: u64 = 64 * 1024 * 1024;
 /// Default inline preview thumbnail box for PDF attachment cards.
 const INLINE_PDF_THUMB_W: u32 = 480;
 const INLINE_PDF_THUMB_H: u32 = 320;
@@ -28,12 +31,33 @@ struct PdfPageKey {
 #[derive(Clone)]
 pub struct CachedPdfPage {
     pub image: Arc<Image>,
+    /// Decoded BGRA texture size (`width * height * 4`) charged against [`MAX_CACHED_PDF_BYTES`].
+    pub decoded_bytes: u64,
+}
+
+impl CachedPdfPage {
+    /// Wrap a rendered page, computing its decoded BGRA footprint from pixel dimensions.
+    pub fn new(image: Arc<Image>, width: u32, height: u32) -> Self {
+        Self {
+            image,
+            decoded_bytes: decoded_bgra_bytes(width, height),
+        }
+    }
+}
+
+/// Decoded 4-byte-per-pixel texture size for a `width x height` page.
+pub(crate) fn decoded_bgra_bytes(width: u32, height: u32) -> u64 {
+    u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(4)
 }
 
 #[derive(Default)]
 struct PdfRenderCache {
     pages: HashMap<PdfPageKey, CachedPdfPage>,
     order: VecDeque<PdfPageKey>,
+    /// Sum of `decoded_bytes` across `pages`.
+    total_bytes: u64,
     page_counts: HashMap<String, u32>,
     thumb_in_flight: HashSet<String>,
     thumb_failed: HashSet<String>,
@@ -52,18 +76,36 @@ impl PdfRenderCache {
     }
 
     fn insert_page(&mut self, key: PdfPageKey, page: CachedPdfPage) -> Vec<CachedPdfPage> {
+        self.insert_page_bounded(key, page, MAX_CACHED_PDF_PAGES, MAX_CACHED_PDF_BYTES)
+    }
+
+    /// Insert `page`, then evict least-recently-used pages until both the page-count and decoded
+    /// byte budgets hold. The just-inserted page is always kept (even if it alone exceeds the
+    /// byte budget) so the visible page never thrashes.
+    fn insert_page_bounded(
+        &mut self,
+        key: PdfPageKey,
+        page: CachedPdfPage,
+        max_pages: usize,
+        max_bytes: u64,
+    ) -> Vec<CachedPdfPage> {
         let mut evicted_pages = Vec::new();
         if let Some(pos) = self.order.iter().position(|k| k == &key) {
             self.order.remove(pos);
         }
+        self.total_bytes = self.total_bytes.saturating_add(page.decoded_bytes);
         if let Some(replaced) = self.pages.insert(key.clone(), page) {
+            self.total_bytes = self.total_bytes.saturating_sub(replaced.decoded_bytes);
             evicted_pages.push(replaced);
         }
         self.order.push_back(key);
-        while self.order.len() > MAX_CACHED_PDF_PAGES {
-            if let Some(evicted) = self.order.pop_front()
-                && let Some(removed) = self.pages.remove(&evicted)
-            {
+        while self.order.len() > 1 && (self.order.len() > max_pages || self.total_bytes > max_bytes)
+        {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.pages.remove(&evicted) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.decoded_bytes);
                 evicted_pages.push(removed);
             }
         }
@@ -83,11 +125,14 @@ impl PdfRenderCache {
             }
             !matches
         });
+        let freed: u64 = removed.iter().map(|p| p.decoded_bytes).sum();
+        self.total_bytes = self.total_bytes.saturating_sub(freed);
         removed
     }
 
     fn take_all(&mut self) -> Vec<CachedPdfPage> {
         self.order.clear();
+        self.total_bytes = 0;
         self.page_counts.clear();
         self.thumb_in_flight.clear();
         self.thumb_failed.clear();
@@ -131,6 +176,12 @@ pub fn clear_pdf_cache(window: &mut Window, cx: &mut App) {
     for page in evicted {
         evict_pdf_image(page.image, Some(window), cx);
     }
+}
+
+/// `(cached_pages, decoded_bytes)` currently held by the PDF page cache (diagnostics).
+pub fn pdf_cache_usage(cx: &App) -> (usize, u64) {
+    cx.try_global::<PdfRenderCache>()
+        .map_or((0, 0), |cache| (cache.pages.len(), cache.total_bytes))
 }
 
 /// Cached page count for `file_id`, if already inspected.
@@ -266,7 +317,7 @@ pub fn request_pdf_inline_thumb(file_id: String, url: String, window: &mut Windo
                     Ok((count, page)) => {
                         let img = Arc::new(Image::from_bytes(ImageFormat::Png, page.png_bytes));
                         cache.page_counts.insert(fid.clone(), count);
-                        cache.insert_page(key, CachedPdfPage { image: img })
+                        cache.insert_page(key, CachedPdfPage::new(img, page.width, page.height))
                     }
                     Err(_) => {
                         cache.thumb_failed.insert(fid);
@@ -317,7 +368,10 @@ pub(crate) async fn fetch_and_render_pdf_page(
         let rendered =
             render_pdf_page_png(&path, clamped_page, max_w, max_h).map_err(|e| e.to_string())?;
         let image = Arc::new(Image::from_bytes(ImageFormat::Png, rendered.png_bytes));
-        Ok((count, CachedPdfPage { image }))
+        Ok((
+            count,
+            CachedPdfPage::new(image, rendered.width, rendered.height),
+        ))
     })
     .await
 }
@@ -337,12 +391,7 @@ mod tests {
                 max_w: 800,
                 max_h: 800,
             };
-            let displaced = cache.insert_page(
-                key,
-                CachedPdfPage {
-                    image: dummy_img.clone(),
-                },
-            );
+            let displaced = cache.insert_page(key, CachedPdfPage::new(dummy_img.clone(), 10, 10));
             if i >= MAX_CACHED_PDF_PAGES {
                 assert_eq!(displaced.len(), 1);
             } else {
@@ -374,6 +423,78 @@ mod tests {
         );
     }
 
+    fn key(id: &str, w: u32) -> PdfPageKey {
+        PdfPageKey {
+            file_id: id.to_owned(),
+            page_index: 0,
+            max_w: w,
+            max_h: w,
+        }
+    }
+
+    #[test]
+    fn pdf_render_cache_enforces_decoded_byte_budget_lru() {
+        let mut cache = PdfRenderCache::default();
+        let img = Arc::new(Image::from_bytes(ImageFormat::Png, vec![1, 2, 3]));
+        assert_eq!(decoded_bgra_bytes(1600, 1600), 1600 * 1600 * 4);
+        let page = |w: u32| CachedPdfPage::new(img.clone(), w, w);
+
+        // Budget of 3 pages' worth of 100x100 BGRA (40_000 bytes each) and a lax count cap.
+        let budget = 3 * decoded_bgra_bytes(100, 100);
+        for id in ["A", "B", "C"] {
+            assert!(
+                cache
+                    .insert_page_bounded(key(id, 100), page(100), 24, budget)
+                    .is_empty()
+            );
+        }
+        assert_eq!(cache.total_bytes, budget);
+        // Touch A so B becomes least recently used.
+        assert!(cache.get_page(&key("A", 100)).is_some());
+        let evicted = cache.insert_page_bounded(key("D", 100), page(100), 24, budget);
+        assert_eq!(evicted.len(), 1);
+        assert!(!cache.pages.contains_key(&key("B", 100)));
+        assert!(cache.pages.contains_key(&key("A", 100)));
+        assert_eq!(cache.total_bytes, budget);
+
+        // A page bigger than the whole budget evicts everything else but is itself kept.
+        let evicted = cache.insert_page_bounded(key("HUGE", 400), page(400), 24, budget);
+        assert_eq!(evicted.len(), 3);
+        assert_eq!(cache.pages.len(), 1);
+        assert_eq!(cache.order.len(), 1);
+        assert_eq!(cache.total_bytes, decoded_bgra_bytes(400, 400));
+
+        // Replacing a key re-accounts its bytes instead of double counting.
+        let replaced = cache.insert_page_bounded(key("HUGE", 400), page(10), 24, budget);
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(cache.total_bytes, decoded_bgra_bytes(10, 10));
+
+        // Viewer-page eviction and take_all keep the byte accounting exact.
+        cache.insert_page_bounded(key("V", 1600), page(50), 24, u64::MAX);
+        let before = cache.total_bytes;
+        let removed = cache.take_viewer_pages(&["V".to_owned()]);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(cache.total_bytes, before - decoded_bgra_bytes(50, 50));
+        cache.take_all();
+        assert_eq!(cache.total_bytes, 0);
+        assert!(cache.pages.is_empty());
+    }
+
+    #[test]
+    fn default_pdf_cache_budget_caps_full_res_viewer_pages_below_count_cap() {
+        let mut cache = PdfRenderCache::default();
+        let img = Arc::new(Image::from_bytes(ImageFormat::Png, vec![1]));
+        for i in 0..MAX_CACHED_PDF_PAGES {
+            cache.insert_page(
+                key(&format!("P{i}"), 1600),
+                CachedPdfPage::new(img.clone(), 1600, 1600),
+            );
+        }
+        // 1600x1600 BGRA = 10 MiB each, so only 6 fit in 64 MiB despite the 24-page cap.
+        assert_eq!(cache.pages.len(), 6);
+        assert!(cache.total_bytes <= MAX_CACHED_PDF_BYTES);
+    }
+
     #[gpui::test]
     fn evict_viewer_pdf_pages_clears_full_res_and_retains_inline_thumbs(
         cx: &mut gpui::TestAppContext,
@@ -389,9 +510,7 @@ mod tests {
                 INLINE_PDF_THUMB_W,
                 INLINE_PDF_THUMB_H,
                 3,
-                CachedPdfPage {
-                    image: inline_img.clone(),
-                },
+                CachedPdfPage::new(inline_img.clone(), INLINE_PDF_THUMB_W, INLINE_PDF_THUMB_H),
                 Some(window),
                 cx,
             );
@@ -401,9 +520,7 @@ mod tests {
                 1600,
                 1600,
                 3,
-                CachedPdfPage {
-                    image: viewer_img.clone(),
-                },
+                CachedPdfPage::new(viewer_img.clone(), 1600, 1600),
                 Some(window),
                 cx,
             );
