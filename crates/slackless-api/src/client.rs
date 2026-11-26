@@ -18,7 +18,6 @@ use crate::assets::stream_to_path;
 use crate::types::ApiResponse;
 use crate::types::endpoints;
 use crate::{ApiError, DownloadError, Result};
-
 /// Maximum entries retained in the in-memory diagnostic net-log ring buffer (`F-SHELL-158`).
 const MAX_NET_LOG_ENTRIES: usize = 500;
 
@@ -91,10 +90,6 @@ pub fn proxy_url() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn redact_url(url: &Url) -> String {
-    slackless_types::net::redact_url(url.as_str())
-}
-
 pub(crate) fn record_net_log(
     method: &str,
     url: &Url,
@@ -111,7 +106,7 @@ pub(crate) fn record_net_log(
     let entry = NetLogEntry {
         timestamp_ms,
         method: method.to_owned(),
-        url: redact_url(url),
+        url: slackless_types::net::redact_url(url.as_str()),
         status,
         elapsed_ms: elapsed.as_millis() as u64,
         error,
@@ -230,8 +225,11 @@ impl SlackApi {
         if !base.path().ends_with('/') {
             base.set_path(&format!("{}/", base.path()));
         }
-        let mut cookie = HeaderValue::from_str(&format!("d={}", encode_cookie(d_cookie)))
-            .expect("percent-encoded cookie value is visible ascii");
+        let mut cookie = HeaderValue::from_str(&format!(
+            "d={}",
+            slackless_types::net::encode_cookie(d_cookie)
+        ))
+        .expect("percent-encoded cookie value is visible ascii");
         cookie.set_sensitive(true);
         Ok(Self {
             http,
@@ -584,11 +582,6 @@ fn status_error(status: StatusCode, body: &[u8]) -> ApiError {
     }
 }
 
-/// URL-encodes the `d` cookie value exactly once via [`slackless_types::net::encode_cookie`].
-fn encode_cookie(value: &str) -> String {
-    slackless_types::net::encode_cookie(value)
-}
-
 /// Heuristic for Slack's HTML sign-in interstitial returned when a file-host `d` cookie is
 /// rejected on an HTML document download (such as a Canvas `url_private` export).
 fn is_slack_signin_html(html: &str) -> bool {
@@ -648,12 +641,6 @@ mod tests {
     }
 
     #[test]
-    fn already_encoded_cookie_is_not_double_encoded() {
-        assert_eq!(encode_cookie("xoxd-a%2Fb%3D"), "xoxd-a%2Fb%3D");
-        assert_eq!(encode_cookie("xoxd-a/b="), "xoxd-a%2Fb%3D");
-    }
-
-    #[test]
     fn debug_redacts_credentials() {
         let api = SlackApi::for_workspace("acme", "xoxc-secret", "xoxd-secret").unwrap();
         let dbg = format!("{api:?}");
@@ -682,13 +669,6 @@ mod tests {
         assert!(!is_trusted_slack_https_url(
             &Url::parse("https://slack.com@evil.example/shortcuts/Ft1").unwrap()
         ));
-    }
-
-    #[test]
-    fn redact_url_strips_userinfo_query_and_fragment() {
-        let url = Url::parse("https://alice:s3cr3t@acme.slack.com/api/auth.test?token=xoxc#frag")
-            .unwrap();
-        assert_eq!(redact_url(&url), "https://acme.slack.com/api/auth.test");
     }
 
     #[test]

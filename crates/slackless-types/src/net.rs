@@ -71,6 +71,8 @@ mod tests {
             "xoxd-abc%2Fdef%2Bghi%3D%3D"
         );
         assert_eq!(encode_cookie("xoxd-plain_123.~-"), "xoxd-plain_123.~-");
+        // Spaces and control characters are encoded, so a `HeaderValue` never rejects the cookie.
+        assert_eq!(encode_cookie("xoxd-a b/c\r\n"), "xoxd-a+b%2Fc%0D%0A");
     }
 
     #[test]

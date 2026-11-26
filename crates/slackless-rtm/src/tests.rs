@@ -11,14 +11,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::{COOKIE, ORIGIN, USER_AGENT};
 use tokio_tungstenite::tungstenite::{self, Message};
 
 use crate::backoff::Backoff;
 use crate::client::RtmClient;
 use crate::config::{ConnectionState, RtmConfig, RtmError, RtmEvent};
-use crate::driver::{Driver, encode_cookie, is_trusted_cookie_host, redact_url_for_log};
+use crate::driver::{Driver, is_trusted_cookie_host};
 use crate::frame::TickleReason;
 use crate::tls::tls_connector;
 use crate::url::ConnectParams;
@@ -801,17 +800,6 @@ async fn presence_sub_during_backoff_replays_server_close_reconnects_healthy_res
 }
 
 #[test]
-fn encode_cookie_handles_raw_and_already_encoded_values() {
-    assert_eq!(encode_cookie("xoxd-a%2Fb%2Bc%3D"), "xoxd-a%2Fb%2Bc%3D");
-    assert_eq!(encode_cookie("xoxd-a/b+c="), "xoxd-a%2Fb%2Bc%3D");
-
-    // Spaces and control characters must be encoded so HeaderValue never rejects the cookie.
-    let encoded = encode_cookie("xoxd-a b/c\r\n");
-    assert_eq!(encoded, "xoxd-a+b%2Fc%0D%0A");
-    assert!(HeaderValue::from_str(&format!("d={encoded}")).is_ok());
-}
-
-#[test]
 fn debug_redacts_token_and_d_cookie() {
     let params = ConnectParams::new("xoxc-super-secret-token");
     let params_dbg = format!("{params:?}");
@@ -827,15 +815,6 @@ fn debug_redacts_token_and_d_cookie() {
     assert!(!cfg_dbg.contains("xoxc-super-secret-token"), "{cfg_dbg}");
     assert!(!cfg_dbg.contains("xoxd-super-secret-cookie"), "{cfg_dbg}");
     assert!(cfg_dbg.contains("<redacted>"), "{cfg_dbg}");
-}
-
-#[test]
-fn redact_url_for_log_strips_query_fragment_and_userinfo() {
-    assert_eq!(
-        redact_url_for_log("wss://user:pass@wss-primary.slack.com/link?token=xoxc#frag"),
-        "wss://wss-primary.slack.com/link"
-    );
-    assert_eq!(redact_url_for_log("not a url"), "<invalid-url>");
 }
 
 #[test]

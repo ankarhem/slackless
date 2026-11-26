@@ -152,7 +152,7 @@ impl Driver {
         let url = match self.reconnect_url.take() {
             Some(url) if is_trusted_cookie_host(&self.config.base_url, &url) => url,
             Some(url) => {
-                let redacted = redact_url_for_log(&url);
+                let redacted = slackless_types::net::redact_url(&url);
                 tracing::warn!(
                     url = %redacted,
                     "rejecting untrusted reconnect_url; falling back to base_url"
@@ -220,7 +220,7 @@ impl Driver {
         if let Some(d) = &self.config.d_cookie
             && is_trusted_cookie_host(&self.config.base_url, url)
         {
-            let encoded = encode_cookie(d);
+            let encoded = slackless_types::net::encode_cookie(d);
             let value =
                 HeaderValue::from_str(&format!("d={encoded}")).map_err(http::Error::from)?;
             headers.insert(COOKIE, value);
@@ -279,7 +279,7 @@ impl Driver {
                             if is_trusted_cookie_host(&self.config.base_url, &r.url) {
                                 self.reconnect_url = Some(r.url.clone());
                             } else {
-                                let redacted = redact_url_for_log(&r.url);
+                                let redacted = slackless_types::net::redact_url(&r.url);
                                 tracing::warn!(
                                     url = %redacted,
                                     "ignoring untrusted reconnect_url from server"
@@ -361,17 +361,6 @@ impl Driver {
         }
         self.events.send(event).await.is_ok()
     }
-}
-
-/// URL-encodes the `d` cookie value exactly once via [`slackless_types::net::encode_cookie`].
-pub(crate) fn encode_cookie(value: &str) -> String {
-    slackless_types::net::encode_cookie(value)
-}
-
-/// Redact query string, fragment, and userinfo before logging a rejected URL via
-/// [`slackless_types::net::redact_url`].
-pub(crate) fn redact_url_for_log(raw: &str) -> String {
-    slackless_types::net::redact_url(raw)
 }
 
 /// Returns whether `target_url` is a trusted host for forwarding the `d` session cookie.
