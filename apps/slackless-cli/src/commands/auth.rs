@@ -1,12 +1,16 @@
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use slackless_core::auth::SessionStore;
+use slackless_core::auth::{Session, SessionStore};
 
 use crate::{Ctx, output, session};
 
 pub(crate) fn cmd_auth_status(ctx: &Ctx) -> Result<ExitCode> {
-    let entries = session::status_entries();
+    emit_auth_status(ctx, ctx.sessions())
+}
+
+fn emit_auth_status(ctx: &Ctx, sessions: &[Session]) -> Result<ExitCode> {
+    let entries = session::status_entries(sessions);
     let view = output::AuthStatusView {
         signed_in: entries.iter().any(|entry| entry.has_secrets),
         workspaces: entries
@@ -26,7 +30,7 @@ pub(crate) fn cmd_auth_login(ctx: &Ctx, workspace_domain: Option<String>) -> Res
     for session in sessions {
         store.upsert(session)?;
     }
-    cmd_auth_status(ctx)
+    emit_auth_status(ctx, &store.load()?)
 }
 
 pub(crate) fn cmd_auth_logout(ctx: &Ctx, workspace: Option<&str>) -> Result<ExitCode> {
@@ -36,5 +40,5 @@ pub(crate) fn cmd_auth_logout(ctx: &Ctx, workspace: Option<&str>) -> Result<Exit
             store.remove(&session.team_id)?;
         }
     }
-    cmd_auth_status(ctx)
+    emit_auth_status(ctx, &store.load()?)
 }

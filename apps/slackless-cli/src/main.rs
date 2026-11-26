@@ -23,7 +23,6 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::Parser;
-use slackless_core::types::TeamId;
 
 use crate::cli::{
     ArchiveCommand, AuthCommand, CanvasCommand, Cli, Commands, HuddleCommand, ListCommand,
@@ -44,16 +43,12 @@ use crate::commands::messages::{
 };
 use crate::commands::summarize::cmd_summarize;
 use crate::live::{HuddleJoinArgs, HuddleTranscriptsArgs};
-use crate::session::{resolve_workspace, validate_workspace_id};
+pub(crate) use crate::session::Ctx;
+use crate::session::validate_workspace_id;
 use crate::write::{
     run_delete, run_edit, run_mark_read, run_pin, run_pins, run_react, run_reply, run_schedule,
     run_scheduled, run_send, run_thread_live, run_unreact, run_unschedule, run_upload,
 };
-
-/// Shared output mode for one invocation.
-pub(crate) struct Ctx {
-    pub(crate) json: bool,
-}
 
 /// A user-actionable failure: message + JSON envelope, not an error dump.
 pub(crate) fn fail(ctx: &Ctx, code: &str, message: &str) -> ExitCode {
@@ -68,7 +63,6 @@ pub(crate) fn fail(ctx: &Ctx, code: &str, message: &str) -> ExitCode {
 fn main() -> ExitCode {
     slackless_core::huddle::install_default_crypto_provider();
     let cli = Cli::parse();
-    let ctx = Ctx { json: cli.json };
     // `--workspace` names `<data>/<TEAM_ID>.sqlite`: refuse anything but a plain team id before
     // any command can open (or create) a file from it.
     let flag = match cli
@@ -78,32 +72,28 @@ fn main() -> ExitCode {
         .transpose()
     {
         Ok(flag) => flag,
-        Err(message) => return fail(&ctx, "invalid_args", &message),
+        Err(message) => return fail(&Ctx::new(cli.json, None), "invalid_args", &message),
     };
-    let workspace = resolve_workspace(flag.as_deref());
+    let ctx = Ctx::new(cli.json, flag);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build();
     let result = match runtime {
-        Ok(rt) => rt.block_on(dispatch(cli, &ctx, flag.as_deref(), workspace.as_ref())),
+        Ok(rt) => rt.block_on(dispatch(cli, &ctx)),
         Err(err) => Err(anyhow::anyhow!("starting the async runtime: {err}")),
     };
     result.unwrap_or_else(|err| fail(&ctx, "command_failed", &format!("{err:#}")))
 }
 
-async fn dispatch(
-    cli: Cli,
-    ctx: &Ctx,
-    flag: Option<&str>,
-    workspace: Option<&TeamId>,
-) -> Result<ExitCode> {
+async fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
+    let flag = ctx.flag();
     match cli.command {
         Commands::Search(args) if args.search_mode().uses_embeddings() => {
             let mode = args.search_mode();
             let sort = args.resolved_sort();
             cmd_search_semantic(
                 ctx,
-                workspace,
+                ctx.workspace(),
                 &args.query,
                 SemanticSearchCmdOpts {
                     mode,
@@ -130,7 +120,7 @@ async fn dispatch(
         ),
         Commands::Search(args) => cmd_search(
             ctx,
-            workspace,
+            ctx.workspace(),
             &args.query,
             args.limit,
             args.resolved_sort(),
@@ -140,7 +130,7 @@ async fn dispatch(
         ),
         Commands::Read(args) => cmd_read(
             ctx,
-            workspace,
+            ctx.workspace(),
             &args.channel,
             args.limit,
             args.since.as_deref(),
@@ -149,7 +139,7 @@ async fn dispatch(
         Commands::Thread(args) if args.live => {
             run_thread_live(ctx, flag, &args.channel, &args.thread_ts, args.limit).await
         }
-        Commands::Thread(args) => cmd_thread(ctx, workspace, &args.channel, &args.thread_ts),
+        Commands::Thread(args) => cmd_thread(ctx, ctx.workspace(), &args.channel, &args.thread_ts),
         Commands::Send(args) => {
             run_send(ctx, flag, &args.channel, args.text, args.allow_secrets).await
         }
@@ -192,17 +182,24 @@ async fn dispatch(
             )
             .await
         }
-        Commands::Channels => cmd_channels(ctx, workspace),
-        Commands::Dms => cmd_dms(ctx, workspace),
-        Commands::Users(args) => {
-            cmd_users(ctx, workspace, args.query.as_deref(), args.include_deleted)
-        }
-        Commands::Digest(args) => {
-            cmd_digest(ctx, workspace, &args.since, args.all_workspaces, args.limit)
-        }
+        Commands::Channels => cmd_channels(ctx, ctx.workspace()),
+        Commands::Dms => cmd_dms(ctx, ctx.workspace()),
+        Commands::Users(args) => cmd_users(
+            ctx,
+            ctx.workspace(),
+            args.query.as_deref(),
+            args.include_deleted,
+        ),
+        Commands::Digest(args) => cmd_digest(
+            ctx,
+            ctx.workspace(),
+            &args.since,
+            args.all_workspaces,
+            args.limit,
+        ),
         Commands::Catchup(args) => cmd_catchup(
             ctx,
-            workspace,
+            ctx.workspace(),
             args.since.as_deref(),
             args.all_workspaces,
             args.limit,
@@ -227,13 +224,15 @@ async fn dispatch(
         }
         Commands::Scheduled { channel } => run_scheduled(ctx, flag, channel.as_deref()).await,
         Commands::Unschedule { channel, id } => run_unschedule(ctx, flag, &channel, &id).await,
-        Commands::Stats { breakdown } => cmd_stats(ctx, workspace, breakdown),
-        Commands::Vacuum => cmd_vacuum(ctx, workspace),
-        Commands::Threads(args) => cmd_threads(ctx, workspace, args.channel.as_deref(), args.limit),
-        Commands::Revisions { channel, ts } => cmd_revisions(ctx, workspace, &channel, &ts),
+        Commands::Stats { breakdown } => cmd_stats(ctx, ctx.workspace(), breakdown),
+        Commands::Vacuum => cmd_vacuum(ctx, ctx.workspace()),
+        Commands::Threads(args) => {
+            cmd_threads(ctx, ctx.workspace(), args.channel.as_deref(), args.limit)
+        }
+        Commands::Revisions { channel, ts } => cmd_revisions(ctx, ctx.workspace(), &channel, &ts),
         Commands::Export(args) => cmd_export(
             ctx,
-            workspace,
+            ctx.workspace(),
             ExportCmdOpts {
                 channel: args.channel.as_deref(),
                 thread_ts: args.thread.as_deref(),
@@ -276,7 +275,7 @@ async fn dispatch(
             live::run_transcribe(
                 ctx,
                 flag,
-                workspace,
+                ctx.workspace(),
                 &args.file_id,
                 args.file.as_deref(),
                 args.provider.as_deref(),
@@ -299,22 +298,24 @@ async fn dispatch(
                 )
                 .await
             }
-            ArchiveCommand::Status => cmd_archive_status(ctx, workspace),
+            ArchiveCommand::Status => cmd_archive_status(ctx, ctx.workspace()),
             ArchiveCommand::IndexSemantic(args) => {
-                cmd_archive_index_semantic(ctx, workspace, *args).await
+                cmd_archive_index_semantic(ctx, ctx.workspace(), *args).await
             }
             ArchiveCommand::SemanticModel { command } => {
                 cmd_archive_semantic_model(ctx, *command).await
             }
-            ArchiveCommand::Check(args) => cmd_archive_check(ctx, workspace, args.full),
-            ArchiveCommand::Backup(args) => cmd_archive_backup(ctx, workspace, &args.output_path),
+            ArchiveCommand::Check(args) => cmd_archive_check(ctx, ctx.workspace(), args.full),
+            ArchiveCommand::Backup(args) => {
+                cmd_archive_backup(ctx, ctx.workspace(), &args.output_path)
+            }
             ArchiveCommand::Prune(args) => cmd_archive_prune(ctx, &args),
         },
         Commands::Update(args) => {
             update::run_update(ctx, args.check, args.force, args.restart, args.beta).await
         }
-        Commands::Summarize(args) => cmd_summarize(ctx, workspace, &args).await,
-        Commands::Mcp { read_only } => mcp::run_mcp(flag, read_only).await,
+        Commands::Summarize(args) => cmd_summarize(ctx, ctx.workspace(), &args).await,
+        Commands::Mcp { read_only } => mcp::run_mcp(ctx, read_only).await,
         Commands::Auth { command } => dispatch_auth(ctx, flag, *command),
     }
 }
@@ -465,7 +466,6 @@ async fn dispatch_huddle(
             limit,
         } => live::run_huddle_transcripts(
             ctx,
-            flag,
             HuddleTranscriptsArgs {
                 channel,
                 search,

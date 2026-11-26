@@ -470,12 +470,8 @@ fn empty_transcripts_json(args: &HuddleTranscriptsArgs) -> serde_json::Value {
 
 /// `huddle transcripts [channel] [--search QUERY] [--lang sv|en] [--call-id ID] [--format md|json] [--limit N]`:
 /// offline query, full-text FTS5 search, and export over locally archived text-only huddle transcripts.
-pub fn run_huddle_transcripts(
-    ctx: &Ctx,
-    flag: Option<&str>,
-    args: HuddleTranscriptsArgs,
-) -> Result<ExitCode> {
-    let Some(workspace) = crate::session::resolve_workspace(flag) else {
+pub fn run_huddle_transcripts(ctx: &Ctx, args: HuddleTranscriptsArgs) -> Result<ExitCode> {
+    let Some(workspace) = ctx.workspace().cloned() else {
         return Ok(crate::commands::empty_local(
             ctx,
             empty_transcripts_json(&args),

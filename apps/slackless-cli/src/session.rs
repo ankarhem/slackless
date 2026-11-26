@@ -1,5 +1,7 @@
 //! Session resolution: which workspace and stored credentials the CLI acts with.
 
+use std::sync::OnceLock;
+
 use slackless_core::auth::{Session, SessionStore};
 use slackless_core::types::{TeamId, UserId};
 
@@ -37,21 +39,66 @@ pub(crate) fn validate_workspace_id(raw: &str) -> Result<String, String> {
     }
 }
 
-/// The workspace local commands read: `--workspace`, else the first stored session's, else the
-/// only archive on disk. `None` means nothing is known; local commands then report empty
-/// results instead of guessing among several archives.
-pub fn resolve_workspace(flag: Option<&str>) -> Option<TeamId> {
-    if let Some(flag) = flag {
-        return Some(TeamId::from(flag));
+/// One invocation's output mode, validated `--workspace`, and stored sessions. The sessions are
+/// read at most once, and only by commands that need them: every read spawns
+/// `/usr/bin/security` for each session whose secrets live in the Keychain.
+pub(crate) struct Ctx {
+    pub(crate) json: bool,
+    flag: Option<String>,
+    sessions: OnceLock<Vec<Session>>,
+    workspace: OnceLock<Option<TeamId>>,
+}
+
+impl Ctx {
+    /// `flag` is the `--workspace` value, already validated.
+    pub(crate) fn new(json: bool, flag: Option<String>) -> Self {
+        Self {
+            json,
+            flag,
+            sessions: OnceLock::new(),
+            workspace: OnceLock::new(),
+        }
     }
-    let sessions = SessionStore::new()
-        .and_then(|store| store.load())
-        .unwrap_or_default();
-    if !sessions.is_empty() {
-        return resolve_workspace_from(None, &sessions, &[]);
+
+    /// The `--workspace` flag.
+    pub(crate) fn flag(&self) -> Option<&str> {
+        self.flag.as_deref()
     }
-    let archive_ids = archive::stored_team_ids();
-    resolve_workspace_from(None, &sessions, &archive_ids)
+
+    /// Every stored session, read on first use; an unreadable store counts as signed out.
+    pub(crate) fn sessions(&self) -> &[Session] {
+        self.sessions.get_or_init(|| {
+            SessionStore::new()
+                .and_then(|store| store.load())
+                .unwrap_or_default()
+        })
+    }
+
+    /// The signed-in user of `workspace`, when a session for it is stored.
+    pub(crate) fn session_user(&self, workspace: &TeamId) -> Option<UserId> {
+        self.sessions()
+            .iter()
+            .find(|session| &session.team_id == workspace)
+            .map(|session| session.user_id.clone())
+    }
+
+    /// The workspace local commands read: `--workspace`, else the first stored session's, else
+    /// the only archive on disk. `None` means nothing is known; local commands then report empty
+    /// results instead of guessing among several archives.
+    pub(crate) fn workspace(&self) -> Option<&TeamId> {
+        self.workspace
+            .get_or_init(|| {
+                if let Some(flag) = self.flag() {
+                    return Some(TeamId::from(flag));
+                }
+                let sessions = self.sessions();
+                if !sessions.is_empty() {
+                    return resolve_workspace_from(None, sessions, &[]);
+                }
+                resolve_workspace_from(None, sessions, &archive::stored_team_ids())
+            })
+            .as_ref()
+    }
 }
 
 pub(crate) fn resolve_workspace_from(
@@ -68,14 +115,7 @@ pub(crate) fn resolve_workspace_from(
     (archive_ids.len() == 1).then(|| archive_ids[0].clone())
 }
 
-/// The session write commands act with: the flagged workspace's, else the first stored one.
-pub fn resolve_session(flag: Option<&str>) -> Result<Session, NotSignedIn> {
-    let sessions = SessionStore::new()
-        .and_then(|store| store.load())
-        .map_err(|_| NotSignedIn)?;
-    resolve_session_from(flag, &sessions)
-}
-
+/// The session live commands act with: the flagged workspace's, else the first stored one.
 pub(crate) fn resolve_session_from(
     flag: Option<&str>,
     sessions: &[Session],
@@ -104,12 +144,9 @@ pub struct StatusEntry {
 }
 
 /// Every stored session with its local archive summary; empty when nothing is stored.
-pub fn status_entries() -> Vec<StatusEntry> {
-    let Ok(sessions) = SessionStore::new().and_then(|store| store.load()) else {
-        return Vec::new();
-    };
+pub fn status_entries(sessions: &[Session]) -> Vec<StatusEntry> {
     sessions
-        .into_iter()
+        .iter()
         .map(|session| {
             let path = archive::store_path(&session.team_id);
             let archive_exists = path.as_ref().is_some_and(|path| path.is_file());

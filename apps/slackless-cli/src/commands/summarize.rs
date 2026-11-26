@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use slackless_core::auth::{AI_SUMMARY_API_KEY_ACCOUNT, SecretStore, SessionStore};
+use slackless_core::auth::{AI_SUMMARY_API_KEY_ACCOUNT, SecretStore};
 use slackless_core::summarize::{
     AiProvider, AiSummaryConfig, SummaryTarget, load_channel_target, load_thread_target,
     load_transcript_target, summarize,
@@ -121,7 +120,7 @@ pub(crate) async fn cmd_summarize(
             Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
         };
         let team_ids: Vec<TeamId> = if args.all_workspaces {
-            all_workspace_ids()
+            all_workspace_ids(ctx.sessions())
         } else {
             workspace.into_iter().cloned().collect()
         };
@@ -132,12 +131,6 @@ pub(crate) async fn cmd_summarize(
                 "summarizing catch-up",
             ));
         }
-        let session_users: HashMap<TeamId, slackless_core::types::UserId> = SessionStore::new()
-            .and_then(|s| s.load())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| (s.team_id, s.user_id))
-            .collect();
         let mut opened = Vec::new();
         for ws in team_ids {
             let Some(archive) =
@@ -145,7 +138,7 @@ pub(crate) async fn cmd_summarize(
             else {
                 continue;
             };
-            let self_user = session_users.get(&ws).cloned();
+            let self_user = ctx.session_user(&ws);
             opened.push((ws, self_user, archive));
         }
         let refs: Vec<(&TeamId, Option<&slackless_core::types::UserId>, &Archive)> = opened
@@ -503,7 +496,7 @@ mod tests {
             api_key: Some("test-cli-token".to_owned()),
             ..AiSummaryConfig::default()
         };
-        let ctx = Ctx { json: true };
+        let ctx = Ctx::new(true, None);
 
         // 1. Thread
         let thread_args = SummarizeArgs {
@@ -585,7 +578,7 @@ mod tests {
             api_key: None,
             ..AiSummaryConfig::default()
         };
-        let ctx = Ctx { json: true };
+        let ctx = Ctx::new(true, None);
         assert_eq!(
             run_summarize_target(&ctx, &cfg, SummaryTarget::CatchUp { briefing })
                 .await

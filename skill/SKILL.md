@@ -812,6 +812,7 @@ slackless mcp [--workspace TEAM_ID] [--read-only]
 
 Runs a stdio MCP server (built on the official Rust SDK `rmcp`; protocol versions 2024-11-05 through 2025-06-18 are supported and any other requested version negotiates to 2025-03-26) supporting tools, resources, and prompts (`initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`, `prompts/list`, `prompts/get`). Pass `--workspace TEAM_ID` to set a default workspace when multiple archives exist.
 Pass `--read-only` to withhold the live write tools (`send_message`, `reply_thread`, `add_reaction`): they are left out of `tools/list` and `tools/call` rejects them with JSON-RPC `-32602`.
+The server reads the stored sessions once, at startup: restart it after `slackless auth login`.
 Tool arguments are validated against each tool's `inputSchema` before the tool runs; malformed arguments come back as `isError: true` with `{"error":"invalid_args","message":...}`. A request for a known method whose params do not parse (for example a `tools/call` without `name`) is rejected with JSON-RPC `-32602`; unparsable lines are ignored, as in the other official MCP SDKs.
 
 ##### Exposed tools

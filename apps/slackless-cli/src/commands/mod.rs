@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use slackless_core::auth::SessionStore;
+use slackless_core::auth::Session;
 use slackless_core::types::time::{days_from_civil, days_in_month};
 use slackless_core::types::{ChannelId, TeamId};
 
@@ -30,14 +30,12 @@ pub(crate) fn open_archive_with_hint(ctx: &Ctx, workspace: &TeamId) -> Result<Op
 
 /// Every workspace known from stored sessions or local archive files, deduplicated in O(n)
 /// while preserving session-first order.
-pub(crate) fn all_workspace_ids() -> Vec<TeamId> {
+pub(crate) fn all_workspace_ids(sessions: &[Session]) -> Vec<TeamId> {
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
-    if let Ok(sessions) = SessionStore::new().and_then(|s| s.load()) {
-        for s in sessions {
-            if seen.insert(s.team_id.clone()) {
-                ids.push(s.team_id);
-            }
+    for s in sessions {
+        if seen.insert(s.team_id.clone()) {
+            ids.push(s.team_id.clone());
         }
     }
     for tid in archive::stored_team_ids() {

@@ -226,7 +226,7 @@ pub(crate) fn cmd_search_all_workspaces(
     query: &str,
     opts: SearchAllOpts<'_>,
 ) -> Result<ExitCode> {
-    let team_ids = all_workspace_ids();
+    let team_ids = all_workspace_ids(ctx.sessions());
     let archives: Vec<(TeamId, PathBuf)> = team_ids
         .into_iter()
         .filter_map(|ws| archive::store_path(&ws).map(|path| (ws, path)))
@@ -460,7 +460,7 @@ pub(crate) fn cmd_search_semantic(
     };
 
     let archives: Vec<(TeamId, PathBuf)> = if opts.all_workspaces {
-        all_workspace_ids()
+        all_workspace_ids(ctx.sessions())
             .into_iter()
             .filter_map(|ws| archive::store_path(&ws).map(|p| (ws, p)))
             .collect()

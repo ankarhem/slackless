@@ -270,7 +270,7 @@ pub(crate) fn cmd_digest(
         Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
     };
     let team_ids: Vec<TeamId> = if all_workspaces {
-        all_workspace_ids()
+        all_workspace_ids(ctx.sessions())
     } else {
         workspace.into_iter().cloned().collect()
     };
@@ -427,7 +427,6 @@ pub(crate) fn cmd_catchup(
     all_workspaces: bool,
     limit: usize,
 ) -> Result<ExitCode> {
-    use slackless_core::auth::SessionStore;
     use slackless_core::catchup::{CatchUpBriefing, format_catchup_human};
 
     let now_secs = now_epoch_secs();
@@ -436,7 +435,7 @@ pub(crate) fn cmd_catchup(
         Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
     };
     let team_ids: Vec<TeamId> = if all_workspaces {
-        all_workspace_ids()
+        all_workspace_ids(ctx.sessions())
     } else {
         workspace.into_iter().cloned().collect()
     };
@@ -449,13 +448,6 @@ pub(crate) fn cmd_catchup(
         ));
     }
 
-    let session_users: HashMap<TeamId, slackless_core::types::UserId> = SessionStore::new()
-        .and_then(|s| s.load())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| (s.team_id, s.user_id))
-        .collect();
-
     let mut opened: Vec<(TeamId, Option<slackless_core::types::UserId>, Archive)> = Vec::new();
     for ws in team_ids {
         let Some(archive) =
@@ -463,7 +455,7 @@ pub(crate) fn cmd_catchup(
         else {
             continue;
         };
-        let self_user = session_users.get(&ws).cloned();
+        let self_user = ctx.session_user(&ws);
         opened.push((ws, self_user, archive));
     }
 

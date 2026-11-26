@@ -6,7 +6,7 @@ use slackless_core::api::{ApiError, SlackApi};
 use slackless_core::types::{ChannelId, TeamId, UserId};
 
 use crate::archive::Archive;
-use crate::session::resolve_session;
+use crate::session::resolve_session_from;
 use crate::{Ctx, fail};
 
 /// Authenticated live session client plus workspace and signed-in user identity.
@@ -18,7 +18,7 @@ pub(crate) struct LiveSession {
 
 /// Resolve credentials and construct a [`LiveSession`]; `Err` is the already-emitted CLI failure.
 pub(crate) fn api_for(ctx: &Ctx, flag: Option<&str>) -> Result<LiveSession, ExitCode> {
-    let session = match resolve_session(flag) {
+    let session = match resolve_session_from(flag, ctx.sessions()) {
         Ok(session) => session,
         Err(not_signed_in) => return Err(fail(ctx, "not_signed_in", &not_signed_in.to_string())),
     };

@@ -36,7 +36,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use slackless_core::NotifyLevel;
 use slackless_core::api::{HistoryOpts, MessageContent, SlackApi};
-use slackless_core::auth::{Session, SessionStore};
+use slackless_core::auth::Session;
 use slackless_core::domain::mrkdwn::mrkdwn_to_plain;
 use slackless_core::export::{
     ExportFormat, ExportOptions, export_channel, export_file_transcript, export_huddle_transcript,
@@ -48,7 +48,6 @@ use slackless_core::store::{
 use slackless_core::types::time::now_epoch_secs;
 use slackless_core::types::{ChannelId, FileId, Message, TeamId, TranscriptCue, Ts};
 
-use crate::CLI_VERSION;
 use crate::archive::{self, Archive};
 use crate::commands::{parse_since_cutoff, raw_channel_id};
 use crate::live::session::{classify_api_error, resolve_channel_with};
@@ -57,6 +56,7 @@ use crate::session::{
     is_valid_workspace_id, resolve_session_from, resolve_workspace_from, validate_workspace_id,
 };
 use crate::write::normalize_emoji_shortcode;
+use crate::{CLI_VERSION, Ctx};
 
 /// Protocol versions this server speaks. A client asking for anything else is answered with
 /// [`DEFAULT_PROTOCOL_VERSION`], as the hand-rolled server did.
@@ -102,13 +102,16 @@ const MAX_CATCHUP_LIMIT: usize = 100;
 const MAX_PROMPT_CONTEXT_CHARS: usize = 16_000;
 const MAX_EXCERPT_CHARS: usize = 200;
 
-/// Entrypoint for `slackless mcp`; `default_workspace` is the validated `--workspace`, and
-/// `read_only` (`--read-only`) withholds the tools that change Slack. Serves MCP over
-/// stdin/stdout until the client closes the connection.
-pub async fn run_mcp(default_workspace: Option<&str>, read_only: bool) -> Result<ExitCode> {
-    let running = McpServer::new(default_workspace.map(str::to_owned), read_only)
-        .serve(rmcp::transport::stdio())
-        .await?;
+/// Entrypoint for `slackless mcp`: the validated `--workspace` is the default workspace, and
+/// `read_only` (`--read-only`) withholds the tools that change Slack. Stored sessions are read
+/// once, before serving. Serves MCP over stdin/stdout until the client closes the connection.
+pub async fn run_mcp(ctx: &Ctx, read_only: bool) -> Result<ExitCode> {
+    let server = McpServer::new(
+        ctx.flag().map(str::to_owned),
+        read_only,
+        ctx.sessions().to_vec(),
+    );
+    let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(ExitCode::SUCCESS)
 }
@@ -121,8 +124,9 @@ pub(crate) struct McpServer {
     /// When `Some`, reads `<dir>/<TEAM_ID>.sqlite` instead of the default app data directory
     /// (used by tests to isolate from `$HOME`).
     archive_dir: Option<PathBuf>,
-    /// When `Some`, replaces `SessionStore` lookups (used by tests to avoid macOS Keychain).
-    test_sessions: Option<Vec<Session>>,
+    /// Stored sessions, read once at startup: a read spawns `/usr/bin/security` per session,
+    /// which must not block a request. Tests pass their own.
+    sessions: Vec<Session>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -306,8 +310,12 @@ enum ResourceUri {
 }
 
 impl McpServer {
-    pub(crate) fn new(default_workspace: Option<String>, read_only: bool) -> Self {
-        Self::with_archives(default_workspace, read_only, None, None)
+    pub(crate) fn new(
+        default_workspace: Option<String>,
+        read_only: bool,
+        sessions: Vec<Session>,
+    ) -> Self {
+        Self::with_archives(default_workspace, read_only, None, sessions)
     }
 
     #[cfg(test)]
@@ -317,36 +325,22 @@ impl McpServer {
         default_workspace: Option<String>,
         read_only: bool,
     ) -> Self {
-        Self::with_archives(
-            default_workspace,
-            read_only,
-            Some(archive_dir),
-            Some(sessions),
-        )
+        Self::with_archives(default_workspace, read_only, Some(archive_dir), sessions)
     }
 
     fn with_archives(
         default_workspace: Option<String>,
         read_only: bool,
         archive_dir: Option<PathBuf>,
-        test_sessions: Option<Vec<Session>>,
+        sessions: Vec<Session>,
     ) -> Self {
         Self {
             default_workspace,
             read_only,
             archive_dir,
-            test_sessions,
+            sessions,
             tool_router: Self::tool_router(),
         }
-    }
-
-    fn load_sessions(&self) -> Vec<Session> {
-        if let Some(ref sessions) = self.test_sessions {
-            return sessions.clone();
-        }
-        SessionStore::new()
-            .and_then(|store| store.load())
-            .unwrap_or_default()
     }
 
     fn archive_path_for(&self, team_id: &TeamId) -> Option<PathBuf> {
@@ -369,9 +363,9 @@ impl McpServer {
     fn all_workspace_ids(&self) -> Vec<TeamId> {
         let mut seen = HashSet::new();
         let mut ids = Vec::new();
-        for s in self.load_sessions() {
+        for s in &self.sessions {
             if is_valid_workspace_id(s.team_id.as_str()) && seen.insert(s.team_id.clone()) {
-                ids.push(s.team_id);
+                ids.push(s.team_id.clone());
             }
         }
         for tid in self.stored_team_ids() {
@@ -407,9 +401,8 @@ impl McpServer {
         explicit: Option<&str>,
     ) -> std::result::Result<Option<TeamId>, String> {
         let flag = self.effective_workspace_flag(explicit)?;
-        let sessions = self.load_sessions();
         let archive_ids = self.stored_team_ids();
-        Ok(resolve_workspace_from(flag, &sessions, &archive_ids))
+        Ok(resolve_workspace_from(flag, &self.sessions, &archive_ids))
     }
 
     fn open_archive(&self, team_id: &TeamId) -> std::result::Result<Option<Archive>, String> {
@@ -442,8 +435,7 @@ impl McpServer {
         let flag = self
             .effective_workspace_flag(explicit_workspace)
             .map_err(|msg| ("invalid_args", msg))?;
-        let sessions = self.load_sessions();
-        let session = resolve_session_from(flag, &sessions)
+        let session = resolve_session_from(flag, &self.sessions)
             .map_err(|not_signed_in| ("not_signed_in", not_signed_in.to_string()))?;
         let api = SlackApi::new(
             &session.api_base(),
@@ -526,12 +518,6 @@ impl McpServer {
     }
 
     fn list_workspaces_payload(&self) -> Value {
-        let sessions = self.load_sessions();
-        let mut by_id: HashMap<TeamId, Session> = HashMap::new();
-        for s in sessions {
-            by_id.entry(s.team_id.clone()).or_insert(s);
-        }
-
         let ids = self.all_workspace_ids();
         let default_workspace = self
             .resolve_workspace(None)
@@ -557,7 +543,7 @@ impl McpServer {
                     || "(no home directory)".to_owned(),
                     |p| p.display().to_string(),
                 );
-                match by_id.get(&team_id) {
+                match self.sessions.iter().find(|s| s.team_id == team_id) {
                     Some(session) => {
                         let has_secrets = session.has_secrets();
                         WorkspaceEntry {
@@ -844,10 +830,10 @@ impl McpServer {
         let cutoff_secs = now.saturating_sub((since_hours as i64).saturating_mul(3_600));
 
         let session_users: HashMap<TeamId, String> = self
-            .load_sessions()
-            .into_iter()
+            .sessions
+            .iter()
             .filter(|s| !s.user_id.as_str().is_empty())
-            .map(|s| (s.team_id, s.user_id.as_str().to_owned()))
+            .map(|s| (s.team_id.clone(), s.user_id.as_str().to_owned()))
             .collect();
 
         let mut total_messages: u64 = 0;

@@ -785,7 +785,7 @@ pub(crate) async fn cmd_archive_index_semantic(
             .map(|p| vec![(ws.clone(), p)])
             .unwrap_or_default()
     } else {
-        all_workspace_ids()
+        all_workspace_ids(ctx.sessions())
             .into_iter()
             .filter_map(|ws| archive::store_path(&ws).map(|p| (ws, p)))
             .collect()

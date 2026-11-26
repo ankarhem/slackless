@@ -344,7 +344,7 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
     ));
 
     // Pre-send secret guard blocks API keys unless --allow-secrets is set.
-    let ctx = crate::Ctx { json: false };
+    let ctx = crate::Ctx::new(false, None);
     let clean = crate::write::check_secrets(&ctx, "Hej teamet, allt ser bra ut!", false);
     assert!(clean.is_none());
     let leaked = format!(
@@ -924,7 +924,7 @@ fn cmd_search_finds_message_by_spoken_word_from_video_transcript() {
     let archive = Archive::open_path(&db_path)
         .expect("open archive")
         .expect("archive exists");
-    let ctx = crate::Ctx { json: true };
+    let ctx = crate::Ctx::new(true, None);
 
     let code = cmd_search_in_archive(
         &ctx,
@@ -1237,7 +1237,7 @@ fn cmd_search_all_workspaces_and_export_and_archive_status_end_to_end() {
         .unwrap();
     }
 
-    let ctx_json = crate::Ctx { json: true };
+    let ctx_json = crate::Ctx::new(true, None);
     let search_out = tmp_dir.join("all_search.json");
     let code = cmd_search_all_in_archives(
         &ctx_json,
@@ -1276,7 +1276,7 @@ fn cmd_search_all_workspaces_and_export_and_archive_status_end_to_end() {
     let ch_md_path = tmp_dir.join("ops.md");
     assert_eq!(
         cmd_export_in_archive(
-            &crate::Ctx { json: false },
+            &crate::Ctx::new(false, None),
             &ws1,
             Some(&archive1),
             ExportCmdOpts {
@@ -1328,7 +1328,7 @@ fn cmd_search_all_workspaces_and_export_and_archive_status_end_to_end() {
     let clip_md_path = tmp_dir.join("clip.md");
     assert_eq!(
         cmd_export_in_archive(
-            &crate::Ctx { json: false },
+            &crate::Ctx::new(false, None),
             &ws1,
             Some(&archive1),
             ExportCmdOpts {
@@ -1567,7 +1567,7 @@ fn cli_semantic_and_hybrid_search_and_archive_index_semantic_end_to_end() {
         .unwrap();
     }
 
-    let ctx_json = crate::Ctx { json: true };
+    let ctx_json = crate::Ctx::new(true, None);
     let embedder = HashProjectionEmbedder::new(128);
     let mut index = SemanticIndex::open(&sem_path).unwrap();
     let archives = vec![(ws1.clone(), db1.clone()), (ws2.clone(), db2.clone())];

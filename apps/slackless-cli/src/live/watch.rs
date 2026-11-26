@@ -9,7 +9,7 @@ use slackless_core::types::{ChannelId, MessageEvent, SlackEvent, TeamId};
 
 use crate::archive::Archive;
 use crate::output;
-use crate::session::resolve_session;
+use crate::session::resolve_session_from;
 use crate::{Ctx, fail};
 
 use super::session::resolve_channel_with;
@@ -26,7 +26,7 @@ pub async fn run_watch(
     channel_arg: Option<&str>,
     count: Option<usize>,
 ) -> Result<ExitCode> {
-    let session = match resolve_session(flag) {
+    let session = match resolve_session_from(flag, ctx.sessions()) {
         Ok(session) => session,
         Err(not_signed_in) => return Ok(fail(ctx, "not_signed_in", &not_signed_in.to_string())),
     };
