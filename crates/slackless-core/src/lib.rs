@@ -38,6 +38,7 @@ pub mod outbox;
 pub mod paths;
 pub mod privacy;
 mod reducer;
+pub mod rules;
 pub mod search;
 pub mod semantic_index;
 pub mod summarize;
@@ -94,6 +95,12 @@ pub use privacy::{
     SecretMatch, detect_secrets, strip_tracking_params, strip_tracking_params_in_text,
 };
 pub use reducer::apply_event;
+pub use rules::{
+    CatchUpReminderStatus, DEFAULT_CATCHUP_REMINDER_TIME, DEFAULT_SEMANTIC_THRESHOLD,
+    NotificationRule, RuleAction, RuleContext, RuleEvaluation, RuleTestResult, SemanticScorer,
+    check_catchup_reminder, evaluate_rules, evaluate_rules_with_semantic, format_local_day,
+    parse_csv_tokens, parse_daily_time_hhmm, test_rule, test_rule_with_semantic, validate_regex,
+};
 pub use search::{
     SearchHitKind, UnifiedSearchHit, UnifiedSearchResults, UnifiedTranscriptHit,
     WorkspaceSearchTarget, discover_disk_archives, discover_local_archives, search_across_stores,

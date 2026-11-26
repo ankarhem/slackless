@@ -251,90 +251,101 @@ impl App {
                     return;
                 }
                 let level = bg_ctx.notify_level;
-                if level == Some(NotifyLevel::Muted) {
-                    return;
-                }
                 let Some(conv) = bg_ctx.conversation.as_ref() else {
                     return;
                 };
                 let dm = matches!(conv.kind(), ConversationKind::Im | ConversationKind::Mpim);
-                let sender_is_vip = message.user.as_ref().is_some_and(|u| {
-                    let handle = bg_ctx
-                        .sender
-                        .as_ref()
-                        .map(|x| x.name.as_str())
-                        .unwrap_or("");
-                    let display = bg_ctx
-                        .sender
-                        .as_ref()
-                        .map(slackless_core::types::User::display_name)
-                        .unwrap_or("");
-                    settings.is_vip(u.as_str(), handle, display)
-                });
-                let breakthrough =
-                    sender_is_vip || settings.is_urgent_dm_breakthrough(dm, &message.text);
-                if !breakthrough
-                    && (self.self_state.paused()
-                        || self.self_state.focused()
-                        || !settings.notifications_allowed_now())
-                {
-                    return;
-                }
                 let mentioned = mentions_me(&message.text, &bg_ctx.self_user, &settings.keywords);
-                let wanted = match (level, settings.notify_level) {
-                    (Some(NotifyLevel::Everything), _) => true,
-                    (Some(NotifyLevel::Mentions), _) => dm || mentioned,
-                    (Some(NotifyLevel::Muted), _) => false,
-                    (None, 0) => true,
-                    (None, 1) => dm || mentioned,
-                    (None, _) => false,
+                let owned_ctx = super::notifications::OwnedRuleContext {
+                    sender_id: message
+                        .user
+                        .as_ref()
+                        .map(|u| u.as_str().to_owned())
+                        .or_else(|| message.bot_id.as_ref().map(|b| b.as_str().to_owned())),
+                    sender_handle: bg_ctx
+                        .sender
+                        .as_ref()
+                        .map(|x| x.name.clone())
+                        .or_else(|| message.username.clone())
+                        .or_else(|| message.bot_profile.as_ref().map(|b| b.name.clone())),
+                    sender_display_name: bg_ctx
+                        .sender
+                        .as_ref()
+                        .map(|u| u.display_name().to_owned())
+                        .or_else(|| message.bot_profile.as_ref().map(|b| b.name.clone())),
+                    channel_id: channel.as_str().to_owned(),
+                    channel_name: conv.name.clone(),
+                    text: message.text.clone(),
+                    is_thread_reply: reply,
+                    mentions_me: mentioned,
                 };
-                if !wanted {
+                let has_semantic_rule = settings.smart_notification_rules.iter().any(|r| {
+                    r.enabled
+                        && r.semantic_topic
+                            .as_deref()
+                            .is_some_and(|t| !t.trim().is_empty())
+                });
+                if !has_semantic_rule {
+                    let rule_eval = if settings.smart_notification_rules.is_empty() {
+                        slackless_core::rules::RuleEvaluation::default()
+                    } else {
+                        let rule_ctx = owned_ctx.as_rule_context();
+                        slackless_core::rules::evaluate_rules(
+                            &settings.smart_notification_rules,
+                            &rule_ctx,
+                        )
+                    };
+                    self.dispatch_bg_message_notification(
+                        ws_index,
+                        channel,
+                        message,
+                        conv,
+                        bg_ctx.sender.as_ref(),
+                        level,
+                        dm,
+                        mentioned,
+                        &settings,
+                        &rule_eval,
+                        cx,
+                    );
                     return;
                 }
-                let ws_name = self
-                    .live_teams
-                    .get(ws_index)
-                    .map(|t| t.name.clone())
-                    .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| "Slack".to_owned());
-                let sender = bg_ctx
-                    .sender
-                    .as_ref()
-                    .map(|u| u.display_name().to_owned())
-                    .or_else(|| message.user.as_ref().map(|u| u.as_str().to_owned()))
-                    .unwrap_or_default();
-                let text = if settings.show_preview {
-                    if !message.text.trim().is_empty() {
-                        message.text.trim().to_owned()
-                    } else if let Some(file) = message.files.first() {
-                        file.title
-                            .clone()
-                            .or_else(|| file.name.clone())
-                            .unwrap_or_else(|| "Shared a file".to_owned())
-                    } else {
-                        "New message".to_owned()
-                    }
-                } else {
-                    "New message".to_owned()
-                };
-                let (title, body) = match conv.kind() {
-                    ConversationKind::Im => (format!("{ws_name} — {sender}"), text),
-                    ConversationKind::Mpim => (
-                        format!("{ws_name} — {}", conv.name.as_deref().unwrap_or("Group DM")),
-                        format!("{sender}: {text}"),
-                    ),
-                    _ => (
-                        format!("{ws_name} — #{}", conv.name.as_deref().unwrap_or_default()),
-                        format!("{sender}: {text}"),
-                    ),
-                };
-                let tag = format!("bg:{ws_index}:{channel}:{}", message.ts);
-                self.system_notification_kind(&tag, &title, &body, dm || mentioned, cx);
-                if sender_is_vip {
-                    let vip_sound = self.preferences.read(cx).settings().vip_sound;
-                    self.play_sound(vip_sound, cx);
-                }
+                let rules = settings.smart_notification_rules.clone();
+                let channel_owned = channel.clone();
+                let message_owned = message.clone();
+                let conv_owned = conv.clone();
+                let sender_owned = bg_ctx.sender.clone();
+                cx.spawn(async move |this, cx| {
+                    let rule_eval = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let ctx = owned_ctx.as_rule_context();
+                            let scorer = crate::preferences::compute_local_semantic_similarity;
+                            slackless_core::rules::evaluate_rules_with_semantic(
+                                &rules,
+                                &ctx,
+                                Some(&scorer),
+                            )
+                        })
+                        .await;
+                    let _ = this.update(cx, |app, cx| {
+                        let fresh_settings = app.preferences.read(cx).settings().clone();
+                        app.dispatch_bg_message_notification(
+                            ws_index,
+                            &channel_owned,
+                            &message_owned,
+                            &conv_owned,
+                            sender_owned.as_ref(),
+                            level,
+                            dm,
+                            mentioned,
+                            &fresh_settings,
+                            &rule_eval,
+                            cx,
+                        );
+                    });
+                })
+                .detach();
             }
             Event::Huddle(HuddleEvent::Updated {
                 channel,
@@ -359,6 +370,112 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_bg_message_notification(
+        &mut self,
+        ws_index: usize,
+        channel: &ChannelId,
+        message: &Message,
+        conv: &Conversation,
+        sender_user: Option<&slackless_core::types::User>,
+        level: Option<NotifyLevel>,
+        dm: bool,
+        mentioned: bool,
+        settings: &crate::preferences::Settings,
+        rule_eval: &slackless_core::rules::RuleEvaluation,
+        cx: &mut Context<Self>,
+    ) {
+        if !settings.desktop_notifications || rule_eval.is_suppressed() {
+            return;
+        }
+        let sender_is_vip = message.user.as_ref().is_some_and(|u| {
+            let handle = sender_user.map(|x| x.name.as_str()).unwrap_or("");
+            let display = sender_user
+                .map(slackless_core::types::User::display_name)
+                .unwrap_or("");
+            settings.is_vip(u.as_str(), handle, display)
+        });
+        let breakthrough = sender_is_vip
+            || settings.is_urgent_dm_breakthrough(dm, &message.text)
+            || rule_eval.breaks_through_mute();
+        if level == Some(NotifyLevel::Muted) && !breakthrough {
+            return;
+        }
+        if !breakthrough
+            && (self.self_state.paused()
+                || self.self_state.focused()
+                || !settings.notifications_allowed_now())
+        {
+            return;
+        }
+        let wanted = breakthrough
+            || rule_eval.is_priority_highlight()
+            || match (level, settings.notify_level) {
+                (Some(NotifyLevel::Everything), _) => true,
+                (Some(NotifyLevel::Mentions), _) => dm || mentioned,
+                (Some(NotifyLevel::Muted), _) => false,
+                (None, 0) => true,
+                (None, 1) => dm || mentioned,
+                (None, _) => false,
+            };
+        if !wanted {
+            return;
+        }
+        let ws_name = self
+            .live_teams
+            .get(ws_index)
+            .map(|t| t.name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "Slack".to_owned());
+        let sender = sender_user
+            .map(|u| u.display_name().to_owned())
+            .or_else(|| message.user.as_ref().map(|u| u.as_str().to_owned()))
+            .unwrap_or_default();
+        let text = if settings.show_preview {
+            if !message.text.trim().is_empty() {
+                message.text.trim().to_owned()
+            } else if let Some(file) = message.files.first() {
+                file.title
+                    .clone()
+                    .or_else(|| file.name.clone())
+                    .unwrap_or_else(|| "Shared a file".to_owned())
+            } else {
+                "New message".to_owned()
+            }
+        } else {
+            "New message".to_owned()
+        };
+        let (raw_title, body) = match conv.kind() {
+            ConversationKind::Im => (format!("{ws_name} — {sender}"), text),
+            ConversationKind::Mpim => (
+                format!("{ws_name} — {}", conv.name.as_deref().unwrap_or("Group DM")),
+                format!("{sender}: {text}"),
+            ),
+            _ => (
+                format!("{ws_name} — #{}", conv.name.as_deref().unwrap_or_default()),
+                format!("{sender}: {text}"),
+            ),
+        };
+        let title = if rule_eval.is_priority_highlight() {
+            format!("\u{2605} {raw_title}")
+        } else {
+            raw_title
+        };
+        let tag = format!("bg:{ws_index}:{channel}:{}", message.ts);
+        self.system_notification_with_breakthrough(
+            &tag,
+            &title,
+            &body,
+            dm || mentioned || rule_eval.breaks_through_mute() || rule_eval.is_priority_highlight(),
+            breakthrough,
+            cx,
+        );
+        if sender_is_vip {
+            let vip_sound = self.preferences.read(cx).settings().vip_sound;
+            self.play_sound(vip_sound, cx);
         }
     }
 }

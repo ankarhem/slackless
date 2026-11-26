@@ -349,6 +349,14 @@ pub struct Settings {
     pub schedule_custom_days: [bool; 7],
     pub schedule_start: usize,
     pub schedule_end: usize,
+    /// User-configured local smart notification rules (evaluated locally in sub-millisecond time).
+    pub smart_notification_rules: Vec<slackless_core::rules::NotificationRule>,
+    /// Enable the opt-in Daily Catch-Up reminder notification (fires at most once per local day).
+    pub catchup_reminder_enabled: bool,
+    /// Local 24-hour `HH:MM` wall-clock time for the Daily Catch-Up reminder (e.g. `"09:00"`).
+    pub catchup_reminder_time: String,
+    /// Last local calendar day (`"YYYY-MM-DD"`) on which the Daily Catch-Up reminder fired.
+    pub catchup_reminder_last_fired_day: Option<String>,
     // Navigation
     pub show_home: bool,
     pub show_dms: bool,
@@ -529,6 +537,10 @@ impl Default for Settings {
             schedule_custom_days: [false, true, true, true, true, true, false],
             schedule_start: 9,
             schedule_end: 18,
+            smart_notification_rules: Vec::new(),
+            catchup_reminder_enabled: false,
+            catchup_reminder_time: slackless_core::rules::DEFAULT_CATCHUP_REMINDER_TIME.to_owned(),
+            catchup_reminder_last_fired_day: None,
             show_home: true,
             show_dms: true,
             show_activity: true,

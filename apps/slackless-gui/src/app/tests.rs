@@ -3213,3 +3213,276 @@ fn app_outbox_events_inline_thread_sync_and_catchup_navigation(cx: &mut gpui::Te
     cx.run_until_parked();
     drop(root);
 }
+
+#[gpui::test]
+fn smart_notification_rules_and_daily_catchup_reminder_in_app(cx: &mut gpui::TestAppContext) {
+    use slackless_core::rules::{NotificationRule, RuleAction};
+    use slackless_core::types::time::days_from_civil;
+
+    let mut fx = fixtures::load();
+    let me = fx.self_user.clone();
+    let peer = fx
+        .users
+        .iter()
+        .find(|u| u.id != me)
+        .expect("peer user")
+        .id
+        .clone();
+    let eng = ChannelId::from("C0ENG");
+    let general = ChannelId::from("C0GENERAL");
+    // Mute #general, set #engineering to Mentions-only.
+    fx.notify_levels.insert(general.clone(), NotifyLevel::Muted);
+    fx.notify_levels.insert(eng.clone(), NotifyLevel::Mentions);
+
+    let (root, app, cx) = mount_test_app(fx, cx);
+    let plain_msg = |user: &UserId, text: &str| Message {
+        ts: Ts::from("1760000100.000100"),
+        user: Some(user.clone()),
+        text: text.to_owned(),
+        ..Default::default()
+    };
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            // Switch off #general and #engineering so neither is on-screen.
+            app.select(ChannelId::from("C0DESIGN"), cx);
+            app.preferences.update(cx, |prefs, cx| {
+                let mut s = prefs.settings().clone();
+                s.desktop_notifications = true;
+                s.schedule_enabled = false;
+                s.notify_level = 1; // Mentions only
+                s.smart_notification_rules = vec![
+                    NotificationRule {
+                        id: "r-suppress-bot".into(),
+                        name: "Suppress build noise".into(),
+                        enabled: true,
+                        action: RuleAction::Suppress,
+                        in_channels: vec!["#engineering".into()],
+                        keywords: vec!["build-noise".into()],
+                        ..Default::default()
+                    },
+                    NotificationRule {
+                        id: "r-breakthrough".into(),
+                        name: "SEV-1 page".into(),
+                        enabled: true,
+                        action: RuleAction::BreakThroughMute,
+                        keywords: vec!["sev-1".into()],
+                        ..Default::default()
+                    },
+                    NotificationRule {
+                        id: "r-priority".into(),
+                        name: "Deploy highlight".into(),
+                        enabled: true,
+                        action: RuleAction::PriorityHighlight,
+                        in_channels: vec!["#engineering".into()],
+                        keywords: vec!["deploy-window".into()],
+                        ..Default::default()
+                    },
+                ];
+                prefs.load_settings(s, window, cx);
+            });
+
+            // 1. Muted #general normally silent, but SEV-1 breaks through mute AND focus mode!
+            assert!(!app.should_notify(&general, &plain_msg(&peer, "normal chatter"), window, cx));
+            assert!(app.should_notify(
+                &general,
+                &plain_msg(&peer, "SEV-1 prod outage"),
+                window,
+                cx
+            ));
+            app.self_state
+                .start_focus_with_status(FOCUS_UNTIL_OFF, false);
+            assert!(app.should_notify(
+                &general,
+                &plain_msg(&peer, "SEV-1 while focused"),
+                window,
+                cx
+            ));
+            app.self_state.end_focus();
+
+            // 2. Suppress silences matching messages even when mentioned!
+            let mentioned_noise = plain_msg(&peer, &format!("<@{me}> build-noise nightly green"));
+            assert!(!app.should_notify(&eng, &mentioned_noise, window, cx));
+
+            // 3. Conflict resolution: BreakThroughMute beats Suppress on the same message.
+            let sev1_noise = plain_msg(&peer, "build-noise SEV-1 rollback");
+            assert!(app.should_notify(&eng, &sev1_noise, window, cx));
+
+            // 4. PriorityHighlight elevates non-mention message in Mentions-only channel,
+            //    while still respecting channel mute.
+            assert!(app.should_notify(
+                &eng,
+                &plain_msg(&peer, "deploy-window starts now"),
+                window,
+                cx
+            ));
+            // Suppress beats PriorityHighlight when both match.
+            assert!(!app.should_notify(
+                &eng,
+                &plain_msg(&peer, "build-noise deploy-window"),
+                window,
+                cx
+            ));
+
+            // 5. Daily Catch-Up reminder fires at most once per calendar day.
+            app.preferences.update(cx, |prefs, cx| {
+                let mut s = prefs.settings().clone();
+                s.catchup_reminder_enabled = true;
+                s.catchup_reminder_time = "09:00".to_owned();
+                s.catchup_reminder_last_fired_day = None;
+                prefs.load_settings(s, window, cx);
+            });
+            let day_26_utc = days_from_civil(2026, 11, 26) * 86_400;
+            // 08:30 UTC (tz 0) -> too early, does not fire.
+            app.check_daily_catchup_reminder_at(day_26_utc + 8 * 3_600 + 30 * 60, 0, window, cx);
+            assert_eq!(
+                app.preferences
+                    .read(cx)
+                    .settings()
+                    .catchup_reminder_last_fired_day,
+                None
+            );
+            // 09:05 UTC -> fires and records 2026-11-26.
+            app.check_daily_catchup_reminder_at(day_26_utc + 9 * 3_600 + 5 * 60, 0, window, cx);
+            assert_eq!(
+                app.preferences
+                    .read(cx)
+                    .settings()
+                    .catchup_reminder_last_fired_day
+                    .as_deref(),
+                Some("2026-11-26")
+            );
+            assert!(
+                app.recent_notified_tags
+                    .iter()
+                    .any(|(tag, _)| tag == "catchup:2026-11-26")
+            );
+            // Calling again later the same day does not re-fire.
+            let count_before = app.recent_notified_tags.len();
+            app.check_daily_catchup_reminder_at(day_26_utc + 15 * 3_600, 0, window, cx);
+            assert_eq!(app.recent_notified_tags.len(), count_before);
+        });
+    });
+    cx.run_until_parked();
+    drop(root);
+}
+
+#[gpui::test]
+fn deep_link_hardening_multi_workspace_threads_files_and_unsigned_workspace(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut fx = fixtures::load();
+    let ws0_id = fx.workspaces[0].id.clone();
+    let ws1_id = fx.workspaces[1].id.clone();
+    let ws1_domain = fx.workspaces[1].domain.clone();
+    let ws1_fx = fixtures::workspace(1);
+    let ws1_ch = ws1_fx.channels[0].id.clone();
+
+    let eng = ChannelId::from("C0ENG");
+    let eng_thread_ts = fx
+        .messages
+        .get(&eng)
+        .and_then(|msgs| msgs.iter().find(|m| m.reply_count.unwrap_or(0) > 0))
+        .map(|m| m.ts.clone())
+        .expect("C0ENG has thread root");
+    let reply_ts = fx
+        .threads
+        .get(&(eng.clone(), eng_thread_ts.clone()))
+        .and_then(|r| r.first())
+        .map(|m| m.ts.clone())
+        .unwrap_or_else(|| Ts::from("1760000000.065432"));
+
+    // Attach a known file ID to a message in #engineering so slack://file resolves directly.
+    if let Some(msgs) = fx.messages.get_mut(&eng)
+        && let Some(first) = msgs.first_mut()
+    {
+        first.files.push(slackless_core::types::File {
+            id: slackless_core::types::FileId::from("F0DEEPFILE"),
+            name: Some("spec.pdf".into()),
+            title: Some("Spec".into()),
+            ..Default::default()
+        });
+    }
+
+    let (root, app, cx) = mount_test_app(fx, cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            // 1. slack://channel with message & thread_ts opens exact thread in target workspace.
+            assert!(app.handle_deep_link(
+                &format!(
+                    "slack://channel?team={ws0_id}&id=C0ENG&message={reply_ts}&thread_ts={eng_thread_ts}"
+                ),
+                window,
+                cx
+            ));
+            assert_eq!(app.workspace, 0);
+            assert_eq!(app.channel, eng);
+            assert!(app.right_pane.is_thread());
+            assert_eq!(
+                app.thread.read(cx).open_thread(),
+                Some((eng.clone(), eng_thread_ts.clone()))
+            );
+            app.close_thread(cx);
+
+            // 2. slack://file jumps to the channel containing the file when present locally.
+            app.select(ChannelId::from("C0DESIGN"), cx);
+            assert!(app.handle_deep_link(
+                &format!("slack://file?team={ws0_id}&id=F0DEEPFILE"),
+                window,
+                cx
+            ));
+            assert_eq!(app.channel, eng);
+
+            // 3. slack://file for an uncached file opens the Files page cleanly.
+            assert!(app.handle_deep_link(
+                &format!("slack://file?team={ws0_id}&id=F_UNKNOWN_REMOTE"),
+                window,
+                cx
+            ));
+            assert_eq!(app.page, MainPage::Files);
+
+            // 4. Multi-workspace routing via slack://open switches to workspace 1.
+            assert!(app.handle_deep_link(
+                &format!("slack://open?team={ws1_id}&id={ws1_ch}"),
+                window,
+                cx
+            ));
+            assert_eq!(app.workspace, 1);
+            assert_eq!(app.channel, ws1_ch);
+
+            // 5. Switch back to workspace 0, then jump to workspace 1 via https://<ws1_domain>.slack.com/archives/...
+            app.switch_workspace(0, window, cx);
+            assert_eq!(app.workspace, 0);
+            if !ws1_domain.is_empty() {
+                assert!(app.handle_deep_link(
+                    &format!("https://{ws1_domain}.slack.com/archives/{ws1_ch}/p1700000001234567"),
+                    window,
+                    cx
+                ));
+                assert_eq!(app.workspace, 1);
+                assert_eq!(app.channel, ws1_ch);
+            }
+
+            // 6. Unsigned-in target workspace does NOT switch workspace, surfaces toast, and returns true.
+            let prev_ws = app.workspace;
+            let prev_ch = app.channel.clone();
+            assert!(app.handle_deep_link(
+                "slack://channel?team=T_NOT_SIGNED_IN&id=C999999",
+                window,
+                cx
+            ));
+            assert_eq!(app.workspace, prev_ws);
+            assert_eq!(app.channel, prev_ch);
+
+            assert!(app.handle_deep_link(
+                "https://unrecognized-org.slack.com/archives/C999999/p1700000001234567",
+                window,
+                cx
+            ));
+            assert_eq!(app.workspace, prev_ws);
+            assert_eq!(app.channel, prev_ch);
+        });
+    });
+    cx.run_until_parked();
+    drop(root);
+}
