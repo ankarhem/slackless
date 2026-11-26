@@ -1122,8 +1122,14 @@ fn parse_cloud_drafts_filters_deleted_sent_empty_and_picks_timestamps() {
     assert_eq!(drafts[0].channel.as_str(), "C1");
     assert_eq!(drafts[0].text, "hello world");
     assert_eq!(drafts[0].updated_secs, Some(200));
+    // The listing carries each draft's conflict token for its next write.
+    assert_eq!(
+        drafts[0].handle().last_updated_ts.as_deref(),
+        Some("200.0000000")
+    );
     assert_eq!(drafts[1].id, "Dr2");
     assert_eq!(drafts[1].updated_secs, Some(150));
+    assert_eq!(drafts[1].last_updated_ts, None);
 }
 
 #[test]

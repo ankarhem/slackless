@@ -270,25 +270,28 @@ pub trait MessagingBackend: Clone + Send + Sync + 'static {
     fn drafts_list(&self) -> impl Future<Output = api::Result<Vec<api::CloudDraft>>> + Send {
         async { Ok(Vec::new()) }
     }
-    /// Create a cloud draft (`drafts.create`).
+    /// Create a cloud draft (`drafts.create`), with the conflict token its next write sends.
     fn drafts_create(
         &self,
         _channel: ChannelId,
         _text: String,
-    ) -> impl Future<Output = api::Result<Option<String>>> + Send {
+    ) -> impl Future<Output = api::Result<Option<api::DraftHandle>>> + Send {
         async { Ok(None) }
     }
-    /// Update an existing cloud draft (`drafts.update`).
+    /// Update an existing cloud draft (`drafts.update`); returns it with its new conflict token.
     fn drafts_update(
         &self,
-        _draft_id: String,
+        draft: api::DraftHandle,
         _channel: ChannelId,
         _text: String,
-    ) -> impl Future<Output = api::Result<()>> + Send {
-        async { Ok(()) }
+    ) -> impl Future<Output = api::Result<api::DraftHandle>> + Send {
+        async { Ok(draft) }
     }
     /// Delete a cloud draft (`drafts.delete`).
-    fn drafts_delete(&self, _draft_id: String) -> impl Future<Output = api::Result<()>> + Send {
+    fn drafts_delete(
+        &self,
+        _draft: api::DraftHandle,
+    ) -> impl Future<Output = api::Result<()>> + Send {
         async { Ok(()) }
     }
     /// Saved-for-Later items (`saved.list`) under `filter` (`"saved"`, `"completed"`, `"archived"`).

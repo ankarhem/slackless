@@ -336,8 +336,13 @@ impl SlackApi {
         channel: &ChannelId,
         scheduled_message_id: &str,
     ) -> Result<()> {
+        // A scheduled draft's token is only in `drafts.list`.
+        let draft = DraftHandle {
+            id: scheduled_message_id.to_owned(),
+            last_updated_ts: None,
+        };
         if self.uses_drafts_schedule() || scheduled_message_id.starts_with("Dr") {
-            return self.drafts_delete(scheduled_message_id).await;
+            return self.drafts_delete(&draft).await;
         }
         let params = vec![
             ("channel", channel.to_string()),
@@ -350,7 +355,7 @@ impl SlackApi {
             Ok(()) => Ok(()),
             Err(ApiError::Slack(ref code)) if code == "not_allowed_token_type" => {
                 self.mark_drafts_schedule();
-                self.drafts_delete(scheduled_message_id).await
+                self.drafts_delete(&draft).await
             }
             Err(e) => Err(e),
         }

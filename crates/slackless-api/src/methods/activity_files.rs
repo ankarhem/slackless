@@ -162,8 +162,13 @@ impl SlackApi {
         })
     }
 
-    /// `drafts.create`: create a cloud-synced draft for `channel` and return its draft id.
-    pub async fn drafts_create(&self, channel: &ChannelId, text: &str) -> Result<Option<String>> {
+    /// `drafts.create`: create a cloud-synced draft for `channel`; returns it with the conflict
+    /// token its next write sends.
+    pub async fn drafts_create(
+        &self,
+        channel: &ChannelId,
+        text: &str,
+    ) -> Result<Option<DraftHandle>> {
         let blocks =
             serde_json::to_string(&[Block::from(RichTextBlock::plain_text(text.to_owned()))])?;
         let destinations = serde_json::json!([{ "channel_id": channel.as_str() }]);
@@ -176,52 +181,63 @@ impl SlackApi {
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
         let raw: Value = self.call(method::DRAFTS_CREATE, params).await?.data;
-        Ok(raw
-            .get("draft")
-            .and_then(|d| d.get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned))
+        Ok(parse_draft_handle(&raw))
     }
 
-    /// `drafts.update`: update an existing cloud draft's text.
+    /// `drafts.update`: replace a cloud draft's text. Returns the draft with the token Slack
+    /// answers with, for its next write.
     pub async fn drafts_update(
         &self,
-        draft_id: &str,
+        draft: &DraftHandle,
         channel: &ChannelId,
         text: &str,
-    ) -> Result<()> {
+    ) -> Result<DraftHandle> {
         let blocks =
             serde_json::to_string(&[Block::from(RichTextBlock::plain_text(text.to_owned()))])?;
         let destinations = serde_json::json!([{ "channel_id": channel.as_str() }]);
         let mut params = vec![
-            ("draft_id", draft_id.to_owned()),
+            ("draft_id", draft.id.clone()),
             ("blocks", blocks),
             ("destinations", destinations.to_string()),
             ("file_ids", "[]".to_owned()),
             ("client_msg_id", uuid::Uuid::new_v4().to_string()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        if let Ok(raw) = self.drafts_list_raw().await
-            && let Some(ts) = find_draft_last_updated_ts(&raw, draft_id)
-        {
-            params.push(("client_last_updated_ts", ts));
-        }
-        self.call_ok(method::DRAFTS_UPDATE, params).await
+        params.extend(
+            self.draft_token(draft)
+                .await
+                .map(|ts| ("client_last_updated_ts", ts)),
+        );
+        let raw: Value = self.call(method::DRAFTS_UPDATE, params).await?.data;
+        Ok(parse_draft_handle(&raw).unwrap_or_else(|| DraftHandle {
+            id: draft.id.clone(),
+            last_updated_ts: None,
+        }))
     }
 
-    /// `drafts.delete`: remove a cloud draft (or cancel a scheduled draft), attaching the
-    /// 7-decimal padded `client_last_updated_ts` when available in `drafts.list`.
-    pub async fn drafts_delete(&self, draft_id: &str) -> Result<()> {
+    /// `drafts.delete`: remove a cloud draft (or cancel a scheduled draft), attaching its
+    /// 7-decimal padded `client_last_updated_ts`.
+    pub async fn drafts_delete(&self, draft: &DraftHandle) -> Result<()> {
         let mut params = vec![
-            ("draft_id", draft_id.to_owned()),
+            ("draft_id", draft.id.clone()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        if let Ok(raw) = self.drafts_list_raw().await
-            && let Some(ts) = find_draft_last_updated_ts(&raw, draft_id)
-        {
-            params.push(("client_last_updated_ts", ts));
-        }
+        params.extend(
+            self.draft_token(draft)
+                .await
+                .map(|ts| ("client_last_updated_ts", ts)),
+        );
         self.call_ok(method::DRAFTS_DELETE, params).await
+    }
+
+    /// `draft`'s conflict token: the one its last write returned, else the one `drafts.list`
+    /// shows (none when that lookup fails).
+    async fn draft_token(&self, draft: &DraftHandle) -> Option<String> {
+        if let Some(ts) = &draft.last_updated_ts {
+            return Some(ts.clone());
+        }
+        let raw = self.drafts_list_raw().await.ok()?;
+        find_draft_last_updated_ts(&raw, &draft.id)
     }
 
     /// One page of `files.list`: the files matching `filter`, newest first. A `channel`

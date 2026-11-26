@@ -191,8 +191,8 @@ struct FakeState {
     /// Cloud draft hooks & call logs.
     cloud_drafts: Vec<api::CloudDraft>,
     draft_creates: Vec<(ChannelId, String)>,
-    draft_updates: Vec<(String, ChannelId, String)>,
-    draft_deletes: Vec<String>,
+    draft_updates: Vec<(api::DraftHandle, ChannelId, String)>,
+    draft_deletes: Vec<api::DraftHandle>,
     fail_draft_delete: bool,
     draft_create_gate: Option<Arc<tokio::sync::Notify>>,
     /// Saved / Later hooks & call logs.
@@ -1062,7 +1062,11 @@ impl crate::backend::MessagingBackend for FakeBackend {
         Ok(self.state.lock().unwrap().cloud_drafts.clone())
     }
 
-    async fn drafts_create(&self, channel: ChannelId, text: String) -> api::Result<Option<String>> {
+    async fn drafts_create(
+        &self,
+        channel: ChannelId,
+        text: String,
+    ) -> api::Result<Option<api::DraftHandle>> {
         let gate = {
             let mut state = self.state.lock().unwrap();
             state.draft_creates.push((channel, text));
@@ -1072,26 +1076,30 @@ impl crate::backend::MessagingBackend for FakeBackend {
             gate.notified().await;
         }
         let n = self.state.lock().unwrap().draft_creates.len();
-        Ok(Some(format!("Dr{n:02}")))
+        Ok(Some(api::DraftHandle {
+            id: format!("Dr{n:02}"),
+            last_updated_ts: Some(format!("{n}.0000000")),
+        }))
     }
 
     async fn drafts_update(
         &self,
-        draft_id: String,
+        draft: api::DraftHandle,
         channel: ChannelId,
         text: String,
-    ) -> api::Result<()> {
-        self.state
-            .lock()
-            .unwrap()
-            .draft_updates
-            .push((draft_id, channel, text));
-        Ok(())
+    ) -> api::Result<api::DraftHandle> {
+        let mut state = self.state.lock().unwrap();
+        state.draft_updates.push((draft.clone(), channel, text));
+        let n = state.draft_updates.len();
+        Ok(api::DraftHandle {
+            last_updated_ts: Some(format!("{n}.5000000")),
+            ..draft
+        })
     }
 
-    async fn drafts_delete(&self, draft_id: String) -> api::Result<()> {
+    async fn drafts_delete(&self, draft: api::DraftHandle) -> api::Result<()> {
         let mut state = self.state.lock().unwrap();
-        state.draft_deletes.push(draft_id);
+        state.draft_deletes.push(draft);
         if state.fail_draft_delete {
             return Err(ApiError::Slack("draft_delete_failed".into()));
         }
@@ -4983,11 +4991,19 @@ async fn drafts_sync_lifecycle_concurrency_delete_failure_and_fetch_reconciliati
         let state = fake.state.lock().unwrap();
         assert_eq!(state.draft_creates.len(), 1, "no double create");
         assert_eq!(state.draft_updates.len(), 1);
-        assert_eq!(state.draft_updates[0].0, "Dr01");
+        assert_eq!(
+            state.draft_updates[0].0,
+            api::DraftHandle {
+                id: "Dr01".into(),
+                last_updated_ts: Some("1.0000000".into()),
+            },
+            "the update sends the token drafts.create returned"
+        );
         assert_eq!(state.draft_updates[0].2, "second");
     }
 
-    // 2. Delete failure retains the channel in cloud_draft_ids; subsequent delete succeeds and removes it.
+    // 2. Delete failure retains the channel in cloud_drafts (forgetting its token); a later
+    //    delete succeeds and removes it.
     fake.state.lock().unwrap().fail_draft_delete = true;
     core.handle(Command::Messaging(MessagingCommand::SyncDraft {
         channel: c1(),
@@ -5001,13 +5017,19 @@ async fn drafts_sync_lifecycle_concurrency_delete_failure_and_fetch_reconciliati
     // Allow post-delete cache update to run before asserting retention.
     tokio::task::yield_now().await;
     assert_eq!(
-        core.cloud_draft_ids
-            .lock()
-            .unwrap()
-            .get(&c1())
-            .map(String::as_str),
-        Some("Dr01"),
-        "failed delete must keep draft id cached"
+        fake.state.lock().unwrap().draft_deletes[0]
+            .last_updated_ts
+            .as_deref(),
+        Some("1.5000000"),
+        "the delete sends the token drafts.update returned"
+    );
+    assert_eq!(
+        core.cloud_drafts.lock().unwrap().get(&c1()),
+        Some(&api::DraftHandle {
+            id: "Dr01".into(),
+            last_updated_ts: None,
+        }),
+        "failed delete must keep the draft cached, without its possibly stale token"
     );
 
     fake.state.lock().unwrap().fail_draft_delete = false;
@@ -5017,20 +5039,24 @@ async fn drafts_sync_lifecycle_concurrency_delete_failure_and_fetch_reconciliati
     }))
     .await;
     wait_until("successful drafts_delete removes cached draft id", || {
-        !core.cloud_draft_ids.lock().unwrap().contains_key(&c1())
+        !core.cloud_drafts.lock().unwrap().contains_key(&c1())
     })
     .await;
 
-    // 3. FetchCloudDrafts seeds cloud_draft_ids and reconciles/removes stale entries.
-    core.cloud_draft_ids
-        .lock()
-        .unwrap()
-        .insert(ChannelId::from("CSTALE"), "DrStale".into());
+    // 3. FetchCloudDrafts seeds cloud_drafts and reconciles/removes stale entries.
+    core.cloud_drafts.lock().unwrap().insert(
+        ChannelId::from("CSTALE"),
+        api::DraftHandle {
+            id: "DrStale".into(),
+            last_updated_ts: None,
+        },
+    );
     fake.state.lock().unwrap().cloud_drafts = vec![api::CloudDraft {
         id: "DrFresh".into(),
         channel: ChannelId::from("C2"),
         text: "remote draft".into(),
         updated_secs: Some(100),
+        last_updated_ts: Some("100.0000000".into()),
     }];
     core.handle(Command::Messaging(MessagingCommand::FetchCloudDrafts))
         .await;
@@ -5038,14 +5064,17 @@ async fn drafts_sync_lifecycle_concurrency_delete_failure_and_fetch_reconciliati
         panic!("expected CloudDrafts");
     };
     assert_eq!(drafts.len(), 1);
-    let map = core.cloud_draft_ids.lock().unwrap();
+    let map = core.cloud_drafts.lock().unwrap();
     assert!(
         !map.contains_key(&ChannelId::from("CSTALE")),
         "stale entry cleared"
     );
     assert_eq!(
-        map.get(&ChannelId::from("C2")).map(String::as_str),
-        Some("DrFresh")
+        map.get(&ChannelId::from("C2")),
+        Some(&api::DraftHandle {
+            id: "DrFresh".into(),
+            last_updated_ts: Some("100.0000000".into()),
+        })
     );
 }
 

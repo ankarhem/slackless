@@ -517,8 +517,9 @@ pub(crate) struct Core<B: Backend> {
     bots_asked: HashSet<BotId>,
     /// Signed-in user id learned from `client.userBoot` (used to mirror self profile/presence).
     self_user_id: Arc<Mutex<Option<UserId>>>,
-    /// Cloud-synced draft ids per channel (`drafts.list` / `drafts.create` / `drafts.update` / `drafts.delete`).
-    cloud_draft_ids: Arc<Mutex<HashMap<ChannelId, String>>>,
+    /// Cloud-synced draft per channel with its conflict token (`drafts.list` / `drafts.create` /
+    /// `drafts.update` / `drafts.delete`).
+    cloud_drafts: Arc<Mutex<HashMap<ChannelId, crate::api::DraftHandle>>>,
     /// Per-channel async mutexes serializing `SyncDraft` so concurrent edits never double-create.
     draft_locks: Arc<Mutex<HashMap<ChannelId, Arc<tokio::sync::Mutex<()>>>>>,
     /// Whether the RTM websocket is currently disconnected or reconnecting.
@@ -635,7 +636,7 @@ impl<B: Backend> Core<B> {
             bots: Arc::new(Mutex::new(cached_bots)),
             bots_asked: HashSet::new(),
             self_user_id: Arc::new(Mutex::new(None)),
-            cloud_draft_ids: Arc::new(Mutex::new(HashMap::new())),
+            cloud_drafts: Arc::new(Mutex::new(HashMap::new())),
             draft_locks: Arc::new(Mutex::new(HashMap::new())),
             is_offline: false,
             has_connected_once: false,

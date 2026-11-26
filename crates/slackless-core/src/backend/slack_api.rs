@@ -341,19 +341,23 @@ impl MessagingBackend for SlackApi {
     async fn drafts_list(&self) -> api::Result<Vec<api::CloudDraft>> {
         SlackApi::drafts_list(self).await
     }
-    async fn drafts_create(&self, channel: ChannelId, text: String) -> api::Result<Option<String>> {
+    async fn drafts_create(
+        &self,
+        channel: ChannelId,
+        text: String,
+    ) -> api::Result<Option<api::DraftHandle>> {
         SlackApi::drafts_create(self, &channel, &text).await
     }
     async fn drafts_update(
         &self,
-        draft_id: String,
+        draft: api::DraftHandle,
         channel: ChannelId,
         text: String,
-    ) -> api::Result<()> {
-        SlackApi::drafts_update(self, &draft_id, &channel, &text).await
+    ) -> api::Result<api::DraftHandle> {
+        SlackApi::drafts_update(self, &draft, &channel, &text).await
     }
-    async fn drafts_delete(&self, draft_id: String) -> api::Result<()> {
-        SlackApi::drafts_delete(self, &draft_id).await
+    async fn drafts_delete(&self, draft: api::DraftHandle) -> api::Result<()> {
+        SlackApi::drafts_delete(self, &draft).await
     }
     async fn saved_list(&self, filter: &'static str) -> api::Result<Vec<api::SavedItem>> {
         SlackApi::saved_list(self, filter, 50).await

@@ -298,6 +298,14 @@ pub(in crate::methods) fn parse_gif_list(data: GifListData) -> Vec<GifItem> {
         .collect()
 }
 
+/// A cloud draft and the conflict token Slack checks on its next write: the 7-decimal padded
+/// `client_last_updated_ts`, as the draft's last write or `drafts.list` returned it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftHandle {
+    pub id: String,
+    pub last_updated_ts: Option<String>,
+}
+
 /// One cloud-synced draft returned by `drafts.list` (`F-CORE-089`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudDraft {
@@ -305,6 +313,18 @@ pub struct CloudDraft {
     pub channel: ChannelId,
     pub text: String,
     pub updated_secs: Option<u64>,
+    /// The draft's conflict token (see [`DraftHandle`]).
+    pub last_updated_ts: Option<String>,
+}
+
+impl CloudDraft {
+    /// This draft's id and conflict token, for its next write.
+    pub fn handle(&self) -> DraftHandle {
+        DraftHandle {
+            id: self.id.clone(),
+            last_updated_ts: self.last_updated_ts.clone(),
+        }
+    }
 }
 
 fn draft_extract_text(blocks: &Value) -> String {
@@ -372,6 +392,7 @@ pub(in crate::methods) fn parse_cloud_drafts(raw: &Value) -> Vec<CloudDraft> {
                 channel,
                 text,
                 updated_secs,
+                last_updated_ts: draft_last_updated_ts(d),
             })
         })
         .collect()
@@ -416,22 +437,35 @@ pub(in crate::methods) fn parse_scheduled_drafts(
         .collect()
 }
 
+/// A draft object's 7-decimal padded `last_updated_ts` (or `date_last_updated`).
+fn draft_last_updated_ts(draft: &Value) -> Option<String> {
+    let raw_ts = draft["last_updated_ts"]
+        .as_str()
+        .map(ToOwned::to_owned)
+        .or_else(|| draft["last_updated_ts"].as_f64().map(|f| format!("{f:.7}")))
+        .or_else(|| draft["date_last_updated"].as_u64().map(|n| n.to_string()))
+        .or_else(|| draft["date_last_updated"].as_str().map(ToOwned::to_owned))?;
+    let padded = pad_draft_ts(&raw_ts);
+    (!padded.is_empty()).then_some(padded)
+}
+
+/// The draft a `drafts.create` / `drafts.update` response carries, with its new token.
+pub(in crate::methods) fn parse_draft_handle(raw: &Value) -> Option<DraftHandle> {
+    let draft = raw.get("draft")?;
+    Some(DraftHandle {
+        id: draft["id"].as_str()?.to_owned(),
+        last_updated_ts: draft_last_updated_ts(draft),
+    })
+}
+
 /// Look up a draft's 7-decimal padded `client_last_updated_ts` from a `drafts.list` payload.
 pub(in crate::methods) fn find_draft_last_updated_ts(
     raw: &Value,
     draft_id: &str,
 ) -> Option<String> {
-    raw["drafts"].as_array()?.iter().find_map(|d| {
-        if d["id"].as_str() != Some(draft_id) {
-            return None;
-        }
-        let raw_ts = d["last_updated_ts"]
-            .as_str()
-            .map(ToOwned::to_owned)
-            .or_else(|| d["last_updated_ts"].as_f64().map(|f| format!("{f:.7}")))
-            .or_else(|| d["date_last_updated"].as_u64().map(|n| n.to_string()))
-            .or_else(|| d["date_last_updated"].as_str().map(ToOwned::to_owned))?;
-        let padded = pad_draft_ts(&raw_ts);
-        (!padded.is_empty()).then_some(padded)
-    })
+    raw["drafts"]
+        .as_array()?
+        .iter()
+        .find(|d| d["id"].as_str() == Some(draft_id))
+        .and_then(draft_last_updated_ts)
 }

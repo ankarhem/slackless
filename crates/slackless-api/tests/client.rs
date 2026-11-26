@@ -3281,3 +3281,52 @@ async fn saved_list_follows_cursors_until_the_limit_is_reached() {
     let two = api.saved_list("saved", 2).await.unwrap();
     assert_eq!(two.len(), 2);
 }
+
+#[tokio::test]
+async fn drafts_writes_carry_the_token_of_the_previous_write() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/drafts.create"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "draft": { "id": "Dr01", "last_updated_ts": "1760000100.5" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/drafts.update"))
+        .and(body_string_contains("draft_id=Dr01"))
+        .and(body_string_contains(
+            "client_last_updated_ts=1760000100.5000000",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "draft": { "id": "Dr01", "last_updated_ts": "1760000200.25" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/drafts.delete"))
+        .and(body_string_contains("draft_id=Dr01"))
+        .and(body_string_contains(
+            "client_last_updated_ts=1760000200.2500000",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Each write answers with the draft's new token, so none of them needs a `drafts.list`.
+    Mock::given(method("POST"))
+        .and(path("/api/drafts.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true, "drafts": []})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let channel = ChannelId::from("C1");
+    let draft = api.drafts_create(&channel, "first").await.unwrap().unwrap();
+    let draft = api.drafts_update(&draft, &channel, "second").await.unwrap();
+    api.drafts_delete(&draft).await.unwrap();
+}

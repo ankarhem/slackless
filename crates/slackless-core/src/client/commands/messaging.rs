@@ -3,7 +3,9 @@
 
 use super::super::*;
 use super::offline::park_transient_send;
-use crate::api::{ActionContainer, ActivityEntry, MessageContent, SavedMark, new_client_msg_id};
+use crate::api::{
+    ActionContainer, ActivityEntry, DraftHandle, MessageContent, SavedMark, new_client_msg_id,
+};
 use crate::outbox::{OutboxPayload, is_transient_send_error};
 use crate::reducer::update_conversation_last_read;
 
@@ -429,14 +431,14 @@ impl<B: Backend> Core<B> {
 
     pub(super) fn fetch_cloud_drafts(&self) {
         let ctx = self.ctx();
-        let draft_ids = Arc::clone(&self.cloud_draft_ids);
+        let cloud_drafts = Arc::clone(&self.cloud_drafts);
         self.spawn("drafts.list", async move {
             let drafts = ctx.backend.drafts_list().await?;
             {
-                let mut guard = draft_ids.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut guard = cloud_drafts.lock().unwrap_or_else(PoisonError::into_inner);
                 guard.clear();
                 for d in &drafts {
-                    guard.insert(d.channel.clone(), d.id.clone());
+                    guard.insert(d.channel.clone(), d.handle());
                 }
             }
             ctx.events.emit(Event::CloudDrafts(drafts));
@@ -446,7 +448,7 @@ impl<B: Backend> Core<B> {
 
     pub(super) fn sync_draft(&self, channel: ChannelId, text: String) {
         let ctx = self.ctx();
-        let draft_ids = Arc::clone(&self.cloud_draft_ids);
+        let cloud_drafts = Arc::clone(&self.cloud_drafts);
         let draft_locks = Arc::clone(&self.draft_locks);
         let channel_lock = {
             let mut locks = self
@@ -464,46 +466,53 @@ impl<B: Backend> Core<B> {
         };
         self.spawn("drafts.sync", async move {
             let _permit = channel_lock.lock().await;
-            let existing = draft_ids
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(&channel)
-                .cloned();
+            let drafts = || cloud_drafts.lock().unwrap_or_else(PoisonError::into_inner);
+            // After a failed write the token may be stale (another device wrote the draft): the
+            // next write looks the current one up instead.
+            let forget_token = |channel: &ChannelId| {
+                if let Some(draft) = drafts().get_mut(channel) {
+                    draft.last_updated_ts = None;
+                }
+            };
+            let existing: Option<DraftHandle> = drafts().get(&channel).cloned();
             let result = if text.trim().is_empty() {
-                if let Some(id) = existing {
-                    match ctx.backend.drafts_delete(id).await {
+                if let Some(draft) = existing {
+                    match ctx.backend.drafts_delete(draft).await {
                         Ok(()) => {
-                            draft_ids
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .remove(&channel);
+                            drafts().remove(&channel);
                             Ok(())
                         }
                         Err(e) if e.is_auth_expired() => Err(e),
                         Err(e) => {
                             tracing::debug!(%channel, %e, "drafts.delete failed");
+                            forget_token(&channel);
                             Ok(())
                         }
                     }
                 } else {
                     Ok(())
                 }
-            } else if let Some(id) = existing {
-                match ctx.backend.drafts_update(id, channel.clone(), text).await {
-                    Ok(()) => Ok(()),
+            } else if let Some(draft) = existing {
+                match ctx
+                    .backend
+                    .drafts_update(draft, channel.clone(), text)
+                    .await
+                {
+                    Ok(updated) => {
+                        drafts().insert(channel.clone(), updated);
+                        Ok(())
+                    }
                     Err(e) if e.is_auth_expired() => Err(e),
                     Err(e) => {
                         tracing::debug!(%channel, %e, "drafts.update failed");
+                        forget_token(&channel);
                         Ok(())
                     }
                 }
             } else {
                 match ctx.backend.drafts_create(channel.clone(), text).await {
-                    Ok(Some(new_id)) => {
-                        draft_ids
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .insert(channel.clone(), new_id);
+                    Ok(Some(created)) => {
+                        drafts().insert(channel.clone(), created);
                         Ok(())
                     }
                     Ok(None) => Ok(()),
