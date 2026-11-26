@@ -3,7 +3,7 @@
 //! performance in `slackless.log` and the Huddle Diagnostics drawer.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Inbound packet-loss percentage threshold at or above which the video stream is degraded.
@@ -44,6 +44,8 @@ pub struct HuddlePerfSnapshot {
     pub rx_seq_gaps: u64,
     /// Estimated inbound RTP video packet loss percentage (`0.0..=100.0`) during this window.
     pub rx_loss_pct: f32,
+    /// Live per-track remote video decoders (one OS thread + H.264/AV1 decoder each).
+    pub rx_decoders: u32,
 }
 
 impl HuddlePerfSnapshot {
@@ -74,6 +76,7 @@ pub struct HuddlePerfCounters {
     rx_frames: AtomicU64,
     rx_bytes: AtomicU64,
     rx_decode_us_sum: AtomicU64,
+    rx_decoders: AtomicUsize,
 }
 
 impl HuddlePerfCounters {
@@ -113,6 +116,16 @@ impl HuddlePerfCounters {
 
     pub fn record_rx_seq_gap(&self, n: u64) {
         self.rx_seq_gaps.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Track how many per-track remote video decoders are live (idle ones are swept).
+    pub fn set_rx_decoders(&self, count: usize) {
+        self.rx_decoders.store(count, Ordering::Relaxed);
+    }
+
+    /// Number of live per-track remote video decoders.
+    pub fn rx_decoders(&self) -> usize {
+        self.rx_decoders.load(Ordering::Relaxed)
     }
 
     pub fn record_rx_frame(&self, width: u32, height: u32, decode_us: u64) {
@@ -167,6 +180,7 @@ impl HuddlePerfCounters {
             rx_kbps: (((rx_bytes as f64 * 8.0) / dt) / 1000.0).round() as u32,
             rx_seq_gaps,
             rx_loss_pct,
+            rx_decoders: self.rx_decoders.load(Ordering::Relaxed) as u32,
         }
     }
 }

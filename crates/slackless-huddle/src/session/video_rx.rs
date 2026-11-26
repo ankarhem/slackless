@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,13 @@ use crate::metrics::HuddlePerfCounters;
 use crate::rtc::InboundVideoPacket;
 use crate::signaling::RemoteVideoSource;
 use crate::video::{H264VideoDecoder, VideoFrame, VideoTileKey};
+
+/// A per-track decoder whose SSRC stops receiving packets (departed participant, camera toggle,
+/// SFU remap) is dropped after this long, so decoders never accumulate for the whole call.
+pub(super) const TRACK_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Queued packets per track before overflow packets are dropped.
+const TRACK_QUEUE: usize = 256;
 
 pub(super) struct VideoPushResult {
     pub(super) frame: Option<VideoFrame>,
@@ -91,6 +99,11 @@ pub(super) struct VideoDecoderThreadArgs {
     pub(super) inbound_video_rx: std::sync::mpsc::Receiver<Option<InboundVideoPacket>>,
     pub(super) audio_only: Arc<AtomicBool>,
     pub(super) clear_decoders: Arc<AtomicBool>,
+    /// Set at teardown: workers exit without decoding their queued packets and the dispatcher
+    /// drops its backlog instead of routing it.
+    pub(super) shutdown: Arc<AtomicBool>,
+    /// Per-track decoders that received no packet for this long are dropped.
+    pub(super) idle_timeout: Duration,
     pub(super) routing: Arc<Mutex<VideoRoutingTable>>,
     pub(super) perf: Arc<HuddlePerfCounters>,
     pub(super) updates: mpsc::UnboundedSender<HuddleUpdate>,
@@ -98,10 +111,51 @@ pub(super) struct VideoDecoderThreadArgs {
     pub(super) codec_tx: mpsc::UnboundedSender<String>,
 }
 
+/// State shared by the dispatcher and one track worker.
+struct TrackContext {
+    /// Set by the dispatcher when the track is retired; the worker exits before decoding another
+    /// packet.
+    stop: Arc<AtomicBool>,
+    routing: Arc<Mutex<VideoRoutingTable>>,
+    perf: Arc<HuddlePerfCounters>,
+    updates: mpsc::UnboundedSender<HuddleUpdate>,
+    keyframe_req_tx: mpsc::UnboundedSender<u32>,
+}
+
+struct TrackWorker {
+    tx: Option<std::sync::mpsc::SyncSender<InboundVideoPacket>>,
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+    last_packet: Instant,
+}
+
+impl TrackWorker {
+    /// Tell the worker to exit without decoding its backlog; the thread ends once its current
+    /// packet (if any) is done.
+    fn retire(mut self) -> std::thread::JoinHandle<()> {
+        self.stop.store(true, Ordering::Relaxed);
+        drop(self.tx.take());
+        self.handle
+    }
+}
+
+/// Stop every worker and wait for the threads; workers skip their queued packets (see
+/// [`TrackWorker::retire`]), so this is bounded by one decode.
+fn stop_all(
+    workers: &mut HashMap<u32, TrackWorker>,
+    retiring: &mut Vec<std::thread::JoinHandle<()>>,
+) {
+    retiring.extend(workers.drain().map(|(_, w)| w.retire()));
+    for handle in retiring.drain(..) {
+        let _ = handle.join();
+    }
+}
+
 /// Spawn a lightweight dispatcher that routes inbound remote video RTP packets by `ssrc` to
 /// parallel per-track decoder workers (H.264 VideoToolbox / AV1 VideoToolbox or `rav1d` /
 /// OpenH264) so a heavy 1080p remote screen share never head-of-line-blocks other participants'
-/// cameras and decoding scales smoothly across CPU cores.
+/// cameras and decoding scales smoothly across CPU cores. Workers idle for `idle_timeout` are
+/// dropped.
 pub(super) fn spawn_video_decoder_thread(
     args: VideoDecoderThreadArgs,
 ) -> Option<std::thread::JoinHandle<()>> {
@@ -109,6 +163,8 @@ pub(super) fn spawn_video_decoder_thread(
         inbound_video_rx,
         audio_only,
         clear_decoders,
+        shutdown,
+        idle_timeout,
         routing,
         perf,
         updates,
@@ -118,24 +174,46 @@ pub(super) fn spawn_video_decoder_thread(
     std::thread::Builder::new()
         .name("slackless-huddle-vdec".to_owned())
         .spawn(move || {
-            struct TrackWorker {
-                tx: std::sync::mpsc::SyncSender<InboundVideoPacket>,
-                handle: std::thread::JoinHandle<()>,
-            }
             let mut workers: HashMap<u32, TrackWorker> = HashMap::new();
+            let mut retiring: Vec<std::thread::JoinHandle<()>> = Vec::new();
             let mut unsupported_video_ssrcs: HashSet<u32> = HashSet::new();
 
-            let stop_all = |workers: &mut HashMap<u32, TrackWorker>| {
-                let drained: Vec<TrackWorker> = workers.drain().map(|(_, w)| w).collect();
-                for w in drained {
-                    drop(w.tx);
-                    let _ = w.handle.join();
+            loop {
+                // Wake exactly when the oldest worker exceeds `idle_timeout`, or after
+                // `idle_timeout` when nothing is running.
+                let wait = workers
+                    .values()
+                    .map(|w| w.last_packet + idle_timeout)
+                    .min()
+                    .map_or(idle_timeout, |deadline| {
+                        deadline.saturating_duration_since(Instant::now())
+                    });
+                let pkt = match inbound_video_rx.recv_timeout(wait) {
+                    Ok(Some(pkt)) => pkt,
+                    Ok(None) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {
+                        let now = Instant::now();
+                        let idle: Vec<u32> = workers
+                            .iter()
+                            .filter(|(_, w)| w.last_packet + idle_timeout <= now)
+                            .map(|(ssrc, _)| *ssrc)
+                            .collect();
+                        for ssrc in idle {
+                            if let Some(worker) = workers.remove(&ssrc) {
+                                tracing::info!(ssrc, "dropping idle remote video decoder");
+                                retiring.push(worker.retire());
+                            }
+                        }
+                        perf.set_rx_decoders(workers.len());
+                        continue;
+                    }
+                };
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
                 }
-            };
-
-            while let Ok(Some(pkt)) = inbound_video_rx.recv() {
                 if clear_decoders.swap(false, Ordering::Relaxed) {
-                    stop_all(&mut workers);
+                    stop_all(&mut workers, &mut retiring);
+                    perf.set_rx_decoders(0);
                 }
                 if audio_only.load(Ordering::Relaxed) {
                     continue;
@@ -157,20 +235,30 @@ pub(super) fn spawn_video_decoder_thread(
                         let _ = codec_tx.send(pkt.mime_type.clone());
                         let _ = keyframe_req_tx.send(ssrc);
 
-                        let (tx, rx) = std::sync::mpsc::sync_channel::<InboundVideoPacket>(256);
-                        let w_routing = Arc::clone(&routing);
-                        let w_perf = Arc::clone(&perf);
-                        let w_updates = updates.clone();
-                        let w_kf = keyframe_req_tx.clone();
+                        let (tx, rx) =
+                            std::sync::mpsc::sync_channel::<InboundVideoPacket>(TRACK_QUEUE);
+                        let stop = Arc::new(AtomicBool::new(false));
+                        let ctx = TrackContext {
+                            stop: Arc::clone(&stop),
+                            routing: Arc::clone(&routing),
+                            perf: Arc::clone(&perf),
+                            updates: updates.clone(),
+                            keyframe_req_tx: keyframe_req_tx.clone(),
+                        };
                         if let Ok(handle) = std::thread::Builder::new()
                             .name(format!("slackless-vdec-{ssrc}"))
-                            .spawn(move || {
-                                run_single_track_decoder(
-                                    dec, rx, w_routing, w_perf, w_updates, w_kf,
-                                );
-                            })
+                            .spawn(move || run_single_track_decoder(dec, rx, ctx))
                         {
-                            workers.insert(ssrc, TrackWorker { tx, handle });
+                            workers.insert(
+                                ssrc,
+                                TrackWorker {
+                                    tx: Some(tx),
+                                    stop,
+                                    handle,
+                                    last_packet: Instant::now(),
+                                },
+                            );
+                            perf.set_rx_decoders(workers.len());
                         }
                     } else {
                         unsupported_video_ssrcs.insert(ssrc);
@@ -183,13 +271,16 @@ pub(super) fn spawn_video_decoder_thread(
                     }
                 }
 
-                if let Some(worker) = workers.get(&ssrc) {
+                if let Some(worker) = workers.get_mut(&ssrc) {
+                    worker.last_packet = Instant::now();
                     // Non-blocking send: if one track's software decoder momentarily falls behind,
                     // drop only that track's overflow packet without stalling other tracks.
-                    let _ = worker.tx.try_send(pkt);
+                    if let Some(tx) = &worker.tx {
+                        let _ = tx.try_send(pkt);
+                    }
                 }
             }
-            stop_all(&mut workers);
+            stop_all(&mut workers, &mut retiring);
         })
         .ok()
 }
@@ -197,17 +288,24 @@ pub(super) fn spawn_video_decoder_thread(
 fn run_single_track_decoder(
     mut decoder: RemoteVideoDecoder,
     rx: std::sync::mpsc::Receiver<InboundVideoPacket>,
-    routing: Arc<Mutex<VideoRoutingTable>>,
-    perf: Arc<HuddlePerfCounters>,
-    updates: mpsc::UnboundedSender<HuddleUpdate>,
-    keyframe_req_tx: mpsc::UnboundedSender<u32>,
+    ctx: TrackContext,
 ) {
+    let TrackContext {
+        stop,
+        routing,
+        perf,
+        updates,
+        keyframe_req_tx,
+    } = ctx;
     let mut decoded_first = false;
     let mut pending_keyframe_req = false;
     let mut last_keyframe_req = Instant::now();
     let mut last_decode_err_log: Option<Instant> = None;
 
     while let Ok(pkt) = rx.recv() {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         let t0 = Instant::now();
         let res = decoder.push(&pkt);
         if res.seq_gaps_delta > 0 {

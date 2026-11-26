@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,8 @@ pub(super) struct SessionRuntime<'a, M: MediaDevices = LiveMediaDevices> {
     pub(super) vdec_routing: Arc<Mutex<VideoRoutingTable>>,
     pub(super) vdec_audio_only: Arc<AtomicBool>,
     pub(super) vdec_clear: Arc<AtomicBool>,
+    /// Set at teardown so decoder workers drop their backlog instead of decoding it.
+    pub(super) vdec_shutdown: Arc<AtomicBool>,
     pub(super) perf: Arc<HuddlePerfCounters>,
     pub(super) outbound_opus_tx: mpsc::UnboundedSender<bytes::Bytes>,
     pub(super) outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
@@ -175,6 +177,7 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
     let mut res_sampler = ProcessResourceSampler::new();
     let vdec_audio_only = Arc::new(AtomicBool::new(snap.audio_only));
     let vdec_clear = Arc::new(AtomicBool::new(false));
+    let vdec_shutdown = Arc::new(AtomicBool::new(false));
     let vdec_routing = Arc::new(Mutex::new(VideoRoutingTable {
         ssrc_to_stream_id: hs.ssrc_to_stream_id.clone(),
         remote_sources: Vec::new(),
@@ -193,6 +196,8 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
         inbound_video_rx: vdec_rx,
         audio_only: Arc::clone(&vdec_audio_only),
         clear_decoders: Arc::clone(&vdec_clear),
+        shutdown: Arc::clone(&vdec_shutdown),
+        idle_timeout: super::video_rx::TRACK_IDLE_TIMEOUT,
         routing: Arc::clone(&vdec_routing),
         perf: Arc::clone(&perf),
         updates: updates.clone(),
@@ -253,6 +258,7 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
         vdec_routing,
         vdec_audio_only,
         vdec_clear,
+        vdec_shutdown,
         perf,
         outbound_opus_tx: hs.outbound_opus_tx,
         outbound_h264_tx: hs.outbound_h264_tx,
@@ -435,6 +441,7 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
                     rx_fps = format_args!("{}.{}", perf_snap.rx_fps_tenths / 10, perf_snap.rx_fps_tenths % 10),
                     rx_dec_ms = format_args!("{:.2}", perf_snap.rx_decode_us as f64 / 1000.0),
                     rx_kbps = perf_snap.rx_kbps,
+                    rx_decoders = perf_snap.rx_decoders,
                     rx_seq_gaps = perf_snap.rx_seq_gaps,
                     rx_loss_pct = format_args!("{:.1}", perf_snap.rx_loss_pct),
                     audio_rx_pkts = audio.packets,
@@ -518,12 +525,15 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
         .await;
     state.media.stop_audio();
     video_tx_task.abort();
+    // Workers exit without decoding their backlog and the dispatcher drops its queue instead of
+    // routing it, so the join is short; it still blocks, so it runs on the blocking pool.
+    state.vdec_shutdown.store(true, Ordering::Relaxed);
     vdec_fwd.abort();
     let _ = vdec_tx.send(None);
     peer.close().await;
     drop(peer);
     if let Some(handle) = vdec_handle {
-        let _ = handle.join();
+        let _ = tokio::task::spawn_blocking(move || handle.join()).await;
     }
     tracing::info!("huddle session teardown complete");
 

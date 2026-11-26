@@ -826,6 +826,7 @@ mod state_machine {
             vdec_routing: Arc::new(Mutex::new(VideoRoutingTable::default())),
             vdec_audio_only: Arc::new(AtomicBool::new(false)),
             vdec_clear: Arc::new(AtomicBool::new(false)),
+            vdec_shutdown: Arc::new(AtomicBool::new(false)),
             perf: Arc::new(HuddlePerfCounters::default()),
             outbound_opus_tx,
             outbound_h264_tx,
@@ -1840,10 +1841,13 @@ mod state_machine {
         let (codec_tx, mut codec_rx) = mpsc::unbounded_channel();
 
         let _ = drain_updates(&mut rx);
+        let idle_timeout = Duration::from_millis(200);
         let join = spawn_video_decoder_thread(VideoDecoderThreadArgs {
             inbound_video_rx: vdec_rx,
             audio_only: Arc::clone(&audio_only),
             clear_decoders: Arc::clone(&clear_decoders),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            idle_timeout,
             routing: Arc::clone(&routing),
             perf: Arc::clone(&perf),
             updates: tx.clone(),
@@ -1909,6 +1913,33 @@ mod state_machine {
             }))
             .unwrap();
 
+        // Both H.264 tracks (888 and 902) get a decoder worker; 901 (VP9) is unsupported.
+        let mut codecs = Vec::new();
+        for _ in 0..2 {
+            codecs.push(
+                tokio::time::timeout(Duration::from_secs(3), codec_rx.recv())
+                    .await
+                    .expect("codec notification for a new decoder worker")
+                    .expect("codec channel open"),
+            );
+        }
+        assert!(
+            codecs
+                .iter()
+                .all(|c| c.contains("H.264") || c.contains("H264")),
+            "got {codecs:?}"
+        );
+
+        // Idle sweep: with no packet for `idle_timeout`, both decoders are dropped so departed
+        // participants and camera toggles never accumulate decoders for the whole call.
+        tokio::time::timeout(idle_timeout * 10, async {
+            while perf.rx_decoders() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle decoder workers must be swept");
+
         // Now trigger clear_decoders + audio_only drop path, then shut down cleanly.
         clear_decoders.store(true, Ordering::Relaxed);
         audio_only.store(true, Ordering::Relaxed);
@@ -1916,11 +1947,6 @@ mod state_machine {
         vdec_tx.send(None).unwrap();
         join.join().expect("decoder thread joined cleanly");
 
-        let codec = codec_rx.try_recv().expect("codec notification");
-        assert!(
-            codec.contains("H.264") || codec.contains("H264"),
-            "got {codec}"
-        );
         let _ = kf_rx.try_recv();
         assert_eq!(perf.sample(1.0, 0, 0).rx_seq_gaps, 4);
     }
