@@ -511,15 +511,26 @@ impl<B: Backend> Core<B> {
         let ws_init = workspace.clone();
         let init_events = events.clone();
         let (raw_offline, outbox_items, cached_bots, raw_synced) = with_store(&store, move |s| {
-            let offline = s.list_offline(&ws_init).unwrap_or_default();
+            // A failed read is logged instead of silently becoming an empty queue, outbox, bot
+            // cache or span map.
+            fn load<T: Default>(what: &str, read: crate::store::Result<T>) -> T {
+                match read {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(what, %err, "failed to read from the store");
+                        T::default()
+                    }
+                }
+            }
+            let offline = load("offline_queue", s.list_offline(&ws_init));
             // Rows left `sending` by an unclean exit stay invisible to every flush until recovered.
             if let Err(err) = s.reset_outbox_sending_to_pending(&ws_init) {
                 tracing::warn!(%err, "failed to recover outbox rows left in sending");
                 init_events.report("outbox recovery", err.into());
             }
-            let outbox = s.list_outbox(&ws_init).unwrap_or_default();
-            let bots = s.bot_profiles(&ws_init).unwrap_or_default();
-            let synced = s.local(&ws_init, BACKFILL_SYNCED_KEY).unwrap_or_default();
+            let outbox = load("outbox", s.list_outbox(&ws_init));
+            let bots = load("bot_profiles", s.bot_profiles(&ws_init));
+            let synced = load(BACKFILL_SYNCED_KEY, s.local(&ws_init, BACKFILL_SYNCED_KEY));
             Ok((offline, outbox, bots, synced))
         })
         .await

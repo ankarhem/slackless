@@ -364,8 +364,14 @@ impl BackfillControl {
 /// Deserialize persisted [`Synced`] spans from `local_state`, returning an empty map if absent
 /// or malformed.
 pub fn decode_synced_spans(raw: Option<String>) -> HashMap<ChannelId, Synced> {
-    raw.and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default()
+    raw.and_then(|json| match serde_json::from_str(&json) {
+        Ok(spans) => Some(spans),
+        Err(err) => {
+            tracing::warn!(%err, "stored backfill spans are malformed; starting from an empty map");
+            None
+        }
+    })
+    .unwrap_or_default()
 }
 
 /// Read persisted [`Synced`] backfill spans for `workspace` from SQLite.
@@ -373,13 +379,21 @@ pub fn read_synced_spans(store: &Store, workspace: &TeamId) -> HashMap<ChannelId
     decode_synced_spans(store.local(workspace, BACKFILL_SYNCED_KEY).ok().flatten())
 }
 
-/// Persist [`Synced`] backfill spans for `workspace` into SQLite `local_state`.
+/// Persist [`Synced`] backfill spans for `workspace` into SQLite `local_state`, layered over the
+/// spans already stored there: a map that a failed load left without some channels must never
+/// erase them. Fails without writing when the stored value cannot be read.
 pub fn write_synced_spans(
     store: &mut Store,
     workspace: &TeamId,
     spans: &HashMap<ChannelId, Synced>,
 ) -> crate::store::Result<()> {
-    let payload = serde_json::to_string(spans)?;
+    let mut merged = decode_synced_spans(store.local(workspace, BACKFILL_SYNCED_KEY)?);
+    merged.extend(
+        spans
+            .iter()
+            .map(|(channel, span)| (channel.clone(), span.clone())),
+    );
+    let payload = serde_json::to_string(&merged)?;
     store.set_local(workspace, BACKFILL_SYNCED_KEY, &payload)
 }
 
@@ -710,14 +724,9 @@ impl<B: Backend> Backfill<B> {
     }
 
     async fn persist_synced(&self) {
-        let Ok(payload) = serde_json::to_string(&*self.lock()) else {
-            return;
-        };
+        let spans = self.lock().clone();
         let ws = self.workspace.clone();
-        if let Err(err) = with_store(&self.store, move |s| {
-            s.set_local(&ws, BACKFILL_SYNCED_KEY, &payload)
-        })
-        .await
+        if let Err(err) = with_store(&self.store, move |s| write_synced_spans(s, &ws, &spans)).await
         {
             tracing::warn!(%err, "failed to persist backfill synced spans");
         }
@@ -1189,6 +1198,20 @@ mod tests {
     async fn synced_spans_persist_in_local_state_across_restarts() {
         let fake = FakeBackend::with_history(1..=7);
         let (bf, _rx) = backfill(&fake);
+        // A channel this session never walked, known only to the store: `bf` starts with an
+        // empty map, as it does when the startup read of the stored spans fails.
+        let c2 = ChannelId::from("C2");
+        let c2_span = Synced {
+            newest: Ts::from("50.0"),
+            oldest: Ts::from("40.0"),
+            complete: true,
+        };
+        write_synced_spans(
+            &mut bf.store.lock().unwrap(),
+            &bf.workspace,
+            &HashMap::from([(c2.clone(), c2_span.clone())]),
+        )
+        .unwrap();
         bf.clone().run(ChannelId::from("C1")).await;
         assert_eq!(fake.calls().len(), 4);
 
@@ -1206,6 +1229,11 @@ mod tests {
                 oldest: Ts::from("1.0"),
                 complete: true,
             })
+        );
+        assert_eq!(
+            restored.get(&c2),
+            Some(&c2_span),
+            "persisting C1 must keep the spans of channels the session never loaded"
         );
 
         fake.push_history(8..=8);
