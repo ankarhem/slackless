@@ -1403,6 +1403,95 @@ impl App {
         );
     }
 
+    /// Download the local ONNX semantic search model in the background with toast feedback.
+    pub(in crate::app) fn download_semantic_model(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        notify(
+            "Downloading embedding model",
+            "Fetching all-MiniLM-L6-v2 (~23 MB) into local app data…",
+            window,
+            cx,
+        );
+        cx.spawn_in(window, async move |_, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    slackless_core::embeddings::download_embedding_model(
+                        slackless_core::embeddings::EmbeddingModel::default(),
+                        |_| {},
+                    )
+                })
+                .await;
+            let _ = cx.update(|window, cx| {
+                match outcome {
+                    Ok(dir) => notify(
+                        "Embedding model ready",
+                        format!("Saved local ONNX model in {}", dir.display()),
+                        window,
+                        cx,
+                    ),
+                    Err(err) => notify("Model download failed", err, window, cx),
+                }
+                window.refresh();
+            });
+        })
+        .detach();
+    }
+
+    /// Incrementally index all local workspace archives into `semantic_index.sqlite`.
+    pub(in crate::app) fn index_semantic_archives(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        notify(
+            "Indexing semantic vectors",
+            "Embedding messages, snippets, canvases, and transcripts in background…",
+            window,
+            cx,
+        );
+        cx.spawn_in(window, async move |_, cx| {
+            let outcome: Result<slackless_core::semantic_index::SemanticIndexReport, String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let embedder = slackless_core::embeddings::OnnxEmbedder::load_default(
+                        slackless_core::embeddings::EmbeddingModel::default(),
+                    )?;
+                    let archives = slackless_core::search::discover_local_archives();
+                    let mut idx = slackless_core::semantic_index::open_default_semantic_index()?;
+                    slackless_core::semantic_index::index_disk_archives(
+                        &archives,
+                        &mut idx,
+                        &embedder,
+                        |_| {},
+                    )
+                })
+                .await;
+            let _ = cx.update(|window, cx| {
+                match outcome {
+                    Ok(rep) => notify(
+                        "Semantic index updated",
+                        format!(
+                            "{} workspace(s): {} embedded, {} unchanged, {} pruned.",
+                            rep.workspaces_indexed.len(),
+                            rep.embedded,
+                            rep.skipped_unchanged,
+                            rep.pruned
+                        ),
+                        window,
+                        cx,
+                    ),
+                    Err(err) => notify("Semantic indexing failed", err, window, cx),
+                }
+                window.refresh();
+            });
+        })
+        .detach();
+    }
+
     /// Open the Archive & Storage modal dialog showing local SQLite metrics, live workspace &
     /// per-channel backfill progress, Start / Pause / Resume controls, and maintenance actions.
     pub(in crate::app) fn open_storage_dialog(
@@ -1480,6 +1569,8 @@ impl App {
             let this_compact = this.clone();
             let this_prune = this.clone();
             let this_reset = this.clone();
+            let this_sem_dl = this.clone();
+            let this_sem_idx = this.clone();
             let active_ch_for_btn = active_channel.clone();
 
             let stats_card = v_flex()
@@ -1771,10 +1862,110 @@ impl App {
                     }),
                 );
 
+            let sem_model = slackless_core::embeddings::EmbeddingModel::default();
+            let sem_setup = slackless_core::embeddings::detect_embedding_model_setup(sem_model);
+            let sem_stats = slackless_core::semantic_index::default_semantic_index_stats();
+            let sem_status_color = if sem_setup.model_ready { success } else { muted };
+            let semantic_card = v_flex()
+                .gap_2()
+                .p_3()
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(card_bg)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg)
+                                .child("Semantic search index (local ONNX)"),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py(px(1.))
+                                .rounded(px(4.))
+                                .bg(sem_status_color.opacity(0.16))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(sem_status_color)
+                                .child(if sem_setup.model_ready {
+                                    "Model ready"
+                                } else {
+                                    "Not downloaded"
+                                }),
+                        ),
+                )
+                .child(div().text_xs().text_color(muted).child(
+                    if sem_setup.model_ready {
+                        format!(
+                            "{} ({}) · {} vectors ({}) across {} workspace(s)",
+                            sem_model.slug(),
+                            slackless_core::types::time::format_bytes(sem_setup.disk_bytes),
+                            sem_stats.total_docs,
+                            slackless_core::types::time::format_bytes(sem_stats.db_bytes),
+                            sem_stats.workspaces,
+                        )
+                    } else {
+                        format!(
+                            "{} ({}) — opt-in local vector index (semantic_index.sqlite).",
+                            sem_model.slug(),
+                            sem_setup.download_size_hint,
+                        )
+                    },
+                ))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_wrap()
+                        .when(!sem_setup.model_ready, |row| {
+                            row.child(
+                                preferences::form_button(
+                                    Button::new("storage-sem-dl")
+                                        .primary()
+                                        .icon(IconName::Download)
+                                        .label(format!(
+                                            "Download model ({})",
+                                            sem_setup.download_size_hint
+                                        )),
+                                    cx,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    let _ = this_sem_dl.update(cx, |app, cx| {
+                                        app.download_semantic_model(window, cx);
+                                    });
+                                }),
+                            )
+                        })
+                        .when(sem_setup.model_ready, |row| {
+                            row.child(
+                                preferences::form_button(
+                                    Button::new("storage-sem-index")
+                                        .outline()
+                                        .icon(IconName::RefreshCw)
+                                        .label("Index semantic vectors"),
+                                    cx,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    let _ = this_sem_idx.update(cx, |app, cx| {
+                                        app.index_semantic_archives(window, cx);
+                                    });
+                                }),
+                            )
+                        }),
+                );
+
             dialog.title("Archive & Storage").w(px(620.)).child(
                 v_flex()
                     .gap_3()
                     .child(stats_card)
+                    .child(semantic_card)
                     .child(backfill_card)
                     .when(!channel_rows.is_empty(), |col| {
                         col.child(

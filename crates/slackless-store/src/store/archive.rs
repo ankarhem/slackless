@@ -292,6 +292,153 @@ impl Store {
         Ok(out)
     }
 
+    /// Stream every non-deleted current message in `workspace` (ordered oldest first) for
+    /// incremental sidecar indexing, including attached file names & transcripts.
+    pub fn list_messages_for_indexing(
+        &self,
+        workspace: &TeamId,
+    ) -> Result<Vec<(ChannelId, Message, String, String)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT channel_id, json, file_names, file_transcripts
+             FROM message_current
+             WHERE workspace_id = ?1 AND deleted = 0
+             ORDER BY ts_key ASC",
+        )?;
+        let rows = stmt.query_map(params![workspace.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                decode_json_value(row.get_ref(1)?)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (ch, json, file_names, file_transcripts) = row?;
+            let channel = ChannelId::from(ch);
+            let Ok(mut message) = serde_json::from_str::<Message>(&json) else {
+                continue;
+            };
+            message.channel.get_or_insert_with(|| channel.clone());
+            out.push((channel, message, file_names, file_transcripts));
+        }
+        Ok(out)
+    }
+
+    /// Every stored `file_transcript` row in `workspace` (with optional carrying message channel
+    /// & ts from `message_file`), for incremental semantic indexing.
+    pub fn list_file_transcripts_for_indexing(
+        &self,
+        workspace: &TeamId,
+    ) -> Result<Vec<WorkspaceFileTranscript>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT ft.file_id, ft.source, ft.text, ft.updated_at,
+                    (SELECT mc.channel_id
+                     FROM message_file mf
+                     JOIN message_current mc ON mc.id = mf.message_id
+                     WHERE mf.workspace_id = ft.workspace_id AND mf.file_id = ft.file_id
+                     ORDER BY mc.ts_key DESC LIMIT 1),
+                    (SELECT mc.ts
+                     FROM message_file mf
+                     JOIN message_current mc ON mc.id = mf.message_id
+                     WHERE mf.workspace_id = ft.workspace_id AND mf.file_id = ft.file_id
+                     ORDER BY mc.ts_key DESC LIMIT 1)
+             FROM file_transcript ft
+             WHERE ft.workspace_id = ?1
+             ORDER BY ft.updated_at DESC, ft.file_id ASC",
+        )?;
+        let rows = stmt.query_map(params![workspace.as_str()], |row| {
+            let file_id: String = row.get(0)?;
+            let source: String = row.get(1)?;
+            let text: String = row.get(2)?;
+            let updated_at: i64 = row.get(3)?;
+            let channel: Option<String> = row.get(4)?;
+            let message_ts: Option<String> = row.get(5)?;
+            Ok(WorkspaceFileTranscript {
+                workspace: workspace.clone(),
+                transcript: StoredFileTranscript {
+                    file_id: crate::types::FileId::from(file_id),
+                    source,
+                    text,
+                    cues: Vec::new(),
+                    updated_at,
+                },
+                channel: channel.map(ChannelId::from),
+                message_ts: message_ts.map(Ts::from),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every stored `huddle_transcript` segment in `workspace`, oldest first, for semantic indexing.
+    pub fn list_huddle_transcripts_for_indexing(
+        &self,
+        workspace: &TeamId,
+    ) -> Result<Vec<HuddleTranscriptSegment>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, channel_id, call_id, thread_root_ts, speaker_id, lang, source, text, at_ms
+             FROM huddle_transcript
+             WHERE workspace_id = ?1
+             ORDER BY at_ms ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![workspace.as_str()], |row| {
+            let channel_s: String = row.get(1)?;
+            let thread_s: Option<String> = row.get(3)?;
+            let speaker_s: Option<String> = row.get(4)?;
+            Ok(HuddleTranscriptSegment {
+                id: row.get(0)?,
+                channel: ChannelId::from(channel_s),
+                call_id: row.get(2)?,
+                thread_root_ts: thread_s.filter(|s| !s.is_empty()).map(Ts::from),
+                speaker_id: speaker_s.filter(|s| !s.is_empty()).map(UserId::from),
+                lang: row.get(5)?,
+                source: row.get(6)?,
+                text: row.get(7)?,
+                at_ms: row.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Fetch a single `huddle_transcript` segment by `(workspace, id)` (for semantic hydration).
+    pub fn huddle_transcript_segment(
+        &self,
+        workspace: &TeamId,
+        segment_id: i64,
+    ) -> Result<Option<HuddleTranscriptSegment>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, channel_id, call_id, thread_root_ts, speaker_id, lang, source, text, at_ms
+             FROM huddle_transcript
+             WHERE workspace_id = ?1 AND id = ?2",
+        )?;
+        Ok(stmt
+            .query_row(params![workspace.as_str(), segment_id], |row| {
+                let channel_s: String = row.get(1)?;
+                let thread_s: Option<String> = row.get(3)?;
+                let speaker_s: Option<String> = row.get(4)?;
+                Ok(HuddleTranscriptSegment {
+                    id: row.get(0)?,
+                    channel: ChannelId::from(channel_s),
+                    call_id: row.get(2)?,
+                    thread_root_ts: thread_s.filter(|s| !s.is_empty()).map(Ts::from),
+                    speaker_id: speaker_s.filter(|s| !s.is_empty()).map(UserId::from),
+                    lang: row.get(5)?,
+                    source: row.get(6)?,
+                    text: row.get(7)?,
+                    at_ms: row.get(8)?,
+                })
+            })
+            .optional()?)
+    }
+
     /// Per-channel stored message counts for `workspace` (including tombstones), in one query.
     pub fn channel_message_counts(&self, workspace: &TeamId) -> Result<HashMap<ChannelId, u64>> {
         let mut stmt = self.conn.prepare_cached(

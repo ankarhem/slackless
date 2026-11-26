@@ -102,6 +102,9 @@ pub struct Preferences {
     pub(super) camera_frame: Option<std::sync::Arc<gpui_kit::gpui::RenderImage>>,
     pub(super) stt_downloading: Option<slackless_core::huddle::TranscriptionProvider>,
     pub(super) stt_download_status: Option<String>,
+    pub(super) semantic_downloading: bool,
+    pub(super) semantic_indexing: bool,
+    pub(super) semantic_status_note: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -274,6 +277,9 @@ impl Preferences {
                 camera_frame: None,
                 stt_downloading: None,
                 stt_download_status: None,
+                semantic_downloading: false,
+                semantic_indexing: false,
+                semantic_status_note: None,
                 _subscriptions: subscriptions,
             }
         })

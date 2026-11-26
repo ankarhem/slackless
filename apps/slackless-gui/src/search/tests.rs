@@ -485,3 +485,120 @@ fn transcript_match_excerpt_handles_case_word_boundaries_modifiers_and_non_match
     let sv_excerpt = transcript_match_excerpt(sv, "betalflödet").expect("must match swedish term");
     assert!(sv_excerpt.contains("betalflödet"));
 }
+
+#[gpui::test]
+fn search_view_keyword_hybrid_semantic_modes_and_missing_model_prompt(cx: &mut TestAppContext) {
+    use slackless_core::embeddings::{Embedder, HashProjectionEmbedder};
+    use slackless_core::semantic_index::index_store_documents;
+    use slackless_core::store::{SearchMode, SemanticIndex};
+
+    let ws = TeamId::from("T_SEM");
+    let ch = Conversation {
+        id: ChannelId::from("C_INFRA"),
+        name: Some("infra".into()),
+        is_channel: true,
+        ..Default::default()
+    };
+    let mut store = Store::open_in_memory().expect("store");
+    store
+        .upsert_team(
+            &ws,
+            &Team {
+                id: ws.clone(),
+                name: "SemanticCorp".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store.upsert_conversation(&ws, &ch).unwrap();
+    store
+        .upsert_messages(
+            &ws,
+            &ch.id,
+            &[
+                Message {
+                    ts: Ts::from("1700001000.000000"),
+                    user: Some(UserId::from("U1")),
+                    text: "Kubernetes cluster autoscaling deployment pipeline".into(),
+                    ..Default::default()
+                },
+                Message {
+                    ts: Ts::from("1700001005.000000"),
+                    user: Some(UserId::from("U1")),
+                    text: "Lunch salad bar menu today".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+    let embedder: Arc<dyn Embedder> = Arc::new(HashProjectionEmbedder::new(128));
+    let mut sem_idx = SemanticIndex::open_in_memory().unwrap();
+    index_store_documents(&store, &mut sem_idx, embedder.as_ref(), Some(&ws), |_| {}).unwrap();
+    let shared_idx = Arc::new(Mutex::new(sem_idx));
+    let archive: SharedStore = Arc::new(Mutex::new(store));
+
+    let mut fx = crate::fixtures::load();
+    fx.sample = true;
+    fx.workspaces = vec![Team {
+        id: ws,
+        name: "SemanticCorp".into(),
+        ..Default::default()
+    }];
+    fx.channels = vec![ch];
+
+    let view = cx.update(|cx| SearchView::new(Arc::new(fx), Some(archive), cx));
+
+    // Default mode is Keyword; switching to Semantic with injected backend finds semantic matches.
+    view.update(cx, |v, cx| {
+        assert_eq!(v.mode(), SearchMode::Keyword);
+        v.set_semantic_backend_for_test(Arc::clone(&embedder), Arc::clone(&shared_idx));
+        v.set_mode(SearchMode::Semantic, cx);
+        v.run("kubernetes autoscaler deploying".into(), cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.mode(), SearchMode::Semantic);
+        assert!(!v.semantic_model_missing_for_test());
+        assert!(
+            !v.local_hits_for_test().is_empty(),
+            "expected semantic hit for morphologically related query"
+        );
+        assert!(
+            v.local_hits_for_test()[0]
+                .message
+                .text
+                .contains("Kubernetes")
+        );
+        assert!(v.local_hits_for_test()[0].semantic_score.is_some());
+    });
+
+    // Hybrid mode blends FTS5 + semantic via RRF.
+    view.update(cx, |v, cx| {
+        v.set_mode(SearchMode::Hybrid, cx);
+        v.run("kubernetes deployment".into(), cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.mode(), SearchMode::Hybrid);
+        assert_eq!(v.local_hits_for_test().len(), 1);
+        assert!(
+            v.local_hits_for_test()[0]
+                .message
+                .text
+                .contains("Kubernetes")
+        );
+    });
+
+    // Switching back to Keyword keeps standard FTS5 behavior cleanly.
+    view.update(cx, |v, cx| {
+        v.set_mode(SearchMode::Keyword, cx);
+        v.run("salad".into(), cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.mode(), SearchMode::Keyword);
+        assert_eq!(v.local_hits_for_test().len(), 1);
+        assert!(v.local_hits_for_test()[0].message.text.contains("salad"));
+    });
+}

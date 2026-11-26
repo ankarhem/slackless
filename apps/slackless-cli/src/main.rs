@@ -34,10 +34,13 @@ use crate::commands::auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
 use crate::commands::browse::{
     cmd_channels, cmd_digest, cmd_dms, cmd_revisions, cmd_threads, cmd_users,
 };
-use crate::commands::maintenance::{cmd_archive_status, cmd_stats, cmd_vacuum};
+use crate::commands::maintenance::{
+    cmd_archive_index_semantic, cmd_archive_semantic_model, cmd_archive_status, cmd_stats,
+    cmd_vacuum,
+};
 use crate::commands::messages::{
-    ExportCmdOpts, SearchAllOpts, cmd_export, cmd_read, cmd_search, cmd_search_all_workspaces,
-    cmd_thread,
+    ExportCmdOpts, SearchAllOpts, SemanticSearchCmdOpts, cmd_export, cmd_read, cmd_search,
+    cmd_search_all_workspaces, cmd_search_semantic, cmd_thread,
 };
 use crate::live::{HuddleJoinArgs, HuddleTranscriptsArgs};
 use crate::session::resolve_workspace;
@@ -84,6 +87,33 @@ async fn dispatch(
     workspace: Option<&TeamId>,
 ) -> Result<ExitCode> {
     match cli.command {
+        Commands::Search(args) if args.search_mode().uses_embeddings() => {
+            let mode = args.search_mode();
+            let sort = if args.sort == crate::cli::SearchSortArg::Recent {
+                // Semantic/hybrid defaults to Relevant unless user passed `--sort recent`?
+                // Keep explicit Relevant when mode uses embeddings and sort is default,
+                // wait: honor `args.sort` cleanly — let's default semantic/hybrid to Relevant
+                // unless caller explicitly needs chronological sorting.
+                slackless_core::store::SearchSort::Relevant
+            } else {
+                args.sort.into()
+            };
+            cmd_search_semantic(
+                ctx,
+                workspace,
+                &args.query,
+                SemanticSearchCmdOpts {
+                    mode,
+                    model: &args.model,
+                    all_workspaces: args.all_workspaces,
+                    limit: args.limit,
+                    sort,
+                    format: args.format,
+                    out: args.out.as_deref(),
+                    include_deleted: args.include_deleted,
+                },
+            )
+        }
         Commands::Search(args) if args.all_workspaces => cmd_search_all_workspaces(
             ctx,
             &args.query,
@@ -260,6 +290,12 @@ async fn dispatch(
                 .await
             }
             ArchiveCommand::Status => cmd_archive_status(ctx, workspace),
+            ArchiveCommand::IndexSemantic(args) => {
+                cmd_archive_index_semantic(ctx, workspace, *args).await
+            }
+            ArchiveCommand::SemanticModel { command } => {
+                cmd_archive_semantic_model(ctx, *command).await
+            }
         },
         Commands::Update(args) => {
             update::run_update(ctx, args.check, args.force, args.restart).await

@@ -12,6 +12,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use query::clear_cached_onnx_embedder;
 pub use query::{fixture_archive, fixture_archive_for};
 #[cfg(test)]
 pub use state::SearchScope;

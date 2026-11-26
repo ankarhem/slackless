@@ -31,6 +31,21 @@ pub fn archive_store_path(team_id: impl AsRef<str>) -> Option<PathBuf> {
     app_data_dir().map(|dir| dir.join(format!("{}.sqlite", team_id.as_ref())))
 }
 
+/// Filename stem reserved for the sidecar semantic vector index (`semantic_index.sqlite`).
+pub const SEMANTIC_INDEX_STEM: &str = "semantic_index";
+
+/// Dedicated sidecar SQLite vector index path (`<app_data_dir>/semantic_index.sqlite`), stored
+/// next to workspace archive databases without modifying their schema.
+pub fn semantic_index_path() -> Option<PathBuf> {
+    app_data_dir().map(|dir| dir.join(format!("{SEMANTIC_INDEX_STEM}.sqlite")))
+}
+
+/// Directory storing opt-in local ONNX sentence embedding models
+/// (`<app_data_dir>/models/embeddings`).
+pub fn semantic_models_dir() -> Option<PathBuf> {
+    app_data_dir().map(|dir| dir.join("models").join("embeddings"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

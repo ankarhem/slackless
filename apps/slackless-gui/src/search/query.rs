@@ -2,20 +2,76 @@
 //! and client-side channel / people / DM matching.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use gpui_kit::gpui::Context;
 use slackless_core::SharedStore;
 use slackless_core::api::SearchSort as ApiSearchSort;
+use slackless_core::embeddings::{
+    Embedder, EmbeddingModel, OnnxEmbedder, detect_embedding_model_setup,
+};
 use slackless_core::search::{
     WorkspaceSearchTarget, discover_local_archives, search_across_stores, search_disk_archives,
     search_huddle_transcripts_across_stores, search_huddle_transcripts_in_disk_archives,
 };
-use slackless_core::store::{SearchFilters, SearchQuery, SearchSort, Store};
+use slackless_core::semantic_index::{
+    hybrid_search_disk_archives, hybrid_search_huddle_transcripts_across_stores,
+    hybrid_search_huddle_transcripts_in_disk_archives, hybrid_search_stores, index_disk_archives,
+    index_store_documents, open_default_semantic_index, open_existing_semantic_index,
+};
+use slackless_core::store::{SearchFilters, SearchMode, SearchQuery, SearchSort, Store};
 use slackless_core::types::{Conversation, ConversationKind, TeamId, User};
 
 use super::state::{RESULT_LIMIT, SearchEvent, SearchScope, SearchSource, SearchTab, SearchView};
 use crate::fixtures::Fixtures;
+
+fn embedder_cache() -> &'static Mutex<Option<Arc<OnnxEmbedder>>> {
+    static CACHE: OnceLock<Mutex<Option<Arc<OnnxEmbedder>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Load (or reuse) the default local ONNX embedder. Stays 0 MB idle until first semantic use.
+pub(crate) fn load_or_get_onnx_embedder() -> Result<Arc<OnnxEmbedder>, String> {
+    let mut guard = embedder_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(cached) = guard.as_ref() {
+        return Ok(Arc::clone(cached));
+    }
+    let loaded = Arc::new(OnnxEmbedder::load_default(EmbeddingModel::default())?);
+    *guard = Some(Arc::clone(&loaded));
+    Ok(loaded)
+}
+
+/// Release the cached ONNX embedder (called when the user deletes the local embedding model).
+pub(crate) fn clear_cached_onnx_embedder() {
+    let mut guard = embedder_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    *guard = None;
+}
+
+enum ResolvedSemanticIndex {
+    Shared(Arc<Mutex<slackless_core::store::SemanticIndex>>),
+    Owned(slackless_core::store::SemanticIndex),
+}
+
+struct ResolvedSemanticBackend {
+    embedder: Arc<dyn Embedder>,
+    index: ResolvedSemanticIndex,
+}
+
+impl ResolvedSemanticBackend {
+    fn with_index<T>(&self, f: impl FnOnce(&slackless_core::store::SemanticIndex) -> T) -> T {
+        match &self.index {
+            ResolvedSemanticIndex::Shared(shared) => {
+                let guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                f(&guard)
+            }
+            ResolvedSemanticIndex::Owned(owned) => f(owned),
+        }
+    }
+}
 
 impl SearchView {
     /// Search messages for `query` (local FTS5 instant by default).
@@ -128,20 +184,118 @@ impl SearchView {
             }
         };
         let sort = self.sort;
+        let mode = self.mode;
         let query = self.query.clone();
+        let embedder_override = self.semantic_embedder_override.clone();
+        let index_override = self.semantic_index_override.clone();
         cx.spawn(async move |this, cx| {
-            let (found, transcripts) = cx
+            let (found, transcripts, model_missing, index_empty) = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut msgs_res = search_across_stores(&targets, &parsed, sort, RESULT_LIMIT)
-                        .map(|r| r.hits)
-                        .map_err(|e| e.to_string());
-                    let mut trs = search_huddle_transcripts_across_stores(
-                        &targets,
-                        &query,
-                        None,
-                        RESULT_LIMIT,
-                    );
+                    let mut model_missing = false;
+                    let mut index_empty = false;
+
+                    // Resolve semantic backend when Hybrid or Semantic mode is active.
+                    let semantic_backend: Option<ResolvedSemanticBackend> = if mode
+                        .uses_embeddings()
+                    {
+                        if let (Some(emb), Some(idx)) = (embedder_override, index_override) {
+                            let is_empty = idx
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.stats().ok())
+                                .is_some_and(|st| st.total_docs == 0);
+                            index_empty = is_empty;
+                            Some(ResolvedSemanticBackend {
+                                embedder: emb,
+                                index: ResolvedSemanticIndex::Shared(idx),
+                            })
+                        } else {
+                            let setup = detect_embedding_model_setup(EmbeddingModel::default());
+                            if !setup.model_ready {
+                                model_missing = true;
+                                None
+                            } else {
+                                match open_existing_semantic_index() {
+                                    Ok(Some(idx)) => {
+                                        let empty =
+                                            idx.stats().map(|s| s.total_docs == 0).unwrap_or(true);
+                                        if empty {
+                                            index_empty = true;
+                                            None
+                                        } else {
+                                            match load_or_get_onnx_embedder() {
+                                                Ok(emb) => Some(ResolvedSemanticBackend {
+                                                    embedder: emb as Arc<dyn Embedder>,
+                                                    index: ResolvedSemanticIndex::Owned(idx),
+                                                }),
+                                                Err(_) => {
+                                                    model_missing = true;
+                                                    None
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(None) | Err(_) => {
+                                        index_empty = true;
+                                        None
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Effective search execution: full semantic/hybrid when ready, else instant
+                    // FTS5 fallback for Keyword/Hybrid (and empty hits for pure Semantic when missing).
+                    if mode == SearchMode::Semantic && semantic_backend.is_none() {
+                        return (Ok(Vec::new()), Vec::new(), model_missing, index_empty);
+                    }
+
+                    let (mut msgs_res, mut trs) = if let Some(ref backend) = semantic_backend {
+                        let effective_sort = if sort == SearchSort::Recent && mode.uses_embeddings()
+                        {
+                            SearchSort::Relevant
+                        } else {
+                            sort
+                        };
+                        backend.with_index(|idx| {
+                            let m = hybrid_search_stores(
+                                &targets,
+                                idx,
+                                backend.embedder.as_ref(),
+                                &parsed,
+                                mode,
+                                effective_sort,
+                                RESULT_LIMIT,
+                            )
+                            .map(|r| r.hits);
+                            let t = hybrid_search_huddle_transcripts_across_stores(
+                                &targets,
+                                idx,
+                                backend.embedder.as_ref(),
+                                &query,
+                                None,
+                                mode,
+                                RESULT_LIMIT,
+                            )
+                            .unwrap_or_default();
+                            (m, t)
+                        })
+                    } else {
+                        let m = search_across_stores(&targets, &parsed, sort, RESULT_LIMIT)
+                            .map(|r| r.hits)
+                            .map_err(|e| e.to_string());
+                        let t = search_huddle_transcripts_across_stores(
+                            &targets,
+                            &query,
+                            None,
+                            RESULT_LIMIT,
+                        );
+                        (m, t)
+                    };
+
                     // In live cross-workspace search, also pick up any additional stored `.sqlite`
                     // archives on disk that are not currently mounted as active/parked bridges.
                     if scope == SearchScope::AllWorkspaces && !is_sample {
@@ -152,32 +306,68 @@ impl SearchView {
                             .filter(|(ws, _)| !mounted.contains(ws))
                             .collect();
                         if !extra.is_empty() {
-                            if let Ok(ref mut hits) = msgs_res
-                                && let Ok(disk_res) =
-                                    search_disk_archives(&extra, &parsed, sort, RESULT_LIMIT)
+                            let (disk_msgs, disk_trs) = if let Some(ref backend) = semantic_backend
                             {
-                                hits.extend(disk_res.hits);
-                                match sort {
-                                    SearchSort::Recent => {
-                                        hits.sort_by(|a, b| b.message.ts.cmp(&a.message.ts));
-                                    }
-                                    SearchSort::Relevant => {
-                                        hits.sort_by(|a, b| {
-                                            let ra = a.rank.unwrap_or(f64::INFINITY);
-                                            let rb = b.rank.unwrap_or(f64::INFINITY);
-                                            ra.total_cmp(&rb)
-                                                .then_with(|| b.message.ts.cmp(&a.message.ts))
-                                        });
-                                    }
+                                let effective_sort =
+                                    if sort == SearchSort::Recent && mode.uses_embeddings() {
+                                        SearchSort::Relevant
+                                    } else {
+                                        sort
+                                    };
+                                backend.with_index(|idx| {
+                                    let dm = hybrid_search_disk_archives(
+                                        &extra,
+                                        idx,
+                                        backend.embedder.as_ref(),
+                                        &parsed,
+                                        mode,
+                                        effective_sort,
+                                        RESULT_LIMIT,
+                                    )
+                                    .ok()
+                                    .map(|r| r.hits);
+                                    let dt = hybrid_search_huddle_transcripts_in_disk_archives(
+                                        &extra,
+                                        idx,
+                                        backend.embedder.as_ref(),
+                                        &query,
+                                        None,
+                                        mode,
+                                        RESULT_LIMIT,
+                                    )
+                                    .unwrap_or_default();
+                                    (dm, dt)
+                                })
+                            } else {
+                                (
+                                    search_disk_archives(&extra, &parsed, sort, RESULT_LIMIT)
+                                        .ok()
+                                        .map(|r| r.hits),
+                                    search_huddle_transcripts_in_disk_archives(
+                                        &extra,
+                                        &query,
+                                        None,
+                                        RESULT_LIMIT,
+                                    ),
+                                )
+                            };
+
+                            if let Ok(ref mut hits) = msgs_res
+                                && let Some(extra_hits) = disk_msgs
+                            {
+                                hits.extend(extra_hits);
+                                if mode.uses_embeddings() || sort == SearchSort::Relevant {
+                                    hits.sort_by(|a, b| {
+                                        let ra = a.rank.unwrap_or(f64::INFINITY);
+                                        let rb = b.rank.unwrap_or(f64::INFINITY);
+                                        ra.total_cmp(&rb)
+                                            .then_with(|| b.message.ts.cmp(&a.message.ts))
+                                    });
+                                } else {
+                                    hits.sort_by(|a, b| b.message.ts.cmp(&a.message.ts));
                                 }
                                 hits.truncate(RESULT_LIMIT);
                             }
-                            let disk_trs = search_huddle_transcripts_in_disk_archives(
-                                &extra,
-                                &query,
-                                None,
-                                RESULT_LIMIT,
-                            );
                             if !disk_trs.is_empty() {
                                 trs.extend(disk_trs);
                                 trs.sort_by(|a, b| {
@@ -190,17 +380,120 @@ impl SearchView {
                             }
                         }
                     }
-                    (msgs_res, trs)
+                    (msgs_res, trs, model_missing, index_empty)
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if view.local_gen != generation {
                     return;
                 }
+                view.semantic_model_missing = model_missing;
+                view.semantic_index_empty = index_empty;
                 view.transcript_results = transcripts;
                 match found {
                     Ok(results) => view.local_results = results,
                     Err(e) => view.local_error = Some(e),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Incrementally index mounted stores and local disk archives into `semantic_index.sqlite`
+    /// in the background, then re-run the active search query.
+    pub(super) fn start_semantic_indexing(&mut self, cx: &mut Context<Self>) {
+        if self.semantic_indexing {
+            return;
+        }
+        self.semantic_indexing = true;
+        self.semantic_status_note = Some("Indexing local archive for semantic search…".to_owned());
+        cx.notify();
+
+        let mounted_targets: Vec<(TeamId, SharedStore)> = if self.workspace_sources.is_empty() {
+            self.archive
+                .clone()
+                .map(|s| vec![(self.workspace.clone(), s)])
+                .unwrap_or_default()
+        } else {
+            self.workspace_sources
+                .iter()
+                .map(|src| (src.team_id.clone(), src.store.clone()))
+                .collect()
+        };
+        let is_sample = self.fixtures.sample;
+        let embedder_override = self.semantic_embedder_override.clone();
+        let index_override = self.semantic_index_override.clone();
+
+        cx.spawn(async move |this, cx| {
+            let outcome: Result<String, String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let embedder: Arc<dyn Embedder> = match embedder_override {
+                        Some(emb) => emb,
+                        None => load_or_get_onnx_embedder()? as Arc<dyn Embedder>,
+                    };
+                    let mut embedded_total = 0usize;
+                    let mut skipped_total = 0usize;
+
+                    let mut run_index = |idx: &mut slackless_core::store::SemanticIndex| -> Result<(), String> {
+                        let mut seen = HashSet::new();
+                        for (ws, shared) in &mounted_targets {
+                            if !seen.insert(ws.clone()) {
+                                continue;
+                            }
+                            let store = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                            let rep = index_store_documents(
+                                &store,
+                                idx,
+                                embedder.as_ref(),
+                                Some(ws),
+                                |_| {},
+                            )?;
+                            embedded_total += rep.embedded;
+                            skipped_total += rep.skipped_unchanged;
+                        }
+                        if !is_sample {
+                            let extra: Vec<_> = discover_local_archives()
+                                .into_iter()
+                                .filter(|(ws, _)| !seen.contains(ws))
+                                .collect();
+                            if !extra.is_empty() {
+                                let rep =
+                                    index_disk_archives(&extra, idx, embedder.as_ref(), |_| {})?;
+                                embedded_total += rep.embedded;
+                                skipped_total += rep.skipped_unchanged;
+                            }
+                        }
+                        Ok(())
+                    };
+
+                    if let Some(shared_idx) = index_override {
+                        let mut guard = shared_idx.lock().unwrap_or_else(PoisonError::into_inner);
+                        run_index(&mut guard)?;
+                    } else {
+                        let mut idx = open_default_semantic_index()?;
+                        run_index(&mut idx)?;
+                    }
+                    Ok(format!(
+                        "Semantic index ready ({embedded_total} embedded, {skipped_total} unchanged)."
+                    ))
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                view.semantic_indexing = false;
+                match outcome {
+                    Ok(note) => {
+                        view.semantic_index_empty = false;
+                        view.semantic_status_note = Some(note);
+                        if !view.query.is_empty() {
+                            view.run_local(cx);
+                        }
+                    }
+                    Err(err) => {
+                        view.semantic_status_note = Some(format!("Indexing failed: {err}"));
+                    }
                 }
                 cx.notify();
             });

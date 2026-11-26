@@ -9693,6 +9693,7 @@ version = "0.1.0"
 dependencies = [
  "dirs 7.0.0",
  "futures",
+ "ort",
  "reqwest",
  "serde",
  "serde_json",
@@ -9813,6 +9814,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "rusqlite",
+ "serde",
  "serde_json",
  "slackless-types",
  "thiserror 2.0.21",

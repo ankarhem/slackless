@@ -1,15 +1,25 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
+use slackless_core::embeddings::{
+    Embedder, EmbeddingModel, OnnxEmbedder, delete_embedding_model, detect_embedding_model_setup,
+    download_embedding_model_async,
+};
 use slackless_core::read_synced_spans;
+use slackless_core::semantic_index::{
+    SemanticIndexReport, default_semantic_index_stats, index_disk_archives,
+    open_default_semantic_index,
+};
+use slackless_core::store::SemanticIndex;
 use slackless_core::types::time::format_bytes;
 use slackless_core::types::{ChannelId, TeamId};
 
-use super::{archive_hint, empty_local};
+use super::{all_workspace_ids, archive_hint, empty_local};
 use crate::archive::{self, Archive, format_channel_name};
-use crate::{Ctx, output};
+use crate::cli::{ArchiveIndexSemanticArgs, SemanticModelCommand};
+use crate::{Ctx, fail, output};
 
 /// Parameters for formatting archive stats in human-readable form.
 pub(crate) struct StatsSummary<'a> {
@@ -366,4 +376,298 @@ pub(crate) fn build_archive_status_report(
         "channels": rows,
     });
     Ok((json, human))
+}
+
+/// `archive semantic-model status | download | delete`.
+pub(crate) async fn cmd_archive_semantic_model(
+    ctx: &Ctx,
+    command: SemanticModelCommand,
+) -> Result<ExitCode> {
+    match command {
+        SemanticModelCommand::Status { model } => emit_semantic_model_status(ctx, &model),
+        SemanticModelCommand::Download { model } => {
+            let Some(parsed) = EmbeddingModel::parse(&model) else {
+                return Ok(fail(
+                    ctx,
+                    "invalid_model",
+                    &format!("unknown embedding model '{model}'; expected 'minilm' or 'bge-small'"),
+                ));
+            };
+            let json_mode = ctx.json;
+            let dir = download_embedding_model_async(parsed, move |p| {
+                if !json_mode {
+                    let pct = p
+                        .total_bytes
+                        .filter(|&t| t > 0)
+                        .map(|t| format!(" ({}%)", (p.downloaded_bytes * 100 / t).min(100)))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[{}/{}] {} {}{}",
+                        p.file_index,
+                        p.file_count,
+                        p.file_name,
+                        format_bytes(p.downloaded_bytes),
+                        pct
+                    );
+                }
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("downloading embedding model: {e}"))?;
+            let status = detect_embedding_model_setup(parsed);
+            let human = format!(
+                "Downloaded {} to {} ({})\n",
+                parsed.slug(),
+                dir.display(),
+                format_bytes(status.disk_bytes)
+            );
+            output::emit(
+                ctx.json,
+                &serde_json::json!({
+                    "ok": true,
+                    "model": parsed.slug(),
+                    "model_ready": status.model_ready,
+                    "model_path": status.model_path.display().to_string(),
+                    "disk_bytes": status.disk_bytes,
+                    "dims": status.dims,
+                }),
+                &human,
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        SemanticModelCommand::Delete { model } => {
+            let Some(parsed) = EmbeddingModel::parse(&model) else {
+                return Ok(fail(
+                    ctx,
+                    "invalid_model",
+                    &format!("unknown embedding model '{model}'; expected 'minilm' or 'bge-small'"),
+                ));
+            };
+            let reclaimed = delete_embedding_model(parsed)
+                .map_err(|e| anyhow::anyhow!("deleting embedding model: {e}"))?;
+            let human = format!(
+                "Removed {} (reclaimed {})\n",
+                parsed.slug(),
+                format_bytes(reclaimed)
+            );
+            output::emit(
+                ctx.json,
+                &serde_json::json!({
+                    "ok": true,
+                    "model": parsed.slug(),
+                    "reclaimed_bytes": reclaimed,
+                }),
+                &human,
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+fn emit_semantic_model_status(ctx: &Ctx, model_arg: &str) -> Result<ExitCode> {
+    let Some(model) = EmbeddingModel::parse(model_arg) else {
+        return Ok(fail(
+            ctx,
+            "invalid_model",
+            &format!("unknown embedding model '{model_arg}'; expected 'minilm' or 'bge-small'"),
+        ));
+    };
+    let setup = detect_embedding_model_setup(model);
+    let idx_stats = default_semantic_index_stats();
+    let idx_path = slackless_core::paths::semantic_index_path();
+    let human = format!(
+        "Model:\t\t{} ({})\nModel path:\t{} ({})\nIndex path:\t{} ({})\nIndexed docs:\t{} total ({} messages, {} snippets, {} canvases, {} file transcripts, {} huddle transcripts)\nWorkspaces:\t{}\n",
+        model.slug(),
+        if setup.model_ready {
+            "ready"
+        } else {
+            "not downloaded"
+        },
+        setup.model_path.display(),
+        if setup.model_ready {
+            format_bytes(setup.disk_bytes)
+        } else {
+            setup.download_size_hint.clone()
+        },
+        idx_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unknown)".to_owned()),
+        format_bytes(idx_stats.db_bytes),
+        idx_stats.total_docs,
+        idx_stats.messages,
+        idx_stats.snippets,
+        idx_stats.canvases,
+        idx_stats.file_transcripts,
+        idx_stats.huddle_transcripts,
+        idx_stats.workspaces,
+    );
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "model": model.slug(),
+            "model_ready": setup.model_ready,
+            "model_path": setup.model_path.display().to_string(),
+            "model_bytes": setup.disk_bytes,
+            "download_size_hint": setup.download_size_hint,
+            "dims": setup.dims,
+            "index_path": idx_path.as_ref().map(|p| p.display().to_string()),
+            "index": idx_stats,
+        }),
+        &human,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `archive index-semantic`: incrementally embed messages, snippets, canvases, and transcripts
+/// into `semantic_index.sqlite`.
+pub(crate) async fn cmd_archive_index_semantic(
+    ctx: &Ctx,
+    workspace: Option<&TeamId>,
+    args: ArchiveIndexSemanticArgs,
+) -> Result<ExitCode> {
+    if args.status {
+        return emit_semantic_model_status(ctx, &args.model);
+    }
+    let Some(model) = EmbeddingModel::parse(&args.model) else {
+        return Ok(fail(
+            ctx,
+            "invalid_model",
+            &format!(
+                "unknown embedding model '{}'; expected 'minilm' or 'bge-small'",
+                args.model
+            ),
+        ));
+    };
+
+    let mut setup = detect_embedding_model_setup(model);
+    if !setup.model_ready {
+        if args.download {
+            let json_mode = ctx.json;
+            download_embedding_model_async(model, move |p| {
+                if !json_mode {
+                    let pct = p
+                        .total_bytes
+                        .filter(|&t| t > 0)
+                        .map(|t| format!(" ({}%)", (p.downloaded_bytes * 100 / t).min(100)))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[{}/{}] {} {}{}",
+                        p.file_index,
+                        p.file_count,
+                        p.file_name,
+                        format_bytes(p.downloaded_bytes),
+                        pct
+                    );
+                }
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("downloading embedding model: {e}"))?;
+            setup = detect_embedding_model_setup(model);
+        } else {
+            return Ok(fail(
+                ctx,
+                "semantic_model_missing",
+                &format!(
+                    "local embedding model {} is not downloaded ({}). Re-run with `--download` or run `slackless archive semantic-model download --model {}`.",
+                    model.slug(),
+                    setup.download_size_hint,
+                    model.slug()
+                ),
+            ));
+        }
+    }
+
+    let archives: Vec<(TeamId, PathBuf)> = if args.single_workspace {
+        let Some(ws) = workspace else {
+            return Ok(empty_local(
+                ctx,
+                serde_json::json!({"ok": false, "reason": "no_workspace"}),
+                "indexing semantic vectors",
+            ));
+        };
+        archive::store_path(ws)
+            .filter(|p| p.is_file())
+            .map(|p| vec![(ws.clone(), p)])
+            .unwrap_or_default()
+    } else {
+        all_workspace_ids()
+            .into_iter()
+            .filter_map(|ws| archive::store_path(&ws).map(|p| (ws, p)))
+            .collect()
+    };
+
+    if archives.is_empty() {
+        return Ok(empty_local(
+            ctx,
+            serde_json::json!({
+                "ok": true,
+                "workspaces_indexed": [],
+                "total_seen": 0,
+                "embedded": 0,
+                "skipped_unchanged": 0,
+                "pruned": 0,
+            }),
+            "indexing semantic vectors",
+        ));
+    }
+
+    let mut index = open_default_semantic_index().map_err(|e| anyhow::anyhow!("{e}"))?;
+    if args.rebuild {
+        index
+            .clear()
+            .context("clearing semantic_index.sqlite before rebuild")?;
+    }
+    let embedder = OnnxEmbedder::load_from_dir(model, &setup.model_path)
+        .map_err(|e| anyhow::anyhow!("loading ONNX embedding model: {e}"))?;
+    let report = index_semantic_archives_with_embedder(ctx, &archives, &mut index, &embedder)?;
+    emit_semantic_index_report(ctx, &report, &index)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+pub(crate) fn index_semantic_archives_with_embedder(
+    ctx: &Ctx,
+    archives: &[(TeamId, PathBuf)],
+    index: &mut SemanticIndex,
+    embedder: &dyn Embedder,
+) -> Result<SemanticIndexReport> {
+    let json_mode = ctx.json;
+    index_disk_archives(archives, index, embedder, |prog| {
+        if !json_mode && prog.total > 0 {
+            eprintln!(
+                "Indexing {} ({}/{} docs; {} embedded, {} unchanged)",
+                prog.workspace, prog.processed, prog.total, prog.embedded, prog.skipped
+            );
+        }
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn emit_semantic_index_report(
+    ctx: &Ctx,
+    report: &SemanticIndexReport,
+    index: &SemanticIndex,
+) -> Result<()> {
+    let stats = index.stats().context("reading semantic index stats")?;
+    let human = format!(
+        "Indexed {} workspace(s) with {} ({} dims)\nDocuments:\t{} seen ({} embedded, {} skipped unchanged, {} pruned)\nTotal indexed:\t{} ({})\n",
+        report.workspaces_indexed.len(),
+        report.model_id,
+        report.dims,
+        report.total_seen,
+        report.embedded,
+        report.skipped_unchanged,
+        report.pruned,
+        stats.total_docs,
+        format_bytes(stats.db_bytes),
+    );
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "ok": true,
+            "report": report,
+            "index": stats,
+        }),
+        &human,
+    );
+    Ok(())
 }
