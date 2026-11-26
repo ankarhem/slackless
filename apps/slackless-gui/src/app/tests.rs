@@ -411,6 +411,31 @@ fn channel_cache_drops_the_least_recently_loaded_channel() {
     assert!((2..=CHANNEL_CACHE_MAX).all(|ix| cache.contains_key(&channel(ix))));
 }
 
+#[test]
+fn parsed_documents_are_dropped_past_the_document_cache_bound() {
+    let mut ws = WorkspaceState::default();
+    let file = |ix: usize| format!("F{ix}");
+    for ix in 0..=DOC_CACHE_MAX {
+        ws.canvases.insert(file(ix), Err(String::new()));
+        ws.canvas_comments.insert(file(ix), Vec::new());
+        ws.lists.insert(file(ix), Err(String::new()));
+        ws.app_homes
+            .insert(ChannelId::from(file(ix)), Err(String::new()));
+    }
+    let oldest = file(0);
+    assert!(!ws.canvases.contains_key(&oldest), "canvases stay bounded");
+    assert!(
+        !ws.canvas_comments.contains_key(&oldest),
+        "comments stay bounded"
+    );
+    assert!(!ws.lists.contains_key(&oldest), "lists stay bounded");
+    assert!(
+        !ws.app_homes.contains_key(&ChannelId::from(oldest)),
+        "App Homes stay bounded"
+    );
+    assert!(ws.canvases.contains_key(&file(DOC_CACHE_MAX)));
+}
+
 #[gpui::test]
 fn mouse_back_and_forward_navigate_across_channels_and_pages(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| {

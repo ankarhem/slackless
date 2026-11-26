@@ -453,15 +453,24 @@ struct WorkspaceViews {
 /// past it the least recently loaded channel is dropped, fetched again when one of its
 /// surfaces next opens.
 const CHANNEL_CACHE_MAX: usize = 32;
+/// Documents a workspace keeps parsed (canvases with their comments and details, Lists, App
+/// Homes): heavier than a channel's lists, so fewer; one dropped loads again when it reopens.
+const DOC_CACHE_MAX: usize = 8;
 
-/// A per-channel cache bounded to the [`CHANNEL_CACHE_MAX`] most recently loaded channels.
-pub(super) struct ChannelCache<V> {
-    entries: HashMap<ChannelId, V>,
-    /// The cached channels, least recently loaded first.
-    lru: Vec<ChannelId>,
+/// A cache bounded to its `CAP` most recently loaded keys.
+pub(super) struct RecentCache<K, V, const CAP: usize> {
+    entries: HashMap<K, V>,
+    /// The cached keys, least recently loaded first.
+    lru: Vec<K>,
 }
 
-impl<V> Default for ChannelCache<V> {
+/// A per-channel cache bounded to the [`CHANNEL_CACHE_MAX`] most recently loaded channels.
+pub(super) type ChannelCache<V> = RecentCache<ChannelId, V, CHANNEL_CACHE_MAX>;
+
+/// A per-document cache bounded to the [`DOC_CACHE_MAX`] most recently loaded documents.
+pub(super) type DocCache<K, V> = RecentCache<K, V, DOC_CACHE_MAX>;
+
+impl<K, V, const CAP: usize> Default for RecentCache<K, V, CAP> {
     fn default() -> Self {
         Self {
             entries: HashMap::new(),
@@ -470,30 +479,51 @@ impl<V> Default for ChannelCache<V> {
     }
 }
 
-impl<V> ChannelCache<V> {
-    fn get(&self, channel: &ChannelId) -> Option<&V> {
-        self.entries.get(channel)
+impl<K: Clone + Eq + std::hash::Hash, V, const CAP: usize> RecentCache<K, V, CAP> {
+    fn get<Q: std::hash::Hash + Eq + ?Sized>(&self, key: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        self.entries.get(key)
     }
 
-    fn contains_key(&self, channel: &ChannelId) -> bool {
-        self.entries.contains_key(channel)
+    fn get_mut<Q: std::hash::Hash + Eq + ?Sized>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        self.entries.get_mut(key)
     }
 
-    /// Keep `channel`'s freshly loaded `value` as the most recent entry, dropping the least
-    /// recently loaded channel past [`CHANNEL_CACHE_MAX`].
-    fn insert(&mut self, channel: ChannelId, value: V) {
-        self.lru.retain(|known| *known != channel);
-        self.lru.push(channel.clone());
-        self.entries.insert(channel, value);
-        while self.lru.len() > CHANNEL_CACHE_MAX {
+    fn contains_key<Q: std::hash::Hash + Eq + ?Sized>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        self.entries.contains_key(key)
+    }
+
+    /// Keep `key`'s freshly loaded `value` as the most recent entry, dropping the least
+    /// recently loaded key past `CAP`.
+    fn insert(&mut self, key: K, value: V) {
+        self.lru.retain(|known| *known != key);
+        self.lru.push(key.clone());
+        self.entries.insert(key, value);
+        while self.lru.len() > CAP {
             let oldest = self.lru.remove(0);
             self.entries.remove(&oldest);
         }
     }
 
-    fn remove(&mut self, channel: &ChannelId) {
-        self.lru.retain(|known| known != channel);
-        self.entries.remove(channel);
+    fn remove<Q: std::hash::Hash + Eq + ?Sized>(&mut self, key: &Q)
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        self.lru
+            .retain(|known| std::borrow::Borrow::<Q>::borrow(known) != key);
+        self.entries.remove(key);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.entries.iter()
     }
 
     fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
@@ -565,11 +595,11 @@ pub(super) struct WorkspaceState {
     /// time Files & links opens.
     pub(super) files: ChannelCache<Loaded<File>>,
     /// Live mode: parsed read-only canvases keyed by file id (`files.info` -> `url_private`, `F-COLLAB-125`).
-    pub(super) canvases: HashMap<String, Result<crate::canvas::CanvasDoc, String>>,
+    pub(super) canvases: DocCache<String, Result<crate::canvas::CanvasDoc, String>>,
     /// Live mode: parsed `CanvasMeta` keyed by file id (`Event::CanvasMetaLoaded`).
-    pub(super) canvas_metas: HashMap<String, slackless_core::api::CanvasMeta>,
+    pub(super) canvas_metas: DocCache<String, slackless_core::api::CanvasMeta>,
     /// Live mode: threaded comments keyed by canvas file id (`Event::CanvasCommentsLoaded`).
-    pub(super) canvas_comments: HashMap<String, Vec<slackless_core::api::CanvasCommentThread>>,
+    pub(super) canvas_comments: DocCache<String, Vec<slackless_core::api::CanvasCommentThread>>,
     /// Live mode: inline status or error banner per canvas id (`(is_error, message)`).
     pub(super) canvas_status: HashMap<String, (bool, String)>,
     /// Live mode: "Canvas updated" notice per canvas id (`F-COLLAB-185`).
@@ -577,11 +607,11 @@ pub(super) struct WorkspaceState {
     /// File id of the live canvas currently displayed in `ConversationTab::Canvas`.
     pub(super) active_canvas: Option<String>,
     /// Live mode: parsed read-only Slack Lists keyed by file id (`files.info` + `lists.records.list`).
-    pub(super) lists: HashMap<String, Result<slackless_core::api::SlackListData, String>>,
+    pub(super) lists: DocCache<String, Result<slackless_core::api::SlackListData, String>>,
     /// File id of the live Slack List currently displayed in `ConversationTab::List`.
     pub(super) active_list: Option<String>,
     /// Live mode: per app DM channel, its App Home metadata and Block Kit view (`F-COLLAB-480`).
-    pub(super) app_homes: HashMap<ChannelId, Result<slackless_core::api::AppHomeResponse, String>>,
+    pub(super) app_homes: DocCache<ChannelId, Result<slackless_core::api::AppHomeResponse, String>>,
     /// Deduplicates `subscriptions.thread.mark` calls: last cursor sent per `(channel, thread_ts)`.
     pub(super) marked_threads: HashMap<(ChannelId, Ts), Ts>,
     /// Live archive backfill progress snapshot for this workspace (`Event::BackfillProgress`).
