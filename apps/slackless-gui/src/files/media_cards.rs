@@ -6,8 +6,9 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, Div, FontWeight, Global, ImageSource, InteractiveElement as _, MouseButton, ObjectFit,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
+    AnyElement, App, Div, FontWeight, Global, ImageSource, ImgResourceLoader,
+    InteractiveElement as _, IntoElement, MouseButton, ObjectFit, ParentElement as _, RenderOnce,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use slackless_core::types::{File, FileId};
 
@@ -16,9 +17,9 @@ use crate::image_viewer::{ImageClick, ImageOrigin};
 
 use super::gallery::download_button;
 use super::meta::{
-    CARD_W, audio_wave_bars, clip_vtt_url, download_url, file_ext, file_name, fit, format_duration,
-    human_size, inline_clip_transcript, media_duration_ms, parse_webvtt, video_playback_url,
-    video_poster_url,
+    CARD_W, audio_wave_bars, clip_vtt_url, download_url, file_ext, file_name, format_duration,
+    human_size, inline_clip_transcript, media_duration_ms, parse_webvtt,
+    resolve_video_preview_size, video_dimensions, video_playback_url, video_poster_url,
 };
 
 /// Cached clip transcript state (`F-CORE-129`), stored globally so expanded transcripts
@@ -31,6 +32,15 @@ struct ClipTranscriptState {
     error: Option<String>,
 }
 
+/// Snapshot of a file's cached WebVTT transcript fetch status shared between inline clip cards
+/// and [`crate::image_viewer::ImageViewer`].
+#[derive(Clone, Default)]
+pub(crate) struct ClipTranscriptStatus {
+    pub loading: bool,
+    pub text: Option<String>,
+    pub error: Option<String>,
+}
+
 #[derive(Default)]
 struct ClipTranscriptStore {
     entries: HashMap<FileId, ClipTranscriptState>,
@@ -38,8 +48,89 @@ struct ClipTranscriptStore {
 
 impl Global for ClipTranscriptStore {}
 
-/// Expandable clip transcript pill + transcript panel (`F-CORE-129`).
-fn clip_transcript_section(fixtures: &Fixtures, file: &File, cx: &App) -> Option<Div> {
+#[cfg(test)]
+pub(crate) fn set_clip_transcript_expanded(file_id: FileId, expanded: bool, cx: &mut App) {
+    cx.default_global::<ClipTranscriptStore>()
+        .entries
+        .entry(file_id)
+        .or_default()
+        .expanded = expanded;
+}
+
+/// Read the cached WebVTT transcript fetch status for `file_id`.
+pub(crate) fn clip_transcript_status(file_id: &FileId, cx: &App) -> ClipTranscriptStatus {
+    cx.try_global::<ClipTranscriptStore>()
+        .and_then(|store| store.entries.get(file_id))
+        .map(|entry| ClipTranscriptStatus {
+            loading: entry.loading,
+            text: entry.text.clone(),
+            error: entry.error.clone(),
+        })
+        .unwrap_or_default()
+}
+
+/// Lazily fetch and cache a Slack clip's WebVTT transcript if not already loaded or in flight.
+pub(crate) fn fetch_clip_vtt_if_needed(
+    file_id: FileId,
+    vtt_url: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let should_fetch = {
+        let store = cx.default_global::<ClipTranscriptStore>();
+        let entry = store.entries.entry(file_id.clone()).or_default();
+        if entry.text.is_none() && !entry.loading {
+            entry.loading = true;
+            entry.error = None;
+            true
+        } else {
+            false
+        }
+    };
+    if !should_fetch {
+        return;
+    }
+    window.refresh();
+    let Some(fut) = crate::media::fetch(vtt_url, cx) else {
+        let store = cx.default_global::<ClipTranscriptStore>();
+        let entry = store.entries.entry(file_id).or_default();
+        entry.loading = false;
+        entry.error = Some("Transcript requires a signed-in workspace.".to_owned());
+        window.refresh();
+        return;
+    };
+    let win = window.window_handle();
+    cx.spawn(async move |cx| {
+        let res = fut.await;
+        cx.update(|cx| {
+            let store = cx.default_global::<ClipTranscriptStore>();
+            let entry = store.entries.entry(file_id).or_default();
+            entry.loading = false;
+            match res {
+                Ok(bytes) => {
+                    let raw = String::from_utf8_lossy(&bytes);
+                    let parsed = parse_webvtt(&raw);
+                    entry.text = Some(if parsed.is_empty() {
+                        raw.trim().to_owned()
+                    } else {
+                        parsed
+                    });
+                }
+                Err(err) => entry.error = Some(err),
+            }
+            let _ = win.update(cx, |_, window, _| window.refresh());
+        });
+    })
+    .detach();
+}
+
+/// Expandable clip transcript pill + selectable transcript panel (`F-CORE-129`).
+fn clip_transcript_section(
+    fixtures: &Fixtures,
+    file: &File,
+    order_base: u64,
+    cx: &App,
+) -> Option<Div> {
     let stored = fixtures.file_transcript(&file.id).map(str::to_owned);
     let inline = stored.or_else(|| inline_clip_transcript(file));
     let vtt_url = clip_vtt_url(file);
@@ -90,54 +181,47 @@ fn clip_transcript_section(fixtures: &Fixtures, file: &File, cx: &App) -> Option
                         "Transcript"
                     })
                     .on_click(move |_, window, cx| {
-                        let store = cx.default_global::<ClipTranscriptStore>();
-                        let entry = store.entries.entry(click_id.clone()).or_default();
-                        entry.expanded = !entry.expanded;
-                        let should_fetch = entry.expanded
-                            && !has_text
-                            && entry.text.is_none()
-                            && !entry.loading
-                            && click_vtt.is_some();
-                        if should_fetch {
-                            entry.loading = true;
-                            entry.error = None;
-                        }
+                        let expanded_now = {
+                            let store = cx.default_global::<ClipTranscriptStore>();
+                            let entry = store.entries.entry(click_id.clone()).or_default();
+                            entry.expanded = !entry.expanded;
+                            entry.expanded
+                        };
                         window.refresh();
-                        if should_fetch
-                            && let (Some(url), Some(fut)) = (
-                                click_vtt.clone(),
-                                click_vtt.clone().and_then(|u| crate::media::fetch(u, cx)),
-                            )
+                        if expanded_now
+                            && !has_text
+                            && let Some(url) = click_vtt.clone()
                         {
-                            let _ = url;
-                            let fid = click_id.clone();
-                            let win = window.window_handle();
-                            cx.spawn(async move |cx| {
-                                let res = fut.await;
-                                cx.update(|cx| {
-                                    let store = cx.default_global::<ClipTranscriptStore>();
-                                    let entry = store.entries.entry(fid).or_default();
-                                    entry.loading = false;
-                                    match res {
-                                        Ok(bytes) => {
-                                            let raw = String::from_utf8_lossy(&bytes);
-                                            let parsed = parse_webvtt(&raw);
-                                            entry.text = Some(if parsed.is_empty() {
-                                                raw.trim().to_owned()
-                                            } else {
-                                                parsed
-                                            });
-                                        }
-                                        Err(err) => entry.error = Some(err),
-                                    }
-                                    let _ = win.update(cx, |_, window, _| window.refresh());
-                                });
-                            })
-                            .detach();
+                            fetch_clip_vtt_if_needed(click_id.clone(), url, window, cx);
                         }
                     }),
             )
             .when(expanded, |col| {
+                let transcript_body: AnyElement = if state.loading {
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child("Loading transcript\u{2026}")
+                        .into_any_element()
+                } else if let Some(err) = state.error {
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("Could not load transcript: {err}"))
+                        .into_any_element()
+                } else if let Some(text) = body_text {
+                    crate::messages::selectable_text(
+                        &format!("clip-transcript-{}", file.id),
+                        0,
+                        text,
+                        None,
+                        order_base,
+                        cx,
+                    )
+                } else {
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child("No transcript available.")
+                        .into_any_element()
+                };
                 col.child(
                     div()
                         .px_2p5()
@@ -148,13 +232,7 @@ fn clip_transcript_section(fixtures: &Fixtures, file: &File, cx: &App) -> Option
                         .bg(theme.secondary.opacity(0.45))
                         .text_xs()
                         .text_color(theme.foreground)
-                        .child(if state.loading {
-                            "Loading transcript\u{2026}".to_owned()
-                        } else if let Some(err) = state.error {
-                            format!("Could not load transcript: {err}")
-                        } else {
-                            body_text.unwrap_or_else(|| "No transcript available.".to_owned())
-                        }),
+                        .child(transcript_body),
                 )
             }),
     )
@@ -225,7 +303,7 @@ fn transcribe_pill_button(
 }
 
 /// Slack-style inline audio player card for uploaded audio files and voice clips.
-pub(super) fn audio_card(fixtures: &Fixtures, file: &File, cx: &App) -> Div {
+pub(super) fn audio_card(fixtures: &Fixtures, file: &File, order_base: u64, cx: &App) -> Div {
     let theme = cx.theme();
     let id_str = file.id.to_string();
     let state = crate::media::audio_state(&id_str, cx);
@@ -422,7 +500,7 @@ pub(super) fn audio_card(fixtures: &Fixtures, file: &File, cx: &App) -> Div {
     });
     let wave = audio_wave_bars(file);
     let has_wave = !wave.is_empty();
-    let transcript = clip_transcript_section(fixtures, file, cx);
+    let transcript = clip_transcript_section(fixtures, file, order_base, cx);
     let card = h_flex()
         .w(px(CARD_W))
         .max_w_full()
@@ -550,359 +628,486 @@ fn inline_transport_button(
         .child(Icon::new(icon).size(px(icon_size)).text_color(fg))
 }
 
+/// Decoded image dimensions from GPUI's asset cache when available (lets video previews without
+/// Slack dimension metadata size to the poster's true aspect ratio as soon as it loads).
+fn loaded_image_dims(
+    source: &ImageSource,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<(i64, i64)> {
+    let data = match source {
+        ImageSource::Resource(resource) => window
+            .use_asset::<ImgResourceLoader>(resource, cx)
+            .and_then(Result::ok)?,
+        ImageSource::Render(data) => data.clone(),
+        _ => return None,
+    };
+    let sz = data.size(0);
+    let (w, h) = (i64::from(sz.width.0), i64::from(sz.height.0));
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// Top-right overlay icon button (matching [`download_button`]) used in active inline video frames.
+fn top_overlay_action_button(
+    id: SharedString,
+    icon: IconName,
+    cx: &App,
+) -> gpui_kit::gpui::Stateful<Div> {
+    let theme = cx.theme();
+    div()
+        .id(id)
+        .size(px(28.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .bg(theme.background)
+        .border_1()
+        .border_color(theme.border)
+        .cursor_pointer()
+        .hover(|button| button.bg(theme.secondary))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(Icon::new(icon).size(px(15.)).text_color(theme.foreground))
+}
+
+/// Width threshold below which the inline video transport switches to a compact two-row layout
+/// so portrait videos never clip transport buttons.
+const COMPACT_TRANSPORT_MAX_W: f32 = 260.;
+
+/// Aspect-ratio-aware video preview / active inline player element rendered via `RenderOnce` so
+/// it can inspect decoded poster dimensions from `Window` when Slack omits video dimension fields.
+#[derive(IntoElement)]
+struct VideoFrame {
+    file: File,
+    ix: usize,
+    poster_source: Option<ImageSource>,
+    video_url: Option<String>,
+    ext: String,
+    meta_duration_ms: Option<u64>,
+    on_open: Option<ImageClick>,
+}
+
+impl RenderOnce for VideoFrame {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let file = self.file;
+        let id_str = file.id.to_string();
+        let poster_dims = self
+            .poster_source
+            .as_ref()
+            .and_then(|src| loaded_image_dims(src, window, cx));
+        let snap = crate::media::inline_video_snapshot(&id_str, cx);
+        let theme = cx.theme();
+        let (w, h) = resolve_video_preview_size(
+            video_dimensions(&file),
+            poster_dims,
+            snap.as_ref().map(|s| (s.width, s.height)),
+        );
+        let duration_label = self.meta_duration_ms.map(format_duration);
+        let group = SharedString::from(format!("video-tile-{}", file.id));
+
+        if let Some(snap) = snap {
+            let fg = crate::theme::media_overlay_foreground();
+            let dur_secs = if snap.duration_secs > 0.0 {
+                snap.duration_secs
+            } else {
+                self.meta_duration_ms.map_or(0.0, |ms| ms as f64 / 1000.0)
+            };
+            let progress = crate::media::progress_fraction(snap.position_secs, dur_secs);
+            let time_text = if dur_secs > 0.0 {
+                format!(
+                    "{} / {}",
+                    crate::media::format_video_time(snap.position_secs),
+                    crate::media::format_video_time(dur_secs)
+                )
+            } else {
+                crate::media::format_video_time(snap.position_secs)
+            };
+            let keep_controls_visible = snap.loading || snap.failed || !snap.playing || snap.ended;
+
+            let id_surface = id_str.clone();
+            let id_play = id_str.clone();
+            let id_seek = id_str.clone();
+            let id_rate = id_str.clone();
+            let id_mute = id_str.clone();
+            let id_expand = id_str.clone();
+            let id_close = id_str.clone();
+
+            let play_pause_btn = inline_transport_button(
+                SharedString::from(format!("video-inline-play-{}", file.id)),
+                if snap.playing {
+                    IconName::Pause
+                } else {
+                    IconName::Play
+                },
+                14.,
+            )
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                crate::media::toggle_inline_video_pause(&id_play, window, cx);
+            });
+
+            let scrub = crate::media::video_scrub_bar(
+                SharedString::from(format!("video-inline-scrub-{}", file.id)),
+                progress,
+                dur_secs,
+                gpui_kit::gpui::hsla(0., 0., 1., 0.28),
+                fg,
+                move |secs, window, cx| {
+                    crate::media::seek_inline_video(&id_seek, secs, window, cx);
+                },
+            );
+
+            let rate_btn = div()
+                .id(SharedString::from(format!("video-inline-rate-{}", file.id)))
+                .flex_none()
+                .px_1()
+                .h(px(22.))
+                .rounded_sm()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(10.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(fg)
+                .cursor_pointer()
+                .hover(|b| b.bg(gpui_kit::gpui::hsla(0., 0., 1., 0.16)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(crate::media::format_playback_rate(snap.rate))
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    crate::media::cycle_inline_video_rate(&id_rate, window, cx);
+                });
+
+            let mute_btn = inline_transport_button(
+                SharedString::from(format!("video-inline-mute-{}", file.id)),
+                if snap.muted {
+                    IconName::VolumeX
+                } else {
+                    IconName::Volume2
+                },
+                14.,
+            )
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                crate::media::toggle_inline_video_mute(&id_mute, window, cx);
+            });
+
+            let close_btn = inline_transport_button(
+                SharedString::from(format!("video-inline-close-{}", file.id)),
+                IconName::X,
+                13.,
+            )
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                crate::media::stop_inline_video(&id_close, window, cx);
+            });
+
+            let expand_top_btn = self.on_open.clone().map(|on_open| {
+                let origin = ImageOrigin::File(self.ix);
+                top_overlay_action_button(
+                    SharedString::from(format!("video-inline-expand-{}", file.id)),
+                    IconName::Maximize2,
+                    cx,
+                )
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    crate::media::stop_inline_video_for_expand(&id_expand, window, cx);
+                    on_open(origin.clone(), window, cx);
+                })
+            });
+
+            let download_top_btn = download_url(&file).map(|url| {
+                let name = file_name(&file);
+                top_overlay_action_button(
+                    SharedString::from(format!("file-download-{}", file.id)),
+                    IconName::Download,
+                    cx,
+                )
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    crate::media::download(url.clone(), name.clone(), window, cx);
+                })
+            });
+
+            let top_actions = (expand_top_btn.is_some() || download_top_btn.is_some()).then(|| {
+                let mut cluster = h_flex()
+                    .absolute()
+                    .top(px(8.))
+                    .right(px(8.))
+                    .items_center()
+                    .gap_1()
+                    .children(expand_top_btn)
+                    .children(download_top_btn);
+                if !keep_controls_visible {
+                    cluster = cluster
+                        .opacity(0.)
+                        .group_hover(group.clone(), |bar| bar.opacity(1.));
+                }
+                cluster
+            });
+
+            let mut transport = if w < COMPACT_TRANSPORT_MAX_W {
+                v_flex()
+                    .id(SharedString::from(format!("video-inline-bar-{}", file.id)))
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .px_1p5()
+                    .py_1()
+                    .bg(crate::theme::media_overlay_scrim_strong())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(h_flex().w_full().items_center().child(scrub))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_0p5()
+                            .child(play_pause_btn)
+                            .child(rate_btn)
+                            .child(mute_btn)
+                            .child(close_btn),
+                    )
+            } else {
+                h_flex()
+                    .id(SharedString::from(format!("video-inline-bar-{}", file.id)))
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .bg(crate::theme::media_overlay_scrim_strong())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(play_pause_btn)
+                    .child(scrub)
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(fg)
+                            .child(time_text),
+                    )
+                    .child(rate_btn)
+                    .child(mute_btn)
+                    .child(close_btn)
+            };
+            if !keep_controls_visible {
+                transport = transport
+                    .opacity(0.)
+                    .group_hover(group.clone(), |bar| bar.opacity(1.));
+            }
+
+            let center_overlay = if snap.loading {
+                Some(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_2p5()
+                                .py_1()
+                                .rounded_full()
+                                .bg(crate::theme::media_overlay_scrim_strong())
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(fg)
+                                .child("Loading\u{2026}"),
+                        ),
+                )
+            } else if snap.failed {
+                Some(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .pb(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_2p5()
+                                .py_1()
+                                .rounded_full()
+                                .bg(crate::theme::media_overlay_scrim_strong())
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(fg)
+                                .child("Playback failed"),
+                        ),
+                )
+            } else if !snap.playing || snap.ended {
+                Some(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .pb(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .size(px(40.))
+                                .rounded_full()
+                                .bg(crate::theme::media_overlay_scrim())
+                                .border_1()
+                                .border_color(crate::theme::media_overlay_border())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Icon::new(IconName::Play).size(px(18.)).text_color(fg)),
+                        ),
+                )
+            } else {
+                None
+            };
+
+            div()
+                .id(SharedString::from(format!("video-active-{}", file.id)))
+                .group(group)
+                .relative()
+                .w(px(w))
+                .h(px(h))
+                .rounded_lg()
+                .overflow_hidden()
+                .border_1()
+                .border_color(theme.foreground.opacity(0.13))
+                .bg(theme.secondary)
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    crate::media::toggle_inline_video_pause(&id_surface, window, cx);
+                })
+                .child(crate::media::render_video_surface(
+                    snap.surface,
+                    self.poster_source,
+                    px(8.),
+                ))
+                .children(center_overlay)
+                .child(transport)
+                .children(top_actions)
+        } else {
+            let mut frame = div()
+                .id(SharedString::from(format!("video-open-{}", file.id)))
+                .group(group.clone())
+                .relative()
+                .w(px(w))
+                .h(px(h))
+                .rounded_lg()
+                .overflow_hidden()
+                .border_1()
+                .border_color(theme.foreground.opacity(0.13))
+                .bg(theme.secondary);
+            if let Some(on_open) = self.on_open {
+                let origin = ImageOrigin::File(self.ix);
+                frame = frame
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| on_open(origin.clone(), window, cx));
+            }
+            if let Some(poster) = self.poster_source {
+                frame = frame.child(
+                    crate::media::Picture::new(poster)
+                        .fit(ObjectFit::Contain)
+                        .radius(px(8.)),
+                );
+            }
+            let mut play_circle = div()
+                .id(SharedString::from(format!("video-play-btn-{}", file.id)))
+                .size(px(48.))
+                .rounded_full()
+                .bg(crate::theme::media_overlay_scrim())
+                .border_1()
+                .border_color(crate::theme::media_overlay_border())
+                .flex()
+                .items_center()
+                .justify_center()
+                .hover(|b| b.bg(crate::theme::media_overlay_scrim_strong()))
+                .child(
+                    Icon::new(IconName::Play)
+                        .size(px(22.))
+                        .text_color(crate::theme::media_overlay_foreground()),
+                );
+            if let Some(url) = self.video_url {
+                let ext = self.ext;
+                play_circle = play_circle
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        crate::media::play_inline_video(
+                            id_str.clone(),
+                            url.clone(),
+                            ext.clone(),
+                            None,
+                            window,
+                            cx,
+                        );
+                    });
+            }
+            let play_badge = div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(play_circle);
+
+            frame
+                .child(play_badge)
+                .when_some(duration_label, |el, dur| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .bottom(px(8.))
+                            .right(px(8.))
+                            .px_1p5()
+                            .py(px(1.))
+                            .rounded(px(4.))
+                            .bg(crate::theme::media_overlay_scrim_strong())
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(crate::theme::media_overlay_foreground())
+                            .child(dur),
+                    )
+                })
+                .children(download_button(&file, group, cx))
+        }
+    }
+}
+
 /// Slack-style inline video card: clicking the centered Play button plays natively right inside
 /// the chat card with compact transport controls; clicking anywhere else on the poster preview
-/// (or clicking Expand while playing) opens the video inside [`crate::image_viewer::ImageViewer`].
+/// (or clicking the top-right Expand button while playing) opens the video inside
+/// [`crate::image_viewer::ImageViewer`].
 pub(super) fn video_card(
     fixtures: &Fixtures,
     file: &File,
     ix: usize,
+    order_base: u64,
     on_open: Option<&ImageClick>,
     cx: &App,
 ) -> Div {
     let theme = cx.theme();
-    let id_str = file.id.to_string();
-    let snap = crate::media::inline_video_snapshot(&id_str, cx);
-    let (w, h) = match (file.original_w, file.original_h) {
-        (Some(_), Some(_)) => fit(file.original_w, file.original_h),
-        _ => match snap.as_ref().filter(|s| s.width > 0 && s.height > 0) {
-            Some(s) => fit(Some(s.width as i64), Some(s.height as i64)),
-            None => fit(file.original_w, file.original_h),
-        },
+    let poster_source = match fixtures.thumbnails.get(&file.id) {
+        Some(image) => Some(ImageSource::Image(image.clone())),
+        None => video_poster_url(file).map(|p| ImageSource::from(SharedString::from(p))),
     };
-    let poster_url = video_poster_url(file);
-    let poster_source = poster_url
-        .clone()
-        .map(|p| ImageSource::from(SharedString::from(p)));
     let video_url = video_playback_url(file);
     let ext = file_ext(file, "mp4");
     let transcribe_btn =
         transcribe_pill_button(fixtures, file, video_url.as_deref(), ext.clone(), cx);
     let meta_duration_ms = media_duration_ms(file);
-    let duration_label = meta_duration_ms.map(format_duration);
-    let group = SharedString::from(format!("video-tile-{}", file.id));
-
-    let frame = if let Some(snap) = snap {
-        let fg = crate::theme::media_overlay_foreground();
-        let dur_secs = if snap.duration_secs > 0.0 {
-            snap.duration_secs
-        } else {
-            meta_duration_ms.map_or(0.0, |ms| ms as f64 / 1000.0)
-        };
-        let progress = crate::media::progress_fraction(snap.position_secs, dur_secs);
-        let time_text = if dur_secs > 0.0 {
-            format!(
-                "{} / {}",
-                crate::media::format_video_time(snap.position_secs),
-                crate::media::format_video_time(dur_secs)
-            )
-        } else {
-            crate::media::format_video_time(snap.position_secs)
-        };
-        let keep_controls_visible = snap.loading || snap.failed || !snap.playing || snap.ended;
-
-        let id_surface = id_str.clone();
-        let id_play = id_str.clone();
-        let id_seek = id_str.clone();
-        let id_rate = id_str.clone();
-        let id_mute = id_str.clone();
-        let id_expand = id_str.clone();
-        let id_close = id_str.clone();
-
-        let play_pause_btn = inline_transport_button(
-            SharedString::from(format!("video-inline-play-{}", file.id)),
-            if snap.playing {
-                IconName::Pause
-            } else {
-                IconName::Play
-            },
-            14.,
-        )
-        .on_click(move |_, window, cx| {
-            cx.stop_propagation();
-            crate::media::toggle_inline_video_pause(&id_play, window, cx);
-        });
-
-        let scrub = crate::media::video_scrub_bar(
-            SharedString::from(format!("video-inline-scrub-{}", file.id)),
-            progress,
-            dur_secs,
-            gpui_kit::gpui::hsla(0., 0., 1., 0.28),
-            fg,
-            move |secs, window, cx| {
-                crate::media::seek_inline_video(&id_seek, secs, window, cx);
-            },
-        );
-
-        let rate_btn = div()
-            .id(SharedString::from(format!("video-inline-rate-{}", file.id)))
-            .flex_none()
-            .px_1()
-            .h(px(22.))
-            .rounded_sm()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(10.))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(fg)
-            .cursor_pointer()
-            .hover(|b| b.bg(gpui_kit::gpui::hsla(0., 0., 1., 0.16)))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(crate::media::format_playback_rate(snap.rate))
-            .on_click(move |_, window, cx| {
-                cx.stop_propagation();
-                crate::media::cycle_inline_video_rate(&id_rate, window, cx);
-            });
-
-        let mute_btn = inline_transport_button(
-            SharedString::from(format!("video-inline-mute-{}", file.id)),
-            if snap.muted {
-                IconName::VolumeX
-            } else {
-                IconName::Volume2
-            },
-            14.,
-        )
-        .on_click(move |_, window, cx| {
-            cx.stop_propagation();
-            crate::media::toggle_inline_video_mute(&id_mute, window, cx);
-        });
-
-        let expand_btn = on_open.cloned().map(|on_open| {
-            let origin = ImageOrigin::File(ix);
-            inline_transport_button(
-                SharedString::from(format!("video-inline-expand-{}", file.id)),
-                IconName::Maximize2,
-                13.,
-            )
-            .on_click(move |_, window, cx| {
-                cx.stop_propagation();
-                crate::media::stop_inline_video_for_expand(&id_expand, window, cx);
-                on_open(origin.clone(), window, cx);
-            })
-        });
-
-        let close_btn = inline_transport_button(
-            SharedString::from(format!("video-inline-close-{}", file.id)),
-            IconName::X,
-            13.,
-        )
-        .on_click(move |_, window, cx| {
-            cx.stop_propagation();
-            crate::media::stop_inline_video(&id_close, window, cx);
-        });
-
-        let mut transport = h_flex()
-            .id(SharedString::from(format!("video-inline-bar-{}", file.id)))
-            .absolute()
-            .left_0()
-            .right_0()
-            .bottom_0()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .bg(crate::theme::media_overlay_scrim_strong())
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(|_, _, cx| cx.stop_propagation())
-            .child(play_pause_btn)
-            .child(scrub)
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(px(10.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(fg)
-                    .child(time_text),
-            )
-            .child(rate_btn)
-            .child(mute_btn)
-            .children(expand_btn)
-            .child(close_btn);
-        if !keep_controls_visible {
-            transport = transport
-                .opacity(0.)
-                .group_hover(group.clone(), |bar| bar.opacity(1.));
-        }
-
-        let center_overlay = if snap.loading {
-            Some(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .px_2p5()
-                            .py_1()
-                            .rounded_full()
-                            .bg(crate::theme::media_overlay_scrim_strong())
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(fg)
-                            .child("Loading\u{2026}"),
-                    ),
-            )
-        } else if snap.failed {
-            Some(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .pb(px(28.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .px_2p5()
-                            .py_1()
-                            .rounded_full()
-                            .bg(crate::theme::media_overlay_scrim_strong())
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(fg)
-                            .child("Playback failed"),
-                    ),
-            )
-        } else if !snap.playing || snap.ended {
-            Some(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .pb(px(28.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .size(px(40.))
-                            .rounded_full()
-                            .bg(crate::theme::media_overlay_scrim())
-                            .border_1()
-                            .border_color(crate::theme::media_overlay_border())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(Icon::new(IconName::Play).size(px(18.)).text_color(fg)),
-                    ),
-            )
-        } else {
-            None
-        };
-
-        div()
-            .id(SharedString::from(format!("video-active-{}", file.id)))
-            .group(group.clone())
-            .relative()
-            .w(px(w))
-            .h(px(h))
-            .rounded_lg()
-            .overflow_hidden()
-            .border_1()
-            .border_color(theme.foreground.opacity(0.13))
-            .bg(theme.secondary)
-            .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(move |_, window, cx| {
-                cx.stop_propagation();
-                crate::media::toggle_inline_video_pause(&id_surface, window, cx);
-            })
-            .child(crate::media::render_video_surface(
-                snap.surface,
-                poster_source,
-                px(8.),
-            ))
-            .children(center_overlay)
-            .child(transport)
-            .children(download_button(file, group, cx))
-    } else {
-        let mut frame = div()
-            .id(SharedString::from(format!("video-open-{}", file.id)))
-            .group(group.clone())
-            .relative()
-            .w(px(w))
-            .h(px(h))
-            .rounded_lg()
-            .overflow_hidden()
-            .border_1()
-            .border_color(theme.foreground.opacity(0.13))
-            .bg(theme.secondary);
-        if let Some(on_open) = on_open.cloned() {
-            let origin = ImageOrigin::File(ix);
-            frame = frame
-                .cursor_pointer()
-                .on_click(move |_, window, cx| on_open(origin.clone(), window, cx));
-        }
-        if let Some(poster) = poster_source {
-            frame = frame.child(
-                crate::media::Picture::new(poster)
-                    .fit(ObjectFit::Cover)
-                    .radius(px(8.)),
-            );
-        }
-        let mut play_circle = div()
-            .id(SharedString::from(format!("video-play-btn-{}", file.id)))
-            .size(px(48.))
-            .rounded_full()
-            .bg(crate::theme::media_overlay_scrim())
-            .border_1()
-            .border_color(crate::theme::media_overlay_border())
-            .flex()
-            .items_center()
-            .justify_center()
-            .hover(|b| b.bg(crate::theme::media_overlay_scrim_strong()))
-            .child(
-                Icon::new(IconName::Play)
-                    .size(px(22.))
-                    .text_color(crate::theme::media_overlay_foreground()),
-            );
-        if let Some(url) = video_url {
-            play_circle = play_circle
-                .cursor_pointer()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(move |_, window, cx| {
-                    cx.stop_propagation();
-                    crate::media::play_inline_video(
-                        id_str.clone(),
-                        url.clone(),
-                        ext.clone(),
-                        None,
-                        window,
-                        cx,
-                    );
-                });
-        }
-        let play_badge = div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(play_circle);
-
-        frame
-            .child(play_badge)
-            .when_some(duration_label, |el, dur| {
-                el.child(
-                    div()
-                        .absolute()
-                        .bottom(px(8.))
-                        .right(px(8.))
-                        .px_1p5()
-                        .py(px(1.))
-                        .rounded(px(4.))
-                        .bg(crate::theme::media_overlay_scrim_strong())
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(crate::theme::media_overlay_foreground())
-                        .child(dur),
-                )
-            })
-            .children(download_button(file, group, cx))
-    };
 
     v_flex()
         .gap_1()
@@ -920,6 +1125,14 @@ pub(super) fn video_card(
                 )
                 .children(transcribe_btn),
         )
-        .child(frame)
-        .children(clip_transcript_section(fixtures, file, cx))
+        .child(VideoFrame {
+            file: file.clone(),
+            ix,
+            poster_source,
+            video_url,
+            ext,
+            meta_duration_ms,
+            on_open: on_open.cloned(),
+        })
+        .children(clip_transcript_section(fixtures, file, order_base, cx))
 }

@@ -133,6 +133,34 @@ pub(crate) fn selectable_code(
     .into_any_element()
 }
 
+/// Plain selectable prose paragraph (used by clip/video transcripts in chat cards and the
+/// image viewer) participating in the window's `TextSelectionLayer` with drag, double/triple-click,
+/// and `Cmd+C`.
+pub(crate) fn selectable_text(
+    key: &str,
+    paragraph_ix: usize,
+    text: String,
+    color: Option<gpui_kit::gpui::Hsla>,
+    document_order: u64,
+    cx: &App,
+) -> AnyElement {
+    let theme = RunTheme::body(cx, SharedString::from(key.to_owned()), document_order, None);
+    let runs = if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![theme.run(DEFAULT_FLAGS, color, None, text.len())]
+    };
+    SelectableParagraph::new(
+        paragraph_id(&theme.key, paragraph_ix, 0, &text),
+        text,
+        runs,
+        Vec::new(),
+        document_order,
+        &theme,
+    )
+    .into_any_element()
+}
+
 /// Slack's pre block: 12px code on an 18px line, 8px in from a 13% foreground ring with 4px
 /// corners, 32px kept clear at the right for the copy button a hover shows there.
 pub(super) fn code_block(code: String, language: Option<String>, theme: &RunTheme) -> Div {

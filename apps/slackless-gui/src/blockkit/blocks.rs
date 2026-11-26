@@ -234,7 +234,7 @@ pub(super) fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                 .bg(theme.secondary)
                 .child(
                     crate::media::Picture::new(ImageSource::from(SharedString::from(thumb)))
-                        .fit(ObjectFit::Cover)
+                        .fit(ObjectFit::Contain)
                         .radius(px(6.)),
                 )
                 .child(

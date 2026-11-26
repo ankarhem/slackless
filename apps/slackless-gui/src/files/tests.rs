@@ -12,8 +12,9 @@ use super::meta::{
     audio_wave_bars, clip_vtt_url, download_url, external_provider_label, external_subtitle,
     file_ext, file_icon_kind, file_name, fit, format_duration, human_size, inline_allowed,
     inline_clip_transcript, is_audio, is_decodable_image_url, is_snippet, is_video,
-    media_duration_ms, parse_webvtt, remote_thumbnail, snippet_hidden_lines, snippet_is_truncated,
-    snippet_lines, snippet_visible_and_omitted, video_playback_url, video_poster_url,
+    media_duration_ms, parse_webvtt, remote_thumbnail, resolve_video_preview_size,
+    snippet_hidden_lines, snippet_is_truncated, snippet_lines, snippet_visible_and_omitted,
+    video_dimensions, video_playback_url, video_poster_url,
 };
 use super::snippet::{SnippetCard, SnippetStore};
 use crate::blockkit::serde_json::json;
@@ -48,6 +49,59 @@ fn human_size_fit_and_inline_limits() {
     assert!(inline_allowed(&small, false));
     assert!(!inline_allowed(&big, false));
     assert!(inline_allowed(&big, true));
+}
+
+#[test]
+fn video_dimensions_and_preview_aspect_ratio_fallbacks() {
+    // 1. `thumb_video_w` / `thumb_video_h` used when `original_w/h` are absent (common on Slack Clips).
+    let mut portrait_clip = File {
+        id: FileId::from("F0PORT"),
+        mimetype: Some("video/mp4".into()),
+        ..Default::default()
+    };
+    portrait_clip
+        .extra
+        .insert("thumb_video_w".into(), json!(405));
+    portrait_clip
+        .extra
+        .insert("thumb_video_h".into(), json!(720));
+    assert_eq!(video_dimensions(&portrait_clip), Some((405, 720)));
+    let (w, h) = resolve_video_preview_size(video_dimensions(&portrait_clip), None, None);
+    assert!((w - 135.).abs() < 0.05 && (h - 240.).abs() < 0.05);
+
+    // 2. Falls back to `thumb_480_w/h` and `thumb_360_w/h` and ignores non-positive `original_w/h`.
+    let thumb_only = File {
+        id: FileId::from("F0T480"),
+        original_w: Some(0),
+        original_h: Some(0),
+        thumb_480_w: Some(480),
+        thumb_480_h: Some(270),
+        ..Default::default()
+    };
+    assert_eq!(video_dimensions(&thumb_only), Some((480, 270)));
+    let (w, h) = resolve_video_preview_size(video_dimensions(&thumb_only), None, None);
+    assert!((w - 360.).abs() < 0.05 && (h - 202.5).abs() < 0.05);
+
+    // 3. Honors 90/270-degree EXIF rotation on `original_w/h`.
+    let mut rotated = File {
+        id: FileId::from("F0ROT"),
+        original_w: Some(1920),
+        original_h: Some(1080),
+        ..Default::default()
+    };
+    rotated.extra.insert("image_exif_rotation".into(), json!(6));
+    assert_eq!(video_dimensions(&rotated), Some((1080, 1920)));
+
+    // 4. When Slack omits all dimension metadata, decoded poster dimensions set the preview aspect ratio.
+    let (pw, ph) = resolve_video_preview_size(None, Some((720, 1280)), None);
+    assert!((pw - 135.).abs() < 0.05 && (ph - 240.).abs() < 0.05);
+
+    // 5. If poster orientation contradicts unrotated metadata, poster orientation wins; live player dims win over all.
+    let (ow, oh) = resolve_video_preview_size(Some((1920, 1080)), Some((405, 720)), None);
+    assert!((ow - 135.).abs() < 0.05 && (oh - 240.).abs() < 0.05);
+    let (sw, sh) =
+        resolve_video_preview_size(Some((1920, 1080)), Some((405, 720)), Some((1080, 1080)));
+    assert!((sw - 240.).abs() < 0.05 && (sh - 240.).abs() < 0.05);
 }
 
 #[test]

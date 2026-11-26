@@ -26,9 +26,12 @@ use media_cards::{audio_card, video_card};
 use meta::{inline_allowed, is_audio, is_snippet};
 use snippet::SnippetCard;
 
+#[cfg(test)]
+pub(crate) use media_cards::set_clip_transcript_expanded;
+pub(crate) use media_cards::{clip_transcript_status, fetch_clip_vtt_if_needed};
 pub(crate) use meta::{
-    download_url, file_ext, file_icon, fit, human_size, is_decodable_image_url, is_video,
-    media_duration_ms, video_playback_url, video_poster_url,
+    clip_vtt_url, download_url, file_ext, file_icon, fit, human_size, inline_clip_transcript,
+    is_decodable_image_url, is_video, media_duration_ms, video_playback_url, video_poster_url,
 };
 
 /// The message's attachments, or `None` when it has no files. `on_open` makes image
@@ -68,14 +71,14 @@ pub fn attachments(
         }));
     }
     for (ix, file) in message.files.iter().enumerate() {
+        // Reserve a disjoint selection document-order slice per file after the message body.
+        let order_base =
+            crate::messages::message_order(&message.ts) + 512_000 + (ix as u64) * 65_536;
         column = column.child(if is_audio(file) {
-            audio_card(fixtures, file, cx)
+            audio_card(fixtures, file, order_base, cx)
         } else if is_video(file) {
-            video_card(fixtures, file, ix, on_open, cx)
+            video_card(fixtures, file, ix, order_base, on_open, cx)
         } else if is_snippet(file) {
-            // Reserve a disjoint selection document-order slice per file after the message body.
-            let order_base =
-                crate::messages::message_order(&message.ts) + 512_000 + (ix as u64) * 65_536;
             div().child(SnippetCard {
                 file: file.clone(),
                 order_base,

@@ -62,7 +62,7 @@ use render::{
 pub(crate) use render::{
     clock, day_and_time, day_label, expand_shortcodes_in_text, file_day, hex_color, iso_date,
     list_stamp, local_offset_now, mrkdwn, mrkdwn_preview, mrkdwn_with_verbatim, now_secs,
-    render_block, selectable_code, short_date, unescape,
+    render_block, selectable_code, selectable_text, short_date, unescape,
 };
 use rows::transcript_row;
 pub use rows::{Jump, message_row, message_row_linked};

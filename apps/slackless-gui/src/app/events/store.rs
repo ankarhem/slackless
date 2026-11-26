@@ -100,6 +100,9 @@ impl App {
             .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
         self.tools_page
             .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
+        if let Some(viewer) = &self.image_viewer {
+            viewer.update(cx, |viewer, cx| viewer.set_fixtures(fixtures.clone(), cx));
+        }
         if let Some(state) = &self.huddle_state {
             state.update(cx, |state, cx| state.set_fixtures(fixtures, cx));
         }

@@ -185,7 +185,7 @@ pub(super) fn file_name(file: &File) -> String {
         .unwrap_or_else(|| file.id.to_string())
 }
 
-pub(super) use slackless_core::domain::webvtt::{
+pub(crate) use slackless_core::domain::webvtt::{
     clip_vtt_url, inline_clip_transcript, parse_webvtt,
 };
 
@@ -350,6 +350,86 @@ pub(crate) fn file_icon(file: &File, cx: &App) -> (IconName, Hsla) {
         FileTileTone::Link => theme.link,
     };
     (icon, color)
+}
+
+fn extra_i64(file: &File, key: &str) -> Option<i64> {
+    let val = file.extra.get(key)?;
+    val.as_i64()
+        .or_else(|| val.as_u64().and_then(|n| i64::try_from(n).ok()))
+        .or_else(|| val.as_f64().filter(|f| f.is_finite()).map(|f| f as i64))
+        .or_else(|| val.as_str().and_then(|s| s.parse::<i64>().ok()))
+}
+
+fn positive_dims(w: Option<i64>, h: Option<i64>) -> Option<(i64, i64)> {
+    match (w, h) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+        _ => None,
+    }
+}
+
+/// Best available `(width, height)` metadata for a video file, falling back from `original_w/h`
+/// (honoring 90°/270° `image_exif_rotation`) through `thumb_video_w/h` and Slack's thumbnail
+/// derivative dimensions.
+pub(crate) fn video_dimensions(file: &File) -> Option<(i64, i64)> {
+    let original = positive_dims(file.original_w, file.original_h).map(|(w, h)| {
+        let swapped = matches!(extra_i64(file, "image_exif_rotation"), Some(5..=8));
+        if swapped { (h, w) } else { (w, h) }
+    });
+    original
+        .or_else(|| {
+            positive_dims(
+                extra_i64(file, "thumb_video_w"),
+                extra_i64(file, "thumb_video_h"),
+            )
+        })
+        .or_else(|| {
+            positive_dims(
+                extra_i64(file, "thumb_1024_w"),
+                extra_i64(file, "thumb_1024_h"),
+            )
+        })
+        .or_else(|| {
+            positive_dims(
+                extra_i64(file, "thumb_960_w"),
+                extra_i64(file, "thumb_960_h"),
+            )
+        })
+        .or_else(|| {
+            positive_dims(
+                extra_i64(file, "thumb_800_w"),
+                extra_i64(file, "thumb_800_h"),
+            )
+        })
+        .or_else(|| {
+            positive_dims(
+                extra_i64(file, "thumb_720_w"),
+                extra_i64(file, "thumb_720_h"),
+            )
+        })
+        .or_else(|| positive_dims(file.thumb_480_w, file.thumb_480_h))
+        .or_else(|| positive_dims(file.thumb_360_w, file.thumb_360_h))
+}
+
+/// Compute the rendered inline video card `(w, h)` from live player dimensions, Slack file
+/// metadata dimensions, and/or decoded poster image dimensions while preserving aspect ratio.
+pub(crate) fn resolve_video_preview_size(
+    meta_dims: Option<(i64, i64)>,
+    poster_dims: Option<(i64, i64)>,
+    snap_dims: Option<(u32, u32)>,
+) -> (f32, f32) {
+    if let Some((sw, sh)) = snap_dims.filter(|&(w, h)| w > 0 && h > 0) {
+        return fit(Some(i64::from(sw)), Some(i64::from(sh)));
+    }
+    let chosen = match (meta_dims, poster_dims) {
+        (Some((mw, mh)), Some((pw, ph))) if (mw > mh) != (pw > ph) => Some((pw, ph)),
+        (Some(m), _) => Some(m),
+        (None, Some(p)) => Some(p),
+        (None, None) => None,
+    };
+    match chosen {
+        Some((w, h)) => fit(Some(w), Some(h)),
+        None => fit(None, None),
+    }
 }
 
 /// Scale `(w, h)` into the thumbnail box, keeping the aspect ratio; smaller images keep

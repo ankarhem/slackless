@@ -22,13 +22,13 @@ use gpui_kit::component::slider::{Slider, SliderEvent, SliderState, SliderValue}
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, Image, ImageFormat,
-    ImageSource, InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div,
-    px, relative,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity, EventEmitter,
+    FontWeight, Image, ImageFormat, ImageSource, InteractiveElement as _, IntoElement, MouseButton,
+    ObjectFit, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, Window, div, px, relative,
 };
 use slackless_core::huddle::NativeVideoPlayer;
-use slackless_core::types::{Block, Message, UserId, time};
+use slackless_core::types::{Block, FileId, Message, UserId, time};
 
 use crate::avatars;
 use crate::fixtures::Fixtures;
@@ -47,6 +47,10 @@ const CONTROL_BUTTON: f32 = 36.;
 const SLIDER_WIDTH: f32 = 120.;
 /// Gutter the arrows reserve at the sides of the image area.
 const ARROW_GUTTER: f32 = 72.;
+/// Width of the toggleable right-side video transcript drawer.
+const TRANSCRIPT_PANEL_WIDTH: f32 = 320.;
+/// Disjoint selection document order for the overlay's selectable transcript text.
+const VIEWER_TRANSCRIPT_ORDER: u64 = 1u64 << 62;
 
 /// Which message image a click stands for, so the transcript can find it again while it
 /// builds the conversation's image list: a file upload by its index in `Message::files`,
@@ -69,6 +73,8 @@ pub struct ViewerVideo {
     pub url: String,
     pub ext: String,
     pub duration_ms: Option<u64>,
+    pub inline_transcript: Option<String>,
+    pub vtt_url: Option<String>,
 }
 
 /// One image or video the viewer can show: the rendition (fixture pixels or a live url the app's
@@ -154,6 +160,8 @@ pub fn message_images(fixtures: &Fixtures, message: &Message) -> Vec<ImageEntry>
                         url: video_url,
                         ext: crate::files::file_ext(file, "mp4"),
                         duration_ms: crate::files::media_duration_ms(file),
+                        inline_transcript: crate::files::inline_clip_transcript(file),
+                        vtt_url: crate::files::clip_vtt_url(file),
                     }),
                 },
             });
@@ -404,6 +412,8 @@ pub struct ImageViewer {
     video_playback: Option<ViewerVideoPlayback>,
     video_load_task: Option<Task<()>>,
     video_tick_task: Option<Task<()>>,
+    show_transcript: bool,
+    transcript_copied: bool,
 }
 
 impl Drop for ImageViewer {
@@ -470,6 +480,8 @@ impl ImageViewer {
                 video_playback: None,
                 video_load_task: None,
                 video_tick_task: None,
+                show_transcript: false,
+                transcript_copied: false,
             }
         });
         viewer.update(cx, |v, cx| v.sync_current_media(window, cx));
@@ -481,9 +493,57 @@ impl ImageViewer {
         &self.images[self.index]
     }
 
+    /// Update workspace fixtures (e.g. when a newly transcribed video's transcript lands live).
+    pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.fixtures = fixtures;
+        cx.notify();
+    }
+
     /// Whether the currently shown item is a playable video.
     pub fn is_video(&self) -> bool {
         self.current().video.is_some()
+    }
+
+    /// Toggle visibility of the right-side video transcript drawer; lazily fetches WebVTT when
+    /// needed.
+    pub fn toggle_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_video() {
+            return;
+        }
+        self.show_transcript = !self.show_transcript;
+        self.transcript_copied = false;
+        if self.show_transcript {
+            self.ensure_transcript_loaded(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn ensure_transcript_loaded(&self, window: &mut Window, cx: &mut App) {
+        let Some(video) = self.current().video.as_ref() else {
+            return;
+        };
+        let fid = FileId::from(video.file_id.clone());
+        let has_local_or_inline =
+            self.fixtures.file_transcript(&fid).is_some() || video.inline_transcript.is_some();
+        if !has_local_or_inline && let Some(vtt_url) = video.vtt_url.as_ref() {
+            crate::files::fetch_clip_vtt_if_needed(fid, vtt_url.clone(), window, cx);
+        }
+    }
+
+    fn resolve_video_transcript(
+        &self,
+        video: &ViewerVideo,
+        cx: &App,
+    ) -> (Option<String>, bool, Option<String>) {
+        let fid = FileId::from(video.file_id.clone());
+        let cached = crate::files::clip_transcript_status(&fid, cx);
+        let text = self
+            .fixtures
+            .file_transcript(&fid)
+            .map(str::to_owned)
+            .or(cached.text)
+            .or_else(|| video.inline_transcript.clone());
+        (text, cached.loading, cached.error)
     }
 
     /// Stop and drop any active video player and background tasks immediately.
@@ -758,8 +818,12 @@ impl ImageViewer {
             return;
         }
         self.index = next as usize;
+        self.transcript_copied = false;
         self.zoom_to(FIT_INDEX, window, cx);
         self.sync_current_media(window, cx);
+        if self.show_transcript {
+            self.ensure_transcript_loaded(window, cx);
+        }
         cx.notify();
     }
 
@@ -804,6 +868,12 @@ impl ImageViewer {
     #[cfg(test)]
     pub fn current_index(&self) -> usize {
         self.index
+    }
+
+    /// Whether the video transcript panel is currently visible (used by tests).
+    #[cfg(test)]
+    pub fn showing_transcript(&self) -> bool {
+        self.show_transcript && self.is_video()
     }
 
     /// The uploader's name (Slack shows the file's uploader on the chip).
@@ -1089,7 +1159,221 @@ impl Render for ImageViewer {
                 .into_any_element()
         };
 
-        let bottom_left_controls = if is_video {
+        let transcript_panel = if self.show_transcript
+            && let Some(video) = image.video.clone()
+        {
+            let fid = FileId::from(video.file_id.clone());
+            let (transcript_text, loading_vtt, vtt_error) =
+                self.resolve_video_transcript(&video, cx);
+            let transcribing = crate::media::is_transcribing(&fid, cx);
+            let copied = self.transcript_copied;
+            let copy_text = transcript_text.clone();
+            let can_transcribe = transcript_text.is_none()
+                && !loading_vtt
+                && !transcribing
+                && !video.url.is_empty()
+                && !crate::media::is_hls_url(&video.url);
+            let body_el: AnyElement = if let Some(text) = transcript_text {
+                crate::messages::selectable_text(
+                    &format!("viewer-transcript-{}", video.file_id),
+                    0,
+                    text,
+                    Some(chrome.text),
+                    VIEWER_TRANSCRIPT_ORDER,
+                    cx,
+                )
+            } else if loading_vtt {
+                div()
+                    .text_color(chrome.text_muted)
+                    .child("Loading transcript\u{2026}")
+                    .into_any_element()
+            } else if transcribing {
+                div()
+                    .text_color(chrome.text_muted)
+                    .child("Transcribing\u{2026}")
+                    .into_any_element()
+            } else if let Some(err) = vtt_error {
+                div()
+                    .text_color(chrome.text_muted)
+                    .child(format!("Could not load transcript: {err}"))
+                    .into_any_element()
+            } else {
+                let transcribe_fid = fid.clone();
+                let transcribe_url = video.url.clone();
+                let transcribe_ext = video.ext.clone();
+                v_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(
+                        div()
+                            .text_color(chrome.text_muted)
+                            .child("No transcript available yet."),
+                    )
+                    .when(can_transcribe, |col| {
+                        col.child(
+                            h_flex()
+                                .id("viewer-transcript-generate")
+                                .items_center()
+                                .gap_1p5()
+                                .px_2p5()
+                                .py_1()
+                                .rounded_md()
+                                .bg(chrome.button)
+                                .border_1()
+                                .border_color(chrome.border)
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(chrome.text)
+                                .cursor_pointer()
+                                .hover(move |b| b.bg(chrome.button_hover))
+                                .child(
+                                    Icon::new(IconName::Captions)
+                                        .size(px(13.))
+                                        .text_color(chrome.text),
+                                )
+                                .child("Transcribe")
+                                .on_click(move |_, window, cx| {
+                                    crate::media::transcribe_media(
+                                        transcribe_fid.clone(),
+                                        transcribe_url.clone(),
+                                        transcribe_ext.clone(),
+                                        false,
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                        )
+                    })
+                    .into_any_element()
+            };
+
+            Some(
+                v_flex()
+                    .id("viewer-transcript-panel")
+                    .w(px(TRANSCRIPT_PANEL_WIDTH))
+                    .flex_none()
+                    .h_full()
+                    .mr(px(12.))
+                    .rounded_lg()
+                    .bg(chrome.glass)
+                    .border_1()
+                    .border_color(chrome.border)
+                    .overflow_hidden()
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(chrome.border)
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(chrome.text)
+                                    .child(
+                                        Icon::new(IconName::Captions)
+                                            .size(px(14.))
+                                            .text_color(chrome.text_muted),
+                                    )
+                                    .child("Transcript"),
+                            )
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .when_some(copy_text, |row, text| {
+                                        row.child(
+                                            h_flex()
+                                                .id("viewer-transcript-copy")
+                                                .items_center()
+                                                .gap_1()
+                                                .px_1p5()
+                                                .py(px(2.))
+                                                .rounded_sm()
+                                                .text_xs()
+                                                .text_color(if copied {
+                                                    chrome.text
+                                                } else {
+                                                    chrome.text_muted
+                                                })
+                                                .cursor_pointer()
+                                                .hover(move |b| b.bg(chrome.button_hover))
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                    cx.stop_propagation()
+                                                })
+                                                .child(
+                                                    Icon::new(if copied {
+                                                        IconName::Check
+                                                    } else {
+                                                        IconName::Copy
+                                                    })
+                                                    .size(px(12.))
+                                                    .text_color(if copied {
+                                                        chrome.text
+                                                    } else {
+                                                        chrome.text_muted
+                                                    }),
+                                                )
+                                                .child(if copied { "Copied" } else { "Copy" })
+                                                .on_click(cx.listener(move |viewer, _, _, cx| {
+                                                    cx.write_to_clipboard(
+                                                        ClipboardItem::new_string(text.clone()),
+                                                    );
+                                                    viewer.transcript_copied = true;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .id("viewer-transcript-close")
+                                            .size(px(24.))
+                                            .rounded_sm()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .hover(move |b| b.bg(chrome.button_hover))
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation()
+                                            })
+                                            .child(
+                                                Icon::new(IconName::X)
+                                                    .size(px(13.))
+                                                    .text_color(chrome.text_muted),
+                                            )
+                                            .on_click(cx.listener(|viewer, _, window, cx| {
+                                                viewer.toggle_transcript(window, cx);
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("viewer-transcript-body")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .px_3()
+                            .py_2p5()
+                            .text_xs()
+                            .line_height(px(18.))
+                            .text_color(chrome.text)
+                            .on_scroll(|_, _, cx| cx.stop_propagation())
+                            .child(body_el),
+                    ),
+            )
+        } else {
+            None
+        };
+
+        let bottom_controls = if is_video {
             let progress = crate::media::progress_fraction(vid_pos, vid_dur);
             let time_readout = if vid_dur > 0.0 {
                 format!(
@@ -1113,12 +1397,14 @@ impl Render for ImageViewer {
                     });
                 },
             );
+            let transcript_active = self.show_transcript;
             h_flex()
                 .items_center()
                 .gap_2()
                 .px_2p5()
                 .h(px(CONTROL_BUTTON))
-                .w(px(460.))
+                .w(px(500.))
+                .max_w_full()
                 .rounded_lg()
                 .bg(chrome.glass)
                 .border_1()
@@ -1200,6 +1486,35 @@ impl Render for ImageViewer {
                             viewer.toggle_video_mute(cx);
                         })),
                 )
+                .child(
+                    div()
+                        .id("viewer-video-transcript")
+                        .flex_none()
+                        .size(px(28.))
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .when(transcript_active, move |b| {
+                            b.bg(chrome.button_hover)
+                                .border_1()
+                                .border_color(chrome.border)
+                        })
+                        .hover(move |b| b.bg(chrome.button_hover))
+                        .child(
+                            Icon::new(IconName::Captions)
+                                .text_color(if transcript_active {
+                                    chrome.text
+                                } else {
+                                    chrome.text_muted
+                                })
+                                .size(px(15.)),
+                        )
+                        .on_click(cx.listener(|viewer, _, window, cx| {
+                            viewer.toggle_transcript(window, cx);
+                        })),
+                )
                 .into_any_element()
         } else {
             h_flex()
@@ -1265,6 +1580,62 @@ impl Render for ImageViewer {
                 .into_any_element()
         };
 
+        let download_control: AnyElement = match image.download.clone() {
+            Some((url, name)) => Self::tile_button("viewer-download", IconName::Download, chrome)
+                .on_click(move |_, window, cx| {
+                    crate::media::download(url.clone(), name.clone(), window, cx)
+                })
+                .into_any_element(),
+            None => {
+                let button: Div = div()
+                    .flex_none()
+                    .size(px(CONTROL_BUTTON))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_lg()
+                    .bg(chrome.button)
+                    .border_1()
+                    .border_color(chrome.border)
+                    .opacity(0.35)
+                    .child(
+                        Icon::new(IconName::Download)
+                            .text_color(chrome.text_dim)
+                            .size(px(16.)),
+                    );
+                button.into_any_element()
+            }
+        };
+
+        let footer = if is_video {
+            h_flex()
+                .items_center()
+                .gap_2()
+                .flex_none()
+                .px(px(12.))
+                .pb(px(12.))
+                .pt(px(4.))
+                .child(div().flex_1().min_w_0())
+                .child(div().flex_none().child(bottom_controls))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .justify_end()
+                        .child(download_control),
+                )
+        } else {
+            h_flex()
+                .items_center()
+                .justify_between()
+                .flex_none()
+                .px(px(12.))
+                .pb(px(12.))
+                .pt(px(4.))
+                .child(bottom_controls)
+                .child(download_control)
+        };
+
         div()
             .id("image-viewer")
             .occlude()
@@ -1315,98 +1686,78 @@ impl Render for ImageViewer {
                             })),
                     ),
             )
-            // The fitted rendition; prev/next arrows hang at the edges of the free area.
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .px(px(ARROW_GUTTER))
-                    .py(px(8.))
-                    .overflow_hidden()
-                    .child(stage_content)
-                    .when(multiple, |body| {
-                        body.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .bottom_0()
-                                .w(px(ARROW_GUTTER))
-                                .pl(px(16.))
-                                .flex()
-                                .items_center()
-                                .child(
-                                    Self::arrow_button("viewer-prev", IconName::ArrowLeft, chrome)
-                                        .on_click(cx.listener(|viewer, _, window, cx| {
-                                            viewer.step(-1, window, cx);
-                                        }))
-                                        .when(!prev_enabled, |button| button.opacity(0.35)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .right_0()
-                                .top_0()
-                                .bottom_0()
-                                .w(px(ARROW_GUTTER))
-                                .pr(px(16.))
-                                .flex()
-                                .items_center()
-                                .justify_end()
-                                .child(
-                                    Self::arrow_button("viewer-next", IconName::ArrowRight, chrome)
-                                        .on_click(cx.listener(|viewer, _, window, cx| {
-                                            viewer.step(1, window, cx);
-                                        }))
-                                        .when(!next_enabled, |button| button.opacity(0.35)),
-                                ),
-                        )
-                    }),
-            )
-            // Controls: zoom slider (images) or video transport bar (videos) bottom-left, Download bottom-right.
+            // The fitted rendition; prev/next arrows hang at the edges of the free area,
+            // with an optional right-side transcript drawer for videos.
             .child(
                 h_flex()
-                    .items_center()
-                    .justify_between()
-                    .flex_none()
-                    .px(px(12.))
-                    .pb(px(12.))
-                    .pt(px(4.))
-                    .child(bottom_left_controls)
-                    .child(match image.download.clone() {
-                        Some((url, name)) => {
-                            Self::tile_button("viewer-download", IconName::Download, chrome)
-                                .on_click(move |_, window, cx| {
-                                    crate::media::download(url.clone(), name.clone(), window, cx)
-                                })
-                                .into_any_element()
-                        }
-                        None => {
-                            let button: Div = div()
-                                .flex_none()
-                                .size(px(CONTROL_BUTTON))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_lg()
-                                .bg(chrome.button)
-                                .border_1()
-                                .border_color(chrome.border)
-                                .opacity(0.35)
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .py(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .relative()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .px(px(ARROW_GUTTER))
+                            .overflow_hidden()
+                            .child(stage_content)
+                            .when(multiple, |body| {
+                                body.child(
+                                    div()
+                                        .absolute()
+                                        .left_0()
+                                        .top_0()
+                                        .bottom_0()
+                                        .w(px(ARROW_GUTTER))
+                                        .pl(px(16.))
+                                        .flex()
+                                        .items_center()
+                                        .child(
+                                            Self::arrow_button(
+                                                "viewer-prev",
+                                                IconName::ArrowLeft,
+                                                chrome,
+                                            )
+                                            .on_click(cx.listener(|viewer, _, window, cx| {
+                                                viewer.step(-1, window, cx);
+                                            }))
+                                            .when(!prev_enabled, |button| button.opacity(0.35)),
+                                        ),
+                                )
                                 .child(
-                                    Icon::new(IconName::Download)
-                                        .text_color(chrome.text_dim)
-                                        .size(px(16.)),
-                                );
-                            button.into_any_element()
-                        }
-                    }),
+                                    div()
+                                        .absolute()
+                                        .right_0()
+                                        .top_0()
+                                        .bottom_0()
+                                        .w(px(ARROW_GUTTER))
+                                        .pr(px(16.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_end()
+                                        .child(
+                                            Self::arrow_button(
+                                                "viewer-next",
+                                                IconName::ArrowRight,
+                                                chrome,
+                                            )
+                                            .on_click(cx.listener(|viewer, _, window, cx| {
+                                                viewer.step(1, window, cx);
+                                            }))
+                                            .when(!next_enabled, |button| button.opacity(0.35)),
+                                        ),
+                                )
+                            }),
+                    )
+                    .when_some(transcript_panel, |row, panel| row.child(panel)),
             )
+            // Controls: zoom slider bottom-left (images) or centered video transport bar (videos), Download bottom-right.
+            .child(footer)
     }
 }
 
@@ -1436,6 +1787,12 @@ mod tests {
             "mp4".into(),
             json!("https://files.slack.com/stream/demo.mp4"),
         );
+        video_file
+            .extra
+            .insert("transcript".into(), json!("Hello from the demo video"));
+        video_file
+            .extra
+            .insert("vtt".into(), json!("https://files.slack.com/demo.vtt"));
 
         let image_file = File {
             id: FileId::from("F_IMG1"),
@@ -1494,6 +1851,8 @@ mod tests {
                 url: "https://files.slack.com/stream/demo.mp4".to_owned(),
                 ext: "mp4".to_owned(),
                 duration_ms: Some(18_500),
+                inline_transcript: Some("Hello from the demo video".to_owned()),
+                vtt_url: Some("https://files.slack.com/demo.vtt".to_owned()),
             })
         );
 
@@ -1509,6 +1868,8 @@ mod tests {
                 url: "https://files.slack.com/pri/clip.mov".to_owned(),
                 ext: "mov".to_owned(),
                 duration_ms: None,
+                inline_transcript: None,
+                vtt_url: None,
             })
         );
 
@@ -1554,6 +1915,8 @@ mod tests {
                     url: "https://files.slack.com/pri/demo.mp4".into(),
                     ext: "mp4".into(),
                     duration_ms: Some(12_000),
+                    inline_transcript: Some("Welcome to the walkthrough clip.".into()),
+                    vtt_url: None,
                 }),
             },
         ]);
@@ -1586,14 +1949,20 @@ mod tests {
             iv.update(cx, |v, cx| v.step(1, window, cx));
             assert!(iv.read(cx).is_video());
             assert!(iv.read(cx).video_playback.is_some());
+            assert!(!iv.read(cx).showing_transcript());
+            iv.update(cx, |v, cx| v.toggle_transcript(window, cx));
+            assert!(iv.read(cx).showing_transcript());
             let _ = window.draw(cx);
-            // Stepping back to an image stops and clears video playback immediately.
+            // Stepping back to an image stops and clears video playback immediately and hides the transcript drawer.
             iv.update(cx, |v, cx| v.step(-1, window, cx));
             assert!(!iv.read(cx).is_video());
+            assert!(!iv.read(cx).showing_transcript());
             assert!(iv.read(cx).video_playback.is_none());
             // Stepping onto video then closing via `evict_assets` stops playback immediately.
             iv.update(cx, |v, cx| v.step(1, window, cx));
             assert!(iv.read(cx).video_playback.is_some());
+            iv.update(cx, |v, cx| v.toggle_transcript(window, cx));
+            assert!(!iv.read(cx).showing_transcript());
             iv.update(cx, |v, cx| v.evict_assets(window, cx));
             assert!(iv.read(cx).video_playback.is_none());
         });

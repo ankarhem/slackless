@@ -6,8 +6,8 @@ mod inline;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use super::code_block::selectable_code;
 pub(super) use super::code_block::{code_block, render_code};
+pub(crate) use super::code_block::{selectable_code, selectable_text};
 pub(super) use super::selectable::SelectableParagraph;
 pub(super) use super::time::{
     CivilTime, card_stamp, date_label, date_label_absolute, day_index, format_clock,

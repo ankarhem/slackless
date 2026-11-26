@@ -667,6 +667,75 @@ fn snippet_card_lines_are_selectable_without_line_numbers(cx: &mut TestAppContex
     });
 }
 
+#[gpui::test]
+fn video_transcript_text_is_selectable(cx: &mut TestAppContext) {
+    let transcript = "Shipping video transcripts with selectable text";
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::init(cx);
+    });
+
+    let file = slackless_core::types::File {
+        id: slackless_core::types::FileId::from("F0VIDTR"),
+        name: Some("walkthrough.mp4".into()),
+        mimetype: Some("video/mp4".into()),
+        filetype: Some("mp4".into()),
+        original_w: Some(1280),
+        original_h: Some(720),
+        url_private: Some("https://files.slack.com/pri/walkthrough.mp4".into()),
+        ..Default::default()
+    };
+    let msg = slackless_core::types::Message {
+        ts: slackless_core::types::Ts::from("1700000000.000100"),
+        files: vec![file.clone()],
+        ..Default::default()
+    };
+    let fixtures =
+        crate::fixtures::load().with_file_transcript(file.id.clone(), transcript.to_owned());
+
+    struct Host {
+        fixtures: crate::fixtures::Fixtures,
+        msg: slackless_core::types::Message,
+    }
+    impl Render for Host {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            gpui_kit::component::v_flex()
+                .size_full()
+                .p_4()
+                .children(crate::files::attachments(
+                    &self.fixtures,
+                    &self.msg,
+                    None,
+                    cx,
+                ))
+                .child(gpui_kit::base::TextSelectionLayer)
+        }
+    }
+
+    let (_view, cx) = cx.add_window_view(|_, cx| {
+        crate::files::set_clip_transcript_expanded(file.id.clone(), true, cx);
+        Host { fixtures, msg }
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        let _ = window.draw(cx);
+    });
+
+    // Double-click selects a word inside the expanded video transcript.
+    let word_ix = transcript.find("selectable").unwrap() + 2;
+    let at = press_at(transcript, word_ix, 2, cx);
+    release_at(at, 2, cx);
+    assert_eq!(selected_text(cx), "selectable");
+
+    // Drag selects a range across the transcript text.
+    let start = transcript.find("video").unwrap();
+    let end_ix = transcript.find("with").unwrap() + "with".len();
+    press_at(transcript, start, 1, cx);
+    let end = drag_to(transcript, end_ix, cx);
+    release_at(end, 1, cx);
+    assert_eq!(selected_text(cx), "video transcripts with");
+}
+
 fn test_run_theme(verbatim: bool) -> RunTheme {
     let fg = Hsla::default();
     RunTheme {
