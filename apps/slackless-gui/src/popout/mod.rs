@@ -422,11 +422,14 @@ impl PopoutWindow {
                     }));
                     subscriptions.push(cx.observe(&state_entity, |this, state_entity, cx| {
                         let st = state_entity.read(cx).view_state();
-                        let prev_ch = this
-                            .huddle_state
-                            .as_ref()
-                            .map(|s| s.session.channel.clone());
-                        if prev_ch.as_ref() != Some(&st.session.channel) {
+                        let (channel_changed, root_changed) =
+                            this.huddle_state.as_ref().map_or((true, true), |prev| {
+                                (
+                                    prev.session.channel != st.session.channel,
+                                    prev.session.thread_root_ts != st.session.thread_root_ts,
+                                )
+                            });
+                        if channel_changed {
                             let target = composer::AlsoSendTarget::for_channel(
                                 &this.fixtures,
                                 &st.session.channel,
@@ -440,7 +443,11 @@ impl PopoutWindow {
                             this.huddle_thread_local.clear();
                         }
                         this.huddle_state = Some(st);
-                        if this.huddle_drawer == Some(HuddleDrawer::Thread) {
+                        // Audio levels alone notify ~8x/s: only a new channel or thread root
+                        // changes the query (new replies arrive through the revision poll).
+                        if (channel_changed || root_changed)
+                            && this.huddle_drawer == Some(HuddleDrawer::Thread)
+                        {
                             this.refresh_huddle_thread_async(cx);
                         }
                         this.maybe_fetch_huddle_thread();

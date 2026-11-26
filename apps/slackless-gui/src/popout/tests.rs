@@ -452,6 +452,95 @@ fn huddle_popout_thread_starts_empty_filters_root_and_uses_composer(cx: &mut Tes
 }
 
 #[gpui::test]
+fn huddle_popout_thread_drawer_skips_store_queries_on_unrelated_huddle_notifies(
+    cx: &mut TestAppContext,
+) {
+    use slackless_core::huddle::{HuddleAudioLevels, HuddlePhase, HuddleSessionSnapshot};
+
+    let fixtures = Arc::new(crate::fixtures::load());
+    let store: SharedStore = Arc::new(Mutex::new(
+        slackless_core::store::Store::open_in_memory().unwrap(),
+    ));
+    let send: CommandForward = Arc::new(|_| {});
+    let on_jump: JumpHandler = Rc::new(|_, _, _, _| {});
+    let on_open_canvas: CanvasOpenHandler = Rc::new(|_, _| {});
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::init(cx);
+    });
+    let state = cx.update(|cx| {
+        crate::huddle_state::HuddleState::new(
+            fixtures.clone(),
+            HuddleSessionSnapshot {
+                phase: HuddlePhase::Connected,
+                channel: ChannelId::from("C0GENERAL"),
+                ..Default::default()
+            },
+            Vec::new(),
+            cx,
+        )
+    });
+    let mut popout_slot: Option<Entity<PopoutWindow>> = None;
+    let win_handle = cx.add_window(|window, cx| {
+        let win = cx.new(|cx| {
+            PopoutWindow::new(
+                PopoutRequest {
+                    kind: PopoutKind::Huddle {
+                        source: state.downgrade(),
+                        on_jump,
+                        on_open_canvas,
+                    },
+                    title: "Huddle".to_owned(),
+                    fixtures: fixtures.clone(),
+                    store: Some(store),
+                    team: Some(TeamId::from("T1")),
+                    send,
+                    later_sync: None,
+                    display_id: None,
+                },
+                window,
+                cx,
+            )
+        });
+        popout_slot = Some(win.clone());
+        gpui_kit::component::Root::new(win, window, cx)
+    });
+    let popout = popout_slot.unwrap();
+    let mut vcx = gpui_kit::VisualTestContext::from_window(win_handle.into(), cx);
+    vcx.update(|_, cx| {
+        popout.update(cx, |win, _| win.huddle_drawer = Some(HuddleDrawer::Thread));
+    });
+    let before = vcx.read(|cx| popout.read(cx).reload_gen);
+
+    // Audio levels notify ~8x/s while people talk: neither they nor a mute may touch SQLite.
+    vcx.update(|_, cx| {
+        state.update(cx, |s, cx| {
+            let levels = HuddleAudioLevels {
+                local_rms: 0.5,
+                ..Default::default()
+            };
+            s.update_levels(levels, cx);
+        });
+    });
+    vcx.update(|_, cx| state.update(cx, |s, cx| s.set_muted_local(true, cx)));
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.read(|cx| popout.read(cx).reload_gen),
+        before,
+        "unrelated huddle notifies must not re-query the thread from the store"
+    );
+
+    // A thread root showing up re-queries once.
+    vcx.update(|_, cx| {
+        state.update(cx, |s, cx| {
+            s.apply_room_meta(None, None, Some(Ts::from("1700000001.000100")), cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(vcx.read(|cx| popout.read(cx).reload_gen), before + 1);
+}
+
+#[gpui::test]
 fn popout_mark_unread_edit_mrkdwn_refresh_edits_and_readonly_skips_composer(
     cx: &mut TestAppContext,
 ) {
