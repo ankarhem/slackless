@@ -1,20 +1,6 @@
 use slackless_core::domain::mrkdwn::PlainDirectory;
 
-use super::{expand_shortcodes_in_text, plain_text};
-
-#[test]
-fn expands_standard_emoji_shortcodes_inside_link_labels() {
-    assert_eq!(
-        expand_shortcodes_in_text(":chart_with_upwards_trend: Dashboard"),
-        "📈 Dashboard"
-    );
-    assert_eq!(expand_shortcodes_in_text(":bar_chart: Panel"), "📊 Panel");
-    assert_eq!(expand_shortcodes_in_text(":mute: Silence"), "🔇 Silence");
-    assert_eq!(
-        expand_shortcodes_in_text("https://example.com:8080/path"),
-        "https://example.com:8080/path"
-    );
-}
+use super::plain_text;
 
 /// The clipboard / notification / list-preview text: references as the transcript names them,
 /// formatting and link syntax dropped, standard emoji as glyphs, custom emoji as `:name:`.
@@ -32,4 +18,29 @@ fn plain_text_names_references_through_the_workspace() {
         plain_text("<@U0BOB> <@U0CARA|cara> <#C0GENERAL>", &PlainDirectory),
         "@U0BOB @cara #C0GENERAL"
     );
+}
+
+/// Known `:shortcode:`s become glyphs and every other colon stays put, whatever byte length the
+/// text around a colon has: a multi-byte first character (`Är du klar: ja?` is a DM preview on
+/// every frame and a notification body), a bullet, CJK, a shortcode followed by a multi-byte
+/// character, a link label, and a URL port.
+#[test]
+fn plain_text_expands_shortcodes_without_slicing_multibyte_text() {
+    let fixtures = crate::fixtures::load();
+    for (raw, shown) in [
+        (":chart_with_upwards_trend: Dashboard", "📈 Dashboard"),
+        (":bar_chart: Panel", "📊 Panel"),
+        (":mute: Silence", "🔇 Silence"),
+        (
+            "https://example.com:8080/path",
+            "https://example.com:8080/path",
+        ),
+        ("Är du klar: ja?", "Är du klar: ja?"),
+        ("• Owner: Alice", "• Owner: Alice"),
+        ("日程: 12:00", "日程: 12:00"),
+        (":tada:Är:", "🎉Är:"),
+        ("<https://example.com|:bar_chart: Panel>", "📊 Panel"),
+    ] {
+        assert_eq!(plain_text(raw, &fixtures), shown, "{raw:?}");
+    }
 }

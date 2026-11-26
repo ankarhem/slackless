@@ -1012,6 +1012,27 @@ fn angle_token_parses_users_channels_specials_dates_links_and_mailto() {
         LinkTarget::Url(SharedString::from("https://example.com/a&b"))
     );
 
+    // A link label with a shortcode (a bot alert) or a multi-byte character before a colon.
+    let mut b = ParagraphBuilder::new();
+    angle_token(
+        &mut b,
+        "<https://example.com|:bar_chart: Panel>",
+        &fixtures,
+        &theme,
+        DEFAULT_FLAGS,
+    );
+    assert_eq!(b.text, "📊 Panel");
+
+    let mut b = ParagraphBuilder::new();
+    angle_token(
+        &mut b,
+        "<https://example.com|Översikt: Q3>",
+        &fixtures,
+        &theme,
+        DEFAULT_FLAGS,
+    );
+    assert_eq!(b.text, "Översikt: Q3");
+
     let mut b = ParagraphBuilder::new();
     assert_eq!(
         angle_token(

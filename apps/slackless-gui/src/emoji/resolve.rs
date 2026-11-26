@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use gpui_kit::gpui::{
     AnyElement, ImageSource, IntoElement as _, ParentElement as _, Pixels, Styled as _, div, px,
 };
+use slackless_core::domain::mrkdwn::replace_shortcodes_with;
 
 use super::catalog::{CATALOG, Emoji, FREQUENT_MAX, lookup, skin_tone_swatch, unicode_emoji};
 use super::picker::EmojiChoice;
@@ -133,55 +134,13 @@ impl EmojiArt {
 }
 
 /// A `:shortcode:` (optionally followed by `:skin-tone-N:`) at the start of `rest`: its byte
-/// length and the shortcode in Slack's `name::skin-tone-N` form. Only the name syntax is
-/// checked; callers resolve it to a glyph or a custom emoji.
-pub(crate) fn parse_shortcode(rest: &str) -> Option<(usize, String)> {
-    let tail = rest.strip_prefix(':')?;
-    let end = tail.find(':')?;
-    let name = &tail[..end];
-    let valid = !name.is_empty()
-        && name.len() <= 40
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '+' | '-'));
-    if !valid {
-        return None;
-    }
-    let len = end + 2;
-    let after = &rest[len..];
-    if let Some(tone) = after
-        .strip_prefix(":skin-tone-")
-        .and_then(|tone| tone.get(..2))
-        .filter(|tone| tone.ends_with(':'))
-    {
-        return Some((
-            len + ":skin-tone-".len() + 2,
-            format!("{name}::skin-tone-{}", &tone[..1]),
-        ));
-    }
-    Some((len, name.to_owned()))
-}
+/// length and the shortcode in Slack's `name::skin-tone-N` form. Core's parser, shared with
+/// the CLI; only the name syntax is checked, callers resolve it to a glyph or a custom emoji.
+pub(crate) use slackless_core::domain::mrkdwn::parse_shortcode;
 
 /// `text` with known `:shortcode:`s replaced by their glyphs (plain_text with `emoji: true`).
 pub(crate) fn replace_shortcodes(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find(':') {
-        out.push_str(&rest[..start]);
-        rest = &rest[start..];
-        match parse_shortcode(rest).and_then(|(len, code)| Some((len, display_glyph(&code)?))) {
-            Some((len, glyph)) => {
-                out.push_str(&glyph);
-                rest = &rest[len..];
-            }
-            None => {
-                out.push(':');
-                rest = &rest[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
+    replace_shortcodes_with(text, &display_glyph)
 }
 
 /// Slack's Frequently Used from the user's prefs: the `emoji_use` counts (a JSON object, sent

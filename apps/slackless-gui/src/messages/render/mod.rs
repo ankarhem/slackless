@@ -22,8 +22,6 @@ pub(super) use blocks::message_body;
 pub(crate) use blocks::{is_deleted_ghost, mrkdwn, mrkdwn_with_verbatim, render_block};
 #[cfg(test)]
 pub(crate) use cards::format_huddle_duration;
-#[cfg(test)]
-pub(crate) use inline::expand_shortcodes_in_text;
 pub(super) use inline::{DEFAULT_FLAGS, RunFlags, RunTheme, paragraph_id};
 #[cfg(test)]
 pub(super) use inline::{

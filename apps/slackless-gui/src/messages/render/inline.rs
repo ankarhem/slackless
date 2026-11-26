@@ -13,7 +13,9 @@ use gpui_kit::gpui::{
     UnderlineStyle, div, px, relative, rgb,
 };
 use linkify::{LinkFinder, LinkKind};
-use slackless_core::domain::mrkdwn::{Directory, mrkdwn_to_plain_with, unescape_mrkdwn};
+use slackless_core::domain::mrkdwn::{
+    Directory, mrkdwn_to_plain_with, replace_shortcodes_with, unescape_mrkdwn,
+};
 use slackless_core::types::{ChannelId, TextStyle, UserId};
 
 use super::super::{APP_ICON_SLOT, INLINE_EMOJI, LinkHandler, LinkTarget, route_link};
@@ -301,7 +303,7 @@ impl ParagraphBuilder {
         let expanded = if theme.emoji_text_mode {
             label
         } else {
-            expand_shortcodes_in_text(&label)
+            replace_shortcodes_with(&label, &emoji::display_glyph)
         };
         let target = LinkTarget::Url(url.into());
         let start = self.text.len();
@@ -980,35 +982,12 @@ pub(in crate::messages) fn styled_label(mut label: &str, mut run: RunFlags) -> (
     (label, run)
 }
 
-/// Expand standard unicode `:shortcode:` tokens inside text (`<url|:bar_chart: Panel>`, plain-text previews).
-pub(crate) fn expand_shortcodes_in_text(text: &str) -> String {
-    if !text.contains(':') {
-        return text.to_owned();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while !rest.is_empty() {
-        if rest.starts_with(':')
-            && let Some((len, code)) = emoji::parse_shortcode(rest)
-            && let Some(glyph) = emoji::display_glyph(&code)
-        {
-            out.push_str(&glyph);
-            rest = &rest[len..];
-            continue;
-        }
-        let next_colon = rest[1..].find(':').map(|i| i + 1).unwrap_or(rest.len());
-        out.push_str(&rest[..next_colon]);
-        rest = &rest[next_colon..];
-    }
-    out
-}
-
 /// `text` as the plain text the clipboard, notifications and list previews show: `@mentions`,
 /// `#channels`, links and `<!date>` tokens resolved through `names` as the transcript shows
 /// them, formatting markers dropped, and known `:shortcode:` emoji as their glyphs (custom
 /// emoji stay `:name:`); line breaks kept.
 pub(crate) fn plain_text(text: &str, names: &dyn Directory) -> String {
-    expand_shortcodes_in_text(&mrkdwn_to_plain_with(text, names))
+    replace_shortcodes_with(&mrkdwn_to_plain_with(text, names), &emoji::display_glyph)
 }
 
 /// A `:shortcode:` at the start of `rest`: a glyph run, or a custom emoji image.
