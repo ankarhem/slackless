@@ -559,8 +559,9 @@ mod state_machine {
         SdkIndexFrame, SdkPingPongFrame, SdkPingPongType, SdkSignalFrame, SdkStreamDescriptor,
         SdkStreamMediaType, SdkSubscribeAckFrame, SdkTrackMapping, sdk_signal_frame,
     };
+    use crate::session::background::apply_background_done;
     use crate::session::connected::SessionRuntime;
-    use crate::session::controls::{apply_background_done, handle_control};
+    use crate::session::controls::handle_control;
     use crate::session::io::{RtcController, SignalSink};
     use crate::session::media::{AudioSwitch, BackgroundDone, MediaDevices};
     use crate::session::signaling_handlers::handle_signal_frame;

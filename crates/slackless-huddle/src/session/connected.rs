@@ -7,7 +7,8 @@ use slackless_types::UserId;
 use tokio::sync::mpsc;
 use webrtc::peer_connection::RTCPeerConnectionState;
 
-use super::controls::{apply_background_done, handle_control};
+use super::background::apply_background_done;
+use super::controls::handle_control;
 use super::handshake::perform_handshake_with;
 use super::io::{
     LiveSessionFactory, OpusTrackOut, RtcSession, SessionFactory, SignalSession, SignalSink,

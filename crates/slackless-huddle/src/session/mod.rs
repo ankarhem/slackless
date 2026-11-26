@@ -7,12 +7,13 @@
 //!   (reactions, effects, GIFs, sticky emoji / hand raise, drawing on shared screens, jukebox, mute)
 //! - Official AWS Chime `SdkTranscriptFrame` live captions on `"aws:chime:transcription"`
 
+mod background;
 mod connected;
 mod controls;
 mod handshake;
 mod io;
-mod signaling_handlers;
 mod media;
+mod signaling_handlers;
 mod supervisor;
 #[cfg(test)]
 mod tests;
