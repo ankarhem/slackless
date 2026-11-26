@@ -837,6 +837,58 @@ fn wired_huddle_commands_follow_the_workspace_running_it(cx: &mut gpui::TestAppC
         );
     });
 
+    // 2b. The dock's notes canvas and huddle thread belong to the huddle's workspace: opening
+    // either with workspace two shown shows workspace one, whose core loads the canvas.
+    let root_ts = Ts::from("1700000500.000100");
+    cx.update(|_, cx| {
+        c1.emit(
+            Event::Huddle(HuddleEvent::Updated {
+                channel: one.clone(),
+                participants: vec![UserId::from("U0ME")],
+                ended: false,
+                topic: None,
+                background_id: None,
+                thread_root_ts: Some(root_ts.clone()),
+            }),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    let dock = (cx.update(|_, cx| app.read(cx).huddle_dock.clone())).expect("the dock is mounted");
+    for event in [
+        crate::huddle_dock::HuddleDockEvent::OpenCanvas("F0NOTES".into()),
+        crate::huddle_dock::HuddleDockEvent::OpenThread,
+    ] {
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.switch_workspace(1, window, cx));
+        });
+        cx.update(|_, cx| dock.update(cx, |_, cx| cx.emit(event)));
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(app.read(cx).workspace, 0, "the huddle's workspace shows"));
+    }
+    cx.update(|_, cx| {
+        assert_eq!(
+            app.read(cx).thread.read(cx).open_thread(),
+            Some((one.clone(), root_ts.clone())),
+            "the huddle thread opens in the huddle's workspace"
+        );
+    });
+    let canvas_loads = |core: &TestCoreHandle| {
+        (core.drain_commands().into_iter())
+            .filter(|c| matches!(c, Command::Collab(CollabCommand::LoadCanvas { .. })))
+            .count()
+    };
+    assert_eq!(
+        (canvas_loads(&c1), canvas_loads(&c2)),
+        (1, 0),
+        "the notes canvas loads from the huddle's workspace"
+    );
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.switch_workspace(1, window, cx));
+    });
+    cx.run_until_parked();
+    let _ = (c1.drain_commands(), c2.drain_commands());
+
     // 3. A DM huddle invite from workspace one rings while workspace two is shown, and
     // declining answers workspace one.
     cx.update(|_, cx| {

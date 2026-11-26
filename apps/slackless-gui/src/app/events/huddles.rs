@@ -4,6 +4,18 @@
 use super::super::*;
 
 impl App {
+    /// Show the workspace running the huddle: what its dock opens (its channel, its thread, its
+    /// notes canvas) belongs there.
+    pub(in crate::app) fn show_huddle_workspace(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(owner) = self.huddle_owner {
+            self.switch_workspace(owner, window, cx);
+        }
+    }
+
     pub(in crate::app) fn on_huddle_media_event(
         &mut self,
         event: &HuddleMediaEvent,

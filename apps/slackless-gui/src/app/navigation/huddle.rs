@@ -346,13 +346,15 @@ impl App {
                     this.open_huddle_floating_panel(window, cx);
                 }
                 crate::huddle_dock::HuddleDockEvent::JumpToChannel(ch) => {
-                    if let Some(owner) = this.huddle_owner {
-                        this.switch_workspace(owner, window, cx);
-                    }
+                    this.show_huddle_workspace(window, cx);
                     this.select(ch.clone(), cx);
                 }
-                crate::huddle_dock::HuddleDockEvent::OpenThread => this.toggle_huddle_thread(cx),
+                crate::huddle_dock::HuddleDockEvent::OpenThread => {
+                    this.show_huddle_workspace(window, cx);
+                    this.toggle_huddle_thread(cx);
+                }
                 crate::huddle_dock::HuddleDockEvent::OpenCanvas(fid) => {
+                    this.show_huddle_workspace(window, cx);
                     this.open_huddle_canvas(fid.clone(), cx);
                 }
                 crate::huddle_dock::HuddleDockEvent::CopyLink(ch) => {
@@ -618,8 +620,14 @@ impl App {
         let title = format!("Huddle — {label}");
         let on_jump = self.popout_jump_handler(window, cx);
         let this = cx.weak_entity();
+        let main_window = window.window_handle();
         let on_open_canvas: crate::popout::CanvasOpenHandler = Rc::new(move |fid, cx| {
-            let _ = this.update(cx, |app, cx| app.open_huddle_canvas(fid, cx));
+            let _ = main_window.update(cx, |_, window, cx| {
+                this.update(cx, |app, cx| {
+                    app.show_huddle_workspace(window, cx);
+                    app.open_huddle_canvas(fid, cx);
+                })
+            });
         });
         let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
