@@ -141,6 +141,45 @@ struct HuddleMediaHub;
 
 impl EventEmitter<HuddleMediaEvent> for HuddleMediaHub {}
 
+/// Test controller paired with [`CoreBridge::test_harness`]: captures every outgoing [`Command`]
+/// sent by GUI views and lets tests push [`Event`]s / [`HuddleMediaEvent`]s through the real GPUI
+/// subscription hubs while sharing the real SQLite [`SharedStore`].
+#[cfg(test)]
+pub(crate) struct TestCoreHandle {
+    commands: Mutex<futures::channel::mpsc::UnboundedReceiver<Command>>,
+    hub: Entity<EventHub>,
+    media_hub: Entity<HuddleMediaHub>,
+    store: SharedStore,
+}
+
+#[cfg(test)]
+impl TestCoreHandle {
+    /// Drain every [`Command`] sent by the GUI since the previous call.
+    pub(crate) fn drain_commands(&self) -> Vec<Command> {
+        let mut rx = self.commands.lock().expect("test command receiver lock");
+        let mut out = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            out.push(cmd);
+        }
+        out
+    }
+
+    /// Emit a core [`Event`] through the real GPUI `EventHub` entity.
+    pub(crate) fn emit(&self, event: Event, cx: &mut gpui::App) {
+        self.hub.update(cx, |_, cx| cx.emit(event));
+    }
+
+    /// Emit a high-frequency [`HuddleMediaEvent`] through the real GPUI `HuddleMediaHub` entity.
+    pub(crate) fn emit_media(&self, event: HuddleMediaEvent, cx: &mut gpui::App) {
+        self.media_hub.update(cx, |_, cx| cx.emit(event));
+    }
+
+    /// Access the shared SQLite store backing this workspace.
+    pub(crate) fn store(&self) -> &SharedStore {
+        &self.store
+    }
+}
+
 pub struct CoreBridge {
     /// Live mode: forwards commands into the core's command loop. Fixture mode: `None`.
     commands: Option<UnboundedSender<Command>>,
@@ -188,6 +227,38 @@ impl CoreBridge {
             session: Some(session),
             ..Self::offline()
         }
+    }
+
+    /// Fully wired in-process test bridge: captures every outgoing [`Command`] sent by the GUI
+    /// and exposes real GPUI [`EventHub`] / [`HuddleMediaHub`] emitters plus the real SQLite
+    /// `store`, so `#[gpui::test]` suites verify true `UI -> Command -> Store/Event -> UI` loops
+    /// instead of calling internal methods directly on an offline stub.
+    #[cfg(test)]
+    pub(crate) fn test_harness(
+        session: Session,
+        store: SharedStore,
+        cx: &mut gpui::App,
+    ) -> (Self, TestCoreHandle) {
+        let (cmd_tx, cmd_rx) = futures::channel::mpsc::unbounded();
+        let hub = cx.new(|_| EventHub);
+        let media_hub = cx.new(|_| HuddleMediaHub);
+        let bridge = Self {
+            commands: Some(cmd_tx),
+            core_thread: None,
+            store: Some(Arc::clone(&store)),
+            reader: None,
+            session: Some(session),
+            fetcher: None,
+            hub: Some(hub.clone()),
+            media_hub: Some(media_hub.clone()),
+        };
+        let handle = TestCoreHandle {
+            commands: Mutex::new(cmd_rx),
+            hub,
+            media_hub,
+            store,
+        };
+        (bridge, handle)
     }
 
     /// Starts the core live for `session`: opens its durable store and starts slackless-core on

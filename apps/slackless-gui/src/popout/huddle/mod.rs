@@ -10,8 +10,7 @@ use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::{Sizable as _, h_flex, h_resizable, resizable_panel};
 use gpui_kit::gpui::{
     Background, ClickEvent, Focusable as _, FontWeight, Hsla, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PathBuilder, StatefulInteractiveElement as _, canvas, hsla,
-    linear_color_stop, linear_gradient, rgb, rgba,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, StatefulInteractiveElement as _, canvas,
 };
 use slackless_core::{CollabCommand, HuddleCommand, HuddleControlCommand};
 
@@ -81,8 +80,8 @@ struct HuddlePalette {
 impl HuddlePalette {
     fn for_theme(bg_id: Option<&str>, cx: &App) -> Self {
         let theme = cx.theme();
-        let dark_mode = theme.mode.is_dark();
         let chrome_dark = crate::theme::sidebar_is_dark(cx);
+        let stage = crate::theme::huddle_stage_tokens(bg_id, theme);
 
         let (
             chrome_bg,
@@ -116,95 +115,8 @@ impl HuddlePalette {
                 theme.border,
                 theme.foreground.opacity(0.08),
                 theme.foreground.opacity(0.15),
-                Hsla::from(rgb(0x2B2D31)),
-                Hsla::from(rgb(0xFFFFFF)),
-            )
-        };
-
-        let (stage_a, stage_b, stage_solid, tile_bg, stage_is_dark) = match bg_id {
-            Some("meadow") => (
-                Hsla::from(rgb(0xBCE3CC)),
-                Hsla::from(rgb(0xDCF2E4)),
-                Hsla::from(rgb(0xCBEAD7)),
-                Hsla::from(rgb(0xFFFFFF)),
-                false,
-            ),
-            Some("sky") => (
-                Hsla::from(rgb(0xC5E5FA)),
-                Hsla::from(rgb(0xE8F5FE)),
-                Hsla::from(rgb(0xD6EEFC)),
-                Hsla::from(rgb(0xFFFFFF)),
-                false,
-            ),
-            Some("midnight") => (
-                Hsla::from(rgb(0x0E1629)),
-                Hsla::from(rgb(0x1B294A)),
-                Hsla::from(rgb(0x10172A)),
-                Hsla::from(rgb(0x1B2440)),
-                true,
-            ),
-            Some("sunset") => (
-                Hsla::from(rgb(0x2B1818)),
-                Hsla::from(rgb(0x472329)),
-                Hsla::from(rgb(0x2B1818)),
-                Hsla::from(rgb(0x3B2222)),
-                true,
-            ),
-            Some("forest") => (
-                Hsla::from(rgb(0x10241C)),
-                Hsla::from(rgb(0x1C3D30)),
-                Hsla::from(rgb(0x11221B)),
-                Hsla::from(rgb(0x1B3328)),
-                true,
-            ),
-            Some("ocean") => (
-                Hsla::from(rgb(0x0D2230)),
-                Hsla::from(rgb(0x183A52)),
-                Hsla::from(rgb(0x0F212E)),
-                Hsla::from(rgb(0x183244)),
-                true,
-            ),
-            Some("plum") => (
-                Hsla::from(rgb(0x24142B)),
-                Hsla::from(rgb(0x3D1D47)),
-                Hsla::from(rgb(0x24142B)),
-                Hsla::from(rgb(0x351F3E)),
-                true,
-            ),
-            _ if dark_mode => {
-                let top = theme.background.blend(theme.title_bar.opacity(0.35));
-                let bot = theme.background;
-                (top, bot, bot, theme.muted, true)
-            }
-            _ => {
-                // Light default: serene pastel sage wash reminiscent of official Slack's
-                // sunlit botanical huddle canvas, bright and airy instead of black.
-                (
-                    Hsla::from(rgb(0xC2E6CE)),
-                    Hsla::from(rgb(0xE1F4E8)),
-                    Hsla::from(rgb(0xD2EEDC)),
-                    Hsla::from(rgb(0xFFFFFF)),
-                    false,
-                )
-            }
-        };
-
-        let stage_bg = linear_gradient(
-            145.,
-            linear_color_stop(stage_a, 0.),
-            linear_color_stop(stage_b, 1.),
-        );
-        let (tile_border, tile_pill_bg, tile_pill_fg) = if stage_is_dark {
-            (
-                Hsla::from(rgba(0xFFFFFF22)),
-                Hsla::from(rgba(0x0E1014CC)),
-                Hsla::from(rgb(0xFFFFFF)),
-            )
-        } else {
-            (
-                Hsla::from(rgba(0xFFFFFFEE)),
-                Hsla::from(rgba(0xFFFFFFE6)),
-                Hsla::from(rgb(0x1D1C1D)),
+                stage.light_ctrl_active_bg,
+                stage.light_ctrl_active_fg,
             )
         };
 
@@ -217,15 +129,15 @@ impl HuddlePalette {
             ctrl_hover,
             ctrl_active_bg,
             ctrl_active_fg,
-            stage_bg,
-            stage_solid,
-            tile_bg,
-            tile_border,
-            tile_pill_bg,
-            tile_pill_fg,
-            scrim_bg: Hsla::from(rgba(0x14171CE2)),
-            scrim_fg: Hsla::from(rgb(0xFFFFFF)),
-            scrim_muted: Hsla::from(rgb(0xD1D2D3)),
+            stage_bg: stage.stage_bg,
+            stage_solid: stage.stage_solid,
+            tile_bg: stage.tile_bg,
+            tile_border: stage.tile_border,
+            tile_pill_bg: stage.tile_pill_bg,
+            tile_pill_fg: stage.tile_pill_fg,
+            scrim_bg: stage.scrim_bg,
+            scrim_fg: stage.scrim_fg,
+            scrim_muted: stage.scrim_muted,
             drawer_bg: theme.background,
             drawer_fg: theme.foreground,
             drawer_muted: theme.muted_foreground,

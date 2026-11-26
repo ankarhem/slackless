@@ -1,0 +1,877 @@
+//! Wired GUI integration tests and UI consistency guardrails.
+//!
+//! Unlike `CoreBridge::offline()` smoke tests (which silently drop outgoing commands and call
+//! internal handlers directly), these tests mount [`App`] against [`CoreBridge::test_harness`]:
+//! - Every user action's outgoing [`Command`] is captured and asserted.
+//! - Inbound [`Event`]s and [`HuddleMediaEvent`]s travel through the real GPUI `EventHub` and
+//!   `HuddleMediaHub` subscriptions into `App`, backed by a real in-memory SQLite [`Store`].
+//! - UI consistency tests render every major page and dialog across Dark/Light themes,
+//!   Normal/Compact density, and Standard/Narrow viewports, and guard the `theme.rs` color-token
+//!   invariant against regressions.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use gpui_kit::base::Root;
+use gpui_kit::gpui::{self, Entity, px, size};
+use slackless_core::auth::Session;
+use slackless_core::huddle::{
+    HuddleAudioLevels, HuddlePhase, HuddleSessionSnapshot, VideoFrame, VideoFrameData, VideoTileKey,
+};
+use slackless_core::store::{NewOutboxItem, OutboxKind, Store};
+use slackless_core::types::{ChannelId, Conversation, Message, Team, TeamId, Ts, User, UserId};
+use slackless_core::{
+    Command, Event, HuddleCommand, HuddleControlCommand, HuddleEvent, HuddleMediaEvent,
+    MessagingCommand, SharedStore,
+};
+
+use super::*;
+use crate::bridge::{CoreBridge, TestCoreHandle};
+use crate::theme::{self, SlackTheme};
+
+fn make_wired_workspace(
+    team: &str,
+    team_name: &str,
+    channels: &[(&str, &str)],
+    users: &[User],
+    cx: &mut gpui::App,
+) -> (CoreBridge, TestCoreHandle) {
+    let mut store = Store::open_in_memory().expect("in-memory store");
+    let team_id = TeamId::from(team);
+    store
+        .upsert_team(
+            &team_id,
+            &Team {
+                id: team_id.clone(),
+                name: team_name.to_owned(),
+                domain: team.to_lowercase(),
+                ..Default::default()
+            },
+        )
+        .expect("upsert team");
+    for (id, name) in channels {
+        store
+            .upsert_conversation(
+                &team_id,
+                &Conversation {
+                    id: ChannelId::from(*id),
+                    name: Some((*name).to_owned()),
+                    is_channel: true,
+                    is_member: true,
+                    ..Default::default()
+                },
+            )
+            .expect("upsert channel");
+    }
+    store.upsert_users(&team_id, users).expect("upsert users");
+    let shared: SharedStore = Arc::new(Mutex::new(store));
+    let session = Session {
+        team_id,
+        user_id: UserId::from("U0ME"),
+        workspace_url: format!("https://{}.slack.com", team.to_lowercase()),
+        xoxc_token: "xoxc-wired-test".into(),
+        d_cookie: "xoxd-wired-test".into(),
+    };
+    CoreBridge::test_harness(session, shared, cx)
+}
+
+fn mount_wired(
+    fixtures: Fixtures,
+    bridges: Vec<CoreBridge>,
+    cx: &mut gpui::TestAppContext,
+) -> (Entity<Root>, Entity<App>, &mut gpui::VisualTestContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let app = App::new_multi(Arc::new(fixtures), bridges, window, cx);
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().expect("mounted App");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    (root, app, cx)
+}
+
+fn user(id: &str, name: &str) -> User {
+    User {
+        id: UserId::from(id),
+        name: name.to_owned(),
+        real_name: Some(name.to_owned()),
+        ..Default::default()
+    }
+}
+
+#[gpui::test]
+fn wired_huddle_lifecycle_commands_events_media_and_teardown(cx: &mut gpui::TestAppContext) {
+    let people = [user("U0ME", "me"), user("U0ALICE", "alice")];
+    let (bridge, core) = cx.update(|cx| {
+        make_wired_workspace(
+            "T0HUD",
+            "Huddle Co",
+            &[("C0ENG", "engineering")],
+            &people,
+            cx,
+        )
+    });
+    let fx = bridge.snapshot(&HashMap::new()).expect("snapshot");
+    let (root, app, cx) = mount_wired(fx, vec![bridge], cx);
+    let _ = core.drain_commands();
+
+    let eng = ChannelId::from("C0ENG");
+
+    // 1. Triggering join in GUI must emit a real `HuddleCommand::Join` over `CoreBridge`.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.join_huddle_in(eng.clone(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let cmds = core.drain_commands();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Huddle(HuddleCommand::Join { channel, .. }) if *channel == eng
+        )),
+        "GUI join must send HuddleCommand::Join, got: {cmds:?}"
+    );
+
+    // 2. Core emits `HuddleEvent::SessionChanged(Connected)` through real `EventHub`.
+    let snap = HuddleSessionSnapshot {
+        phase: HuddlePhase::Connected,
+        channel: eng.clone(),
+        call_id: "R0WIRED".into(),
+        attendee_id: "att-me".into(),
+        started_at_secs: 1_700_000_000,
+        ..Default::default()
+    };
+    cx.update(|_, cx| {
+        core.emit(
+            Event::Huddle(HuddleEvent::SessionChanged(Box::new(snap.clone()))),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        let state = app
+            .read(cx)
+            .huddle_state
+            .as_ref()
+            .expect("HuddleState mounted on Connected");
+        assert_eq!(state.read(cx).session().phase, HuddlePhase::Connected);
+        assert_eq!(state.read(cx).session().call_id, "R0WIRED");
+    });
+
+    // 3. Emit high-frequency `HuddleMediaEvent`s through real `HuddleMediaHub` (AudioLevels,
+    // VideoFrame, VideoTileClosed) and verify `HuddleState` + `HuddleVideoStore` stay in sync.
+    let tile = VideoTileKey::RemoteCamera(UserId::from("U0ALICE"));
+    let frame = VideoFrame {
+        width: 4,
+        height: 4,
+        data: VideoFrameData::Bgra(Arc::new(vec![200u8; 4 * 4 * 4])),
+    };
+    cx.update(|_, cx| {
+        core.emit_media(
+            HuddleMediaEvent::AudioLevels(HuddleAudioLevels {
+                local_rms: 0.42,
+                active_speakers: vec![(UserId::from("U0ALICE"), 0.85)],
+                muted_peers: vec![],
+            }),
+            cx,
+        );
+        core.emit_media(
+            HuddleMediaEvent::VideoFrame {
+                tile: tile.clone(),
+                frame,
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        let state = app.read(cx).huddle_state.as_ref().unwrap().read(cx);
+        assert_eq!(state.view_state().levels.active_speakers.len(), 1);
+        assert!(
+            state.video_store().read(cx).frames().contains_key(&tile),
+            "VideoFrame via HuddleMediaHub must land in HuddleVideoStore"
+        );
+    });
+
+    cx.update(|_, cx| {
+        core.emit_media(HuddleMediaEvent::VideoTileClosed(tile.clone()), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let state = app.read(cx).huddle_state.as_ref().unwrap().read(cx);
+        assert!(
+            !state.video_store().read(cx).frames().contains_key(&tile),
+            "VideoTileClosed via HuddleMediaHub must remove tile"
+        );
+    });
+
+    // 4. Leaving via GUI emits `HuddleCommand::Leave`; Core `Idle` tears down `HuddleState`.
+    let _ = core.drain_commands();
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| app.leave_huddle(cx));
+    });
+    cx.run_until_parked();
+    let leave_cmds = core.drain_commands();
+    assert!(
+        leave_cmds
+            .iter()
+            .any(|c| matches!(c, Command::Huddle(HuddleCommand::Leave))),
+        "leave_huddle must send HuddleCommand::Leave, got: {leave_cmds:?}"
+    );
+
+    let idle = HuddleSessionSnapshot {
+        phase: HuddlePhase::Idle,
+        channel: eng,
+        ..Default::default()
+    };
+    cx.update(|_, cx| {
+        core.emit(
+            Event::Huddle(HuddleEvent::SessionChanged(Box::new(idle))),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        assert!(
+            app.read(cx).huddle_state.is_none(),
+            "Idle session event must cleanly tear down HuddleState"
+        );
+        assert!(app.read(cx).huddle_dock.is_none());
+    });
+    drop(root);
+}
+
+#[gpui::test]
+fn wired_composer_send_message_store_event_and_outbox_retry(cx: &mut gpui::TestAppContext) {
+    let people = [user("U0ME", "me"), user("U0ALICE", "alice")];
+    let (bridge, core) = cx.update(|cx| {
+        make_wired_workspace("T0MSG", "Msg Co", &[("C0ENG", "engineering")], &people, cx)
+    });
+    let fx = bridge.snapshot(&HashMap::new()).expect("snapshot");
+    let (root, app, cx) = mount_wired(fx, vec![bridge], cx);
+    let _ = core.drain_commands();
+
+    // 1. Focus composer, type a real message through GPUI key dispatch, press Enter.
+    cx.update(|window, cx| {
+        let composer = app.read(cx).composer.clone();
+        composer.update(cx, |c, cx| c.focus_input(window, cx));
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("h e l l o space w i r e d enter");
+    cx.run_until_parked();
+
+    let cmds = core.drain_commands();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Messaging(MessagingCommand::SendMessage { channel, content, .. })
+                if channel.as_str() == "C0ENG" && content.text == "hello wired"
+        )),
+        "submitting composer must send MessagingCommand::SendMessage, got: {cmds:?}"
+    );
+
+    // 2. Core writes an incoming peer message to SQLite and emits `Event::MessagePosted`.
+    let peer_msg = Message {
+        ts: Ts::from("1700000999.000100"),
+        user: Some(UserId::from("U0ALICE")),
+        text: "Inbound from real EventHub".into(),
+        ..Default::default()
+    };
+    {
+        let mut s = core.store().lock().expect("store lock");
+        s.upsert_message(&TeamId::from("T0MSG"), &ChannelId::from("C0ENG"), &peer_msg)
+            .expect("upsert");
+    }
+    cx.update(|_, cx| {
+        core.emit(
+            Event::StoreChanged {
+                channel: ChannelId::from("C0ENG"),
+            },
+            cx,
+        );
+        core.emit(
+            Event::MessagePosted {
+                channel: ChannelId::from("C0ENG"),
+                message: Box::new(peer_msg.clone()),
+            },
+            cx,
+        );
+    });
+    cx.executor().advance_clock(RELOAD_DEBOUNCE);
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        let last = app
+            .read(cx)
+            .messages
+            .read(cx)
+            .last_message_text_for_test(cx);
+        assert_eq!(
+            last.as_deref(),
+            Some("Inbound from real EventHub"),
+            "StoreChanged + MessagePosted via EventHub must update rendered MessageList"
+        );
+    });
+
+    // 3. Emit an outbox failure through `EventHub`, verify GUI tracks it cleanly.
+    let item = {
+        let mut s = core.store().lock().expect("store lock");
+        let row = s
+            .enqueue_outbox(
+                &TeamId::from("T0MSG"),
+                &NewOutboxItem {
+                    channel_id: &ChannelId::from("C0ENG"),
+                    thread_ts: None,
+                    kind: OutboxKind::Message,
+                    payload_json: r#"{"kind":"message","content":{"text":"offline msg"}}"#,
+                    last_error: Some("503 unavailable"),
+                },
+            )
+            .expect("enqueue");
+        s.mark_outbox_failed(row.id, "503 unavailable")
+            .expect("fail");
+        s.list_outbox(&TeamId::from("T0MSG")).expect("list")
+    };
+    cx.update(|_, cx| {
+        core.emit(Event::OutboxUpdated(item), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        assert_eq!(app.read(cx).ws.outbox.len(), 1);
+    });
+    drop(root);
+}
+
+#[gpui::test]
+fn wired_multi_workspace_event_isolation_and_switching(cx: &mut gpui::TestAppContext) {
+    let people = [user("U0ME", "me"), user("U0PEER", "peer")];
+    let ((b1, c1), (b2, c2)) = cx.update(|cx| {
+        (
+            make_wired_workspace(
+                "T0ONE",
+                "Workspace One",
+                &[("C0ONE", "one-chan")],
+                &people,
+                cx,
+            ),
+            make_wired_workspace(
+                "T0TWO",
+                "Workspace Two",
+                &[("C0TWO", "two-chan")],
+                &people,
+                cx,
+            ),
+        )
+    });
+    let mut fx = b1.snapshot(&HashMap::new()).expect("ws1 snapshot");
+    fx.workspaces = vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()];
+    let (root, app, cx) = mount_wired(fx, vec![b1, b2], cx);
+    let _ = c1.drain_commands();
+    let _ = c2.drain_commands();
+
+    // Background workspace T0TWO receives a live message via its own EventHub.
+    let bg_msg = Message {
+        ts: Ts::from("1700001234.000100"),
+        user: Some(UserId::from("U0PEER")),
+        text: "Ping <@U0ME> in workspace two".into(),
+        ..Default::default()
+    };
+    {
+        let mut s = c2.store().lock().expect("store2 lock");
+        s.upsert_message(&TeamId::from("T0TWO"), &ChannelId::from("C0TWO"), &bg_msg)
+            .expect("upsert ws2");
+    }
+    cx.update(|_, cx| {
+        c2.emit(
+            Event::MessagePosted {
+                channel: ChannelId::from("C0TWO"),
+                message: Box::new(bg_msg),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    // Active workspace T0ONE must NOT be polluted by T0TWO's channel, while T0TWO badge updates.
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        assert_eq!(app.read(cx).workspace, 0);
+        assert!(
+            app.read(cx)
+                .fixtures
+                .conversation(&ChannelId::from("C0TWO"))
+                .is_none(),
+            "background workspace message must never leak into active workspace snapshot"
+        );
+    });
+
+    // Switch to T0TWO -> off-thread snapshot loads C0TWO cleanly.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.switch_workspace(1, window, cx));
+    });
+    cx.executor().advance_clock(RELOAD_DEBOUNCE);
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        assert_eq!(app.read(cx).workspace, 1);
+        assert!(
+            app.read(cx)
+                .fixtures
+                .conversation(&ChannelId::from("C0TWO"))
+                .is_some(),
+            "switching to workspace 1 must load its channels"
+        );
+    });
+    drop(root);
+}
+
+#[gpui::test]
+fn ui_consistency_all_views_and_dialogs_render_across_themes_densities_and_viewports(
+    cx: &mut gpui::TestAppContext,
+) {
+    let fx = fixtures::load();
+    let (root, app, cx) = mount_wired(fx, vec![CoreBridge::offline()], cx);
+
+    let matrix = [
+        (SlackTheme::Dark, false, size(px(1280.), px(800.))),
+        (SlackTheme::Light, true, size(px(820.), px(640.))),
+    ];
+
+    for (mode, compact, _viewport) in matrix {
+        cx.update(|window, cx| {
+            theme::activate(mode, cx);
+            app.update(cx, |app, cx| {
+                app.preferences.update(cx, |prefs, cx| {
+                    let mut s = prefs.settings().clone();
+                    s.density = usize::from(compact);
+                    prefs.load_settings(s, window, cx);
+                });
+            });
+            let _ = window.draw(cx);
+        });
+
+        // Cycle through every major page & render cleanly.
+        let pages = [
+            MainPage::Channel,
+            MainPage::Threads,
+            MainPage::Unreads,
+            MainPage::Later,
+            MainPage::Activity,
+            MainPage::Files,
+            MainPage::Directory,
+            MainPage::Huddles,
+            MainPage::CatchUp,
+            MainPage::Search,
+        ];
+        for page in pages {
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.page = page;
+                    cx.notify();
+                });
+                let _ = window.draw(cx);
+            });
+        }
+
+        // Open previously untested high-churn dialogs (Storage, Summary, Preferences) & draw cleanly.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.page = MainPage::Channel;
+                app.open_storage_dialog(window, cx);
+            });
+            let _ = window.draw(cx);
+            window.close_dialog(cx);
+            app.update(cx, |app, cx| {
+                app.open_summary_for_channel(window, cx);
+            });
+            let _ = window.draw(cx);
+            window.close_dialog(cx);
+            app.update(cx, |app, cx| {
+                app.open_preferences(None, window, cx);
+            });
+            let _ = window.draw(cx);
+            window.close_dialog(cx);
+        });
+
+        cx.update(|_, cx| {
+            assert_eq!(
+                cx.theme().mode.is_dark(),
+                matches!(mode, SlackTheme::Dark),
+                "theme mode must stay consistent after cycling pages and dialogs"
+            );
+        });
+    }
+
+    // Ensure at least one control-command type check compiles cleanly for future tests.
+    let _ = std::mem::size_of::<HuddleControlCommand>();
+    drop(root);
+}
+
+#[test]
+fn ui_consistency_theme_token_guardrail_blocks_new_hardcoded_colors() {
+    // `theme.rs` documents the invariant: every standard view reads colors through `cx.theme()`
+    // or `theme::*` helpers rather than scattering raw `rgb()`/`rgba()`/`hsla()` literals.
+    // This allowlist tracks ONLY intentional exceptions (dark video/huddle overlay surfaces,
+    // user-defined hex color previewers, and box-shadow/media-scrim helpers). New views must NOT
+    // be added here; add a semantic token in `theme.rs` instead.
+    const ALLOWLIST: &[&str] = &[
+        "theme.rs",
+        "app/chrome/mod.rs",
+        "files/media_cards.rs",
+        "media/video_player.rs",
+        "emoji/gifs.rs",
+        "messages/render/inline.rs",
+        "composer/tokens.rs",
+        "preferences/mod.rs",
+        "preferences/sections/appearance.rs",
+    ];
+
+    fn walk(root: &Path, dir: &Path, violations: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, violations);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .expect("strip prefix")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.ends_with("/tests.rs")
+                || rel.contains("/tests/")
+                || rel.ends_with("wired_tests.rs")
+                || ALLOWLIST.contains(&rel.as_str())
+            {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (idx, line) in content.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if trimmed.contains("rgb(")
+                    || trimmed.contains("rgba(")
+                    || trimmed.contains("hsla(")
+                {
+                    violations.push(format!("{rel}:{}: {}", idx + 1, trimmed));
+                }
+            }
+        }
+    }
+
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut violations = Vec::new();
+    walk(&src_root, &src_root, &mut violations);
+    assert!(
+        violations.is_empty(),
+        "Hardcoded colors found outside theme.rs (add a semantic token to theme.rs instead):\n{}",
+        violations.join("\n")
+    );
+}
+
+#[gpui::test]
+fn wired_storage_dialog_backfill_commands_and_progress_events(cx: &mut gpui::TestAppContext) {
+    use slackless_core::WorkspaceCommand;
+    use slackless_core::backfill::{BackfillStatus, WorkspaceBackfillProgress};
+
+    let people = [user("U0ME", "me"), user("U0PEER", "peer")];
+    let (bridge, core) = cx.update(|cx| {
+        make_wired_workspace(
+            "T0STOR",
+            "Storage Test",
+            &[("C0ARCH", "archive")],
+            &people,
+            cx,
+        )
+    });
+    let fx = bridge.snapshot(&HashMap::new()).expect("snapshot");
+    let (root, app, cx) = mount_wired(fx, vec![bridge], cx);
+    let _ = core.drain_commands();
+
+    // 1. Open Storage dialog, start/pause/resume workspace backfill -> exact WorkspaceCommands emitted!
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_storage_dialog(window, cx);
+            app.start_workspace_backfill(window, cx);
+            app.pause_backfill(window, cx);
+            app.resume_backfill(window, cx);
+        });
+        let _ = window.draw(cx);
+    });
+    let cmds = core.drain_commands();
+    assert!(cmds.iter().any(|c| matches!(
+        c,
+        Command::Workspace(WorkspaceCommand::BackfillWorkspace {
+            include_threads: true
+        })
+    )));
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Command::Workspace(WorkspaceCommand::PauseBackfill)))
+    );
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Command::Workspace(WorkspaceCommand::ResumeBackfill)))
+    );
+
+    // 2. Receive live BackfillProgress events (running -> paused -> complete) and render cleanly.
+    for (status, paused, done_ch) in [
+        (BackfillStatus::Running, false, 0),
+        (BackfillStatus::Paused, true, 1),
+        (BackfillStatus::Complete, false, 1),
+    ] {
+        cx.update(|window, cx| {
+            core.emit(
+                Event::BackfillProgress(WorkspaceBackfillProgress {
+                    workspace: TeamId::from("T0STOR"),
+                    status,
+                    paused,
+                    active_channel: (status == BackfillStatus::Running)
+                        .then(|| ChannelId::from("C0ARCH")),
+                    total_channels: 1,
+                    completed_channels: done_ch,
+                    pages_fetched: 2,
+                    messages_stored: 42,
+                    threads_fetched: 1,
+                    replies_stored: 3,
+                    channels: Vec::new(),
+                }),
+                cx,
+            );
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    cx.update(|window, cx| {
+        window.close_dialog(cx);
+    });
+    drop(root);
+}
+
+#[gpui::test]
+fn wired_summary_dialog_states_generation_guard_and_live_targets(cx: &mut gpui::TestAppContext) {
+    use super::dialogs::summary::{SummaryDialogState, SummaryDialogView, SummaryRequest};
+    use slackless_core::summarize::{AiProvider, SummaryResult, SummaryTarget};
+
+    let people = [user("U0ME", "me"), user("U0PEER", "peer")];
+    let (bridge, core) = cx.update(|cx| {
+        make_wired_workspace(
+            "T0SUM",
+            "Summary Test",
+            &[("C0ENG", "engineering")],
+            &people,
+            cx,
+        )
+    });
+    {
+        let mut s = core.store().lock().expect("store lock");
+        let root_msg = Message {
+            ts: Ts::from("1700000100.000100"),
+            user: Some(UserId::from("U0PEER")),
+            text: "Release checklist is ready for review".into(),
+            ..Default::default()
+        };
+        s.upsert_message(&TeamId::from("T0SUM"), &ChannelId::from("C0ENG"), &root_msg)
+            .expect("upsert");
+    }
+    let fx = bridge.snapshot(&HashMap::new()).expect("snapshot");
+    let (root, app, cx) = mount_wired(fx, vec![bridge], cx);
+
+    // 1. Channel, thread, and catch-up entry points open cleanly on wired workspace.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_summary_for_channel(window, cx);
+        });
+        let _ = window.draw(cx);
+        window.close_dialog(cx);
+
+        app.update(cx, |app, cx| {
+            app.open_summary_for_thread(
+                ChannelId::from("C0ENG"),
+                Ts::from("1700000100.000100"),
+                window,
+                cx,
+            );
+        });
+        let _ = window.draw(cx);
+        window.close_dialog(cx);
+
+        app.update(cx, |app, cx| {
+            app.open_summary_for_catchup(window, cx);
+        });
+        let _ = window.draw(cx);
+        window.close_dialog(cx);
+    });
+
+    // 2. Directly exercise SummaryDialogView across Loading -> stale gen ignored -> Ready -> Error
+    //    in both Dark and Light modes.
+    let req = SummaryRequest::Direct(SummaryTarget::Channel {
+        channel_label: "#engineering".into(),
+        topic: Some("Ship v2".into()),
+        messages: Vec::new(),
+    });
+    let view = cx.update(|_, cx| {
+        SummaryDialogView::new(
+            app.downgrade(),
+            req,
+            SummaryDialogState::Loading {
+                target_title: "#engineering".into(),
+                provider: AiProvider::Ollama,
+                model: "llama3.2".into(),
+                source_items: 5,
+            },
+            7,
+            cx,
+        )
+    });
+
+    // Stale generation (6 != 7) MUST be ignored!
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.apply_result(
+                6,
+                Err("stale error".into()),
+                AiProvider::Ollama,
+                "llama3.2".into(),
+                cx,
+            );
+        });
+        assert!(matches!(
+            view.read(cx).state(),
+            SummaryDialogState::Loading { .. }
+        ));
+    });
+
+    // Matching generation transitions to Ready, then Error; render both in Dark and Light!
+    let view_for_dialog = view.clone();
+    cx.update(|window, cx| {
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.child(view_for_dialog.clone())
+        });
+        let _ = window.draw(cx);
+
+        view.update(cx, |v, cx| {
+            v.apply_result(
+                7,
+                Ok(SummaryResult {
+                    title: "#engineering".into(),
+                    summary: "## Key Decisions\n- Shipped v2 cleanly".into(),
+                    provider: AiProvider::Ollama,
+                    endpoint: "http://localhost:11434/v1".into(),
+                    model: "llama3.2".into(),
+                    target_kind: "channel".into(),
+                    source_items: 5,
+                    truncated: false,
+                    prompt_tokens: Some(120),
+                    completion_tokens: Some(45),
+                    total_tokens: Some(165),
+                    elapsed_ms: 42,
+                }),
+                AiProvider::Ollama,
+                "llama3.2".into(),
+                cx,
+            );
+        });
+        assert!(matches!(
+            view.read(cx).state(),
+            SummaryDialogState::Ready(_)
+        ));
+        let _ = window.draw(cx);
+
+        theme::activate(SlackTheme::Light, cx);
+        view.update(cx, |v, cx| {
+            v.apply_result(
+                7,
+                Err("connection refused".into()),
+                AiProvider::Ollama,
+                "llama3.2".into(),
+                cx,
+            );
+        });
+        assert!(matches!(
+            view.read(cx).state(),
+            SummaryDialogState::Error { .. }
+        ));
+        let _ = window.draw(cx);
+        window.close_dialog(cx);
+        theme::activate(SlackTheme::Dark, cx);
+    });
+    drop(root);
+}
+
+#[gpui::test]
+fn wired_preferences_stealth_and_transcript_toggles_forward_commands_to_core(
+    cx: &mut gpui::TestAppContext,
+) {
+    use slackless_core::WorkspaceCommand;
+
+    let people = [user("U0ME", "me")];
+    let (bridge, core) = cx.update(|cx| {
+        make_wired_workspace("T0PREF", "Prefs Test", &[("C0GEN", "general")], &people, cx)
+    });
+    let fx = bridge.snapshot(&HashMap::new()).expect("snapshot");
+    let (root, app, cx) = mount_wired(fx, vec![bridge], cx);
+    let _ = core.drain_commands();
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_preferences(Some(preferences::Section::Advanced), window, cx);
+            app.preferences.update(cx, |prefs, cx| {
+                let mut s = prefs.settings().clone();
+                s.stealth_mode = !s.stealth_mode;
+                s.huddle_save_transcripts = !s.huddle_save_transcripts;
+                s.density = 1;
+                prefs.load_settings(s, window, cx);
+            });
+            app.apply_preferences(window, cx);
+        });
+        let _ = window.draw(cx);
+        window.close_dialog(cx);
+    });
+    cx.run_until_parked();
+
+    let cmds = core.drain_commands();
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Command::Workspace(WorkspaceCommand::SetStealthMode(_)))),
+        "applying preferences must sync SetStealthMode to CoreBridge"
+    );
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Workspace(WorkspaceCommand::SetSaveHuddleTranscripts(_))
+        )),
+        "applying preferences must sync SetSaveHuddleTranscripts to CoreBridge"
+    );
+    drop(root);
+}

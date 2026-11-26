@@ -17,7 +17,7 @@ use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     App, AppContext as _, Div, Entity, FontWeight, Global, Hsla, InteractiveElement as _,
     IntoElement as _, ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _,
-    Styled as _, Window, div, px, rgb,
+    Styled as _, Window, div, px,
 };
 use slackless_core::api::{
     ListAccessLevel, ListCellInput, ListCellInputValue, ListMeta, SlackListCellValue,

@@ -802,3 +802,141 @@ impl Render for HuddleDock {
         bar
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::{self, SlackTheme};
+    use gpui_kit::base::Root;
+    use gpui_kit::gpui::{self, TestAppContext};
+    use slackless_core::huddle::{HuddleAudioLevels, HuddleSessionSnapshot};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    #[gpui::test]
+    fn huddle_dock_renders_every_phase_and_theme_and_tracks_speakers_and_overflow(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_global(crate::zoom::Zoom::default());
+            gpui_kit::init(cx);
+            theme::init(cx);
+        });
+        let fx = Arc::new(crate::fixtures::load());
+        let me = fx.self_user.clone();
+        let peers: Vec<UserId> = fx
+            .users
+            .iter()
+            .filter(|u| u.id != me)
+            .take(5)
+            .map(|u| u.id.clone())
+            .collect();
+        let channel = fx.channels[0].id.clone();
+
+        let state = cx.update(|cx| {
+            let snap = HuddleSessionSnapshot {
+                phase: HuddlePhase::Connecting,
+                channel: channel.clone(),
+                call_id: "R0DOCK".into(),
+                topic: Some("Standup".into()),
+                huddle_link: Some("https://app.slack.com/huddle/T1/C1".into()),
+                ..Default::default()
+            };
+            HuddleState::new(fx.clone(), snap, peers.clone(), cx)
+        });
+        let events: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let ev_log = events.clone();
+        let dock_slot: Rc<RefCell<Option<Entity<HuddleDock>>>> = Rc::new(RefCell::new(None));
+        let dock_slot_in = dock_slot.clone();
+        let state_in = state.clone();
+
+        let (root, vcx) = cx.add_window_view(move |window, cx| {
+            let dock = HuddleDock::new(state_in.clone(), cx);
+            cx.subscribe(&dock, move |_, _, ev: &HuddleDockEvent, _| {
+                let tag = match ev {
+                    HuddleDockEvent::ToggleMute => "mute",
+                    HuddleDockEvent::ToggleCamera => "cam",
+                    HuddleDockEvent::ToggleScreenShare => "share",
+                    HuddleDockEvent::Leave => "leave",
+                    HuddleDockEvent::PopOut => "popout",
+                    HuddleDockEvent::OpenFloatingPanel => "float",
+                    HuddleDockEvent::JumpToChannel(_) => "jump",
+                    HuddleDockEvent::OpenThread => "thread",
+                    HuddleDockEvent::OpenCanvas(_) => "canvas",
+                    HuddleDockEvent::CopyLink(_) => "copy",
+                    HuddleDockEvent::OpenBrowser(_) => "browser",
+                    HuddleDockEvent::RetryJoin(_) => "retry",
+                    HuddleDockEvent::OpenAudioSettings => "audio",
+                    HuddleDockEvent::SwitchInputDevice(_) => "in",
+                    HuddleDockEvent::SwitchOutputDevice(_) => "out",
+                };
+                ev_log.borrow_mut().push(tag);
+            })
+            .detach();
+            *dock_slot_in.borrow_mut() = Some(dock.clone());
+            Root::new(dock, window, cx)
+        });
+        let dock = dock_slot.borrow_mut().take().unwrap();
+
+        // Exercise every HuddlePhase + error/UDP-blocked + Dark & Light themes + open menu.
+        for (phase, err, udp_blocked, mode) in [
+            (HuddlePhase::Joining, None, false, SlackTheme::Dark),
+            (HuddlePhase::Connecting, None, false, SlackTheme::Dark),
+            (HuddlePhase::Connected, None, false, SlackTheme::Dark),
+            (HuddlePhase::Connected, None, false, SlackTheme::Light),
+            (HuddlePhase::Reconnecting, None, false, SlackTheme::Dark),
+            (
+                HuddlePhase::Failed,
+                Some("UDP media blocked".to_owned()),
+                true,
+                SlackTheme::Light,
+            ),
+            (HuddlePhase::Leaving, None, false, SlackTheme::Dark),
+        ] {
+            vcx.update(|window, cx| {
+                theme::activate(mode, cx);
+                state.update(cx, |s, cx| {
+                    let mut snap = s.session().clone();
+                    snap.phase = phase;
+                    snap.error = err.clone();
+                    snap.udp_blocked = udp_blocked;
+                    snap.muted = matches!(phase, HuddlePhase::Reconnecting);
+                    snap.sharing = matches!(phase, HuddlePhase::Connected);
+                    snap.canvas_file_id = Some("F0CANVAS".into());
+                    s.update_session(snap, cx);
+                    s.update_levels(
+                        HuddleAudioLevels {
+                            local_rms: 0.4,
+                            active_speakers: peers
+                                .first()
+                                .cloned()
+                                .map(|u| vec![(u, 0.7)])
+                                .unwrap_or_default(),
+                            muted_peers: peers.get(1).cloned().into_iter().collect(),
+                        },
+                        cx,
+                    );
+                });
+                dock.update(cx, |d, cx| {
+                    d.menu_open = matches!(phase, HuddlePhase::Connected);
+                    // Verify helper invariants on people, speaking, muted, label, browser_url.
+                    let st = state.read(cx);
+                    assert!(d.all_people(st).contains(&me));
+                    assert!(d.all_people(st).len() >= 5);
+                    if let Some(first_peer) = peers.first() {
+                        assert!(d.is_speaking(st, first_peer));
+                    }
+                    if let Some(second_peer) = peers.get(1) {
+                        assert!(d.is_muted_user(st, second_peer));
+                    }
+                    assert!(!d.channel_label(st).is_empty());
+                    assert!(d.browser_url(st).contains("https://"));
+                    cx.notify();
+                });
+                let _ = window.draw(cx);
+            });
+        }
+        drop(root);
+    }
+}

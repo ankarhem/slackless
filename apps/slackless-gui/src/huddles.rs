@@ -15,9 +15,9 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FontWeight, Hsla, InteractiveElement as _,
+    App, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
-    div, linear_color_stop, linear_gradient, px, rgb,
+    div, px,
 };
 use slackless_core::domain::huddles::parse_huddle_room;
 use slackless_core::store::Store;
@@ -194,19 +194,7 @@ impl HuddlesView {
             theme.foreground,
             theme.muted_foreground,
         );
-        let banner_bg = if dark {
-            linear_gradient(
-                135.,
-                linear_color_stop(Hsla::from(rgb(0x1E3A34)), 0.),
-                linear_color_stop(Hsla::from(rgb(0x284359)), 1.),
-            )
-        } else {
-            linear_gradient(
-                135.,
-                linear_color_stop(Hsla::from(rgb(0x9BC7C9)), 0.),
-                linear_color_stop(Hsla::from(rgb(0xD5E2B8)), 1.),
-            )
-        };
+        let banner_bg = crate::theme::huddle_banner_gradient(dark);
         let (lock_icon, title) = self.conversation_heading(&huddle.channel);
         let people_label = match huddle.participants.len() {
             0 => "Live now".to_owned(),
@@ -249,10 +237,10 @@ impl HuddlesView {
                                 .px_2()
                                 .py_0p5()
                                 .rounded_full()
-                                .bg(Hsla::from(rgb(0x14171C)).opacity(0.75))
+                                .bg(crate::theme::media_backdrop_bg().opacity(0.75))
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(Hsla::from(rgb(0xFFFFFF)))
+                                .text_color(crate::theme::media_overlay_fg())
                                 .child(elapsed),
                         )
                     })

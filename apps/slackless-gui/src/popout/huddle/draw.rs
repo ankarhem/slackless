@@ -75,8 +75,7 @@ pub(super) fn paint_smooth_stroke(
         return;
     }
     let to_xy = |p: [f64; 2]| (left + p[0] as f32 * width, top + p[1] as f32 * height);
-    let h = (hue.rem_euclid(360)) as f32 / 360.0;
-    let color = hsla(h, 0.90, 0.54, 0.96 * alpha);
+    let color = crate::theme::huddle_draw_hue_color(hue, 0.90, 0.54, 0.96 * alpha);
     let stroke_w = 5.0 * width_scale;
     let cap_r = stroke_w * 0.5;
 

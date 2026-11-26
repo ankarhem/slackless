@@ -451,7 +451,7 @@ impl PopoutWindow {
                 .overflow_hidden()
                 .border_1()
                 .border_color(border)
-                .bg(rgb(0x14171C))
+                .bg(crate::theme::media_backdrop_bg())
                 .flex()
                 .items_center()
                 .justify_center()
@@ -527,13 +527,13 @@ impl PopoutWindow {
                             .bg(if active_tab == HuddleShareTab::Screen {
                                 pal.popover_bg
                             } else {
-                                Hsla::from(rgba(0x00000000))
+                                gpui_kit::gpui::transparent_black()
                             })
                             .border_1()
                             .border_color(if active_tab == HuddleShareTab::Screen {
                                 border
                             } else {
-                                Hsla::from(rgba(0x00000000))
+                                gpui_kit::gpui::transparent_black()
                             })
                             .text_color(if active_tab == HuddleShareTab::Screen {
                                 pal.popover_fg
@@ -566,13 +566,13 @@ impl PopoutWindow {
                             .bg(if active_tab == HuddleShareTab::Window {
                                 pal.popover_bg
                             } else {
-                                Hsla::from(rgba(0x00000000))
+                                gpui_kit::gpui::transparent_black()
                             })
                             .border_1()
                             .border_color(if active_tab == HuddleShareTab::Window {
                                 border
                             } else {
-                                Hsla::from(rgba(0x00000000))
+                                gpui_kit::gpui::transparent_black()
                             })
                             .text_color(if active_tab == HuddleShareTab::Window {
                                 pal.popover_fg
@@ -658,12 +658,12 @@ impl PopoutWindow {
                                 .border_color(if is_selected {
                                     primary
                                 } else {
-                                    Hsla::from(rgba(0x00000000))
+                                    gpui_kit::gpui::transparent_black()
                                 })
                                 .bg(if is_selected {
                                     primary.opacity(0.08)
                                 } else {
-                                    Hsla::from(rgba(0x00000000))
+                                    gpui_kit::gpui::transparent_black()
                                 })
                                 .hover(move |el| if is_selected { el } else { el.bg(hover) })
                                 .child(render_thumb(thumb, true, res, px(244.), px(138.)))
@@ -735,12 +735,12 @@ impl PopoutWindow {
                                     .border_color(if is_selected {
                                         primary
                                     } else {
-                                        Hsla::from(rgba(0x00000000))
+                                        gpui_kit::gpui::transparent_black()
                                     })
                                     .bg(if is_selected {
                                         primary.opacity(0.08)
                                     } else {
-                                        Hsla::from(rgba(0x00000000))
+                                        gpui_kit::gpui::transparent_black()
                                     })
                                     .hover(move |el| if is_selected { el } else { el.bg(hover) })
                                     .child(render_thumb(thumb, false, res, px(180.), px(102.)))
@@ -890,7 +890,7 @@ impl PopoutWindow {
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(if can_share {
-                                rgb(0xFFFFFF).into()
+                                pal.scrim_fg
                             } else {
                                 pal.popover_muted
                             })
@@ -908,7 +908,7 @@ impl PopoutWindow {
             .id("popout-huddle-share-backdrop")
             .absolute()
             .inset_0()
-            .bg(rgba(0x00000078))
+            .bg(crate::theme::media_overlay_scrim())
             .flex()
             .items_center()
             .justify_center()
@@ -1270,7 +1270,7 @@ impl PopoutWindow {
                         div()
                             .size(px(12.))
                             .rounded_full()
-                            .bg(rgb(hex))
+                            .bg(crate::theme::swatch_color(hex))
                             .border_1()
                             .border_color(pal.popover_border),
                     )

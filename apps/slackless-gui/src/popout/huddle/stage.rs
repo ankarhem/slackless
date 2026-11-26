@@ -88,13 +88,13 @@ impl PopoutWindow {
                 .bg(if draw_mode {
                     primary
                 } else {
-                    Hsla::from(rgba(0xFFFFFF1C))
+                    white.opacity(0.11)
                 })
                 .hover(move |el| {
                     el.bg(if draw_mode {
                         emerald
                     } else {
-                        Hsla::from(rgba(0xFFFFFF2E))
+                        white.opacity(0.18)
                     })
                 })
                 .text_xs()
@@ -140,13 +140,9 @@ impl PopoutWindow {
                         .size(px(15.))
                         .rounded_full()
                         .cursor_pointer()
-                        .bg(hsla(hue as f32 / 360.0, 0.88, 0.56, 1.0))
+                        .bg(crate::theme::huddle_draw_hue_color(hue, 0.88, 0.56, 1.0))
                         .border_2()
-                        .border_color(if selected {
-                            white
-                        } else {
-                            Hsla::from(rgba(0xFFFFFF30))
-                        })
+                        .border_color(if selected { white } else { white.opacity(0.19) })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.huddle_draw_hue = hue;
                             if let Some(dock) = this.huddle_state_entity() {
@@ -176,9 +172,9 @@ impl PopoutWindow {
                         .rounded_full()
                         .cursor_pointer()
                         .bg(if focused.is_none() {
-                            rgba(0xFFFFFF2A)
+                            white.opacity(0.16)
                         } else {
-                            rgba(0xFFFFFF10)
+                            white.opacity(0.06)
                         })
                         .text_xs()
                         .text_color(white)
@@ -202,9 +198,9 @@ impl PopoutWindow {
                         .rounded_full()
                         .cursor_pointer()
                         .bg(if is_f {
-                            rgba(0xFFFFFF2A)
+                            white.opacity(0.16)
                         } else {
-                            rgba(0xFFFFFF10)
+                            white.opacity(0.06)
                         })
                         .text_xs()
                         .text_color(white)
@@ -234,7 +230,7 @@ impl PopoutWindow {
                 .overflow_hidden()
                 .border_1()
                 .border_color(pal.drawer_border)
-                .bg(rgb(0x0B0D10))
+                .bg(crate::theme::media_backdrop_bg())
                 .child(h_flex().size_full().gap_1p5().children(
                     visible_screens.into_iter().enumerate().map(
                         |(ix, (item_id, _lbl, img_frame))| {
@@ -254,7 +250,7 @@ impl PopoutWindow {
                         .rounded_full()
                         .bg(pal.scrim_bg)
                         .border_1()
-                        .border_color(rgba(0xFFFFFF1A))
+                        .border_color(white.opacity(0.10))
                         .child(
                             gpui_kit::component::Icon::new(IconName::ScreenShare)
                                 .size(px(12.))
@@ -280,7 +276,7 @@ impl PopoutWindow {
                         .rounded_full()
                         .bg(pal.scrim_bg)
                         .border_1()
-                        .border_color(rgba(0xFFFFFF1A))
+                        .border_color(white.opacity(0.10))
                         .children(swatches)
                         .child(draw_btn)
                         .child(
@@ -290,8 +286,8 @@ impl PopoutWindow {
                                 .px_2()
                                 .rounded_full()
                                 .cursor_pointer()
-                                .bg(rgba(0xFFFFFF14))
-                                .hover(|el| el.bg(rgba(0xFFFFFF28)))
+                                .bg(white.opacity(0.08))
+                                .hover(move |el| el.bg(white.opacity(0.16)))
                                 .flex()
                                 .items_center()
                                 .gap_1()
@@ -318,8 +314,8 @@ impl PopoutWindow {
                                 .px_2()
                                 .rounded_full()
                                 .cursor_pointer()
-                                .bg(rgba(0xFFFFFF14))
-                                .hover(|el| el.bg(rgba(0xFFFFFF28)))
+                                .bg(white.opacity(0.08))
+                                .hover(move |el| el.bg(white.opacity(0.16)))
                                 .flex()
                                 .items_center()
                                 .text_xs()
@@ -520,15 +516,20 @@ impl PopoutWindow {
                     }
                     let cx_px = left + cur.x as f32 * width;
                     let cy_px = top + cur.y as f32 * height;
-                    let h = (cur.hue.rem_euclid(360)) as f32 / 360.0;
                     if let Ok(halo) = build_smooth_circle(cx_px, cy_px, 11.0).build() {
-                        window.paint_path(halo, hsla(h, 0.90, 0.56, 0.22));
+                        window.paint_path(
+                            halo,
+                            crate::theme::huddle_draw_hue_color(cur.hue, 0.90, 0.56, 0.22),
+                        );
                     }
                     if let Ok(ring) = build_smooth_circle(cx_px, cy_px, 6.5).build() {
-                        window.paint_path(ring, hsla(0.0, 0.0, 1.0, 0.95));
+                        window.paint_path(ring, crate::theme::huddle_draw_cursor_ring());
                     }
                     if let Ok(dot) = build_smooth_circle(cx_px, cy_px, 4.5).build() {
-                        window.paint_path(dot, hsla(h, 0.92, 0.54, 0.98));
+                        window.paint_path(
+                            dot,
+                            crate::theme::huddle_draw_hue_color(cur.hue, 0.92, 0.54, 0.98),
+                        );
                     }
                 }
                 if needs_anim_frame {
@@ -932,7 +933,7 @@ impl PopoutWindow {
                             .border_color(if speaking {
                                 pal.success.opacity(0.65)
                             } else {
-                                Hsla::from(rgba(0x00000000))
+                                gpui_kit::gpui::transparent_black()
                             })
                             .child(crate::avatars::user_chip(&self.fixtures, uid, avatar_px)),
                     )
@@ -1073,12 +1074,12 @@ impl PopoutWindow {
             .gap_2()
             .pb_1()
             .border_b_1()
-            .border_color(rgba(0xFFFFFF12))
+            .border_color(pal.scrim_fg.opacity(0.07))
             .child(
                 h_flex()
                     .items_center()
                     .gap_1p5()
-                    .child(div().size(px(6.)).rounded_full().bg(rgb(0x2BAC76)))
+                    .child(div().size(px(6.)).rounded_full().bg(pal.success))
                     .child(
                         div()
                             .text_xs()
@@ -1093,7 +1094,7 @@ impl PopoutWindow {
                         .px_1p5()
                         .py(px(1.))
                         .rounded(px(4.))
-                        .bg(rgba(0xFFFFFF14))
+                        .bg(pal.scrim_fg.opacity(0.08))
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(pal.scrim_fg)
@@ -1112,7 +1113,7 @@ impl PopoutWindow {
             .rounded_2xl()
             .bg(pal.scrim_bg)
             .border_1()
-            .border_color(rgba(0xFFFFFF1E))
+            .border_color(pal.scrim_fg.opacity(0.12))
             .shadow_xl()
             .child(header);
 

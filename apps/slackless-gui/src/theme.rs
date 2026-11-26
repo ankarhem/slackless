@@ -892,6 +892,220 @@ pub fn syntax_token_color(kind: crate::syntax::TokenKind, dark: bool, fg: Hsla) 
     }
 }
 
+/// Live huddle card header gradient, tuned for Dark and Light themes.
+pub fn huddle_banner_gradient(dark: bool) -> Background {
+    if dark {
+        linear_gradient(
+            135.,
+            linear_color_stop(Hsla::from(rgb(0x1E_3A_34)), 0.),
+            linear_color_stop(Hsla::from(rgb(0x28_43_59)), 1.),
+        )
+    } else {
+        linear_gradient(
+            135.,
+            linear_color_stop(Hsla::from(rgb(0x9B_C7_C9)), 0.),
+            linear_color_stop(Hsla::from(rgb(0xD5_E2_B8)), 1.),
+        )
+    }
+}
+
+/// Dark neutral backdrop behind video frames, screen thumbnails, and media scrim pills.
+pub fn media_backdrop_bg() -> Hsla {
+    Hsla::from(rgb(0x14_17_1C))
+}
+
+/// High-contrast white ink for badges/controls sitting directly atop dark media scrims.
+pub fn media_overlay_fg() -> Hsla {
+    Hsla::from(rgb(0xFF_FF_FF))
+}
+
+/// Warm Slack brand gold used for the emoji picker tab icon accent.
+pub fn emoji_tab_accent() -> Hsla {
+    Hsla::from(rgb(0xEC_B2_2E))
+}
+
+/// Semantic tag color for Slack Lists select/multi-select option chips.
+pub fn list_choice_color(name: &str, theme: &Theme) -> Hsla {
+    match name {
+        "green" => theme.success,
+        "red" => theme.danger,
+        "blue" | "indigo" => theme.link,
+        "yellow" | "orange" => rgb(0xD9_77_06).into(),
+        "purple" => rgb(0x7C_3A_ED).into(),
+        "pink" => rgb(0xDB_27_77).into(),
+        "cyan" => rgb(0x08_91_B2).into(),
+        "brown" => rgb(0x92_40_0E).into(),
+        _ => theme.muted_foreground,
+    }
+}
+
+/// Stage surface, participant card, and overlay tokens for the Huddle pop-out window.
+#[derive(Clone, Copy)]
+pub struct HuddleStageTokens {
+    pub light_ctrl_active_bg: Hsla,
+    pub light_ctrl_active_fg: Hsla,
+    pub stage_bg: Background,
+    pub stage_solid: Hsla,
+    pub tile_bg: Hsla,
+    pub tile_border: Hsla,
+    pub tile_pill_bg: Hsla,
+    pub tile_pill_fg: Hsla,
+    pub scrim_bg: Hsla,
+    pub scrim_fg: Hsla,
+    pub scrim_muted: Hsla,
+}
+
+/// Resolve the Huddle pop-out stage palette for an optional room background preset and active theme.
+pub fn huddle_stage_tokens(bg_id: Option<&str>, theme: &Theme) -> HuddleStageTokens {
+    let dark_mode = theme.mode.is_dark();
+    let (stage_a, stage_b, stage_solid, tile_bg, stage_is_dark) = match bg_id {
+        Some("meadow") => (
+            color(0xBC_E3_CC),
+            color(0xDC_F2_E4),
+            color(0xCB_EA_D7),
+            color(0xFF_FF_FF),
+            false,
+        ),
+        Some("sky") => (
+            color(0xC5_E5_FA),
+            color(0xE8_F5_FE),
+            color(0xD6_EE_FC),
+            color(0xFF_FF_FF),
+            false,
+        ),
+        Some("midnight") => (
+            color(0x0E_16_29),
+            color(0x1B_29_4A),
+            color(0x10_17_2A),
+            color(0x1B_24_40),
+            true,
+        ),
+        Some("sunset") => (
+            color(0x2B_18_18),
+            color(0x47_23_29),
+            color(0x2B_18_18),
+            color(0x3B_22_22),
+            true,
+        ),
+        Some("forest") => (
+            color(0x10_24_1C),
+            color(0x1C_3D_30),
+            color(0x11_22_1B),
+            color(0x1B_33_28),
+            true,
+        ),
+        Some("ocean") => (
+            color(0x0D_22_30),
+            color(0x18_3A_52),
+            color(0x0F_21_2E),
+            color(0x18_32_44),
+            true,
+        ),
+        Some("plum") => (
+            color(0x24_14_2B),
+            color(0x3D_1D_47),
+            color(0x24_14_2B),
+            color(0x35_1F_3E),
+            true,
+        ),
+        _ if dark_mode => {
+            let top = theme.background.blend(theme.title_bar.opacity(0.35));
+            let bot = theme.background;
+            (top, bot, bot, theme.muted, true)
+        }
+        _ => (
+            color(0xC2_E6_CE),
+            color(0xE1_F4_E8),
+            color(0xD2_EE_DC),
+            color(0xFF_FF_FF),
+            false,
+        ),
+    };
+
+    let stage_bg = linear_gradient(
+        145.,
+        linear_color_stop(stage_a, 0.),
+        linear_color_stop(stage_b, 1.),
+    );
+    let (tile_border, tile_pill_bg, tile_pill_fg) = if stage_is_dark {
+        (
+            color(0xFF_FF_FF).opacity(0.13),
+            color(0x0E_10_14).opacity(0.80),
+            color(0xFF_FF_FF),
+        )
+    } else {
+        (
+            color(0xFF_FF_FF).opacity(0.93),
+            color(0xFF_FF_FF).opacity(0.90),
+            color(0x1D_1C_1D),
+        )
+    };
+
+    HuddleStageTokens {
+        light_ctrl_active_bg: color(0x2B_2D_31),
+        light_ctrl_active_fg: color(0xFF_FF_FF),
+        stage_bg,
+        stage_solid,
+        tile_bg,
+        tile_border,
+        tile_pill_bg,
+        tile_pill_fg,
+        scrim_bg: color(0x14_17_1C).opacity(0.89),
+        scrim_fg: color(0xFF_FF_FF),
+        scrim_muted: color(0xD1_D2_D3),
+    }
+}
+
+/// Fixed dark-glass palette for the always-on-top floating huddle control bar, binding semantic
+/// danger/accent hues to the active theme while keeping crisp contrast over any desktop wallpaper.
+#[derive(Clone, Copy)]
+pub struct FloatingHuddlePalette {
+    pub bar_bg: Hsla,
+    pub bar_border: Hsla,
+    pub active_bg: Hsla,
+    pub active_hover: Hsla,
+    pub active_fg: Hsla,
+    pub inactive_bg: Hsla,
+    pub inactive_hover: Hsla,
+    pub white: Hsla,
+    pub danger_bg: Hsla,
+    pub danger_hover: Hsla,
+    pub pen_active_bg: Hsla,
+    pub pen_active_hover: Hsla,
+    pub subtle_fg: Hsla,
+}
+
+/// Semantic tokens for [`crate::popout::floating_controls::HuddleFloatingPanel`].
+pub fn floating_huddle_palette(theme: &Theme) -> FloatingHuddlePalette {
+    let white = color(0xFF_FF_FF);
+    FloatingHuddlePalette {
+        bar_bg: color(0x15_1A_21),
+        bar_border: white.opacity(0.14),
+        active_bg: color(0xE6_E8_EB),
+        active_hover: color(0xF5_F6_F7),
+        active_fg: color(0x1A_1D_21),
+        inactive_bg: color(0x4B_4F_55),
+        inactive_hover: color(0x5D_62_6A),
+        white,
+        danger_bg: theme.danger,
+        danger_hover: theme.danger_hover,
+        pen_active_bg: color(0x1D_9B_D1),
+        pen_active_hover: color(0x2A_AA_E0),
+        subtle_fg: white.opacity(0.53),
+    }
+}
+
+/// Chromatic hue color for Huddle screen-share drawing pens, strokes, and live cursor halos.
+pub fn huddle_draw_hue_color(hue: i32, saturation: f32, lightness: f32, alpha: f32) -> Hsla {
+    let h = (hue.rem_euclid(360)) as f32 / 360.0;
+    hsla(h, saturation, lightness, alpha)
+}
+
+/// White outer halo ring around remote Huddle drawing cursors.
+pub fn huddle_draw_cursor_ring() -> Hsla {
+    hsla(0.0, 0.0, 1.0, 0.95)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

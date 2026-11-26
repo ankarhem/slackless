@@ -419,6 +419,8 @@ mod workspace;
 use workspace::{build_workspace, subscribe_workspace};
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wired_tests;
 
 use self::chrome::{corner_cap, joinable, shadow};
 use self::demo::demo;

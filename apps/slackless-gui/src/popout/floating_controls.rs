@@ -9,13 +9,13 @@
 //!   across Cmd+Tab until disabled + inline color dots), and Close.
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{Icon, h_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, h_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, DisplayId, FocusHandle, Focusable,
-    Hsla, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render,
     StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, div, hsla, px, rgb, rgba, size,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, div, px, size,
 };
 
 use crate::huddle_state::HuddleState;
@@ -48,7 +48,11 @@ impl Focusable for HuddleFloatingPanel {
 }
 
 impl HuddleFloatingPanel {
-    fn new(state: WeakEntity<HuddleState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(
+        state: WeakEntity<HuddleState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let initial_pen = state.upgrade().is_some_and(|s| s.read(cx).draw_mode());
@@ -109,20 +113,20 @@ impl Render for HuddleFloatingPanel {
         let pen_on = state.draw_mode;
         let pen_hue = state.draw_hue;
 
-        // Official Slack floating dark huddle bar palette (matching reference screenshot).
-        let bar_bg = Hsla::from(rgb(0x151A21));
-        let bar_border = Hsla::from(rgba(0xFFFFFF24));
-        let active_bg = Hsla::from(rgb(0xE6E8EB));
-        let active_hover = Hsla::from(rgb(0xF5F6F7));
-        let active_fg = Hsla::from(rgb(0x1A1D21));
-        let inactive_bg = Hsla::from(rgb(0x4B4F55));
-        let inactive_hover = Hsla::from(rgb(0x5D626A));
-        let white = Hsla::from(rgb(0xFFFFFF));
-        let danger_bg = Hsla::from(rgb(0xE01E5A));
-        let danger_hover = Hsla::from(rgb(0xEC326B));
-        let pen_active_bg = Hsla::from(rgb(0x1D9BD1));
-        let pen_active_hover = Hsla::from(rgb(0x2AAAE0));
-        let subtle_fg = Hsla::from(rgba(0xFFFFFF88));
+        let pal = crate::theme::floating_huddle_palette(cx.theme());
+        let bar_bg = pal.bar_bg;
+        let bar_border = pal.bar_border;
+        let active_bg = pal.active_bg;
+        let active_hover = pal.active_hover;
+        let active_fg = pal.active_fg;
+        let inactive_bg = pal.inactive_bg;
+        let inactive_hover = pal.inactive_hover;
+        let white = pal.white;
+        let danger_bg = pal.danger_bg;
+        let danger_hover = pal.danger_hover;
+        let pen_active_bg = pal.pen_active_bg;
+        let pen_active_hover = pal.pen_active_hover;
+        let subtle_fg = pal.subtle_fg;
 
         let dock_mic = dock.clone();
         let mic_btn = div()
@@ -244,13 +248,9 @@ impl Render for HuddleFloatingPanel {
                         .size(px(16.))
                         .rounded_full()
                         .cursor_pointer()
-                        .bg(hsla(hue as f32 / 360.0, 0.88, 0.56, 1.0))
+                        .bg(crate::theme::huddle_draw_hue_color(hue, 0.88, 0.56, 1.0))
                         .border_2()
-                        .border_color(if selected {
-                            white
-                        } else {
-                            Hsla::from(rgba(0xFFFFFF33))
-                        })
+                        .border_color(if selected { white } else { white.opacity(0.20) })
                         .on_click(move |_, _, cx| {
                             dock_hue.update(cx, |d, cx| d.set_draw_hue(hue, cx));
                         })
@@ -265,7 +265,7 @@ impl Render for HuddleFloatingPanel {
             .flex()
             .items_center()
             .justify_center()
-            .hover(move |el| el.bg(Hsla::from(rgba(0xFFFFFF1E))))
+            .hover(move |el| el.bg(white.opacity(0.12)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(Icon::new(IconName::X).size(px(14.)).text_color(subtle_fg))
             .on_click(cx.listener(|this, _, window, cx| {
@@ -273,12 +273,7 @@ impl Render for HuddleFloatingPanel {
             }));
 
         // 2×3 grip dots indicating the bar is freely draggable.
-        let dot = || {
-            div()
-                .size(px(3.))
-                .rounded_full()
-                .bg(Hsla::from(rgba(0xFFFFFF4D)))
-        };
+        let dot = || div().size(px(3.)).rounded_full().bg(white.opacity(0.30));
         let grip = div()
             .id("floating-huddle-grip")
             .w(px(14.))
@@ -335,7 +330,7 @@ impl Render for HuddleFloatingPanel {
                     .child(share_btn)
                     .child(pen_btn)
                     .when_some(swatches, |row, s| row.child(s))
-                    .child(div().w(px(1.)).h(px(22.)).bg(Hsla::from(rgba(0xFFFFFF1F))))
+                    .child(div().w(px(1.)).h(px(22.)).bg(white.opacity(0.12)))
                     .child(close_btn),
             )
     }

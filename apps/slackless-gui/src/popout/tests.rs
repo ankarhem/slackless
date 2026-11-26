@@ -582,3 +582,219 @@ fn popout_mark_unread_edit_mrkdwn_refresh_edits_and_readonly_skips_composer(
         other => panic!("expected SendMessage, got {other:?}"),
     }
 }
+
+#[gpui::test]
+fn popout_huddle_renders_all_drawers_popovers_themes_and_floating_panel(cx: &mut TestAppContext) {
+    use crate::huddle_state::HuddleState;
+    use crate::popout::floating_controls::HuddleFloatingPanel;
+    use crate::theme::{self, SlackTheme};
+    use slackless_core::huddle::{
+        HuddleAudioLevels, HuddleDataEvent, HuddleDrawMessage, HuddleDrawSegment, HuddlePhase,
+        HuddleReactionKind, HuddleSessionSnapshot, VideoFrame, VideoFrameData, VideoTileKey,
+    };
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let fixtures = Arc::new(crate::fixtures::load());
+    let channel = fixtures.channels[0].id.clone();
+    let peer = fixtures
+        .users
+        .iter()
+        .find(|u| u.id != fixtures.self_user)
+        .unwrap()
+        .id
+        .clone();
+
+    let state = cx.update(|cx| {
+        let snap = HuddleSessionSnapshot {
+            phase: HuddlePhase::Connected,
+            channel: channel.clone(),
+            call_id: "R0POP".into(),
+            attendee_id: "att-me".into(),
+            topic: Some("Design Critique".into()),
+            background_id: Some("meadow".into()),
+            jukebox_song: Some("lofi".into()),
+            captions_enabled: true,
+            video: true,
+            sharing: true,
+            share_source_id: Some("monitor:1".into()),
+            started_at_secs: 1_700_000_000,
+            ..Default::default()
+        };
+        let entity = HuddleState::new(fixtures.clone(), snap, vec![peer.clone()], cx);
+        entity.update(cx, |s, cx| {
+            s.update_levels(
+                HuddleAudioLevels {
+                    local_rms: 0.35,
+                    active_speakers: vec![(peer.clone(), 0.9)],
+                    muted_peers: vec![],
+                },
+                cx,
+            );
+            s.update_video_frame(
+                VideoTileKey::RemoteCamera(peer.clone()),
+                &VideoFrame {
+                    width: 4,
+                    height: 4,
+                    data: VideoFrameData::Bgra(Arc::new(vec![180u8; 64])),
+                },
+                cx,
+            );
+            s.apply_data_event(
+                &HuddleDataEvent::Reaction {
+                    user: peer.clone(),
+                    emoji: "tada".into(),
+                    kind: HuddleReactionKind::Standard,
+                    emoji_url: None,
+                    at_ms: 0,
+                },
+                cx,
+            );
+            s.apply_data_event(
+                &HuddleDataEvent::Caption {
+                    user: peer.clone(),
+                    text: "Looks great!".into(),
+                    is_partial: false,
+                    at_ms: 0,
+                    lang: Some("en".into()),
+                },
+                cx,
+            );
+            s.apply_data_event(
+                &HuddleDataEvent::Draw {
+                    user: peer.clone(),
+                    message: HuddleDrawMessage::New {
+                        item_id: "d1".into(),
+                        segment: HuddleDrawSegment {
+                            a: [0.1, 0.1],
+                            b: [0.2, 0.3],
+                            c: [0.4, 0.5],
+                            d: [0.6, 0.7],
+                        },
+                    },
+                    at_ms: 0,
+                },
+                cx,
+            );
+        });
+        entity
+    });
+
+    let sent: Arc<Mutex<Vec<Command>>> = Arc::new(Mutex::new(Vec::new()));
+    let sent_cb = sent.clone();
+    let send: CommandForward = Arc::new(move |cmd| {
+        sent_cb.lock().unwrap().push(cmd);
+    });
+    let on_jump: JumpHandler = Rc::new(|_, _, _, _| {});
+    let on_open_canvas: CanvasOpenHandler = Rc::new(|_, _| {});
+
+    let mut popout_slot: Option<Entity<PopoutWindow>> = None;
+    let state_in = state.clone();
+    let fixtures_in = fixtures.clone();
+    let vcx = cx.add_window(|window, cx| {
+        let win = cx.new(|cx| {
+            PopoutWindow::new(
+                PopoutRequest {
+                    kind: PopoutKind::Huddle {
+                        source: state_in.downgrade(),
+                        on_jump,
+                        on_open_canvas,
+                    },
+                    title: "Huddle".to_owned(),
+                    fixtures: fixtures_in,
+                    store: None,
+                    team: None,
+                    send,
+                    later_sync: None,
+                    display_id: None,
+                },
+                window,
+                cx,
+            )
+        });
+        popout_slot = Some(win.clone());
+        gpui_kit::component::Root::new(win, window, cx)
+    });
+    let popout = popout_slot.unwrap();
+    let mut vcx = gpui_kit::VisualTestContext::from_window(vcx.into(), cx);
+
+    // Cycle themes, backgrounds, ALL drawers (Thread/Notes/Diagnostics), and ALL popovers
+    // (Invite/Devices/Camera/Share/Reactions/Theme/More/Music) while drawing every frame cleanly.
+    for (mode, bg, drawer, popover) in [
+        (SlackTheme::Dark, None, None, None),
+        (
+            SlackTheme::Light,
+            Some("meadow"),
+            Some(HuddleDrawer::Thread),
+            Some(HuddlePopover::Reactions),
+        ),
+        (
+            SlackTheme::Dark,
+            Some("midnight"),
+            Some(HuddleDrawer::Notes),
+            Some(HuddlePopover::Theme),
+        ),
+        (
+            SlackTheme::Light,
+            Some("sky"),
+            Some(HuddleDrawer::Diagnostics),
+            Some(HuddlePopover::More),
+        ),
+        (
+            SlackTheme::Dark,
+            Some("forest"),
+            None,
+            Some(HuddlePopover::Share),
+        ),
+        (
+            SlackTheme::Light,
+            Some("sunset"),
+            None,
+            Some(HuddlePopover::Invite),
+        ),
+        (
+            SlackTheme::Dark,
+            Some("aurora"),
+            None,
+            Some(HuddlePopover::Devices),
+        ),
+        (
+            SlackTheme::Light,
+            Some("lavender"),
+            None,
+            Some(HuddlePopover::Camera),
+        ),
+        (SlackTheme::Dark, None, None, Some(HuddlePopover::Music)),
+    ] {
+        vcx.update(|window, cx| {
+            theme::activate(mode, cx);
+            state.update(cx, |s, cx| {
+                s.set_background_local(bg.unwrap_or_default().to_owned(), cx);
+            });
+            popout.update(cx, |win, cx| {
+                win.huddle_drawer = drawer;
+                win.huddle_popover = popover;
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+        });
+    }
+
+    // Also mount and draw `HuddleFloatingPanel` with draw mode on and off.
+    let state_float = state.clone();
+    let float_win = cx.add_window(|window, cx| {
+        let panel = cx.new(|cx| HuddleFloatingPanel::new(state_float.downgrade(), window, cx));
+        gpui_kit::component::Root::new(panel, window, cx)
+    });
+    let mut float_vcx = gpui_kit::VisualTestContext::from_window(float_win.into(), cx);
+    float_vcx.update(|window, cx| {
+        let _ = window.draw(cx);
+        state.update(cx, |s, cx| s.set_draw_mode(true, cx));
+        let _ = window.draw(cx);
+        state.update(cx, |s, cx| s.set_draw_mode(false, cx));
+        let _ = window.draw(cx);
+    });
+}

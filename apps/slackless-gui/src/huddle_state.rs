@@ -824,16 +824,37 @@ impl HuddleState {
                     self.raised_hands.insert(user.clone());
                 } else {
                     self.raised_hands.remove(user);
+                    if self
+                        .sticky_emojis
+                        .get(user)
+                        .is_some_and(|em| em == "raised_hand" || em == "✋")
+                    {
+                        self.sticky_emojis.remove(user);
+                    }
                 }
                 if *user == self.fixtures.self_user {
                     self.session.hand_raised = *raised;
+                    if !*raised
+                        && matches!(
+                            self.session.sticky_emoji.as_deref(),
+                            Some("raised_hand") | Some("✋")
+                        )
+                    {
+                        self.session.sticky_emoji = None;
+                    }
                 }
             }
             HuddleDataEvent::StickyEmoji { user, emoji } => {
+                let prev_was_hand = self
+                    .sticky_emojis
+                    .get(user)
+                    .is_some_and(|em| em == "raised_hand" || em == "✋");
                 match emoji {
                     Some(em) if !em.is_empty() => {
                         if em == "raised_hand" || em == "✋" {
                             self.raised_hands.insert(user.clone());
+                        } else if prev_was_hand {
+                            self.raised_hands.remove(user);
                         }
                         self.sticky_emojis.insert(user.clone(), em.clone());
                     }
@@ -1073,10 +1094,14 @@ impl HuddleState {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
-    use super::overlay_stroke_fade;
+    use super::*;
+    use gpui_kit::gpui::{self, TestAppContext};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn overlay_stroke_fade_covers_active_hold_smoothstep_and_expired() {
         assert_eq!(overlay_stroke_fade(None, 10_000), (1.0, 1.0));
@@ -1094,5 +1119,334 @@ mod tests {
 
         assert_eq!(overlay_stroke_fade(Some(1_000), 6_400), (0.0, 0.72));
         assert_eq!(overlay_stroke_fade(Some(1_000), 99_000), (0.0, 0.72));
+    }
+
+    fn make_state(cx: &mut TestAppContext) -> (Entity<HuddleState>, Rc<RefCell<Vec<String>>>) {
+        let fx = Arc::new(crate::fixtures::load());
+        let events: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let ev_log = events.clone();
+        let state = cx.update(|cx| {
+            let snap = HuddleSessionSnapshot {
+                phase: HuddlePhase::Connected,
+                channel: ChannelId::from("C0ENG"),
+                call_id: "R0TEST".into(),
+                attendee_id: "att-me".into(),
+                started_at_secs: now_secs().saturating_sub(10),
+                ..Default::default()
+            };
+            let entity = HuddleState::new(fx, snap, vec![UserId::from("U0ALICE")], cx);
+            cx.subscribe(&entity, move |_, ev: &HuddleStateEvent, _| {
+                let tag = match ev {
+                    HuddleStateEvent::ToggleMute => "toggle_mute",
+                    HuddleStateEvent::ToggleCamera => "toggle_cam",
+                    HuddleStateEvent::ToggleScreenShare => "toggle_share",
+                    HuddleStateEvent::OpenFloatingPanel => "open_floating",
+                    HuddleStateEvent::CloseFloatingPanel => "close_floating",
+                    HuddleStateEvent::SendDraw(_) => "send_draw",
+                    HuddleStateEvent::OpenAudioSettings => "audio_settings",
+                };
+                ev_log.borrow_mut().push(tag.to_owned());
+            })
+            .detach();
+            entity
+        });
+        (state, events)
+    }
+
+    #[gpui::test]
+    fn reactions_effects_hand_raise_sticky_emoji_and_captions_keep_consistent_state(
+        cx: &mut TestAppContext,
+    ) {
+        let (state, _events) = make_state(cx);
+        let me = cx.update(|cx| state.read(cx).fixtures().self_user.clone());
+        let peer = UserId::from("U0ALICE");
+
+        cx.update(|cx| {
+            state.update(cx, |s, cx| {
+                // 1. Reaction cap (24 max) + Effect tracking.
+                for i in 0..30 {
+                    s.apply_data_event(
+                        &HuddleDataEvent::Reaction {
+                            user: peer.clone(),
+                            emoji: format!("e{i}"),
+                            kind: if i == 29 {
+                                HuddleReactionKind::Effect
+                            } else {
+                                HuddleReactionKind::Standard
+                            },
+                            emoji_url: None,
+                            at_ms: 0,
+                        },
+                        cx,
+                    );
+                }
+                assert_eq!(s.view_state().reactions.len(), 24);
+                assert_eq!(
+                    s.view_state().active_effect.as_ref().map(|e| e.1.as_str()),
+                    Some("e29")
+                );
+
+                // 2. Regression: StickyEmoji("raised_hand") followed by StickyEmoji("coffee")
+                // MUST clear `raised_hands` so peer's hand isn't stuck raised!
+                s.apply_data_event(
+                    &HuddleDataEvent::StickyEmoji {
+                        user: peer.clone(),
+                        emoji: Some("raised_hand".into()),
+                    },
+                    cx,
+                );
+                assert!(s.view_state().raised_hands.contains(&peer));
+                assert_eq!(
+                    s.view_state().sticky_emojis.get(&peer).map(String::as_str),
+                    Some("raised_hand")
+                );
+
+                s.apply_data_event(
+                    &HuddleDataEvent::StickyEmoji {
+                        user: peer.clone(),
+                        emoji: Some("coffee".into()),
+                    },
+                    cx,
+                );
+                assert!(
+                    !s.view_state().raised_hands.contains(&peer),
+                    "switching sticky emoji away from raised_hand must clear raised_hands"
+                );
+                assert_eq!(
+                    s.view_state().sticky_emojis.get(&peer).map(String::as_str),
+                    Some("coffee")
+                );
+
+                // 3. HandRaise(false) for self clears both `session.hand_raised` and `"raised_hand"` sticky.
+                s.apply_data_event(
+                    &HuddleDataEvent::StickyEmoji {
+                        user: me.clone(),
+                        emoji: Some("raised_hand".into()),
+                    },
+                    cx,
+                );
+                assert!(s.session().hand_raised);
+                s.apply_data_event(
+                    &HuddleDataEvent::HandRaise {
+                        user: me.clone(),
+                        raised: false,
+                    },
+                    cx,
+                );
+                assert!(!s.session().hand_raised);
+                assert!(!s.view_state().raised_hands.contains(&me));
+                assert!(!s.view_state().sticky_emojis.contains_key(&me));
+
+                // 4. Captions: partial from same speaker updates in-place; finalizes; caps at 4.
+                s.apply_data_event(
+                    &HuddleDataEvent::Caption {
+                        user: peer.clone(),
+                        text: "Hel".into(),
+                        is_partial: true,
+                        at_ms: 100,
+                        lang: Some("en".into()),
+                    },
+                    cx,
+                );
+                s.apply_data_event(
+                    &HuddleDataEvent::Caption {
+                        user: peer.clone(),
+                        text: "Hello world".into(),
+                        is_partial: false,
+                        at_ms: 200,
+                        lang: None,
+                    },
+                    cx,
+                );
+                assert_eq!(s.view_state().captions.len(), 1);
+                assert_eq!(s.view_state().captions[0].1, "Hello world");
+                assert_eq!(s.view_state().captions[0].3.as_deref(), Some("en"));
+                for i in 0..6 {
+                    s.apply_data_event(
+                        &HuddleDataEvent::Caption {
+                            user: peer.clone(),
+                            text: format!("line {i}"),
+                            is_partial: false,
+                            at_ms: 300 + i,
+                            lang: None,
+                        },
+                        cx,
+                    );
+                }
+                assert_eq!(s.view_state().captions.len(), 4);
+
+                // 5. Topic, Jukebox, MutedByPeer, room meta.
+                s.apply_data_event(
+                    &HuddleDataEvent::Topic {
+                        user: peer.clone(),
+                        topic: "Incident review".into(),
+                    },
+                    cx,
+                );
+                s.apply_data_event(
+                    &HuddleDataEvent::Jukebox {
+                        user: peer.clone(),
+                        song_key: Some("lofi".into()),
+                    },
+                    cx,
+                );
+                s.apply_data_event(
+                    &HuddleDataEvent::MutedByPeer {
+                        actor: peer.clone(),
+                    },
+                    cx,
+                );
+                assert_eq!(s.session().topic.as_deref(), Some("Incident review"));
+                assert_eq!(s.session().jukebox_song.as_deref(), Some("lofi"));
+                assert!(s.session().muted);
+
+                s.apply_room_meta(
+                    Some("Updated topic".into()),
+                    Some("bg-1".into()),
+                    Some(slackless_core::types::Ts::from("1700000001.000100")),
+                    cx,
+                );
+                assert_eq!(s.session().topic.as_deref(), Some("Updated topic"));
+                assert_eq!(s.session().background_id.as_deref(), Some("bg-1"));
+                assert_eq!(
+                    s.session().thread_root_ts.as_ref().map(|t| t.as_str()),
+                    Some("1700000001.000100")
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn draw_strokes_cursors_sharing_floating_panel_and_local_controls(cx: &mut TestAppContext) {
+        let (state, events) = make_state(cx);
+        let peer = UserId::from("U0ALICE");
+        let seg1 = HuddleDrawSegment {
+            a: [0.1, 0.1],
+            b: [0.2, 0.2],
+            c: [0.3, 0.3],
+            d: [0.4, 0.4],
+        };
+        let seg2 = HuddleDrawSegment {
+            a: [0.4, 0.4],
+            b: [0.5, 0.5],
+            c: [0.6, 0.6],
+            d: [0.7, 0.7],
+        };
+
+        cx.update(|cx| {
+            state.update(cx, |s, cx| {
+                // Request events forward cleanly.
+                s.request_toggle_mute(cx);
+                s.request_toggle_camera(cx);
+                s.request_toggle_screen_share(cx);
+                s.request_open_floating_panel(cx);
+                s.open_audio_settings(cx);
+
+                // Remote draw protocol: ChangeHue -> New -> Edit -> End + Position.
+                s.apply_data_event(
+                    &HuddleDataEvent::Draw {
+                        user: peer.clone(),
+                        message: HuddleDrawMessage::ChangeHue {
+                            item_id: "s1".into(),
+                            hue: 140,
+                        },
+                        at_ms: 1,
+                    },
+                    cx,
+                );
+                s.apply_data_event(
+                    &HuddleDataEvent::Draw {
+                        user: peer.clone(),
+                        message: HuddleDrawMessage::New {
+                            item_id: "s1".into(),
+                            segment: seg1,
+                        },
+                        at_ms: 2,
+                    },
+                    cx,
+                );
+                s.apply_data_event(
+                    &HuddleDataEvent::Draw {
+                        user: peer.clone(),
+                        message: HuddleDrawMessage::Edit {
+                            item_id: "s1".into(),
+                            segment: seg2,
+                        },
+                        at_ms: 3,
+                    },
+                    cx,
+                );
+                s.apply_data_event(
+                    &HuddleDataEvent::Draw {
+                        user: peer.clone(),
+                        message: HuddleDrawMessage::End {
+                            item_id: "s1".into(),
+                        },
+                        at_ms: 4,
+                    },
+                    cx,
+                );
+                s.apply_data_event(
+                    &HuddleDataEvent::Draw {
+                        user: peer.clone(),
+                        message: HuddleDrawMessage::Position {
+                            item_id: "s1".into(),
+                            x: 0.5,
+                            y: 0.6,
+                        },
+                        at_ms: 5,
+                    },
+                    cx,
+                );
+
+                let vs = s.view_state();
+                assert_eq!(vs.draw_strokes.len(), 1);
+                assert_eq!(vs.draw_strokes[0].hue, 140);
+                assert!(vs.draw_strokes[0].ended);
+                assert_eq!(vs.draw_strokes[0].segments, vec![seg2]);
+                assert!(vs.draw_cursors.contains_key(&peer));
+
+                // Local draw mode + hue + commit stroke.
+                s.toggle_draw_mode(cx);
+                assert!(s.draw_mode());
+                s.set_draw_hue(30, cx);
+                assert_eq!(s.draw_hue(), 30);
+                s.commit_local_draw_stroke("local-1".into(), 30, vec![seg1], cx);
+                assert_eq!(s.view_state().draw_strokes.len(), 2);
+
+                // Session sharing transitions emit OpenFloatingPanel then CloseFloatingPanel and
+                // disable draw_mode when sharing stops.
+                let mut sharing_snap = s.session().clone();
+                sharing_snap.sharing = true;
+                sharing_snap.share_source_id = Some("monitor:1".into());
+                s.update_session(sharing_snap.clone(), cx);
+                sharing_snap.sharing = false;
+                sharing_snap.share_source_id = None;
+                s.update_session(sharing_snap, cx);
+                assert!(!s.draw_mode(), "stopping share must disable draw_mode");
+
+                // Local optimistic setters + audio_only clears video frames.
+                s.set_muted_local(true, cx);
+                s.set_camera_local(true, cx);
+                s.set_blur_local(true, cx);
+                s.set_captions_local(true, cx);
+                s.set_background_local("bg-2".into(), cx);
+                s.set_jukebox_local(Some("ambient".into()), cx);
+                s.set_participants(vec![peer.clone()], cx);
+                s.set_audio_only_local(true, cx);
+                assert!(!s.session().video);
+                assert!(s.session().audio_only);
+                s.clear_video_frames(cx);
+            });
+        });
+
+        let log = events.borrow();
+        assert!(log.contains(&"toggle_mute".to_owned()));
+        assert!(log.contains(&"toggle_cam".to_owned()));
+        assert!(log.contains(&"toggle_share".to_owned()));
+        assert!(log.contains(&"open_floating".to_owned()));
+        assert!(log.contains(&"close_floating".to_owned()));
+        assert!(log.contains(&"send_draw".to_owned()));
+        assert!(log.contains(&"audio_settings".to_owned()));
     }
 }

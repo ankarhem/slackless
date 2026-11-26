@@ -35,18 +35,7 @@ pub(super) fn live_column_width(column: &SlackListColumn) -> f32 {
 }
 
 pub(super) fn slack_choice_color(name: &str, cx: &App) -> Hsla {
-    let theme = cx.theme();
-    match name {
-        "green" => theme.success,
-        "red" => theme.danger,
-        "blue" | "indigo" => theme.link,
-        "yellow" | "orange" => rgb(0xd97706).into(),
-        "purple" => rgb(0x7c3aed).into(),
-        "pink" => rgb(0xdb2777).into(),
-        "cyan" => rgb(0x0891b2).into(),
-        "brown" => rgb(0x92400e).into(),
-        _ => theme.muted_foreground,
-    }
+    crate::theme::list_choice_color(name, cx.theme())
 }
 
 pub(super) fn cell_sort_key(

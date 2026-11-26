@@ -11,7 +11,7 @@ use gpui_kit::gpui::{
     AnyElement, AppContext as _, BoxShadow, Context, Entity, EventEmitter, Focusable as _,
     FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
     ScrollStrategy, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
-    UniformListScrollHandle, Window, div, point, px, rgb, uniform_list,
+    UniformListScrollHandle, Window, div, point, px, uniform_list,
 };
 use slackless_core::api::GifItem;
 
@@ -525,7 +525,7 @@ impl Render for EmojiPicker {
             let emoji_active = self.tab == PickerTab::Emoji;
             let gifs_active = self.tab == PickerTab::Gifs;
             let transparent = Hsla::transparent_black();
-            let emoji_accent = Hsla::from(rgb(0xEC_B2_2E));
+            let emoji_accent = crate::theme::emoji_tab_accent();
             h_flex()
                 .w_full()
                 .h(px(44.))
