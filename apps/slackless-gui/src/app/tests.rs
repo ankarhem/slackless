@@ -962,7 +962,7 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
     let mut cx = gpui::VisualTestContext::from_window(win.into(), cx);
     cx.run_until_parked();
 
-    cx.update(|window, cx| {
+    let _popout = cx.update(|window, cx| {
         app.update(cx, |app, cx| {
             // 1. Start huddle in #general -> persistent sidebar mini-dock mounts.
             app.select(general.clone(), cx);
@@ -1002,7 +1002,16 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
 
             // 4b. Phase 2–4: video frames (camera & screen share) arrive on HuddleMediaEvent and
             // DATA_MESSAGE events (reactions, hand raise, topic, captions) arrive on Event::Huddle
-            // -> HuddleState -> HuddleViewState.
+            // -> HuddleState -> HuddleViewState. The store converts frames, off the UI thread,
+            // only while a huddle pop-out window shows video.
+            let popout = app
+                .huddle_state
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .video_store()
+                .read(cx)
+                .register_popout();
             let frame = slackless_core::huddle::VideoFrame::from_bgra(4, 4, vec![180u8; 4 * 4 * 4]);
             app.on_huddle_media_event(
                 &HuddleMediaEvent::VideoFrame {
@@ -1147,6 +1156,12 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
                 window,
                 cx,
             );
+            popout
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
             let vs = app.huddle_state.as_ref().unwrap().read(cx).view_state();
             let video_store = app.huddle_state.as_ref().unwrap().read(cx).video_store();
             assert_eq!(video_store.read(cx).frames().len(), 2);

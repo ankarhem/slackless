@@ -87,19 +87,42 @@ pub fn stroke_fade_curve(ended_at_ms: Option<u64>, now_ms: u64) -> (f32, f32, bo
 /// GPU surfaces, or clones bytes for portable BGRA frames).
 pub fn frame_to_render_image(frame: &VideoFrame) -> Option<Arc<RenderImage>> {
     let (w, h, bgra) = frame.to_bgra_fit(0, 0)?;
-    let rgba = image::RgbaImage::from_raw(w, h, bgra)?;
-    Some(Arc::new(RenderImage::new(smallvec::smallvec![
-        image::Frame::new(rgba)
-    ])))
+    bgra_render_image(w, h, bgra)
 }
 
 /// Convert an owned [`VideoFrame`] into a [`RenderImage`] without cloning when uniquely owned.
 pub fn frame_into_render_image(frame: VideoFrame) -> Option<Arc<RenderImage>> {
     let (w, h, bgra) = frame.into_bgra()?;
-    let rgba = image::RgbaImage::from_raw(w, h, bgra)?;
+    bgra_render_image(w, h, bgra)
+}
+
+fn bgra_render_image(width: u32, height: u32, bgra: Vec<u8>) -> Option<Arc<RenderImage>> {
+    let rgba = image::RgbaImage::from_raw(width, height, bgra)?;
     Some(Arc::new(RenderImage::new(smallvec::smallvec![
         image::Frame::new(rgba)
     ])))
+}
+
+/// A frame waiting for its conversion to a [`RenderImage`] on the background executor: a
+/// camera's GPU surface, scaled down to its tile, or a portable BGRA frame (a software decode,
+/// such as an AV1 screen share) at its own size. Either conversion copies the whole frame.
+enum PendingFrame {
+    #[cfg(target_os = "macos")]
+    CameraSurface(Arc<slackless_core::huddle::MacVideoSurface>),
+    Bgra(VideoFrame),
+}
+
+impl PendingFrame {
+    fn into_render_image(self) -> Option<Arc<RenderImage>> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::CameraSurface(surface) => {
+                let (w, h, bgra) = surface.to_bgra_fit(480, 270)?;
+                bgra_render_image(w, h, bgra)
+            }
+            Self::Bgra(frame) => frame_into_render_image(frame),
+        }
+    }
 }
 
 /// Display-ready video frame stored in [`HuddleVideoStore`].
@@ -136,7 +159,7 @@ impl DisplayVideoFrame {
     }
 }
 
-/// RAII guard tracking open Pop-out Huddle Windows so [`HuddleVideoStore`] skips camera GPU
+/// RAII guard tracking open Pop-out Huddle Windows so [`HuddleVideoStore`] skips frame
 /// conversion and UI notifications whenever no huddle window is open to display video.
 pub struct HuddlePopoutGuard {
     active_popouts: Arc<AtomicUsize>,
@@ -154,10 +177,9 @@ pub struct HuddleVideoStore {
     frames: HashMap<VideoTileKey, DisplayVideoFrame>,
     stale_images: Vec<Arc<RenderImage>>,
     active_popouts: Arc<AtomicUsize>,
-    #[cfg(target_os = "macos")]
-    pending_cam_surfaces: HashMap<VideoTileKey, Arc<slackless_core::huddle::MacVideoSurface>>,
-    #[cfg(target_os = "macos")]
-    cam_in_flight: HashSet<VideoTileKey>,
+    /// The newest frame per tile still to convert, and the tiles converting now.
+    pending: HashMap<VideoTileKey, PendingFrame>,
+    converting: HashSet<VideoTileKey>,
 }
 
 impl HuddleVideoStore {
@@ -166,10 +188,8 @@ impl HuddleVideoStore {
             frames: HashMap::new(),
             stale_images: Vec::new(),
             active_popouts: Arc::new(AtomicUsize::new(0)),
-            #[cfg(target_os = "macos")]
-            pending_cam_surfaces: HashMap::new(),
-            #[cfg(target_os = "macos")]
-            cam_in_flight: HashSet::new(),
+            pending: HashMap::new(),
+            converting: HashSet::new(),
         })
     }
 
@@ -182,60 +202,57 @@ impl HuddleVideoStore {
     }
 
     pub fn update_frame(&mut self, tile: VideoTileKey, frame: &VideoFrame, cx: &mut Context<Self>) {
-        let is_screen = matches!(
-            tile,
-            VideoTileKey::LocalScreen | VideoTileKey::RemoteScreen(_)
-        );
-
         #[cfg(target_os = "macos")]
         if let Some(surface) = frame.mac_surface() {
-            let popout_visible = self.active_popouts.load(Ordering::Acquire) > 0;
-            if is_screen {
+            if matches!(
+                tile,
+                VideoTileKey::LocalScreen | VideoTileKey::RemoteScreen(_)
+            ) {
                 // Zero-copy Metal GPU surface for 1080p/1200p screen shares (~50ns retain).
+                let popout_visible = self.active_popouts.load(Ordering::Acquire) > 0;
                 self.insert_display_frame(
                     tile,
                     DisplayVideoFrame::Surface(Arc::clone(surface)),
                     popout_visible,
                     cx,
                 );
-                return;
-            }
-            // Camera card over gradient stage: skip GPU conversion completely when no huddle
-            // popout window is open! When visible, run hardware `VTPixelTransferSession` scaling
-            // to 480x270 on a coalescing background task so the main UI thread never blocks.
-            if !popout_visible {
-                return;
-            }
-            self.pending_cam_surfaces
-                .insert(tile.clone(), Arc::clone(surface));
-            if self.cam_in_flight.insert(tile.clone()) {
-                self.spawn_camera_surface_convert(tile, cx);
+            } else {
+                // Camera card over gradient stage: hardware `VTPixelTransferSession` scaling to
+                // 480x270.
+                self.queue_conversion(tile, PendingFrame::CameraSurface(Arc::clone(surface)), cx);
             }
             return;
         }
+        self.queue_conversion(tile, PendingFrame::Bgra(frame.clone()), cx);
+    }
 
-        let _ = is_screen;
-        if let Some(img) = frame_to_render_image(frame) {
-            self.insert_display_frame(tile, DisplayVideoFrame::Image(img), true, cx);
+    /// Convert `frame` for `tile` on a coalescing background task, so the UI thread never
+    /// copies a frame: one conversion per tile at a time, the newest frame next. Nothing is
+    /// converted while no huddle pop-out window is open to show it.
+    fn queue_conversion(
+        &mut self,
+        tile: VideoTileKey,
+        frame: PendingFrame,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_popouts.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        self.pending.insert(tile.clone(), frame);
+        if self.converting.insert(tile.clone()) {
+            self.spawn_conversion(tile, cx);
         }
     }
 
-    #[cfg(target_os = "macos")]
-    fn spawn_camera_surface_convert(&mut self, tile: VideoTileKey, cx: &mut Context<Self>) {
-        let Some(surface) = self.pending_cam_surfaces.remove(&tile) else {
-            self.cam_in_flight.remove(&tile);
+    fn spawn_conversion(&mut self, tile: VideoTileKey, cx: &mut Context<Self>) {
+        let Some(frame) = self.pending.remove(&tile) else {
+            self.converting.remove(&tile);
             return;
         };
         cx.spawn(async move |this, cx| {
             let rendered = cx
                 .background_executor()
-                .spawn(async move {
-                    let (w, h, bgra) = surface.to_bgra_fit(480, 270)?;
-                    let rgba = image::RgbaImage::from_raw(w, h, bgra)?;
-                    Some(Arc::new(RenderImage::new(smallvec::smallvec![
-                        image::Frame::new(rgba)
-                    ])))
-                })
+                .spawn(async move { frame.into_render_image() })
                 .await;
             let _ = this.update(cx, |store: &mut HuddleVideoStore, cx| {
                 let popout_visible = store.active_popouts.load(Ordering::Acquire) > 0;
@@ -247,11 +264,11 @@ impl HuddleVideoStore {
                         cx,
                     );
                 }
-                if popout_visible && store.pending_cam_surfaces.contains_key(&tile) {
-                    store.spawn_camera_surface_convert(tile, cx);
+                if popout_visible && store.pending.contains_key(&tile) {
+                    store.spawn_conversion(tile, cx);
                 } else {
-                    store.pending_cam_surfaces.remove(&tile);
-                    store.cam_in_flight.remove(&tile);
+                    store.pending.remove(&tile);
+                    store.converting.remove(&tile);
                 }
             });
         })
@@ -279,10 +296,7 @@ impl HuddleVideoStore {
     }
 
     pub fn close_tile(&mut self, tile: &VideoTileKey, cx: &mut Context<Self>) {
-        #[cfg(target_os = "macos")]
-        {
-            self.pending_cam_surfaces.remove(tile);
-        }
+        self.pending.remove(tile);
         if let Some(old) = self.frames.remove(tile) {
             if let DisplayVideoFrame::Image(img) = old {
                 self.stale_images.push(img);
@@ -292,11 +306,8 @@ impl HuddleVideoStore {
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
-        #[cfg(target_os = "macos")]
-        {
-            self.pending_cam_surfaces.clear();
-            self.cam_in_flight.clear();
-        }
+        self.pending.clear();
+        self.converting.clear();
         for (_, old) in self.frames.drain() {
             if let DisplayVideoFrame::Image(img) = old {
                 cx.drop_image(img, None);
@@ -402,7 +413,35 @@ pub fn make_catmull_rom_segment(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_elapsed, make_catmull_rom_segment};
+    use super::{
+        DisplayVideoFrame, HuddleVideoStore, UserId, VideoFrame, VideoTileKey, format_elapsed,
+        make_catmull_rom_segment,
+    };
+    use gpui_kit::gpui::{self, TestAppContext};
+
+    #[gpui::test]
+    fn bgra_frames_convert_off_thread_only_while_a_huddle_window_shows_video(
+        cx: &mut TestAppContext,
+    ) {
+        let store = cx.update(HuddleVideoStore::new);
+        let tile = VideoTileKey::RemoteScreen(UserId::from("U_PEER"));
+        let frame = VideoFrame::from_bgra(4, 2, vec![0x7f; 4 * 2 * 4]);
+
+        // No huddle window shows video: the frame is dropped without being copied.
+        store.update(cx, |store, cx| store.update_frame(tile.clone(), &frame, cx));
+        cx.run_until_parked();
+        assert!(store.read_with(cx, |store, _| store.frames().is_empty()));
+
+        // With one open, the copy runs on the background executor, not in the call.
+        let _popout = store.read_with(cx, |store, _| store.register_popout());
+        store.update(cx, |store, cx| store.update_frame(tile.clone(), &frame, cx));
+        assert!(store.read_with(cx, |store, _| store.frames().is_empty()));
+        cx.run_until_parked();
+        let shown = store.read_with(cx, |store, _| {
+            store.frames().get(&tile).map(DisplayVideoFrame::dimensions)
+        });
+        assert_eq!(shown, Some((4, 2)));
+    }
 
     #[test]
     fn format_elapsed_renders_mm_ss_and_h_mm_ss() {

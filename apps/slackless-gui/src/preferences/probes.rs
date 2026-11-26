@@ -82,32 +82,56 @@ impl Preferences {
                 if !started {
                     return;
                 }
+                // Each frame the probe goes to the background executor and comes back: fitting
+                // the frame to the preview and copying it into an image both cost a whole frame,
+                // which the UI thread must not pay twelve times a second.
                 loop {
                     cx.background_executor()
                         .timer(std::time::Duration::from_millis(80))
                         .await;
+                    let Some((probe, blur)) = this
+                        .update(cx, |prefs, _| {
+                            if prefs.camera_probe_gen != probe_gen {
+                                return None;
+                            }
+                            let blur = prefs.settings.huddle_blur_background;
+                            prefs.camera_probe.take().map(|probe| (probe, blur))
+                        })
+                        .ok()
+                        .flatten()
+                    else {
+                        break;
+                    };
+                    let (probe, image) = cx
+                        .background_executor()
+                        .spawn(async move {
+                            probe.set_blur(blur);
+                            let image = probe
+                                .latest_frame()
+                                .and_then(crate::huddle_video::frame_into_render_image);
+                            (probe, image)
+                        })
+                        .await;
+                    let mut probe = Some(probe);
                     let keep = this
                         .update(cx, |prefs, cx| {
                             if prefs.camera_probe_gen != probe_gen {
                                 return false;
                             }
-                            if let Some(probe) = &prefs.camera_probe {
-                                probe.set_blur(prefs.settings.huddle_blur_background);
-                                if let Some(frame) = probe.latest_frame()
-                                    && let Some(img) =
-                                        crate::huddle_video::frame_to_render_image(&frame)
-                                {
-                                    if let Some(old) = prefs.camera_frame.replace(img) {
-                                        cx.drop_image(old, None);
-                                    }
-                                    cx.notify();
+                            prefs.camera_probe = probe.take();
+                            if let Some(img) = image {
+                                if let Some(old) = prefs.camera_frame.replace(img) {
+                                    cx.drop_image(old, None);
                                 }
-                                true
-                            } else {
-                                false
+                                cx.notify();
                             }
+                            true
                         })
                         .unwrap_or(false);
+                    // Stopped meanwhile: release the camera off the UI thread, as stopping does.
+                    if let Some(stale) = probe {
+                        std::thread::spawn(move || drop(stale));
+                    }
                     if !keep {
                         break;
                     }

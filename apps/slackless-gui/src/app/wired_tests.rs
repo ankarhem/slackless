@@ -208,6 +208,11 @@ fn wired_huddle_lifecycle_commands_events_media_and_teardown(cx: &mut gpui::Test
         height: 4,
         data: VideoFrameData::Bgra(Arc::new(vec![200u8; 4 * 4 * 4])),
     };
+    // The store converts frames only while a huddle pop-out window shows video.
+    let _popout = cx.update(|_, cx| {
+        let state = app.read(cx).huddle_state.as_ref().unwrap().read(cx);
+        state.video_store().read(cx).register_popout()
+    });
     cx.update(|_, cx| {
         core.emit_media(
             HuddleMediaEvent::AudioLevels(HuddleAudioLevels {
