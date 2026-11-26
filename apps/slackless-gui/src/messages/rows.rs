@@ -18,7 +18,8 @@ pub(super) fn transcript_row(
     let message = &messages[ix];
     let previous = ix.checked_sub(1).map(|previous| &messages[previous]);
     // Like Slack, a run of joins (or of leaves) reads as its first line, "<name> and N others
-    // left #channel."; the rest of the run keeps an empty row (and so its scroll position).
+    // left #channel."; the rest of the run keeps a row (and so its scroll position) that takes
+    // no space: the row gap below rides only rows that show something.
     if previous.is_some_and(|prev| membership_run(prev, message)) {
         return div();
     }
@@ -43,7 +44,10 @@ pub(super) fn transcript_row(
         })
     };
 
-    let mut row = v_flex().min_w_0();
+    let prefs = crate::preferences::display_prefs(cx);
+    let mut row = v_flex()
+        .min_w_0()
+        .pb(px(if prefs.compact { 0. } else { ROW_GAP }));
     if date_break {
         let label = message
             .ts
@@ -84,7 +88,6 @@ pub(super) fn transcript_row(
         })
     };
 
-    let prefs = crate::preferences::display_prefs(cx);
     let avatar_size = message_avatar_size(prefs.compact);
     let row_gap_x = if prefs.compact { px(8.) } else { px(12.) };
     let author = author_name_with(message, fixtures, prefs.display_names_only);

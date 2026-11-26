@@ -18,7 +18,7 @@
 //! Design tokens: colors and fonts come from the active gpui-kit theme via `cx.theme()`; the
 //! avatar identity chips resolve through [`crate::theme::avatar_color`], Slack's fixed
 //! per-user hue table (theme-owned, not view-local). Spacing rides the 4px utility scale
-//! (`gap_1`, `px_2`, `py_2`, ...); the row rhythm is the scroller's 2px gap plus dividers'
+//! (`gap_1`, `px_2`, `py_2`, ...); the row rhythm is each row's 2px bottom gap plus dividers'
 //! own padding. Typography: body at `text_sm`, meta text (timestamps, labels, counts) at
 //! `text_xs`.
 
@@ -96,7 +96,8 @@ pub(super) fn message_avatar_size(compact: bool) -> f32 {
 const AVATAR_TOP: f32 = 5.;
 /// Horizontal gutter around the transcript (px); overrides the scroller's 12px default.
 const GUTTER: f32 = 16.;
-/// Space the scroller inserts between consecutive rows (px); dividers add their own padding.
+/// Space under each transcript row that shows something (px; none in compact density);
+/// dividers add their own padding.
 const ROW_GAP: f32 = 2.;
 /// Seconds after which consecutive messages by one author render as separate cards.
 const GROUP_WINDOW_SECS: i64 = 300;
@@ -1649,11 +1650,6 @@ impl Render for MessageList {
         let scroller = self.scroller.clone();
         let now = CivilTime::now();
         let background = cx.theme().background;
-        let row_gap = if crate::preferences::display_prefs(cx).compact {
-            0.
-        } else {
-            ROW_GAP
-        };
 
         MessageScroller::new("message-list", scroller, move |ix, window, cx| {
             // Block Kit text inputs need a window-created textarea before the row renders.
@@ -1675,9 +1671,11 @@ impl Render for MessageList {
             transcript_row(store, ix, &this, &now, cx)
         })
         .jump_button(true)
+        // Rows carry their own gap (see `ROW_GAP`), so a row that shows nothing takes no space;
+        // this replaces the scroller's default 32px row padding.
         .with_row_style(
             StyleRefinement::default()
-                .pb(px(row_gap))
+                .pb(px(0.))
                 .pl(px(GUTTER))
                 .pr(px(GUTTER)),
         )

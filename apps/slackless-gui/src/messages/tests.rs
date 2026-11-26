@@ -205,6 +205,50 @@ fn membership_runs_end_at_day_boundaries() {
     );
 }
 
+/// A run of joins reads as its first line: the joins folded into it keep their rows (and
+/// scroll positions) but take no space, so a run of three sits as tight as a single join.
+#[gpui::test]
+fn folded_join_rows_take_no_space(cx: &mut TestAppContext) {
+    let post = |ts: &str, user: &str, text: &str| Message {
+        ts: Ts::from(ts),
+        user: Some(UserId::from(user)),
+        text: text.into(),
+        ..Default::default()
+    };
+    let join = |ts: &str, user: &str| Message {
+        subtype: Some(MessageSubtype::ChannelJoin),
+        ..post(ts, user, "has joined the channel")
+    };
+    with_transcript("C0RANDOM", cx, |harness, cx| {
+        harness.update(cx, |harness, cx| {
+            harness.list.update(cx, |list, cx| {
+                for message in [
+                    post("1900000000.000100", "U0BOB", "Above the long run."),
+                    join("1900000000.000200", "U0J1"),
+                    join("1900000000.000300", "U0J2"),
+                    join("1900000000.000400", "U0J3"),
+                    post("1900000000.000500", "U0CARA", "Below the long run."),
+                    post("1900000000.000600", "U0BOB", "Above the short run."),
+                    join("1900000000.000700", "U0J4"),
+                    post("1900000000.000800", "U0CARA", "Below the short run."),
+                ] {
+                    list.append(ChannelId::from("C0RANDOM"), message, cx);
+                }
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let _ = window.draw(cx);
+        });
+        let y = |text: &str, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| painted_position(text, 0, window, cx).y)
+        };
+        let long = y("Below the long run.", cx) - y("Above the long run.", cx);
+        let short = y("Below the short run.", cx) - y("Above the short run.", cx);
+        assert_eq!(long, short, "the run's two folded joins leave no gap");
+    });
+}
+
 #[gpui::test]
 fn drag_selects_across_paragraphs_and_messages(cx: &mut TestAppContext) {
     // The deploy report: a rich-text section followed by a code block, then the latency
