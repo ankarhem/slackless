@@ -631,7 +631,9 @@ pub fn load() -> Fixtures {
             "D0ALICE",
             2 * DAY + 9_120,
             "U0ALICE",
-            "Here it is, plus the dashboard mockup we discussed.",
+            // Starts with a multi-byte character and contains a colon: every DM-list preview
+            // and notification built from it exercises the plain-text shortcode expansion.
+            "Är du klar: ja?",
         ),
     ];
     dm_alice[2].files = vec![
