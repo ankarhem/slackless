@@ -18,7 +18,7 @@ use slackless_core::types::{ChannelId, Ts, UserId};
 
 use crate::archive::Archive;
 use crate::output;
-use crate::write::{check_secrets, resolve_text_arg};
+use crate::write::{check_outgoing_text, resolve_text_arg};
 use crate::{CanvasAccessArg, Ctx, fail};
 
 use super::session::{api_for, classify_api_error, resolve_channel, resolve_channel_with};
@@ -783,7 +783,7 @@ pub async fn run_canvas_comment(
         Ok(ts) => ts,
         Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
     };
-    if let Some(exit) = check_secrets(ctx, &text, allow_secrets) {
+    if let Some(exit) = check_outgoing_text(ctx, &text, allow_secrets) {
         return Ok(exit);
     }
 

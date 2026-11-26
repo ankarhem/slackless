@@ -345,14 +345,16 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
 
     // Pre-send secret guard blocks API keys unless --allow-secrets is set.
     let ctx = crate::Ctx::new(false, None);
-    let clean = crate::write::check_secrets(&ctx, "Hej teamet, allt ser bra ut!", false);
+    let clean = crate::write::check_outgoing_text(&ctx, "Hej teamet, allt ser bra ut!", false);
     assert!(clean.is_none());
     let leaked = format!(
         "token={} please check",
         ["xoxb", "1234567890", "abcdefghij123456"].join("-")
     );
-    assert!(crate::write::check_secrets(&ctx, &leaked, false).is_some());
-    assert!(crate::write::check_secrets(&ctx, &leaked, true).is_none());
+    assert!(crate::write::check_outgoing_text(&ctx, &leaked, false).is_some());
+    assert!(crate::write::check_outgoing_text(&ctx, &leaked, true).is_none());
+    // `--allow-secrets` does not let a blank body through.
+    assert!(crate::write::check_outgoing_text(&ctx, " \n", true).is_some());
 
     // Huddle transcripts & --transcribe flags.
     assert!(matches!(

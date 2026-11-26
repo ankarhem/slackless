@@ -48,9 +48,13 @@ pub(crate) fn normalize_emoji_shortcode(emoji: &str) -> String {
     emoji.trim_matches(':').to_owned()
 }
 
-/// Pre-send secret-leak guard shared across `send`, `reply`, `edit`, `schedule`, `upload`, and
-/// `canvas comment`.
-pub(crate) fn check_secrets(ctx: &Ctx, text: &str, allow_secrets: bool) -> Option<ExitCode> {
+/// Pre-send guard shared across `send`, `reply`, `edit`, `schedule`, `upload`, and
+/// `canvas comment`: refuses a blank body locally (Slack answers `no_text` only after a round
+/// trip), then possible secrets unless `allow_secrets`.
+pub(crate) fn check_outgoing_text(ctx: &Ctx, text: &str, allow_secrets: bool) -> Option<ExitCode> {
+    if text.trim().is_empty() {
+        return Some(fail(ctx, "invalid_args", "the message text is empty"));
+    }
     if allow_secrets {
         return None;
     }
@@ -81,7 +85,7 @@ pub async fn run_send(
     allow_secrets: bool,
 ) -> Result<ExitCode> {
     let text = resolve_text_arg(text)?;
-    if let Some(exit) = check_secrets(ctx, &text, allow_secrets) {
+    if let Some(exit) = check_outgoing_text(ctx, &text, allow_secrets) {
         return Ok(exit);
     }
     let session = match api_for(ctx, flag) {
@@ -120,7 +124,7 @@ pub async fn run_reply(
     allow_secrets: bool,
 ) -> Result<ExitCode> {
     let text = resolve_text_arg(text)?;
-    if let Some(exit) = check_secrets(ctx, &text, allow_secrets) {
+    if let Some(exit) = check_outgoing_text(ctx, &text, allow_secrets) {
         return Ok(exit);
     }
     let session = match api_for(ctx, flag) {
@@ -246,7 +250,7 @@ pub async fn run_edit(
     allow_secrets: bool,
 ) -> Result<ExitCode> {
     let text = resolve_text_arg(text)?;
-    if let Some(exit) = check_secrets(ctx, &text, allow_secrets) {
+    if let Some(exit) = check_outgoing_text(ctx, &text, allow_secrets) {
         return Ok(exit);
     }
     let session = match api_for(ctx, flag) {
@@ -344,7 +348,7 @@ pub async fn run_upload(
     }
     let comment = comment.map(resolve_text_arg).transpose()?;
     if let Some(ref text) = comment
-        && let Some(exit) = check_secrets(ctx, text, allow_secrets)
+        && let Some(exit) = check_outgoing_text(ctx, text, allow_secrets)
     {
         return Ok(exit);
     }
@@ -750,7 +754,7 @@ pub async fn run_schedule(
     allow_secrets: bool,
 ) -> Result<ExitCode> {
     let text = resolve_text_arg(text)?;
-    if let Some(exit) = check_secrets(ctx, &text, allow_secrets) {
+    if let Some(exit) = check_outgoing_text(ctx, &text, allow_secrets) {
         return Ok(exit);
     }
     let now = u64::try_from(now_epoch_secs()).unwrap_or(0);

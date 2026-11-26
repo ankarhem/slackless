@@ -204,6 +204,10 @@ fn invalid_arguments_fail_locally_with_invalid_args() {
         ],
         vec!["--workspace", "../escape", "vacuum"],
         vec!["--workspace", "", "stats"],
+        // A blank message body (`-` reads the empty stdin) would make Slack answer `no_text`
+        // after a round trip.
+        vec!["send", "C0X", "-"],
+        vec!["reply", "C0X", "1700000000.000100", " "],
     ] {
         let (code, json) = run_json(&dir, &args);
         assert_eq!(

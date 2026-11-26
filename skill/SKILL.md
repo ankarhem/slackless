@@ -1009,7 +1009,7 @@ slackless schedule "#eng" "Standup in 5m" --at "+30m" --json
 
 - Always pass `--json` and parse the output line(s). Tab-separated mode exists for human eyes.
 - Quote arguments in the shell. Text and queries contain spaces, and a leading `#` starts a shell comment.
-- Use `-` as `<TEXT>` with `send`, `reply`, `edit`, `schedule`, or `canvas comment` to pass multi-line or shell-tricky bodies via stdin.
+- Use `-` as `<TEXT>` with `send`, `reply`, `edit`, `schedule`, or `canvas comment` to pass multi-line or shell-tricky bodies via stdin. A blank body fails with `invalid_args` before anything is sent.
 - Treat `ts` values as opaque identifiers and copy them verbatim into `reply`, `edit`, `delete`, `react`, `unreact`, `pin`, `unpin`, `thread`, `revisions`, and `mark-read`.
 - Empty local results with exit 0 usually mean the archive has not synced yet; check `auth status --json` for `archive_exists` and `messages`, or run `slackless backfill <CHANNEL>`.
 - A `session_rejected` error is fixed by the user signing in again (`slackless auth login`), not by retrying.
