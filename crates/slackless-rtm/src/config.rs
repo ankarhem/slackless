@@ -10,11 +10,21 @@ use crate::backoff::Backoff;
 use crate::url::ConnectParams;
 
 /// Default capacity of the bounded outgoing command channel.
-pub(crate) const DEFAULT_COMMAND_BUFFER: usize = 256;
+const DEFAULT_COMMAND_BUFFER: usize = 256;
 /// Default timeout for writing a single websocket frame.
-pub(crate) const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Interval between app-level `ping` frames.
+const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// Reconnect after this many consecutive pings go unanswered.
+const MAX_MISSED_PONGS: u32 = 3;
+/// A session that lived this long resets the backoff to its first step.
+const HEALTHY_AFTER: Duration = Duration::from_secs(60);
+/// Capacity of the event channel. While it is full the driver reads no further frames
+/// (backpressure on the socket) but keeps sending pings and frames and honors close.
+const EVENT_BUFFER: usize = 256;
 
-/// Everything the client needs to connect. Construct with [`RtmConfig::new`].
+/// Everything the client needs to connect. Construct with [`RtmConfig::new`]; the timing and
+/// buffer knobs are crate-private (this crate's tests tune them through the fields).
 #[derive(Clone)]
 pub struct RtmConfig {
     pub params: ConnectParams,
@@ -25,20 +35,13 @@ pub struct RtmConfig {
     /// Sent as `User-Agent` on the handshake; defaults to [`BROWSER_USER_AGENT`], the one every
     /// HTTP request carries.
     pub user_agent: String,
-    /// Interval between app-level `ping` frames.
-    pub ping_interval: Duration,
-    /// Reconnect after this many consecutive pings go unanswered.
-    pub max_missed_pongs: u32,
-    pub backoff: Backoff,
-    /// A session that lived this long resets the backoff to its first step.
-    pub healthy_after: Duration,
-    /// Capacity of the event channel. While it is full the driver reads no further frames
-    /// (backpressure on the socket) but keeps sending pings and frames and honors close.
-    pub event_buffer: usize,
-    /// Capacity of the bounded outgoing command channel.
-    pub command_buffer: usize,
-    /// Timeout applied to websocket frame writes before treating the connection as stalled.
-    pub write_timeout: Duration,
+    pub(crate) ping_interval: Duration,
+    pub(crate) max_missed_pongs: u32,
+    pub(crate) backoff: Backoff,
+    pub(crate) healthy_after: Duration,
+    pub(crate) event_buffer: usize,
+    pub(crate) command_buffer: usize,
+    pub(crate) write_timeout: Duration,
 }
 
 impl fmt::Debug for RtmConfig {
@@ -66,11 +69,11 @@ impl RtmConfig {
             base_url: WSS_PRIMARY.to_owned(),
             d_cookie: None,
             user_agent: BROWSER_USER_AGENT.to_owned(),
-            ping_interval: Duration::from_secs(15),
-            max_missed_pongs: 3,
+            ping_interval: PING_INTERVAL,
+            max_missed_pongs: MAX_MISSED_PONGS,
             backoff: Backoff::default(),
-            healthy_after: Duration::from_secs(60),
-            event_buffer: 256,
+            healthy_after: HEALTHY_AFTER,
+            event_buffer: EVENT_BUFFER,
             command_buffer: DEFAULT_COMMAND_BUFFER,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
         }
