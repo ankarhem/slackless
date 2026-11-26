@@ -1459,7 +1459,8 @@ pub fn chunk_audio_for_transcription_with_offsets(samples: &[f32]) -> Vec<(usize
 
 /// Split 16 kHz mono audio into chunks of at most 28 seconds, preferring the lowest-energy
 /// silence boundary between 20s and 28s so words are not cut in half.
-pub fn chunk_audio_for_transcription(samples: &[f32]) -> Vec<&[f32]> {
+#[cfg(test)]
+fn chunk_audio_for_transcription(samples: &[f32]) -> Vec<&[f32]> {
     chunk_audio_for_transcription_with_offsets(samples)
         .into_iter()
         .map(|(_, slice)| slice)

@@ -42,7 +42,8 @@ impl HuddleChime {
     }
 
     /// Full official Slack CDN URL for this huddle lifecycle sound.
-    pub fn slack_cdn_url(self) -> String {
+    #[cfg(test)]
+    pub(crate) fn slack_cdn_url(self) -> String {
         format!("{SLACK_CDN_AUDIO_BASE}/{}", self.slack_asset_filename())
     }
 }

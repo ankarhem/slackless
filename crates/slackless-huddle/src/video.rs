@@ -747,23 +747,6 @@ pub fn bgra_to_rgb(bgra: &[u8]) -> Vec<u8> {
     rgb
 }
 
-/// Convert RGBA8888 into BGRA8888 for GPUI `RenderImage` and RGB888 for OpenH264 encoding.
-pub fn rgba_to_rgb_and_bgra(rgba: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let pixels = rgba.len() / 4;
-    let mut rgb = Vec::with_capacity(pixels * 3);
-    let mut bgra = Vec::with_capacity(pixels * 4);
-    for px in rgba.as_chunks::<4>().0 {
-        rgb.push(px[0]);
-        rgb.push(px[1]);
-        rgb.push(px[2]);
-        bgra.push(px[2]);
-        bgra.push(px[1]);
-        bgra.push(px[0]);
-        bgra.push(px[3]);
-    }
-    (rgb, bgra)
-}
-
 /// Fast software portrait background blur (`F-COLLAB-038`): computes a downsampled box-blurred copy
 /// and blends it radially outside a centered head-and-shoulders ellipse.
 pub fn apply_portrait_blur(rgb: &mut [u8], w: usize, h: usize) {
@@ -1219,14 +1202,11 @@ mod tests {
         assert_eq!(resized.len(), (rw * rh * 3) as usize);
         assert!(resized.iter().all(|&b| b == 100));
 
-        // rgb_to_bgra & rgba_to_rgb_and_bgra.
+        // rgb_to_bgra.
         assert_eq!(
             rgb_to_bgra(&[10, 20, 30, 40, 50, 60, 99]),
             vec![30, 20, 10, 255, 60, 50, 40, 255]
         );
-        let (rgb, bgra) = rgba_to_rgb_and_bgra(&[11, 22, 33, 44, 55, 66, 77, 88, 99]);
-        assert_eq!(rgb, vec![11, 22, 33, 55, 66, 77]);
-        assert_eq!(bgra, vec![33, 22, 11, 44, 77, 66, 55, 88]);
 
         // VideoFrame::into_bgra: unique Arc moves without cloning; shared Arc clones cleanly.
         let unique_bytes = vec![1u8, 2, 3, 255];

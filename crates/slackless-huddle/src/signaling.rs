@@ -302,18 +302,15 @@ pub struct RemoteVideoSource {
     pub max_bitrate_kbps: u32,
 }
 
-/// Extract remote camera and `#content` screen-share sources from an `SdkIndexFrame`,
-/// deduplicating simulcast layers by `(attendee_id, group_id)` (picking the highest-bitrate
-/// stream per group, matching `amazon-chime-sdk-js`).
-pub fn parse_index_sources(
-    index: &SdkIndexFrame,
-    self_attendee_id: &str,
-) -> Vec<RemoteVideoSource> {
+#[cfg(test)]
+fn parse_index_sources(index: &SdkIndexFrame, self_attendee_id: &str) -> Vec<RemoteVideoSource> {
     parse_index_sources_with_lookup(index, self_attendee_id, &HashMap::new())
 }
 
-/// Same as [`parse_index_sources`], using `attendee_to_user` as a fallback when a `#content`
-/// stream descriptor omits `external_user_id`.
+/// Extract remote camera and `#content` screen-share sources from an `SdkIndexFrame`,
+/// deduplicating simulcast layers by `(attendee_id, group_id)` (picking the highest-bitrate
+/// stream per group, matching `amazon-chime-sdk-js`). `attendee_to_user` is the fallback when a
+/// `#content` stream descriptor omits `external_user_id`.
 pub fn parse_index_sources_with_lookup(
     index: &SdkIndexFrame,
     self_attendee_id: &str,
