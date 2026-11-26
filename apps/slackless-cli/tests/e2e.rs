@@ -9,6 +9,7 @@
 
 #![allow(clippy::unwrap_used)]
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -706,4 +707,55 @@ async fn live_commands_report_local_mirror_failures_on_stderr() {
         stderr.contains("could not record the echo"),
         "MCP send_message: {stderr:?}"
     );
+}
+
+/// `backfill` runs the core history walk: a channel whose history is already inside a stored
+/// synced span costs one request to refresh, instead of walking every page again.
+#[tokio::test]
+async fn backfill_skips_pages_inside_a_synced_span() {
+    let dir = TempArchiveDir::new("backfill");
+    dir.seed_workspace("T0BF");
+    {
+        let mut store = Store::open(dir.data().join("T0BF.sqlite")).unwrap();
+        slackless_core::write_synced_spans(
+            &mut store,
+            &TeamId::from("T0BF"),
+            &HashMap::from([(
+                ChannelId::from("C0ENG"),
+                slackless_core::Synced {
+                    newest: Ts::from("1700000200.000100"),
+                    oldest: Ts::from("1700000100.000100"),
+                    complete: true,
+                },
+            )]),
+        )
+        .unwrap();
+    }
+    let server = MockServer::start().await;
+    // Slack keeps offering an older page; the walk must stop at the first one, which overlaps.
+    Mock::given(path("/api/conversations.history"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "has_more": true,
+            "response_metadata": {"next_cursor": "older"},
+            "messages": [
+                {"type": "message", "user": "U0BOB", "text": "newest", "ts": "1700000200.000100"},
+                {"type": "message", "user": "U0ALICE", "text": "known", "ts": "1700000150.000100"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+    sign_in(&dir, "T0BF", &server);
+
+    let (code, json) = run_json(&dir, &["backfill", "C0ENG", "--pages", "0"]);
+    assert_eq!(code, Some(0), "{json}");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "a channel inside a complete synced span is refreshed with one page, got {} requests",
+        requests.len()
+    );
+    assert_eq!(json["channels"][0]["pages"], 1, "{json}");
+    assert_eq!(json["channels"][0]["reached_end"], true, "{json}");
 }

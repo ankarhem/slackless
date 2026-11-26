@@ -440,7 +440,13 @@ pub(crate) fn build_archive_status_report(
     let stats = store
         .stats(workspace)
         .with_context(|| format!("reading local archive stats for {workspace}"))?;
-    let spans = read_synced_spans(store, workspace);
+    // A failed read is reported rather than shown as "nothing synced yet".
+    let spans = read_synced_spans(store, workspace).unwrap_or_else(|err| {
+        eprintln!(
+            "slackless: could not read the stored backfill progress of {workspace} ({err}); showing no synced spans"
+        );
+        HashMap::new()
+    });
     let counts = store
         .channel_message_counts(workspace)
         .with_context(|| format!("reading channel message counts for {workspace}"))?;

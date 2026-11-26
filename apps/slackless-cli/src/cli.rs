@@ -349,31 +349,24 @@ pub(crate) struct FilesArgs {
 
 #[derive(Args)]
 pub(crate) struct BackfillArgs {
-    /// Channel id, #name, or @handle.
-    pub(crate) channel: String,
-    /// Maximum number of history pages to walk (0 = walk all history to the beginning).
-    #[arg(long, value_name = "N", default_value_t = 10)]
-    pub(crate) pages: usize,
-    /// Messages per page (Slack max 200).
-    #[arg(long, value_name = "N", default_value_t = 200)]
-    pub(crate) page_size: u32,
-}
-
-#[derive(Args)]
-pub(crate) struct ArchiveBackfillArgs {
-    /// Channel id, #name, or @handle (omit or pass `--all` to backfill every archived channel).
+    /// Channel id, #name, or @handle (omit, or pass --all, to backfill every archived channel and DM).
     pub(crate) channel: Option<String>,
-    /// Backfill every stored channel and DM in the workspace sequentially.
+    /// Backfill every member channel and DM in the workspace sequentially.
     #[arg(long)]
     pub(crate) all: bool,
     /// Also walk `conversations.replies` for every thread root encountered.
     #[arg(long)]
     pub(crate) threads: bool,
     /// Maximum number of history pages per channel (0 = walk all history to the beginning).
-    #[arg(long, value_name = "N", default_value_t = 0)]
+    #[arg(long, value_name = "N", default_value_t = 10)]
     pub(crate) pages: usize,
-    /// Messages per page (Slack max 200).
-    #[arg(long, value_name = "N", default_value_t = 200)]
+    /// Messages per page (1..=200, Slack max 200).
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 200,
+        value_parser = clap::value_parser!(u32).range(1..=200)
+    )]
     pub(crate) page_size: u32,
 }
 
@@ -446,8 +439,6 @@ pub(crate) enum SemanticModelCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum ArchiveCommand {
-    /// Backfill one channel or the whole workspace into the local SQLite archive (needs a stored session).
-    Backfill(Box<ArchiveBackfillArgs>),
     /// Show per-channel backfill sync status and local archive progress (offline).
     Status,
     /// Build or incrementally update the sidecar semantic vector index (`semantic_index.sqlite`) across workspaces.
@@ -664,9 +655,10 @@ pub(crate) enum Commands {
     Download(Box<DownloadArgs>),
     /// Transcribe a video/audio file locally (`parakeet` or `whisper`) and index it in local search.
     Transcribe(Box<TranscribeArgs>),
-    /// Backfill a conversation's historical messages into the local SQLite archive (needs a stored session).
+    /// Backfill a conversation's (or the whole workspace's) history into the local archive, skipping
+    /// pages already stored (needs a stored session).
     Backfill(Box<BackfillArgs>),
-    /// Manage the durable local SQLite archive (backfill channel/workspace history, inspect sync status).
+    /// Manage the durable local SQLite archive (sync status, integrity, backups, semantic index).
     Archive {
         #[command(subcommand)]
         command: Box<ArchiveCommand>,

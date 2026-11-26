@@ -78,8 +78,6 @@ pub enum Event {
     Connection(ConnectionState),
     /// Messages of `channel` changed in the store; re-read it.
     StoreChanged { channel: ChannelId },
-    /// Backfill reached the beginning of `channel`'s history; every message is in the store.
-    HistoryComplete { channel: ChannelId },
     /// These conversations were added or updated in the store.
     Conversations(Vec<ChannelId>),
     /// An opened channel's `conversations.info` refresh (already merged into the store).

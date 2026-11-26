@@ -772,10 +772,10 @@ NDJSON shapes:
 #### backfill
 
 ```sh
-slackless backfill <CHANNEL> [--pages N] [--page-size N]
+slackless backfill [<CHANNEL> | --all] [--threads] [--pages N] [--page-size N]
 ```
 
-Walk `conversations.history` cursors politely (Tier-3 paced with automatic 429 retry) and upsert messages into the local SQLite archive. Defaults: `--pages 10` (`0` = walk all history to the beginning), `--page-size 200` (Slack max `200`).
+Walk `conversations.history` newest first (Tier-3 paced, with automatic 429 retry) for one channel, or for every member channel and DM with `--all` or no `<CHANNEL>`, storing each page in the local SQLite archive before fetching the next. Pages inside the span an earlier backfill stored are skipped: a rerun fetches only what is new above that span, then continues below it. `--threads` also walks `conversations.replies` for every thread root. Defaults: `--pages 10` per channel (`0` = walk all history to the beginning), `--page-size 200` (`1` to `200`).
 
 JSON output:
 
@@ -783,13 +783,28 @@ JSON output:
 {
   "ok": true,
   "workspace": "T0123ABC",
-  "channel": "C0123ABC",
-  "label": "#eng",
+  "include_threads": false,
+  "channels_count": 1,
+  "completed_channels": 0,
   "pages": 10,
   "messages": 2000,
-  "reached_end": false
+  "threads": 0,
+  "replies": 0,
+  "channels": [
+    {
+      "channel": "C0123ABC",
+      "label": "#eng",
+      "pages": 10,
+      "messages": 2000,
+      "threads": 0,
+      "replies": 0,
+      "reached_end": false
+    }
+  ]
 }
 ```
+
+`reached_end` turns `true` once the archive holds the channel's history back to its first message.
 
 #### huddle
 

@@ -2672,9 +2672,7 @@ async fn loop_applies_socket_events_in_order_and_stops_on_shutdown() {
     loop {
         match next(&mut rx).await {
             Event::StoreChanged { channel: c } if c == c1() => break,
-            Event::ConversationInfo { .. }
-            | Event::HistoryComplete { .. }
-            | Event::StoreChanged { .. } => {}
+            Event::ConversationInfo { .. } | Event::StoreChanged { .. } => {}
             other => panic!("unexpected event after open: {other:?}"),
         }
     }
@@ -2734,7 +2732,7 @@ async fn open_conversation_merges_member_count_without_clobbering_stored_fields(
                 assert_eq!(num_members, Some(42), "the event carries the count");
                 break;
             }
-            Event::StoreChanged { .. } | Event::HistoryComplete { .. } => {}
+            Event::StoreChanged { .. } => {}
             other => panic!("unexpected event after open: {other:?}"),
         }
     }
@@ -2815,7 +2813,7 @@ async fn open_conversation_counts_humans_and_apps_for_the_header() {
                 assert_eq!(members.len(), 5, "the member id list rides along");
                 break;
             }
-            Event::StoreChanged { .. } | Event::HistoryComplete { .. } => {}
+            Event::StoreChanged { .. } => {}
             other => panic!("unexpected event after open: {other:?}"),
         }
     }
@@ -2867,7 +2865,7 @@ async fn open_conversation_falls_back_to_infos_count_when_members_fail() {
                 assert!(members.is_empty(), "no member list, no ids either");
                 break;
             }
-            Event::StoreChanged { .. } | Event::HistoryComplete { .. } => {}
+            Event::StoreChanged { .. } => {}
             other => panic!("unexpected event after open: {other:?}"),
         }
     }
@@ -2938,7 +2936,7 @@ async fn open_conversation_of_connect_channel_resolves_the_connected_teams() {
         match next(&mut rx).await {
             Event::SidebarChanged => break,
             Event::ConversationInfo { members, .. } => announced = members,
-            Event::StoreChanged { .. } | Event::HistoryComplete { .. } => {}
+            Event::StoreChanged { .. } => {}
             other => panic!("unexpected event after open: {other:?}"),
         }
     }
@@ -3102,9 +3100,20 @@ async fn hydrate_backfills_previews_only_for_dms_without_stored_messages() {
         dm2.clone(),
     )))
     .await;
+    // Two pages at two per page: the walk is over once all three messages landed.
     loop {
         match next(&mut rx).await {
-            Event::HistoryComplete { channel } if channel == dm2 => break,
+            Event::StoreChanged { channel } if channel == dm2 => {
+                let stored = store
+                    .lock()
+                    .unwrap()
+                    .channel_history(&ws, &dm2, None, 10)
+                    .unwrap()
+                    .len();
+                if stored == 3 {
+                    break;
+                }
+            }
             Event::StoreChanged { .. } | Event::ConversationInfo { .. } => {}
             other => panic!("unexpected event after open: {other:?}"),
         }
@@ -3575,7 +3584,7 @@ async fn open_conversation_announces_an_empty_member_list_when_info_fails() {
                 );
                 break;
             }
-            Event::StoreChanged { .. } | Event::HistoryComplete { .. } | Event::Error(_) => {}
+            Event::StoreChanged { .. } | Event::Error(_) => {}
             other => panic!("unexpected event after open: {other:?}"),
         }
     }
@@ -3652,7 +3661,6 @@ async fn open_dm_fetches_peer_dnd_and_presence_once_each() {
                 presence = true;
             }
             Event::StoreChanged { .. }
-            | Event::HistoryComplete { .. }
             | Event::Conversations(_)
             | Event::ConversationInfo { .. } => {}
             other => panic!("unexpected event after open: {other:?}"),
@@ -3671,7 +3679,6 @@ async fn open_dm_fetches_peer_dnd_and_presence_once_each() {
         match next(&mut rx).await {
             Event::DndPaused { paused, .. } if paused => break,
             Event::StoreChanged { .. }
-            | Event::HistoryComplete { .. }
             | Event::Conversations(_)
             | Event::ConversationInfo { .. } => {}
             other => panic!("unexpected event after reopen: {other:?}"),

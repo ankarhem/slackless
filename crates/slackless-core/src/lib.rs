@@ -49,8 +49,9 @@ pub use backend::{
     UsersBackend, WorkspaceBackend,
 };
 pub use backfill::{
-    BACKFILL_SYNCED_KEY, BackfillStatus, ChannelBackfillProgress, Synced,
-    WorkspaceBackfillProgress, decode_synced_spans, read_synced_spans, write_synced_spans,
+    BACKFILL_SYNCED_KEY, BackfillStatus, ChannelBackfillProgress, HistorySink, HistoryWalk,
+    PAGE_DELAY, Synced, WalkPage, WalkStats, WorkspaceBackfillProgress, decode_synced_spans,
+    read_synced_spans, wait_out_rate_limits, walk_history, walk_thread, write_synced_spans,
 };
 pub use catchup::{
     CATCHUP_LAST_VISIT_KEY, CatchUpBriefing, CatchUpExcerpt, CatchUpMention, CatchUpThread,
@@ -60,8 +61,8 @@ pub use catchup::{
     format_catchup_human, read_catchup_last_visit, record_catchup_visit,
 };
 pub use client::{
-    Client, ClientHandle, ClientHandles, Closed, CommandSender, EventReceiver, HuddleMediaReceiver,
-    HuddleMediaSender, SharedStore,
+    Client, ClientHandle, ClientHandles, Closed, CommandSender, CoreError, EventReceiver,
+    HuddleMediaReceiver, HuddleMediaSender, SharedStore,
 };
 pub use command::{
     ChannelCommand, CollabCommand, Command, HuddleCommand, HuddleControlCommand, MessagingCommand,

@@ -311,21 +311,18 @@ async fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
             .await
         }
         Commands::Backfill(args) => {
-            live::run_backfill(ctx, flag, &args.channel, args.pages, args.page_size).await
+            live::run_backfill(
+                ctx,
+                flag,
+                args.channel.as_deref(),
+                args.all,
+                args.threads,
+                args.pages,
+                args.page_size,
+            )
+            .await
         }
         Commands::Archive { command } => match *command {
-            ArchiveCommand::Backfill(args) => {
-                live::run_archive_backfill(
-                    ctx,
-                    flag,
-                    args.channel.as_deref(),
-                    args.all,
-                    args.threads,
-                    args.pages,
-                    args.page_size,
-                )
-                .await
-            }
             ArchiveCommand::Status => cmd_archive_status(ctx, ctx.workspace()),
             ArchiveCommand::IndexSemantic(args) => {
                 cmd_archive_index_semantic(ctx, ctx.workspace(), *args).await

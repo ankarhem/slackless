@@ -250,7 +250,7 @@ impl ClientHandle {
 
 /// Failures inside the core, reported to the front-end as [`Event`]s.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum CoreError {
+pub enum CoreError {
     #[error(transparent)]
     Api(#[from] ApiError),
     #[error(transparent)]

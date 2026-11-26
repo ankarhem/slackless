@@ -2,26 +2,26 @@
 
 use std::collections::HashMap;
 use std::process::ExitCode;
-use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use slackless_core::api::{
     ApiError, ClientCounts, ConversationCounts, HistoryOpts, ListOpts, Page, SlackApi,
 };
-use slackless_core::types::time::now_epoch_secs;
+use slackless_core::backfill::{
+    HistorySink, HistoryWalk, PAGE_DELAY, WalkPage, wait_out_rate_limits, walk_history,
+};
 use slackless_core::types::{ChannelId, Message, TeamId, Ts};
-use slackless_core::{NotifyLevel, Synced, read_synced_spans, write_synced_spans};
+use slackless_core::{CoreError, NotifyLevel, Synced, read_synced_spans, write_synced_spans};
 
 use crate::Ctx;
 use crate::archive::Archive;
 use crate::output;
 
-use super::session::{api_fail, api_for, display_channel, resolve_channel_with};
-
-/// Maximum 429 rate-limit waits per history page (aligned with `slackless_core::backfill`).
-pub(crate) const MAX_RATE_LIMIT_WAITS: u32 = 5;
-/// Polite Tier-3 delay between `conversations.history` pages.
-const BACKFILL_PAGE_DELAY: Duration = Duration::from_millis(1200);
+use super::session::{
+    LiveSession, api_fail, api_for, classify_api_error, display_channel, resolve_channel_with,
+};
+use crate::commands::CmdError;
+use crate::fail;
 
 pub(crate) struct UnreadSummary {
     pub items: Vec<serde_json::Value>,
@@ -135,65 +135,34 @@ pub async fn run_unread(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-pub(crate) fn clamp_backfill_page_size(page_size: u32) -> u32 {
-    page_size.clamp(1, 200)
-}
-
-pub(crate) fn backfill_should_stop(max_pages: usize, pages_fetched: usize) -> bool {
-    max_pages > 0 && pages_fetched >= max_pages
-}
-
 /// Returns the next pagination cursor if non-empty and strictly different from `current`
 /// (stuck-cursor guard matching `slackless_core::backfill`).
 pub(crate) fn next_backfill_cursor(current: Option<&str>, next: Option<String>) -> Option<String> {
     next.filter(|c| !c.is_empty() && current != Some(c.as_str()))
 }
 
-pub(crate) fn format_backfill_output(
-    workspace: &TeamId,
-    channel: &ChannelId,
-    label: Option<&str>,
-    pages_fetched: usize,
-    messages_stored: usize,
-    reached_end: bool,
-) -> (serde_json::Value, String) {
-    let display = display_channel(channel, label);
-    let json = serde_json::json!({
-        "ok": true,
-        "workspace": workspace.as_str(),
-        "channel": channel.as_str(),
-        "label": display,
-        "pages": pages_fetched,
-        "messages": messages_stored,
-        "reached_end": reached_end,
-    });
-    let human = format!(
-        "backfilled {display}: {messages_stored} messages across {pages_fetched} page(s) (complete={reached_end})\n"
-    );
-    (json, human)
-}
-
-/// Per-channel summary emitted by `slackless archive backfill`.
+/// One channel's outcome of a `backfill` run.
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ArchiveBackfillChannelSummary {
+pub(crate) struct BackfillChannelSummary {
     pub channel: String,
     pub label: String,
-    pub pages: usize,
-    pub messages: usize,
-    pub threads: usize,
-    pub replies: usize,
+    pub pages: u64,
+    pub messages: u64,
+    pub threads: u64,
+    pub replies: u64,
+    /// The channel's history is in the archive back to its beginning.
     pub reached_end: bool,
 }
 
-pub(crate) fn format_archive_backfill_output(
+pub(crate) fn format_backfill_output(
     workspace: &TeamId,
     include_threads: bool,
-    channels: &[ArchiveBackfillChannelSummary],
+    channels: &[BackfillChannelSummary],
 ) -> (serde_json::Value, String) {
-    let total_pages: usize = channels.iter().map(|c| c.pages).sum();
-    let total_messages: usize = channels.iter().map(|c| c.messages).sum();
-    let total_threads: usize = channels.iter().map(|c| c.threads).sum();
-    let total_replies: usize = channels.iter().map(|c| c.replies).sum();
+    let total_pages: u64 = channels.iter().map(|c| c.pages).sum();
+    let total_messages: u64 = channels.iter().map(|c| c.messages).sum();
+    let total_threads: u64 = channels.iter().map(|c| c.threads).sum();
+    let total_replies: u64 = channels.iter().map(|c| c.replies).sum();
     let completed: usize = channels.iter().filter(|c| c.reached_end).count();
 
     let mut human = String::new();
@@ -236,262 +205,162 @@ pub(crate) fn format_archive_backfill_output(
     (json, human)
 }
 
-fn record_synced_page(
-    spans: &mut HashMap<ChannelId, Synced>,
-    channel: &ChannelId,
-    items: &[Message],
-    reached_end: bool,
-) {
-    let page_newest = items.iter().map(|m| &m.ts).max().cloned();
-    let page_oldest = items.iter().map(|m| &m.ts).min().cloned();
-    match spans.get_mut(channel) {
-        Some(span) => {
-            if let Some(newest) = page_newest
-                && newest > span.newest
-            {
-                span.newest = newest;
-            }
-            if let Some(oldest) = page_oldest
-                && oldest < span.oldest
-            {
-                span.oldest = oldest;
-            }
-            span.complete |= reached_end;
-        }
-        None => {
-            if let (Some(newest), Some(oldest)) = (page_newest, page_oldest) {
-                spans.insert(
-                    channel.clone(),
-                    Synced {
-                        newest,
-                        oldest,
-                        complete: reached_end,
-                    },
-                );
-            } else if reached_end {
-                spans.insert(
-                    channel.clone(),
-                    Synced {
-                        newest: Ts::from("0"),
-                        oldest: Ts::from("0"),
-                        complete: true,
-                    },
-                );
-            }
-        }
+/// The CLI's side of a headless history walk: pages from `api`, one archive to store them in,
+/// the synced spans of every channel walked so far, and Slack's Tier-3 pacing.
+struct CliSink<'a> {
+    api: &'a SlackApi,
+    archive: &'a mut Archive,
+    workspace: &'a TeamId,
+    channel: &'a ChannelId,
+    spans: &'a mut HashMap<ChannelId, Synced>,
+    history_opts: HistoryOpts,
+}
+
+impl HistorySink for CliSink<'_> {
+    async fn fetch(
+        &mut self,
+        latest: Option<Ts>,
+        cursor: Option<String>,
+    ) -> Result<Page<Message>, ApiError> {
+        let opts = HistoryOpts {
+            latest,
+            ..self.history_opts.clone()
+        };
+        wait_out_rate_limits(|| {
+            self.api
+                .conversations_history(self.channel, &opts, cursor.clone())
+        })
+        .await
+    }
+
+    async fn fetch_replies(
+        &mut self,
+        thread_ts: Ts,
+        cursor: Option<String>,
+    ) -> Result<Page<Message>, ApiError> {
+        let opts = HistoryOpts::default();
+        wait_out_rate_limits(|| {
+            self.api
+                .conversations_replies(self.channel, &thread_ts, &opts, cursor.clone())
+        })
+        .await
+    }
+
+    async fn store(&mut self, items: Vec<Message>, fetched_at: i64) -> Result<(), CoreError> {
+        self.archive.store_mut().upsert_history_page(
+            self.workspace,
+            self.channel,
+            &items,
+            fetched_at,
+        )?;
+        Ok(())
+    }
+
+    async fn store_replies(
+        &mut self,
+        items: Vec<Message>,
+        fetched_at: i64,
+    ) -> Result<(), CoreError> {
+        self.archive.store_mut().upsert_replies_page(
+            self.workspace,
+            self.channel,
+            &items,
+            fetched_at,
+        )?;
+        Ok(())
+    }
+
+    async fn record_span(&mut self, span: &Synced) -> Result<(), CoreError> {
+        self.spans.insert(self.channel.clone(), span.clone());
+        write_synced_spans(self.archive.store_mut(), self.workspace, self.spans)?;
+        Ok(())
+    }
+
+    async fn on_page(&mut self, _page: &WalkPage<'_>) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    async fn await_resume(&mut self) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    async fn pace(&mut self) -> Result<(), CoreError> {
+        tokio::time::sleep(PAGE_DELAY).await;
+        Ok(())
     }
 }
 
-enum BackfillStepError {
-    Api(ApiError),
-    Store(anyhow::Error),
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn backfill_one_channel(
-    api: &SlackApi,
+/// Every member channel and DM of the workspace, pulling the conversation list from Slack once
+/// when the archive knows none yet.
+async fn backfill_targets(
+    session: &LiveSession,
     archive: &mut Archive,
-    workspace: &TeamId,
-    channel: &ChannelId,
-    label: Option<&str>,
-    include_threads: bool,
-    max_pages: usize,
-    page_size: u32,
-    spans: &mut HashMap<ChannelId, Synced>,
-) -> std::result::Result<ArchiveBackfillChannelSummary, BackfillStepError> {
-    let opts = HistoryOpts {
-        limit: Some(clamp_backfill_page_size(page_size)),
-        ..Default::default()
-    };
+) -> Result<Vec<(ChannelId, Option<String>)>, CmdError> {
+    let mut stored: Vec<(ChannelId, Option<String>)> = archive
+        .channels(&session.workspace)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.is_member && !c.is_archived)
+        .map(|c| {
+            let lbl = c.label();
+            (c.id, Some(lbl))
+        })
+        .collect();
+    for dm in archive.dms(&session.workspace).unwrap_or_default() {
+        let lbl = dm.label();
+        stored.push((dm.id, Some(lbl)));
+    }
+    if !stored.is_empty() {
+        return Ok(stored);
+    }
+    // Fresh archive: pull the conversation list from Slack once so `--all` has targets.
     let mut cursor: Option<String> = None;
-    let mut pages_fetched: usize = 0;
-    let mut messages_stored: usize = 0;
-    let mut threads_fetched: usize = 0;
-    let mut replies_stored: usize = 0;
-    let mut reached_end = false;
-
-    loop {
-        if backfill_should_stop(max_pages, pages_fetched) {
-            break;
-        }
-        let mut waits = 0u32;
-        let fetched_at = now_epoch_secs();
-        let page = loop {
-            match api
-                .conversations_history(channel, &opts, cursor.clone())
-                .await
-            {
-                Ok(page) => break page,
-                Err(ApiError::RateLimited { retry_after }) if waits < MAX_RATE_LIMIT_WAITS => {
-                    waits += 1;
-                    tokio::time::sleep(retry_after.max(Duration::from_secs(1))).await;
-                }
-                Err(err) => return Err(BackfillStepError::Api(err)),
+    let mut convs = Vec::new();
+    for _ in 0..10 {
+        let page = match session
+            .api
+            .conversations_list(&ListOpts::default(), cursor.clone())
+            .await
+        {
+            Ok(page) => page,
+            Err(err) => {
+                let (code, msg) = classify_api_error(&err);
+                return Err(CmdError::new(code, msg));
             }
         };
-        pages_fetched += 1;
-        let next = next_backfill_cursor(cursor.as_deref(), page.next_cursor);
-        let page_done = next.is_none();
-        if !page.items.is_empty() {
-            archive
-                .store_mut()
-                .upsert_history_page(workspace, channel, &page.items, fetched_at)
-                .with_context(|| format!("storing history page for {channel}"))
-                .map_err(BackfillStepError::Store)?;
-            messages_stored += page.items.len();
-        }
-        record_synced_page(spans, channel, &page.items, page_done);
-        write_synced_spans(archive.store_mut(), workspace, spans)
-            .with_context(|| format!("persisting backfill progress for {workspace}"))
-            .map_err(BackfillStepError::Store)?;
-
-        if include_threads {
-            let thread_roots: Vec<Ts> = page
-                .items
-                .iter()
-                .filter(|m| m.reply_count.unwrap_or(0) > 0)
-                .map(|m| m.ts.clone())
-                .collect();
-            for root_ts in thread_roots {
-                let mut reply_cursor: Option<String> = None;
-                let mut got_any = false;
-                loop {
-                    let mut reply_waits = 0u32;
-                    let reply_fetched_at = now_epoch_secs();
-                    let reply_page = loop {
-                        match api
-                            .conversations_replies(
-                                channel,
-                                &root_ts,
-                                &HistoryOpts::default(),
-                                reply_cursor.clone(),
-                            )
-                            .await
-                        {
-                            Ok(rp) => break rp,
-                            Err(ApiError::RateLimited { retry_after })
-                                if reply_waits < MAX_RATE_LIMIT_WAITS =>
-                            {
-                                reply_waits += 1;
-                                tokio::time::sleep(retry_after.max(Duration::from_secs(1))).await;
-                            }
-                            Err(err) if err.is_auth_expired() => {
-                                return Err(BackfillStepError::Api(err));
-                            }
-                            Err(_) => {
-                                break Page {
-                                    items: Vec::new(),
-                                    next_cursor: None,
-                                };
-                            }
-                        }
-                    };
-                    if !reply_page.items.is_empty() {
-                        got_any = true;
-                        let reply_count =
-                            reply_page.items.iter().filter(|m| m.ts != root_ts).count();
-                        archive
-                            .store_mut()
-                            .upsert_replies_page(
-                                workspace,
-                                channel,
-                                &reply_page.items,
-                                reply_fetched_at,
-                            )
-                            .with_context(|| {
-                                format!("storing thread replies for {channel} ({root_ts})")
-                            })
-                            .map_err(BackfillStepError::Store)?;
-                        replies_stored += reply_count;
-                    }
-                    match next_backfill_cursor(reply_cursor.as_deref(), reply_page.next_cursor) {
-                        Some(next_rc) => {
-                            reply_cursor = Some(next_rc);
-                            tokio::time::sleep(BACKFILL_PAGE_DELAY).await;
-                        }
-                        None => break,
-                    }
-                }
-                if got_any {
-                    threads_fetched += 1;
-                }
-            }
-        }
-
-        match next {
-            Some(next_cursor) => {
-                cursor = Some(next_cursor);
-                tokio::time::sleep(BACKFILL_PAGE_DELAY).await;
-            }
-            None => {
-                reached_end = true;
-                break;
-            }
+        convs.extend(page.items);
+        match next_backfill_cursor(cursor.as_deref(), page.next_cursor) {
+            Some(next) => cursor = Some(next),
+            None => break,
         }
     }
-
-    Ok(ArchiveBackfillChannelSummary {
-        channel: channel.as_str().to_owned(),
-        label: display_channel(channel, label),
-        pages: pages_fetched,
-        messages: messages_stored,
-        threads: threads_fetched,
-        replies: replies_stored,
-        reached_end,
-    })
+    if convs.is_empty() {
+        return Ok(stored);
+    }
+    archive
+        .store_mut()
+        .upsert_conversations(&session.workspace, &convs)
+        .map_err(|err| {
+            CmdError::store(
+                err,
+                format!("storing conversations for {}", session.workspace),
+            )
+        })?;
+    Ok(convs
+        .into_iter()
+        .filter(|c| (c.is_member || c.is_im || c.is_mpim) && !c.is_archived)
+        .map(|c| {
+            let name = c.name.as_deref().map(|n| format!("#{n}"));
+            (c.id, name)
+        })
+        .collect())
 }
 
-/// `backfill <CHANNEL> [--pages N] [--page-size N]`
-/// Walks `conversations.history` pages politely (Tier-3 pacing, bounded 429 waits, stuck-cursor
-/// guard) and batch-upserts each page into the local SQLite archive in one transaction (`X-1`).
+/// `backfill [<CHANNEL> | --all] [--threads] [--pages N] [--page-size N]`
+/// Walks `conversations.history` (and optionally `conversations.replies`) for one channel or
+/// every member conversation in the workspace through the core walk: pages inside a synced span
+/// are skipped, and every page is committed before the next is fetched.
 pub async fn run_backfill(
-    ctx: &Ctx,
-    flag: Option<&str>,
-    channel_arg: &str,
-    max_pages: usize,
-    page_size: u32,
-) -> Result<ExitCode> {
-    let session = match api_for(ctx, flag) {
-        Ok(s) => s,
-        Err(exit) => return Ok(exit),
-    };
-    let mut archive = Archive::open_or_create_rw(&session.workspace)?;
-    let (channel, label) = resolve_channel_with(Some(&archive), &session.workspace, channel_arg);
-    let mut spans = read_synced_spans(archive.store(), &session.workspace);
-    let summary = match backfill_one_channel(
-        &session.api,
-        &mut archive,
-        &session.workspace,
-        &channel,
-        label.as_deref(),
-        false,
-        max_pages,
-        page_size,
-        &mut spans,
-    )
-    .await
-    {
-        Ok(summary) => summary,
-        Err(BackfillStepError::Api(err)) => return Ok(api_fail(ctx, &err)),
-        Err(BackfillStepError::Store(err)) => return Err(err),
-    };
-
-    let (json, human) = format_backfill_output(
-        &session.workspace,
-        &channel,
-        label.as_deref(),
-        summary.pages,
-        summary.messages,
-        summary.reached_end,
-    );
-    output::emit(ctx.json, &json, &human);
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `archive backfill [<CHANNEL> | --all] [--threads] [--pages N] [--page-size N]`
-/// Walks `conversations.history` (and optionally `conversations.replies`) for a single channel
-/// or every member conversation in the workspace, persisting `backfill_synced_spans` in SQLite.
-pub async fn run_archive_backfill(
     ctx: &Ctx,
     flag: Option<&str>,
     channel_arg: Option<&str>,
@@ -505,92 +374,59 @@ pub async fn run_archive_backfill(
         Err(exit) => return Ok(exit),
     };
     let mut archive = Archive::open_or_create_rw(&session.workspace)?;
-    let mut spans = read_synced_spans(archive.store(), &session.workspace);
-
-    let targets: Vec<(ChannelId, Option<String>)> = if let Some(arg) = channel_arg
-        && !all
-    {
-        vec![resolve_channel_with(
-            Some(&archive),
-            &session.workspace,
-            arg,
-        )]
-    } else {
-        let mut stored: Vec<(ChannelId, Option<String>)> = archive
-            .channels(&session.workspace)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|c| c.is_member && !c.is_archived)
-            .map(|c| {
-                let lbl = c.label();
-                (c.id, Some(lbl))
-            })
-            .collect();
-        for dm in archive.dms(&session.workspace).unwrap_or_default() {
-            let lbl = dm.label();
-            stored.push((dm.id, Some(lbl)));
-        }
-        if stored.is_empty() {
-            // Fresh archive: pull conversation list from Slack once so `--all` has targets.
-            let mut cursor: Option<String> = None;
-            let mut convs = Vec::new();
-            for _ in 0..10 {
-                match session
-                    .api
-                    .conversations_list(&ListOpts::default(), cursor.clone())
-                    .await
-                {
-                    Ok(page) => {
-                        convs.extend(page.items);
-                        match next_backfill_cursor(cursor.as_deref(), page.next_cursor) {
-                            Some(next) => cursor = Some(next),
-                            None => break,
-                        }
-                    }
-                    Err(err) => return Ok(api_fail(ctx, &err)),
-                }
-            }
-            if !convs.is_empty() {
-                archive
-                    .store_mut()
-                    .upsert_conversations(&session.workspace, &convs)
-                    .with_context(|| format!("storing conversations for {}", session.workspace))?;
-                stored = convs
-                    .into_iter()
-                    .filter(|c| (c.is_member || c.is_im || c.is_mpim) && !c.is_archived)
-                    .map(|c| {
-                        let name = c.name.as_deref().map(|n| format!("#{n}"));
-                        (c.id, name)
-                    })
-                    .collect();
-            }
-        }
-        stored
+    let workspace = session.workspace.clone();
+    let mut spans = read_synced_spans(archive.store(), &workspace).unwrap_or_else(|err| {
+        eprintln!(
+            "slackless: could not read the stored backfill progress of {workspace} ({err}); walking from the newest page"
+        );
+        HashMap::new()
+    });
+    let targets: Vec<(ChannelId, Option<String>)> = match channel_arg {
+        Some(arg) if !all => vec![resolve_channel_with(Some(&archive), &workspace, arg)],
+        _ => match backfill_targets(&session, &mut archive).await {
+            Ok(targets) => targets,
+            Err(err) => return Ok(fail(ctx, err.code, &err.message)),
+        },
     };
-
+    let history_opts = HistoryOpts {
+        limit: Some(page_size),
+        ..HistoryOpts::default()
+    };
+    let walk = HistoryWalk {
+        include_threads,
+        max_pages,
+    };
     let mut summaries = Vec::with_capacity(targets.len());
     for (channel, label) in targets {
-        match backfill_one_channel(
-            &session.api,
-            &mut archive,
-            &session.workspace,
-            &channel,
-            label.as_deref(),
-            include_threads,
-            max_pages,
-            page_size,
-            &mut spans,
-        )
-        .await
-        {
-            Ok(summary) => summaries.push(summary),
-            Err(BackfillStepError::Api(err)) => return Ok(api_fail(ctx, &err)),
-            Err(BackfillStepError::Store(err)) => return Err(err),
-        }
+        let prior = spans.get(&channel).cloned();
+        let mut sink = CliSink {
+            api: &session.api,
+            archive: &mut archive,
+            workspace: &workspace,
+            channel: &channel,
+            spans: &mut spans,
+            history_opts: history_opts.clone(),
+        };
+        let stats = match walk_history(prior, walk, &mut sink).await {
+            Ok(stats) => stats,
+            Err(CoreError::Api(err)) => return Ok(api_fail(ctx, &err)),
+            Err(CoreError::Store(err)) => {
+                return Err(anyhow::Error::new(err).context("storing the backfilled history"));
+            }
+            Err(CoreError::Cancelled) => return Err(anyhow::anyhow!("the backfill was cancelled")),
+        };
+        summaries.push(BackfillChannelSummary {
+            channel: channel.as_str().to_owned(),
+            label: display_channel(&channel, label.as_deref()),
+            pages: stats.pages_fetched,
+            messages: stats.messages_stored,
+            threads: stats.threads_fetched,
+            replies: stats.replies_stored,
+            reached_end: stats.span.as_ref().is_some_and(|span| span.complete),
+        });
     }
 
-    let (json, human) =
-        format_archive_backfill_output(&session.workspace, include_threads, &summaries);
+    let (json, human) = format_backfill_output(&workspace, include_threads, &summaries);
     output::emit(ctx.json, &json, &human);
     Ok(ExitCode::SUCCESS)
 }

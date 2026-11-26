@@ -21,7 +21,7 @@ use crate::types::{ChannelId, Message, TeamId, Ts};
 use crate::unfurl::Unfurls;
 
 /// Pause between history pages. `conversations.history` is Tier 3 (~50 requests/minute).
-pub(crate) const PAGE_DELAY: Duration = Duration::from_millis(1200);
+pub const PAGE_DELAY: Duration = Duration::from_millis(1200);
 /// How many times one page waits out a rate limit (on top of the API client's own retries).
 const MAX_RATE_LIMIT_WAITS: u32 = 5;
 /// `local_state` key persisting known backfill spans per workspace so restarts skip completed
@@ -38,6 +38,378 @@ pub struct Synced {
 }
 
 pub(crate) type SyncedMap = Arc<Mutex<HashMap<ChannelId, Synced>>>;
+
+/// Options for a headless [`walk_history`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryWalk {
+    /// Also walk `conversations.replies` for every thread root encountered.
+    pub include_threads: bool,
+    /// Stop after this many history pages (`0` walks to the beginning).
+    pub max_pages: usize,
+}
+
+/// Totals of a finished [`walk_history`], with the channel's synced span as the walk left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkStats {
+    pub pages_fetched: u64,
+    pub messages_stored: u64,
+    pub threads_fetched: u64,
+    pub replies_stored: u64,
+    pub span: Option<Synced>,
+}
+
+/// One stored history page of a headless walk, reported through [`HistorySink::on_page`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkPage<'a> {
+    pub messages: u64,
+    pub threads: u64,
+    pub replies: u64,
+    /// The channel's synced span as this page left it, once it has one.
+    pub span: Option<&'a Synced>,
+    /// The newest message stored above a prior span while catching up, before it merges.
+    pub newest: Option<Ts>,
+    /// The walk returns after this page: the history is complete or ran out.
+    pub finished: bool,
+}
+
+/// What a headless history walk needs from its surroundings: pages from Slack, a store for
+/// them, and the pace to keep. [`Backfill`] supplies the core's implementation (shared store,
+/// event stream, pause control); the CLI its own over an `SlackApi` client and one archive.
+pub trait HistorySink {
+    /// The `conversations.history` page older than `latest` or at `cursor`, after waiting out
+    /// rate limits.
+    fn fetch(
+        &mut self,
+        latest: Option<Ts>,
+        cursor: Option<String>,
+    ) -> impl Future<Output = Result<Page<Message>, ApiError>> + Send;
+    /// The `conversations.replies` page of `thread_ts` at `cursor`, after waiting out rate limits.
+    fn fetch_replies(
+        &mut self,
+        thread_ts: Ts,
+        cursor: Option<String>,
+    ) -> impl Future<Output = Result<Page<Message>, ApiError>> + Send;
+    /// Stores one history page requested at `fetched_at`, naming the channels its unfurls point
+    /// at and announcing the change; `Err` stops the walk.
+    fn store(
+        &mut self,
+        items: Vec<Message>,
+        fetched_at: i64,
+    ) -> impl Future<Output = Result<(), CoreError>> + Send;
+    /// Stores one replies page requested at `fetched_at`.
+    fn store_replies(
+        &mut self,
+        items: Vec<Message>,
+        fetched_at: i64,
+    ) -> impl Future<Output = Result<(), CoreError>> + Send;
+    /// Records the channel's synced span so a later run skips it.
+    fn record_span(&mut self, span: &Synced) -> impl Future<Output = Result<(), CoreError>> + Send;
+    /// Reports a stored page (and the walk ending) to whoever tracks progress.
+    fn on_page(
+        &mut self,
+        page: &WalkPage<'_>,
+    ) -> impl Future<Output = Result<(), CoreError>> + Send;
+    /// Parks while a pause is in effect; returns at once when the sink cannot pause.
+    fn await_resume(&mut self) -> impl Future<Output = Result<(), CoreError>> + Send;
+    /// Waits [`PAGE_DELAY`] between requests.
+    fn pace(&mut self) -> impl Future<Output = Result<(), CoreError>> + Send;
+}
+
+/// Walks one conversation's `conversations.history` newest-first through `sink`, starting from
+/// the span `prior` an earlier walk stored: only the gap above it is fetched, then the walk jumps
+/// below that span and continues to the beginning. Every page is stored before the next is
+/// fetched, so an aborted walk resumes where it stopped on the next run.
+pub async fn walk_history<S: HistorySink>(
+    prior: Option<Synced>,
+    opts: HistoryWalk,
+    sink: &mut S,
+) -> Result<WalkStats, CoreError> {
+    let mut stats = WalkStats {
+        pages_fetched: 0,
+        messages_stored: 0,
+        threads_fetched: 0,
+        replies_stored: 0,
+        span: prior.clone(),
+    };
+    let mut catching_up = prior;
+    let mut catch_up_newest: Option<Ts> = None;
+    let mut latest: Option<Ts> = None;
+    let mut cursor: Option<String> = None;
+    let mut first = true;
+    loop {
+        if opts.max_pages > 0 && stats.pages_fetched >= opts.max_pages as u64 {
+            return Ok(stats);
+        }
+        sink.await_resume().await?;
+        if !std::mem::take(&mut first) {
+            sink.pace().await?;
+            sink.await_resume().await?;
+        }
+        let fetched_at = now_epoch_secs();
+        let page = sink.fetch(latest.clone(), cursor.clone()).await?;
+        let next = page
+            .next_cursor
+            .clone()
+            .filter(|c| Some(c) != cursor.as_ref());
+        let newest = page.items.iter().map(|m| &m.ts).max().cloned();
+        let oldest = page.items.iter().map(|m| &m.ts).min().cloned();
+        let overlaps = catching_up
+            .as_ref()
+            .is_some_and(|prior| page.items.iter().any(|m| m.ts <= prior.newest));
+        let page_messages = page.items.len() as u64;
+        let thread_roots: Vec<Ts> = if opts.include_threads {
+            page.items
+                .iter()
+                .filter(|m| m.reply_count.unwrap_or(0) > 0)
+                .map(|m| m.ts.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        sink.store(page.items, fetched_at).await?;
+        stats.pages_fetched += 1;
+        stats.messages_stored += page_messages;
+
+        let mut page_threads = 0u64;
+        let mut page_replies = 0u64;
+        for thread_ts in thread_roots {
+            sink.await_resume().await?;
+            sink.pace().await?;
+            sink.await_resume().await?;
+            page_replies += walk_thread(&thread_ts, sink).await?;
+            page_threads += 1;
+        }
+        stats.threads_fetched += page_threads;
+        stats.replies_stored += page_replies;
+        let counts = (page_messages, page_threads, page_replies);
+
+        if let Some(prior) = &catching_up {
+            catch_up_newest = catch_up_newest.or(newest);
+            if !overlaps && next.is_some() {
+                let (messages, threads, replies) = counts;
+                sink.on_page(&WalkPage {
+                    messages,
+                    threads,
+                    replies,
+                    span: None,
+                    newest: catch_up_newest.clone(),
+                    finished: false,
+                })
+                .await?;
+                cursor = next;
+                continue;
+            }
+            // Contiguous with the earlier span now (or history ended above it).
+            let mut span = prior.clone();
+            if let Some(n) = catch_up_newest.take().filter(|n| *n > span.newest) {
+                span.newest = n;
+            }
+            span.complete |= next.is_none() && !overlaps;
+            catching_up = None;
+            sink.record_span(&span).await?;
+            let (messages, threads, replies) = counts;
+            sink.on_page(&WalkPage {
+                messages,
+                threads,
+                replies,
+                span: Some(&span),
+                newest: None,
+                finished: span.complete,
+            })
+            .await?;
+            stats.span = Some(span.clone());
+            if span.complete {
+                return Ok(stats);
+            }
+            latest = Some(span.oldest);
+            cursor = None;
+            continue;
+        }
+
+        match (&mut stats.span, newest, oldest) {
+            (Some(span), _, Some(oldest)) if oldest < span.oldest => span.oldest = oldest,
+            (None, Some(newest), Some(oldest)) => {
+                stats.span = Some(Synced {
+                    newest,
+                    oldest,
+                    complete: false,
+                })
+            }
+            _ => {}
+        }
+        if next.is_none()
+            && let Some(span) = &mut stats.span
+        {
+            span.complete = true;
+        }
+        if let Some(span) = &stats.span {
+            sink.record_span(span).await?;
+        }
+        let (messages, threads, replies) = counts;
+        sink.on_page(&WalkPage {
+            messages,
+            threads,
+            replies,
+            span: stats.span.as_ref(),
+            newest: None,
+            finished: next.is_none(),
+        })
+        .await?;
+        match next {
+            Some(next) => cursor = Some(next),
+            None => return Ok(stats),
+        }
+    }
+}
+
+/// Fetches one thread's whole `conversations.replies` history through `sink`, storing every
+/// page before fetching the next (so a cancelled fetch keeps what it stored), and returns the
+/// replies stored. Read-only on Slack: it never moves the user's read cursor.
+pub async fn walk_thread<S: HistorySink>(thread_ts: &Ts, sink: &mut S) -> Result<u64, CoreError> {
+    let mut cursor: Option<String> = None;
+    let mut first = true;
+    let mut stored = 0u64;
+    loop {
+        if !std::mem::take(&mut first) {
+            sink.pace().await?;
+        }
+        let fetched_at = now_epoch_secs();
+        let page = sink
+            .fetch_replies(thread_ts.clone(), cursor.clone())
+            .await?;
+        let next = page
+            .next_cursor
+            .filter(|next| Some(next) != cursor.as_ref());
+        stored += page.items.iter().filter(|m| &m.ts != thread_ts).count() as u64;
+        sink.store_replies(page.items, fetched_at).await?;
+        match next {
+            Some(next) => cursor = Some(next),
+            None => return Ok(stored),
+        }
+    }
+}
+
+/// [`Backfill`]'s side of a headless walk: the backend's pages, the shared store, the event
+/// stream and, for an explicit archive backfill, the pause control and progress events.
+struct BackfillSink<'a, B: Backend> {
+    backfill: &'a Backfill<B>,
+    channel: &'a ChannelId,
+    channel_name: Option<&'a str>,
+    explicit: bool,
+}
+
+impl<B: Backend> BackfillSink<'_, B> {
+    /// Announces the stored page; the walk ends once the front-end stopped listening.
+    fn announce(&self) -> Result<(), CoreError> {
+        if self.backfill.events.emit(Event::StoreChanged {
+            channel: self.channel.clone(),
+        }) {
+            Ok(())
+        } else {
+            Err(CoreError::Cancelled)
+        }
+    }
+}
+
+impl<B: Backend> HistorySink for BackfillSink<'_, B> {
+    async fn fetch(
+        &mut self,
+        latest: Option<Ts>,
+        cursor: Option<String>,
+    ) -> Result<Page<Message>, ApiError> {
+        self.backfill.fetch(self.channel, &latest, &cursor).await
+    }
+
+    async fn fetch_replies(
+        &mut self,
+        thread_ts: Ts,
+        cursor: Option<String>,
+    ) -> Result<Page<Message>, ApiError> {
+        wait_out_rate_limits(|| {
+            self.backfill.backend.replies_page(
+                self.channel.clone(),
+                thread_ts.clone(),
+                cursor.clone(),
+            )
+        })
+        .await
+    }
+
+    async fn store(&mut self, items: Vec<Message>, fetched_at: i64) -> Result<(), CoreError> {
+        self.backfill
+            .store_history_page(self.channel, items, fetched_at)
+            .await?;
+        self.announce()
+    }
+
+    async fn store_replies(
+        &mut self,
+        items: Vec<Message>,
+        fetched_at: i64,
+    ) -> Result<(), CoreError> {
+        self.backfill
+            .store_replies_page(self.channel, items, fetched_at)
+            .await?;
+        self.announce()
+    }
+
+    async fn record_span(&mut self, span: &Synced) -> Result<(), CoreError> {
+        self.backfill
+            .lock()
+            .insert(self.channel.clone(), span.clone());
+        self.backfill.persist_synced().await;
+        Ok(())
+    }
+
+    async fn on_page(&mut self, page: &WalkPage<'_>) -> Result<(), CoreError> {
+        if !self.explicit {
+            return Ok(());
+        }
+        let progress = self
+            .backfill
+            .control
+            .update_channel(self.channel, self.channel_name, |c| {
+                c.pages_fetched += 1;
+                c.messages_stored += page.messages;
+                c.threads_fetched += page.threads;
+                c.replies_stored += page.replies;
+                if let Some(n) = &page.newest
+                    && c.newest_ts.as_ref().is_none_or(|cur| n > cur)
+                {
+                    c.newest_ts = Some(n.clone());
+                }
+                if let Some(span) = page.span {
+                    c.newest_ts = Some(span.newest.clone());
+                    c.oldest_ts = Some(span.oldest.clone());
+                    c.complete = span.complete;
+                    if span.complete {
+                        c.status = BackfillStatus::Complete;
+                    }
+                }
+                if page.finished {
+                    c.complete = true;
+                    c.status = BackfillStatus::Complete;
+                }
+            });
+        self.backfill.events.emit(Event::BackfillProgress(progress));
+        Ok(())
+    }
+
+    async fn await_resume(&mut self) -> Result<(), CoreError> {
+        if self.explicit {
+            self.backfill
+                .control
+                .wait_if_paused(&self.backfill.events, Some(self.channel), true)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn pace(&mut self) -> Result<(), CoreError> {
+        tokio::time::sleep(self.backfill.page_delay).await;
+        Ok(())
+    }
+}
 
 /// Lifecycle state for a channel or workspace archive backfill job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -374,9 +746,15 @@ pub fn decode_synced_spans(raw: Option<String>) -> HashMap<ChannelId, Synced> {
     .unwrap_or_default()
 }
 
-/// Read persisted [`Synced`] backfill spans for `workspace` from SQLite.
-pub fn read_synced_spans(store: &Store, workspace: &TeamId) -> HashMap<ChannelId, Synced> {
-    decode_synced_spans(store.local(workspace, BACKFILL_SYNCED_KEY).ok().flatten())
+/// Read persisted [`Synced`] backfill spans for `workspace` from SQLite; an unreadable value
+/// is an error, not an empty map that would make a caller re-walk every channel.
+pub fn read_synced_spans(
+    store: &Store,
+    workspace: &TeamId,
+) -> crate::store::Result<HashMap<ChannelId, Synced>> {
+    Ok(decode_synced_spans(
+        store.local(workspace, BACKFILL_SYNCED_KEY)?,
+    ))
 }
 
 /// Persist [`Synced`] backfill spans for `workspace` into SQLite `local_state`, layered over the
@@ -538,6 +916,8 @@ impl<B: Backend> Backfill<B> {
         self.events.emit(Event::BackfillProgress(done));
     }
 
+    /// Walks `channel`'s history through a [`BackfillSink`]: the headless walk over this
+    /// backend, store, event stream and (when `explicit`) pause control.
     async fn walk(
         &self,
         channel: &ChannelId,
@@ -545,182 +925,23 @@ impl<B: Backend> Backfill<B> {
         include_threads: bool,
         explicit: bool,
     ) -> Result<(), CoreError> {
-        let mut catching_up = self.lock().get(channel).cloned();
-        let mut catch_up_newest: Option<Ts> = None;
-        let mut latest: Option<Ts> = None;
-        let mut cursor: Option<String> = None;
-        let mut first = true;
-        loop {
-            if explicit {
-                self.control
-                    .wait_if_paused(&self.events, Some(channel), true)
-                    .await;
-            }
-            if !std::mem::take(&mut first) {
-                tokio::time::sleep(self.page_delay).await;
-                if explicit {
-                    self.control
-                        .wait_if_paused(&self.events, Some(channel), true)
-                        .await;
-                }
-            }
-            let fetched_at = now_epoch_secs();
-            let page = self.fetch(channel, &latest, &cursor).await?;
-            let next = page
-                .next_cursor
-                .clone()
-                .filter(|c| Some(c) != cursor.as_ref());
-            let newest = page.items.iter().map(|m| &m.ts).max().cloned();
-            let oldest = page.items.iter().map(|m| &m.ts).min().cloned();
-            let overlaps = catching_up
-                .as_ref()
-                .is_some_and(|prior| page.items.iter().any(|m| m.ts <= prior.newest));
-            let page_count = page.items.len() as u64;
-            let thread_roots: Vec<Ts> = if include_threads {
-                page.items
-                    .iter()
-                    .filter(|m| m.reply_count.unwrap_or(0) > 0)
-                    .map(|m| m.ts.clone())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            self.store_history_page(channel, page.items, fetched_at)
-                .await?;
-            if !self.events.emit(Event::StoreChanged {
-                channel: channel.clone(),
-            }) {
-                return Ok(());
-            }
-
-            let mut page_threads = 0u64;
-            let mut page_replies = 0u64;
-            for thread_ts in thread_roots {
-                if explicit {
-                    self.control
-                        .wait_if_paused(&self.events, Some(channel), true)
-                        .await;
-                }
-                tokio::time::sleep(self.page_delay).await;
-                if explicit {
-                    self.control
-                        .wait_if_paused(&self.events, Some(channel), true)
-                        .await;
-                }
-                let stored_replies = self
-                    .fetch_thread_counted(channel.clone(), thread_ts)
-                    .await?;
-                page_threads += 1;
-                page_replies += stored_replies;
-            }
-
-            if let Some(prior) = &catching_up {
-                catch_up_newest = catch_up_newest.or(newest);
-                if !overlaps && next.is_some() {
-                    if explicit {
-                        let progress = self.control.update_channel(channel, channel_name, |c| {
-                            c.pages_fetched += 1;
-                            c.messages_stored += page_count;
-                            c.threads_fetched += page_threads;
-                            c.replies_stored += page_replies;
-                            if let Some(n) = &catch_up_newest
-                                && c.newest_ts.as_ref().is_none_or(|cur| n > cur)
-                            {
-                                c.newest_ts = Some(n.clone());
-                            }
-                        });
-                        self.events.emit(Event::BackfillProgress(progress));
-                    }
-                    cursor = next;
-                    continue;
-                }
-                // Contiguous with the earlier span now (or history ended above it).
-                let mut span = prior.clone();
-                if let Some(n) = catch_up_newest.take().filter(|n| *n > span.newest) {
-                    span.newest = n;
-                }
-                span.complete |= next.is_none() && !overlaps;
-                catching_up = None;
-                self.lock().insert(channel.clone(), span.clone());
-                self.persist_synced().await;
-                if explicit {
-                    let progress = self.control.update_channel(channel, channel_name, |c| {
-                        c.pages_fetched += 1;
-                        c.messages_stored += page_count;
-                        c.threads_fetched += page_threads;
-                        c.replies_stored += page_replies;
-                        c.newest_ts = Some(span.newest.clone());
-                        c.oldest_ts = Some(span.oldest.clone());
-                        c.complete = span.complete;
-                        if span.complete {
-                            c.status = BackfillStatus::Complete;
-                        }
-                    });
-                    self.events.emit(Event::BackfillProgress(progress));
-                }
-                if span.complete {
-                    self.events.emit(Event::HistoryComplete {
-                        channel: channel.clone(),
-                    });
-                    return Ok(());
-                }
-                latest = Some(span.oldest);
-                cursor = None;
-                continue;
-            }
-
-            let span_snapshot = {
-                let mut synced = self.lock();
-                match (synced.get_mut(channel), newest, oldest) {
-                    (Some(span), _, Some(oldest)) if oldest < span.oldest => span.oldest = oldest,
-                    (None, Some(newest), Some(oldest)) => {
-                        synced.insert(
-                            channel.clone(),
-                            Synced {
-                                newest,
-                                oldest,
-                                complete: false,
-                            },
-                        );
-                    }
-                    _ => {}
-                }
-                if next.is_none()
-                    && let Some(span) = synced.get_mut(channel)
-                {
-                    span.complete = true;
-                }
-                synced.get(channel).cloned()
-            };
-            self.persist_synced().await;
-            if explicit {
-                let progress = self.control.update_channel(channel, channel_name, |c| {
-                    c.pages_fetched += 1;
-                    c.messages_stored += page_count;
-                    c.threads_fetched += page_threads;
-                    c.replies_stored += page_replies;
-                    if let Some(span) = &span_snapshot {
-                        c.newest_ts = Some(span.newest.clone());
-                        c.oldest_ts = Some(span.oldest.clone());
-                        c.complete = span.complete;
-                    }
-                    if next.is_none() {
-                        c.complete = true;
-                        c.status = BackfillStatus::Complete;
-                    }
-                });
-                self.events.emit(Event::BackfillProgress(progress));
-            }
-            match next {
-                Some(next) => cursor = Some(next),
-                None => {
-                    self.events.emit(Event::HistoryComplete {
-                        channel: channel.clone(),
-                    });
-                    return Ok(());
-                }
-            }
-        }
+        let prior = self.lock().get(channel).cloned();
+        let mut sink = BackfillSink {
+            backfill: self,
+            channel,
+            channel_name,
+            explicit,
+        };
+        walk_history(
+            prior,
+            HistoryWalk {
+                include_threads,
+                max_pages: 0,
+            },
+            &mut sink,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn persist_synced(&self) {
@@ -763,36 +984,13 @@ impl<B: Backend> Backfill<B> {
         channel: ChannelId,
         thread_ts: Ts,
     ) -> Result<u64, CoreError> {
-        let mut cursor: Option<String> = None;
-        let mut first = true;
-        let mut stored = 0u64;
-        loop {
-            if !std::mem::take(&mut first) {
-                tokio::time::sleep(self.page_delay).await;
-            }
-            let fetched_at = now_epoch_secs();
-            let page = wait_out_rate_limits(|| {
-                self.backend
-                    .replies_page(channel.clone(), thread_ts.clone(), cursor.clone())
-            })
-            .await?;
-            let next = page
-                .next_cursor
-                .filter(|next| Some(next) != cursor.as_ref());
-            let replies_in_page = page.items.iter().filter(|m| m.ts != thread_ts).count() as u64;
-            stored += replies_in_page;
-            self.store_replies_page(&channel, page.items, fetched_at)
-                .await?;
-            if !self.events.emit(Event::StoreChanged {
-                channel: channel.clone(),
-            }) {
-                return Ok(stored);
-            }
-            match next {
-                Some(next) => cursor = Some(next),
-                None => return Ok(stored),
-            }
-        }
+        let mut sink = BackfillSink {
+            backfill: self,
+            channel: &channel,
+            channel_name: None,
+            explicit: false,
+        };
+        walk_thread(&thread_ts, &mut sink).await
     }
 
     /// Stores one `conversations.history` page requested at `fetched_at` (unix seconds) after
@@ -839,7 +1037,7 @@ impl<B: Backend> Backfill<B> {
 
 /// Runs `fetch` until it stops hitting a rate limit, waiting Slack's `retry_after` each time
 /// (on top of the API client's own retries; at most [`MAX_RATE_LIMIT_WAITS`] waits).
-pub(crate) async fn wait_out_rate_limits<T, F, Fut>(mut fetch: F) -> Result<T, ApiError>
+pub async fn wait_out_rate_limits<T, F, Fut>(mut fetch: F) -> Result<T, ApiError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, ApiError>>,
@@ -919,12 +1117,6 @@ mod tests {
             matches!(
                 e,
                 Event::StoreChanged { channel } if *channel == ChannelId::from("C1")
-            )
-        }));
-        assert!(events.iter().any(|e| {
-            matches!(
-                e,
-                Event::HistoryComplete { channel } if *channel == ChannelId::from("C1")
             )
         }));
         let span = bf.synced.lock().unwrap()[&ChannelId::from("C1")].clone();
@@ -1069,16 +1261,11 @@ mod tests {
         let fake = FakeBackend::with_history(1..=6);
         fake.push_thread("6.0", 1..=6);
         fake.set_stuck_cursor(true);
-        let (bf, mut rx) = backfill(&fake);
+        let (bf, _rx) = backfill(&fake);
 
         bf.clone().run(ChannelId::from("C1")).await;
         assert_eq!(fake.calls().len(), 2);
-        assert!(drain(&mut rx).iter().any(|e| {
-            matches!(
-                e,
-                Event::HistoryComplete { channel } if *channel == ChannelId::from("C1")
-            )
-        }));
+        assert!(bf.synced.lock().unwrap()[&ChannelId::from("C1")].complete);
 
         bf.fetch_thread(ChannelId::from("C1"), Ts::from("6.0"))
             .await
@@ -1105,7 +1292,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn multi_page_catchup_over_incomplete_span_bridges_gap_and_finishes() {
         let fake = FakeBackend::with_history(1..=12);
-        let (bf, mut rx) = backfill(&fake);
+        let (bf, _rx) = backfill(&fake);
         // Pre-seed incomplete middle span 5..=6.
         {
             let mut store = bf.store.lock().unwrap();
@@ -1145,12 +1332,6 @@ mod tests {
                 complete: true,
             }
         );
-        assert!(drain(&mut rx).iter().any(|e| {
-            matches!(
-                e,
-                Event::HistoryComplete { channel } if *channel == ChannelId::from("C1")
-            )
-        }));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1165,9 +1346,12 @@ mod tests {
         assert!(events.contains(&Event::StoreChanged {
             channel: ChannelId::from("C1")
         }));
-        assert!(events.contains(&Event::HistoryComplete {
-            channel: ChannelId::from("C1")
-        }));
+        assert!(
+            !bf.synced
+                .lock()
+                .unwrap()
+                .contains_key(&ChannelId::from("C1"))
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1184,9 +1368,12 @@ mod tests {
             "walk stops after first page once receiver drops"
         );
 
-        bf.fetch_thread(ChannelId::from("C1"), Ts::from("10.0"))
-            .await
-            .unwrap();
+        // Nobody listens for the pages it stores, so the fetch ends as cancelled.
+        assert!(matches!(
+            bf.fetch_thread(ChannelId::from("C1"), Ts::from("10.0"))
+                .await,
+            Err(CoreError::Cancelled)
+        ));
         assert_eq!(
             fake.reply_calls().len(),
             1,

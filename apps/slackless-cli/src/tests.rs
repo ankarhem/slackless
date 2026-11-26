@@ -1043,9 +1043,9 @@ fn parses_unified_search_export_and_archive_cli_flags() {
         _ => panic!("expected Export"),
     }
 
+    // One `backfill` command covers a channel, `--all`, and `--threads`; `archive backfill` is gone.
     let cli_bf = Cli::try_parse_from([
         "slackless",
-        "archive",
         "backfill",
         "--all",
         "--threads",
@@ -1054,19 +1054,35 @@ fn parses_unified_search_export_and_archive_cli_flags() {
         "--page-size",
         "50",
     ])
-    .expect("parse archive backfill");
+    .expect("parse backfill --all");
     match cli_bf.command {
-        Commands::Archive { command } => match *command {
-            ArchiveCommand::Backfill(args) => {
-                assert!(args.all);
-                assert!(args.threads);
-                assert_eq!(args.pages, 3);
-                assert_eq!(args.page_size, 50);
-            }
-            _ => panic!("expected ArchiveCommand::Backfill"),
-        },
-        _ => panic!("expected Archive"),
+        Commands::Backfill(args) => {
+            assert!(args.channel.is_none());
+            assert!(args.all);
+            assert!(args.threads);
+            assert_eq!(args.pages, 3);
+            assert_eq!(args.page_size, 50);
+        }
+        _ => panic!("expected Backfill"),
     }
+    let cli_bf =
+        Cli::try_parse_from(["slackless", "backfill", "#eng"]).expect("parse backfill <CHANNEL>");
+    match cli_bf.command {
+        Commands::Backfill(args) => {
+            assert_eq!(args.channel.as_deref(), Some("#eng"));
+            assert!(!args.all && !args.threads);
+            assert_eq!((args.pages, args.page_size), (10, 200));
+        }
+        _ => panic!("expected Backfill"),
+    }
+    assert!(
+        Cli::try_parse_from(["slackless", "archive", "backfill", "--all"]).is_err(),
+        "`archive backfill` no longer exists"
+    );
+    assert!(
+        Cli::try_parse_from(["slackless", "backfill", "#eng", "--page-size", "0"]).is_err(),
+        "a zero page size is a usage error"
+    );
 
     let cli_status =
         Cli::try_parse_from(["slackless", "--json", "archive", "status"]).expect("parse status");

@@ -879,7 +879,7 @@ fn saved_mark_thread_and_files_formatters_cover_edge_cases() {
 }
 
 #[test]
-fn canvas_list_and_backfill_seams_cover_argument_validation_and_formatting() {
+fn canvas_list_and_list_seams_cover_argument_validation_and_formatting() {
     // Canvas edit op builder.
     assert_eq!(
         build_canvas_edit_op("hello".into(), Some("S1".into()), true),
@@ -961,30 +961,6 @@ fn canvas_list_and_backfill_seams_cover_argument_validation_and_formatting() {
         ..Default::default()
     };
     assert_eq!(select_list_primary_column(&with_primary), "ColB");
-
-    // Backfill seams.
-    assert_eq!(clamp_backfill_page_size(0), 1);
-    assert_eq!(clamp_backfill_page_size(100), 100);
-    assert_eq!(clamp_backfill_page_size(999), 200);
-    assert!(!backfill_should_stop(0, 50));
-    assert!(!backfill_should_stop(3, 2));
-    assert!(backfill_should_stop(3, 3));
-
-    let (json, human) = format_backfill_output(
-        &TeamId::from("T1"),
-        &ChannelId::from("C1"),
-        Some("#eng"),
-        2,
-        150,
-        true,
-    );
-    assert_eq!(json["pages"], 2);
-    assert_eq!(json["messages"], 150);
-    assert_eq!(json["reached_end"], true);
-    assert_eq!(
-        human,
-        "backfilled #eng: 150 messages across 2 page(s) (complete=true)\n"
-    );
 }
 
 #[test]
@@ -1659,10 +1635,10 @@ fn backfill_stuck_cursor_guard_status_spacing_and_huddle_helpers() {
 }
 
 #[test]
-fn format_archive_backfill_output_aggregates_channels_and_threads() {
+fn format_backfill_output_aggregates_channels_and_threads() {
     let ws = TeamId::from("T1");
     let channels = vec![
-        ArchiveBackfillChannelSummary {
+        BackfillChannelSummary {
             channel: "C1".into(),
             label: "#general".into(),
             pages: 2,
@@ -1671,7 +1647,7 @@ fn format_archive_backfill_output_aggregates_channels_and_threads() {
             replies: 11,
             reached_end: true,
         },
-        ArchiveBackfillChannelSummary {
+        BackfillChannelSummary {
             channel: "C2".into(),
             label: "#ops".into(),
             pages: 1,
@@ -1681,7 +1657,7 @@ fn format_archive_backfill_output_aggregates_channels_and_threads() {
             reached_end: false,
         },
     ];
-    let (json, human) = format_archive_backfill_output(&ws, true, &channels);
+    let (json, human) = format_backfill_output(&ws, true, &channels);
     assert_eq!(json["ok"], true);
     assert_eq!(json["channels_count"], 2);
     assert_eq!(json["completed_channels"], 1);
@@ -1692,4 +1668,13 @@ fn format_archive_backfill_output_aggregates_channels_and_threads() {
         "backfilled #general: 50 messages across 2 page(s), 11 replies across 3 thread(s)"
     ));
     assert!(human.contains("total (T1): 1/2 channels complete, 60 messages, 11 thread replies"));
+
+    // One channel: no total line; none: a note instead of a silent success.
+    let (_, human) = format_backfill_output(&ws, false, &channels[..1]);
+    assert_eq!(
+        human,
+        "backfilled #general: 50 messages across 2 page(s) (complete=true)\n"
+    );
+    let (_, human) = format_backfill_output(&ws, false, &[]);
+    assert_eq!(human, "no channels found to backfill in workspace T1\n");
 }
