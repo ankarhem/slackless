@@ -223,40 +223,20 @@ impl ProcessResourceSampler {
 
 #[cfg(unix)]
 fn current_process_cpu_us() -> u64 {
-    #[cfg(target_os = "macos")]
-    type SusecondsT = i32;
-    #[cfg(not(target_os = "macos"))]
-    type SusecondsT = std::ffi::c_long;
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    struct TimeVal {
-        tv_sec: std::ffi::c_long,
-        tv_usec: SusecondsT,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct RUsage {
-        ru_utime: TimeVal,
-        ru_stime: TimeVal,
-        _rest: [std::ffi::c_long; 14],
-    }
-
-    unsafe extern "C" {
-        fn getrusage(who: i32, usage: *mut RUsage) -> i32;
-    }
-
-    const RUSAGE_SELF: i32 = 0;
-    let mut usage = std::mem::MaybeUninit::<RUsage>::zeroed();
-    let rc = unsafe { getrusage(RUSAGE_SELF, usage.as_mut_ptr()) };
-    if rc != 0 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: `usage` is a writable `rusage` for the duration of the call, and `RUSAGE_SELF`
+    // asks only about this process.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
         return 0;
     }
-    let u = unsafe { usage.assume_init() };
-    let user_us = (u.ru_utime.tv_sec.max(0) as u64) * 1_000_000 + u.ru_utime.tv_usec.max(0) as u64;
-    let sys_us = (u.ru_stime.tv_sec.max(0) as u64) * 1_000_000 + u.ru_stime.tv_usec.max(0) as u64;
-    user_us.saturating_add(sys_us)
+    // SAFETY: `getrusage` returned 0, so it filled `usage` (which was zeroed to begin with).
+    let usage = unsafe { usage.assume_init() };
+    let micros = |tv: libc::timeval| {
+        let secs = u64::try_from(tv.tv_sec).unwrap_or(0);
+        secs.saturating_mul(1_000_000)
+            .saturating_add(u64::try_from(tv.tv_usec).unwrap_or(0))
+    };
+    micros(usage.ru_utime).saturating_add(micros(usage.ru_stime))
 }
 
 #[cfg(not(unix))]
@@ -336,6 +316,11 @@ mod tests {
         assert!(dt > 0.0);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         assert!(rss > 0, "process RSS should be positive");
+        #[cfg(unix)]
+        assert!(
+            current_process_cpu_us() > 0,
+            "getrusage should report CPU time"
+        );
     }
 
     #[test]

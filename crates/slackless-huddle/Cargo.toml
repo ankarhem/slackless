@@ -47,6 +47,9 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dy
 # Same version ort loads the runtime with; used to vet the library before ort does.
 libloading = "0.9"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 nokhwa = { version = "0.10", features = ["input-native"] }
 
