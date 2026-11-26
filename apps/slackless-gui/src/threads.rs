@@ -156,6 +156,10 @@ pub enum ThreadPanelEvent {
     },
     /// Save for later / Remind me / unsave; the root keeps the Later list.
     Later(SaveRequest),
+    /// Retry a durable V13 outbox reply shown inline at the bottom of this thread.
+    RetryOutbox(i64),
+    /// Discard a durable V13 outbox reply shown inline at the bottom of this thread.
+    DiscardOutbox(i64),
 }
 
 /// Avatar chip size and the text-column inset (avatar plus its gap), mirroring `messages.rs`
@@ -194,6 +198,11 @@ pub struct ThreadPanel {
     scroll: ScrollHandle,
     /// A reply permalink's message, scrolled into view once it is loaded.
     reveal: Option<Ts>,
+    /// Durable V13 outbox items for the active workspace (filtered to this thread on render).
+    outbox: Vec<slackless_core::store::OutboxItem>,
+    /// True when the live workspace RTM connection is offline (skips optimistic local echo so
+    /// the inline outbox card does not duplicate the reply).
+    offline: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -299,9 +308,29 @@ impl ThreadPanel {
                 composer,
                 scroll: ScrollHandle::new(),
                 reveal: None,
+                outbox: Vec::new(),
+                offline: false,
                 _subscriptions: subscriptions,
             }
         })
+    }
+
+    /// Update the workspace's durable V13 outbox snapshot shown inline at the bottom of the thread.
+    pub fn set_outbox(
+        &mut self,
+        items: Vec<slackless_core::store::OutboxItem>,
+        cx: &mut Context<Self>,
+    ) {
+        self.outbox = items;
+        cx.notify();
+    }
+
+    /// Track live connection offline state so offline replies render exclusively via outbox cards.
+    pub fn set_offline(&mut self, offline: bool, cx: &mut Context<Self>) {
+        if self.offline != offline {
+            self.offline = offline;
+            cx.notify();
+        }
     }
 
     /// Clear per-message deleted overrides when the global setting changes.
@@ -560,13 +589,18 @@ impl ThreadPanel {
         let Some((channel, thread_ts)) = self.thread.clone() else {
             return;
         };
-        // The local echo shows the same blocks the reply posts with.
-        let mut message =
-            self.fixtures
-                .local_message(&channel, content.text.clone(), Some(thread_ts.clone()));
-        message.blocks = content.blocks.clone();
-        message.attachments = content.attachments.clone();
-        self.replies.push(message);
+        // Skip synthetic optimistic echo while offline in live mode so the durable V13 inline
+        // outbox card renders cleanly without duplicating the reply.
+        if self.fixtures.sample || !self.offline {
+            let mut message = self.fixtures.local_message(
+                &channel,
+                content.text.clone(),
+                Some(thread_ts.clone()),
+            );
+            message.blocks = content.blocks.clone();
+            message.attachments = content.attachments.clone();
+            self.replies.push(message);
+        }
         self.reply_hint = false;
         let broadcast = self
             .composer
@@ -1366,8 +1400,31 @@ impl Render for ThreadPanel {
             .track_scroll(&self.scroll)
             .children(rows);
 
+        let outbox_strip = self.thread.as_ref().and_then(|(ch, root_ts)| {
+            let panel_retry = cx.entity().downgrade();
+            let panel_discard = cx.entity().downgrade();
+            crate::outbox::inline_outbox_strip(
+                &self.outbox,
+                ch,
+                Some(root_ts),
+                crate::outbox::OutboxActions {
+                    on_retry: Rc::new(move |id, _window, cx| {
+                        let _ = panel_retry
+                            .update(cx, |_, cx| cx.emit(ThreadPanelEvent::RetryOutbox(id)));
+                    }),
+                    on_discard: Rc::new(move |id, _window, cx| {
+                        let _ = panel_discard
+                            .update(cx, |_, cx| cx.emit(ThreadPanelEvent::DiscardOutbox(id)));
+                    }),
+                },
+                "thread",
+                cx,
+            )
+        });
+
         let composer_area = v_flex()
             .flex_none()
+            .children(outbox_strip)
             .when(self.reply_hint, |column| {
                 column.child(
                     h_flex()

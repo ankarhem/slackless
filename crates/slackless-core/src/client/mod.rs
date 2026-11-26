@@ -480,6 +480,9 @@ pub(crate) struct Core<B: Backend> {
     has_connected_once: bool,
     /// Outgoing mutations persisted in SQLite `offline_queue`, flushed FIFO on reconnect.
     offline_queue: VecDeque<(i64, QueuedMutation)>,
+    /// Serializes durable V13 `outbox` flushes per workspace so reconnect / manual flushes are
+    /// strictly FIFO and idempotent.
+    outbox_flush_lock: Arc<tokio::sync::Mutex<()>>,
     /// True Stealth Mode: suppresses outbound typing, read-cursor updates, and active presence
     /// (shared atomically with background offline-queue flushers).
     stealth_mode: Arc<AtomicBool>,
@@ -499,11 +502,13 @@ impl<B: Backend> Core<B> {
         huddle_media: HuddleMediaSender,
     ) -> Self {
         let ws_init = workspace.clone();
-        let (raw_offline, cached_bots, raw_synced) = with_store(&store, move |s| {
+        let (raw_offline, outbox_items, cached_bots, raw_synced) = with_store(&store, move |s| {
             let offline = s.list_offline(&ws_init).unwrap_or_default();
+            let _ = s.reset_outbox_sending_to_pending(&ws_init);
+            let outbox = s.list_outbox(&ws_init).unwrap_or_default();
             let bots = s.bot_profiles(&ws_init).unwrap_or_default();
             let synced = s.local(&ws_init, BACKFILL_SYNCED_KEY).unwrap_or_default();
-            Ok((offline, bots, synced))
+            Ok((offline, outbox, bots, synced))
         })
         .await
         .unwrap_or_default();
@@ -518,6 +523,9 @@ impl<B: Backend> Core<B> {
             .collect();
         if !persisted.is_empty() {
             events.emit(Event::OfflineQueueChanged(persisted.len()));
+        }
+        if !outbox_items.is_empty() {
+            events.emit(Event::OutboxUpdated(outbox_items));
         }
 
         let tasks = TaskTracker::default();
@@ -562,6 +570,7 @@ impl<B: Backend> Core<B> {
             is_offline: false,
             has_connected_once: false,
             offline_queue: persisted,
+            outbox_flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             stealth_mode: Arc::new(AtomicBool::new(false)),
             save_huddle_transcripts: Arc::new(AtomicBool::new(true)),
             huddle: Arc::new(Mutex::new(HuddleSlot::default())),

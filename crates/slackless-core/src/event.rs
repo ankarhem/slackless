@@ -255,6 +255,8 @@ pub enum Event {
     OfflineQueueChanged(usize),
     /// A queued offline mutation failed while flushing on reconnect.
     OfflineMutationFailed(FailedMutation),
+    /// Updated snapshot of all durable V13 `outbox` entries (pending/sending/failed) for this workspace.
+    OutboxUpdated(Vec<crate::store::OutboxItem>),
     /// A live Slack canvas HTML export finished loading (`F-COLLAB-125`).
     CanvasLoaded {
         file_id: String,

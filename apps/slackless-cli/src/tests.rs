@@ -993,7 +993,7 @@ fn parses_unified_search_export_and_archive_cli_flags() {
     match cli.command {
         Commands::Search(args) => {
             assert!(args.all_workspaces);
-            assert_eq!(args.sort, SearchSortArg::Relevant);
+            assert_eq!(args.sort, Some(SearchSortArg::Relevant));
             assert_eq!(args.limit, 15);
             assert_eq!(args.query, "canary");
         }
@@ -1386,5 +1386,445 @@ fn cmd_search_all_workspaces_and_export_and_archive_status_end_to_end() {
     assert!(status_human.contains("complete"));
 
     drop(archive1);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn cli_semantic_and_hybrid_search_and_archive_index_semantic_end_to_end() {
+    use clap::Parser as _;
+    use slackless_core::embeddings::HashProjectionEmbedder;
+    use slackless_core::store::{SearchMode, SearchSort, SemanticIndex, Store};
+    use slackless_core::types::{ChannelId, Conversation, Message, Team, TeamId, Ts, UserId};
+    use std::process::ExitCode;
+
+    use crate::cli::{ArchiveCommand, Cli, Commands, ExportFormat, SemanticModelCommand};
+    use crate::commands::maintenance::index_semantic_archives_with_embedder;
+    use crate::commands::messages::{SemanticSearchCmdOpts, cmd_search_semantic_in_archives};
+
+    // 1. CLI argument parsing covers `--semantic`, `--hybrid`, `archive index-semantic`, and
+    //    `archive semantic-model status|download|delete`.
+    let parsed_sem = Cli::try_parse_from(["slackless", "search", "--semantic", "rollback"])
+        .expect("parse --semantic");
+    match parsed_sem.command {
+        Commands::Search(args) => {
+            assert_eq!(args.search_mode(), SearchMode::Semantic);
+            assert_eq!(args.resolved_sort(), SearchSort::Relevant);
+        }
+        _ => panic!("expected Search"),
+    }
+    let parsed_sem_recent = Cli::try_parse_from([
+        "slackless",
+        "search",
+        "--semantic",
+        "--sort",
+        "recent",
+        "rollback",
+    ])
+    .expect("parse --semantic --sort recent");
+    match parsed_sem_recent.command {
+        Commands::Search(args) => {
+            assert_eq!(args.search_mode(), SearchMode::Semantic);
+            assert_eq!(args.resolved_sort(), SearchSort::Recent);
+        }
+        _ => panic!("expected Search"),
+    }
+    let parsed_kw =
+        Cli::try_parse_from(["slackless", "search", "rollback"]).expect("parse keyword");
+    match parsed_kw.command {
+        Commands::Search(args) => {
+            assert_eq!(args.search_mode(), SearchMode::Keyword);
+            assert_eq!(args.resolved_sort(), SearchSort::Recent);
+        }
+        _ => panic!("expected Search"),
+    }
+    let parsed_hyb = Cli::try_parse_from([
+        "slackless",
+        "search",
+        "--hybrid",
+        "--all-workspaces",
+        "deploy",
+    ])
+    .expect("parse --hybrid");
+    match parsed_hyb.command {
+        Commands::Search(args) => {
+            assert_eq!(args.search_mode(), SearchMode::Hybrid);
+            assert_eq!(args.resolved_sort(), SearchSort::Relevant);
+            assert!(args.all_workspaces);
+        }
+        _ => panic!("expected Search"),
+    }
+    assert!(
+        Cli::try_parse_from(["slackless", "search", "--semantic", "--hybrid", "conflict"]).is_err(),
+        "--semantic and --hybrid must be mutually exclusive"
+    );
+    let parsed_idx = Cli::try_parse_from([
+        "slackless",
+        "archive",
+        "index-semantic",
+        "--model",
+        "bge-small",
+        "--download",
+    ])
+    .expect("parse archive index-semantic");
+    match parsed_idx.command {
+        Commands::Archive { command } => match *command {
+            ArchiveCommand::IndexSemantic(args) => {
+                assert_eq!(args.model, "bge-small");
+                assert!(args.download);
+            }
+            _ => panic!("expected IndexSemantic"),
+        },
+        _ => panic!("expected Archive"),
+    }
+    let parsed_model = Cli::try_parse_from(["slackless", "archive", "semantic-model", "status"])
+        .expect("parse archive semantic-model status");
+    match parsed_model.command {
+        Commands::Archive { command } => match *command {
+            ArchiveCommand::SemanticModel { command } => {
+                assert!(matches!(*command, SemanticModelCommand::Status { .. }));
+            }
+            _ => panic!("expected SemanticModel"),
+        },
+        _ => panic!("expected Archive"),
+    }
+
+    // 2. End-to-end incremental sidecar indexing + hybrid & semantic search over two disk archives.
+    let tmp_dir =
+        std::env::temp_dir().join(format!("slackless-cli-semantic-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    let ws1 = TeamId::from("T_SEM1");
+    let ws2 = TeamId::from("T_SEM2");
+    let db1 = tmp_dir.join("T_SEM1.sqlite");
+    let db2 = tmp_dir.join("T_SEM2.sqlite");
+    let sem_path = tmp_dir.join("semantic_index.sqlite");
+
+    {
+        let mut s1 = Store::open(&db1).unwrap();
+        s1.upsert_team(
+            &ws1,
+            &Team {
+                id: ws1.clone(),
+                name: "Alpha".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s1.upsert_conversation(
+            &ws1,
+            &Conversation {
+                id: ChannelId::from("C1"),
+                name: Some("ops".into()),
+                is_channel: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s1.upsert_message(
+            &ws1,
+            &ChannelId::from("C1"),
+            &Message {
+                ts: Ts::from("1700010000.000000"),
+                user: Some(UserId::from("U1")),
+                text: "Deploying kubernetes autoscaling cluster rollback".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    {
+        let mut s2 = Store::open(&db2).unwrap();
+        s2.upsert_team(
+            &ws2,
+            &Team {
+                id: ws2.clone(),
+                name: "Beta".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s2.upsert_conversation(
+            &ws2,
+            &Conversation {
+                id: ChannelId::from("C2"),
+                name: Some("infra".into()),
+                is_channel: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s2.upsert_message(
+            &ws2,
+            &ChannelId::from("C2"),
+            &Message {
+                ts: Ts::from("1700020000.000000"),
+                user: Some(UserId::from("U2")),
+                text: "Cluster autoscaler canary rollout documentation".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    let ctx_json = crate::Ctx { json: true };
+    let embedder = HashProjectionEmbedder::new(128);
+    let mut index = SemanticIndex::open(&sem_path).unwrap();
+    let archives = vec![(ws1.clone(), db1.clone()), (ws2.clone(), db2.clone())];
+
+    let rep1 = index_semantic_archives_with_embedder(&ctx_json, &archives, &mut index, &embedder)
+        .expect("first semantic index");
+    assert_eq!(rep1.embedded, 2);
+    assert_eq!(rep1.skipped_unchanged, 0);
+
+    // Second run skips both unchanged docs.
+    let rep2 = index_semantic_archives_with_embedder(&ctx_json, &archives, &mut index, &embedder)
+        .expect("second semantic index");
+    assert_eq!(rep2.embedded, 0);
+    assert_eq!(rep2.skipped_unchanged, 2);
+
+    // Hybrid search writes JSON with mode, model, semantic_score, and hits from both workspaces.
+    let out_json = tmp_dir.join("hybrid_out.json");
+    let code = cmd_search_semantic_in_archives(
+        &ctx_json,
+        &archives,
+        &index,
+        &embedder,
+        "kubernetes cluster autoscaler",
+        SemanticSearchCmdOpts {
+            mode: SearchMode::Hybrid,
+            model: "minilm",
+            all_workspaces: true,
+            limit: 10,
+            sort: SearchSort::Relevant,
+            format: Some(ExportFormat::Json),
+            out: Some(&out_json),
+            include_deleted: false,
+        },
+    )
+    .expect("hybrid search");
+    assert_eq!(code, ExitCode::SUCCESS);
+    let val: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_json).unwrap()).unwrap();
+    assert_eq!(val["mode"], "hybrid");
+    assert_eq!(val["all_workspaces"], true);
+    assert!(val["count"].as_u64().unwrap_or(0) >= 2);
+    let msgs = val["messages"].as_array().unwrap();
+    assert!(msgs.iter().any(|m| m["workspace"] == "T_SEM1"));
+    assert!(msgs.iter().any(|m| m["workspace"] == "T_SEM2"));
+    assert!(msgs.iter().all(|m| m["semantic_score"].is_number()));
+
+    drop(index);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn cli_catchup_flag_parsing_and_multi_workspace_briefing() {
+    use slackless_core::catchup::{CatchUpWindow, format_catchup_human};
+    use slackless_core::store::Store;
+    use slackless_core::types::{
+        ChannelId, Conversation, FileId, Message, Team, TeamId, Ts, User, UserId,
+    };
+
+    use crate::archive::Archive;
+    use crate::commands::browse::{build_catchup_for_archives, parse_catchup_window};
+
+    // 1. Clap flag parsing for `slackless catchup [--since 24h|7d] [--all-workspaces] [--json]`.
+    let parsed = Cli::try_parse_from([
+        "slackless",
+        "--json",
+        "catchup",
+        "--since",
+        "7d",
+        "--all-workspaces",
+    ])
+    .expect("parse catchup");
+    assert!(parsed.json);
+    match parsed.command {
+        Commands::Catchup(args) => {
+            assert_eq!(args.since.as_deref(), Some("7d"));
+            assert!(args.all_workspaces);
+            assert_eq!(args.limit, 25);
+        }
+        _ => panic!("expected Commands::Catchup"),
+    }
+
+    let now = 1_750_000_000_i64;
+    assert_eq!(
+        parse_catchup_window(None, now).unwrap(),
+        CatchUpWindow::SinceLastVisit
+    );
+    assert_eq!(
+        parse_catchup_window(Some("24h"), now).unwrap(),
+        CatchUpWindow::Last24h
+    );
+    assert_eq!(
+        parse_catchup_window(Some("7d"), now).unwrap(),
+        CatchUpWindow::Last7d
+    );
+    assert_eq!(
+        parse_catchup_window(Some("6h"), now).unwrap(),
+        CatchUpWindow::Custom {
+            since_secs: now - 6 * 3600
+        }
+    );
+    assert!(parse_catchup_window(Some("bogus"), now).is_err());
+
+    // 2. End-to-end single & multi-workspace catchup across two temporary SQLite archives.
+    let tmp_dir =
+        std::env::temp_dir().join(format!("slackless-cli-catchup-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+
+    let ws1 = TeamId::from("T_CATCH1");
+    let ws2 = TeamId::from("T_CATCH2");
+    let db1 = tmp_dir.join("T_CATCH1.sqlite");
+    let db2 = tmp_dir.join("T_CATCH2.sqlite");
+
+    {
+        let mut s1 = Store::open(&db1).unwrap();
+        s1.upsert_team(
+            &ws1,
+            &Team {
+                id: ws1.clone(),
+                name: "Acme".into(),
+                ..Team::default()
+            },
+        )
+        .unwrap();
+        s1.upsert_user(
+            &ws1,
+            &User {
+                id: UserId::from("U_ALICE"),
+                name: "alice".into(),
+                ..User::default()
+            },
+        )
+        .unwrap();
+        s1.upsert_conversations(
+            &ws1,
+            &[Conversation {
+                id: ChannelId::from("C1"),
+                name: Some("general".into()),
+                is_channel: true,
+                is_member: true,
+                last_read: Some(Ts::from(format!("{}.000000", now - 3600))),
+                ..Conversation::default()
+            }],
+        )
+        .unwrap();
+        s1.upsert_messages(
+            &ws1,
+            &ChannelId::from("C1"),
+            &[
+                Message {
+                    ts: Ts::from(format!("{}.000000", now - 1200)),
+                    user: Some(UserId::from("U_ALICE")),
+                    text: "Hey <@U_ME> please review the release checklist".into(),
+                    reply_count: Some(1),
+                    ..Message::default()
+                },
+                Message {
+                    ts: Ts::from(format!("{}.000000", now - 600)),
+                    thread_ts: Some(Ts::from(format!("{}.000000", now - 1200))),
+                    user: Some(UserId::from("U_ALICE")),
+                    text: "Added benchmark numbers".into(),
+                    ..Message::default()
+                },
+            ],
+        )
+        .unwrap();
+        s1.upsert_file_transcript(
+            &ws1,
+            &FileId::from("F_DEMO"),
+            "whisper",
+            "Quick architecture demo walkthrough",
+        )
+        .unwrap();
+    }
+
+    {
+        let mut s2 = Store::open(&db2).unwrap();
+        s2.upsert_team(
+            &ws2,
+            &Team {
+                id: ws2.clone(),
+                name: "Beta".into(),
+                ..Team::default()
+            },
+        )
+        .unwrap();
+        s2.upsert_user(
+            &ws2,
+            &User {
+                id: UserId::from("U_BOB"),
+                name: "bob".into(),
+                ..User::default()
+            },
+        )
+        .unwrap();
+        s2.upsert_conversations(
+            &ws2,
+            &[Conversation {
+                id: ChannelId::from("C2"),
+                name: Some("incidents".into()),
+                is_channel: true,
+                is_member: true,
+                ..Conversation::default()
+            }],
+        )
+        .unwrap();
+        s2.upsert_messages(
+            &ws2,
+            &ChannelId::from("C2"),
+            &[Message {
+                ts: Ts::from(format!("{}.000000", now - 300)),
+                user: Some(UserId::from("U_BOB")),
+                text: "<!here> database failover complete".into(),
+                ..Message::default()
+            }],
+        )
+        .unwrap();
+    }
+
+    let arch1 = Archive::open_path(&db1).unwrap().unwrap();
+    let arch2 = Archive::open_path(&db2).unwrap().unwrap();
+    let me = UserId::from("U_ME");
+
+    // Single workspace catchup (`--since 24h`)
+    let single = build_catchup_for_archives(
+        &[(&ws1, Some(&me), &arch1)],
+        CatchUpWindow::Last24h,
+        now,
+        25,
+    )
+    .unwrap();
+    assert_eq!(single.workspaces.len(), 1);
+    assert_eq!(single.mentions.len(), 1);
+    assert_eq!(single.unread_channels.len(), 1);
+    assert_eq!(single.active_threads.len(), 1);
+    let single_json = serde_json::to_value(&single).unwrap();
+    assert!(single_json["mentions"].is_array());
+    assert!(single_json["unread_channels"].is_array());
+    assert!(single_json["active_threads"].is_array());
+    assert!(single_json["transcripts"].is_array());
+
+    // Multi-workspace catchup (`--all-workspaces`)
+    let all = build_catchup_for_archives(
+        &[(&ws1, Some(&me), &arch1), (&ws2, Some(&me), &arch2)],
+        CatchUpWindow::Last24h,
+        now,
+        25,
+    )
+    .unwrap();
+    assert_eq!(all.workspaces.len(), 2);
+    assert_eq!(all.mentions.len(), 2);
+    let human = format_catchup_human(&all, true);
+    assert!(human.contains("MENTIONS (2)"));
+    assert!(human.contains("#general"));
+    assert!(human.contains("#incidents"));
+
+    drop(arch1);
+    drop(arch2);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

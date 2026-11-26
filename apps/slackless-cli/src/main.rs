@@ -32,12 +32,15 @@ use crate::cli::{
 pub(crate) use crate::cli::{CLI_VERSION, CanvasAccessArg, ListReadFormat};
 use crate::commands::auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
 use crate::commands::browse::{
-    cmd_channels, cmd_digest, cmd_dms, cmd_revisions, cmd_threads, cmd_users,
+    cmd_catchup, cmd_channels, cmd_digest, cmd_dms, cmd_revisions, cmd_threads, cmd_users,
 };
-use crate::commands::maintenance::{cmd_archive_status, cmd_stats, cmd_vacuum};
+use crate::commands::maintenance::{
+    cmd_archive_index_semantic, cmd_archive_semantic_model, cmd_archive_status, cmd_stats,
+    cmd_vacuum,
+};
 use crate::commands::messages::{
-    ExportCmdOpts, SearchAllOpts, cmd_export, cmd_read, cmd_search, cmd_search_all_workspaces,
-    cmd_thread,
+    ExportCmdOpts, SearchAllOpts, SemanticSearchCmdOpts, cmd_export, cmd_read, cmd_search,
+    cmd_search_all_workspaces, cmd_search_semantic, cmd_thread,
 };
 use crate::live::{HuddleJoinArgs, HuddleTranscriptsArgs};
 use crate::session::resolve_workspace;
@@ -84,12 +87,31 @@ async fn dispatch(
     workspace: Option<&TeamId>,
 ) -> Result<ExitCode> {
     match cli.command {
+        Commands::Search(args) if args.search_mode().uses_embeddings() => {
+            let mode = args.search_mode();
+            let sort = args.resolved_sort();
+            cmd_search_semantic(
+                ctx,
+                workspace,
+                &args.query,
+                SemanticSearchCmdOpts {
+                    mode,
+                    model: &args.model,
+                    all_workspaces: args.all_workspaces,
+                    limit: args.limit,
+                    sort,
+                    format: args.format,
+                    out: args.out.as_deref(),
+                    include_deleted: args.include_deleted,
+                },
+            )
+        }
         Commands::Search(args) if args.all_workspaces => cmd_search_all_workspaces(
             ctx,
             &args.query,
             SearchAllOpts {
                 limit: args.limit,
-                sort: args.sort.into(),
+                sort: args.resolved_sort(),
                 format: args.format,
                 out: args.out.as_deref(),
                 include_deleted: args.include_deleted,
@@ -100,7 +122,7 @@ async fn dispatch(
             workspace,
             &args.query,
             args.limit,
-            args.sort.into(),
+            args.resolved_sort(),
             args.format,
             args.out.as_deref(),
             args.include_deleted,
@@ -167,6 +189,13 @@ async fn dispatch(
         Commands::Digest(args) => {
             cmd_digest(ctx, workspace, &args.since, args.all_workspaces, args.limit)
         }
+        Commands::Catchup(args) => cmd_catchup(
+            ctx,
+            workspace,
+            args.since.as_deref(),
+            args.all_workspaces,
+            args.limit,
+        ),
         Commands::MarkRead { channel, ts } => {
             run_mark_read(ctx, flag, &channel, ts.as_deref()).await
         }
@@ -260,6 +289,12 @@ async fn dispatch(
                 .await
             }
             ArchiveCommand::Status => cmd_archive_status(ctx, workspace),
+            ArchiveCommand::IndexSemantic(args) => {
+                cmd_archive_index_semantic(ctx, workspace, *args).await
+            }
+            ArchiveCommand::SemanticModel { command } => {
+                cmd_archive_semantic_model(ctx, *command).await
+            }
         },
         Commands::Update(args) => {
             update::run_update(ctx, args.check, args.force, args.restart, args.beta).await

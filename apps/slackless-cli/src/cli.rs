@@ -56,9 +56,18 @@ pub(crate) struct SearchArgs {
     /// Search across every locally archived workspace at once (messages, snippets, canvases, transcripts).
     #[arg(long)]
     pub(crate) all_workspaces: bool,
-    /// Sort order (`recent` = newest first, `relevant` = FTS5 BM25 relevance).
-    #[arg(long, value_enum, default_value_t = SearchSortArg::Recent)]
-    pub(crate) sort: SearchSortArg,
+    /// Sort order (`recent` = newest first, `relevant` = BM25/semantic relevance; defaults to `recent` for keyword and `relevant` for `--semantic`/`--hybrid`).
+    #[arg(long, value_enum)]
+    pub(crate) sort: Option<SearchSortArg>,
+    /// Search using local ONNX semantic embeddings instead of keyword FTS5.
+    #[arg(long, conflicts_with = "hybrid")]
+    pub(crate) semantic: bool,
+    /// Blend SQLite FTS5 keyword search with local ONNX semantic embeddings via Reciprocal Rank Fusion.
+    #[arg(long, conflicts_with = "semantic")]
+    pub(crate) hybrid: bool,
+    /// Local embedding model for `--semantic` / `--hybrid` (`minilm` or `bge-small`).
+    #[arg(long, value_name = "MODEL", default_value = "minilm")]
+    pub(crate) model: String,
     /// Optional export format (`md` or `json`) for search results.
     #[arg(long, value_enum)]
     pub(crate) format: Option<ExportFormat>,
@@ -68,6 +77,28 @@ pub(crate) struct SearchArgs {
     /// Include locally archived deleted messages in results.
     #[arg(long)]
     pub(crate) include_deleted: bool,
+}
+
+impl SearchArgs {
+    pub(crate) fn search_mode(&self) -> slackless_core::store::SearchMode {
+        if self.semantic {
+            slackless_core::store::SearchMode::Semantic
+        } else if self.hybrid {
+            slackless_core::store::SearchMode::Hybrid
+        } else {
+            slackless_core::store::SearchMode::Keyword
+        }
+    }
+
+    pub(crate) fn resolved_sort(&self) -> slackless_core::store::SearchSort {
+        match self.sort {
+            Some(explicit) => explicit.into(),
+            None if self.search_mode().uses_embeddings() => {
+                slackless_core::store::SearchSort::Relevant
+            }
+            None => slackless_core::store::SearchSort::Recent,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -231,6 +262,19 @@ pub(crate) struct DigestArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct CatchupArgs {
+    /// Time window (`24h`, `7d`, `since-last-visit`, or any duration/date cutoff; defaults to since last visit).
+    #[arg(long, value_name = "WHEN")]
+    pub(crate) since: Option<String>,
+    /// Aggregate catch-up briefing across every locally archived workspace at once.
+    #[arg(long)]
+    pub(crate) all_workspaces: bool,
+    /// Maximum items to include per briefing section.
+    #[arg(long, value_name = "N", default_value_t = 25)]
+    pub(crate) limit: usize,
+}
+
+#[derive(Args)]
 pub(crate) struct FilesArgs {
     /// Optional channel id, #name, or @handle to filter by.
     #[arg(long, value_name = "CHANNEL")]
@@ -273,12 +317,60 @@ pub(crate) struct ArchiveBackfillArgs {
     pub(crate) page_size: u32,
 }
 
+#[derive(Args)]
+pub(crate) struct ArchiveIndexSemanticArgs {
+    /// Index only the active `--workspace` instead of all locally stored workspaces.
+    #[arg(long)]
+    pub(crate) single_workspace: bool,
+    /// Local ONNX embedding model (`minilm` = all-MiniLM-L6-v2, `bge-small` = bge-small-en-v1.5).
+    #[arg(long, value_name = "MODEL", default_value = "minilm")]
+    pub(crate) model: String,
+    /// Automatically download the local embedding model if it is not installed yet.
+    #[arg(long)]
+    pub(crate) download: bool,
+    /// Clear existing vectors and re-embed every archived document from scratch.
+    #[arg(long)]
+    pub(crate) rebuild: bool,
+    /// Print semantic model and index status without indexing.
+    #[arg(long)]
+    pub(crate) status: bool,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SemanticModelCommand {
+    /// Show download status, disk usage, and sidecar vector index statistics (offline).
+    Status {
+        /// Local ONNX embedding model (`minilm` or `bge-small`).
+        #[arg(long, value_name = "MODEL", default_value = "minilm")]
+        model: String,
+    },
+    /// Download quantized ONNX weights and WordPiece vocab into the local app-data models directory.
+    Download {
+        /// Local ONNX embedding model (`minilm` or `bge-small`).
+        #[arg(long, value_name = "MODEL", default_value = "minilm")]
+        model: String,
+    },
+    /// Remove downloaded local embedding model weights to reclaim disk space.
+    Delete {
+        /// Local ONNX embedding model (`minilm` or `bge-small`).
+        #[arg(long, value_name = "MODEL", default_value = "minilm")]
+        model: String,
+    },
+}
+
 #[derive(Subcommand)]
 pub(crate) enum ArchiveCommand {
     /// Backfill one channel or the whole workspace into the local SQLite archive (needs a stored session).
     Backfill(Box<ArchiveBackfillArgs>),
     /// Show per-channel backfill sync status and local archive progress (offline).
     Status,
+    /// Build or incrementally update the sidecar semantic vector index (`semantic_index.sqlite`) across workspaces.
+    IndexSemantic(Box<ArchiveIndexSemanticArgs>),
+    /// Inspect, download, or remove local ONNX embedding models for semantic/hybrid search.
+    SemanticModel {
+        #[command(subcommand)]
+        command: Box<SemanticModelCommand>,
+    },
 }
 
 #[derive(Args)]
@@ -381,6 +473,8 @@ pub(crate) enum Commands {
     Users(Box<UsersArgs>),
     /// Summarize recent archived activity per conversation (offline).
     Digest(Box<DigestArgs>),
+    /// Local Catch-Up / Daily Briefing: mentions, unread channels, active threads, and new transcripts (offline).
+    Catchup(Box<CatchupArgs>),
     /// Mark a conversation read (`conversations.mark`; defaults to newest archived message ts).
     MarkRead {
         /// Channel id, #name, or @handle.

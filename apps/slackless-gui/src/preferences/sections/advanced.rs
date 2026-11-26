@@ -308,6 +308,7 @@ impl Preferences {
             text_input_box_for(&self.protocol_allowlist_input, false, false, m, cx)
                 .w_full()
                 .max_w(px(420.));
+        let semantic_search_card = self.semantic_search_card(cx);
         let network_group = self.network_diagnostics_group(cx);
         v_flex()
             .child(self.group(
@@ -328,7 +329,8 @@ impl Preferences {
                     .gap_2()
                     .child(remote_search)
                     .child(search_in_ch)
-                    .child(self.labeled("Exclude these channels from local search", excluded_input)),
+                    .child(self.labeled("Exclude these channels from local search", excluded_input))
+                    .child(semantic_search_card),
                 cx,
             ))
             .child(self.group(
@@ -369,6 +371,314 @@ impl Preferences {
                 storage_summary,
                 cx,
             ))
+    }
+
+    fn semantic_search_card(&mut self, cx: &mut Context<Self>) -> Div {
+        let model = slackless_core::embeddings::EmbeddingModel::default();
+        let (setup_ready, disk_bytes, download_hint, model_path_label, idx_stats) =
+            match &self.semantic_snapshot {
+                Some(snap) => (
+                    snap.setup.model_ready,
+                    snap.setup.disk_bytes,
+                    snap.setup.download_size_hint.clone(),
+                    snap.setup.model_path.display().to_string(),
+                    snap.stats.clone(),
+                ),
+                None => (
+                    false,
+                    0,
+                    model.download_size_hint().to_owned(),
+                    "app data models directory".to_owned(),
+                    slackless_core::store::SemanticIndexStats::default(),
+                ),
+            };
+        let downloading = self.semantic_downloading || crate::search::semantic_download_in_flight();
+        let indexing = self.semantic_indexing || crate::search::semantic_index_in_flight();
+        let (link_color, success_color, warn_color) = {
+            let theme = cx.theme();
+            (theme.link, theme.success, theme.warning)
+        };
+        let dot_color = if downloading || indexing {
+            link_color
+        } else if setup_ready {
+            success_color
+        } else {
+            warn_color
+        };
+        let (title, badge, detail) = if downloading {
+            (
+                format!("Downloading {}…", model.slug()),
+                Some("Downloading"),
+                self.semantic_status_note
+                    .clone()
+                    .unwrap_or_else(|| "Fetching quantized ONNX weights (~23 MB)…".to_owned()),
+            )
+        } else if indexing {
+            (
+                "Indexing local semantic vectors…".to_owned(),
+                Some("Indexing"),
+                self.semantic_status_note.clone().unwrap_or_else(|| {
+                    "Embedding archived messages, snippets, canvases & transcripts…".to_owned()
+                }),
+            )
+        } else if setup_ready {
+            (
+                format!("Semantic search · {}", model.slug()),
+                Some("Ready"),
+                self.semantic_status_note.clone().unwrap_or_else(|| {
+                    format!(
+                        "{} model · {} docs indexed ({}) across {} workspace(s).",
+                        format_bytes(disk_bytes),
+                        idx_stats.total_docs,
+                        format_bytes(idx_stats.db_bytes),
+                        idx_stats.workspaces,
+                    )
+                }),
+            )
+        } else {
+            (
+                format!("Local semantic model ({download_hint})"),
+                Some("Opt-in"),
+                self.semantic_status_note.clone().unwrap_or_else(|| {
+                    format!(
+                        "0 MB on disk until downloaded. Powers local Hybrid & Semantic search in {model_path_label}."
+                    )
+                }),
+            )
+        };
+
+        let actions = h_flex()
+            .items_center()
+            .gap_1p5()
+            .when(!setup_ready, |row| {
+                row.child(
+                    self.btn(
+                        Button::new("prefs-sem-download")
+                            .primary()
+                            .icon(IconName::Download)
+                            .disabled(downloading)
+                            .label(if downloading {
+                                "Downloading…".to_owned()
+                            } else {
+                                format!("Download ({download_hint})")
+                            }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.start_semantic_model_download(cx);
+                    })),
+                )
+            })
+            .when(setup_ready && !downloading, |row| {
+                row.child(
+                    self.btn(
+                        Button::new("prefs-sem-index")
+                            .outline()
+                            .icon(IconName::RefreshCw)
+                            .disabled(indexing)
+                            .label(if indexing {
+                                "Indexing…"
+                            } else {
+                                "Index archive"
+                            }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.start_semantic_archive_index(cx);
+                    })),
+                )
+                .child(
+                    self.btn(
+                        Button::new("prefs-sem-delete")
+                            .ghost()
+                            .icon(IconName::Trash)
+                            .disabled(indexing)
+                            .label("Remove model"),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        crate::search::clear_cached_onnx_embedder();
+                        match slackless_core::embeddings::delete_embedding_model(
+                            slackless_core::embeddings::EmbeddingModel::default(),
+                        ) {
+                            Ok(freed) => {
+                                this.semantic_status_note = Some(format!(
+                                    "Removed local embedding model (reclaimed {}).",
+                                    format_bytes(freed)
+                                ));
+                            }
+                            Err(err) => {
+                                this.semantic_status_note =
+                                    Some(format!("Could not remove model: {err}"));
+                            }
+                        }
+                        this.refresh_semantic_snapshot(cx);
+                        cx.notify();
+                    })),
+                )
+            });
+
+        self.status_card(
+            super::StatusCard {
+                dot_color,
+                title: title.into(),
+                chip: badge.map(SharedString::from),
+                detail: detail.into(),
+                detail_is_err: false,
+                actions,
+            },
+            cx,
+        )
+    }
+
+    fn start_semantic_model_download(&mut self, cx: &mut Context<Self>) {
+        if self.semantic_downloading {
+            return;
+        }
+        let Some(task_guard) = crate::search::try_begin_semantic_download() else {
+            self.semantic_status_note = Some("Model download is already in progress…".to_owned());
+            cx.notify();
+            return;
+        };
+        let model = slackless_core::embeddings::EmbeddingModel::default();
+        self.semantic_downloading = true;
+        self.semantic_status_note = Some("Connecting to Hugging Face…".to_owned());
+        cx.notify();
+
+        let progress_note: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let done_result: std::sync::Arc<
+            std::sync::Mutex<Option<Result<std::path::PathBuf, String>>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let prog_writer = std::sync::Arc::clone(&progress_note);
+        let done_writer = std::sync::Arc::clone(&done_result);
+
+        if let Err(err) = std::thread::Builder::new()
+            .name("slackless-prefs-embed-dl".to_owned())
+            .spawn(move || {
+                let _guard = task_guard;
+                let res = slackless_core::embeddings::download_embedding_model(model, move |p| {
+                    let pct = p
+                        .total_bytes
+                        .filter(|&t| t > 0)
+                        .map(|t| format!(" · {}%", (p.downloaded_bytes * 100 / t).min(100)))
+                        .unwrap_or_default();
+                    let line = format!(
+                        "[{}/{}] {} ({}{})",
+                        p.file_index,
+                        p.file_count,
+                        p.file_name,
+                        format_bytes(p.downloaded_bytes),
+                        pct
+                    );
+                    if let Ok(mut g) = prog_writer.lock() {
+                        *g = Some(line);
+                    }
+                });
+                if let Ok(mut g) = done_writer.lock() {
+                    *g = Some(res);
+                }
+            })
+        {
+            self.semantic_downloading = false;
+            self.semantic_status_note = Some(format!("Failed to start download thread: {err}"));
+            cx.notify();
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(180))
+                    .await;
+                let latest = progress_note.lock().ok().and_then(|g| g.clone());
+                let finished = done_result.lock().ok().and_then(|mut g| g.take());
+                let keep = this
+                    .update(cx, |prefs, cx| {
+                        if let Some(line) = latest {
+                            prefs.semantic_status_note = Some(line);
+                        }
+                        if let Some(res) = finished {
+                            prefs.semantic_downloading = false;
+                            match res {
+                                Ok(_) => {
+                                    prefs.semantic_status_note = Some(
+                                        "Model downloaded. Click 'Index archive' to build semantic_index.sqlite.".to_owned(),
+                                    );
+                                }
+                                Err(err) => {
+                                    prefs.semantic_status_note =
+                                        Some(format!("Download failed: {err}"));
+                                }
+                            }
+                            prefs.refresh_semantic_snapshot(cx);
+                            cx.notify();
+                            false
+                        } else {
+                            cx.notify();
+                            true
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn start_semantic_archive_index(&mut self, cx: &mut Context<Self>) {
+        if self.semantic_indexing {
+            return;
+        }
+        let Some(task_guard) = crate::search::try_begin_semantic_index() else {
+            self.semantic_status_note = Some("Semantic indexing is already running…".to_owned());
+            cx.notify();
+            return;
+        };
+        self.semantic_indexing = true;
+        self.semantic_status_note =
+            Some("Embedding archived messages across workspaces…".to_owned());
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let outcome: Result<(String, super::SemanticStorageSnapshot), String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let _guard = task_guard;
+                    let embedder = crate::search::load_or_get_onnx_embedder()?;
+                    let archives = slackless_core::search::discover_local_archives();
+                    let mut idx = slackless_core::semantic_index::open_default_semantic_index()?;
+                    let report = slackless_core::semantic_index::index_disk_archives(
+                        &archives,
+                        &mut idx,
+                        embedder.as_ref(),
+                        |_| {},
+                    )?;
+                    let msg = format!(
+                        "Indexed {} workspace(s): {} embedded, {} unchanged, {} pruned.",
+                        report.workspaces_indexed.len(),
+                        report.embedded,
+                        report.skipped_unchanged,
+                        report.pruned
+                    );
+                    Ok((msg, super::SemanticStorageSnapshot::collect()))
+                })
+                .await;
+            let _ = this.update(cx, |prefs, cx| {
+                prefs.semantic_indexing = false;
+                match outcome {
+                    Ok((msg, snap)) => {
+                        prefs.semantic_status_note = Some(msg);
+                        prefs.set_semantic_snapshot(snap, cx);
+                    }
+                    Err(err) => {
+                        prefs.semantic_status_note = Some(format!("Indexing failed: {err}"));
+                        prefs.refresh_semantic_snapshot(cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn network_diagnostics_group(&mut self, cx: &mut Context<Self>) -> Div {

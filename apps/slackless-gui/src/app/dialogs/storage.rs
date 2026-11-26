@@ -347,31 +347,33 @@ impl App {
         .detach();
     }
 
-    /// Gather SQLite & media cache metrics off the UI thread, push them to `Preferences`, and
-    /// refresh `window` so an open Storage modal dialog repaints immediately on load.
+    /// Gather SQLite, media cache, and semantic vector index metrics off the UI thread, push
+    /// them to `Preferences`, and refresh `window` so an open Storage modal dialog repaints immediately.
     pub(in crate::app) fn refresh_storage_stats_in(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((store, team)) = self
+        let store_and_team = self
             .bridge
             .read_store_clone()
-            .zip(self.bridge.team_id().cloned())
-        else {
-            self.preferences
-                .update(cx, |prefs, cx| prefs.set_storage_stats(None, cx));
-            window.refresh();
-            return;
-        };
+            .zip(self.bridge.team_id().cloned());
         let prefs = self.preferences.downgrade();
         cx.spawn_in(window, async move |_, cx| {
-            let info = cx
+            let (info, sem_snap) = cx
                 .background_executor()
-                .spawn(async move { collect_storage_info(&store, &team) })
+                .spawn(async move {
+                    let info = store_and_team
+                        .and_then(|(store, team)| collect_storage_info(&store, &team));
+                    let sem_snap = crate::preferences::SemanticStorageSnapshot::collect();
+                    (info, sem_snap)
+                })
                 .await;
             let _ = cx.update(|window, cx| {
-                let _ = prefs.update(cx, |prefs, cx| prefs.set_storage_stats(info, cx));
+                let _ = prefs.update(cx, |prefs, cx| {
+                    prefs.set_storage_stats(info, cx);
+                    prefs.set_semantic_snapshot(sem_snap, cx);
+                });
                 window.refresh();
             });
         })
@@ -822,8 +824,8 @@ impl App {
         };
         let markdown_export =
             slackless_core::export::render_huddle_transcript_markdown(&export_doc);
-        let json_export =
-            slackless_core::export::render_huddle_transcript_json(&export_doc).unwrap_or_default();
+        let json_export = slackless_core::export::render_huddle_transcript_json(&export_doc)
+            .map_err(|e| e.to_string());
         let suggested_stem =
             slackless_core::export::sanitize_export_filename(&call_id, "huddle-transcript");
 
@@ -1066,8 +1068,14 @@ impl App {
                                 cx,
                             )
                             .on_click(move |_, window, cx| {
+                                let content = match save_json.clone() {
+                                    Ok(c) => c,
+                                    Err(err) => {
+                                        notify("Export failed", err, window, cx);
+                                        return;
+                                    }
+                                };
                                 let suggested = format!("{stem_json}.json");
-                                let content = save_json.clone();
                                 let rx = cx.prompt_for_new_path(&dir_json, Some(&suggested));
                                 window
                                     .spawn(cx, async move |cx| {
@@ -1403,6 +1411,129 @@ impl App {
         );
     }
 
+    /// Download the local ONNX semantic search model in the background with in-flight guard & toast.
+    pub(in crate::app) fn download_semantic_model(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task_guard) = crate::search::try_begin_semantic_download() else {
+            notify(
+                "Download already running",
+                "Local embedding model download is already in progress.",
+                window,
+                cx,
+            );
+            return;
+        };
+        notify(
+            "Downloading embedding model",
+            "Fetching all-MiniLM-L6-v2 (~23 MB) into local app data…",
+            window,
+            cx,
+        );
+        window.refresh();
+        let prefs = self.preferences.downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            let (outcome, snap) = cx
+                .background_executor()
+                .spawn(async move {
+                    let _guard = task_guard;
+                    let res = slackless_core::embeddings::download_embedding_model(
+                        slackless_core::embeddings::EmbeddingModel::default(),
+                        |_| {},
+                    );
+                    let snap = crate::preferences::SemanticStorageSnapshot::collect();
+                    (res, snap)
+                })
+                .await;
+            let _ = cx.update(|window, cx| {
+                let _ = prefs.update(cx, |p, cx| p.set_semantic_snapshot(snap, cx));
+                match outcome {
+                    Ok(dir) => notify(
+                        "Embedding model ready",
+                        format!("Saved local ONNX model in {}", dir.display()),
+                        window,
+                        cx,
+                    ),
+                    Err(err) => notify("Model download failed", err, window, cx),
+                }
+                window.refresh();
+            });
+        })
+        .detach();
+    }
+
+    /// Incrementally index all local workspace archives into `semantic_index.sqlite`.
+    pub(in crate::app) fn index_semantic_archives(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task_guard) = crate::search::try_begin_semantic_index() else {
+            notify(
+                "Indexing already running",
+                "Semantic vector indexing is already in progress.",
+                window,
+                cx,
+            );
+            return;
+        };
+        notify(
+            "Indexing semantic vectors",
+            "Embedding messages, snippets, canvases, and transcripts in background…",
+            window,
+            cx,
+        );
+        window.refresh();
+        let prefs = self.preferences.downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            let (outcome, snap): (
+                Result<slackless_core::semantic_index::SemanticIndexReport, String>,
+                crate::preferences::SemanticStorageSnapshot,
+            ) = cx
+                .background_executor()
+                .spawn(async move {
+                    let _guard = task_guard;
+                    let res = (|| {
+                        let embedder = crate::search::load_or_get_onnx_embedder()?;
+                        let archives = slackless_core::search::discover_local_archives();
+                        let mut idx =
+                            slackless_core::semantic_index::open_default_semantic_index()?;
+                        slackless_core::semantic_index::index_disk_archives(
+                            &archives,
+                            &mut idx,
+                            embedder.as_ref(),
+                            |_| {},
+                        )
+                    })();
+                    let snap = crate::preferences::SemanticStorageSnapshot::collect();
+                    (res, snap)
+                })
+                .await;
+            let _ = cx.update(|window, cx| {
+                let _ = prefs.update(cx, |p, cx| p.set_semantic_snapshot(snap, cx));
+                match outcome {
+                    Ok(rep) => notify(
+                        "Semantic index updated",
+                        format!(
+                            "{} workspace(s): {} embedded, {} unchanged, {} pruned.",
+                            rep.workspaces_indexed.len(),
+                            rep.embedded,
+                            rep.skipped_unchanged,
+                            rep.pruned
+                        ),
+                        window,
+                        cx,
+                    ),
+                    Err(err) => notify("Semantic indexing failed", err, window, cx),
+                }
+                window.refresh();
+            });
+        })
+        .detach();
+    }
+
     /// Open the Archive & Storage modal dialog showing local SQLite metrics, live workspace &
     /// per-channel backfill progress, Start / Pause / Resume controls, and maintenance actions.
     pub(in crate::app) fn open_storage_dialog(
@@ -1415,7 +1546,7 @@ impl App {
             self.bridge.send(WorkspaceCommand::QueryBackfillProgress);
         }
         let this = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let theme = cx.theme();
             let (border, muted, fg, accent, success, danger, card_bg, pill_bg) = (
                 theme.border,
@@ -1429,19 +1560,22 @@ impl App {
             );
             let snapshot = this.upgrade().map(|app| {
                 let a = app.read(cx);
-                let stats = a.preferences.read(cx).storage_stats_snapshot();
+                let prefs = a.preferences.read(cx);
+                let stats = prefs.storage_stats_snapshot();
+                let sem_snapshot = prefs.semantic_snapshot();
                 let progress = a.ws.backfill_progress.clone();
                 let active_channel = a.channel.clone();
                 let active_label = a.label(&active_channel);
                 let sample = a.fixtures.sample;
-                (stats, progress, active_channel, active_label, sample)
+                (stats, sem_snapshot, progress, active_channel, active_label, sample)
             });
-            let (stats, progress, active_channel, active_label, sample) = match snapshot {
-                Some(s) => s,
-                None => {
-                    return dialog.title("Archive & Storage").w(px(620.)).child(div());
-                }
-            };
+            let (stats, sem_snapshot, progress, active_channel, active_label, sample) =
+                match snapshot {
+                    Some(s) => s,
+                    None => {
+                        return dialog.title("Archive & Storage").w(px(620.)).child(div());
+                    }
+                };
 
             let status = progress
                 .as_ref()
@@ -1480,6 +1614,8 @@ impl App {
             let this_compact = this.clone();
             let this_prune = this.clone();
             let this_reset = this.clone();
+            let this_sem_dl = this.clone();
+            let this_sem_idx = this.clone();
             let active_ch_for_btn = active_channel.clone();
 
             let stats_card = v_flex()
@@ -1724,6 +1860,7 @@ impl App {
             let maintenance = h_flex()
                 .items_center()
                 .justify_between()
+                .flex_wrap()
                 .gap_2()
                 .pt_2()
                 .border_t_1()
@@ -1731,6 +1868,7 @@ impl App {
                 .child(
                     h_flex()
                         .items_center()
+                        .flex_wrap()
                         .gap_2()
                         .child(
                             preferences::form_button(
@@ -1771,10 +1909,144 @@ impl App {
                     }),
                 );
 
+            let sem_model = slackless_core::embeddings::EmbeddingModel::default();
+            let sem_dl_busy = crate::search::semantic_download_in_flight();
+            let sem_idx_busy = crate::search::semantic_index_in_flight();
+            let (sem_ready, sem_disk_bytes, sem_hint, sem_stats) = match sem_snapshot {
+                Some(snap) => (
+                    snap.setup.model_ready,
+                    snap.setup.disk_bytes,
+                    snap.setup.download_size_hint,
+                    snap.stats,
+                ),
+                None => (
+                    false,
+                    0,
+                    sem_model.download_size_hint().to_owned(),
+                    slackless_core::store::SemanticIndexStats::default(),
+                ),
+            };
+            let sem_status_color = if sem_dl_busy || sem_idx_busy {
+                accent
+            } else if sem_ready {
+                success
+            } else {
+                muted
+            };
+            let sem_status_label = if sem_dl_busy {
+                "Downloading…"
+            } else if sem_idx_busy {
+                "Indexing…"
+            } else if sem_ready {
+                "Model ready"
+            } else {
+                "Not downloaded"
+            };
+            let semantic_card = v_flex()
+                .gap_2()
+                .p_3()
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(card_bg)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg)
+                                .child("Semantic search index (local ONNX)"),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py(px(1.))
+                                .rounded(px(4.))
+                                .bg(sem_status_color.opacity(0.16))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(sem_status_color)
+                                .child(sem_status_label),
+                        ),
+                )
+                .child(div().text_xs().text_color(muted).child(if sem_ready {
+                    format!(
+                        "{} ({}) · {} vectors ({}) across {} workspace(s)",
+                        sem_model.slug(),
+                        slackless_core::types::time::format_bytes(sem_disk_bytes),
+                        sem_stats.total_docs,
+                        slackless_core::types::time::format_bytes(sem_stats.db_bytes),
+                        sem_stats.workspaces,
+                    )
+                } else {
+                    format!(
+                        "{} ({sem_hint}) — opt-in local vector index (semantic_index.sqlite).",
+                        sem_model.slug(),
+                    )
+                }))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_wrap()
+                        .when(!sem_ready, |row| {
+                            row.child(
+                                preferences::form_button(
+                                    Button::new("storage-sem-dl")
+                                        .primary()
+                                        .icon(IconName::Download)
+                                        .disabled(sem_dl_busy)
+                                        .label(if sem_dl_busy {
+                                            "Downloading…".to_owned()
+                                        } else {
+                                            format!("Download model ({sem_hint})")
+                                        }),
+                                    cx,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    let _ = this_sem_dl.update(cx, |app, cx| {
+                                        app.download_semantic_model(window, cx);
+                                    });
+                                }),
+                            )
+                        })
+                        .when(sem_ready, |row| {
+                            row.child(
+                                preferences::form_button(
+                                    Button::new("storage-sem-index")
+                                        .outline()
+                                        .icon(IconName::RefreshCw)
+                                        .disabled(sem_idx_busy)
+                                        .label(if sem_idx_busy {
+                                            "Indexing…"
+                                        } else {
+                                            "Index semantic vectors"
+                                        }),
+                                    cx,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    let _ = this_sem_idx.update(cx, |app, cx| {
+                                        app.index_semantic_archives(window, cx);
+                                    });
+                                }),
+                            )
+                        }),
+                );
+
+            let max_body_h = (window.viewport_size().height * 0.78).max(px(360.));
             dialog.title("Archive & Storage").w(px(620.)).child(
                 v_flex()
+                    .id("storage-dialog-body")
+                    .max_h(max_body_h)
+                    .overflow_y_scroll()
+                    .on_scroll(|_, _, cx| cx.stop_propagation())
                     .gap_3()
                     .child(stats_card)
+                    .child(semantic_card)
                     .child(backfill_card)
                     .when(!channel_rows.is_empty(), |col| {
                         col.child(
@@ -2004,8 +2276,11 @@ fn collect_storage_info(
             .sum()
     }
     let stats = store.lock().ok()?.stats(team).ok()?;
-    let media_cache_bytes = dir_bytes(&std::env::temp_dir().join("slackless-media"))
+    let mut media_cache_bytes = dir_bytes(&std::env::temp_dir().join("slackless-media"))
         .saturating_add(dir_bytes(&std::env::temp_dir().join("slackless-audio")));
+    if let Some(cache) = slackless_core::Fetcher::disk_cache_dir() {
+        media_cache_bytes = media_cache_bytes.saturating_add(dir_bytes(&cache));
+    }
     Some(crate::preferences::StorageInfo {
         messages: stats.messages,
         revisions: stats.revisions,

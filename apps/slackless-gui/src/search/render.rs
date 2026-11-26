@@ -9,7 +9,7 @@ use gpui_kit::gpui::{
     Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use slackless_core::search::{SearchHitKind, UnifiedSearchHit};
-use slackless_core::store::SearchSort;
+use slackless_core::store::{SearchMode, SearchSort};
 use slackless_core::types::{ChannelId, Conversation, File, Message, Ts, User};
 
 use super::query::transcript_match_excerpt;
@@ -34,10 +34,19 @@ impl SearchView {
                 } else {
                     ""
                 };
-                match self.local_results.len() {
-                    0 => format!("Local · instant{scope_note}"),
-                    1 => format!("1 local hit{scope_note}"),
-                    n => format!("{n} local hits{scope_note}"),
+                if self.local_loading {
+                    format!("Searching…{scope_note}")
+                } else {
+                    let mode_tag = match self.mode {
+                        SearchMode::Keyword => "local",
+                        SearchMode::Hybrid => "hybrid",
+                        SearchMode::Semantic => "semantic",
+                    };
+                    match self.local_results.len() {
+                        0 => format!("Local · {mode_tag}{scope_note}"),
+                        1 => format!("1 {mode_tag} hit{scope_note}"),
+                        n => format!("{n} {mode_tag} hits{scope_note}"),
+                    }
                 }
             }
             (SearchTab::Messages, SearchSource::Remote) => {
@@ -55,10 +64,14 @@ impl SearchView {
                 } else {
                     ""
                 };
-                match self.transcript_results.len() {
-                    0 => format!("Huddle transcripts · instant{scope_note}"),
-                    1 => format!("1 transcript hit{scope_note}"),
-                    n => format!("{n} transcript hits{scope_note}"),
+                if self.local_loading {
+                    format!("Searching…{scope_note}")
+                } else {
+                    match self.transcript_results.len() {
+                        0 => format!("Huddle transcripts · instant{scope_note}"),
+                        1 => format!("1 transcript hit{scope_note}"),
+                        n => format!("{n} transcript hits{scope_note}"),
+                    }
                 }
             }
             (SearchTab::Files, _) => {
@@ -244,6 +257,51 @@ impl SearchView {
                                     .border_color(border)
                                     .child(
                                         pill(
+                                            "search-mode-keyword",
+                                            "Keyword",
+                                            self.mode == SearchMode::Keyword,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.set_mode(SearchMode::Keyword, cx);
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        pill(
+                                            "search-mode-hybrid",
+                                            "Hybrid",
+                                            self.mode == SearchMode::Hybrid,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.set_mode(SearchMode::Hybrid, cx);
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        pill(
+                                            "search-mode-semantic",
+                                            "Semantic",
+                                            self.mode == SearchMode::Semantic,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.set_mode(SearchMode::Semantic, cx);
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .p(px(2.))
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(border)
+                                    .child(
+                                        pill(
                                             "search-scope-current",
                                             "This workspace",
                                             self.scope == SearchScope::CurrentWorkspace,
@@ -342,7 +400,19 @@ impl SearchView {
     fn empty_state(&self, cx: &mut Context<Self>) -> Div {
         let (title, hint, offer_remote) = match (self.tab, self.source) {
             (SearchTab::Messages, SearchSource::Local) => {
-                if self.archive.is_none() {
+                if self.local_loading {
+                    (
+                        format!(
+                            "Searching local archives for \u{201C}{}\u{201D}…",
+                            self.query
+                        ),
+                        "Querying your local FTS5 archive index.",
+                        false,
+                    )
+                } else if self.archive.is_none()
+                    && (self.scope == SearchScope::CurrentWorkspace
+                        || self.workspace_sources.is_empty())
+                {
                     (
                         "Your local archive is empty".to_owned(),
                         "Messages you open are cached locally for instant offline search.",
@@ -410,14 +480,27 @@ impl SearchView {
                     )
                 }
             }
-            (SearchTab::Transcripts, _) => (
-                format!(
-                    "No huddle transcript matches for \u{201C}{}\u{201D}",
-                    self.query
-                ),
-                "Finalized live captions and local multilingual (EN/SV) huddle transcripts are indexed here automatically.",
-                false,
-            ),
+            (SearchTab::Transcripts, _) => {
+                if self.local_loading {
+                    (
+                        format!(
+                            "Searching huddle transcripts for \u{201C}{}\u{201D}…",
+                            self.query
+                        ),
+                        "Querying local multilingual (EN/SV) huddle transcript archives.",
+                        false,
+                    )
+                } else {
+                    (
+                        format!(
+                            "No huddle transcript matches for \u{201C}{}\u{201D}",
+                            self.query
+                        ),
+                        "Finalized live captions and local multilingual (EN/SV) huddle transcripts are indexed here automatically.",
+                        false,
+                    )
+                }
+            }
             (SearchTab::Channels | SearchTab::People | SearchTab::Dms, _) => {
                 ("No matches".to_owned(), "Try another query.", false)
             }
@@ -814,7 +897,30 @@ impl SearchView {
                                 .text_color(muted)
                                 .child(kind),
                         )
-                    }),
+                    })
+                    .when_some(
+                        self.mode
+                            .uses_embeddings()
+                            .then_some(hit.semantic_score)
+                            .flatten(),
+                        |row, score| {
+                            let label = if self.mode == SearchMode::Semantic {
+                                format!("{}% match", (score.clamp(0.0, 1.0) * 100.0).round() as u32)
+                            } else {
+                                "Hybrid".to_owned()
+                            };
+                            row.child(
+                                div()
+                                    .px_1p5()
+                                    .py(px(1.))
+                                    .rounded(px(4.))
+                                    .bg(pill_bg)
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(label),
+                            )
+                        },
+                    ),
             )
             .child(body_el)
             .when_some(transcript_match, |col, (filename, excerpt)| {
@@ -855,9 +961,138 @@ impl SearchView {
             }))
     }
 
+    fn semantic_status_banner(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.mode.uses_embeddings() {
+            return None;
+        }
+        let show = self.semantic_downloading
+            || self.semantic_indexing
+            || self.semantic_model_missing
+            || self.semantic_index_empty;
+        if !show {
+            return None;
+        }
+        let theme = cx.theme();
+        let (border, fg, muted, card_bg, link_color) = (
+            theme.border,
+            theme.foreground,
+            theme.muted_foreground,
+            theme.secondary.opacity(0.42),
+            theme.link,
+        );
+        let (title, detail) = if self.semantic_downloading {
+            (
+                "Downloading local embedding model…".to_owned(),
+                self.semantic_status_note.clone().unwrap_or_else(|| {
+                    "Fetching all-MiniLM-L6-v2 ONNX weights (~23 MB)…".to_owned()
+                }),
+            )
+        } else if self.semantic_indexing {
+            (
+                "Building semantic vector index…".to_owned(),
+                self.semantic_status_note.clone().unwrap_or_else(|| {
+                    "Embedding local messages, snippets, canvases, and transcripts…".to_owned()
+                }),
+            )
+        } else if self.semantic_model_missing {
+            (
+                "Local semantic model not downloaded (~23 MB)".to_owned(),
+                self.semantic_status_note.clone().unwrap_or_else(|| {
+                    "Download all-MiniLM-L6-v2 (INT8 ONNX) once for offline semantic & hybrid search. Everything stays 100% local."
+                        .to_owned()
+                }),
+            )
+        } else {
+            (
+                "Semantic index is empty".to_owned(),
+                self.semantic_status_note.clone().unwrap_or_else(|| {
+                    "Build semantic_index.sqlite from your local archive to enable vector similarity search."
+                        .to_owned()
+                }),
+            )
+        };
+
+        let mut actions = h_flex().flex_none().flex_wrap().items_center().gap_2();
+        if self.semantic_model_missing && !self.semantic_downloading {
+            actions = actions
+                .child(
+                    Button::new("search-sem-download")
+                        .primary()
+                        .with_size(Size::Small)
+                        .icon(IconName::Download)
+                        .label("Download model (~23 MB)")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.start_semantic_model_download(cx);
+                        })),
+                )
+                .child(
+                    Button::new("search-sem-fallback-kw")
+                        .outline()
+                        .with_size(Size::Small)
+                        .label("Use Keyword")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_mode(SearchMode::Keyword, cx);
+                        })),
+                );
+        } else if self.semantic_index_empty && !self.semantic_indexing && !self.semantic_downloading
+        {
+            actions = actions.child(
+                Button::new("search-sem-index-now")
+                    .primary()
+                    .with_size(Size::Small)
+                    .icon(IconName::RefreshCw)
+                    .label("Index archive now")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.start_semantic_indexing(cx);
+                    })),
+            );
+        }
+
+        Some(
+            h_flex()
+                .flex_none()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .px_4()
+                .py_2p5()
+                .border_b_1()
+                .border_color(border)
+                .bg(card_bg)
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(
+                                    if self.semantic_downloading || self.semantic_indexing {
+                                        link_color
+                                    } else {
+                                        fg
+                                    },
+                                )
+                                .child(title),
+                        )
+                        .child(div().text_xs().text_color(muted).child(detail)),
+                )
+                .child(actions),
+        )
+    }
+
     fn render_local_messages(&self, cx: &mut Context<Self>) -> AnyElement {
+        let banner = self.semantic_status_banner(cx);
         if self.local_results.is_empty() {
-            return self.empty_state(cx).into_any_element();
+            return v_flex()
+                .flex_1()
+                .min_h_0()
+                .children(banner)
+                .child(self.empty_state(cx))
+                .into_any_element();
         }
         let theme = cx.theme();
         let (muted, border) = (theme.muted_foreground, theme.border);
@@ -869,37 +1104,43 @@ impl SearchView {
             .collect();
         let query_for_cta = self.query.clone();
         v_flex()
-            .id(SharedString::from("search-results"))
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .children(hits)
-            .when(!self.fixtures.sample && !query_for_cta.is_empty(), |list| {
-                list.child(
-                    h_flex()
-                        .px_4()
-                        .py_3()
-                        .items_center()
-                        .justify_between()
-                        .border_t_1()
-                        .border_color(border)
-                        .child(
-                            div().text_xs().text_color(muted).child(
-                                "Showing instant local results. Need older history or unjoined channels?",
-                            ),
+            .children(banner)
+            .child(
+                v_flex()
+                    .id(SharedString::from("search-results"))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(hits)
+                    .when(!self.fixtures.sample && !query_for_cta.is_empty(), |list| {
+                        list.child(
+                            h_flex()
+                                .px_4()
+                                .py_3()
+                                .items_center()
+                                .justify_between()
+                                .border_t_1()
+                                .border_color(border)
+                                .child(
+                                    div().text_xs().text_color(muted).child(
+                                        "Showing instant local results. Need older history or unjoined channels?",
+                                    ),
+                                )
+                                .child(
+                                    Button::new("search-footer-remote")
+                                        .outline()
+                                        .with_size(Size::Small)
+                                        .icon(IconName::Globe)
+                                        .label("Search Slack remotely")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_source(SearchSource::Remote, cx);
+                                        })),
+                                ),
                         )
-                        .child(
-                            Button::new("search-footer-remote")
-                                .outline()
-                                .with_size(Size::Small)
-                                .icon(IconName::Globe)
-                                .label("Search Slack remotely")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.set_source(SearchSource::Remote, cx);
-                                })),
-                        ),
-                )
-            })
+                    }),
+            )
             .into_any_element()
     }
 
@@ -953,8 +1194,14 @@ impl SearchView {
     }
 
     fn render_transcripts(&self, cx: &mut Context<Self>) -> AnyElement {
+        let banner = self.semantic_status_banner(cx);
         if self.transcript_results.is_empty() {
-            return self.empty_state(cx).into_any_element();
+            return v_flex()
+                .flex_1()
+                .min_h_0()
+                .children(banner)
+                .child(self.empty_state(cx))
+                .into_any_element();
         }
         let theme = cx.theme();
         let (muted, border, fg, link_color, hover, pill_bg) = (
@@ -1118,11 +1365,17 @@ impl SearchView {
             })
             .collect();
         v_flex()
-            .id(SharedString::from("search-transcripts-local"))
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .children(rows)
+            .children(banner)
+            .child(
+                v_flex()
+                    .id(SharedString::from("search-transcripts-local"))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
             .into_any_element()
     }
 

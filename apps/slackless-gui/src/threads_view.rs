@@ -914,14 +914,17 @@ impl Render for ThreadsView {
                     .flex_none()
                     .items_center()
                     .justify_between()
+                    .flex_wrap()
                     .px_5()
-                    .h(px(49.))
+                    .py_2()
+                    .min_h(px(49.))
                     .gap_2()
                     .border_b_1()
                     .border_color(border)
                     .child(
                         h_flex()
                             .items_center()
+                            .flex_wrap()
                             .gap_2()
                             .child(
                                 div()

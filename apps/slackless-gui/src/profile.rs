@@ -735,18 +735,26 @@ impl Render for ProfilePanel {
                         .bg(theme.secondary.opacity(0.45))
                         .child(
                             h_flex()
+                                .min_w_0()
                                 .items_center()
                                 .gap_2()
                                 .child(if let Some(ref team) = external_team {
-                                    crate::channel_details::org_chip(team, 20.).into_any_element()
+                                    div()
+                                        .flex_none()
+                                        .child(crate::channel_details::org_chip(team, 20.))
+                                        .into_any_element()
                                 } else {
                                     Icon::new(IconName::Building2)
+                                        .flex_none()
                                         .size(px(15.))
                                         .text_color(muted)
                                         .into_any_element()
                                 })
                                 .child(
                                     div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
                                         .text_sm()
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .child(org_label),
@@ -754,6 +762,7 @@ impl Render for ProfilePanel {
                                 .when(verified, |row| {
                                     row.child(
                                         h_flex()
+                                            .flex_none()
                                             .items_center()
                                             .gap_0p5()
                                             .px_1()
@@ -768,7 +777,14 @@ impl Render for ProfilePanel {
                                 }),
                         )
                         .when_some(org_domain, |box_el, domain| {
-                            box_el.child(div().text_xs().text_color(muted).child(domain))
+                            box_el.child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(domain),
+                            )
                         })
                         .child(div().text_xs().text_color(muted).child(
                             "External person · Profile details managed by their organization",

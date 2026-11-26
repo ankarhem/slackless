@@ -387,7 +387,28 @@ const V12: &str = r#"
 ALTER TABLE file_transcript ADD COLUMN cues_json TEXT NOT NULL DEFAULT '';
 "#;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
+/// Version 13: durable offline send outbox (`outbox`) for resilient messages, thread replies, and
+/// reactions that fail due to offline/transient transport errors and flush idempotently in FIFO
+/// order on reconnect.
+const V13: &str = r#"
+CREATE TABLE outbox (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id TEXT NOT NULL,
+    channel_id   TEXT NOT NULL,
+    thread_ts    TEXT,
+    kind         TEXT NOT NULL CHECK (kind IN ('message', 'reply', 'reaction_add', 'reaction_remove')),
+    payload_json TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sending', 'failed')),
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    last_error   TEXT,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
+);
+CREATE INDEX outbox_ws_status ON outbox (workspace_id, status, id);
+CREATE INDEX outbox_ws_channel ON outbox (workspace_id, channel_id, thread_ts, id);
+"#;
+
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13];
 
 /// The schema version this build migrates to.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -833,6 +854,75 @@ mod tests {
         // FTS5 stays intact after V10 backfill UPDATE (V6 trigger scopes to text, file_names).
         conn.execute(
             "INSERT INTO message_fts(message_fts) VALUES('integrity-check')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v12_migrates_cleanly_to_v13_outbox_with_constraints_and_indexes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_up_to_for_test(&conn, 12);
+        assert_eq!(schema_version(&conn).unwrap(), 12);
+
+        // Seed existing V12 data to verify zero data loss on migration.
+        conn.execute(
+            "INSERT INTO file_transcript (workspace_id, file_id, source, text, cues_json, updated_at)
+             VALUES ('T1', 'F1', 'parakeet', 'hello clip', '[]', 1700000000)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 13);
+        assert_eq!(SCHEMA_VERSION, 13);
+
+        // Existing V12 row survives untouched.
+        let ft_text: String = conn
+            .query_row(
+                "SELECT text FROM file_transcript WHERE workspace_id = 'T1' AND file_id = 'F1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ft_text, "hello clip");
+
+        // Outbox table and indexes exist.
+        for idx in ["outbox_ws_status", "outbox_ws_channel"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "missing V13 index {idx}");
+        }
+
+        // CHECK constraints reject invalid kind or status.
+        assert!(
+            conn.execute(
+                "INSERT INTO outbox
+                 (workspace_id, channel_id, kind, payload_json, status, attempts, created_at, updated_at)
+                 VALUES ('T1', 'C1', 'invalid_kind', '{}', 'pending', 0, 100, 100)",
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO outbox
+                 (workspace_id, channel_id, kind, payload_json, status, attempts, created_at, updated_at)
+                 VALUES ('T1', 'C1', 'message', '{}', 'bogus_status', 0, 100, 100)",
+                [],
+            )
+            .is_err()
+        );
+        // Valid row succeeds.
+        conn.execute(
+            "INSERT INTO outbox
+             (workspace_id, channel_id, thread_ts, kind, payload_json, status, attempts, last_error, created_at, updated_at)
+             VALUES ('T1', 'C1', NULL, 'message', '{\"text\":\"hi\"}', 'pending', 0, NULL, 100, 100)",
             [],
         )
         .unwrap();

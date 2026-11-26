@@ -290,6 +290,7 @@ pub(crate) fn card(
             .map(|t| format!("External · {}", t.name))
             .unwrap_or_else(|| "External organization".to_owned());
         h_flex()
+            .min_w_0()
             .items_center()
             .gap_1()
             .mt_0p5()
@@ -300,15 +301,22 @@ pub(crate) fn card(
             .border_color(border)
             .bg(theme.secondary.opacity(0.6))
             .child(if let Some(ref team) = profile.external_team {
-                crate::channel_details::org_chip(team, 13.).into_any_element()
+                div()
+                    .flex_none()
+                    .child(crate::channel_details::org_chip(team, 13.))
+                    .into_any_element()
             } else {
                 Icon::new(IconName::Building2)
+                    .flex_none()
                     .size(px(12.))
                     .text_color(muted)
                     .into_any_element()
             })
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
                     .text_xs()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(muted)
@@ -319,7 +327,14 @@ pub(crate) fn card(
                     .external_team
                     .as_ref()
                     .is_some_and(|t| t.is_verified),
-                |chip| chip.child(Icon::new(IconName::Check).size(px(10.)).text_color(link)),
+                |chip| {
+                    chip.child(
+                        Icon::new(IconName::Check)
+                            .flex_none()
+                            .size(px(10.))
+                            .text_color(link),
+                    )
+                },
             )
     });
     let identity = v_flex()

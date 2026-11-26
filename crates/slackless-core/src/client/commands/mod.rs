@@ -50,6 +50,12 @@ impl<B: Backend> Core<B> {
                 thread_ts,
                 broadcast,
             } => self.send_message(channel, content, thread_ts, broadcast),
+            MessagingCommand::ReplyThread {
+                channel,
+                thread_ts,
+                content,
+                broadcast,
+            } => self.send_message(channel, content, Some(thread_ts), broadcast),
             MessagingCommand::EditMessage {
                 channel,
                 ts,
@@ -147,6 +153,9 @@ impl<B: Backend> Core<B> {
             MessagingCommand::DiscardOfflineMutation(id) => {
                 self.discard_offline_mutation(id).await;
             }
+            MessagingCommand::FlushOutbox => self.flush_outbox(),
+            MessagingCommand::RetryOutboxItem(id) => self.retry_outbox_item(id).await,
+            MessagingCommand::DiscardOutboxItem(id) => self.discard_outbox_item(id).await,
         }
     }
 

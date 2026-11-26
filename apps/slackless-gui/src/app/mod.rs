@@ -263,6 +263,7 @@ use crate::bookmarks;
 use crate::bridge::{CoreBridge, SavedDraft};
 use crate::browser::{ChannelBrowser, ChannelBrowserEvent};
 use crate::canvas::canvas_view;
+use crate::catchup::{CatchUpEvent, CatchUpView};
 use crate::channel_details::{self, ChannelDetails, ChannelDetailsEvent};
 use crate::composer::{self, Composer, ComposerEvent, ContextBar, Placeholder, TypingNames};
 use crate::directory::{DirectoryEvent, DirectoryView};
@@ -321,6 +322,7 @@ actions!(
         NewMessage,
         OpenThreads,
         OpenUnreads,
+        OpenCatchUp,
         OpenHome,
         OpenLater,
         OpenFiles,
@@ -470,6 +472,8 @@ pub(super) struct WorkspaceState {
     pub(super) offline_queued: usize,
     /// Live mode: offline mutations that failed to flush and await user Retry or Discard.
     pub(super) failed_mutations: Vec<slackless_core::FailedMutation>,
+    /// Live mode: durable V13 send outbox items (queued, sending, or failed) for this workspace.
+    pub(super) outbox: Vec<slackless_core::store::OutboxItem>,
     /// Member counts from open-time `conversations.info`, newer than the snapshot's.
     pub(super) member_counts: HashMap<ChannelId, u32>,
     /// Apps among a channel's members, counted apart from people as Slack's header does.
@@ -544,6 +548,7 @@ enum PickerTarget {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) enum NavPlace {
     Channel(ChannelId),
+    CatchUp,
     Threads,
     Unreads,
     Huddles,
@@ -560,6 +565,7 @@ pub(super) enum NavPlace {
 pub(super) enum MainPage {
     #[default]
     Channel,
+    CatchUp,
     Search,
     Drafts,
     Later,
@@ -710,6 +716,10 @@ pub struct App {
     threads: Entity<ThreadsView>,
     /// The All Unreads view (Slack's `p-unreads_view`); shown when `page == MainPage::Unreads`.
     unreads: Entity<UnreadsView>,
+    /// Local Catch-Up / Daily Briefing view; shown when `page == MainPage::CatchUp`.
+    catchup: Entity<CatchUpView>,
+    /// Monotonic generation guarding background Catch-Up briefing builds against stale writes.
+    catchup_generation: u64,
     /// Channels already asked for a single-page history fetch from `refresh_unreads`, so an
     /// empty unread channel is fetched at most once per session.
     unreads_fetched: HashSet<ChannelId>,

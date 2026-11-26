@@ -17,6 +17,7 @@ struct FeatureViews {
     later: Entity<LaterView>,
     threads: Entity<ThreadsView>,
     unreads: Entity<UnreadsView>,
+    catchup: Entity<CatchUpView>,
     activity: Entity<ActivityFeed>,
     files_page: Entity<FilesPage>,
     huddles: Entity<HuddlesView>,
@@ -44,6 +45,7 @@ fn bind_app_keybindings(cx: &mut Context<App>) {
         // its own menu labels "All Unreads"; Activity keeps Cmd+Shift+M.
         KeyBinding::new("cmd-shift-m", OpenActivity, None),
         KeyBinding::new("cmd-shift-a", OpenUnreads, None),
+        KeyBinding::new("cmd-shift-b", OpenCatchUp, None),
         KeyBinding::new("cmd-shift-t", OpenThreads, None),
         KeyBinding::new("cmd-shift-d", OpenDrafts, None),
         KeyBinding::new("cmd-shift-e", OpenPeople, None),
@@ -273,193 +275,15 @@ fn wire_window_and_input_subscriptions(
                 let Some(viewer) = app.image_viewer.clone() else {
                     return;
                 };
-                let mods = event.keystroke.modifiers;
-                let no_cmd = !mods.platform && !mods.control && !mods.alt;
-                match event.keystroke.key.as_str() {
-                    "escape" => {
+                match viewer.update(cx, |v, cx| v.handle_keystroke(&event.keystroke, window, cx)) {
+                    crate::image_viewer::ViewerKeyOutcome::Close => {
                         app.close_image_viewer(window, cx);
                         cx.stop_propagation();
                     }
-                    "left" if mods.shift && no_cmd => {
-                        let handled = viewer.update(cx, |viewer, cx| {
-                            if viewer.is_video() {
-                                viewer.seek_video_relative(-5.0, window, cx);
-                                true
-                            } else if viewer.is_pdf() {
-                                viewer.step_pdf_page(-1, window, cx)
-                            } else {
-                                false
-                            }
-                        });
-                        if handled {
-                            cx.stop_propagation();
-                        }
-                    }
-                    "right" if mods.shift && no_cmd => {
-                        let handled = viewer.update(cx, |viewer, cx| {
-                            if viewer.is_video() {
-                                viewer.seek_video_relative(5.0, window, cx);
-                                true
-                            } else if viewer.is_pdf() {
-                                viewer.step_pdf_page(1, window, cx)
-                            } else {
-                                false
-                            }
-                        });
-                        if handled {
-                            cx.stop_propagation();
-                        }
-                    }
-                    "left" => {
-                        viewer.update(cx, |viewer, cx| {
-                            if viewer.is_pdf() && viewer.item_count() == 1 {
-                                viewer.step_pdf_page(-1, window, cx);
-                            } else {
-                                viewer.step(-1, window, cx);
-                            }
-                        });
+                    crate::image_viewer::ViewerKeyOutcome::Handled => {
                         cx.stop_propagation();
                     }
-                    "right" => {
-                        viewer.update(cx, |viewer, cx| {
-                            if viewer.is_pdf() && viewer.item_count() == 1 {
-                                viewer.step_pdf_page(1, window, cx);
-                            } else {
-                                viewer.step(1, window, cx);
-                            }
-                        });
-                        cx.stop_propagation();
-                    }
-                    "pageup" | "[" if no_cmd => {
-                        let handled = viewer.update(cx, |viewer, cx| {
-                            if viewer.is_pdf() {
-                                viewer.step_pdf_page(-1, window, cx);
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        if handled {
-                            cx.stop_propagation();
-                        }
-                    }
-                    "pagedown" | "]" if no_cmd => {
-                        let handled = viewer.update(cx, |viewer, cx| {
-                            if viewer.is_pdf() {
-                                viewer.step_pdf_page(1, window, cx);
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        if handled {
-                            cx.stop_propagation();
-                        }
-                    }
-                    "up" if no_cmd && !mods.shift => {
-                        let handled = viewer.update(cx, |viewer, cx| {
-                            if viewer.is_video() {
-                                viewer.adjust_video_volume(0.1, cx);
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        if handled {
-                            cx.stop_propagation();
-                        }
-                    }
-                    "down" if no_cmd && !mods.shift => {
-                        let handled = viewer.update(cx, |viewer, cx| {
-                            if viewer.is_video() {
-                                viewer.adjust_video_volume(-0.1, cx);
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        if handled {
-                            cx.stop_propagation();
-                        }
-                    }
-                    "+" | "=" => {
-                        viewer.update(cx, |viewer, cx| viewer.zoom_step(1, window, cx));
-                        cx.stop_propagation();
-                    }
-                    "-" | "_" => {
-                        viewer.update(cx, |viewer, cx| viewer.zoom_step(-1, window, cx));
-                        cx.stop_propagation();
-                    }
-                    "0" => {
-                        viewer.update(cx, |viewer, cx| viewer.reset_zoom(window, cx));
-                        cx.stop_propagation();
-                    }
-                    "space" => {
-                        let handled = viewer.update(cx, |viewer, cx| {
-                            if viewer.is_video() {
-                                viewer.toggle_video_play(window, cx);
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        if handled {
-                            cx.stop_propagation();
-                        }
-                    }
-                    "c" if no_cmd && !mods.shift => {
-                        let handled = viewer.update(cx, |viewer, cx| {
-                            if viewer.is_video() {
-                                viewer.toggle_transcript(window, cx);
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        if handled {
-                            cx.stop_propagation();
-                        }
-                    }
-                    "m" if no_cmd && !mods.shift => {
-                        let handled = viewer.update(cx, |viewer, cx| {
-                            if viewer.is_video() {
-                                viewer.toggle_video_mute(cx);
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        if handled {
-                            cx.stop_propagation();
-                        }
-                    }
-                    "j" if no_cmd && !mods.shift => {
-                        let handled = viewer.update(cx, |viewer, cx| {
-                            if viewer.is_video() {
-                                viewer.seek_video_relative(-5.0, window, cx);
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        if handled {
-                            cx.stop_propagation();
-                        }
-                    }
-                    "l" if no_cmd && !mods.shift => {
-                        let handled = viewer.update(cx, |viewer, cx| {
-                            if viewer.is_video() {
-                                viewer.seek_video_relative(5.0, window, cx);
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        if handled {
-                            cx.stop_propagation();
-                        }
-                    }
-                    _ => {}
+                    crate::image_viewer::ViewerKeyOutcome::Ignored => {}
                 }
             });
         }),
@@ -1265,6 +1089,60 @@ fn wire_feature_view_subscriptions(
             },
         ),
         cx.subscribe_in(
+            &views.catchup,
+            window,
+            |this: &mut App, _, event: &CatchUpEvent, window, cx| match event {
+                CatchUpEvent::Close => {
+                    if this.page == MainPage::CatchUp {
+                        this.page = MainPage::Channel;
+                        this.sidebar.update(cx, |s, cx| s.set_home_page(None, cx));
+                    }
+                    cx.notify();
+                }
+                CatchUpEvent::OpenChannel {
+                    workspace,
+                    channel,
+                    ts,
+                } => {
+                    this.open_catchup_channel(workspace, channel.clone(), ts.clone(), window, cx);
+                }
+                CatchUpEvent::OpenThread {
+                    workspace,
+                    channel,
+                    thread_ts,
+                } => {
+                    this.open_catchup_thread(
+                        workspace,
+                        channel.clone(),
+                        thread_ts.clone(),
+                        window,
+                        cx,
+                    );
+                }
+                CatchUpEvent::OpenHuddleTranscript {
+                    workspace,
+                    call_id,
+                    channel,
+                } => {
+                    this.open_catchup_huddle(
+                        workspace,
+                        call_id.clone(),
+                        channel.clone(),
+                        window,
+                        cx,
+                    );
+                }
+                CatchUpEvent::WindowChanged(_)
+                | CatchUpEvent::ScopeChanged(_)
+                | CatchUpEvent::Refresh => {
+                    this.refresh_catchup(cx);
+                }
+                CatchUpEvent::MarkCaughtUp => {
+                    this.mark_catchup_visited(window, cx);
+                }
+            },
+        ),
+        cx.subscribe_in(
             &views.directory,
             window,
             |this: &mut App, _, event: &DirectoryEvent, window, cx| match event {
@@ -1789,6 +1667,7 @@ impl App {
             let later = LaterView::new(cx);
             let threads = ThreadsView::new(fixtures.clone(), window, cx);
             let unreads = UnreadsView::new(fixtures.clone(), cx);
+            let catchup = CatchUpView::new(cx);
             let activity = ActivityFeed::new(fixtures.clone(), cx);
             let files_page = FilesPage::new(fixtures.clone(), window, cx);
             let huddles = HuddlesView::new(fixtures.clone(), cx);
@@ -1829,6 +1708,7 @@ impl App {
                 later,
                 threads,
                 unreads,
+                catchup,
                 activity,
                 files_page,
                 huddles,
@@ -1910,6 +1790,10 @@ impl App {
                 }
             });
 
+            let initial_outbox = bridge.outbox_sync();
+            if !initial_outbox.is_empty() {
+                thread.update(cx, |panel, cx| panel.set_outbox(initial_outbox.clone(), cx));
+            }
             let (cached_member_counts, cached_app_counts) =
                 CoreBridge::parse_channel_counts(&local);
             let cached_bots = fixtures.bots.clone();
@@ -1925,6 +1809,7 @@ impl App {
                 later,
                 threads,
                 unreads,
+                catchup,
                 activity,
                 files_page,
                 huddles,
@@ -1949,6 +1834,7 @@ impl App {
                     bots: cached_bots,
                     member_counts: cached_member_counts,
                     app_counts: cached_app_counts,
+                    outbox: initial_outbox,
                     ..Default::default()
                 },
                 channel,
@@ -1997,6 +1883,8 @@ impl App {
                 later,
                 threads,
                 unreads,
+                catchup,
+                catchup_generation: 0,
                 unreads_fetched: HashSet::new(),
                 activity,
                 files_page,

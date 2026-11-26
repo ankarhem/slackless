@@ -485,3 +485,260 @@ fn transcript_match_excerpt_handles_case_word_boundaries_modifiers_and_non_match
     let sv_excerpt = transcript_match_excerpt(sv, "betalflödet").expect("must match swedish term");
     assert!(sv_excerpt.contains("betalflödet"));
 }
+
+#[gpui::test]
+fn search_view_keyword_hybrid_semantic_modes_and_missing_model_prompt(cx: &mut TestAppContext) {
+    use slackless_core::embeddings::{Embedder, HashProjectionEmbedder};
+    use slackless_core::semantic_index::index_store_documents;
+    use slackless_core::store::{SearchMode, SemanticIndex};
+
+    let ws = TeamId::from("T_SEM");
+    let ch = Conversation {
+        id: ChannelId::from("C_INFRA"),
+        name: Some("infra".into()),
+        is_channel: true,
+        ..Default::default()
+    };
+    let mut store = Store::open_in_memory().expect("store");
+    store
+        .upsert_team(
+            &ws,
+            &Team {
+                id: ws.clone(),
+                name: "SemanticCorp".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store.upsert_conversation(&ws, &ch).unwrap();
+    store
+        .upsert_messages(
+            &ws,
+            &ch.id,
+            &[
+                Message {
+                    ts: Ts::from("1700001000.000000"),
+                    user: Some(UserId::from("U1")),
+                    text: "Kubernetes cluster autoscaling deployment pipeline".into(),
+                    ..Default::default()
+                },
+                Message {
+                    ts: Ts::from("1700001005.000000"),
+                    user: Some(UserId::from("U1")),
+                    text: "Lunch salad bar menu today".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+    let embedder: Arc<dyn Embedder> = Arc::new(HashProjectionEmbedder::new(128));
+    let mut sem_idx = SemanticIndex::open_in_memory().unwrap();
+    index_store_documents(&store, &mut sem_idx, embedder.as_ref(), Some(&ws), |_| {}).unwrap();
+    let shared_idx = Arc::new(Mutex::new(sem_idx));
+    let archive: SharedStore = Arc::new(Mutex::new(store));
+
+    let mut fx = crate::fixtures::load();
+    fx.sample = true;
+    fx.workspaces = vec![Team {
+        id: ws,
+        name: "SemanticCorp".into(),
+        ..Default::default()
+    }];
+    fx.channels = vec![ch];
+
+    let view = cx.update(|cx| SearchView::new(Arc::new(fx), Some(archive), cx));
+
+    // Default mode is Keyword; switching to Semantic sets sort to Relevant and finds semantic matches.
+    view.update(cx, |v, cx| {
+        assert_eq!(v.mode(), SearchMode::Keyword);
+        v.set_semantic_backend_for_test(Arc::clone(&embedder), Arc::clone(&shared_idx));
+        v.set_mode(SearchMode::Semantic, cx);
+        assert_eq!(v.sort, slackless_core::store::SearchSort::Relevant);
+        v.run("kubernetes autoscaler deploying".into(), cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.mode(), SearchMode::Semantic);
+        assert!(!v.semantic_model_missing_for_test());
+        assert!(
+            !v.local_hits_for_test().is_empty(),
+            "expected semantic hit for morphologically related query"
+        );
+        assert!(
+            v.local_hits_for_test()[0]
+                .message
+                .text
+                .contains("Kubernetes")
+        );
+        assert!(v.local_hits_for_test()[0].semantic_score.is_some());
+    });
+
+    // Explicit `Most recent` toggle is honored in Semantic mode (not silently overridden).
+    view.update(cx, |v, cx| {
+        v.set_sort(slackless_core::store::SearchSort::Recent, cx);
+        assert_eq!(v.sort, slackless_core::store::SearchSort::Recent);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.sort, slackless_core::store::SearchSort::Recent);
+        assert!(!v.local_hits_for_test().is_empty());
+    });
+
+    // Hybrid mode blends FTS5 + semantic via RRF.
+    view.update(cx, |v, cx| {
+        v.set_mode(SearchMode::Hybrid, cx);
+        v.run("kubernetes deployment".into(), cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.mode(), SearchMode::Hybrid);
+        assert_eq!(v.local_hits_for_test().len(), 1);
+        assert!(
+            v.local_hits_for_test()[0]
+                .message
+                .text
+                .contains("Kubernetes")
+        );
+    });
+
+    // Switching back to Keyword keeps standard FTS5 behavior cleanly.
+    view.update(cx, |v, cx| {
+        v.set_mode(SearchMode::Keyword, cx);
+        v.run("salad".into(), cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.mode(), SearchMode::Keyword);
+        assert_eq!(v.local_hits_for_test().len(), 1);
+        assert!(v.local_hits_for_test()[0].message.text.contains("salad"));
+    });
+}
+
+#[gpui::test]
+fn search_view_tracks_local_loading_and_rejects_duplicate_remote_pages(cx: &mut TestAppContext) {
+    use super::state::{SearchScope, SearchWorkspaceSource};
+
+    let ws_a = TeamId::from("T_RACE_A");
+    let mut store_a = Store::open_in_memory().expect("store_a");
+    store_a
+        .upsert_conversation(
+            &ws_a,
+            &Conversation {
+                id: ChannelId::from("C_R1"),
+                name: Some("general".into()),
+                is_channel: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store_a
+        .upsert_message(
+            &ws_a,
+            &ChannelId::from("C_R1"),
+            &Message {
+                ts: Ts::from("1700001000.000000"),
+                text: "canary deployment complete".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let shared_a: SharedStore = Arc::new(Mutex::new(store_a));
+
+    let mut fx = crate::fixtures::load();
+    fx.sample = true;
+    fx.workspaces = vec![Team {
+        id: ws_a.clone(),
+        name: "RaceWS".into(),
+        ..Default::default()
+    }];
+
+    // Archive is None, but AllWorkspaces has workspace_sources -> must still query!
+    let view = cx.update(|cx| SearchView::new(Arc::new(fx), None, cx));
+    view.update(cx, |v, cx| {
+        v.set_workspace_sources_quiet(vec![SearchWorkspaceSource {
+            team_id: ws_a.clone(),
+            name: "RaceWS".into(),
+            store: shared_a.clone(),
+        }]);
+        v.set_scope(SearchScope::AllWorkspaces, cx);
+        v.run("canary".into(), cx);
+        assert!(
+            v.is_local_loading_for_test(),
+            "local_loading must be true while async FTS5 search is in flight"
+        );
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(!v.is_local_loading_for_test());
+        assert_eq!(v.local_hits_for_test().len(), 1);
+    });
+
+    // Duplicate or out-of-order remote pages (> 1) must not append duplicate hits.
+    view.update(cx, |v, cx| {
+        let hit = |ts: &str| RemoteMessageHit {
+            channel: ChannelId::from("C_R1"),
+            channel_name: Some("general".into()),
+            message: Message {
+                ts: Ts::from(ts),
+                text: format!("hit {ts}"),
+                ..Default::default()
+            },
+        };
+        v.set_remote_messages(
+            "canary",
+            ApiSearchSort::Timestamp,
+            1,
+            Ok(RemoteMessagePage {
+                total: 2,
+                page: 1,
+                page_count: 2,
+                hits: vec![hit("1.0")],
+            }),
+            cx,
+        );
+        assert_eq!(v.remote_messages_len_for_test(), 1);
+        // Out-of-order page 3 before page 2 is ignored.
+        v.set_remote_messages(
+            "canary",
+            ApiSearchSort::Timestamp,
+            3,
+            Ok(RemoteMessagePage {
+                total: 3,
+                page: 3,
+                page_count: 3,
+                hits: vec![hit("3.0")],
+            }),
+            cx,
+        );
+        assert_eq!(v.remote_messages_len_for_test(), 1);
+        // Page 2 appends normally.
+        v.set_remote_messages(
+            "canary",
+            ApiSearchSort::Timestamp,
+            2,
+            Ok(RemoteMessagePage {
+                total: 2,
+                page: 2,
+                page_count: 2,
+                hits: vec![hit("2.0")],
+            }),
+            cx,
+        );
+        assert_eq!(v.remote_messages_len_for_test(), 2);
+        // Duplicate page 2 is rejected.
+        v.set_remote_messages(
+            "canary",
+            ApiSearchSort::Timestamp,
+            2,
+            Ok(RemoteMessagePage {
+                total: 2,
+                page: 2,
+                page_count: 2,
+                hits: vec![hit("2.0")],
+            }),
+            cx,
+        );
+        assert_eq!(v.remote_messages_len_for_test(), 2);
+    });
+}

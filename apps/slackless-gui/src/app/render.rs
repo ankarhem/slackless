@@ -734,9 +734,35 @@ impl App {
             }
             // The Pins tab keeps the transcript under it; its panel is the right column.
             ConversationTab::Messages | ConversationTab::Pins => {
+                let outbox_strip = crate::outbox::inline_outbox_strip(
+                    &self.ws.outbox,
+                    &self.channel,
+                    None,
+                    crate::outbox::OutboxActions {
+                        on_retry: {
+                            let this = cx.weak_entity();
+                            Rc::new(move |id, _window, cx| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(MessagingCommand::RetryOutboxItem(id));
+                                });
+                            })
+                        },
+                        on_discard: {
+                            let this = cx.weak_entity();
+                            Rc::new(move |id, _window, cx| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(MessagingCommand::DiscardOutboxItem(id));
+                                });
+                            })
+                        },
+                    },
+                    "channel",
+                    cx,
+                );
                 let column = column
                     .children(self.app_dm_banner(conversation, cx))
-                    .child(div().flex_1().min_h_0().child(self.messages.clone()));
+                    .child(div().flex_1().min_h_0().child(self.messages.clone()))
+                    .children(outbox_strip);
                 // In a public channel the user is not in, Slack's Join card takes the
                 // composer's place.
                 match conversation.filter(|c| joinable(c)) {
@@ -825,6 +851,7 @@ impl App {
         cx: &mut Context<Self>,
     ) -> Div {
         match self.page {
+            MainPage::CatchUp => v_flex().size_full().child(self.catchup.clone()),
             MainPage::Search => v_flex().size_full().child(self.results.clone()),
             MainPage::Drafts => v_flex().size_full().child(self.drafts.clone()),
             MainPage::Later => v_flex().size_full().child(self.later.clone()),
@@ -913,6 +940,7 @@ impl App {
             cx.listener(|this, _: &OpenActivity, _, cx| this.show_nav(NavItem::Activity, cx)),
         )
         .on_action(cx.listener(|this, _: &OpenDrafts, _, cx| this.open_drafts(cx)))
+        .on_action(cx.listener(|this, _: &OpenCatchUp, window, cx| this.open_catchup(window, cx)))
         .on_action(
             cx.listener(|this, _: &OpenChannelBrowser, window, cx| this.open_browser(window, cx)),
         )
@@ -1057,6 +1085,9 @@ impl App {
             this.cycle_pane_focus(false, window, cx);
         }))
         .on_action(cx.listener(|this, _: &BrowseUp, _, cx| {
+            if this.image_viewer.is_some() {
+                return;
+            }
             if this.page == MainPage::Activity {
                 this.activity.update(cx, |a, cx| a.step(false, cx));
             } else if this.showing_transcript() {
@@ -1064,6 +1095,9 @@ impl App {
             }
         }))
         .on_action(cx.listener(|this, _: &BrowseDown, _, cx| {
+            if this.image_viewer.is_some() {
+                return;
+            }
             if this.page == MainPage::Activity {
                 this.activity.update(cx, |a, cx| a.step(true, cx));
             } else if this.showing_transcript() {
@@ -1071,6 +1105,9 @@ impl App {
             }
         }))
         .on_action(cx.listener(|this, _: &BrowseOpen, window, cx| {
+            if this.image_viewer.is_some() {
+                return;
+            }
             if this.page == MainPage::Activity {
                 this.activity.update(cx, |a, cx| a.open_selected(cx));
             } else if this.showing_transcript() {
@@ -1078,6 +1115,9 @@ impl App {
             }
         }))
         .on_action(cx.listener(|this, _: &ExitThread, window, cx| {
+            if this.image_viewer.is_some() {
+                return;
+            }
             if this.right_pane.is_thread() {
                 this.close_thread(cx);
                 this.focus.focus(window, cx);
@@ -1085,12 +1125,18 @@ impl App {
             }
         }))
         .on_action(cx.listener(|this, _: &JumpToOldest, _, cx| {
+            if this.image_viewer.is_some() {
+                return;
+            }
             if this.showing_transcript() {
                 this.messages
                     .update(cx, |m, cx| m.jump(crate::messages::Jump::Beginning, cx));
             }
         }))
         .on_action(cx.listener(|this, _: &JumpToNewest, _, cx| {
+            if this.image_viewer.is_some() {
+                return;
+            }
             if this.showing_transcript() {
                 this.messages
                     .update(cx, |m, cx| m.jump(crate::messages::Jump::Recent, cx));
@@ -1352,6 +1398,9 @@ impl App {
                 };
                 let playing = pip.snapshot.playing;
                 let muted = pip.snapshot.muted;
+                let loading = pip.snapshot.loading;
+                let (pip_w, pip_stage_h) =
+                    crate::media::pip_stage_dimensions(pip.snapshot.width, pip.snapshot.height);
                 let title = SharedString::from(pip.meta.title.clone());
 
                 root.child(
@@ -1363,7 +1412,7 @@ impl App {
                         .absolute()
                         .right(px(18.))
                         .bottom(bottom_offset)
-                        .w(px(288.))
+                        .w(px(pip_w))
                         .rounded_lg()
                         .overflow_hidden()
                         .bg(chrome.panel)
@@ -1520,7 +1569,7 @@ impl App {
                                 .id("video-pip-stage")
                                 .relative()
                                 .w_full()
-                                .h(px(156.))
+                                .h(px(pip_stage_h))
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     crate::media::stop_inline_video_for_expand(
@@ -1548,7 +1597,29 @@ impl App {
                                     pip.snapshot.surface,
                                     poster,
                                     px(0.),
-                                )),
+                                ))
+                                .when(loading, |stage| {
+                                    stage.child(
+                                        div()
+                                            .absolute()
+                                            .inset_0()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                div()
+                                                    .px_2p5()
+                                                    .py_1()
+                                                    .rounded_full()
+                                                    .bg(chrome.glass)
+                                                    .border_1()
+                                                    .border_color(chrome.border)
+                                                    .text_xs()
+                                                    .text_color(fg)
+                                                    .child("Loading\u{2026}"),
+                                            ),
+                                    )
+                                }),
                         )
                         // Compact bottom transport bar: play/pause, scrub bar, time, mute.
                         .child(

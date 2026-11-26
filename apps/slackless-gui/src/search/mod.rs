@@ -12,6 +12,10 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use query::{
+    clear_cached_onnx_embedder, load_or_get_onnx_embedder, semantic_download_in_flight,
+    semantic_index_in_flight, try_begin_semantic_download, try_begin_semantic_index,
+};
 pub use query::{fixture_archive, fixture_archive_for};
 #[cfg(test)]
 pub use state::SearchScope;

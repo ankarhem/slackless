@@ -24,6 +24,11 @@ const GROUPS: [(&str, &[Shortcut]); 5] = [
             (&["\u{2318}", "\u{21e7}", "K"], "Open direct messages", true),
             (&["\u{2318}", "\u{21e7}", "M"], "Open activity", true),
             (&["\u{2318}", "\u{21e7}", "A"], "Open All unreads", true),
+            (
+                &["\u{2318}", "\u{21e7}", "B"],
+                "Open Catch-Up briefing",
+                true,
+            ),
             (&["\u{2318}", "\u{21e7}", "T"], "Open threads", true),
             (&["\u{2318}", "\u{21e7}", "D"], "Open drafts & sent", true),
             (&["\u{2318}", "\u{21e7}", "L"], "Browse channels", true),

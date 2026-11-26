@@ -455,6 +455,50 @@ impl App {
                 }))
         });
 
+        let outbox_badge = crate::outbox::top_bar_outbox_badge(
+            &self.ws.outbox,
+            &self.fixtures,
+            chrome_fg,
+            crate::outbox::TopBarOutboxActions {
+                on_flush: {
+                    let this = cx.weak_entity();
+                    Rc::new(move |_window, cx| {
+                        let _ = this.update(cx, |app, _| {
+                            app.bridge.send(MessagingCommand::FlushOutbox);
+                        });
+                    })
+                },
+                on_open: {
+                    let this = cx.weak_entity();
+                    Rc::new(move |channel, thread_ts, _window, cx| {
+                        let _ = this.update(cx, |app, cx| {
+                            app.select(channel.clone(), cx);
+                            if let Some(root_ts) = thread_ts {
+                                app.open_thread(channel, root_ts, cx);
+                            }
+                        });
+                    })
+                },
+                on_retry: {
+                    let this = cx.weak_entity();
+                    Rc::new(move |id, _window, cx| {
+                        let _ = this.update(cx, |app, _| {
+                            app.bridge.send(MessagingCommand::RetryOutboxItem(id));
+                        });
+                    })
+                },
+                on_discard: {
+                    let this = cx.weak_entity();
+                    Rc::new(move |id, _window, cx| {
+                        let _ = this.update(cx, |app, _| {
+                            app.bridge.send(MessagingCommand::DiscardOutboxItem(id));
+                        });
+                    })
+                },
+            },
+            cx,
+        );
+
         let rail_toggle = chrome_icon(
             "toggle-workspace-rail",
             IconName::PanelLeft,
@@ -503,6 +547,7 @@ impl App {
                             .h_full()
                             .items_center()
                             .gap_1()
+                            .children(outbox_badge)
                             .children(stealth_pill)
                             .child(status_button)
                             .child(

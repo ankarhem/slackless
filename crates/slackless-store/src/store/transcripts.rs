@@ -87,7 +87,7 @@ fn row_to_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<HuddleTranscriptS
     })
 }
 
-fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<HuddleTranscriptSession> {
+pub(super) fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<HuddleTranscriptSession> {
     let call_id: String = row.get(0)?;
     let ch: String = row.get(1)?;
     let thread_s: Option<String> = row.get(2)?;

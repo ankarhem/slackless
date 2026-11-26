@@ -397,6 +397,36 @@ impl CoreBridge {
         }
     }
 
+    /// Synchronous read of all persisted V13 outbox items for this workspace (FIFO order).
+    pub fn outbox_sync(&self) -> Vec<slackless_core::store::OutboxItem> {
+        let Some(team) = self.session.as_ref().map(|s| &s.team_id) else {
+            return Vec::new();
+        };
+        let Some(store) = self.read_store().and_then(|s| s.lock().ok()) else {
+            return Vec::new();
+        };
+        store.list_outbox(team).unwrap_or_default()
+    }
+
+    /// Signed-in user ID for this live workspace, if any.
+    pub fn self_user_id(&self) -> Option<&UserId> {
+        self.session.as_ref().map(|s| &s.user_id)
+    }
+
+    /// Persist the user's latest Catch-Up visit timestamp in SQLite `local_state` off the UI thread.
+    pub fn record_catchup_visit(
+        &self,
+        now_secs: i64,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let team = self.session.as_ref()?.team_id.clone();
+        let store = self.store.as_ref()?.clone();
+        Some(async move {
+            if let Ok(mut guard) = store.lock() {
+                let _ = slackless_core::catchup::record_catchup_visit(&mut guard, &team, now_secs);
+            }
+        })
+    }
+
     /// Live mode: a read of `channel`'s stored history (oldest first) to run off the UI thread:
     /// the newest `HISTORY_LIMIT` messages, or the `HISTORY_LIMIT` before `before` when paging
     /// older on scroll-back. Locally preserved deleted messages are tagged with

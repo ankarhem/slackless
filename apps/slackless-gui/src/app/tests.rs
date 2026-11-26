@@ -2997,3 +2997,219 @@ fn parity_finish_gui_slash_disambiguation_profile_general_rename_and_beta_prefs(
     });
     drop(root);
 }
+
+#[gpui::test]
+fn qa_wave1_modal_stale_submit_workspace_switch_and_viewer_shortcut_guards(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui_kit::base::Root;
+    use slackless_core::api::ViewSubmitResponse;
+    use std::cell::RefCell;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let app = App::new(
+            Arc::new(fixtures::load()),
+            CoreBridge::offline(),
+            window,
+            cx,
+        );
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            // 1. Open a modal on workspace 0, then deliver stale submit errors for a closed view_id.
+            let view = serde_json::json!({
+                "id": "V_ACTIVE",
+                "title": { "type": "plain_text", "text": "Active Modal" },
+                "submit": { "type": "plain_text", "text": "Submit" },
+                "blocks": [{
+                    "type": "input",
+                    "block_id": "b1",
+                    "label": { "type": "plain_text", "text": "Name" },
+                    "element": { "type": "plain_text_input", "action_id": "a1" }
+                }]
+            });
+            app.modal_stack
+                .update(cx, |stack, cx| stack.open_view(view, window, cx));
+            assert_eq!(app.modal_stack.read(cx).depth(), 1);
+
+            let mut stale_errs = HashMap::new();
+            stale_errs.insert("b1".to_owned(), "Stale field error".to_owned());
+            app.modal_stack.update(cx, |stack, cx| {
+                stack.apply_submit_result(
+                    "V_CLOSED",
+                    Ok(ViewSubmitResponse::Errors(stale_errs)),
+                    window,
+                    cx,
+                );
+                stack.apply_submit_result(
+                    "V_CLOSED",
+                    Err("Stale transport failure".to_owned()),
+                    window,
+                    cx,
+                );
+            });
+            let active_kit = app.modal_stack.read(cx).top_kit().expect("active kit");
+            assert_eq!(
+                active_kit.read(cx).block_error("b1"),
+                None,
+                "stale view_id validation errors must not attach to active modal"
+            );
+            assert_eq!(
+                app.modal_stack.read(cx).frames[0].submit_error,
+                None,
+                "stale view_id submit error must not attach to active modal"
+            );
+
+            // 2. Switching workspaces must dismiss open modals from the outgoing workspace.
+            app.switch_workspace(1, window, cx);
+            assert_eq!(app.workspace, 1);
+            assert_eq!(
+                app.modal_stack.read(cx).depth(),
+                0,
+                "switch_workspace must dismiss open modal stack"
+            );
+
+            // 3. While ImageViewer is open, single-key transcript shortcuts must not fire.
+            app.messages
+                .update(cx, |list, cx| list.step_focus(true, cx));
+            let items = Rc::new(vec![crate::image_viewer::ViewerImage {
+                source: gpui::ImageSource::from(SharedString::from("https://example.com/a.png")),
+                name: "a.png".into(),
+                user: None,
+                taken_at: None,
+                download: None,
+                video: None,
+                pdf: None,
+            }]);
+            app.open_image_viewer(app.channel.clone(), items, 0, window, cx);
+            assert!(app.image_viewer.is_some());
+            app.open_remind_menu(window, cx);
+            assert!(
+                app.remind_menu.is_none(),
+                "remind menu shortcut must be inert while ImageViewer is open"
+            );
+            let before_thread = app.right_pane.is_thread();
+            app.focus_message(MessageAction::ReplyInThread, window, cx);
+            assert_eq!(
+                app.right_pane.is_thread(),
+                before_thread,
+                "focused-message shortcuts must be inert while ImageViewer is open"
+            );
+            app.close_image_viewer(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    drop(root);
+}
+
+#[gpui::test]
+fn app_outbox_events_inline_thread_sync_and_catchup_navigation(cx: &mut gpui::TestAppContext) {
+    use gpui_kit::base::Root;
+    use slackless_core::api::MessageContent;
+    use slackless_core::catchup::CatchUpWindow;
+    use slackless_core::outbox::OutboxPayload;
+    use slackless_core::store::{OutboxItem, OutboxKind, OutboxStatus};
+    use std::cell::RefCell;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let fx = Arc::new(fixtures::workspace(0));
+        let app = App::new(fx, CoreBridge::offline(), window, cx);
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+
+    // 1. OutboxUpdated populates channel + thread outbox state and renders cleanly.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            let ws_id = app.fixtures.workspaces[0].id.clone();
+            let ch = app.channel.clone();
+            let item_ch = OutboxItem {
+                id: 101,
+                workspace_id: ws_id.clone(),
+                channel_id: ch.clone(),
+                thread_ts: None,
+                kind: OutboxKind::Message,
+                payload_json: OutboxPayload::Message {
+                    content: MessageContent::plain("Queued while on a flight"),
+                }
+                .encode(),
+                status: OutboxStatus::Pending,
+                attempts: 0,
+                last_error: None,
+                created_at: 1_750_000_000,
+                updated_at: 1_750_000_000,
+            };
+            let item_reply = OutboxItem {
+                id: 102,
+                workspace_id: ws_id,
+                channel_id: ch.clone(),
+                thread_ts: Some(Ts::from("1700000001.000100")),
+                kind: OutboxKind::Reply,
+                payload_json: OutboxPayload::Reply {
+                    content: MessageContent::plain("Failed thread reply"),
+                    broadcast: false,
+                }
+                .encode(),
+                status: OutboxStatus::Failed,
+                attempts: 1,
+                last_error: Some("503 service unavailable".into()),
+                created_at: 1_750_000_001,
+                updated_at: 1_750_000_001,
+            };
+            app.on_core_event(&Event::OutboxUpdated(vec![item_ch, item_reply]), window, cx);
+            assert_eq!(app.ws.outbox.len(), 2);
+            app.open_thread(ch, Ts::from("1700000001.000100"), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // 2. Open Catch-Up view, switch window & scope, and jump back to a channel.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_catchup(window, cx);
+            assert_eq!(app.page, MainPage::CatchUp);
+            assert_eq!(app.current_place(cx), NavPlace::CatchUp);
+            app.catchup.update(cx, |v, cx| {
+                v.select_window(CatchUpWindow::Last7d, cx);
+                v.select_scope(true, cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            assert_eq!(app.catchup.read(cx).window(), CatchUpWindow::Last7d);
+            assert!(app.catchup.read(cx).all_workspaces());
+            let ws1_id = app.fixtures.workspaces[1].id.clone();
+            let ws1_ch = fixtures::workspace(1).channels[0].id.clone();
+            app.open_catchup_channel(&ws1_id, ws1_ch.clone(), None, window, cx);
+            assert_eq!(app.workspace, 1);
+            assert_eq!(app.page, MainPage::Channel);
+            assert_eq!(app.channel, ws1_ch);
+        });
+    });
+    cx.run_until_parked();
+    drop(root);
+}
