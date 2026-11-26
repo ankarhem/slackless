@@ -19,6 +19,7 @@
 //! `ActivityEvent::Open { channel, thread_ts }` (thread rows open their thread),
 //! `ActivityEvent::Mark { entries, read }` (the read toggles) and `ActivityEvent::Retry`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
@@ -171,7 +172,7 @@ pub struct ActivityFeed {
     items: Vec<Item>,
     filter: Filter,
     unreads_only: bool,
-    vip_users: String,
+    vips: Vips,
     load: Load,
     /// Keyboard-selected visible row index (`Up` / `Down` / `Enter` in Activity).
     selected: Option<usize>,
@@ -192,7 +193,7 @@ impl ActivityFeed {
             fixtures,
             filter: Filter::All,
             unreads_only: false,
-            vip_users: String::new(),
+            vips: Vips::default(),
             load: Load::Idle,
             selected: None,
         })
@@ -200,8 +201,9 @@ impl ActivityFeed {
 
     /// Update the configured VIP list used by the `VIPs` filter tab (`F-SHELL-061`).
     pub fn set_vip_users(&mut self, vip_users: String, cx: &mut Context<Self>) {
-        if self.vip_users != vip_users {
-            self.vip_users = vip_users;
+        let vips = Vips::parse(&vip_users);
+        if self.vips != vips {
+            self.vips = vips;
             cx.notify();
         }
     }
@@ -312,30 +314,18 @@ impl ActivityFeed {
 
     /// The rows the current tab and Unreads toggle show, in `items` order.
     fn visible(&self) -> Vec<usize> {
-        let base = visible(&self.items, self.filter, self.unreads_only);
-        if self.filter != Filter::Vips {
-            return base;
-        }
-        let vip_settings = crate::preferences::Settings {
-            vip_users: self.vip_users.clone(),
-            ..Default::default()
-        };
-        base.into_iter()
-            .filter(|&ix| {
+        let mut rows = visible(&self.items, self.filter, self.unreads_only);
+        if self.filter == Filter::Vips {
+            rows.retain(|&ix| {
                 let item = &self.items[ix];
-                let uid = item
-                    .message
+                item.message
                     .as_ref()
-                    .and_then(|m| m.user.as_ref())
-                    .or(item.actor.as_ref());
-                uid.is_some_and(|u| {
-                    let user_obj = self.fixtures.user(u);
-                    let handle = user_obj.map(|x| x.name.as_str()).unwrap_or("");
-                    let display = user_obj.map(|x| x.display_name()).unwrap_or("");
-                    vip_settings.is_vip(u.as_str(), handle, display)
-                })
-            })
-            .collect()
+                    .and_then(|message| message.user.as_ref())
+                    .or(item.actor.as_ref())
+                    .is_some_and(|user| self.vips.includes(user, &self.fixtures))
+            });
+        }
+        rows
     }
 
     fn toggle_read(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -387,7 +377,14 @@ impl ActivityFeed {
         SharedString::from(item.actor_label.clone())
     }
 
-    fn row(&self, ix: usize, item: &Item, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// Row `ix` of the feed; `is_selected` draws the keyboard selection.
+    fn row(
+        &self,
+        ix: usize,
+        is_selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let item = &self.items[ix];
         let theme = cx.theme();
         let (dim, hover, fg, border) = (
             theme.muted_foreground,
@@ -410,10 +407,6 @@ impl ActivityFeed {
             .map(|message| message.text.clone())
             .unwrap_or_else(|| item.text.clone());
         let group = SharedString::from(format!("activity-group-{ix}"));
-        let is_selected = self
-            .selected
-            .and_then(|pos| self.visible().get(pos).copied())
-            == Some(ix);
         let ring = cx.theme().ring;
         h_flex()
             .id(("activity-row", ix))
@@ -617,7 +610,9 @@ impl Render for ActivityFeed {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (fg, dim, border) = (theme.foreground, theme.muted_foreground, theme.border);
-        let rows: Vec<(String, Vec<usize>)> = day_groups(&self.items, &self.visible());
+        let visible = self.visible();
+        let selected = self.selected.and_then(|pos| visible.get(pos).copied());
+        let rows: Vec<(String, Vec<usize>)> = day_groups(&self.items, &visible);
         let empty = rows.is_empty();
         let page = v_flex()
             .id("activity-page")
@@ -637,7 +632,11 @@ impl Render for ActivityFeed {
                             .text_color(dim)
                             .child(label.clone()),
                     )
-                    .children(group.iter().map(|&ix| self.row(ix, &self.items[ix], cx)))
+                    .children(
+                        group
+                            .iter()
+                            .map(|&ix| self.row(ix, selected == Some(ix), cx)),
+                    )
             }));
         let page = match &self.load {
             Load::Loading if empty => page.child(
@@ -758,6 +757,36 @@ fn context_line(item: &Item, dim: Hsla, cx: &App) -> impl IntoElement {
         RowContext::Dm => row.child("Direct message"),
         RowContext::App => row.child("App"),
         RowContext::Channel { label } => row.child(label.clone()),
+    }
+}
+
+/// The VIP colleagues the VIPs tab keeps rows by (`F-SHELL-061`): ids, handles or display
+/// names, one per comma or line, `@` optional, any case. Parsed once when the preference
+/// changes, not per row and frame.
+#[derive(Default, PartialEq)]
+struct Vips(HashSet<String>);
+
+impl Vips {
+    fn parse(list: &str) -> Self {
+        Self(
+            list.split([',', '\n'])
+                .map(|entry| entry.trim().trim_start_matches('@').to_ascii_lowercase())
+                .filter(|entry| !entry.is_empty())
+                .collect(),
+        )
+    }
+
+    /// Whether `user` is on the list, by id, handle or display name.
+    fn includes(&self, user: &UserId, fixtures: &Fixtures) -> bool {
+        let profile = fixtures.user(user);
+        [
+            Some(user.as_str()),
+            profile.map(|profile| profile.name.as_str()),
+            profile.map(|profile| profile.display_name()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|name| self.0.contains(&name.to_ascii_lowercase()))
     }
 }
 
@@ -1019,6 +1048,37 @@ mod tests {
             vec![ActivityKind::Mention, ActivityKind::App],
             "the Unreads toggle keeps only unread rows"
         );
+    }
+
+    /// The VIPs tab's list names colleagues by id, handle or display name in any case, `@`
+    /// optional, one per comma or line; blank entries name nobody.
+    #[test]
+    fn vips_match_ids_handles_and_display_names_in_any_case() {
+        let mut fixtures = crate::fixtures::load();
+        fixtures.users.push(slackless_core::types::User {
+            id: UserId::from("U0GRACE"),
+            name: "grace".to_owned(),
+            profile: slackless_core::types::Profile {
+                display_name: Some("Grace Hopper".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let vips = Vips::parse("@SAM, u0bob\n grace hopper ,, @");
+        for (user, listed) in [
+            ("U0ME", true),
+            ("U0BOB", true),
+            ("U0GRACE", true),
+            ("U0CARA", false),
+            ("U0NOBODY", false),
+        ] {
+            assert_eq!(
+                vips.includes(&UserId::from(user), &fixtures),
+                listed,
+                "{user}"
+            );
+        }
+        assert!(!Vips::parse(" , ").includes(&UserId::from("U0ME"), &fixtures));
     }
 
     #[test]
