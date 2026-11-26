@@ -11,7 +11,7 @@ use gpui_kit::component::input::TextareaState;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, ClipboardItem, Div, FontWeight, InteractiveElement as _,
+    App, AppContext as _, ClipboardItem, Div, Focusable as _, FontWeight, InteractiveElement as _,
     ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _,
     Window, div, px,
 };
@@ -37,11 +37,18 @@ pub(super) fn open_share_panel(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let input = cx.new(|cx| {
-        TextareaState::new(window, cx)
-            .placeholder("#C01ENG, @U01ALICE…")
-            .auto_grow(1, 2)
+    let existing = cx
+        .try_global::<super::ListUiStore>()
+        .and_then(|store| store.panels.get(list_key))
+        .and_then(|p| p.share_target_input.clone());
+    let input = existing.unwrap_or_else(|| {
+        cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("#C01ENG, @U01ALICE…")
+                .auto_grow(1, 2)
+        })
     });
+    let focus_input = (tab == ListShareTab::Share).then(|| input.clone());
     mutate_panel(
         list_key,
         |s| {
@@ -49,6 +56,7 @@ pub(super) fn open_share_panel(
             s.share_tab = tab;
             s.share_item_id = item_record_id;
             s.share_status = None;
+            s.link_copied = false;
             if s.share_target_input.is_none() {
                 s.share_target_input = Some(input);
             }
@@ -56,6 +64,9 @@ pub(super) fn open_share_panel(
         window,
         cx,
     );
+    if let Some(input) = focus_input {
+        input.read(cx).focus_handle(cx).focus(window, cx);
+    }
 }
 
 /// Render the tabbed List Share & Access Management dialog drawer (`F-COLLAB-274..279`).
@@ -116,8 +127,8 @@ pub(super) fn render_list_share_panel(
             .bg(bg)
             .text_xs()
             .text_color(theme.foreground)
-            .child(Icon::new(icon).size(px(14.)).text_color(fg))
-            .child(div().flex_1().child(format_list_error(&msg)))
+            .child(Icon::new(icon).flex_none().size(px(14.)).text_color(fg))
+            .child(div().flex_1().min_w_0().child(format_list_error(&msg)))
     });
 
     let tab_bar = {
@@ -172,6 +183,7 @@ pub(super) fn render_list_share_panel(
 
     let key_copy = list_key.to_owned();
     let key_close = list_key.to_owned();
+    let key_esc = list_key.to_owned();
     let link_for_copy = effective_link.clone();
     let header_title = if state.share_item_id.is_some() {
         format!("Share item \u{b7} {list_title}")
@@ -185,7 +197,15 @@ pub(super) fn render_list_share_panel(
             .w(px(340.))
             .flex_none()
             .h_full()
+            .min_h_0()
             .overflow_y_scroll()
+            .on_scroll(|_, _, cx| cx.stop_propagation())
+            .on_key_down(move |event, window, cx| {
+                if event.keystroke.key == "escape" {
+                    mutate_panel(&key_esc, |s| s.share_open = false, window, cx);
+                    cx.stop_propagation();
+                }
+            })
             .border_l_1()
             .border_color(theme.border)
             .bg(theme.background)
@@ -661,13 +681,22 @@ fn render_access_tab(
             h_flex()
                 .items_center()
                 .justify_between()
+                .gap_1()
                 .p_1p5()
                 .rounded_sm()
                 .bg(theme.secondary.opacity(0.3))
                 .text_xs()
-                .child(div().font_weight(FontWeight::MEDIUM).child(owner_name))
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(owner_name),
+                )
+                .child(
+                    div()
+                        .flex_none()
                         .px_1p5()
                         .py_0p5()
                         .rounded_sm()
@@ -696,7 +725,7 @@ fn render_access_tab(
                 .border_1()
                 .border_color(theme.border)
                 .text_xs()
-                .child(div().flex_1().truncate().child(name))
+                .child(div().flex_1().min_w_0().truncate().child(name))
                 .child(
                     Button::new(SharedString::from(format!(
                         "list-share-promote-{list_key}-{ix}"
@@ -800,7 +829,7 @@ fn render_access_tab(
                     .border_1()
                     .border_color(theme.border)
                     .text_xs()
-                    .child(div().flex_1().truncate().child(label))
+                    .child(div().flex_1().min_w_0().truncate().child(label))
                     .child(
                         Button::new(SharedString::from(format!(
                             "list-share-rm-ch-{list_key}-{ix}"

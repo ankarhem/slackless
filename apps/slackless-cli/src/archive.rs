@@ -88,7 +88,13 @@ pub(crate) fn stored_team_ids_in(dir: &Path) -> Vec<TeamId> {
                     .extension()
                     .is_some_and(|ext| ext.to_string_lossy() == "sqlite")
         })
-        .filter_map(|path| path.file_stem()?.to_str().map(str::to_owned))
+        .filter_map(|path| {
+            let stem = path.file_stem()?.to_str()?;
+            if stem.is_empty() || stem == slackless_core::paths::SEMANTIC_INDEX_STEM {
+                return None;
+            }
+            Some(stem.to_owned())
+        })
         .map(TeamId::from)
         .collect();
     ids.sort();
@@ -892,6 +898,7 @@ mod tests {
         let dir = TempDir::new("team-ids");
         std::fs::write(dir.path().join("T200.sqlite"), b"").unwrap();
         std::fs::write(dir.path().join("T100.sqlite"), b"").unwrap();
+        std::fs::write(dir.path().join("semantic_index.sqlite"), b"").unwrap();
         std::fs::write(dir.path().join("T100.sqlite-wal"), b"").unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
         std::fs::create_dir(dir.path().join("TDIR.sqlite")).unwrap();

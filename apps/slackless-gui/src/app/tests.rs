@@ -2704,6 +2704,122 @@ fn cross_workspace_search_jump_storage_backfill_progress_and_export_engine(
 }
 
 #[gpui::test]
+fn qa_wave1_modal_stale_submit_workspace_switch_and_viewer_shortcut_guards(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui_kit::base::Root;
+    use slackless_core::api::ViewSubmitResponse;
+    use std::cell::RefCell;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let app = App::new(
+            Arc::new(fixtures::load()),
+            CoreBridge::offline(),
+            window,
+            cx,
+        );
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            // 1. Open a modal on workspace 0, then deliver stale submit errors for a closed view_id.
+            let view = serde_json::json!({
+                "id": "V_ACTIVE",
+                "title": { "type": "plain_text", "text": "Active Modal" },
+                "submit": { "type": "plain_text", "text": "Submit" },
+                "blocks": [{
+                    "type": "input",
+                    "block_id": "b1",
+                    "label": { "type": "plain_text", "text": "Name" },
+                    "element": { "type": "plain_text_input", "action_id": "a1" }
+                }]
+            });
+            app.modal_stack
+                .update(cx, |stack, cx| stack.open_view(view, window, cx));
+            assert_eq!(app.modal_stack.read(cx).depth(), 1);
+
+            let mut stale_errs = HashMap::new();
+            stale_errs.insert("b1".to_owned(), "Stale field error".to_owned());
+            app.modal_stack.update(cx, |stack, cx| {
+                stack.apply_submit_result(
+                    "V_CLOSED",
+                    Ok(ViewSubmitResponse::Errors(stale_errs)),
+                    window,
+                    cx,
+                );
+                stack.apply_submit_result(
+                    "V_CLOSED",
+                    Err("Stale transport failure".to_owned()),
+                    window,
+                    cx,
+                );
+            });
+            let active_kit = app.modal_stack.read(cx).top_kit().expect("active kit");
+            assert_eq!(
+                active_kit.read(cx).block_error("b1"),
+                None,
+                "stale view_id validation errors must not attach to active modal"
+            );
+            assert_eq!(
+                app.modal_stack.read(cx).frames[0].submit_error,
+                None,
+                "stale view_id submit error must not attach to active modal"
+            );
+
+            // 2. Switching workspaces must dismiss open modals from the outgoing workspace.
+            app.switch_workspace(1, window, cx);
+            assert_eq!(app.workspace, 1);
+            assert_eq!(
+                app.modal_stack.read(cx).depth(),
+                0,
+                "switch_workspace must dismiss open modal stack"
+            );
+
+            // 3. While ImageViewer is open, single-key transcript shortcuts must not fire.
+            app.messages
+                .update(cx, |list, cx| list.step_focus(true, cx));
+            let items = Rc::new(vec![crate::image_viewer::ViewerImage {
+                source: gpui::ImageSource::from(SharedString::from("https://example.com/a.png")),
+                name: "a.png".into(),
+                user: None,
+                taken_at: None,
+                download: None,
+                video: None,
+                pdf: None,
+            }]);
+            app.open_image_viewer(app.channel.clone(), items, 0, window, cx);
+            assert!(app.image_viewer.is_some());
+            app.open_remind_menu(window, cx);
+            assert!(
+                app.remind_menu.is_none(),
+                "remind menu shortcut must be inert while ImageViewer is open"
+            );
+            let before_thread = app.right_pane.is_thread();
+            app.focus_message(MessageAction::ReplyInThread, window, cx);
+            assert_eq!(
+                app.right_pane.is_thread(),
+                before_thread,
+                "focused-message shortcuts must be inert while ImageViewer is open"
+            );
+            app.close_image_viewer(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    drop(root);
+}
+
+#[gpui::test]
 fn app_outbox_events_inline_thread_sync_and_catchup_navigation(cx: &mut gpui::TestAppContext) {
     use gpui_kit::base::Root;
     use slackless_core::api::MessageContent;

@@ -74,7 +74,8 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.picker.is_some()
+        if self.image_viewer.is_some()
+            || self.picker.is_some()
             || self.remind_menu.is_some()
             || !window
                 .focused(cx)

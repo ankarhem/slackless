@@ -944,8 +944,9 @@ impl Sidebar {
             .when(selected, |row| row.bg(theme.sidebar_accent))
             .when(!selected, |row| row.hover(|row| row.bg(row_hover)))
             .child(leading);
-        let name = div().truncate().font_weight(weight).child(label);
+        let name = div().min_w_0().truncate().font_weight(weight).child(label);
         let external_badge_icon = Icon::new(IconName::Building2)
+            .flex_none()
             .size(px(12.))
             .text_color(color.opacity(0.8));
         row = if shared {

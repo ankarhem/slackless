@@ -4,12 +4,18 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use slackless_core::domain::mrkdwn::mrkdwn_to_plain;
+use slackless_core::embeddings::{
+    Embedder, EmbeddingModel, OnnxEmbedder, detect_embedding_model_setup,
+};
 use slackless_core::export::{
     ExportFormat as CoreExportFormat, ExportOptions, export_channel, export_file_transcript,
     export_huddle_transcript, export_thread,
 };
 use slackless_core::search::{SearchHitKind, UnifiedSearchHit, search_disk_archives};
-use slackless_core::store::{SearchQuery, SearchSort, Store, StoredMessage};
+use slackless_core::semantic_index::{hybrid_search_disk_archives, open_existing_semantic_index};
+use slackless_core::store::{
+    SearchMode, SearchQuery, SearchSort, SemanticIndex, Store, StoredMessage,
+};
 use slackless_core::types::time::now_epoch_secs;
 use slackless_core::types::{ChannelId, FileId, TeamId, Ts};
 
@@ -135,6 +141,9 @@ fn unified_hit_to_json(hit: &UnifiedSearchHit) -> serde_json::Value {
         }
         if let Some(rank) = hit.rank {
             map.insert("rank".to_owned(), serde_json::json!(rank));
+        }
+        if let Some(score) = hit.semantic_score {
+            map.insert("semantic_score".to_owned(), serde_json::json!(score));
         }
     }
     obj
@@ -397,6 +406,170 @@ pub(crate) fn cmd_search_in_archive(
     output::emit(
         ctx.json,
         &serde_json::json!({"query": query, "count": rows.len(), "messages": rows}),
+        &human,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+pub(crate) struct SemanticSearchCmdOpts<'a> {
+    pub(crate) mode: SearchMode,
+    pub(crate) model: &'a str,
+    pub(crate) all_workspaces: bool,
+    pub(crate) limit: usize,
+    pub(crate) sort: SearchSort,
+    pub(crate) format: Option<ExportFormat>,
+    pub(crate) out: Option<&'a Path>,
+    pub(crate) include_deleted: bool,
+}
+
+pub(crate) fn cmd_search_semantic(
+    ctx: &Ctx,
+    workspace: Option<&TeamId>,
+    query: &str,
+    opts: SemanticSearchCmdOpts<'_>,
+) -> Result<ExitCode> {
+    let Some(model) = EmbeddingModel::parse(opts.model) else {
+        return Ok(fail(
+            ctx,
+            "invalid_model",
+            &format!(
+                "unknown embedding model '{}'; expected 'minilm' or 'bge-small'",
+                opts.model
+            ),
+        ));
+    };
+    let setup = detect_embedding_model_setup(model);
+    if !setup.model_ready {
+        return Ok(fail(
+            ctx,
+            "semantic_model_missing",
+            &format!(
+                "local embedding model {} is not downloaded ({}). Run: slackless archive semantic-model download --model {}",
+                model.slug(),
+                setup.download_size_hint,
+                model.slug()
+            ),
+        ));
+    }
+    let Some(index) = open_existing_semantic_index().map_err(|e| anyhow::anyhow!("{e}"))? else {
+        return Ok(fail(
+            ctx,
+            "semantic_index_missing",
+            "semantic_index.sqlite has not been built yet. Run: slackless archive index-semantic",
+        ));
+    };
+
+    let archives: Vec<(TeamId, PathBuf)> = if opts.all_workspaces {
+        all_workspace_ids()
+            .into_iter()
+            .filter_map(|ws| archive::store_path(&ws).map(|p| (ws, p)))
+            .collect()
+    } else {
+        let Some(ws) = workspace else {
+            return Ok(empty_local(
+                ctx,
+                serde_json::json!({
+                    "query": query,
+                    "mode": opts.mode.as_str(),
+                    "all_workspaces": false,
+                    "count": 0,
+                    "messages": [],
+                }),
+                "running semantic search",
+            ));
+        };
+        archive::store_path(ws)
+            .filter(|p| p.is_file())
+            .map(|p| vec![(ws.clone(), p)])
+            .unwrap_or_default()
+    };
+
+    if archives.is_empty() {
+        return Ok(empty_local(
+            ctx,
+            serde_json::json!({
+                "query": query,
+                "mode": opts.mode.as_str(),
+                "all_workspaces": opts.all_workspaces,
+                "count": 0,
+                "messages": [],
+            }),
+            "running semantic search",
+        ));
+    }
+
+    let embedder = OnnxEmbedder::load_default(model)
+        .map_err(|e| anyhow::anyhow!("loading local ONNX embedding model: {e}"))?;
+    cmd_search_semantic_in_archives(ctx, &archives, &index, &embedder, query, opts)
+}
+
+pub(crate) fn cmd_search_semantic_in_archives(
+    ctx: &Ctx,
+    archives: &[(TeamId, PathBuf)],
+    index: &SemanticIndex,
+    embedder: &dyn Embedder,
+    query: &str,
+    opts: SemanticSearchCmdOpts<'_>,
+) -> Result<ExitCode> {
+    let mut parsed = SearchQuery::parse(query);
+    parsed.filters.include_deleted = opts.include_deleted;
+    // Semantic/hybrid defaults to relevance ranking unless caller explicitly asked for recent.
+    let results = hybrid_search_disk_archives(
+        archives, index, embedder, &parsed, opts.mode, opts.sort, opts.limit,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let searched: Vec<&str> = results
+        .workspaces_searched
+        .iter()
+        .map(|(ws, _)| ws.as_str())
+        .collect();
+    let workspaces_meta: Vec<serde_json::Value> = results
+        .workspaces_searched
+        .iter()
+        .map(|(ws, name)| serde_json::json!({"id": ws.as_str(), "name": name}))
+        .collect();
+    let json_rows: Vec<serde_json::Value> = results.hits.iter().map(unified_hit_to_json).collect();
+
+    if opts.format.is_some() || opts.out.is_some() {
+        let effective = if ctx.json {
+            ExportFormat::Json
+        } else {
+            opts.format.unwrap_or(ExportFormat::Md)
+        };
+        let rendered = match effective {
+            ExportFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
+                "query": query,
+                "mode": opts.mode.as_str(),
+                "model": embedder.model_id(),
+                "all_workspaces": opts.all_workspaces,
+                "workspaces_searched": searched,
+                "workspaces": workspaces_meta,
+                "count": json_rows.len(),
+                "messages": json_rows,
+            }))?,
+            ExportFormat::Md => format_unified_markdown_export(query, &results.hits),
+        };
+        write_or_print_export(ctx, &rendered, opts.out, json_rows.len(), "search matches")?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut human = String::new();
+    for hit in &results.hits {
+        human.push_str(&unified_hit_human_line(hit));
+    }
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "query": query,
+            "mode": opts.mode.as_str(),
+            "model": embedder.model_id(),
+            "all_workspaces": opts.all_workspaces,
+            "workspaces_searched": searched,
+            "workspaces": workspaces_meta,
+            "count": json_rows.len(),
+            "messages": json_rows,
+        }),
         &human,
     );
     Ok(ExitCode::SUCCESS)

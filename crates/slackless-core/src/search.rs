@@ -54,6 +54,8 @@ pub struct UnifiedSearchHit {
     pub transcript_excerpt: Option<String>,
     /// BM25 relevance rank (lower/more negative = better) when `SearchSort::Relevant`.
     pub rank: Option<f64>,
+    /// Semantic cosine similarity or RRF fused score when searched via `SearchMode::Semantic` / `Hybrid`.
+    pub semantic_score: Option<f32>,
 }
 
 /// One cross-workspace huddle transcript hit with workspace, channel, and speaker attribution.
@@ -97,7 +99,7 @@ pub fn discover_disk_archives(dir: &Path) -> Vec<(TeamId, PathBuf)> {
         })
         .filter_map(|path| {
             let stem = path.file_stem()?.to_str()?.to_owned();
-            if stem.is_empty() {
+            if stem.is_empty() || stem == paths::SEMANTIC_INDEX_STEM {
                 return None;
             }
             Some((TeamId::from(stem), path))
@@ -528,6 +530,7 @@ fn record_message_hit(
         transcript_file_id,
         transcript_excerpt,
         rank: hit.rank,
+        semantic_score: None,
     });
 }
 
@@ -606,6 +609,7 @@ fn append_standalone_file_transcripts(
             transcript_file_id: Some(entry.transcript.file_id),
             transcript_excerpt: excerpt,
             rank: None,
+            semantic_score: None,
         });
     }
     Ok(())
@@ -665,7 +669,7 @@ fn classify_hit(
     (SearchHitKind::Message, None, None)
 }
 
-fn is_canvas_file(file: &File) -> bool {
+pub(crate) fn is_canvas_file(file: &File) -> bool {
     matches!(
         file.filetype.as_deref(),
         Some("quip" | "canvas" | "slack_canvas")
@@ -674,7 +678,7 @@ fn is_canvas_file(file: &File) -> bool {
         || file.extra.contains_key("document_content")
 }
 
-fn is_snippet_file(file: &File) -> bool {
+pub(crate) fn is_snippet_file(file: &File) -> bool {
     file.mode == Some(FileMode::Snippet)
         || file
             .preview
@@ -683,7 +687,7 @@ fn is_snippet_file(file: &File) -> bool {
         || file.extra.contains_key("plain_text")
 }
 
-fn match_excerpt(body: &str, terms: &[String]) -> Option<String> {
+pub(crate) fn match_excerpt(body: &str, terms: &[String]) -> Option<String> {
     let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         return None;
@@ -727,7 +731,7 @@ fn match_excerpt(body: &str, terms: &[String]) -> Option<String> {
     Some(out)
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= max_chars {
         collapsed

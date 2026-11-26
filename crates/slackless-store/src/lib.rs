@@ -20,10 +20,16 @@ pub use slackless_types as types;
 
 pub mod query;
 mod schema;
+pub mod semantic;
 mod store;
 
 pub use query::{Date, Has, SearchFilters, SearchQuery, SearchSort};
 pub use schema::SCHEMA_VERSION;
+pub use semantic::{
+    DEFAULT_RRF_K, SearchMode, SemanticDocInput, SemanticDocKind, SemanticHit, SemanticIndex,
+    SemanticIndexStats, cosine_similarity, decode_f32_blob, encode_f32_blob, fuse_rrf,
+    l2_normalize, rrf_score,
+};
 pub use store::{
     ALL_CONVERSATION_KINDS, ConversationSummary, DigestChannel, HuddleTranscriptSegment,
     HuddleTranscriptSession, MemberCounts, NewHuddleTranscriptSegment, NewOutboxItem, OutboxItem,
