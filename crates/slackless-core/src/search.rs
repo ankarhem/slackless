@@ -435,7 +435,6 @@ struct WorkspaceMeta {
     name: Option<String>,
     channels: HashMap<String, String>,
     users: HashMap<String, String>,
-    file_transcripts: HashMap<FileId, String>,
 }
 
 fn load_workspace_meta(
@@ -465,12 +464,10 @@ fn load_workspace_meta(
             users.insert(u.id.as_str().to_owned(), label);
         }
     }
-    let file_transcripts = store.all_file_transcripts(workspace)?;
     Ok(WorkspaceMeta {
         name: team_name,
         channels,
         users,
-        file_transcripts,
     })
 }
 
@@ -516,7 +513,7 @@ fn record_message_hit(
         .or_else(|| hit.message.bot_profile.as_ref().map(|b| b.name.clone()));
 
     let (kind, transcript_file_id, transcript_excerpt) =
-        classify_hit(&hit.message, meta.map(|m| &m.file_transcripts), query);
+        classify_hit(store, &hit.workspace, &hit.message, query);
 
     hits.push(UnifiedSearchHit {
         workspace: hit.workspace,
@@ -616,9 +613,12 @@ fn append_standalone_file_transcripts(
 }
 
 /// Classify whether a message matched primarily as a transcript, canvas, snippet, or plain message.
+/// Stored transcripts are read per attached file of the matched hits (at most `limit`), never
+/// whole-workspace per search.
 fn classify_hit(
+    store: &Store,
+    workspace: &TeamId,
     message: &Message,
-    stored_transcripts: Option<&HashMap<FileId, String>>,
     query: &SearchQuery,
 ) -> (SearchHitKind, Option<FileId>, Option<String>) {
     if message.files.is_empty() {
@@ -635,9 +635,11 @@ fn classify_hit(
         !terms_lower.is_empty() && terms_lower.iter().all(|t| text_lower.contains(t.as_str()));
 
     for file in &message.files {
-        let transcript = stored_transcripts
-            .and_then(|map| map.get(&file.id))
-            .cloned()
+        let transcript = store
+            .file_transcript(workspace, &file.id)
+            .ok()
+            .flatten()
+            .map(|t| t.text)
             .or_else(|| extract_inline_file_transcript(file));
         if let Some(tr) = transcript {
             let excerpt = match_excerpt(&tr, &query.terms);
@@ -882,6 +884,30 @@ mod tests {
         snip_msg.files = vec![canvas_file];
         s2.upsert_message(&TeamId::from("T2"), &ChannelId::from("C2"), &snip_msg)
             .unwrap();
+        // A message that only matches through the stored transcript of its attached file.
+        s2.upsert_message(
+            &TeamId::from("T2"),
+            &ChannelId::from("C2"),
+            &Message {
+                ts: Ts::from("1700000250.000100"),
+                user: Some(UserId::from("U2")),
+                text: "Recording of the launch call".into(),
+                files: vec![File {
+                    id: FileId::from("F_CLIP"),
+                    name: Some("launch.mp4".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s2.upsert_file_transcript(
+            &TeamId::from("T2"),
+            &FileId::from("F_CLIP"),
+            "parakeet-v3",
+            "Nebula launch walkthrough",
+        )
+        .unwrap();
 
         let targets = vec![
             WorkspaceSearchTarget {
@@ -904,7 +930,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(res.workspaces_searched.len(), 2);
-        assert_eq!(res.hits.len(), 4);
+        assert_eq!(res.hits.len(), 5);
+
+        let attached_tx = res
+            .hits
+            .iter()
+            .find(|h| h.transcript_file_id == Some(FileId::from("F_CLIP")))
+            .expect("attached transcript hit");
+        assert_eq!(
+            (attached_tx.kind, attached_tx.transcript_excerpt.as_deref()),
+            (
+                SearchHitKind::FileTranscript,
+                Some("Nebula launch walkthrough")
+            )
+        );
 
         let canvas_hit = res
             .hits

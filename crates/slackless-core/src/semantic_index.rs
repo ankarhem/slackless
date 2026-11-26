@@ -691,6 +691,7 @@ pub fn hybrid_search_huddle_transcripts_across_stores(
     }
 
     let mut semantic_hits = Vec::new();
+    let mut channel_names: HashMap<TeamId, HashMap<String, String>> = HashMap::new();
     let lang_prefix = lang
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -714,7 +715,9 @@ pub fn hybrid_search_huddle_transcripts_across_stores(
         {
             continue;
         }
-        let channels = store.channel_names(&hit.workspace).unwrap_or_default();
+        let channels = channel_names
+            .entry(hit.workspace.clone())
+            .or_insert_with(|| store.channel_names(&hit.workspace).unwrap_or_default());
         let channel_name = channels.get(segment.channel.as_str()).cloned();
         let speaker_name = segment
             .speaker_id
@@ -776,6 +779,7 @@ pub fn hybrid_search_huddle_transcripts_in_disk_archives(
         path_by_ws.insert(ws.as_str(), p.as_path());
     }
     let mut store_cache: HashMap<String, Store> = HashMap::new();
+    let mut channel_names: HashMap<TeamId, HashMap<String, String>> = HashMap::new();
     let lang_prefix = lang
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -812,7 +816,9 @@ pub fn hybrid_search_huddle_transcripts_in_disk_archives(
             .flatten()
             .map(|t| t.name)
             .filter(|n| !n.trim().is_empty());
-        let channels = store.channel_names(&hit.workspace).unwrap_or_default();
+        let channels = channel_names
+            .entry(hit.workspace.clone())
+            .or_insert_with(|| store.channel_names(&hit.workspace).unwrap_or_default());
         let channel_name = channels.get(segment.channel.as_str()).cloned();
         let speaker_name = segment
             .speaker_id
