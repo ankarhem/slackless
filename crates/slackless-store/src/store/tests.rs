@@ -48,6 +48,24 @@ fn lists_conversations_and_users_per_workspace() {
         .collect();
     assert_eq!(users, [UserId::from("U1")]);
     assert!(store.users(&TeamId::from("T2")).unwrap().is_empty());
+
+    // A row whose JSON no longer decodes (a field type tightened by an upgrade) is skipped
+    // instead of failing the whole list.
+    store
+        .conn
+        .execute(
+            r#"INSERT INTO "user" (workspace_id, id, name, is_bot, deleted, json, updated_at)
+               VALUES (?1, 'U2', 'stale', 0, 0, '{"id": 2}', 0)"#,
+            params![ws().as_str()],
+        )
+        .unwrap();
+    let users: Vec<_> = store
+        .users(&ws())
+        .unwrap()
+        .into_iter()
+        .map(|u| u.id)
+        .collect();
+    assert_eq!(users, [UserId::from("U1")]);
 }
 
 fn general() -> ChannelId {

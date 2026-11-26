@@ -402,15 +402,24 @@ impl Store {
         row.map(decode_stored_message).transpose()
     }
 
-    /// Every stored user of `workspace`, as last upserted.
+    /// Every stored user of `workspace`, as last upserted. A row whose JSON no longer decodes
+    /// (a field type tightened by an upgrade, say) is logged and skipped, so one stale row cannot
+    /// fail the whole list.
     pub fn users(&self, workspace: &TeamId) -> Result<Vec<User>> {
-        self.json_column(
-            r#"SELECT json FROM "user" WHERE workspace_id = ?1"#,
-            workspace,
-        )?
-        .iter()
-        .map(|json| Ok(serde_json::from_str(json)?))
-        .collect()
+        Ok(self
+            .json_column(
+                r#"SELECT json FROM "user" WHERE workspace_id = ?1"#,
+                workspace,
+            )?
+            .iter()
+            .filter_map(|json| match serde_json::from_str(json) {
+                Ok(user) => Some(user),
+                Err(error) => {
+                    tracing::warn!(%error, %workspace, "skipping stored user that no longer decodes");
+                    None
+                }
+            })
+            .collect())
     }
 
     /// Stores the workspace's team record (`client.userBoot.team`).
