@@ -4,7 +4,7 @@
 //! ([`sign_in`]), later launches reuse the stored session. Without a session (sign-in cancelled,
 //! or `SLACKLESS_FIXTURES=1`) the window renders the bundled sample workspace from [`fixtures`]
 //! with an offline [`bridge::CoreBridge`]. `slackless-gui --sign-in` signs in again.
-//! Module layout and the public interface between views are documented in `app.rs`.
+//! The root view lives in [`app`]; views talk upward through event enums the root subscribes to.
 //! `SLACKLESS_GUI_DEMO=browser` / `SLACKLESS_GUI_DEMO=search:<query>` start on the channel
 //! browser or a search result list; `SLACKLESS_GUI_DEMO=canvas` / `=list` start in the huddle
 //! channel with the huddle bar open on its Canvas or List tab; `=prefs` / `=profile` /

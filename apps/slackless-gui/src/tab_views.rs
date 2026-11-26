@@ -1,6 +1,6 @@
 //! How the conversation tabs render: a tab row entry, and the bodies of the tabs that list
 //! fetched data (Files & links, a bookmark folder). Each body renders a lazily loaded list
-//! ([`Loaded`], fetched each time its tab opens, see `app.rs`) with loading, error and empty
+//! ([`Loaded`], fetched each time its tab opens, see `app::render`) with loading, error and empty
 //! states; every clickable row opens its file or link in the browser, and a row with
 //! nothing to open is plain (no hover).
 
