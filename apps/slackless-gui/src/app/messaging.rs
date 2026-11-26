@@ -983,7 +983,8 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if invocation.app_id.is_none() && !invocation.force_builtin {
+        if invocation.app_id.is_none() && invocation.app_name.is_none() && !invocation.force_builtin
+        {
             let candidates = matching_slash_candidates(invocation, &self.fixtures.app_commands);
             if candidates.len() > 1 {
                 self.open_slash_disambiguation_dialog(
@@ -998,6 +999,7 @@ impl App {
         }
         let remote = !invocation.force_builtin
             && (invocation.app_id.is_some()
+                || invocation.app_name.is_some()
                 || invocation
                     .command
                     .is_none_or(|command| command.kind == SlashKind::Giphy));
@@ -1294,10 +1296,18 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(ix, cand)| {
-                    let this_pick = this.clone();
-                    let inv = invocation.clone();
-                    let thread_c = thread.clone();
-                    let cand_c = cand.clone();
+                    let chosen = if cand.is_builtin {
+                        invocation.clone().with_builtin()
+                    } else {
+                        invocation
+                            .clone()
+                            .with_app(cand.app_id.clone(), Some(cand.provider_label.clone()))
+                    };
+                    let this_row = this.clone();
+                    let chosen_row = chosen.clone();
+                    let thread_row = thread.clone();
+                    let this_btn = this.clone();
+                    let thread_btn = thread.clone();
                     h_flex()
                         .id(("slash-disambig-row", ix))
                         .items_center()
@@ -1309,6 +1319,12 @@ impl App {
                         .border_color(border)
                         .cursor_pointer()
                         .hover(move |el| el.bg(hover))
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let _ = this_row.update(cx, |app, cx| {
+                                app.run_slash(&chosen_row, thread_row.clone(), window, cx);
+                            });
+                        })
                         .child(
                             v_flex()
                                 .min_w_0()
@@ -1320,6 +1336,8 @@ impl App {
                                         .gap_2()
                                         .child(
                                             div()
+                                                .min_w_0()
+                                                .truncate()
                                                 .text_sm()
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .child(cand.provider_label.clone()),
@@ -1327,6 +1345,8 @@ impl App {
                                         .when(!cand.usage.is_empty(), |row| {
                                             row.child(
                                                 div()
+                                                    .min_w_0()
+                                                    .truncate()
                                                     .text_xs()
                                                     .text_color(muted)
                                                     .child(cand.usage.clone()),
@@ -1336,6 +1356,7 @@ impl App {
                                 .when(!cand.description.is_empty(), |col| {
                                     col.child(
                                         div()
+                                            .min_w_0()
                                             .text_xs()
                                             .text_color(muted)
                                             .child(cand.description.clone()),
@@ -1343,26 +1364,21 @@ impl App {
                                 }),
                         )
                         .child(
-                            preferences::form_button(
-                                Button::new(("slash-disambig-run", ix))
-                                    .primary()
-                                    .label("Run"),
-                                cx,
-                            )
-                            .on_click(move |_, window, cx| {
-                                window.close_dialog(cx);
-                                let chosen = if cand_c.is_builtin {
-                                    inv.clone().with_builtin()
-                                } else {
-                                    inv.clone().with_app(
-                                        cand_c.app_id.clone(),
-                                        Some(cand_c.provider_label.clone()),
-                                    )
-                                };
-                                let _ = this_pick.update(cx, |app, cx| {
-                                    app.run_slash(&chosen, thread_c.clone(), window, cx);
-                                });
-                            }),
+                            div().flex_none().child(
+                                preferences::form_button(
+                                    Button::new(("slash-disambig-run", ix))
+                                        .primary()
+                                        .label("Run"),
+                                    cx,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.close_dialog(cx);
+                                    let _ = this_btn.update(cx, |app, cx| {
+                                        app.run_slash(&chosen, thread_btn.clone(), window, cx);
+                                    });
+                                }),
+                            ),
                         )
                 })
                 .collect();
@@ -1373,7 +1389,15 @@ impl App {
                     v_flex()
                         .gap_3()
                         .child(div().text_sm().text_color(muted).child(subtitle))
-                        .child(v_flex().gap_2().children(rows))
+                        .child(
+                            v_flex()
+                                .id("slash-disambig-list")
+                                .max_h(px(320.))
+                                .overflow_y_scroll()
+                                .on_scroll(|_, _, cx| cx.stop_propagation())
+                                .gap_2()
+                                .children(rows),
+                        )
                         .child(
                             h_flex().justify_end().pt_1().child(
                                 preferences::form_button(

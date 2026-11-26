@@ -818,8 +818,18 @@ impl Render for EmojiPicker {
                 .gap_1p5()
                 .text_xs()
                 .text_color(muted)
-                .child(Icon::new(IconName::Globe).size(px(12.)).text_color(muted))
-                .child("Slack Connect \u{b7} Custom workspace emoji are visible to external people here")
+                .child(
+                    Icon::new(IconName::Globe)
+                        .flex_none()
+                        .size(px(12.))
+                        .text_color(muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child("Slack Connect \u{b7} Custom workspace emoji are visible to external people here"),
+                )
         });
 
         v_flex()

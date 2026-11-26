@@ -304,7 +304,14 @@ pub fn parse_github_releases_list(
         };
         let replace = match &best {
             None => true,
-            Some(prev) => is_newer_version(&info.version, &prev.version),
+            Some(prev) => match (
+                parse_comparable_version(&info.version),
+                parse_comparable_version(&prev.version),
+            ) {
+                (Some(cand), Some(cur)) => cand > cur,
+                (Some(_), None) => true,
+                _ => false,
+            },
         };
         if replace {
             best = Some(info);
@@ -1230,5 +1237,60 @@ mod tests {
             .expect("release");
         assert_eq!(chosen.version, "2026.11.26-01");
         assert!(!chosen.is_prerelease);
+
+        // Older unparseable/non-standard tags must NEVER overwrite a valid newer release.
+        let with_nonstandard = json!([
+            {
+                "tag_name": "2026.11.26-01",
+                "html_url": "https://example.com/valid",
+                "draft": false,
+                "prerelease": false,
+                "assets": [{ "name": "Slackless-2026.11.26-01-macos-arm64.app.tar.gz", "browser_download_url": "https://example.com/v.tar.gz" }]
+            },
+            {
+                "tag_name": "nightly",
+                "html_url": "https://example.com/nightly",
+                "draft": false,
+                "prerelease": true,
+                "assets": [{ "name": "Slackless-nightly-macos-arm64.app.tar.gz", "browser_download_url": "https://example.com/n.tar.gz" }]
+            },
+            {
+                "tag_name": "v1.0-custom",
+                "html_url": "https://example.com/custom",
+                "draft": false,
+                "prerelease": false,
+                "assets": [{ "name": "Slackless-v1.0-custom-macos-arm64.app.tar.gz", "browser_download_url": "https://example.com/c.tar.gz" }]
+            }
+        ])
+        .to_string();
+        let chosen_beta =
+            parse_github_releases_list(with_nonstandard.as_bytes(), UpdateChannel::Beta)
+                .expect("valid")
+                .expect("release");
+        assert_eq!(chosen_beta.version, "2026.11.26-01");
+
+        // And a valid release arriving AFTER a leading unparseable tag replaces it.
+        let unparseable_first = json!([
+            {
+                "tag_name": "nightly",
+                "html_url": "https://example.com/nightly",
+                "draft": false,
+                "prerelease": true,
+                "assets": [{ "name": "Slackless-nightly-macos-arm64.app.tar.gz", "browser_download_url": "https://example.com/n.tar.gz" }]
+            },
+            {
+                "tag_name": "2026.11.26-01",
+                "html_url": "https://example.com/valid",
+                "draft": false,
+                "prerelease": false,
+                "assets": [{ "name": "Slackless-2026.11.26-01-macos-arm64.app.tar.gz", "browser_download_url": "https://example.com/v.tar.gz" }]
+            }
+        ])
+        .to_string();
+        let chosen_after =
+            parse_github_releases_list(unparseable_first.as_bytes(), UpdateChannel::Beta)
+                .expect("valid")
+                .expect("release");
+        assert_eq!(chosen_after.version, "2026.11.26-01");
     }
 }

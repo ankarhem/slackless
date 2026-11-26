@@ -341,10 +341,11 @@ pub(super) fn transcript_row(
                     .text_color(theme.muted_foreground)
                     .child(
                         Icon::new(IconName::Globe)
+                            .flex_none()
                             .size(px(11.))
                             .text_color(theme.muted_foreground),
                     )
-                    .child(ext_label),
+                    .child(div().flex_1().min_w_0().child(ext_label)),
             );
         }
         body = body.children(actions::reaction_chips(

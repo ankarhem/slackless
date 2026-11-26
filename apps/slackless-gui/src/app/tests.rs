@@ -2919,6 +2919,15 @@ fn parity_finish_gui_slash_disambiguation_profile_general_rename_and_beta_prefs(
             );
             window.close_dialog(cx);
 
+            // Selecting a duplicate app with app_id=None + distinct app_name must NOT loop back
+            // into the disambiguation dialog.
+            let chosen_by_name = inv.with_app(None, Some("ReleaseBot".to_owned()));
+            app.run_slash(&chosen_by_name, None, window, cx);
+            assert!(
+                !window.has_active_dialog(cx),
+                "choosing an app by app_name with app_id=None must not re-open disambiguation"
+            );
+
             // 3. ProfilePanel locked fields, automatic status source, and pronoun toggle (F-SHELL-005/010/020..021)
             let self_id = app.fixtures.self_user.clone();
             app.profile.update(cx, |p, cx| {

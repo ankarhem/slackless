@@ -371,10 +371,11 @@ impl Render for Composer {
                     .text_color(theme.foreground)
                     .child(
                         Icon::new(IconName::Building2)
+                            .flex_none()
                             .size(px(13.))
                             .text_color(theme.muted_foreground),
                     )
-                    .child(notice)
+                    .child(div().flex_1().min_w_0().child(notice))
             });
         let upload_warning = self.upload_warning.clone().map(|msg| {
             let danger = cx.theme().danger;

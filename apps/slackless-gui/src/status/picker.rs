@@ -660,6 +660,7 @@ impl Render for StatusPicker {
                 .text_color(muted)
                 .child(
                     Icon::new(IconName::Sparkles)
+                        .flex_none()
                         .size(px(13.))
                         .text_color(muted),
                 )
@@ -679,10 +680,15 @@ impl Render for StatusPicker {
                 .gap_1p5()
                 .text_xs()
                 .text_color(muted)
-                .child(Icon::new(IconName::Globe).size(px(12.)).text_color(muted))
-                .child(format!(
+                .child(
+                    Icon::new(IconName::Globe)
+                        .flex_none()
+                        .size(px(12.))
+                        .text_color(muted),
+                )
+                .child(div().flex_1().min_w_0().child(format!(
                     "Visible to everyone in {ws} and connected Slack Connect channels"
-                ))
+                )))
         };
 
         v_flex()

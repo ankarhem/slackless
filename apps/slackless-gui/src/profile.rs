@@ -810,11 +810,12 @@ impl Render for ProfilePanel {
                             .when(source.is_automatic(), |row| {
                                 row.child(
                                     Icon::new(IconName::Sparkles)
+                                        .flex_none()
                                         .size(px(11.))
                                         .text_color(muted),
                                 )
                             })
-                            .child(meta),
+                            .child(div().flex_1().min_w_0().child(meta)),
                     )
             }))
             .child(presence)

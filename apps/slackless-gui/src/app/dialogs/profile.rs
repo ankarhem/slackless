@@ -184,7 +184,7 @@ impl App {
         });
 
         let this = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let theme = cx.theme();
             let (muted, border, card_bg) = (
                 theme.muted_foreground,
@@ -300,8 +300,13 @@ impl App {
             );
             let show_pronouns_save = show_pronouns_state.clone();
             let this_photo = this.clone();
+            let max_body_h = (window.viewport_size().height * 0.78).max(px(360.));
             dialog.title("Edit your profile").w(px(460.)).child(
                 v_flex()
+                    .id("edit-profile-body")
+                    .max_h(max_body_h)
+                    .overflow_y_scroll()
+                    .on_scroll(|_, _, cx| cx.stop_propagation())
                     .gap_3()
                     .child(
                         h_flex()

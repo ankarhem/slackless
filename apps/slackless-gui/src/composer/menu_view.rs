@@ -125,8 +125,15 @@ impl Composer {
     fn row(&self, entry: &Entry, tones: RowTones, cx: &App) -> Div {
         let fixtures: &Fixtures = &self.fixtures;
         let RowTones { secondary, ring } = tones;
-        let title = |text: SharedString| div().font_weight(FontWeight::SEMIBOLD).child(text);
-        let note = |text: SharedString| div().text_color(secondary).child(text);
+        let title = |text: SharedString| {
+            div()
+                .min_w_0()
+                .truncate()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(text)
+        };
+        let note =
+            |text: SharedString| div().min_w_0().truncate().text_color(secondary).child(text);
         let line = h_flex().items_center().gap_2();
         match entry {
             Entry::User(id) => {
@@ -145,6 +152,7 @@ impl Composer {
                 .when(is_app, |row| {
                     row.child(
                         div()
+                            .flex_none()
                             .px_1()
                             .rounded(px(3.))
                             .bg(cx.theme().secondary)
@@ -158,6 +166,7 @@ impl Composer {
                 .when(is_app, |row| {
                     row.child(
                         div()
+                            .flex_none()
                             .ml_auto()
                             .text_xs()
                             .text_color(secondary)
@@ -173,6 +182,7 @@ impl Composer {
                 });
                 line.child(
                     Icon::new(IconName::Users)
+                        .flex_none()
                         .size(px(16.))
                         .text_color(secondary),
                 )
@@ -189,6 +199,7 @@ impl Composer {
                 };
                 line.child(
                     Icon::new(IconName::Megaphone)
+                        .flex_none()
                         .size(px(16.))
                         .text_color(secondary),
                 )
@@ -197,6 +208,7 @@ impl Composer {
                 .when_some(self.broadcast_hint.clone(), |row, badge| {
                     row.child(
                         div()
+                            .flex_none()
                             .ml_auto()
                             .px_1p5()
                             .py(px(1.))
