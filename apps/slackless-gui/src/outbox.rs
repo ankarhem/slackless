@@ -10,7 +10,8 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     Anchor, AnyElement, App, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, Stateful, Styled as _, Window, div, px,
+    ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _,
+    Window, div, px,
 };
 use slackless_core::outbox::decode_outbox_payload;
 use slackless_core::store::{OutboxItem, OutboxStatus};
@@ -112,6 +113,9 @@ pub fn inline_outbox_strip(
             .id(SharedString::from(format!("{id_prefix}-outbox-strip")))
             .flex_none()
             .w_full()
+            .max_h(px(200.))
+            .overflow_y_scroll()
+            .on_scroll(|_, _, cx| cx.stop_propagation())
             .px_4()
             .py_2()
             .gap_1p5()
@@ -155,9 +159,10 @@ pub fn inline_outbox_strip(
                     .id(SharedString::from(format!("{id_prefix}-outbox-{item_id}")))
                     .w_full()
                     .min_w_0()
+                    .flex_wrap()
                     .items_start()
                     .justify_between()
-                    .gap_3()
+                    .gap_2()
                     .px_3()
                     .py_2()
                     .rounded(px(8.))
@@ -182,12 +187,19 @@ pub fn inline_outbox_strip(
                                     .min_w_0()
                                     .items_center()
                                     .gap_1p5()
-                                    .child(Icon::new(icon).size(px(12.)).text_color(accent))
+                                    .child(
+                                        Icon::new(icon)
+                                            .flex_none()
+                                            .size(px(12.))
+                                            .text_color(accent),
+                                    )
                                     .child(
                                         div()
+                                            .min_w_0()
                                             .text_xs()
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(if is_failed { danger } else { muted })
+                                            .truncate()
                                             .child(status_text),
                                     )
                                     .when_some(err_detail, |row, detail| {
@@ -331,13 +343,15 @@ pub fn top_bar_outbox_badge(
             .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
                 if pending > 0 {
                     let on_flush = Rc::clone(&actions.on_flush);
-                    menu = menu.item(
-                        PopupMenuItem::new(format!("Send queued now ({pending})"))
-                            .icon(IconName::Send)
-                            .on_click(move |_, window, cx| on_flush(window, cx)),
-                    );
+                    menu = menu
+                        .item(
+                            PopupMenuItem::new(format!("Send queued now ({pending})"))
+                                .icon(IconName::Send)
+                                .on_click(move |_, window, cx| on_flush(window, cx)),
+                        )
+                        .separator();
                 }
-                menu = menu.separator().label("Outbox");
+                menu = menu.label("Outbox");
                 for (id, channel, thread_ts, label, status) in &entries {
                     let item_id = *id;
                     let open_cb = Rc::clone(&actions.on_open);

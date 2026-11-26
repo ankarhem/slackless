@@ -352,7 +352,11 @@ impl<B: Backend> Core<B> {
     /// Flush all `pending` V13 outbox items for this workspace strictly sequentially in FIFO
     /// order. Serialized by `outbox_flush_lock` plus SQLite `status != 'sending'` atomic claims
     /// so overlapping reconnects or manual flushes are idempotent and never double-send.
+    /// No-ops while offline so pending items remain queued for automatic flush on reconnect.
     pub(in crate::client) fn flush_outbox(&self) {
+        if self.is_offline {
+            return;
+        }
         let ctx = self.ctx();
         let lock = Arc::clone(&self.outbox_flush_lock);
         self.tasks.spawn(async move {
@@ -409,18 +413,26 @@ impl<B: Backend> Core<B> {
         });
     }
 
-    /// Permanently remove a V13 outbox item and emit [`Event::OutboxUpdated`].
+    /// Permanently remove a V13 outbox item owned by this workspace and emit
+    /// [`Event::OutboxUpdated`].
     pub(super) async fn discard_outbox_item(&mut self, id: i64) {
         let ws = self.workspace.clone();
         match with_store(&self.store, move |s| {
+            let owned = s
+                .get_outbox_item(id)?
+                .is_some_and(|item| item.workspace_id == ws);
+            if !owned {
+                return Ok(None);
+            }
             s.delete_outbox_item(id)?;
-            s.list_outbox(&ws)
+            Ok(Some(s.list_outbox(&ws)?))
         })
         .await
         {
-            Ok(all) => {
+            Ok(Some(all)) => {
                 self.events.emit(Event::OutboxUpdated(all));
             }
+            Ok(None) => {}
             Err(err) => tracing::warn!(id, %err, "failed to discard outbox item"),
         }
     }

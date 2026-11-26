@@ -403,8 +403,8 @@ pub(crate) fn build_catchup_for_archives(
     merged.unread_channels.sort_by(|a, b| {
         b.mention_count
             .cmp(&a.mention_count)
-            .then_with(|| b.latest_at.cmp(&a.latest_at))
             .then_with(|| b.message_count.cmp(&a.message_count))
+            .then_with(|| b.latest_at.cmp(&a.latest_at))
     });
     merged.unread_channels.truncate(limit);
     merged.active_threads.sort_by(|a, b| {

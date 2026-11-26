@@ -1227,20 +1227,21 @@ impl App {
     }
 
     /// Persist the current timestamp as the Catch-Up visit watermark for the scoped workspace(s)
-    /// and refresh the briefing.
+    /// and refresh the briefing once the SQLite write(s) complete.
     pub(super) fn mark_catchup_visited(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let all_workspaces = self.catchup.read(cx).all_workspaces();
         let now_secs = slackless_core::types::time::now_epoch_secs();
+        let mut writes = Vec::new();
         if !self.fixtures.sample {
             if let Some(write) = self.bridge.record_catchup_visit(now_secs) {
-                cx.background_executor().spawn(write).detach();
+                writes.push(write);
             }
             if all_workspaces {
                 for slot in &self.parked_bridges {
                     if let Some(bg) = slot.as_ref()
                         && let Some(write) = bg.record_catchup_visit(now_secs)
                     {
-                        cx.background_executor().spawn(write).detach();
+                        writes.push(write);
                     }
                 }
             }
@@ -1251,7 +1252,23 @@ impl App {
             window,
             cx,
         );
-        self.refresh_catchup(cx);
+        if writes.is_empty() {
+            self.refresh_catchup(cx);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .spawn(async move {
+                    for write in writes {
+                        write.await;
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                app.refresh_catchup(cx);
+            });
+        })
+        .detach();
     }
 
     /// Jump from Catch-Up into a channel (switching workspaces if needed) and optionally reveal `ts`.

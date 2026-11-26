@@ -241,6 +241,7 @@ impl CatchUpView {
                             .gap_1p5()
                             .child(
                                 div()
+                                    .min_w_0()
                                     .text_sm()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(fg)
@@ -249,6 +250,7 @@ impl CatchUpView {
                             )
                             .child(
                                 div()
+                                    .min_w_0()
                                     .text_xs()
                                     .text_color(muted)
                                     .truncate()
@@ -364,11 +366,13 @@ impl CatchUpView {
                                 } else {
                                     IconName::Hash
                                 })
+                                .flex_none()
                                 .size(px(13.))
                                 .text_color(muted),
                             )
                             .child(
                                 div()
+                                    .min_w_0()
                                     .text_sm()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(fg)
@@ -513,6 +517,7 @@ impl CatchUpView {
                             .gap_1p5()
                             .child(
                                 div()
+                                    .min_w_0()
                                     .text_sm()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(fg)
@@ -663,9 +668,15 @@ impl CatchUpView {
                             .min_w_0()
                             .items_center()
                             .gap_1p5()
-                            .child(Icon::new(icon).size(px(14.)).text_color(theme.primary))
+                            .child(
+                                Icon::new(icon)
+                                    .flex_none()
+                                    .size(px(14.))
+                                    .text_color(theme.primary),
+                            )
                             .child(
                                 div()
+                                    .min_w_0()
                                     .text_sm()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(fg)
@@ -675,6 +686,7 @@ impl CatchUpView {
                             .when_some(tr.channel_label.clone(), |row, label| {
                                 row.child(
                                     div()
+                                        .min_w_0()
                                         .text_xs()
                                         .text_color(muted)
                                         .truncate()
@@ -798,6 +810,7 @@ impl Render for CatchUpView {
                             .gap_2()
                             .child(
                                 Icon::new(IconName::Sparkles)
+                                    .flex_none()
                                     .size(px(18.))
                                     .text_color(theme.primary),
                             )

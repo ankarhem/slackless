@@ -7478,12 +7478,16 @@ async fn outbox_enqueues_on_transient_errors_and_rejects_permanent_slack_and_aut
     }))
     .await;
 
-    wait_until("all 4 transient mutations persisted in outbox", || {
-        store.lock().unwrap().list_outbox(&ws).unwrap().len() == 4
-    })
-    .await;
+    // Wait for all 4 OutboxUpdated events (avoiding any race between store insert and event emit).
+    for _ in 0..4 {
+        match next(&mut rx).await {
+            Event::OutboxUpdated(_) => {}
+            other => panic!("expected OutboxUpdated for transient error, got {other:?}"),
+        }
+    }
 
     let items = store.lock().unwrap().list_outbox(&ws).unwrap();
+    assert_eq!(items.len(), 4);
     let kinds: HashSet<OutboxKind> = items.iter().map(|i| i.kind).collect();
     assert!(kinds.contains(&OutboxKind::Message));
     assert!(kinds.contains(&OutboxKind::Reply));
@@ -7491,9 +7495,6 @@ async fn outbox_enqueues_on_transient_errors_and_rejects_permanent_slack_and_aut
     assert!(kinds.contains(&OutboxKind::ReactionRemove));
     assert!(items.iter().all(|i| i.status == OutboxStatus::Pending));
     assert!(items.iter().all(|i| i.last_error.is_some()));
-
-    // Drain events emitted so far.
-    while rx.try_recv().is_ok() {}
 
     // 2. Permanent Slack errors (`channel_not_found`, `not_in_channel`, `invalid_auth`) MUST NOT
     //    enqueue into outbox.
@@ -7719,7 +7720,50 @@ async fn outbox_retry_offline_resets_to_pending_and_discard_removes_row() {
     assert_eq!(item.status, OutboxStatus::Pending);
     assert!(fake.state.lock().unwrap().posted_messages.is_empty());
 
-    // Discard removes it and emits empty OutboxUpdated.
+    // FlushOutbox while offline must no-op (keep item Pending, zero backend calls).
+    core.handle(Command::Messaging(MessagingCommand::FlushOutbox))
+        .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let item_after_offline_flush = store.lock().unwrap().get_outbox_item(id).unwrap().unwrap();
+    assert_eq!(item_after_offline_flush.status, OutboxStatus::Pending);
+    assert!(fake.state.lock().unwrap().posted_messages.is_empty());
+
+    // DiscardOutboxItem must ignore IDs belonging to a different workspace.
+    let other_ws = TeamId::from("T_OTHER");
+    let other_id = {
+        let mut s = store.lock().unwrap();
+        let payload = crate::outbox::OutboxPayload::Message {
+            content: MessageContent::plain("other workspace"),
+        }
+        .encode();
+        s.enqueue_outbox(
+            &other_ws,
+            &crate::store::NewOutboxItem {
+                channel_id: &c1(),
+                thread_ts: None,
+                kind: crate::store::OutboxKind::Message,
+                payload_json: &payload,
+                last_error: None,
+            },
+        )
+        .unwrap()
+        .id
+    };
+    core.handle(Command::Messaging(MessagingCommand::DiscardOutboxItem(
+        other_id,
+    )))
+    .await;
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .get_outbox_item(other_id)
+            .unwrap()
+            .is_some(),
+        "discarding another workspace's outbox item must be ignored"
+    );
+
+    // Discard removes T1's own item and emits empty OutboxUpdated.
     while rx.try_recv().is_ok() {}
     core.handle(Command::Messaging(MessagingCommand::DiscardOutboxItem(id)))
         .await;
