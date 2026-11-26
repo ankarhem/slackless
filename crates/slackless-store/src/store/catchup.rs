@@ -58,11 +58,12 @@ impl Store {
             let ws = workspace.as_str();
             let mut out = HashMap::with_capacity(keys.len());
             for (ch, ts) in keys {
-                if let Some(raw) = stmt
+                if let Some(message) = stmt
                     .query_row(params![ws, ch.as_str(), ts.as_str()], raw_row)
                     .optional()?
+                    .and_then(decode_or_skip)
                 {
-                    out.insert((ch.clone(), ts.clone()), decode_stored_message(raw)?);
+                    out.insert((ch.clone(), ts.clone()), message);
                 }
             }
             Ok(out)

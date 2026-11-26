@@ -352,6 +352,54 @@ fn latest_messages_picks_each_channels_newest_top_level() {
 }
 
 #[test]
+fn multi_row_reads_skip_a_stored_row_that_no_longer_decodes() {
+    let mut store = Store::open_in_memory().unwrap();
+    let fresh = msg("1700000001.000100", "U1", "fresh rocket");
+    store.upsert_message(&ws(), &general(), &fresh).unwrap();
+    // Rows an older build wrote before `reply_count` became a `u32`: one older than `fresh` in
+    // C1, and the newest (only) message of D1.
+    let stale = Ts::from("1700000000.000100");
+    let dm = ChannelId::from("D1");
+    for (channel, ts) in [("C1", stale.as_str()), ("D1", "1700000002.000100")] {
+        let json = format!(r#"{{"ts":"{ts}","text":"stale rocket","reply_count":"many"}}"#);
+        store
+            .conn
+            .execute(
+                "INSERT INTO message_current
+                 (workspace_id, channel_id, ts, ts_key, edit_ts, user_id, text, file_names,
+                  deleted, has_link, has_file, is_pinned, reply_count, json, updated_at)
+                 VALUES ('T1', ?1, ?2, ?3, '', 'U1', 'stale rocket', '', 0, 0, 0, 0, NULL, ?4, 100)",
+                params![channel, ts, ts_key(&Ts::from(ts)), json],
+            )
+            .unwrap();
+    }
+
+    let texts = |found: Vec<StoredMessage>| -> Vec<String> {
+        found.into_iter().map(|m| m.message.text).collect()
+    };
+    // In order: channel_history, search, latest_messages over C1 and D1, and messages_by_keys
+    // over both C1 rows. Each keeps the message that still decodes.
+    let found = [
+        store
+            .channel_history(&ws(), &general(), None, 10)
+            .map(texts),
+        store
+            .search(&ws(), &SearchQuery::parse("rocket"), 10)
+            .map(texts),
+        store
+            .latest_messages(&ws(), &[general(), dm])
+            .map(|m| texts(m.into_values().collect())),
+        store
+            .messages_by_keys(&ws(), &[(general(), fresh.ts.clone()), (general(), stale)])
+            .map(|m| texts(m.into_values().collect())),
+    ]
+    .map(|read| read.map_err(|error| error.to_string()));
+    let fresh_only: [Result<Vec<String>, String>; 4] =
+        std::array::from_fn(|_| Ok(vec!["fresh rocket".to_owned()]));
+    assert_eq!(found, fresh_only);
+}
+
+#[test]
 fn member_counts_split_humans_apps_and_drop_the_gone() {
     let mut store = Store::open_in_memory().unwrap();
     let user = |id: &str, bot: bool, deleted: bool| User {

@@ -221,8 +221,8 @@ impl Store {
                 let row = stmt
                     .query_row(params![ws, channel.as_str(), broadcast], raw_row)
                     .optional()?;
-                if let Some(raw) = row {
-                    out.insert(channel.clone(), decode_stored_message(raw)?);
+                if let Some(message) = row.and_then(decode_or_skip) {
+                    out.insert(channel.clone(), message);
                 }
             }
             Ok(out)
@@ -771,14 +771,35 @@ pub(super) fn raw_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
 
 pub(super) fn decode_stored_message(raw: RawRow) -> Result<StoredMessage> {
     let (channel, json, deleted) = raw;
+    Ok(stored_message(
+        channel,
+        serde_json::from_str(&json)?,
+        deleted,
+    ))
+}
+
+/// [`decode_stored_message`] for reads that return many messages: a row whose JSON no longer
+/// matches [`Message`] (a field type tightened by an upgrade, say) is logged and skipped, so one
+/// stale row cannot fail a whole channel, digest or search. [`Store::message`] stays strict.
+pub(super) fn decode_or_skip(raw: RawRow) -> Option<StoredMessage> {
+    let (channel, json, deleted) = raw;
+    match serde_json::from_str(&json) {
+        Ok(message) => Some(stored_message(channel, message, deleted)),
+        Err(error) => {
+            tracing::warn!(%error, %channel, "skipping stored message that no longer decodes");
+            None
+        }
+    }
+}
+
+fn stored_message(channel: String, mut message: Message, deleted: bool) -> StoredMessage {
     let channel = ChannelId::from(channel);
-    let mut message: Message = serde_json::from_str(&json)?;
     message.channel.get_or_insert_with(|| channel.clone());
-    Ok(StoredMessage {
+    StoredMessage {
         channel,
         message,
         deleted,
-    })
+    }
 }
 
 pub(super) fn collect(
@@ -786,7 +807,9 @@ pub(super) fn collect(
 ) -> Result<Vec<StoredMessage>> {
     let mut out = Vec::new();
     for row in rows {
-        out.push(decode_stored_message(row?)?);
+        if let Some(message) = decode_or_skip(row?) {
+            out.push(message);
+        }
     }
     Ok(out)
 }

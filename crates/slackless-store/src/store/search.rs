@@ -203,9 +203,14 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (ws, ch, json, deleted, rank) = row?;
-            let channel = ChannelId::from(ch);
-            let mut message: Message = serde_json::from_str(&json)?;
-            message.channel.get_or_insert_with(|| channel.clone());
+            let Some(StoredMessage {
+                channel,
+                message,
+                deleted,
+            }) = decode_or_skip((ch, json, deleted))
+            else {
+                continue;
+            };
             out.push(WorkspaceStoredMessage {
                 workspace: TeamId::from(ws),
                 channel,
