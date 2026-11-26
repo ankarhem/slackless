@@ -3190,24 +3190,40 @@ fn huddle_transcripts_fts5_multilingual_en_sv_and_sessions() {
 }
 
 #[test]
-fn recent_threads_uses_partial_index_and_filters_correctly() {
+fn recent_reads_use_their_indexes_and_threads_filter_correctly() {
     let mut store = Store::open_in_memory().unwrap();
-    let plan: Vec<String> = {
-        let explain_sql = format!("EXPLAIN QUERY PLAN {RECENT_THREADS_WORKSPACE_SQL}");
-        let mut stmt = store.conn.prepare(&explain_sql).unwrap();
-        let rows: Vec<String> = stmt
-            .query_map(params![ws().as_str(), 10i64], |r| r.get::<_, String>(3))
+    let workspace = SqlValue::Text(ws().as_str().to_owned());
+    for (sql, args, index) in [
+        (
+            RECENT_THREADS_WORKSPACE_SQL,
+            vec![workspace.clone(), SqlValue::Integer(10)],
+            "message_current_threads",
+        ),
+        (
+            super::archive::RECENT_MESSAGES_BY_SUBTYPE_SQL,
+            vec![
+                workspace.clone(),
+                SqlValue::Text(MessageSubtype::HuddleThread.as_str().to_owned()),
+                SqlValue::Integer(10),
+            ],
+            "message_current_subtype",
+        ),
+    ] {
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params_from_iter(args), |r| r.get::<_, String>(3))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        drop(stmt);
-        rows
-    };
-    assert!(
-        plan.iter()
-            .any(|detail| detail.contains("USING INDEX message_current_threads")),
-        "expected recent_threads to use partial index message_current_threads, got plan: {plan:?}"
-    );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains(&format!("USING INDEX {index}"))),
+            "expected {index} in the plan of {sql:?}, got {plan:?}"
+        );
+    }
 
     let mut root1 = msg("1700000001.000100", "U1", "thread one");
     root1.reply_count = Some(2);

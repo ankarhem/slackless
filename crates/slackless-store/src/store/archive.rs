@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// `recent_messages_by_subtype`'s query, shared with the test asserting that its
+/// `EXPLAIN QUERY PLAN` uses `message_current_subtype`.
+pub(super) const RECENT_MESSAGES_BY_SUBTYPE_SQL: &str =
+    "SELECT channel_id, json, deleted FROM message_current
+ WHERE workspace_id = ?1 AND subtype = ?2 AND deleted = 0
+ ORDER BY ts_key DESC LIMIT ?3";
+
 /// Summary metadata for one stored conversation (channel, private group, DM, or group DM).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationSummary {
@@ -494,11 +501,7 @@ impl Store {
         subtype: &MessageSubtype,
         limit: usize,
     ) -> Result<Vec<StoredMessage>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT channel_id, json, deleted FROM message_current
-             WHERE workspace_id = ?1 AND subtype = ?2 AND deleted = 0
-             ORDER BY ts_key DESC LIMIT ?3",
-        )?;
+        let mut stmt = self.conn.prepare_cached(RECENT_MESSAGES_BY_SUBTYPE_SQL)?;
         let rows = stmt.query_map(
             params![
                 workspace.as_str(),

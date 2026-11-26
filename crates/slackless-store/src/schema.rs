@@ -408,7 +408,14 @@ CREATE INDEX outbox_ws_status ON outbox (workspace_id, status, id);
 CREATE INDEX outbox_ws_channel ON outbox (workspace_id, channel_id, thread_ts, id);
 "#;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13];
+/// Version 14: index `recent_messages_by_subtype` (huddle threads and other sparse subtypes) so it
+/// reads the matching rows newest first instead of walking the workspace's whole timeline.
+const V14: &str = r#"
+CREATE INDEX IF NOT EXISTS message_current_subtype
+    ON message_current (workspace_id, subtype, ts_key DESC);
+"#;
+
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14];
 
 /// The schema version this build migrates to.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -874,8 +881,7 @@ mod tests {
         .unwrap();
 
         migrate(&mut conn).unwrap();
-        assert_eq!(schema_version(&conn).unwrap(), 13);
-        assert_eq!(SCHEMA_VERSION, 13);
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
 
         // Existing V12 row survives untouched.
         let ft_text: String = conn
