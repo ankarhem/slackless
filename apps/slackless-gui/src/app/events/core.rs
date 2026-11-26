@@ -161,7 +161,16 @@ impl App {
                 let pending = self.pending_dm.take();
                 self.select(channel.clone(), cx);
                 if let Some(content) = pending {
-                    self.deliver_send(content, cx);
+                    self.submit(
+                        messaging::OutgoingMessage {
+                            channel: channel.clone(),
+                            thread_ts: None,
+                            broadcast: false,
+                            content,
+                        },
+                        window,
+                        cx,
+                    );
                 }
             }
             Event::ChannelManagers { channel, users } => {

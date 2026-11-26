@@ -2461,12 +2461,21 @@ fn wave1_and_wave2_gui_secret_guard_link_scrubber_stealth_and_stt_provider(
             );
             window.close_dialog(cx);
 
-            // 2. Outgoing tracking-parameter scrubber cleans text + rich-text links.
-            let mut content = MessageContent::plain(
-                "Check https://example.com/page?utm_source=slack&id=42&fbclid=abc".to_owned(),
+            // 2. The send pipeline's tracking-parameter scrubber cleans the text it posts.
+            app.send(
+                MessageContent::plain(
+                    "Check https://example.com/page?utm_source=slack&id=42&fbclid=abc".to_owned(),
+                ),
+                window,
+                cx,
             );
-            app.sanitize_outgoing_content(&mut content, cx);
-            assert_eq!(content.text, "Check https://example.com/page?id=42");
+            assert_eq!(
+                app.messages
+                    .read(cx)
+                    .last_message_text_for_test(cx)
+                    .as_deref(),
+                Some("Check https://example.com/page?id=42")
+            );
 
             // 3. Stealth mode toggle updates settings cleanly.
             app.preferences

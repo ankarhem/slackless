@@ -466,13 +466,15 @@ pub(super) fn subscribe_workspace(
                     thread_ts,
                     content,
                 } => {
-                    this.bridge.send(MessagingCommand::SendMessage {
+                    let msg = messaging::OutgoingMessage {
                         channel: channel.clone(),
-                        content: content.clone(),
                         thread_ts: Some(thread_ts.clone()),
                         broadcast: true,
-                    });
-                    window.push_notification("Sent reply to channel", cx);
+                        content: content.clone(),
+                    };
+                    if this.submit(msg, window, cx) {
+                        window.push_notification("Sent reply to channel", cx);
+                    }
                 }
                 ThreadPanelEvent::Reply {
                     channel,
@@ -480,11 +482,13 @@ pub(super) fn subscribe_workspace(
                     content,
                     broadcast,
                 } => {
-                    this.send_thread_reply(
-                        (channel.clone(), thread_ts.clone()),
-                        content.clone(),
-                        *broadcast,
-                        false,
+                    this.submit(
+                        messaging::OutgoingMessage {
+                            channel: channel.clone(),
+                            thread_ts: Some(thread_ts.clone()),
+                            broadcast: *broadcast,
+                            content: content.clone(),
+                        },
                         window,
                         cx,
                     );

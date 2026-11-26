@@ -427,9 +427,9 @@ use self::demo::demo;
 #[cfg(test)]
 pub(crate) use self::dialogs::profile::detect_locked_profile_fields;
 use self::helpers::{
-    broadcast_kind, convert_emoticons, first_conversation, forget_failure,
-    is_catchup_notification_tag, is_suspicious_url, mentions_me, parse_notification_target,
-    parse_permalink, sync_launch_at_login, workspace_badge_from_counts,
+    broadcast_kind, first_conversation, forget_failure, is_catchup_notification_tag,
+    is_suspicious_url, mentions_me, parse_notification_target, parse_permalink,
+    sync_launch_at_login, workspace_badge_from_counts,
 };
 pub(crate) use self::messaging::{broadcast_autocomplete_hint, mention_permission_summary};
 #[cfg(test)]

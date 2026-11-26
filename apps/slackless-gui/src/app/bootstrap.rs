@@ -795,11 +795,13 @@ fn wire_feature_view_subscriptions(
                     content,
                     broadcast,
                 } => {
-                    this.send_thread_reply(
-                        (channel.clone(), thread_ts.clone()),
-                        content.clone(),
-                        *broadcast,
-                        true,
+                    this.submit(
+                        messaging::OutgoingMessage {
+                            channel: channel.clone(),
+                            thread_ts: Some(thread_ts.clone()),
+                            broadcast: *broadcast,
+                            content: content.clone(),
+                        },
                         window,
                         cx,
                     );
@@ -903,14 +905,15 @@ fn wire_feature_view_subscriptions(
                     this.mark_read(channel, ts.clone(), cx);
                 }
                 UnreadsEvent::Reply { channel, text } => {
-                    let content = slackless_core::api::MessageContent::plain(text.clone());
-                    this.bridge.send(MessagingCommand::SendMessage {
+                    let msg = messaging::OutgoingMessage {
                         channel: channel.clone(),
-                        content,
                         thread_ts: None,
                         broadcast: false,
-                    });
-                    actions::notify("Reply sent", this.label(channel), window, cx);
+                        content: slackless_core::api::MessageContent::plain(text.clone()),
+                    };
+                    if this.submit(msg, window, cx) {
+                        actions::notify("Reply sent", this.label(channel), window, cx);
+                    }
                 }
                 UnreadsEvent::MessageAction {
                     channel,

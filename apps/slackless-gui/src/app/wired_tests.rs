@@ -362,6 +362,120 @@ fn wired_composer_send_message_store_event_and_outbox_retry(cx: &mut gpui::TestA
 }
 
 #[gpui::test]
+fn wired_confirmed_send_stays_on_the_channel_it_was_submitted_to(cx: &mut gpui::TestAppContext) {
+    let people = [user("U0ME", "me"), user("U0PEER", "peer")];
+    let (bridge, core) = cx.update(|cx| {
+        make_wired_workspace(
+            "T0BCAST",
+            "Broadcast Co",
+            &[("C0BIG", "big"), ("C0SMALL", "small")],
+            &people,
+            cx,
+        )
+    });
+    // `@channel` in a channel of six or more members asks before sending.
+    core.store()
+        .lock()
+        .expect("store lock")
+        .upsert_conversation(
+            &TeamId::from("T0BCAST"),
+            &Conversation {
+                id: ChannelId::from("C0BIG"),
+                name: Some("big".into()),
+                is_channel: true,
+                is_member: true,
+                num_members: Some(12),
+                ..Default::default()
+            },
+        )
+        .expect("upsert");
+    let fx = bridge.snapshot(&HashMap::new()).expect("snapshot");
+    let (root, app, cx) = mount_wired(fx, vec![bridge], cx);
+    let _ = core.drain_commands();
+    let (big, small) = (ChannelId::from("C0BIG"), ChannelId::from("C0SMALL"));
+    let sent_to = |cmds: &[Command], channel: &ChannelId| {
+        cmds.iter().any(|c| {
+            matches!(
+                c,
+                Command::Messaging(MessagingCommand::SendMessage { channel: target, .. })
+                    if target == channel
+            )
+        })
+    };
+
+    // 1. `@channel hi` in #big opens the confirmation; nothing goes out yet.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.select(big.clone(), cx);
+            app.send(
+                crate::composer::content_of("<!channel> hi", &app.fixtures),
+                window,
+                cx,
+            );
+        });
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    let cmds = core.drain_commands();
+    assert!(
+        !sent_to(&cmds, &big),
+        "the @channel guard must hold the message until confirmed: {cmds:?}"
+    );
+
+    // 2. The user moves to #small before confirming: the message still goes to #big.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.select(small.clone(), cx));
+        let _ = window.draw(cx);
+    });
+    let send = cx
+        .debug_bounds("broadcast-send")
+        .expect("the confirmation's Send button is on screen");
+    cx.simulate_click(send.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let cmds = core.drain_commands();
+    assert!(
+        sent_to(&cmds, &big),
+        "confirming must send to the channel the message was submitted to: {cmds:?}"
+    );
+    assert!(
+        !sent_to(&cmds, &small),
+        "nothing may reach the channel that was open at confirm time: {cmds:?}"
+    );
+
+    // 3. Canceling after the same switch puts the text back where it was typed.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.select(big.clone(), cx);
+            app.send(
+                crate::composer::content_of("<!channel> again", &app.fixtures),
+                window,
+                cx,
+            );
+            app.select(small.clone(), cx);
+        });
+        let _ = window.draw(cx);
+    });
+    let cancel = cx
+        .debug_bounds("broadcast-cancel")
+        .expect("Cancel is on screen");
+    cx.simulate_click(cancel.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let app = app.read(cx);
+        assert_eq!(
+            app.channel, big,
+            "cancel returns to the conversation the text belongs to"
+        );
+        assert_eq!(app.composer.read(cx).text(), "<!channel> again");
+    });
+    assert!(
+        !sent_to(&core.drain_commands(), &big),
+        "a canceled send sends nothing"
+    );
+    drop(root);
+}
+
+#[gpui::test]
 fn wired_multi_workspace_event_isolation_and_switching(cx: &mut gpui::TestAppContext) {
     let people = [user("U0ME", "me"), user("U0PEER", "peer")];
     let ((b1, c1), (b2, c2)) = cx.update(|cx| {

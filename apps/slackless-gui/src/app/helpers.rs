@@ -156,12 +156,6 @@ pub(super) fn forget_failure<T>(loaded: &mut ChannelCache<Loaded<T>>, channel: &
     }
 }
 
-/// Convert common typed emoticons outside inline/fenced code spans into Slack `:shortcode:`
-/// emoji when Preferences > Appearance > Convert emoticons is enabled (`F-SHELL-091`).
-pub(super) fn convert_emoticons(text: &str) -> String {
-    crate::composer::convert_emoticons(text)
-}
-
 /// Howard Hinnant's `civil_from_days`: convert days since 1970-01-01 into `(year, month, day)`.
 #[cfg(test)]
 pub(super) fn civil_from_days(days: i64) -> (i32, u32, u32) {
@@ -258,9 +252,9 @@ pub(super) fn mentions_me(text: &str, me: &UserId, keywords: &str) -> bool {
 #[cfg(test)]
 mod notification_tag_tests {
     use super::{
-        civil_from_days, convert_emoticons, is_catchup_notification_tag, is_suspicious_url,
-        parse_notification_target,
+        civil_from_days, is_catchup_notification_tag, is_suspicious_url, parse_notification_target,
     };
+    use crate::composer::convert_emoticons;
     use crate::messages::parse_local_schedule;
     use slackless_core::types::{ChannelId, Ts};
 
