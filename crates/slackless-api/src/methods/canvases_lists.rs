@@ -3,11 +3,7 @@
 use futures::stream::{self, StreamExt};
 
 use super::*;
-use crate::pagination::paginate_at_most;
-
-/// Most pages read from one List, canvas comment history or comment thread: bounds a server that
-/// keeps handing out fresh cursors.
-const MAX_PAGES: usize = 50;
+use crate::pagination::{MAX_PAGES, paginate_at_most};
 /// Comment threads whose replies are fetched at once.
 const REPLY_FETCH_CONCURRENCY: usize = 4;
 
@@ -742,11 +738,13 @@ impl SlackApi {
                 limit: Some(100),
                 ..Default::default()
             };
-            if let Ok(page) = self
-                .conversations_replies(&comment_ch, &synthetic_ts, &opts, None)
-                .await
+            if let Ok(replies) = paginate_at_most(MAX_PAGES, |cursor| {
+                self.conversations_replies(&comment_ch, &synthetic_ts, &opts, cursor)
+            })
+            .try_collect()
+            .await
             {
-                out = page.items;
+                out = replies;
             }
         }
         Ok(out)

@@ -1,6 +1,9 @@
 //! Pins, bookmarks, drafts, files, activity feed, GIFs, saved items, Edge search, and prefs.
 
+use futures::StreamExt as _;
+
 use super::*;
+use crate::pagination::{MAX_PAGES, paginate_at_most};
 
 impl SlackApi {
     /// `pins.list`: a conversation's pinned messages and files, oldest pin first.
@@ -444,21 +447,34 @@ impl SlackApi {
         Ok(parse_gif_list(resp.data))
     }
 
-    /// `saved.list`: items saved for Later under `filter` (`"saved"`, `"completed"`, `"archived"`).
+    /// `saved.list`: items saved for Later under `filter` (`"saved"`, `"completed"`, `"archived"`),
+    /// following cursors until `limit` items are in hand (Slack may cap a page below `limit`).
     pub async fn saved_list(&self, filter: &str, limit: u32) -> Result<Vec<SavedItem>> {
-        let resp: ApiResponse<SavedListWire> = self
-            .call(
-                method::SAVED_LIST,
-                vec![
-                    ("filter", filter.to_owned()),
-                    ("limit", limit.to_string()),
-                    ("include_tombstones", "true".to_owned()),
-                    ("_x_reason", "saved-api/savedList".to_owned()),
-                    ("_x_mode", MODE_ONLINE.to_owned()),
-                ],
-            )
-            .await?;
-        Ok(parse_saved_list(resp.data, filter))
+        paginate_at_most(MAX_PAGES, |cursor| {
+            self.saved_list_page(filter, limit, cursor)
+        })
+        .take(limit as usize)
+        .try_collect()
+        .await
+    }
+
+    /// One page of `saved.list`.
+    async fn saved_list_page(
+        &self,
+        filter: &str,
+        limit: u32,
+        cursor: Option<String>,
+    ) -> Result<Page<SavedItem>> {
+        let mut params = vec![
+            ("filter", filter.to_owned()),
+            ("limit", limit.to_string()),
+            ("include_tombstones", "true".to_owned()),
+            ("_x_reason", "saved-api/savedList".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        params.extend(cursor.map(|cursor| ("cursor", cursor)));
+        let resp: ApiResponse<SavedListWire> = self.call(method::SAVED_LIST, params).await?;
+        Ok(page(resp, |wire| parse_saved_list(wire, filter)))
     }
 
     /// `saved.add`: save a message for Later, optionally with a reminder due time (unix seconds).

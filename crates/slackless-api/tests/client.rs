@@ -3164,7 +3164,7 @@ async fn slack_lists_access_meta_threads_and_team_connections() {
         assert_eq!(msgs[0].text, "Root comment");
         assert_eq!(msgs[1].text, "Reply 1");
 
-        // Fallback when lists.getThreadsForRecord errors -> conversations.replies on C0LIST1.
+        // Fallback when lists.getThreadsForRecord errors -> every conversations.replies page on C0LIST1.
         Mock::given(method("POST"))
             .and(path("/api/lists.getThreadsForRecord"))
             .and(body_string_contains("record_id=RecFallback"))
@@ -3179,11 +3179,26 @@ async fn slack_lists_access_meta_threads_and_team_connections() {
             .and(path("/api/conversations.replies"))
             .and(body_string_contains("channel=C0LIST1"))
             .and(body_string_contains("ts=F0LIST1-RecFallback"))
+            .and(body_string_contains("cursor=p2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "messages": [
+                    { "ts": "1701.2", "user": "U3", "text": "Fallback reply" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/conversations.replies"))
+            .and(body_string_contains("channel=C0LIST1"))
+            .and(body_string_contains("ts=F0LIST1-RecFallback"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "ok": true,
                 "messages": [
                     { "ts": "1701.1", "user": "U3", "text": "Fallback comment" }
-                ]
+                ],
+                "response_metadata": { "next_cursor": "p2" }
             })))
             .expect(1)
             .mount(&server)
@@ -3193,8 +3208,9 @@ async fn slack_lists_access_meta_threads_and_team_connections() {
             .lists_get_threads_for_record("F0LIST1", "RecFallback")
             .await
             .unwrap();
-        assert_eq!(fb.len(), 1);
+        assert_eq!(fb.len(), 2);
         assert_eq!(fb[0].text, "Fallback comment");
+        assert_eq!(fb[1].text, "Fallback reply");
     }
 
     // 4. conversations.teamConnections parses connected and pending organizations
@@ -3226,4 +3242,42 @@ async fn slack_lists_access_meta_threads_and_team_connections() {
         assert_eq!(conns.pending_connections.len(), 1);
         assert_eq!(conns.pending_connections[0].name, "Pending Org");
     }
+}
+
+#[tokio::test]
+async fn saved_list_follows_cursors_until_the_limit_is_reached() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/saved.list"))
+        .and(body_string_contains("cursor=p2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "saved_items": [
+                { "item_id": "C1", "ts": "3.0" },
+                { "item_id": "C1", "ts": "4.0" }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/saved.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "saved_items": [
+                { "item_id": "C1", "ts": "1.0" },
+                { "item_id": "C1", "ts": "2.0" }
+            ],
+            "response_metadata": { "next_cursor": "p2" }
+        })))
+        // Both reads fetch the first page; only the one allowing four items asks for `p2`.
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let all = api.saved_list("saved", 4).await.unwrap();
+    let stamps: Vec<&str> = all.iter().map(|item| item.ts.as_str()).collect();
+    assert_eq!(stamps, ["1.0", "2.0", "3.0", "4.0"]);
+    let two = api.saved_list("saved", 2).await.unwrap();
+    assert_eq!(two.len(), 2);
 }

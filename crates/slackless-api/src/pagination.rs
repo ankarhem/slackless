@@ -7,6 +7,10 @@ use futures::stream::{self, Stream, TryStreamExt};
 
 use crate::ApiError;
 
+/// Most pages one walk reads (a List, a comment history or thread, saved items): bounds a server
+/// that keeps handing out fresh cursors.
+pub(crate) const MAX_PAGES: usize = 50;
+
 /// One page of a cursor-paginated method.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Page<T> {
