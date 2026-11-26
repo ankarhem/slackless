@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use ort::session::Session;
 use ort::value::Tensor;
@@ -861,6 +862,144 @@ impl Embedder for OnnxEmbedder {
     }
 }
 
+/// Idle time after which the shared cached [`OnnxEmbedder`] session is unloaded (5 minutes).
+pub const EMBEDDER_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
+/// How often the background reaper checks the shared embedder for idleness.
+const EMBEDDER_REAPER_INTERVAL: Duration = Duration::from_secs(60);
+
+struct IdleEntry<K, T> {
+    key: K,
+    value: Arc<T>,
+    last_used: Instant,
+}
+
+/// Thread-safe slot holding one lazily loaded, idle-evictable shared value (e.g. an ONNX
+/// Runtime session, ~60-90 MB resident), keyed so a different key reloads it.
+pub struct IdleSlot<K, T> {
+    inner: Mutex<Option<IdleEntry<K, T>>>,
+}
+
+impl<K, T> Default for IdleSlot<K, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K, T> IdleSlot<K, T> {
+    pub const fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<IdleEntry<K, T>>> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether a value is currently cached.
+    pub fn is_loaded(&self) -> bool {
+        self.lock().is_some()
+    }
+
+    /// Drop the cached value (callers still holding an `Arc` keep theirs alive until done).
+    /// Returns `true` when something was cached.
+    pub fn unload(&self) -> bool {
+        self.lock().take().is_some()
+    }
+
+    /// Unload the cached value if it has not been used for `ttl` and nobody else currently holds
+    /// it (an in-flight indexing run keeps its session). Returns `true` when unloaded.
+    pub fn unload_if_idle(&self, ttl: Duration) -> bool {
+        self.unload_if_idle_at(ttl, Instant::now())
+    }
+
+    /// [`Self::unload_if_idle`] with an explicit `now` (deterministic tests).
+    pub fn unload_if_idle_at(&self, ttl: Duration, now: Instant) -> bool {
+        let mut guard = self.lock();
+        let idle = guard.as_ref().is_some_and(|entry| {
+            Arc::strong_count(&entry.value) == 1
+                && now.saturating_duration_since(entry.last_used) >= ttl
+        });
+        if idle {
+            *guard = None;
+        }
+        idle
+    }
+}
+
+impl<K: PartialEq, T> IdleSlot<K, T> {
+    /// Return the cached value for `key` (refreshing its idle timer), or load it with `load`.
+    pub fn get_or_try_load<E>(
+        &self,
+        key: K,
+        load: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<Arc<T>, E> {
+        let mut guard = self.lock();
+        if let Some(entry) = guard.as_mut()
+            && entry.key == key
+        {
+            entry.last_used = Instant::now();
+            return Ok(Arc::clone(&entry.value));
+        }
+        let value = Arc::new(load()?);
+        *guard = Some(IdleEntry {
+            key,
+            value: Arc::clone(&value),
+            last_used: Instant::now(),
+        });
+        Ok(value)
+    }
+}
+
+static ONNX_EMBEDDER: IdleSlot<EmbeddingModel, OnnxEmbedder> = IdleSlot::new();
+
+/// Spawn (once) a tiny background thread that unloads the shared ONNX session after
+/// [`EMBEDDER_IDLE_TTL`] of inactivity, returning its memory to the OS.
+fn ensure_embedder_reaper() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let spawned = std::thread::Builder::new()
+            .name("slackless-embed-reaper".to_owned())
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(EMBEDDER_REAPER_INTERVAL);
+                    if ONNX_EMBEDDER.unload_if_idle(EMBEDDER_IDLE_TTL) {
+                        tracing::debug!("unloaded idle ONNX embedding session");
+                    }
+                }
+            });
+        if let Err(err) = spawned {
+            tracing::warn!(%err, "failed to spawn embedder idle reaper");
+        }
+    });
+}
+
+/// Shared, lazily loaded [`OnnxEmbedder`] for `model` (0 MB until first semantic use). Each call
+/// refreshes the idle timer; the session is unloaded automatically after [`EMBEDDER_IDLE_TTL`].
+pub fn cached_onnx_embedder(
+    model: EmbeddingModel,
+) -> std::result::Result<Arc<OnnxEmbedder>, String> {
+    let embedder = ONNX_EMBEDDER.get_or_try_load(model, || OnnxEmbedder::load_default(model))?;
+    ensure_embedder_reaper();
+    Ok(embedder)
+}
+
+/// Explicitly unload the shared cached ONNX session (e.g. after deleting the model). Returns
+/// `true` when a session was cached.
+pub fn unload_cached_embedder() -> bool {
+    ONNX_EMBEDDER.unload()
+}
+
+/// Unload the shared ONNX session if idle for at least `ttl` and not in use.
+pub fn unload_idle_embedder(ttl: Duration) -> bool {
+    ONNX_EMBEDDER.unload_if_idle(ttl)
+}
+
+/// Whether the shared ONNX session is currently resident in memory.
+pub fn embedder_loaded() -> bool {
+    ONNX_EMBEDDER.is_loaded()
+}
+
 /// Deterministic pure-Rust signed feature-hashing embedder (zero network, zero model weights).
 ///
 /// Projects lowercased word unigrams, word bigrams, and character trigrams into an L2-normalized
@@ -1066,6 +1205,66 @@ mod tests {
         assert_eq!(EmbeddingModel::parse("unknown-model"), None);
         assert!(EmbeddingModel::AllMiniLmL6V2.query_prefix().is_none());
         assert!(EmbeddingModel::BgeSmallEnV15.query_prefix().is_some());
+    }
+
+    #[test]
+    fn idle_slot_loads_once_reuses_reloads_on_key_change_and_unloads_when_idle() {
+        let slot: IdleSlot<u8, String> = IdleSlot::new();
+        assert!(!slot.is_loaded());
+        let mut loads = 0;
+        let a = slot
+            .get_or_try_load(1, || {
+                loads += 1;
+                Ok::<_, String>("one".to_owned())
+            })
+            .unwrap();
+        let again = slot
+            .get_or_try_load(1, || {
+                loads += 1;
+                Ok::<_, String>("other".to_owned())
+            })
+            .unwrap();
+        assert_eq!(loads, 1);
+        assert!(Arc::ptr_eq(&a, &again));
+        drop(again);
+
+        // Not idle yet, and still held by `a`: never unloaded.
+        let ttl = Duration::from_secs(300);
+        assert!(!slot.unload_if_idle_at(ttl, Instant::now()));
+        let far_future = Instant::now() + Duration::from_secs(301);
+        assert!(
+            !slot.unload_if_idle_at(ttl, far_future),
+            "in-use sessions must not be unloaded"
+        );
+        drop(a);
+        assert!(slot.unload_if_idle_at(ttl, far_future));
+        assert!(!slot.is_loaded());
+
+        // Load errors leave the slot empty.
+        let err = slot.get_or_try_load(2, || Err::<String, _>("boom".to_owned()));
+        assert_eq!(err.unwrap_err(), "boom");
+        assert!(!slot.is_loaded());
+
+        // A different key reloads; explicit unload clears.
+        slot.get_or_try_load(3, || Ok::<_, String>("three".into()))
+            .unwrap();
+        let four = slot
+            .get_or_try_load(4, || Ok::<_, String>("four".into()))
+            .unwrap();
+        assert_eq!(four.as_str(), "four");
+        assert!(slot.unload());
+        assert!(!slot.unload());
+        assert_eq!(four.as_str(), "four", "callers keep their Arc after unload");
+    }
+
+    #[test]
+    fn cached_onnx_embedder_reports_missing_model_without_caching() {
+        // The default model is never downloaded in CI; the error must not poison the cache.
+        if detect_embedding_model_setup(EmbeddingModel::BgeSmallEnV15).model_ready {
+            return;
+        }
+        assert!(cached_onnx_embedder(EmbeddingModel::BgeSmallEnV15).is_err());
+        assert!(!embedder_loaded());
     }
 
     #[test]

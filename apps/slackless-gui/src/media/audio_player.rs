@@ -3,18 +3,27 @@
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use gpui_kit::gpui::{App, BackgroundExecutor, Global, Window};
 use slackless_core::Fetcher;
 use slackless_core::huddle::NativeVideoPlayer;
+use slackless_core::maintenance::{
+    DEFAULT_MEDIA_CACHE_MAX_DAYS, DEFAULT_MEDIA_CACHE_MAX_MB, MediaCachePolicy,
+    prune_media_cache_policy,
+};
 use slackless_core::types::FileId;
 
 use super::downloads::active_fetcher;
 use super::video_player::{sanitize_secs, transcribe_media};
 
-/// Maximum cumulative bytes kept in `$TMPDIR/slackless-media/` before evicting oldest files.
-const MAX_MEDIA_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+/// User-configurable byte cap for `$TMPDIR/slackless-media/` (`0` = unlimited), set from
+/// Preferences via [`set_media_cache_policy`].
+static MEDIA_CACHE_MAX_BYTES: AtomicU64 =
+    AtomicU64::new(DEFAULT_MEDIA_CACHE_MAX_MB as u64 * 1024 * 1024);
+/// User-configurable max file age in days (`0` = never expire).
+static MEDIA_CACHE_MAX_AGE_DAYS: AtomicU32 = AtomicU32::new(DEFAULT_MEDIA_CACHE_MAX_DAYS);
 /// Maximum number of cached media files kept in `$TMPDIR/slackless-media/`.
 const MAX_MEDIA_CACHE_FILES: usize = 200;
 /// Lightweight ~10 Hz progress refresh cadence while audio is actively playing.
@@ -270,6 +279,27 @@ async fn run_audio_progress_loop(
     }
 }
 
+/// Apply the user's media cache retention policy to every subsequent cache write.
+pub fn set_media_cache_policy(policy: MediaCachePolicy) {
+    MEDIA_CACHE_MAX_BYTES.store(policy.max_bytes, Ordering::Relaxed);
+    MEDIA_CACHE_MAX_AGE_DAYS.store(policy.max_age_days, Ordering::Relaxed);
+}
+
+/// The media cache retention policy currently in effect.
+pub fn media_cache_policy() -> MediaCachePolicy {
+    MediaCachePolicy {
+        max_bytes: MEDIA_CACHE_MAX_BYTES.load(Ordering::Relaxed),
+        max_age_days: MEDIA_CACHE_MAX_AGE_DAYS.load(Ordering::Relaxed),
+    }
+}
+
+/// Enforce the active size/age policy plus the file-count cap on `dir`, never evicting `keep`.
+fn enforce_media_cache_limits(dir: &Path, keep: Option<&Path>) {
+    let policy = media_cache_policy();
+    prune_media_cache_policy(dir, policy.max_bytes, policy.max_age_days, keep);
+    prune_media_cache(dir, u64::MAX, MAX_MEDIA_CACHE_FILES, keep);
+}
+
 fn media_cache_dir() -> PathBuf {
     std::env::temp_dir().join("slackless-media")
 }
@@ -366,12 +396,7 @@ pub(crate) async fn fetch_cached_media(
     let write_path = path.clone();
     bg.spawn(async move {
         std::fs::write(&write_path, &bytes).map_err(|e| e.to_string())?;
-        prune_media_cache(
-            &dir,
-            MAX_MEDIA_CACHE_BYTES,
-            MAX_MEDIA_CACHE_FILES,
-            Some(&write_path),
-        );
+        enforce_media_cache_limits(&dir, Some(&write_path));
         Ok::<PathBuf, String>(write_path)
     })
     .await
@@ -526,6 +551,46 @@ mod tests {
         assert!(!f3.exists());
         assert!(f4.exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn media_cache_policy_round_trips_and_limits_apply_to_writes() {
+        let original = media_cache_policy();
+        let dir = std::env::temp_dir().join(format!(
+            "slackless-media-policy-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let aged = |name: &str, age_days: u64| {
+            let path = dir.join(name);
+            std::fs::write(&path, [0u8; 64]).unwrap();
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(age_days * 86_400))
+                .unwrap();
+            path
+        };
+        let stale = aged("stale.mp4", 10);
+        let recent = aged("recent.mp4", 1);
+        let written = aged("written.mp4", 20);
+
+        set_media_cache_policy(MediaCachePolicy {
+            max_bytes: 0,
+            max_age_days: 7,
+        });
+        assert_eq!(media_cache_policy().max_age_days, 7);
+        enforce_media_cache_limits(&dir, Some(&written));
+        assert!(!stale.exists(), "files past max age are evicted");
+        assert!(recent.exists());
+        assert!(written.exists(), "the file just written is never evicted");
+
+        set_media_cache_policy(original);
+        assert_eq!(media_cache_policy(), original);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

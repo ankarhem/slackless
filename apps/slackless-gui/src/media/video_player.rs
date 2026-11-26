@@ -1402,6 +1402,32 @@ mod tests {
     }
 
     #[gpui::test]
+    fn stopping_inline_video_releases_player_and_decoded_surface_slot(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            seed_inline_video_for_test(test_meta("F_STOP"), false, true, cx);
+            gpui::Empty
+        });
+        cx.update(|window, cx| {
+            assert!(cx.global::<InlineVideoManager>().active.is_some());
+            // `stop_active_inline_video` takes the whole `ActiveInlineVideo`, dropping the
+            // `NativeVideoPlayer` and its `last_frame` IOSurface `Arc` in one step.
+            stop_active_inline_video(window, cx);
+            let mgr = cx.global::<InlineVideoManager>();
+            assert!(
+                mgr.active.is_none(),
+                "stopped video must not retain decoded surfaces"
+            );
+            assert!(inline_video_snapshot("F_STOP", cx).is_none());
+            assert!(active_pip_video(false, cx).is_none());
+            // Stopping again is a harmless no-op.
+            stop_active_inline_video(window, cx);
+            assert_eq!(stop_inline_video("F_STOP", window, cx), None);
+        });
+    }
+
+    #[gpui::test]
     fn paused_pip_dock_survives_temporary_image_viewer_open(cx: &mut gpui::TestAppContext) {
         let (_, cx) = cx.add_window_view(|_, cx| {
             seed_inline_video_for_test(test_meta("F_PAUSED_PIP"), true, false, cx);

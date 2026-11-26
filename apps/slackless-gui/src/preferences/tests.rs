@@ -47,6 +47,29 @@ fn settings_json_is_backwards_compatible_with_partial_payloads() {
 }
 
 #[test]
+fn media_cache_policy_settings_default_safely_and_convert() {
+    let legacy: Settings = serde_json::from_str(r#"{"clock_24h":true}"#).unwrap();
+    assert_eq!(legacy.media_cache_max_mb, 256);
+    assert_eq!(legacy.media_cache_max_days, 30);
+    let policy = legacy.media_cache_policy();
+    assert_eq!(policy.max_bytes, 256 * 1024 * 1024);
+    assert_eq!(policy.max_age_days, 30);
+
+    let custom: Settings =
+        serde_json::from_str(r#"{"media_cache_max_mb":0,"media_cache_max_days":7}"#).unwrap();
+    assert_eq!(custom.media_cache_policy().max_bytes, 0);
+    assert_eq!(custom.media_cache_policy().max_age_days, 7);
+    let round: Settings = serde_json::from_str(&serde_json::to_string(&custom).unwrap()).unwrap();
+    assert!(round == custom);
+
+    // Option tables include the defaults and an unlimited/never escape hatch.
+    assert!(MEDIA_CACHE_SIZE_OPTIONS.iter().any(|(mb, _)| *mb == 256));
+    assert!(MEDIA_CACHE_SIZE_OPTIONS.iter().any(|(mb, _)| *mb == 0));
+    assert!(MEDIA_CACHE_AGE_OPTIONS.iter().any(|(d, _)| *d == 30));
+    assert!(MEDIA_CACHE_AGE_OPTIONS.iter().any(|(d, _)| *d == 0));
+}
+
+#[test]
 fn spellcheck_language_timezone_and_schedule_helpers() {
     let mut s = Settings::default();
     assert_eq!(s.spellcheck_language(), Some("en_US"));

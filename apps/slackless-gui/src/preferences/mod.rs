@@ -32,9 +32,9 @@ pub use prefs_globals::{
     active_quick_reactions, display_prefs, matches_highlight_keyword, set_display_prefs,
 };
 pub use settings::{
-    AppearanceMode, HOURS, MESSAGE_VERBOSITY, MOBILE_HANDOFF, NOTIFY_LEVELS, SCHEDULE_DAYS,
-    SOUND_FILES, Section, Settings, StorageInfo, TRANSCRIPTION_PROVIDERS,
-    format_accessible_message, format_cross_workspace_summary,
+    AppearanceMode, HOURS, MEDIA_CACHE_AGE_OPTIONS, MEDIA_CACHE_SIZE_OPTIONS, MESSAGE_VERBOSITY,
+    MOBILE_HANDOFF, NOTIFY_LEVELS, SCHEDULE_DAYS, SOUND_FILES, Section, Settings, StorageInfo,
+    TRANSCRIPTION_PROVIDERS, format_accessible_message, format_cross_workspace_summary,
 };
 pub(crate) use slackless_core::types::time::format_bytes;
 pub use window::open_preferences_window;
@@ -77,6 +77,8 @@ pub(super) type Choice = fn(&mut Settings) -> &mut usize;
 pub struct SemanticStorageSnapshot {
     pub setup: slackless_core::embeddings::EmbeddingModelStatus,
     pub stats: slackless_core::store::SemanticIndexStats,
+    /// Whether the ONNX embedding session is currently resident in memory.
+    pub embedder_loaded: bool,
 }
 
 impl SemanticStorageSnapshot {
@@ -86,6 +88,7 @@ impl SemanticStorageSnapshot {
         Self {
             setup: slackless_core::embeddings::detect_embedding_model_setup(model),
             stats: slackless_core::semantic_index::default_semantic_index_stats(),
+            embedder_loaded: slackless_core::embeddings::embedder_loaded(),
         }
     }
 }
@@ -125,6 +128,10 @@ pub struct Preferences {
     pub(super) semantic_indexing: bool,
     pub(super) semantic_status_note: Option<String>,
     pub(super) semantic_snapshot: Option<SemanticStorageSnapshot>,
+    /// Result of the most recent "Verify integrity" run for the active workspace archive.
+    pub(super) integrity_report: Option<slackless_core::store::IntegrityReport>,
+    /// Whether a "Verify integrity" run is in flight.
+    pub(super) integrity_running: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -301,6 +308,8 @@ impl Preferences {
                 semantic_indexing: false,
                 semantic_status_note: None,
                 semantic_snapshot: None,
+                integrity_report: None,
+                integrity_running: false,
                 _subscriptions: subscriptions,
             }
         })
@@ -344,6 +353,38 @@ impl Preferences {
             });
         })
         .detach();
+    }
+
+    /// Latest SQLite integrity check result and whether a check is currently running.
+    pub fn integrity_status(&self) -> (Option<slackless_core::store::IntegrityReport>, bool) {
+        (self.integrity_report.clone(), self.integrity_running)
+    }
+
+    /// Mark an integrity check as started (`report == None`) or record its result.
+    pub fn set_integrity_status(
+        &mut self,
+        report: Option<slackless_core::store::IntegrityReport>,
+        running: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if report.is_some() || !running {
+            self.integrity_report = report;
+        }
+        self.integrity_running = running;
+        cx.notify();
+    }
+
+    /// Update the automatic media cache retention policy (persisted via `Changed`).
+    pub fn set_media_cache_policy(&mut self, max_mb: u32, max_days: u32, cx: &mut Context<Self>) {
+        if (
+            self.settings.media_cache_max_mb,
+            self.settings.media_cache_max_days,
+        ) != (max_mb, max_days)
+        {
+            self.settings.media_cache_max_mb = max_mb;
+            self.settings.media_cache_max_days = max_days;
+            self.changed(cx);
+        }
     }
 
     /// Update the live workspace backfill progress shown in Preferences -> Advanced.

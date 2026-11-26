@@ -477,6 +477,161 @@ impl App {
         .detach();
     }
 
+    /// Run `PRAGMA quick_check` on the active workspace archive off the UI thread, record the
+    /// result for the Archive & Storage dialog, and toast the outcome.
+    pub(in crate::app) fn verify_storage_integrity(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = self
+            .bridge
+            .read_store_clone()
+            .or_else(|| self.bridge.store().cloned())
+        else {
+            notify(
+                "No local database",
+                "Integrity checks are available in live workspaces.",
+                window,
+                cx,
+            );
+            return;
+        };
+        if self.preferences.read(cx).integrity_status().1 {
+            return;
+        }
+        self.preferences
+            .update(cx, |p, cx| p.set_integrity_status(None, true, cx));
+        window.refresh();
+        let prefs = self.preferences.downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            let outcome: Result<slackless_core::store::IntegrityReport, String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let guard = store
+                        .lock()
+                        .map_err(|_| "Could not acquire database lock.".to_owned())?;
+                    guard.integrity_check().map_err(|err| err.to_string())
+                })
+                .await;
+            let _ = cx.update(|window, cx| {
+                match outcome {
+                    Ok(report) => {
+                        let (title, msg) = if report.ok {
+                            (
+                                "Archive verified",
+                                format!("SQLite integrity check passed ({} ms).", report.elapsed_ms),
+                            )
+                        } else {
+                            (
+                                "Integrity problems found",
+                                format!(
+                                    "{} — back up the archive, then clear the local cache to re-sync.",
+                                    report.summary()
+                                ),
+                            )
+                        };
+                        let _ = prefs.update(cx, |p, cx| {
+                            p.set_integrity_status(Some(report), false, cx);
+                        });
+                        notify(title, msg, window, cx);
+                    }
+                    Err(err) => {
+                        let _ = prefs.update(cx, |p, cx| p.set_integrity_status(None, false, cx));
+                        notify("Integrity check failed", err, window, cx);
+                    }
+                }
+                window.refresh();
+            });
+        })
+        .detach();
+    }
+
+    /// Prompt for a destination with the native save panel and write a consistent, compacted
+    /// online snapshot of the active workspace archive there (`VACUUM INTO`).
+    pub(in crate::app) fn backup_archive(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((store, team)) = self
+            .bridge
+            .read_store_clone()
+            .or_else(|| self.bridge.store().cloned())
+            .zip(self.bridge.team_id().cloned())
+        else {
+            notify(
+                "No local database",
+                "Backups are available in live workspaces.",
+                window,
+                cx,
+            );
+            return;
+        };
+        let suggested = slackless_core::maintenance::default_backup_file_name(
+            team.as_str(),
+            slackless_core::types::time::now_epoch_secs(),
+        );
+        let start_dir = self.default_export_dir(cx);
+        let rx = cx.prompt_for_new_path(&start_dir, Some(&suggested));
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(dest))) = rx.await else {
+                return;
+            };
+            let target = dest.clone();
+            let outcome: Result<u64, String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let guard = store
+                        .lock()
+                        .map_err(|_| "Could not acquire database lock.".to_owned())?;
+                    guard.backup_to(&target).map_err(|err| err.to_string())
+                })
+                .await;
+            let _ = cx.update(|window, cx| match outcome {
+                Ok(bytes) => notify(
+                    "Archive backed up",
+                    format!(
+                        "Saved {} to {}",
+                        slackless_core::types::time::format_bytes(bytes),
+                        dest.display()
+                    ),
+                    window,
+                    cx,
+                ),
+                Err(err) => notify("Backup failed", err, window, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Apply the media cache retention policy to every media cache directory (and, at startup,
+    /// drop semantic vectors for workspaces whose archives are gone) on a background thread.
+    pub(in crate::app) fn auto_prune_caches(
+        &self,
+        policy: slackless_core::maintenance::MediaCachePolicy,
+        include_semantic: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // Never touch the developer's real cache directories from unit tests or sample mode.
+        if cfg!(test) || self.fixtures.sample {
+            return;
+        }
+        cx.background_executor()
+            .spawn(async move {
+                let report = slackless_core::maintenance::prune_default_media_caches(policy);
+                if report.removed_files > 0 {
+                    tracing::info!(
+                        files = report.removed_files,
+                        bytes = report.removed_bytes,
+                        "auto-pruned media cache"
+                    );
+                }
+                if include_semantic
+                    && let Err(err) = slackless_core::maintenance::prune_default_semantic_index()
+                {
+                    tracing::warn!(%err, "semantic index auto-prune failed");
+                }
+            })
+            .detach();
+    }
+
     /// Open a modal dialog showing every locally recorded revision of `(channel, ts)` from
     /// SQLite's immutable append-only `message_revision` log.
     pub(in crate::app) fn open_revision_history(
@@ -1563,19 +1718,40 @@ impl App {
                 let prefs = a.preferences.read(cx);
                 let stats = prefs.storage_stats_snapshot();
                 let sem_snapshot = prefs.semantic_snapshot();
+                let integrity = prefs.integrity_status();
+                let policy = (
+                    prefs.settings().media_cache_max_mb,
+                    prefs.settings().media_cache_max_days,
+                );
                 let progress = a.ws.backfill_progress.clone();
                 let active_channel = a.channel.clone();
                 let active_label = a.label(&active_channel);
                 let sample = a.fixtures.sample;
-                (stats, sem_snapshot, progress, active_channel, active_label, sample)
+                (
+                    stats,
+                    sem_snapshot,
+                    progress,
+                    active_channel,
+                    active_label,
+                    sample,
+                    integrity,
+                    policy,
+                )
             });
-            let (stats, sem_snapshot, progress, active_channel, active_label, sample) =
-                match snapshot {
-                    Some(s) => s,
-                    None => {
-                        return dialog.title("Archive & Storage").w(px(620.)).child(div());
-                    }
-                };
+            let Some((
+                stats,
+                sem_snapshot,
+                progress,
+                active_channel,
+                active_label,
+                sample,
+                (integrity_report, integrity_running),
+                (cache_max_mb, cache_max_days),
+            )) = snapshot
+            else {
+                return dialog.title("Archive & Storage").w(px(620.)).child(div());
+            };
+            let (pdf_pages, pdf_bytes) = crate::media::pdf_cache_usage(cx);
 
             let status = progress
                 .as_ref()
@@ -1616,7 +1792,148 @@ impl App {
             let this_reset = this.clone();
             let this_sem_dl = this.clone();
             let this_sem_idx = this.clone();
+            let this_verify = this.clone();
+            let this_backup = this.clone();
             let active_ch_for_btn = active_channel.clone();
+
+            let (integrity_label, integrity_color) = match (&integrity_report, integrity_running) {
+                (_, true) => ("Checking…".to_owned(), accent),
+                (Some(r), _) if r.ok => (format!("OK ({} ms)", r.elapsed_ms), success),
+                (Some(r), _) => (format!("Problems: {}", r.summary()), danger),
+                (None, _) => ("Not checked yet".to_owned(), muted),
+            };
+            let diagnostics_row = h_flex()
+                .items_center()
+                .flex_wrap()
+                .gap_x_3()
+                .gap_y_1()
+                .text_xs()
+                .text_color(muted)
+                .when_some(stats.as_ref(), |row, st| {
+                    row.child(format!(
+                        "WAL {}",
+                        slackless_core::types::time::format_bytes(st.wal_bytes)
+                    ))
+                    .child(format!(
+                        "Reclaimable {}",
+                        slackless_core::types::time::format_bytes(st.freelist_bytes)
+                    ))
+                })
+                .child(format!(
+                    "PDF pages in memory: {pdf_pages} ({})",
+                    slackless_core::types::time::format_bytes(pdf_bytes)
+                ))
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .child("Integrity:")
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(integrity_color)
+                                .child(integrity_label),
+                        ),
+                );
+
+            let policy_chip = |id: SharedString,
+                               label: &'static str,
+                               selected: bool,
+                               on_pick: Box<dyn Fn(&mut gpui::App) + 'static>| {
+                Button::new(id)
+                    .with_size(Size::XSmall)
+                    .when(selected, |b| b.primary())
+                    .when(!selected, |b| b.ghost())
+                    .disabled(sample)
+                    .label(label)
+                    .on_click(move |_, window, cx| {
+                        on_pick(cx);
+                        window.refresh();
+                    })
+            };
+            let size_chips = preferences::MEDIA_CACHE_SIZE_OPTIONS.iter().map(|&(mb, label)| {
+                let this = this.clone();
+                policy_chip(
+                    SharedString::from(format!("storage-cache-mb-{mb}")),
+                    label,
+                    mb == cache_max_mb,
+                    Box::new(move |cx| {
+                        let _ = this.update(cx, |app, cx| {
+                            app.preferences.update(cx, |p, cx| {
+                                let days = p.settings().media_cache_max_days;
+                                p.set_media_cache_policy(mb, days, cx);
+                            });
+                        });
+                    }),
+                )
+            });
+            let age_chips = preferences::MEDIA_CACHE_AGE_OPTIONS.iter().map(|&(days, label)| {
+                let this = this.clone();
+                policy_chip(
+                    SharedString::from(format!("storage-cache-days-{days}")),
+                    label,
+                    days == cache_max_days,
+                    Box::new(move |cx| {
+                        let _ = this.update(cx, |app, cx| {
+                            app.preferences.update(cx, |p, cx| {
+                                let mb = p.settings().media_cache_max_mb;
+                                p.set_media_cache_policy(mb, days, cx);
+                            });
+                        });
+                    }),
+                )
+            });
+            let policy_card = v_flex()
+                .gap_2()
+                .p_3()
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(card_bg)
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg)
+                        .child("Automatic media cache cleanup"),
+                )
+                .child(div().text_xs().text_color(muted).child(
+                    "Cached videos, audio, PDFs, avatars and emoji are trimmed automatically: \
+                     oldest files go first once a cache folder exceeds its size cap, and files \
+                     unused for longer than the age limit are removed.",
+                ))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap_1()
+                        .child(
+                            div()
+                                .w(px(88.))
+                                .flex_none()
+                                .text_xs()
+                                .text_color(muted)
+                                .child("Max size"),
+                        )
+                        .children(size_chips),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap_1()
+                        .child(
+                            div()
+                                .w(px(88.))
+                                .flex_none()
+                                .text_xs()
+                                .text_color(muted)
+                                .child("Remove after"),
+                        )
+                        .children(age_chips),
+                );
 
             let stats_card = v_flex()
                 .gap_1p5()
@@ -1645,7 +1962,8 @@ impl App {
                     None => div().text_xs().text_color(muted).child(
                         "Connect a live workspace to inspect SQLite database metrics and backfill Slack history.",
                     ),
-                });
+                })
+                .child(diagnostics_row);
 
             let mut controls = h_flex().items_center().flex_wrap().gap_2();
             match status {
@@ -1893,6 +2211,38 @@ impl App {
                                 let _ = this_prune
                                     .update(cx, |app, cx| app.prune_media_cache(window, cx));
                             }),
+                        )
+                        .child(
+                            preferences::form_button(
+                                Button::new("storage-dlg-verify")
+                                    .outline()
+                                    .icon(IconName::Check)
+                                    .disabled(sample || integrity_running)
+                                    .label(if integrity_running {
+                                        "Verifying…"
+                                    } else {
+                                        "Verify integrity"
+                                    }),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                let _ = this_verify
+                                    .update(cx, |app, cx| app.verify_storage_integrity(window, cx));
+                            }),
+                        )
+                        .child(
+                            preferences::form_button(
+                                Button::new("storage-dlg-backup")
+                                    .outline()
+                                    .icon(IconName::Download)
+                                    .disabled(sample)
+                                    .label("Back up archive\u{2026}"),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                let _ = this_backup
+                                    .update(cx, |app, cx| app.backup_archive(window, cx));
+                            }),
                         ),
                 )
                 .child(
@@ -1912,18 +2262,20 @@ impl App {
             let sem_model = slackless_core::embeddings::EmbeddingModel::default();
             let sem_dl_busy = crate::search::semantic_download_in_flight();
             let sem_idx_busy = crate::search::semantic_index_in_flight();
-            let (sem_ready, sem_disk_bytes, sem_hint, sem_stats) = match sem_snapshot {
+            let (sem_ready, sem_disk_bytes, sem_hint, sem_stats, sem_loaded) = match sem_snapshot {
                 Some(snap) => (
                     snap.setup.model_ready,
                     snap.setup.disk_bytes,
                     snap.setup.download_size_hint,
                     snap.stats,
+                    snap.embedder_loaded,
                 ),
                 None => (
                     false,
                     0,
                     sem_model.download_size_hint().to_owned(),
                     slackless_core::store::SemanticIndexStats::default(),
+                    false,
                 ),
             };
             let sem_status_color = if sem_dl_busy || sem_idx_busy {
@@ -1975,12 +2327,17 @@ impl App {
                 )
                 .child(div().text_xs().text_color(muted).child(if sem_ready {
                     format!(
-                        "{} ({}) · {} vectors ({}) across {} workspace(s)",
+                        "{} ({}) · {} vectors ({}) across {} workspace(s) · {}",
                         sem_model.slug(),
                         slackless_core::types::time::format_bytes(sem_disk_bytes),
                         sem_stats.total_docs,
                         slackless_core::types::time::format_bytes(sem_stats.db_bytes),
                         sem_stats.workspaces,
+                        if sem_loaded {
+                            "model loaded in memory (auto-unloads after 5 min idle)"
+                        } else {
+                            "model not in memory"
+                        },
                     )
                 } else {
                     format!(
@@ -2047,6 +2404,7 @@ impl App {
                     .gap_3()
                     .child(stats_card)
                     .child(semantic_card)
+                    .child(policy_card)
                     .child(backfill_card)
                     .when(!channel_rows.is_empty(), |col| {
                         col.child(
@@ -2260,27 +2618,25 @@ impl StoreExportExt for slackless_core::store::Store {
     }
 }
 
+/// Returns `true` exactly once per process so the first preference application at launch runs
+/// the automatic cache/semantic-index prune pass.
+pub(in crate::app) fn claim_startup_cache_prune() -> bool {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    !DONE.swap(true, std::sync::atomic::Ordering::AcqRel)
+}
+
 fn collect_storage_info(
     store: &SharedStore,
     team: &slackless_core::types::TeamId,
 ) -> Option<crate::preferences::StorageInfo> {
-    fn dir_bytes(dir: &std::path::Path) -> u64 {
-        std::fs::read_dir(dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| e.metadata().ok())
-            .filter(|m| m.is_file())
-            .map(|m| m.len())
-            .sum()
-    }
-    let stats = store.lock().ok()?.stats(team).ok()?;
-    let mut media_cache_bytes = dir_bytes(&std::env::temp_dir().join("slackless-media"))
-        .saturating_add(dir_bytes(&std::env::temp_dir().join("slackless-audio")));
-    if let Some(cache) = slackless_core::Fetcher::disk_cache_dir() {
-        media_cache_bytes = media_cache_bytes.saturating_add(dir_bytes(&cache));
-    }
+    let (stats, file_info) = {
+        let guard = store.lock().ok()?;
+        (
+            guard.stats(team).ok()?,
+            guard.file_info().unwrap_or_default(),
+        )
+    };
+    let media_cache_bytes = slackless_core::maintenance::media_cache_bytes();
     Some(crate::preferences::StorageInfo {
         messages: stats.messages,
         revisions: stats.revisions,
@@ -2289,6 +2645,8 @@ fn collect_storage_info(
         offline_queued: stats.offline_queued,
         db_bytes: stats.db_bytes(),
         media_cache_bytes,
+        wal_bytes: file_info.wal_bytes,
+        freelist_bytes: file_info.freelist_bytes,
     })
 }
 

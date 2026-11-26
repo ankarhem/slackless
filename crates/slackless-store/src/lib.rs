@@ -32,8 +32,9 @@ pub use semantic::{
 };
 pub use store::{
     ALL_CONVERSATION_KINDS, ConversationSummary, DigestChannel, HuddleTranscriptSegment,
-    HuddleTranscriptSession, MemberCounts, NewHuddleTranscriptSegment, NewOutboxItem, OutboxItem,
-    OutboxKind, OutboxStatus, RecentFileTranscript, Revision, StorageBreakdown, Store, StoreStats,
+    HuddleTranscriptSession, IntegrityMode, IntegrityReport, MemberCounts,
+    NewHuddleTranscriptSegment, NewOutboxItem, OutboxItem, OutboxKind, OutboxStatus,
+    RecentFileTranscript, Revision, StorageBreakdown, Store, StoreFileInfo, StoreStats,
     StoredFileTranscript, StoredMessage, UserSummary, WorkspaceFileTranscript,
     WorkspaceHuddleTranscriptSegment, WorkspaceStoredMessage, extract_inline_file_body,
     extract_inline_file_transcript,
@@ -50,6 +51,10 @@ pub enum StoreError {
     FutureSchema { found: u32, supported: u32 },
     #[error("store was opened read-only")]
     ReadOnly,
+    #[error("invalid backup destination: {0}")]
+    InvalidBackupPath(String),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;

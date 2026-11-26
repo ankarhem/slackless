@@ -12,7 +12,8 @@ mod video_player;
 
 pub(crate) use audio_player::fetch_cached_media;
 pub use audio_player::{
-    audio_state, cycle_audio_rate, seek_audio, stop_audio, toggle_audio, toggle_audio_mute,
+    audio_state, cycle_audio_rate, media_cache_policy, seek_audio, set_media_cache_policy,
+    stop_audio, toggle_audio, toggle_audio_mute,
 };
 pub(crate) use downloads::active_fetcher;
 pub use downloads::{
@@ -22,7 +23,7 @@ pub use downloads::{
 pub use http::CoreHttp;
 pub use pdf::{
     cached_pdf_inline_thumb, cached_pdf_page, cached_pdf_page_count, clear_pdf_cache,
-    evict_viewer_pdf_pages, request_pdf_inline_thumb, store_cached_pdf_page,
+    evict_viewer_pdf_pages, pdf_cache_usage, request_pdf_inline_thumb, store_cached_pdf_page,
 };
 pub(crate) use pdf::{evict_pdf_image, fetch_and_render_pdf_page};
 pub use picture::Picture;

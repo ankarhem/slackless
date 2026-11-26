@@ -647,10 +647,11 @@ impl Preferences {
                     let embedder = crate::search::load_or_get_onnx_embedder()?;
                     let archives = slackless_core::search::discover_local_archives();
                     let mut idx = slackless_core::semantic_index::open_default_semantic_index()?;
-                    let report = slackless_core::semantic_index::index_disk_archives(
+                    let report = slackless_core::semantic_index::index_disk_archives_paced(
                         &archives,
                         &mut idx,
                         embedder.as_ref(),
+                        slackless_core::semantic_index::IndexPacing::BACKGROUND,
                         |_| {},
                     )?;
                     let msg = format!(

@@ -1828,3 +1828,173 @@ fn cli_catchup_flag_parsing_and_multi_workspace_briefing() {
     drop(arch2);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[test]
+fn archive_check_backup_and_prune_parse_with_global_flags() {
+    use crate::cli::ArchiveCommand;
+
+    let check = Cli::try_parse_from([
+        "slackless",
+        "archive",
+        "check",
+        "--workspace",
+        "T1",
+        "--json",
+        "--full",
+    ])
+    .expect("parse archive check");
+    assert!(check.json);
+    assert_eq!(check.workspace.as_deref(), Some("T1"));
+    match check.command {
+        Commands::Archive { command } => match *command {
+            ArchiveCommand::Check(args) => assert!(args.full),
+            _ => panic!("expected ArchiveCommand::Check"),
+        },
+        _ => panic!("expected Archive"),
+    }
+
+    let backup = Cli::try_parse_from(["slackless", "archive", "backup", "/tmp/out.sqlite"])
+        .expect("parse archive backup");
+    match backup.command {
+        Commands::Archive { command } => match *command {
+            ArchiveCommand::Backup(args) => {
+                assert_eq!(
+                    args.output_path,
+                    std::path::PathBuf::from("/tmp/out.sqlite")
+                );
+            }
+            _ => panic!("expected ArchiveCommand::Backup"),
+        },
+        _ => panic!("expected Archive"),
+    }
+    assert!(
+        Cli::try_parse_from(["slackless", "archive", "backup"]).is_err(),
+        "backup requires an output path"
+    );
+
+    let prune = Cli::try_parse_from(["slackless", "archive", "prune"]).expect("parse prune");
+    match prune.command {
+        Commands::Archive { command } => match *command {
+            ArchiveCommand::Prune(args) => {
+                assert_eq!(args.max_mb, 256);
+                assert_eq!(args.max_days, 30);
+                assert!(!args.semantic);
+            }
+            _ => panic!("expected ArchiveCommand::Prune"),
+        },
+        _ => panic!("expected Archive"),
+    }
+    let prune2 = Cli::try_parse_from([
+        "slackless",
+        "archive",
+        "prune",
+        "--max-mb",
+        "0",
+        "--max-days",
+        "7",
+        "--semantic",
+    ])
+    .expect("parse prune flags");
+    match prune2.command {
+        Commands::Archive { command } => match *command {
+            ArchiveCommand::Prune(args) => {
+                assert_eq!((args.max_mb, args.max_days, args.semantic), (0, 7, true));
+            }
+            _ => panic!("expected ArchiveCommand::Prune"),
+        },
+        _ => panic!("expected Archive"),
+    }
+}
+
+#[test]
+fn archive_check_and_backup_reports_cover_healthy_corrupt_and_unsafe_targets() {
+    use slackless_core::store::{IntegrityMode, Store};
+    use slackless_core::types::{ChannelId, Message, TeamId, Ts};
+
+    use crate::commands::maintenance::{
+        archive_backup_report, archive_check_report, prune_report_output,
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "slackless-cli-archive-maint-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ws = TeamId::from("T1");
+    let db = dir.join("T1.sqlite");
+    {
+        let mut store = Store::open(&db).unwrap();
+        store
+            .upsert_messages(
+                &ws,
+                &ChannelId::from("C1"),
+                &[Message {
+                    ts: Ts::from("1700000001.000100"),
+                    text: "backup me".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+    }
+
+    // Healthy archive: quick and full checks pass.
+    let (json, human, ok) = archive_check_report(&ws, &db, IntegrityMode::Quick);
+    assert!(ok, "{human}");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["check"], "quick_check");
+    assert_eq!(json["problems"].as_array().unwrap().len(), 0);
+    assert!(json["db_bytes"].as_u64().unwrap() > 0);
+    assert!(human.contains("Integrity:\tok (quick_check"));
+    let (full_json, _, full_ok) = archive_check_report(&ws, &db, IntegrityMode::Full);
+    assert!(full_ok);
+    assert_eq!(full_json["mode"], "full");
+
+    // Backup round-trips and the copy passes its own check.
+    let dest = dir.join("backup.sqlite");
+    let (bjson, bhuman) = archive_backup_report(&ws, &db, &dest).unwrap();
+    assert_eq!(bjson["ok"], true);
+    assert_eq!(
+        bjson["bytes"].as_u64().unwrap(),
+        std::fs::metadata(&dest).unwrap().len()
+    );
+    assert!(bhuman.starts_with("Backed up T1 to "));
+    let copy = Store::open_read_only(&dest).unwrap();
+    assert_eq!(copy.message_count(&ws).unwrap(), 1);
+    drop(copy);
+    assert!(archive_check_report(&ws, &dest, IntegrityMode::Quick).2);
+
+    // Refuses to overwrite the live archive or write into a missing directory.
+    let err = archive_backup_report(&ws, &db, &db).unwrap_err();
+    assert!(format!("{err:#}").contains("live database"), "{err:#}");
+    assert!(archive_backup_report(&ws, &db, &dir.join("nope").join("x.sqlite")).is_err());
+
+    // A file that is not a SQLite database is a failed check, not a crash.
+    let garbage = dir.join("garbage.sqlite");
+    std::fs::write(&garbage, b"definitely not sqlite, just bytes").unwrap();
+    let (gjson, ghuman, gok) = archive_check_report(&ws, &garbage, IntegrityMode::Quick);
+    assert!(!gok);
+    assert_eq!(gjson["ok"], false);
+    assert!(!gjson["problems"].as_array().unwrap().is_empty());
+    assert!(ghuman.contains("FAILED"));
+
+    // Prune summary formatting.
+    let policy = slackless_core::maintenance::MediaCachePolicy::from_mb_days(1, 7);
+    let report = slackless_core::maintenance::PruneReport {
+        removed_files: 2,
+        removed_bytes: 2048,
+        remaining_files: 1,
+        remaining_bytes: 1024,
+    };
+    let (pjson, phuman) = prune_report_output(policy, &report, Some(3));
+    assert_eq!(pjson["media"]["removed_files"], 2);
+    assert_eq!(pjson["semantic_vectors_pruned"], 3);
+    assert_eq!(pjson["policy"]["max_age_days"], 7);
+    assert!(phuman.contains("removed 2 file(s)"));
+    assert!(phuman.contains("pruned 3 orphaned vector(s)"));
+    let (pjson2, phuman2) = prune_report_output(policy, &report, None);
+    assert!(pjson2["semantic_vectors_pruned"].is_null());
+    assert!(!phuman2.contains("Semantic"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

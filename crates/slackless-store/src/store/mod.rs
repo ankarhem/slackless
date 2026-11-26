@@ -20,6 +20,7 @@ pub use file_transcripts::{
     StoredFileTranscript, WorkspaceFileTranscript, extract_inline_file_body,
     extract_inline_file_transcript,
 };
+pub use maintenance::{IntegrityMode, IntegrityReport, StoreFileInfo};
 pub use outbox::{NewOutboxItem, OutboxItem, OutboxKind, OutboxStatus};
 pub use search::WorkspaceStoredMessage;
 pub use transcripts::{

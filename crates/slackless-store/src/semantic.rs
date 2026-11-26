@@ -411,6 +411,34 @@ impl SemanticIndex {
         Ok(removed)
     }
 
+    /// Distinct workspace ids that currently own vectors, sorted.
+    pub fn workspace_ids(&self) -> Result<Vec<TeamId>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT workspace_id FROM semantic_embedding ORDER BY workspace_id",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(TeamId::from(row?));
+        }
+        Ok(out)
+    }
+
+    /// Delete every vector belonging to `workspace` (e.g. after its archive was removed).
+    pub fn delete_workspace(&mut self, workspace: &TeamId) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM semantic_embedding WHERE workspace_id = ?1",
+            params![workspace.as_str()],
+        )?)
+    }
+
+    /// Checkpoint the WAL and compact free pages so pruned vectors give disk space back.
+    pub fn vacuum(&mut self) -> Result<()> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        Ok(())
+    }
+
     /// Load existing `(doc_kind, doc_id) -> (content_hash, dims)` for one workspace so
     /// incremental indexing can skip unchanged documents.
     pub fn existing_hashes(
@@ -792,5 +820,31 @@ mod tests {
         assert!(idx.ensure_model("bge-small", 4).unwrap());
         assert_eq!(idx.stats().unwrap().total_docs, 0);
         assert_eq!(idx.model_id().unwrap().as_deref(), Some("bge-small"));
+    }
+
+    #[test]
+    fn workspace_listing_deletion_and_vacuum() {
+        let mut idx = SemanticIndex::open_in_memory().unwrap();
+        idx.ensure_model("m", 2).unwrap();
+        let doc = |ws: &str, id: &str| SemanticDocInput {
+            workspace: TeamId::from(ws),
+            kind: SemanticDocKind::Message,
+            doc_id: id.into(),
+            channel_id: "C1".into(),
+            ts: "1.0".into(),
+            content_hash: "h".into(),
+            embedding: vec![1.0, 0.0],
+        };
+        idx.upsert_batch(&[doc("T2", "a"), doc("T1", "b"), doc("T2", "c")])
+            .unwrap();
+        assert_eq!(
+            idx.workspace_ids().unwrap(),
+            vec![TeamId::from("T1"), TeamId::from("T2")]
+        );
+        assert_eq!(idx.delete_workspace(&TeamId::from("T2")).unwrap(), 2);
+        assert_eq!(idx.delete_workspace(&TeamId::from("T9")).unwrap(), 0);
+        assert_eq!(idx.workspace_ids().unwrap(), vec![TeamId::from("T1")]);
+        idx.vacuum().unwrap();
+        assert_eq!(idx.stats().unwrap().total_docs, 1);
     }
 }
