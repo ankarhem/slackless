@@ -302,7 +302,7 @@ pub async fn run_delete(
         Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let mut archive = Archive::open_rw(&session.workspace).ok().flatten();
+    let mut archive = Archive::open_rw_or_report(&session.workspace);
     let (channel, label) = resolve_channel_with(archive.as_ref(), &session.workspace, channel_arg);
     let ts = Ts::from(ts.to_owned());
     match session.api.chat_delete(&channel, &ts).await {
@@ -473,7 +473,7 @@ pub async fn run_mark_read(
         Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let mut archive = Archive::open_rw(&session.workspace).ok().flatten();
+    let mut archive = Archive::open_rw_or_report(&session.workspace);
     let (channel, label) = resolve_channel_with(archive.as_ref(), &session.workspace, channel_arg);
     let ts_str = match ts_arg {
         Some(ts) => ts.to_owned(),

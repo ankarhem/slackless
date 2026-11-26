@@ -643,6 +643,10 @@ async fn live_commands_report_local_mirror_failures_on_stderr() {
             json!({"ok": true, "channel": "C0LIVE", "ts": "1700000200.000100",
                 "message": {"type": "message", "user": "U0E2E", "text": "sent", "ts": "1700000200.000100"}}),
         ),
+        (
+            "chat.delete",
+            json!({"ok": true, "channel": "C0LIVE", "ts": "1700000200.000100"}),
+        ),
     ] {
         Mock::given(path(format!("/api/{method}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
@@ -706,6 +710,20 @@ async fn live_commands_report_local_mirror_failures_on_stderr() {
     assert!(
         stderr.contains("could not record the echo"),
         "MCP send_message: {stderr:?}"
+    );
+
+    // An archive file that does not open is reported, not taken for "no archive yet".
+    std::fs::remove_dir(dir.data().join("T0LIVE.sqlite")).unwrap();
+    std::fs::write(dir.data().join("T0LIVE.sqlite"), b"not a sqlite database").unwrap();
+    let out = cli(&dir)
+        .args(["--json", "delete", "C0LIVE", "1700000200.000100"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "delete failed: {stderr}");
+    assert!(
+        stderr.contains("could not open the local archive"),
+        "delete: {stderr:?}"
     );
 }
 

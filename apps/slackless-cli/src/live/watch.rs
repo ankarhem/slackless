@@ -31,7 +31,7 @@ pub async fn run_watch(
         Ok(session) => session,
         Err(not_signed_in) => return Ok(fail(ctx, "not_signed_in", &not_signed_in.to_string())),
     };
-    let mut archive = Archive::open_rw(&session.team_id).ok().flatten();
+    let mut archive = Archive::open_rw_or_report(&session.team_id);
     let filter_ch =
         channel_arg.map(|ch| resolve_channel_with(archive.as_ref(), &session.team_id, ch).0);
     let mut cfg = RtmConfig::new(ConnectParams::new(session.xoxc_token.clone()));

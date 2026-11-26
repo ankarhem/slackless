@@ -282,7 +282,16 @@ pub async fn run_huddle_join(
         Err(exit) => return Ok(exit),
     };
     // Keep one RW Store handle open across the whole huddle session (creating parent dir + DB if needed).
-    let mut archive = Archive::open_or_create_rw(&session.workspace).ok();
+    let mut archive = match Archive::open_or_create_rw(&session.workspace) {
+        Ok(archive) => Some(archive),
+        Err(err) => {
+            eprintln!(
+                "slackless: could not open the local archive of {} ({err:#}); huddle transcripts are not stored",
+                session.workspace
+            );
+            None
+        }
+    };
     let (channel, label) =
         resolve_channel_with(archive.as_ref(), &session.workspace, &args.channel);
     let joined = match session.api.rooms_join(&channel, None, None).await {
@@ -313,6 +322,7 @@ pub async fn run_huddle_join(
     let mut sent_connected_actions = false;
     let mut video_frames: u64 = 0;
     let mut deduper = CaptionDeduper::default();
+    let mut transcript_store_failed = false;
 
     loop {
         let timer_fut = async {
@@ -389,9 +399,15 @@ pub async fn run_huddle_join(
                                 text: &trimmed,
                                 at_ms: seg_at_ms,
                             };
-                            let _ = archive
+                            if let Err(err) = archive
                                 .store_mut()
-                                .insert_huddle_transcript_segment(&session.workspace, &seg);
+                                .insert_huddle_transcript_segment(&session.workspace, &seg)
+                                && !std::mem::replace(&mut transcript_store_failed, true)
+                            {
+                                eprintln!(
+                                    "slackless: could not store huddle transcript lines ({err}); later failures are not reported"
+                                );
+                            }
                         }
                         let (json, human) = format_huddle_data_event(&display, &ev);
                         output::emit(ctx.json, &json, &human);

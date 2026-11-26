@@ -154,6 +154,18 @@ impl Archive {
         }))
     }
 
+    /// [`Archive::open_rw`] for a live command that mirrors its change into the archive: the
+    /// command goes on without one, but an archive that fails to open is reported on stderr
+    /// instead of passing for "no archive yet".
+    pub(crate) fn open_rw_or_report(team_id: &TeamId) -> Option<Self> {
+        Self::open_rw(team_id).unwrap_or_else(|err| {
+            eprintln!(
+                "slackless: could not open the local archive of {team_id} ({err}); continuing without it"
+            );
+            None
+        })
+    }
+
     /// Opens a workspace archive read-write, creating its parent directory and database if needed.
     pub fn open_or_create_rw(team_id: &TeamId) -> Result<Self> {
         let path = store_path(team_id).context("resolving the local archive path")?;
