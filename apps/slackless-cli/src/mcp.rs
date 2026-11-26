@@ -41,9 +41,7 @@ use slackless_core::domain::mrkdwn::mrkdwn_to_plain;
 use slackless_core::export::format_utc_timestamp;
 use slackless_core::export::{ChannelWindow, ExportFormat, ExportOptions, ExportRequest};
 use slackless_core::search::truncate_chars;
-use slackless_core::store::{
-    Has, SearchQuery, SearchSort, Store, StoredFileTranscript, StoredMessage,
-};
+use slackless_core::store::{Has, SearchQuery, SearchSort, StoredFileTranscript, StoredMessage};
 use slackless_core::types::time::now_epoch_secs;
 use slackless_core::types::{ChannelId, FileId, Message, TeamId, TranscriptCue, Ts, UserId};
 
@@ -301,16 +299,7 @@ impl McpServer {
         let path = self
             .archive_path_for(team_id)
             .ok_or_else(|| format!("could not resolve local archive path for {team_id}"))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| format!("creating archive directory {}: {err}", parent.display()))?;
-        }
-        let store = Store::open(&path)
-            .map_err(|err| format!("opening local archive {}: {err}", path.display()))?;
-        drop(store);
-        Archive::open_rw_path(&path)
-            .map_err(|err| format!("opening archive rw for {team_id}: {err}"))?
-            .ok_or_else(|| format!("archive file missing after creation: {}", path.display()))
+        Archive::open_rw_or_create_path(&path).map_err(|err| format!("{err:#}"))
     }
 
     fn resolve_live_api(
@@ -2969,7 +2958,7 @@ fn parse_resource_uri(uri: &str) -> Result<ResourceUri, ErrorData> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slackless_core::store::NewHuddleTranscriptSegment;
+    use slackless_core::store::{NewHuddleTranscriptSegment, Store};
     use slackless_core::types::{
         Conversation, File, Latest, Message, Profile, TopicPurpose, User, UserId,
     };

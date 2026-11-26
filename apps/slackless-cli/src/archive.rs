@@ -157,11 +157,16 @@ impl Archive {
     /// Opens a workspace archive read-write, creating its parent directory and database if needed.
     pub fn open_or_create_rw(team_id: &TeamId) -> Result<Self> {
         let path = store_path(team_id).context("resolving the local archive path")?;
+        Self::open_rw_or_create_path(&path)
+    }
+
+    /// [`Archive::open_or_create_rw`] for the archive file at `path`.
+    pub(crate) fn open_rw_or_create_path(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating archive directory {}", parent.display()))?;
         }
-        let store = Store::open(&path)
+        let store = Store::open(path)
             .with_context(|| format!("opening local archive {}", path.display()))?;
         Ok(Self { store })
     }
