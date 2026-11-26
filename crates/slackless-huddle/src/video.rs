@@ -36,7 +36,7 @@ pub enum VideoFrameData {
     Bgra(Arc<Vec<u8>>),
     /// Zero-copy macOS `IOSurface`-backed `420f` `CVPixelBuffer` rendered directly by Metal.
     #[cfg(target_os = "macos")]
-    MacSurface(Arc<crate::macos_media::MacVideoSurface>),
+    MacSurface(Arc<crate::macos::MacVideoSurface>),
 }
 
 /// One decoded or captured video frame (zero-copy GPU surface on macOS, or portable BGRA8888).
@@ -59,7 +59,7 @@ impl VideoFrame {
 
     /// Wrap a zero-copy macOS `IOSurface`-backed `CVPixelBuffer`.
     #[cfg(target_os = "macos")]
-    pub fn from_mac_surface(surface: crate::macos_media::MacVideoSurface) -> Self {
+    pub fn from_mac_surface(surface: crate::macos::MacVideoSurface) -> Self {
         Self {
             width: surface.width(),
             height: surface.height(),
@@ -69,7 +69,7 @@ impl VideoFrame {
 
     /// Borrow the underlying zero-copy macOS GPU surface if this frame is GPU-backed.
     #[cfg(target_os = "macos")]
-    pub fn mac_surface(&self) -> Option<&Arc<crate::macos_media::MacVideoSurface>> {
+    pub fn mac_surface(&self) -> Option<&Arc<crate::macos::MacVideoSurface>> {
         match &self.data {
             VideoFrameData::MacSurface(s) => Some(s),
             VideoFrameData::Bgra(_) => None,
@@ -1051,7 +1051,6 @@ mod tests {
         }
         let frame = decoded.expect("Single NAL sequence must decode");
         assert_eq!((frame.width, frame.height), (w as u32, h as u32));
-        let mut seq = 0u16;
         // Buffer resets after decode: malformed or empty marker must return None.
         assert!(dec.push_rtp_packet(nals.len() as u16, &[], true).is_none());
 
@@ -1069,6 +1068,7 @@ mod tests {
 
         // 3. Multi-packet FU-A fragmentation (NAL type 28) on the final IDR NAL.
         let mut dec_fua = H264VideoDecoder::new().unwrap();
+        let mut seq = 0u16;
         for nal in &nals[..nals.len() - 1] {
             assert!(dec_fua.push_rtp_packet(seq, nal, false).is_none());
             seq += 1;
@@ -1308,7 +1308,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             let bitstream = encode_test_keyframe(160, 96, 40, 180, 220);
-            let mut vt = crate::macos_media::VtH264Decoder::new().unwrap();
+            let mut vt = crate::macos::VtH264Decoder::new().unwrap();
             let surface_frame = vt
                 .decode_annex_b(&bitstream)
                 .expect("VT should decode synthetic keyframe");

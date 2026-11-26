@@ -12,8 +12,6 @@ pub mod content_share;
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod macos_audio_tap;
-#[cfg(target_os = "macos")]
-pub use macos as macos_media;
 pub mod metrics;
 pub mod onnx_runtime;
 pub mod pdf;
@@ -40,34 +38,31 @@ use slackless_types::{ChannelId, Ts, UserId};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+use backend::platform_backend;
+use metrics::HuddlePerfSnapshot;
+
 pub use audio::{
-    AmbientMusicPlayer, AudioDeviceInfo, AudioDevices, HuddleChime, MicLevelProbe,
-    list_audio_devices, play_huddle_chime, play_speaker_test_tone,
+    AudioDeviceInfo, AudioDevices, HuddleChime, MicLevelProbe, list_audio_devices,
+    play_huddle_chime, play_speaker_test_tone,
 };
-pub use backend::{MediaCapabilities, platform_backend};
 pub use clips::{
-    AudioClipRecorder, ClipVideoSource, MAX_CLIP_DURATION_MS, RecordedClip, VideoClipRecorder,
-    finish_audio_clip,
+    AudioClipRecorder, ClipVideoSource, MAX_CLIP_DURATION_MS, VideoClipRecorder, finish_audio_clip,
 };
-pub use content_share::{detect_system_audio_loopback, system_audio_source_label};
+pub use content_share::system_audio_source_label;
 #[cfg(target_os = "macos")]
-pub use macos_media::MacVideoSurface;
-pub use metrics::{HuddlePerfCounters, HuddlePerfSnapshot, ProcessResourceSampler};
-pub use pdf::{RenderedPdfPage, pdf_page_count, render_pdf_page_png};
-pub use screen::{ScreenCapture, ScreenSource, capture_screen_thumbnails, list_screen_sources};
+pub use macos::MacVideoSurface;
+pub use pdf::{pdf_page_count, render_pdf_page_png};
+pub use screen::{ScreenSource, capture_screen_thumbnails, list_screen_sources};
 pub use session::spawn_huddle_session;
 pub use signaling::install_default_crypto_provider;
 pub use transcribe::{
-    ModelDownloadProgress, ProviderSetupStatus, TimedTranscription, TranscriptionProvider,
-    chunk_audio_for_transcription_with_offsets, default_parakeet_model_dir,
-    default_whisper_model_dir, delete_provider_model, detect_provider_setup, detect_spoken_lang,
-    download_provider_model, extract_audio_16k_mono, parse_whisper_json_cues,
+    TranscriptionProvider, delete_provider_model, detect_provider_setup, download_provider_model,
     resolve_local_file_provider, transcribe_media_file, transcribe_media_file_timed,
 };
 pub use video::{
     CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoFrameData, VideoTileKey, list_cameras,
 };
-pub use video_player::{NativeVideoPlayer, VideoPlayerState};
+pub use video_player::NativeVideoPlayer;
 
 /// Returns `true` if OS screen recording permission is granted (always `true` on non-macOS).
 pub fn has_screen_capture_permission() -> bool {

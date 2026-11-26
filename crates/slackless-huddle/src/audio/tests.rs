@@ -6,6 +6,7 @@ use bytes::Bytes;
 use opus::{Application, Bitrate, Channels, Decoder, Encoder};
 use tokio::sync::mpsc;
 
+use super::chimes::slack_lounge_music_filename;
 use super::dsp::{build_sonora, downmix_to_mono_f32, soft_limit_sample};
 use super::playout::{MAX_JITTER_DELAY_MS, RemoteAudioMixer, service};
 use super::*;

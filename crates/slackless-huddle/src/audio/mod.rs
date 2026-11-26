@@ -18,13 +18,14 @@ pub const FRAME_10MS: usize = 480;
 /// 20ms frame size for Opus encoding/decoding (960 samples at 48 kHz).
 pub const FRAME_20MS: usize = 960;
 
-pub use chimes::{AmbientMusicPlayer, HuddleChime, play_huddle_chime, slack_lounge_music_filename};
+pub(crate) use chimes::AmbientMusicPlayer;
+pub use chimes::{HuddleChime, play_huddle_chime};
 pub(crate) use devices::cpal_device_name;
 pub use devices::{
     AudioDeviceInfo, AudioDevices, MicLevelProbe, list_audio_devices, play_speaker_test_tone,
 };
 pub(crate) use dsp::RateConverter;
 pub use dsp::{LoudnessNormalizer, compute_rms_mono, normalized_gain_for_rms};
-pub use engine::{AudioEngine, AudioSharedState};
+pub(crate) use engine::{AudioEngine, AudioSharedState};
 pub use playout::AudioRxSnapshot;
 pub(crate) use playout::PlayoutRing;
