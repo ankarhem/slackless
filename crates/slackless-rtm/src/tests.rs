@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use slackless_types::endpoints::WEB_ORIGIN;
+use slackless_types::endpoints::{BROWSER_USER_AGENT, WEB_ORIGIN};
 use slackless_types::{ChannelId, SlackEvent, UserId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -536,7 +536,7 @@ async fn handshake_sends_origin_cookie_and_user_agent_headers() {
         .unwrap();
         assert_eq!(seen_origin.as_deref(), Some(WEB_ORIGIN));
         assert_eq!(seen_cookie.as_deref(), Some("d=xoxd-cookie-val"));
-        assert_eq!(seen_ua.as_deref(), Some("SlacklessTest/1.0"));
+        assert_eq!(seen_ua.as_deref(), Some(BROWSER_USER_AGENT));
         ws.send(Message::text(r#"{"type":"hello"}"#)).await.unwrap();
         let _ = ws.next().await;
     });
@@ -544,7 +544,6 @@ async fn handshake_sends_origin_cookie_and_user_agent_headers() {
     let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-hdr"));
     cfg.base_url = format!("ws://{addr}/link/");
     cfg.d_cookie = Some("xoxd-cookie-val".to_owned());
-    cfg.user_agent = Some("SlacklessTest/1.0".to_owned());
     let (client, mut rx, driver) = RtmClient::new(cfg).unwrap();
     let drv = tokio::spawn(driver);
 

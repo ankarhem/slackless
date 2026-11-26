@@ -4,7 +4,7 @@ use std::fmt;
 use std::time::Duration;
 
 use slackless_types::SlackEvent;
-use slackless_types::endpoints::WSS_PRIMARY;
+use slackless_types::endpoints::{BROWSER_USER_AGENT, WSS_PRIMARY};
 
 use crate::backoff::Backoff;
 use crate::url::ConnectParams;
@@ -22,7 +22,9 @@ pub struct RtmConfig {
     pub base_url: String,
     /// Value of the `d` session cookie (`xoxd-...`), sent as `Cookie: d=<value>`.
     pub d_cookie: Option<String>,
-    pub user_agent: Option<String>,
+    /// Sent as `User-Agent` on the handshake; defaults to [`BROWSER_USER_AGENT`], the one every
+    /// HTTP request carries.
+    pub user_agent: String,
     /// Interval between app-level `ping` frames.
     pub ping_interval: Duration,
     /// Reconnect after this many consecutive pings go unanswered.
@@ -62,7 +64,7 @@ impl RtmConfig {
             params,
             base_url: WSS_PRIMARY.to_owned(),
             d_cookie: None,
-            user_agent: None,
+            user_agent: BROWSER_USER_AGENT.to_owned(),
             ping_interval: Duration::from_secs(15),
             max_missed_pongs: 3,
             backoff: Backoff::default(),

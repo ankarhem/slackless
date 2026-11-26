@@ -135,9 +135,6 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Extended timeout for file uploads and downloads.
 const UPLOAD_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
-/// Browser-like UA; the web client is a browser and Slack sees what it sends.
-const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
 
 /// Installs `rustls`'s `ring` `CryptoProvider` as the process-wide default (no-op if one is
 /// already installed).
@@ -152,7 +149,7 @@ pub fn install_default_crypto_provider() {
 pub(crate) fn build_http_client(proxy: Option<&str>, timeout: Duration) -> Result<reqwest::Client> {
     install_default_crypto_provider();
     let mut builder = reqwest::Client::builder()
-        .user_agent(BROWSER_USER_AGENT)
+        .user_agent(endpoints::BROWSER_USER_AGENT)
         .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
         .timeout(timeout);
     if let Some(proxy) = proxy {

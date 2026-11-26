@@ -10,6 +10,11 @@ pub const SLACK_API_BASE: &str = "https://slack.com/api/";
 /// Web origin sent on websocket handshakes and some HTTP calls.
 pub const WEB_ORIGIN: &str = "https://app.slack.com";
 
+/// User-Agent of the desktop browser the web client runs in. Every HTTP request and the websocket
+/// handshake carry it, so Slack sees one browser.
+pub const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
+
 /// Web client page; its HTML carries the `data-version-ts` attributes used at boot.
 pub const APP_CLIENT_URL: &str = "https://app.slack.com/client";
 

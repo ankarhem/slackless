@@ -220,12 +220,10 @@ impl Driver {
                 HeaderValue::from_str(&format!("d={encoded}")).map_err(http::Error::from)?;
             headers.insert(COOKIE, value);
         }
-        if let Some(ua) = &self.config.user_agent {
-            headers.insert(
-                USER_AGENT,
-                HeaderValue::from_str(ua).map_err(http::Error::from)?,
-            );
-        }
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(&self.config.user_agent).map_err(http::Error::from)?,
+        );
         Ok(request)
     }
 
