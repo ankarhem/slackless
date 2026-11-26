@@ -31,9 +31,9 @@ use crate::canvas::{
     canvas_server_rule_notice, canvas_to_printable_html, canvas_view, comment_thread_counts,
     cycle_canvas_focus_region, cycle_region, filter_comment_threads, general_access_summary,
     live_canvas_view, parse_canvas_html, parse_canvas_markdown, parse_inline_canvas_segments,
-    parse_share_targets, resolve_profile_card, save_canvas_pdf_to_path, section_delete_op,
-    section_insert_after_op, section_replace_op, step_block, toggle_section_actions_shortcut,
-    trigger_canvas_print, write_printable_html,
+    parse_share_targets, resolve_profile_card, section_delete_op, section_insert_after_op,
+    section_replace_op, step_block, toggle_section_actions_shortcut, trigger_canvas_print,
+    write_printable_html,
 };
 
 #[test]
@@ -1298,7 +1298,6 @@ fn printable_html_export_escapes_content_and_respects_print_policy() {
 
     // OS subprocess helpers are safely disabled in `#[cfg(test)]`.
     assert!(trigger_canvas_print(&doc).is_err());
-    assert!(save_canvas_pdf_to_path(&doc, &tmp_path).is_err());
 }
 
 #[test]

@@ -33,9 +33,11 @@ pub use comments::{
 };
 #[cfg(test)]
 pub use comments::{comment_thread_counts, filter_comment_threads};
-pub use export::{canvas_export_stem, save_canvas_pdf_to_path, trigger_canvas_print};
+pub use export::trigger_canvas_print;
 #[cfg(test)]
-pub use export::{canvas_print_allowed, canvas_to_printable_html, write_printable_html};
+pub use export::{
+    canvas_export_stem, canvas_print_allowed, canvas_to_printable_html, write_printable_html,
+};
 #[cfg(test)]
 pub use keyboard::{
     CanvasActivation, activate_focused_block, step_block, toggle_section_actions_shortcut,

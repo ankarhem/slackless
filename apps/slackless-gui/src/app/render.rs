@@ -77,26 +77,15 @@ impl App {
                 move |doc, window, cx| match crate::canvas::trigger_canvas_print(&doc) {
                     Ok(_) => notify(
                         "Print canvas",
-                        "Opened printable canvas preview.",
+                        "Opened the print panel; its PDF menu saves a PDF.",
                         window,
                         cx,
                     ),
                     Err(err) => notify("Print canvas", err, window, cx),
                 },
             );
-        let on_save_pdf: crate::canvas::CanvasExportFn = Rc::new(move |doc, window, cx| {
-            let stem = crate::canvas::canvas_export_stem(&doc.title);
-            let target = std::env::temp_dir().join(format!("{stem}.pdf"));
-            match crate::canvas::save_canvas_pdf_to_path(&doc, &target) {
-                Ok(saved) => notify(
-                    "Saved PDF",
-                    format!("Exported to {}", saved.display()),
-                    window,
-                    cx,
-                ),
-                Err(err) => notify("Save as PDF", err, window, cx),
-            }
-        });
+        // Save as PDF is the print panel's PDF menu.
+        let on_save_pdf = on_print_canvas.clone();
         crate::canvas::CanvasActions {
             on_pop_out: Some(on_pop_out),
             on_open_media: Some(on_open_media),
