@@ -171,13 +171,72 @@ impl Render for WorkflowDetailsView {
                 )
             })
             .when_some(self.error.clone(), |col, err| {
+                let retry_trigger = self.trigger_id.clone();
                 col.child(
-                    div()
-                        .text_xs()
-                        .text_color(danger)
-                        .child(format!("Could not load workflow details: {err}")),
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .px_2p5()
+                        .py_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(danger.opacity(0.4))
+                        .bg(danger.opacity(0.1))
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .items_start()
+                                .gap_1p5()
+                                .child(
+                                    Icon::new(IconName::TriangleAlert)
+                                        .flex_none()
+                                        .size(px(14.))
+                                        .text_color(danger),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .text_color(danger)
+                                        .child(format!("Could not load workflow details: {err}")),
+                                ),
+                        )
+                        .when_some(retry_trigger, |row, tid| {
+                            row.child(
+                                Button::new("wf-details-retry")
+                                    .outline()
+                                    .with_size(Size::XSmall)
+                                    .icon(IconName::RotateCcw)
+                                    .label("Retry")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.loading = true;
+                                        this.error = None;
+                                        let _ = this.app.update(cx, |app, _| {
+                                            app.bridge.send(
+                                                CollabCommand::FetchWorkflowTriggerInfo {
+                                                    trigger_id: tid.clone(),
+                                                },
+                                            );
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
                 )
             })
+            .when(
+                !self.loading && self.error.is_none() && self.info.is_none() && url.is_none(),
+                |col| {
+                    col.child(
+                        div().text_xs().text_color(muted).child(
+                            "No additional workflow details are available for this trigger.",
+                        ),
+                    )
+                },
+            )
             .when(!description.is_empty(), |col| {
                 col.child(div().text_sm().text_color(fg).child(description))
             })
@@ -350,13 +409,18 @@ impl Render for CallingAppLauncher {
             )
             .child(
                 v_flex()
+                    .id("call-app-choices")
+                    .max_h(px(260.))
+                    .overflow_y_scroll()
                     .gap_1p5()
                     .children(self.apps.iter().enumerate().map(|(ix, calling_app)| {
                         let active = ix == self.selected_ix;
+                        let hover_bg = theme.accent;
                         h_flex()
                             .id(("call-app-choice", ix))
                             .items_center()
                             .justify_between()
+                            .gap_2()
                             .px_3()
                             .py_2()
                             .rounded_md()
@@ -367,20 +431,28 @@ impl Render for CallingAppLauncher {
                             } else {
                                 theme.muted
                             })
+                            .when(!active, |row| row.hover(move |el| el.bg(hover_bg)))
                             .cursor_pointer()
                             .child(
                                 h_flex()
+                                    .flex_1()
+                                    .min_w_0()
                                     .items_center()
                                     .gap_2()
                                     .child(
                                         Icon::new(IconName::Video)
+                                            .flex_none()
                                             .size(px(15.))
                                             .text_color(if active { link } else { muted }),
                                     )
                                     .child(
                                         v_flex()
+                                            .flex_1()
+                                            .min_w_0()
                                             .child(
                                                 div()
+                                                    .min_w_0()
+                                                    .truncate()
                                                     .text_sm()
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .text_color(fg)
@@ -388,6 +460,8 @@ impl Render for CallingAppLauncher {
                                             )
                                             .child(
                                                 div()
+                                                    .min_w_0()
+                                                    .truncate()
                                                     .text_xs()
                                                     .text_color(muted)
                                                     .child(calling_app.command.clone()),
@@ -395,7 +469,12 @@ impl Render for CallingAppLauncher {
                                     ),
                             )
                             .when(active, |row| {
-                                row.child(Icon::new(IconName::Check).size(px(14.)).text_color(link))
+                                row.child(
+                                    Icon::new(IconName::Check)
+                                        .flex_none()
+                                        .size(px(14.))
+                                        .text_color(link),
+                                )
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.selected_ix = ix;
@@ -463,6 +542,8 @@ impl Render for CallingAppLauncher {
                 h_flex()
                     .items_center()
                     .justify_between()
+                    .flex_wrap()
+                    .gap_2()
                     .pt_2()
                     .child(div().when_some(logout_cmd, |slot, cmd| {
                         slot.child(
@@ -482,6 +563,7 @@ impl Render for CallingAppLauncher {
                     }))
                     .child(
                         h_flex()
+                            .flex_none()
                             .gap_2()
                             .child(
                                 preferences::form_button(
@@ -492,8 +574,8 @@ impl Render for CallingAppLauncher {
                             )
                             .when_some(selected_for_run, |row, chosen| {
                                 let label = match mode {
-                                    CallMode::Video => format!("Start {} video call", chosen.name),
-                                    CallMode::Audio => format!("Start {} audio call", chosen.name),
+                                    CallMode::Video => "Start video call",
+                                    CallMode::Audio => "Start audio call",
                                 };
                                 row.child(
                                     preferences::form_button(

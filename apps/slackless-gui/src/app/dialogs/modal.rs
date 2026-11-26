@@ -451,7 +451,12 @@ impl AppModalStack {
                     .frames
                     .iter()
                     .rposition(|f| f.view_id == view_id)
-                    .or_else(|| self.frames.len().checked_sub(1));
+                    .or_else(|| {
+                        view_id
+                            .is_empty()
+                            .then(|| self.frames.len().checked_sub(1))
+                            .flatten()
+                    });
                 if let Some(ix) = target_ix {
                     let frame = &mut self.frames[ix];
                     frame.submitting = false;
@@ -473,7 +478,12 @@ impl AppModalStack {
                     .frames
                     .iter()
                     .rposition(|f| f.view_id == view_id)
-                    .or_else(|| self.frames.len().checked_sub(1));
+                    .or_else(|| {
+                        view_id
+                            .is_empty()
+                            .then(|| self.frames.len().checked_sub(1))
+                            .flatten()
+                    });
                 if let Some(ix) = target_ix {
                     let frame = &mut self.frames[ix];
                     frame.submitting = false;
@@ -556,7 +566,7 @@ impl AppModalStack {
 }
 
 impl Render for AppModalStack {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (border, muted, fg, danger, secondary) = (
             theme.border,
@@ -587,8 +597,6 @@ impl Render for AppModalStack {
         let team_id = top.team_id.clone();
         let submitting = top.submitting;
         let submit_error = top.submit_error.clone();
-
-        crate::blockkit::prepare_raw_inputs(&kit, &ts, &raw_blocks, window, cx);
 
         let app_for_links = self.app.clone();
         let links: crate::messages::LinkHandler = Rc::new(move |target, window, cx| {

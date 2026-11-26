@@ -523,12 +523,38 @@ impl Drop for ImageViewer {
 
 impl EventEmitter<ViewerEvent> for ImageViewer {}
 
+/// Result of routing a keystroke to an open [`ImageViewer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerKeyOutcome {
+    /// Caller should close the viewer and stop propagation.
+    Close,
+    /// Viewer handled the keystroke; caller should stop propagation.
+    Handled,
+    /// Keystroke was not consumed by the viewer (e.g., `Cmd+C` to copy transcript text).
+    Ignored,
+}
+
 impl ImageViewer {
-    /// Evict decoded full-resolution image textures loaded by this viewer from GPUI's window &
-    /// asset caches and immediately stop any active video playback or PDF render tasks.
+    /// Evict decoded full-resolution image and PDF page textures loaded by this viewer from GPUI's
+    /// window & asset caches and immediately stop any active video playback or PDF render tasks.
     pub fn evict_assets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_video();
+        let active_pdf_page = self
+            .pdf_playback
+            .as_ref()
+            .and_then(|pb| pb.rendered_page.clone());
         self.stop_pdf();
+        let pdf_ids: Vec<String> = self
+            .images
+            .iter()
+            .filter_map(|entry| entry.pdf.as_ref().map(|p| p.file_id.clone()))
+            .collect();
+        if !pdf_ids.is_empty() {
+            crate::media::evict_viewer_pdf_pages(&pdf_ids, window, cx);
+        }
+        if let Some(img) = active_pdf_page {
+            crate::media::evict_pdf_image(img, Some(window), cx);
+        }
         for entry in self.images.iter() {
             if let ImageSource::Resource(ref resource) = entry.source {
                 if let Some(Ok(data)) =
@@ -538,6 +564,138 @@ impl ImageViewer {
                 }
                 entry.source.remove_asset(cx);
             }
+        }
+    }
+
+    /// Handle keyboard shortcuts while the viewer is open, isolating image/video/PDF controls from
+    /// the underlying transcript and leaving system chords (such as `Cmd+C`) untouched.
+    pub fn handle_keystroke(
+        &mut self,
+        keystroke: &gpui_kit::gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ViewerKeyOutcome {
+        let mods = keystroke.modifiers;
+        let no_cmd = !mods.platform && !mods.control && !mods.alt;
+        match keystroke.key.as_str() {
+            "escape" => ViewerKeyOutcome::Close,
+            "left" if mods.shift && no_cmd => {
+                if self.is_video() {
+                    self.seek_video_relative(-5.0, window, cx);
+                    ViewerKeyOutcome::Handled
+                } else if self.is_pdf() {
+                    let _ = self.step_pdf_page(-1, window, cx);
+                    ViewerKeyOutcome::Handled
+                } else {
+                    ViewerKeyOutcome::Ignored
+                }
+            }
+            "right" if mods.shift && no_cmd => {
+                if self.is_video() {
+                    self.seek_video_relative(5.0, window, cx);
+                    ViewerKeyOutcome::Handled
+                } else if self.is_pdf() {
+                    let _ = self.step_pdf_page(1, window, cx);
+                    ViewerKeyOutcome::Handled
+                } else {
+                    ViewerKeyOutcome::Ignored
+                }
+            }
+            "left" if no_cmd && !mods.shift => {
+                if self.is_pdf() && self.item_count() == 1 {
+                    let _ = self.step_pdf_page(-1, window, cx);
+                } else {
+                    self.step(-1, window, cx);
+                }
+                ViewerKeyOutcome::Handled
+            }
+            "right" if no_cmd && !mods.shift => {
+                if self.is_pdf() && self.item_count() == 1 {
+                    let _ = self.step_pdf_page(1, window, cx);
+                } else {
+                    self.step(1, window, cx);
+                }
+                ViewerKeyOutcome::Handled
+            }
+            "pageup" | "[" if no_cmd => {
+                if self.is_pdf() {
+                    let _ = self.step_pdf_page(-1, window, cx);
+                    ViewerKeyOutcome::Handled
+                } else {
+                    ViewerKeyOutcome::Ignored
+                }
+            }
+            "pagedown" | "]" if no_cmd => {
+                if self.is_pdf() {
+                    let _ = self.step_pdf_page(1, window, cx);
+                    ViewerKeyOutcome::Handled
+                } else {
+                    ViewerKeyOutcome::Ignored
+                }
+            }
+            "up" if no_cmd && !mods.shift => {
+                if self.is_video() {
+                    self.adjust_video_volume(0.1, cx);
+                }
+                ViewerKeyOutcome::Handled
+            }
+            "down" if no_cmd && !mods.shift => {
+                if self.is_video() {
+                    self.adjust_video_volume(-0.1, cx);
+                }
+                ViewerKeyOutcome::Handled
+            }
+            "+" | "=" if !mods.control && !mods.alt => {
+                self.zoom_step(1, window, cx);
+                ViewerKeyOutcome::Handled
+            }
+            "-" | "_" if !mods.control && !mods.alt => {
+                self.zoom_step(-1, window, cx);
+                ViewerKeyOutcome::Handled
+            }
+            "0" if !mods.control && !mods.alt => {
+                self.reset_zoom(window, cx);
+                ViewerKeyOutcome::Handled
+            }
+            "space" if no_cmd && !mods.shift => {
+                if self.is_video() {
+                    self.toggle_video_play(window, cx);
+                }
+                ViewerKeyOutcome::Handled
+            }
+            "c" if no_cmd && !mods.shift => {
+                if self.is_video() {
+                    self.toggle_transcript(window, cx);
+                    ViewerKeyOutcome::Handled
+                } else {
+                    ViewerKeyOutcome::Ignored
+                }
+            }
+            "m" if no_cmd && !mods.shift => {
+                if self.is_video() {
+                    self.toggle_video_mute(cx);
+                    ViewerKeyOutcome::Handled
+                } else {
+                    ViewerKeyOutcome::Ignored
+                }
+            }
+            "j" if no_cmd && !mods.shift => {
+                if self.is_video() {
+                    self.seek_video_relative(-5.0, window, cx);
+                    ViewerKeyOutcome::Handled
+                } else {
+                    ViewerKeyOutcome::Ignored
+                }
+            }
+            "l" if no_cmd && !mods.shift => {
+                if self.is_video() {
+                    self.seek_video_relative(5.0, window, cx);
+                    ViewerKeyOutcome::Handled
+                } else {
+                    ViewerKeyOutcome::Ignored
+                }
+            }
+            _ => ViewerKeyOutcome::Ignored,
         }
     }
 
@@ -741,7 +899,7 @@ impl ImageViewer {
                 bg,
             )
             .await;
-            let _ = weak.update_in(cx, |viewer, _, cx| {
+            let _ = weak.update_in(cx, |viewer, window, cx| {
                 if viewer.pdf_gen != generation {
                     return;
                 }
@@ -755,6 +913,7 @@ impl ImageViewer {
                             VIEWER_PDF_MAX_H,
                             page_count,
                             rendered.clone(),
+                            Some(window),
                             cx,
                         );
                         viewer.pdf_playback = Some(ViewerPdfPlayback {
@@ -2783,8 +2942,152 @@ mod tests {
             assert_eq!(iv.read(cx).pdf_page(), 0);
             iv.update(cx, |v, cx| v.evict_assets(window, cx));
             assert!(iv.read(cx).pdf_playback.is_none());
+            assert!(
+                crate::media::cached_pdf_page(
+                    "F_LOCAL_PDF",
+                    0,
+                    VIEWER_PDF_MAX_W,
+                    VIEWER_PDF_MAX_H,
+                    cx
+                )
+                .is_none(),
+                "evict_assets must drop full-resolution viewer PDF pages from cache"
+            );
         });
         cx.run_until_parked();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[gpui::test]
+    fn viewer_keystroke_isolation_handles_image_video_and_pdf(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let ks = |spec: &'static str| gpui::Keystroke::parse(spec).unwrap();
+        let items = Rc::new(vec![
+            ViewerImage {
+                source: empty_placeholder_source(),
+                name: "photo.png".into(),
+                user: None,
+                taken_at: None,
+                download: None,
+                video: None,
+                pdf: None,
+            },
+            ViewerImage {
+                source: empty_placeholder_source(),
+                name: "demo.mp4".into(),
+                user: None,
+                taken_at: None,
+                download: None,
+                video: Some(ViewerVideo {
+                    file_id: "F_VID_KEYS".into(),
+                    url: String::new(),
+                    ext: "mp4".into(),
+                    duration_ms: Some(12_000),
+                    vtt_url: None,
+                    inline_transcript: Some("hello world".into()),
+                }),
+                pdf: None,
+            },
+            ViewerImage {
+                source: empty_placeholder_source(),
+                name: "deck.pdf".into(),
+                user: None,
+                taken_at: None,
+                download: None,
+                video: None,
+                pdf: Some(ViewerPdf {
+                    file_id: "F_PDF_KEYS".into(),
+                    url: String::new(),
+                    local_path: None,
+                    page_count: Some(2),
+                }),
+            },
+        ]);
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let entity = ImageViewer::new(
+                Arc::new(crate::fixtures::load()),
+                "#eng".into(),
+                items,
+                0,
+                window,
+                cx,
+            );
+            struct Host(Entity<ImageViewer>);
+            impl Render for Host {
+                fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                    self.0.clone()
+                }
+            }
+            Host(entity)
+        });
+        cx.update(|window, cx| {
+            let iv = host.read(cx).0.clone();
+            // On an image: up/down/space are absorbed so hidden transcript does not move;
+            // plain `c` and `Cmd+C` are ignored; `Escape` requests close; `Cmd+Left` ignored.
+            assert_eq!(
+                iv.update(cx, |v, cx| v.handle_keystroke(&ks("up"), window, cx)),
+                ViewerKeyOutcome::Handled
+            );
+            assert_eq!(
+                iv.update(cx, |v, cx| v.handle_keystroke(&ks("space"), window, cx)),
+                ViewerKeyOutcome::Handled
+            );
+            assert_eq!(
+                iv.update(cx, |v, cx| v.handle_keystroke(&ks("c"), window, cx)),
+                ViewerKeyOutcome::Ignored
+            );
+            assert_eq!(
+                iv.update(cx, |v, cx| v.handle_keystroke(&ks("cmd-c"), window, cx)),
+                ViewerKeyOutcome::Ignored
+            );
+            assert_eq!(
+                iv.update(cx, |v, cx| v.handle_keystroke(&ks("cmd-left"), window, cx)),
+                ViewerKeyOutcome::Ignored
+            );
+            assert_eq!(
+                iv.update(cx, |v, cx| v.handle_keystroke(&ks("escape"), window, cx)),
+                ViewerKeyOutcome::Close
+            );
+
+            // Step to video item: plain `c` toggles transcript, `Cmd+C` still passes through.
+            assert_eq!(
+                iv.update(cx, |v, cx| v.handle_keystroke(&ks("right"), window, cx)),
+                ViewerKeyOutcome::Handled
+            );
+            assert!(iv.read(cx).is_video());
+            assert_eq!(
+                iv.update(cx, |v, cx| v.handle_keystroke(&ks("cmd-c"), window, cx)),
+                ViewerKeyOutcome::Ignored
+            );
+            assert!(!iv.read(cx).showing_transcript());
+            assert_eq!(
+                iv.update(cx, |v, cx| v.handle_keystroke(&ks("c"), window, cx)),
+                ViewerKeyOutcome::Handled
+            );
+            assert!(iv.read(cx).showing_transcript());
+
+            // Step to PDF item: shift-left on page 0 is still Handled (no leak to hidden UI).
+            assert_eq!(
+                iv.update(cx, |v, cx| v.handle_keystroke(&ks("right"), window, cx)),
+                ViewerKeyOutcome::Handled
+            );
+            assert!(iv.read(cx).is_pdf());
+            assert_eq!(
+                iv.update(cx, |v, cx| v.handle_keystroke(
+                    &ks("shift-left"),
+                    window,
+                    cx
+                )),
+                ViewerKeyOutcome::Handled
+            );
+            assert_eq!(
+                iv.update(cx, |v, cx| v.handle_keystroke(&ks("up"), window, cx)),
+                ViewerKeyOutcome::Handled
+            );
+            iv.update(cx, |v, cx| v.evict_assets(window, cx));
+        });
     }
 }

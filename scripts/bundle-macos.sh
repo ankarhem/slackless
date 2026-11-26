@@ -51,8 +51,9 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
   fi
 fi
 
-BIN="$ROOT/target/$PROFILE/slackless-gui"
-CLI_BIN="$ROOT/target/$PROFILE/slackless"
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+BIN="$TARGET_DIR/$PROFILE/slackless-gui"
+CLI_BIN="$TARGET_DIR/$PROFILE/slackless"
 if [[ ! -x "$BIN" ]]; then
   echo "Expected binary not found at $BIN" >&2
   exit 1
@@ -60,7 +61,7 @@ fi
 
 VERSION="${SLACKLESS_VERSION:-$(awk -F'"' '/^version *=/{print $2; exit}' "$ROOT/Cargo.toml")}"
 BUNDLE_VERSION="${VERSION//-/.}"
-APP="$ROOT/target/bundle/Slackless.app"
+APP="$TARGET_DIR/bundle/Slackless.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
