@@ -2,6 +2,7 @@
 //! and client-side channel / people / DM matching.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use gpui_kit::gpui::Context;
@@ -49,6 +50,41 @@ pub(crate) fn clear_cached_onnx_embedder() {
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     *guard = None;
+}
+
+static SEMANTIC_DOWNLOAD_BUSY: AtomicBool = AtomicBool::new(false);
+static SEMANTIC_INDEX_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// RAII guard preventing concurrent model downloads or concurrent semantic index rebuilds across
+/// Search, Preferences, and the Archive & Storage dialog.
+pub(crate) struct SemanticTaskGuard(&'static AtomicBool);
+
+impl Drop for SemanticTaskGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+pub(crate) fn semantic_download_in_flight() -> bool {
+    SEMANTIC_DOWNLOAD_BUSY.load(Ordering::Acquire)
+}
+
+pub(crate) fn semantic_index_in_flight() -> bool {
+    SEMANTIC_INDEX_BUSY.load(Ordering::Acquire)
+}
+
+pub(crate) fn try_begin_semantic_download() -> Option<SemanticTaskGuard> {
+    SEMANTIC_DOWNLOAD_BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| SemanticTaskGuard(&SEMANTIC_DOWNLOAD_BUSY))
+}
+
+pub(crate) fn try_begin_semantic_index() -> Option<SemanticTaskGuard> {
+    SEMANTIC_INDEX_BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| SemanticTaskGuard(&SEMANTIC_INDEX_BUSY))
 }
 
 enum ResolvedSemanticIndex {
@@ -254,12 +290,6 @@ impl SearchView {
                     }
 
                     let (mut msgs_res, mut trs) = if let Some(ref backend) = semantic_backend {
-                        let effective_sort = if sort == SearchSort::Recent && mode.uses_embeddings()
-                        {
-                            SearchSort::Relevant
-                        } else {
-                            sort
-                        };
                         backend.with_index(|idx| {
                             let m = hybrid_search_stores(
                                 &targets,
@@ -267,7 +297,7 @@ impl SearchView {
                                 backend.embedder.as_ref(),
                                 &parsed,
                                 mode,
-                                effective_sort,
+                                sort,
                                 RESULT_LIMIT,
                             )
                             .map(|r| r.hits);
@@ -308,12 +338,6 @@ impl SearchView {
                         if !extra.is_empty() {
                             let (disk_msgs, disk_trs) = if let Some(ref backend) = semantic_backend
                             {
-                                let effective_sort =
-                                    if sort == SearchSort::Recent && mode.uses_embeddings() {
-                                        SearchSort::Relevant
-                                    } else {
-                                        sort
-                                    };
                                 backend.with_index(|idx| {
                                     let dm = hybrid_search_disk_archives(
                                         &extra,
@@ -321,7 +345,7 @@ impl SearchView {
                                         backend.embedder.as_ref(),
                                         &parsed,
                                         mode,
-                                        effective_sort,
+                                        sort,
                                         RESULT_LIMIT,
                                     )
                                     .ok()
@@ -356,7 +380,7 @@ impl SearchView {
                                 && let Some(extra_hits) = disk_msgs
                             {
                                 hits.extend(extra_hits);
-                                if mode.uses_embeddings() || sort == SearchSort::Relevant {
+                                if sort == SearchSort::Relevant {
                                     hits.sort_by(|a, b| {
                                         let ra = a.rank.unwrap_or(f64::INFINITY);
                                         let rb = b.rank.unwrap_or(f64::INFINITY);
@@ -406,6 +430,11 @@ impl SearchView {
         if self.semantic_indexing {
             return;
         }
+        let Some(task_guard) = try_begin_semantic_index() else {
+            self.semantic_status_note = Some("Semantic indexing is already running…".to_owned());
+            cx.notify();
+            return;
+        };
         self.semantic_indexing = true;
         self.semantic_status_note = Some("Indexing local archive for semantic search…".to_owned());
         cx.notify();
@@ -429,6 +458,7 @@ impl SearchView {
             let outcome: Result<String, String> = cx
                 .background_executor()
                 .spawn(async move {
+                    let _guard = task_guard;
                     let embedder: Arc<dyn Embedder> = match embedder_override {
                         Some(emb) => emb,
                         None => load_or_get_onnx_embedder()? as Arc<dyn Embedder>,

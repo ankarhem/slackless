@@ -979,7 +979,7 @@ impl SearchView {
             )
         };
 
-        let mut actions = h_flex().flex_none().items_center().gap_2();
+        let mut actions = h_flex().flex_none().flex_wrap().items_center().gap_2();
         if self.semantic_model_missing && !self.semantic_downloading {
             actions = actions
                 .child(
@@ -1018,6 +1018,7 @@ impl SearchView {
         Some(
             h_flex()
                 .flex_none()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
                 .gap_3()

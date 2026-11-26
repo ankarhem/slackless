@@ -375,6 +375,26 @@ pub fn index_disk_archives(
     Ok(combined)
 }
 
+/// Verify that `index` was built with the same model as `embedder` so we never compare
+/// incompatible vector spaces (e.g. two different 384-dim models like MiniLM vs BGE).
+fn validate_index_model(
+    index: &SemanticIndex,
+    embedder: &dyn Embedder,
+) -> std::result::Result<(), String> {
+    let stored_model = index
+        .model_id()
+        .map_err(|e| format!("failed to read semantic_index model metadata: {e}"))?;
+    if let Some(indexed_model) = stored_model
+        && indexed_model != embedder.model_id()
+    {
+        return Err(format!(
+            "semantic_index.sqlite was indexed with model '{indexed_model}', which does not match query model '{}'. Re-run `slackless archive index-semantic` with the matching model.",
+            embedder.model_id()
+        ));
+    }
+    Ok(())
+}
+
 /// Unified hybrid search across active in-memory/mounted [`WorkspaceSearchTarget`]s.
 ///
 /// - `SearchMode::Keyword`: pure FTS5 (`search_across_stores`).
@@ -400,6 +420,7 @@ pub fn hybrid_search_stores(
     if mode == SearchMode::Keyword || free_text.trim().is_empty() {
         return search_across_stores(targets, query, sort, limit).map_err(|e| e.to_string());
     }
+    validate_index_model(index, embedder)?;
 
     let candidate_limit = (limit.saturating_mul(3)).max(40);
     let workspaces: Vec<TeamId> = targets.iter().map(|t| t.workspace.clone()).collect();
@@ -477,6 +498,7 @@ pub fn hybrid_search_disk_archives(
     if mode == SearchMode::Keyword || free_text.trim().is_empty() {
         return search_disk_archives(archives, query, sort, limit).map_err(|e| e.to_string());
     }
+    validate_index_model(index, embedder)?;
 
     let candidate_limit = (limit.saturating_mul(3)).max(40);
     let mut opened: Vec<(TeamId, Option<String>, Store)> = Vec::new();
@@ -576,6 +598,7 @@ pub fn hybrid_search_huddle_transcripts_across_stores(
             targets, query, lang, limit,
         ));
     }
+    validate_index_model(index, embedder)?;
 
     let candidate_limit = (limit.saturating_mul(3)).max(40);
     let workspaces: Vec<TeamId> = targets.iter().map(|t| t.workspace.clone()).collect();
@@ -661,6 +684,7 @@ pub fn hybrid_search_huddle_transcripts_in_disk_archives(
             archives, query, lang, limit,
         ));
     }
+    validate_index_model(index, embedder)?;
 
     let candidate_limit = (limit.saturating_mul(3)).max(40);
     let workspaces: Vec<TeamId> = archives.iter().map(|(w, _)| w.clone()).collect();
@@ -1492,6 +1516,61 @@ mod tests {
         assert_eq!(trs.len(), 1);
         assert_eq!(trs[0].workspace, ws_b);
         assert_eq!(trs[0].segment.call_id, "R_BETA1");
+    }
+
+    #[test]
+    fn hybrid_search_rejects_cross_model_mismatch_with_same_dims() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ws = TeamId::from("T_MODEL");
+        seed_ws(&mut store, "T_MODEL", "Acme", "C1", "eng", "U1", "alice");
+        store
+            .upsert_message(
+                &ws,
+                &ChannelId::from("C1"),
+                &Message {
+                    ts: Ts::from("1700001000.000000"),
+                    user: Some(UserId::from("U1")),
+                    text: "Kubernetes cluster autoscaling".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let emb_a = HashProjectionEmbedder::with_model_id(384, "onnx:all-MiniLM-L6-v2");
+        let emb_b = HashProjectionEmbedder::with_model_id(384, "onnx:bge-small-en-v1.5");
+        let mut index = SemanticIndex::open_in_memory().unwrap();
+        index_store_documents(&store, &mut index, &emb_a, None, |_| {}).unwrap();
+
+        let targets = vec![WorkspaceSearchTarget {
+            workspace: ws,
+            workspace_name: Some("Acme".into()),
+            store: Arc::new(Mutex::new(store)),
+        }];
+        let q = SearchQuery::parse("kubernetes");
+        let err = hybrid_search_stores(
+            &targets,
+            &index,
+            &emb_b,
+            &q,
+            SearchMode::Semantic,
+            SearchSort::Relevant,
+            10,
+        )
+        .unwrap_err();
+        assert!(err.contains("all-MiniLM-L6-v2"));
+        assert!(err.contains("bge-small-en-v1.5"));
+
+        let tr_err = hybrid_search_huddle_transcripts_across_stores(
+            &targets,
+            &index,
+            &emb_b,
+            "kubernetes",
+            None,
+            SearchMode::Hybrid,
+            10,
+        )
+        .unwrap_err();
+        assert!(tr_err.contains("bge-small-en-v1.5"));
     }
 
     #[test]

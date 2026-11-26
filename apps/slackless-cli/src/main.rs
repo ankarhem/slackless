@@ -89,15 +89,7 @@ async fn dispatch(
     match cli.command {
         Commands::Search(args) if args.search_mode().uses_embeddings() => {
             let mode = args.search_mode();
-            let sort = if args.sort == crate::cli::SearchSortArg::Recent {
-                // Semantic/hybrid defaults to Relevant unless user passed `--sort recent`?
-                // Keep explicit Relevant when mode uses embeddings and sort is default,
-                // wait: honor `args.sort` cleanly — let's default semantic/hybrid to Relevant
-                // unless caller explicitly needs chronological sorting.
-                slackless_core::store::SearchSort::Relevant
-            } else {
-                args.sort.into()
-            };
+            let sort = args.resolved_sort();
             cmd_search_semantic(
                 ctx,
                 workspace,
@@ -119,7 +111,7 @@ async fn dispatch(
             &args.query,
             SearchAllOpts {
                 limit: args.limit,
-                sort: args.sort.into(),
+                sort: args.resolved_sort(),
                 format: args.format,
                 out: args.out.as_deref(),
                 include_deleted: args.include_deleted,
@@ -130,7 +122,7 @@ async fn dispatch(
             workspace,
             &args.query,
             args.limit,
-            args.sort.into(),
+            args.resolved_sort(),
             args.format,
             args.out.as_deref(),
             args.include_deleted,

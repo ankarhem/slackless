@@ -993,7 +993,7 @@ fn parses_unified_search_export_and_archive_cli_flags() {
     match cli.command {
         Commands::Search(args) => {
             assert!(args.all_workspaces);
-            assert_eq!(args.sort, SearchSortArg::Relevant);
+            assert_eq!(args.sort, Some(SearchSortArg::Relevant));
             assert_eq!(args.limit, 15);
             assert_eq!(args.query, "canary");
         }
@@ -1406,7 +1406,35 @@ fn cli_semantic_and_hybrid_search_and_archive_index_semantic_end_to_end() {
     let parsed_sem = Cli::try_parse_from(["slackless", "search", "--semantic", "rollback"])
         .expect("parse --semantic");
     match parsed_sem.command {
-        Commands::Search(args) => assert_eq!(args.search_mode(), SearchMode::Semantic),
+        Commands::Search(args) => {
+            assert_eq!(args.search_mode(), SearchMode::Semantic);
+            assert_eq!(args.resolved_sort(), SearchSort::Relevant);
+        }
+        _ => panic!("expected Search"),
+    }
+    let parsed_sem_recent = Cli::try_parse_from([
+        "slackless",
+        "search",
+        "--semantic",
+        "--sort",
+        "recent",
+        "rollback",
+    ])
+    .expect("parse --semantic --sort recent");
+    match parsed_sem_recent.command {
+        Commands::Search(args) => {
+            assert_eq!(args.search_mode(), SearchMode::Semantic);
+            assert_eq!(args.resolved_sort(), SearchSort::Recent);
+        }
+        _ => panic!("expected Search"),
+    }
+    let parsed_kw =
+        Cli::try_parse_from(["slackless", "search", "rollback"]).expect("parse keyword");
+    match parsed_kw.command {
+        Commands::Search(args) => {
+            assert_eq!(args.search_mode(), SearchMode::Keyword);
+            assert_eq!(args.resolved_sort(), SearchSort::Recent);
+        }
         _ => panic!("expected Search"),
     }
     let parsed_hyb = Cli::try_parse_from([
@@ -1420,6 +1448,7 @@ fn cli_semantic_and_hybrid_search_and_archive_index_semantic_end_to_end() {
     match parsed_hyb.command {
         Commands::Search(args) => {
             assert_eq!(args.search_mode(), SearchMode::Hybrid);
+            assert_eq!(args.resolved_sort(), SearchSort::Relevant);
             assert!(args.all_workspaces);
         }
         _ => panic!("expected Search"),

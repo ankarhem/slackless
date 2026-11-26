@@ -261,6 +261,7 @@ impl SearchView {
         self.mode = mode;
         if mode.uses_embeddings() {
             self.source = SearchSource::Local;
+            self.sort = SearchSort::Relevant;
             if self.semantic_embedder_override.is_none() {
                 let setup = detect_embedding_model_setup(EmbeddingModel::default());
                 self.semantic_model_missing = !setup.model_ready;
@@ -286,6 +287,11 @@ impl SearchView {
         if self.semantic_downloading {
             return;
         }
+        let Some(task_guard) = super::try_begin_semantic_download() else {
+            self.semantic_status_note = Some("Model download is already in progress…".to_owned());
+            cx.notify();
+            return;
+        };
         let model = EmbeddingModel::default();
         self.semantic_downloading = true;
         self.semantic_status_note = Some("Downloading all-MiniLM-L6-v2 (~23 MB)…".to_owned());
@@ -297,9 +303,10 @@ impl SearchView {
         let prog_writer = Arc::clone(&progress_note);
         let done_writer = Arc::clone(&done_result);
 
-        let _ = std::thread::Builder::new()
+        if let Err(err) = std::thread::Builder::new()
             .name("slackless-search-embed-dl".to_owned())
             .spawn(move || {
+                let _guard = task_guard;
                 let res = download_embedding_model(model, move |p| {
                     let pct = p
                         .total_bytes
@@ -321,7 +328,13 @@ impl SearchView {
                 if let Ok(mut g) = done_writer.lock() {
                     *g = Some(res);
                 }
-            });
+            })
+        {
+            self.semantic_downloading = false;
+            self.semantic_status_note = Some(format!("Failed to start download thread: {err}"));
+            cx.notify();
+            return;
+        }
 
         cx.spawn(async move |this, cx| {
             loop {

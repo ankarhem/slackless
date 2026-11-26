@@ -549,11 +549,12 @@ fn search_view_keyword_hybrid_semantic_modes_and_missing_model_prompt(cx: &mut T
 
     let view = cx.update(|cx| SearchView::new(Arc::new(fx), Some(archive), cx));
 
-    // Default mode is Keyword; switching to Semantic with injected backend finds semantic matches.
+    // Default mode is Keyword; switching to Semantic sets sort to Relevant and finds semantic matches.
     view.update(cx, |v, cx| {
         assert_eq!(v.mode(), SearchMode::Keyword);
         v.set_semantic_backend_for_test(Arc::clone(&embedder), Arc::clone(&shared_idx));
         v.set_mode(SearchMode::Semantic, cx);
+        assert_eq!(v.sort, slackless_core::store::SearchSort::Relevant);
         v.run("kubernetes autoscaler deploying".into(), cx);
     });
     cx.run_until_parked();
@@ -571,6 +572,17 @@ fn search_view_keyword_hybrid_semantic_modes_and_missing_model_prompt(cx: &mut T
                 .contains("Kubernetes")
         );
         assert!(v.local_hits_for_test()[0].semantic_score.is_some());
+    });
+
+    // Explicit `Most recent` toggle is honored in Semantic mode (not silently overridden).
+    view.update(cx, |v, cx| {
+        v.set_sort(slackless_core::store::SearchSort::Recent, cx);
+        assert_eq!(v.sort, slackless_core::store::SearchSort::Recent);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.sort, slackless_core::store::SearchSort::Recent);
+        assert!(!v.local_hits_for_test().is_empty());
     });
 
     // Hybrid mode blends FTS5 + semantic via RRF.

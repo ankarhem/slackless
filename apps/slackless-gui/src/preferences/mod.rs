@@ -71,6 +71,25 @@ pub(super) type Flag = fn(&mut Settings) -> &mut bool;
 /// Accessor for a radio group's / select's option index.
 pub(super) type Choice = fn(&mut Settings) -> &mut usize;
 
+/// Cached off-thread snapshot of local semantic embedding model + `semantic_index.sqlite` stats,
+/// refreshed asynchronously so GPUI render frames never block on SQLite or disk I/O.
+#[derive(Clone)]
+pub struct SemanticStorageSnapshot {
+    pub setup: slackless_core::embeddings::EmbeddingModelStatus,
+    pub stats: slackless_core::store::SemanticIndexStats,
+}
+
+impl SemanticStorageSnapshot {
+    /// Collect current model & index status (blocking — call on a background executor).
+    pub fn collect() -> Self {
+        let model = slackless_core::embeddings::EmbeddingModel::default();
+        Self {
+            setup: slackless_core::embeddings::detect_embedding_model_setup(model),
+            stats: slackless_core::semantic_index::default_semantic_index_stats(),
+        }
+    }
+}
+
 pub struct Preferences {
     pub(super) section: Section,
     pub(super) settings: Settings,
@@ -105,6 +124,7 @@ pub struct Preferences {
     pub(super) semantic_downloading: bool,
     pub(super) semantic_indexing: bool,
     pub(super) semantic_status_note: Option<String>,
+    pub(super) semantic_snapshot: Option<SemanticStorageSnapshot>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -280,6 +300,7 @@ impl Preferences {
                 semantic_downloading: false,
                 semantic_indexing: false,
                 semantic_status_note: None,
+                semantic_snapshot: None,
                 _subscriptions: subscriptions,
             }
         })
@@ -294,6 +315,35 @@ impl Preferences {
     /// Snapshot of the latest local SQLite & media cache metrics (if loaded).
     pub fn storage_stats_snapshot(&self) -> Option<StorageInfo> {
         self.storage_stats.clone()
+    }
+
+    /// Update the cached off-thread semantic model & vector index snapshot.
+    pub fn set_semantic_snapshot(
+        &mut self,
+        snapshot: SemanticStorageSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        self.semantic_snapshot = Some(snapshot);
+        cx.notify();
+    }
+
+    /// Return the latest cached semantic model & vector index snapshot (zero UI-thread I/O).
+    pub fn semantic_snapshot(&self) -> Option<SemanticStorageSnapshot> {
+        self.semantic_snapshot.clone()
+    }
+
+    /// Refresh `semantic_snapshot` off the UI thread.
+    pub fn refresh_semantic_snapshot(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let snap = cx
+                .background_executor()
+                .spawn(async move { SemanticStorageSnapshot::collect() })
+                .await;
+            let _ = this.update(cx, |prefs, cx| {
+                prefs.set_semantic_snapshot(snap, cx);
+            });
+        })
+        .detach();
     }
 
     /// Update the live workspace backfill progress shown in Preferences -> Advanced.
@@ -387,6 +437,9 @@ impl Preferences {
             self.refresh_audio_devices_and_probe(cx);
         } else {
             self.stop_mic_probe(cx);
+        }
+        if section == Section::Advanced {
+            self.refresh_semantic_snapshot(cx);
         }
         cx.notify();
     }

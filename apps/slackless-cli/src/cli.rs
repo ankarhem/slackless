@@ -56,9 +56,9 @@ pub(crate) struct SearchArgs {
     /// Search across every locally archived workspace at once (messages, snippets, canvases, transcripts).
     #[arg(long)]
     pub(crate) all_workspaces: bool,
-    /// Sort order (`recent` = newest first, `relevant` = FTS5 BM25 relevance).
-    #[arg(long, value_enum, default_value_t = SearchSortArg::Recent)]
-    pub(crate) sort: SearchSortArg,
+    /// Sort order (`recent` = newest first, `relevant` = BM25/semantic relevance; defaults to `recent` for keyword and `relevant` for `--semantic`/`--hybrid`).
+    #[arg(long, value_enum)]
+    pub(crate) sort: Option<SearchSortArg>,
     /// Search using local ONNX semantic embeddings instead of keyword FTS5.
     #[arg(long, conflicts_with = "hybrid")]
     pub(crate) semantic: bool,
@@ -87,6 +87,16 @@ impl SearchArgs {
             slackless_core::store::SearchMode::Hybrid
         } else {
             slackless_core::store::SearchMode::Keyword
+        }
+    }
+
+    pub(crate) fn resolved_sort(&self) -> slackless_core::store::SearchSort {
+        match self.sort {
+            Some(explicit) => explicit.into(),
+            None if self.search_mode().uses_embeddings() => {
+                slackless_core::store::SearchSort::Relevant
+            }
+            None => slackless_core::store::SearchSort::Recent,
         }
     }
 }

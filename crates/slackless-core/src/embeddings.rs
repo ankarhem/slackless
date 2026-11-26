@@ -270,50 +270,74 @@ async fn download_files_to_dir(
             continue;
         }
         let part_path = dest_dir.join(format!("{name}.part"));
-        let mut resp = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("download failed for {name}: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {} downloading {name}", resp.status()));
-        }
-        let total_bytes = resp.content_length();
-        let mut file = std::fs::File::create(&part_path)
-            .map_err(|e| format!("cannot create {}: {e}", part_path.display()))?;
-        let mut downloaded: u64 = 0;
-        let mut last_emit: u64 = 0;
-        on_progress(EmbeddingDownloadProgress {
-            file_name: name.to_owned(),
-            file_index: idx + 1,
-            file_count,
-            downloaded_bytes: 0,
-            total_bytes,
-        });
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| format!("stream error downloading {name}: {e}"))?
-        {
-            file.write_all(&chunk)
-                .map_err(|e| format!("write error for {name}: {e}"))?;
-            downloaded = downloaded.saturating_add(chunk.len() as u64);
-            if downloaded.saturating_sub(last_emit) >= 256 * 1024 {
-                last_emit = downloaded;
-                on_progress(EmbeddingDownloadProgress {
-                    file_name: name.to_owned(),
-                    file_index: idx + 1,
-                    file_count,
-                    downloaded_bytes: downloaded,
-                    total_bytes,
-                });
+        let download_res: std::result::Result<(u64, Option<u64>), String> = async {
+            let mut resp = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| format!("download failed for {name}: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("HTTP {} downloading {name}", resp.status()));
             }
+            let total_bytes = resp.content_length();
+            if total_bytes == Some(0) {
+                return Err(format!("empty 0-byte response downloading {name}"));
+            }
+            let mut file = std::fs::File::create(&part_path)
+                .map_err(|e| format!("cannot create {}: {e}", part_path.display()))?;
+            let mut downloaded: u64 = 0;
+            let mut last_emit: u64 = 0;
+            on_progress(EmbeddingDownloadProgress {
+                file_name: name.to_owned(),
+                file_index: idx + 1,
+                file_count,
+                downloaded_bytes: 0,
+                total_bytes,
+            });
+            while let Some(chunk) = resp
+                .chunk()
+                .await
+                .map_err(|e| format!("stream error downloading {name}: {e}"))?
+            {
+                file.write_all(&chunk)
+                    .map_err(|e| format!("write error for {name}: {e}"))?;
+                downloaded = downloaded.saturating_add(chunk.len() as u64);
+                if downloaded.saturating_sub(last_emit) >= 256 * 1024 {
+                    last_emit = downloaded;
+                    on_progress(EmbeddingDownloadProgress {
+                        file_name: name.to_owned(),
+                        file_index: idx + 1,
+                        file_count,
+                        downloaded_bytes: downloaded,
+                        total_bytes,
+                    });
+                }
+            }
+            file.flush()
+                .map_err(|e| format!("flush error for {name}: {e}"))?;
+            drop(file);
+            if downloaded == 0 {
+                return Err(format!("downloaded 0 bytes for {name}"));
+            }
+            if let Some(expected) = total_bytes
+                && downloaded != expected
+            {
+                return Err(format!(
+                    "truncated download for {name}: got {downloaded} of {expected} bytes"
+                ));
+            }
+            std::fs::rename(&part_path, &final_path)
+                .map_err(|e| format!("rename error for {name}: {e}"))?;
+            Ok((downloaded, total_bytes))
         }
-        file.flush()
-            .map_err(|e| format!("flush error for {name}: {e}"))?;
-        drop(file);
-        std::fs::rename(&part_path, &final_path)
-            .map_err(|e| format!("rename error for {name}: {e}"))?;
+        .await;
+        let (downloaded, total_bytes) = match download_res {
+            Ok(ok) => ok,
+            Err(err) => {
+                let _ = std::fs::remove_file(&part_path);
+                return Err(err);
+            }
+        };
         on_progress(EmbeddingDownloadProgress {
             file_name: name.to_owned(),
             file_index: idx + 1,
@@ -713,55 +737,97 @@ impl OnnxEmbedder {
             .map_err(|e| format!("failed to extract f32 embedding tensor: {e}"))?;
 
         let dims_slice: Vec<usize> = shape.iter().map(|&d| d.max(0) as usize).collect();
-        match dims_slice.as_slice() {
-            // [batch, seq_len, hidden_dim] -> CLS or attention-masked mean pooling.
-            [b, s, h] if *b == batch_size && *h > 0 => {
-                let mut results = Vec::with_capacity(batch_size);
-                for bi in 0..batch_size {
-                    let mut pooled = vec![0.0_f32; *h];
-                    if self.model.uses_cls_pooling() {
-                        let start = bi * (*s) * (*h);
-                        pooled.copy_from_slice(&data[start..start + *h]);
-                    } else {
-                        let mut weight_sum = 0.0_f32;
-                        for si in 0..(*s) {
-                            let m = flat_mask[bi * seq_len + si] as f32;
-                            if m <= 0.0 {
-                                continue;
-                            }
-                            weight_sum += m;
-                            let offset = (bi * (*s) + si) * (*h);
-                            for (dst, &val) in pooled.iter_mut().zip(&data[offset..offset + *h]) {
-                                *dst += val * m;
-                            }
+        pool_embedding_tensor(
+            &dims_slice,
+            data,
+            batch_size,
+            seq_len,
+            &flat_mask,
+            self.model.uses_cls_pooling(),
+        )
+    }
+}
+
+/// Pool a raw ONNX embedding output tensor (`[batch, seq_len, hidden]` or `[batch, hidden]`)
+/// with strict bounds validation so malformed ONNX outputs return `Err` instead of panicking.
+fn pool_embedding_tensor(
+    shape: &[usize],
+    data: &[f32],
+    batch_size: usize,
+    seq_len: usize,
+    flat_mask: &[i64],
+    uses_cls_pooling: bool,
+) -> std::result::Result<Vec<Vec<f32>>, String> {
+    match shape {
+        // [batch, seq_len, hidden_dim] -> CLS or attention-masked mean pooling.
+        [b, s, h] if *b == batch_size && *s > 0 && *s <= seq_len && *h > 0 => {
+            let needed = b
+                .checked_mul(*s)
+                .and_then(|v| v.checked_mul(*h))
+                .ok_or_else(|| "ONNX output tensor dimensions overflowed".to_owned())?;
+            let mask_needed = batch_size
+                .checked_mul(seq_len)
+                .ok_or_else(|| "attention mask dimensions overflowed".to_owned())?;
+            if data.len() < needed || flat_mask.len() < mask_needed {
+                return Err(format!(
+                    "ONNX output tensor buffer too short: got {} elements for shape {shape:?}",
+                    data.len()
+                ));
+            }
+            let mut results = Vec::with_capacity(batch_size);
+            for bi in 0..batch_size {
+                let mut pooled = vec![0.0_f32; *h];
+                if uses_cls_pooling {
+                    let start = bi * (*s) * (*h);
+                    pooled.copy_from_slice(&data[start..start + *h]);
+                } else {
+                    let mut weight_sum = 0.0_f32;
+                    for si in 0..(*s) {
+                        let m = flat_mask[bi * seq_len + si] as f32;
+                        if m <= 0.0 {
+                            continue;
                         }
-                        if weight_sum > 0.0 {
-                            let inv = 1.0 / weight_sum;
-                            for v in &mut pooled {
-                                *v *= inv;
-                            }
+                        weight_sum += m;
+                        let offset = (bi * (*s) + si) * (*h);
+                        for (dst, &val) in pooled.iter_mut().zip(&data[offset..offset + *h]) {
+                            *dst += val * m;
                         }
                     }
-                    l2_normalize(&mut pooled);
-                    results.push(pooled);
+                    if weight_sum > 0.0 {
+                        let inv = 1.0 / weight_sum;
+                        for v in &mut pooled {
+                            *v *= inv;
+                        }
+                    }
                 }
-                Ok(results)
+                l2_normalize(&mut pooled);
+                results.push(pooled);
             }
-            // [batch, hidden_dim] -> pre-pooled sentence embeddings.
-            [b, h] if *b == batch_size && *h > 0 => {
-                let mut results = Vec::with_capacity(batch_size);
-                for bi in 0..batch_size {
-                    let start = bi * (*h);
-                    let mut vec = data[start..start + *h].to_vec();
-                    l2_normalize(&mut vec);
-                    results.push(vec);
-                }
-                Ok(results)
-            }
-            other => Err(format!(
-                "unexpected ONNX embedding output tensor shape: {other:?}"
-            )),
+            Ok(results)
         }
+        // [batch, hidden_dim] -> pre-pooled sentence embeddings.
+        [b, h] if *b == batch_size && *h > 0 => {
+            let needed = b
+                .checked_mul(*h)
+                .ok_or_else(|| "ONNX output tensor dimensions overflowed".to_owned())?;
+            if data.len() < needed {
+                return Err(format!(
+                    "ONNX output tensor buffer too short: got {} elements for shape {shape:?}",
+                    data.len()
+                ));
+            }
+            let mut results = Vec::with_capacity(batch_size);
+            for bi in 0..batch_size {
+                let start = bi * (*h);
+                let mut vec = data[start..start + *h].to_vec();
+                l2_normalize(&mut vec);
+                results.push(vec);
+            }
+            Ok(results)
+        }
+        other => Err(format!(
+            "unexpected ONNX embedding output tensor shape: {other:?}"
+        )),
     }
 }
 
@@ -1010,5 +1076,26 @@ mod tests {
         assert_eq!(h1.len(), 64);
         assert_eq!(h1, h2);
         assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn pool_embedding_tensor_validates_bounds_and_masks() {
+        // Mean pooling ignores masked-out padding tokens.
+        let data = vec![2.0, 0.0, 0.0, 2.0, 100.0, 100.0];
+        let mask = vec![1, 1, 0];
+        let mean = pool_embedding_tensor(&[1, 3, 2], &data, 1, 3, &mask, false).unwrap();
+        assert_eq!(mean.len(), 1);
+        assert!((mean[0][0] - mean[0][1]).abs() < 1e-5);
+
+        // CLS pooling takes token 0 only.
+        let cls = pool_embedding_tensor(&[1, 3, 2], &data, 1, 3, &mask, true).unwrap();
+        assert!((cls[0][0] - 1.0).abs() < 1e-5);
+        assert!(cls[0][1].abs() < 1e-5);
+
+        // Out-of-bounds sequence length or truncated buffers return Err cleanly instead of panicking.
+        assert!(pool_embedding_tensor(&[1, 4, 2], &data, 1, 3, &mask, false).is_err());
+        assert!(pool_embedding_tensor(&[1, 0, 2], &data, 1, 3, &mask, false).is_err());
+        assert!(pool_embedding_tensor(&[1, 3, 2], &data[..4], 1, 3, &mask, false).is_err());
+        assert!(pool_embedding_tensor(&[1, 4], &[1.0, 2.0], 1, 3, &mask, false).is_err());
     }
 }
