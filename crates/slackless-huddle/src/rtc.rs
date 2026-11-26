@@ -47,7 +47,7 @@ use webrtc::rtp_transceiver::{
 };
 
 use crate::proto::SdkTurnCredentials;
-use crate::signaling::ClientMetricsSnapshot;
+use crate::signaling::{ClientMetricsSnapshot, PLACEHOLDER_STUN_RTT_MS};
 use crate::{HuddleError, Result};
 
 const OPUS_PAYLOAD_TYPE: PayloadType = 111;
@@ -1023,7 +1023,7 @@ impl ChimeRtcPeer {
         let (tx_pkts, tx_bytes) = self.sent.take_delta();
         let (rx_pkts, rx_bytes) = self.received.take_delta();
         ClientMetricsSnapshot {
-            stun_rtt_ms: 25.0,
+            stun_rtt_ms: PLACEHOLDER_STUN_RTT_MS,
             mic_pps: tx_pkts as f64,
             mic_bitrate_bps: tx_bytes as f64 * 8.0,
             mic_audio_level: (local_rms as f64 * 32767.0).clamp(0.0, 32767.0),

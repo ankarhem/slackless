@@ -23,7 +23,7 @@ use crate::proto::sdk_signal_frame;
 use crate::rtc::{ChimeRtcPeer, VideoSenderFeedback};
 use crate::screen::{SCREEN_BITRATE_BPS, SCREEN_MAX_FPS, SCREEN_MAX_H, SCREEN_MAX_W};
 use crate::signaling::{
-    ChimeSignalClient, ClientMetricsSnapshot, build_client_metric_frame,
+    ChimeSignalClient, ClientMetricsSnapshot, PLACEHOLDER_STUN_RTT_MS, build_client_metric_frame,
     build_content_subscribe_frame, build_join_frame, decode_sdp_answer,
 };
 use crate::{HuddleCredentials, HuddleError, Result};
@@ -360,7 +360,7 @@ impl ContentShareSession {
                     }
                     _ = metric_tick.tick() => {
                         let stats = ClientMetricsSnapshot {
-                            stun_rtt_ms: 25.0,
+                            stun_rtt_ms: PLACEHOLDER_STUN_RTT_MS,
                             ..Default::default()
                         };
                         let _ = sig.send_frame(&build_client_metric_frame(stats)).await;

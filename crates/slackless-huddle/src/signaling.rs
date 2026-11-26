@@ -604,6 +604,10 @@ pub fn build_pong_frame(ping_id: u32) -> SdkSignalFrame {
     }
 }
 
+/// STUN round-trip time reported in `CLIENT_METRIC`. A fixed placeholder: Chime wants the
+/// metric present, and the peer connection's measured candidate-pair RTT is not read yet.
+pub(crate) const PLACEHOLDER_STUN_RTT_MS: f64 = 25.0;
+
 /// Snapshot of real audio/transport stats sent every 1s inside `CLIENT_METRIC`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClientMetricsSnapshot {
