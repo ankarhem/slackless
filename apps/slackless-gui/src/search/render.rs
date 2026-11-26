@@ -34,15 +34,19 @@ impl SearchView {
                 } else {
                     ""
                 };
-                let mode_tag = match self.mode {
-                    SearchMode::Keyword => "local",
-                    SearchMode::Hybrid => "hybrid",
-                    SearchMode::Semantic => "semantic",
-                };
-                match self.local_results.len() {
-                    0 => format!("Local · {mode_tag}{scope_note}"),
-                    1 => format!("1 {mode_tag} hit{scope_note}"),
-                    n => format!("{n} {mode_tag} hits{scope_note}"),
+                if self.local_loading {
+                    format!("Searching…{scope_note}")
+                } else {
+                    let mode_tag = match self.mode {
+                        SearchMode::Keyword => "local",
+                        SearchMode::Hybrid => "hybrid",
+                        SearchMode::Semantic => "semantic",
+                    };
+                    match self.local_results.len() {
+                        0 => format!("Local · {mode_tag}{scope_note}"),
+                        1 => format!("1 {mode_tag} hit{scope_note}"),
+                        n => format!("{n} {mode_tag} hits{scope_note}"),
+                    }
                 }
             }
             (SearchTab::Messages, SearchSource::Remote) => {
@@ -60,10 +64,14 @@ impl SearchView {
                 } else {
                     ""
                 };
-                match self.transcript_results.len() {
-                    0 => format!("Huddle transcripts · instant{scope_note}"),
-                    1 => format!("1 transcript hit{scope_note}"),
-                    n => format!("{n} transcript hits{scope_note}"),
+                if self.local_loading {
+                    format!("Searching…{scope_note}")
+                } else {
+                    match self.transcript_results.len() {
+                        0 => format!("Huddle transcripts · instant{scope_note}"),
+                        1 => format!("1 transcript hit{scope_note}"),
+                        n => format!("{n} transcript hits{scope_note}"),
+                    }
                 }
             }
             (SearchTab::Files, _) => {
@@ -392,7 +400,19 @@ impl SearchView {
     fn empty_state(&self, cx: &mut Context<Self>) -> Div {
         let (title, hint, offer_remote) = match (self.tab, self.source) {
             (SearchTab::Messages, SearchSource::Local) => {
-                if self.archive.is_none() {
+                if self.local_loading {
+                    (
+                        format!(
+                            "Searching local archives for \u{201C}{}\u{201D}…",
+                            self.query
+                        ),
+                        "Querying your local FTS5 archive index.",
+                        false,
+                    )
+                } else if self.archive.is_none()
+                    && (self.scope == SearchScope::CurrentWorkspace
+                        || self.workspace_sources.is_empty())
+                {
                     (
                         "Your local archive is empty".to_owned(),
                         "Messages you open are cached locally for instant offline search.",
@@ -460,14 +480,27 @@ impl SearchView {
                     )
                 }
             }
-            (SearchTab::Transcripts, _) => (
-                format!(
-                    "No huddle transcript matches for \u{201C}{}\u{201D}",
-                    self.query
-                ),
-                "Finalized live captions and local multilingual (EN/SV) huddle transcripts are indexed here automatically.",
-                false,
-            ),
+            (SearchTab::Transcripts, _) => {
+                if self.local_loading {
+                    (
+                        format!(
+                            "Searching huddle transcripts for \u{201C}{}\u{201D}…",
+                            self.query
+                        ),
+                        "Querying local multilingual (EN/SV) huddle transcript archives.",
+                        false,
+                    )
+                } else {
+                    (
+                        format!(
+                            "No huddle transcript matches for \u{201C}{}\u{201D}",
+                            self.query
+                        ),
+                        "Finalized live captions and local multilingual (EN/SV) huddle transcripts are indexed here automatically.",
+                        false,
+                    )
+                }
+            }
             (SearchTab::Channels | SearchTab::People | SearchTab::Dms, _) => {
                 ("No matches".to_owned(), "Try another query.", false)
             }

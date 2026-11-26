@@ -824,8 +824,8 @@ impl App {
         };
         let markdown_export =
             slackless_core::export::render_huddle_transcript_markdown(&export_doc);
-        let json_export =
-            slackless_core::export::render_huddle_transcript_json(&export_doc).unwrap_or_default();
+        let json_export = slackless_core::export::render_huddle_transcript_json(&export_doc)
+            .map_err(|e| e.to_string());
         let suggested_stem =
             slackless_core::export::sanitize_export_filename(&call_id, "huddle-transcript");
 
@@ -1068,8 +1068,14 @@ impl App {
                                 cx,
                             )
                             .on_click(move |_, window, cx| {
+                                let content = match save_json.clone() {
+                                    Ok(c) => c,
+                                    Err(err) => {
+                                        notify("Export failed", err, window, cx);
+                                        return;
+                                    }
+                                };
                                 let suggested = format!("{stem_json}.json");
-                                let content = save_json.clone();
                                 let rx = cx.prompt_for_new_path(&dir_json, Some(&suggested));
                                 window
                                     .spawn(cx, async move |cx| {
@@ -1540,7 +1546,7 @@ impl App {
             self.bridge.send(WorkspaceCommand::QueryBackfillProgress);
         }
         let this = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let theme = cx.theme();
             let (border, muted, fg, accent, success, danger, card_bg, pill_bg) = (
                 theme.border,
@@ -1854,6 +1860,7 @@ impl App {
             let maintenance = h_flex()
                 .items_center()
                 .justify_between()
+                .flex_wrap()
                 .gap_2()
                 .pt_2()
                 .border_t_1()
@@ -1861,6 +1868,7 @@ impl App {
                 .child(
                     h_flex()
                         .items_center()
+                        .flex_wrap()
                         .gap_2()
                         .child(
                             preferences::form_button(
@@ -2029,8 +2037,13 @@ impl App {
                         }),
                 );
 
+            let max_body_h = (window.viewport_size().height * 0.78).max(px(360.));
             dialog.title("Archive & Storage").w(px(620.)).child(
                 v_flex()
+                    .id("storage-dialog-body")
+                    .max_h(max_body_h)
+                    .overflow_y_scroll()
+                    .on_scroll(|_, _, cx| cx.stop_propagation())
                     .gap_3()
                     .child(stats_card)
                     .child(semantic_card)
@@ -2263,8 +2276,11 @@ fn collect_storage_info(
             .sum()
     }
     let stats = store.lock().ok()?.stats(team).ok()?;
-    let media_cache_bytes = dir_bytes(&std::env::temp_dir().join("slackless-media"))
+    let mut media_cache_bytes = dir_bytes(&std::env::temp_dir().join("slackless-media"))
         .saturating_add(dir_bytes(&std::env::temp_dir().join("slackless-audio")));
+    if let Some(cache) = slackless_core::Fetcher::disk_cache_dir() {
+        media_cache_bytes = media_cache_bytes.saturating_add(dir_bytes(&cache));
+    }
     Some(crate::preferences::StorageInfo {
         messages: stats.messages,
         revisions: stats.revisions,

@@ -114,6 +114,8 @@ pub struct SearchView {
     /// Instant local FTS5 / semantic / hybrid hits (single-workspace or cross-workspace).
     pub(super) local_results: Vec<UnifiedSearchHit>,
     pub(super) local_error: Option<String>,
+    /// True while a background local search query is in flight for the current `local_gen`.
+    pub(super) local_loading: bool,
     /// True when Hybrid/Semantic mode is active and the local ONNX embedding model is missing.
     pub(super) semantic_model_missing: bool,
     /// True when Hybrid/Semantic mode is active, the model is ready, but no docs are indexed yet.
@@ -176,6 +178,7 @@ impl SearchView {
             remote_auto: false,
             local_results: Vec::new(),
             local_error: None,
+            local_loading: false,
             semantic_model_missing: false,
             semantic_index_empty: false,
             semantic_downloading: false,
@@ -200,6 +203,12 @@ impl SearchView {
             excluded_channels: Vec::new(),
             include_deleted: false,
         })
+    }
+
+    /// Register all available workspace stores (active + parked live stores or sample workspaces)
+    /// for cross-workspace local FTS5 search without triggering an immediate re-query.
+    pub fn set_workspace_sources_quiet(&mut self, sources: Vec<SearchWorkspaceSource>) {
+        self.workspace_sources = sources;
     }
 
     /// Register all available workspace stores (active + parked live stores or sample workspaces)
@@ -405,6 +414,16 @@ impl SearchView {
         &self.local_results
     }
 
+    #[cfg(test)]
+    pub fn is_local_loading_for_test(&self) -> bool {
+        self.local_loading
+    }
+
+    #[cfg(test)]
+    pub fn remote_messages_len_for_test(&self) -> usize {
+        self.remote_messages.len()
+    }
+
     /// Live refresh: the query and its results stay; names come from `fixtures`.
     /// Preserves `self.workspace` once initialized so workspace index > 0 is never clobbered.
     pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
@@ -449,6 +468,9 @@ impl SearchView {
         if query != self.remote_query_string() || sort != self.api_sort() {
             return;
         }
+        if page > 1 && page != self.remote_messages_page + 1 {
+            return;
+        }
         self.remote_messages_loading = false;
         match result {
             Ok(data) => {
@@ -479,6 +501,9 @@ impl SearchView {
         cx: &mut Context<Self>,
     ) {
         if query != self.remote_query_string() || sort != self.api_sort() {
+            return;
+        }
+        if page > 1 && page != self.remote_files_page + 1 {
             return;
         }
         self.remote_files_loading = false;

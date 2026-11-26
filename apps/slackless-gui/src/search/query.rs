@@ -152,9 +152,10 @@ impl SearchView {
         self.local_results.clear();
         self.transcript_results.clear();
         self.local_error = None;
-        let (Some(archive), false) = (self.archive.clone(), self.query.is_empty()) else {
+        self.local_loading = false;
+        if self.query.is_empty() {
             return;
-        };
+        }
         let mut parsed = SearchQuery::parse(&self.query);
         parsed
             .filters
@@ -195,19 +196,18 @@ impl SearchView {
         let scope = self.scope;
         let is_sample = self.fixtures.sample;
         let targets: Vec<WorkspaceSearchTarget> = match scope {
-            SearchScope::CurrentWorkspace => vec![WorkspaceSearchTarget {
-                workspace: workspace.clone(),
-                workspace_name,
-                store: archive,
-            }],
+            SearchScope::CurrentWorkspace => self
+                .archive
+                .clone()
+                .map(|store| WorkspaceSearchTarget {
+                    workspace: workspace.clone(),
+                    workspace_name,
+                    store,
+                })
+                .into_iter()
+                .collect(),
             SearchScope::AllWorkspaces => {
-                if self.workspace_sources.is_empty() {
-                    vec![WorkspaceSearchTarget {
-                        workspace: workspace.clone(),
-                        workspace_name,
-                        store: archive,
-                    }]
-                } else {
+                if !self.workspace_sources.is_empty() {
                     self.workspace_sources
                         .iter()
                         .map(|src| WorkspaceSearchTarget {
@@ -216,9 +216,23 @@ impl SearchView {
                             store: src.store.clone(),
                         })
                         .collect()
+                } else {
+                    self.archive
+                        .clone()
+                        .map(|store| WorkspaceSearchTarget {
+                            workspace: workspace.clone(),
+                            workspace_name,
+                            store,
+                        })
+                        .into_iter()
+                        .collect()
                 }
             }
         };
+        if targets.is_empty() && (scope == SearchScope::CurrentWorkspace || is_sample) {
+            return;
+        }
+        self.local_loading = true;
         let sort = self.sort;
         let mode = self.mode;
         let query = self.query.clone();
@@ -411,6 +425,7 @@ impl SearchView {
                 if view.local_gen != generation {
                     return;
                 }
+                view.local_loading = false;
                 view.semantic_model_missing = model_missing;
                 view.semantic_index_empty = index_empty;
                 view.transcript_results = transcripts;

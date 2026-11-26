@@ -609,33 +609,17 @@ impl Render for PopoutWindow {
             .on_key_down(
                 cx.listener(|this, event: &gpui_kit::gpui::KeyDownEvent, window, cx| {
                     if let Some(viewer) = this.image_viewer.clone() {
-                        match event.keystroke.key.as_str() {
-                            "escape" => {
+                        match viewer
+                            .update(cx, |v, cx| v.handle_keystroke(&event.keystroke, window, cx))
+                        {
+                            crate::image_viewer::ViewerKeyOutcome::Close => {
                                 this.close_image_viewer(window, cx);
                                 cx.stop_propagation();
                             }
-                            "left" => {
-                                viewer.update(cx, |v, cx| v.step(-1, window, cx));
+                            crate::image_viewer::ViewerKeyOutcome::Handled => {
                                 cx.stop_propagation();
                             }
-                            "right" => {
-                                viewer.update(cx, |v, cx| v.step(1, window, cx));
-                                cx.stop_propagation();
-                            }
-                            "space" => {
-                                let handled = viewer.update(cx, |v, cx| {
-                                    if v.is_video() {
-                                        v.toggle_video_play(window, cx);
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                });
-                                if handled {
-                                    cx.stop_propagation();
-                                }
-                            }
-                            _ => {}
+                            crate::image_viewer::ViewerKeyOutcome::Ignored => {}
                         }
                     } else if event.keystroke.key == "escape"
                         && (this.picker.take().is_some() || this.editing.take().is_some())

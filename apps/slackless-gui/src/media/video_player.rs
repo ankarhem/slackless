@@ -321,7 +321,8 @@ pub fn active_pip_video(image_viewer_open: bool, cx: &mut App) -> Option<PipVide
     let mgr = cx.global_mut::<InlineVideoManager>();
     let active = mgr.active.as_mut()?;
     if image_viewer_open {
-        active.pip_engaged = false;
+        // Hide PiP while the full-screen viewer covers the window, without wiping `pip_engaged`
+        // so a paused PiP dock is preserved if the user opens an unrelated image and closes it.
         return None;
     }
     if active.confirmed_inline_visible {
@@ -363,6 +364,31 @@ pub fn stop_active_inline_video(window: &mut Window, cx: &mut App) {
 pub fn is_hls_url(url: &str) -> bool {
     let base = url.split(['?', '#']).next().unwrap_or(url);
     base.to_ascii_lowercase().ends_with(".m3u8")
+}
+
+/// Compute `(dock_width, stage_height)` for the floating Picture-in-Picture mini-player based on
+/// the decoded video dimensions so portrait, square, and landscape videos all render cleanly
+/// without squishing portrait clips or clipping the transport bar.
+pub fn pip_stage_dimensions(width: u32, height: u32) -> (f32, f32) {
+    if width == 0 || height == 0 {
+        return (288., 162.);
+    }
+    let ratio = width as f32 / height as f32;
+    if ratio < 0.85 {
+        // Portrait clip (e.g. 9:16 phone recording): keep dock wide enough for controls while
+        // giving vertical breathing room so the video isn't a tiny pillarboxed sliver.
+        let dock_w: f32 = 228.;
+        let stage_h = (dock_w / ratio).clamp(180., 280.);
+        (dock_w, stage_h)
+    } else if ratio < 1.15 {
+        // Near-square clip.
+        (248., 228.)
+    } else {
+        // Landscape clip (16:9 / 16:10 / ultrawide).
+        let dock_w: f32 = 288.;
+        let stage_h = (dock_w / ratio).clamp(124., 184.);
+        (dock_w, stage_h)
+    }
 }
 
 /// Format a playback rate (`1.0`, `1.5`, `2.0`) as a compact button label (`1x`, `1.5x`, `2x`).
@@ -1351,6 +1377,60 @@ mod tests {
             assert!(
                 active_pip_video(false, cx).is_none(),
                 "PiP must dismiss when inline card returns into view"
+            );
+        });
+    }
+
+    #[test]
+    fn pip_stage_dimensions_adapt_to_portrait_square_and_landscape() {
+        // Landscape 16:9
+        let (lw, lh) = pip_stage_dimensions(1920, 1080);
+        assert_eq!(lw, 288.0);
+        assert!((150.0..=170.0).contains(&lh));
+
+        // Portrait 9:16: narrower dock width, taller stage bounded within safe max height
+        let (pw, ph) = pip_stage_dimensions(720, 1280);
+        assert!(pw < lw, "portrait PiP should use narrower width");
+        assert!(ph > lh, "portrait PiP should be taller than landscape");
+        assert!(ph <= 300.0);
+
+        // Square 1:1
+        assert_eq!(pip_stage_dimensions(600, 600), (248.0, 228.0));
+
+        // Unknown dimensions default to 16:9 landscape
+        assert_eq!(pip_stage_dimensions(0, 0), (288.0, 162.0));
+    }
+
+    #[gpui::test]
+    fn paused_pip_dock_survives_temporary_image_viewer_open(cx: &mut gpui::TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            seed_inline_video_for_test(test_meta("F_PAUSED_PIP"), true, false, cx);
+            gpui::Empty
+        });
+        cx.update(|_, cx| {
+            // Engage PiP when off-screen.
+            assert!(active_pip_video(false, cx).is_some());
+            assert!(
+                cx.global::<InlineVideoManager>()
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .pip_engaged
+            );
+            // Temporarily opening ImageViewer suppresses PiP without clearing `pip_engaged`.
+            assert!(active_pip_video(true, cx).is_none());
+            assert!(
+                cx.global::<InlineVideoManager>()
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .pip_engaged,
+                "opening ImageViewer must not wipe pip_engaged on an active/paused PiP dock"
+            );
+            // Closing ImageViewer brings the PiP dock right back.
+            assert!(
+                active_pip_video(false, cx).is_some(),
+                "PiP must reappear after closing an unrelated ImageViewer"
             );
         });
     }

@@ -771,24 +771,42 @@ pub fn format_utc_timestamp(secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
 }
 
-/// Turn a channel label or ID into a filesystem-safe filename stem.
+/// Turn a channel label or ID into a filesystem-safe filename stem (capped to 96 ASCII chars).
 pub fn sanitize_export_filename(label: &str, fallback: &str) -> String {
-    let cleaned: String = label
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
+    fn clean_stem(raw: &str) -> String {
+        const MAX_LEN: usize = 96;
+        let mut out = String::with_capacity(raw.len().min(MAX_LEN));
+        let mut prev_dash = false;
+        for c in raw.chars() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                if out.len() >= MAX_LEN {
+                    break;
+                }
+                out.push(c);
+                prev_dash = false;
+            } else if !prev_dash && !out.is_empty() {
+                if out.len() >= MAX_LEN {
+                    break;
+                }
+                out.push('-');
+                prev_dash = true;
             }
-        })
-        .collect();
-    let trimmed = cleaned.trim_matches('-');
-    if trimmed.is_empty() {
-        fallback.to_owned()
-    } else {
-        trimmed.to_owned()
+        }
+        while out.ends_with('-') {
+            out.pop();
+        }
+        out
     }
+
+    let primary = clean_stem(label);
+    if !primary.is_empty() {
+        return primary;
+    }
+    let secondary = clean_stem(fallback);
+    if !secondary.is_empty() {
+        return secondary;
+    }
+    "export".to_owned()
 }
 
 fn load_user_displays(store: &Store, workspace: &TeamId) -> StoreResult<HashMap<UserId, String>> {
@@ -1084,5 +1102,24 @@ mod tests {
             .map(|m| m["text"].as_str().unwrap())
             .collect();
         assert_eq!(texts, vec!["entry-2", "entry-3", "entry-4"]);
+    }
+
+    #[test]
+    fn sanitize_export_filename_handles_traversal_dashes_and_long_names() {
+        assert_eq!(
+            sanitize_export_filename("#eng / release: v2.0!", "C123"),
+            "eng-release-v2-0"
+        );
+        // Empty/punctuation-only label falls back and still sanitizes path traversal in fallback.
+        assert_eq!(
+            sanitize_export_filename("///...", "../etc/passwd"),
+            "etc-passwd"
+        );
+        assert_eq!(sanitize_export_filename("   ", "///"), "export");
+        // Overlong channel labels are capped safely below OS filename limits.
+        let long = "a".repeat(250);
+        let stem = sanitize_export_filename(&long, "fallback");
+        assert_eq!(stem.len(), 96);
+        assert!(!stem.ends_with('-'));
     }
 }

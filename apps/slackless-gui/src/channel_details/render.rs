@@ -1100,10 +1100,12 @@ impl ChannelDetails {
                     .gap_0p5()
                     .child(
                         h_flex()
+                            .min_w_0()
                             .items_center()
                             .gap_2()
                             .child(
                                 div()
+                                    .min_w_0()
                                     .truncate()
                                     .text_size(px(15.))
                                     .font_weight(FontWeight::SEMIBOLD)
@@ -1120,6 +1122,8 @@ impl ChannelDetails {
                                 name_row.child(
                                     div()
                                         .flex_none()
+                                        .max_w(px(140.))
+                                        .truncate()
                                         .px_1p5()
                                         .py(px(1.))
                                         .rounded_sm()
@@ -1133,6 +1137,7 @@ impl ChannelDetails {
                             })
                             .children(row.handle.as_ref().map(|handle| {
                                 div()
+                                    .min_w_0()
                                     .truncate()
                                     .text_size(px(15.))
                                     .text_color(foreground)
