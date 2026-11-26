@@ -15,7 +15,7 @@ use crate::signaling::{
 };
 use crate::video::VideoTileKey;
 use crate::{
-    HuddleAudioConfig, HuddleControl, HuddleDataEvent, HuddleSessionSnapshot, HuddleUpdate, Result,
+    HuddleAudioConfig, HuddleControl, HuddleDataEvent, HuddleSessionSnapshot, HuddleUpdate,
 };
 
 impl<M: MediaDevices> SessionRuntime<'_, M> {
@@ -56,6 +56,32 @@ impl<M: MediaDevices> SessionRuntime<'_, M> {
         tokio::spawn(async move {
             let result = start.await;
             let _ = done_tx.send(BackgroundDone::CameraStart { generation, result });
+        });
+    }
+
+    /// Start sharing `source_id` off the event loop (a whole second Chime handshake); the result
+    /// reports back tagged with its request `generation`.
+    pub(super) fn start_screen_share(
+        &mut self,
+        generation: u64,
+        source_id: String,
+        share_audio: bool,
+    ) {
+        let start = self.media.start_screen_share(
+            self.creds.clone(),
+            source_id.clone(),
+            share_audio,
+            self.local_screen_tx.clone(),
+            Arc::clone(&self.perf),
+        );
+        let done_tx = self.bg_done_tx.clone();
+        tokio::spawn(async move {
+            let result = start.await;
+            let _ = done_tx.send(BackgroundDone::ScreenShareStart {
+                generation,
+                source_id,
+                result,
+            });
         });
     }
 }
@@ -142,32 +168,43 @@ pub(super) async fn apply_background_done<R: RtcController, S: SignalSink, M: Me
                 .updates
                 .send(HuddleUpdate::State(Box::new(snap.clone())));
         }
-    }
-}
-
-/// Apply a finished `#content` share start to the snapshot and announce it to late joiners.
-async fn apply_screen_share_start<S: SignalSink, M: MediaDevices>(
-    result: Result<M::ScreenShare>,
-    source_id: &str,
-    snap: &mut HuddleSessionSnapshot,
-    signal: &mut S,
-    state: &mut SessionRuntime<'_, M>,
-) {
-    match result {
-        Ok(share) => {
-            snap.screen_audio_device = M::screen_share_loopback(&share);
-            state.media.install_screen_share(share);
-            snap.sharing = true;
-            snap.share_source_id = Some(source_id.to_owned());
-            snap.error = None;
-            state.media.set_camera_compact(true);
-            announce_screen_share_capabilities(&state.creds.attendee_id, signal, source_id).await;
-        }
-        Err(err) => {
-            tracing::error!(source_id, %err, "failed to start screen share session");
-            snap.sharing = false;
-            snap.share_source_id = None;
-            snap.error = Some(err.to_string());
+        BackgroundDone::ScreenShareStart {
+            generation,
+            source_id,
+            result,
+        } => {
+            if generation != state.screen_share_gen {
+                return; // superseded: dropping the result stops that share
+            }
+            match result {
+                Ok(share) => {
+                    snap.screen_audio_device = M::screen_share_loopback(&share);
+                    state.media.install_screen_share(share);
+                    snap.sharing = true;
+                    snap.share_source_id = Some(source_id.clone());
+                    snap.error = None;
+                    state.media.set_camera_compact(true);
+                    announce_screen_share_capabilities(
+                        &state.creds.attendee_id,
+                        signal,
+                        &source_id,
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    tracing::error!(
+                        source_id = %source_id,
+                        %err,
+                        "failed to start screen share session"
+                    );
+                    snap.sharing = false;
+                    snap.share_source_id = None;
+                    snap.error = Some(err.to_string());
+                }
+            }
+            let _ = state
+                .updates
+                .send(HuddleUpdate::State(Box::new(snap.clone())));
         }
     }
 }
@@ -288,17 +325,10 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
             source_id,
             share_audio,
         }) => {
+            state.screen_share_gen += 1;
             if let Some(src_id) = source_id {
                 // Native `#content` second Chime session — runs simultaneously with camera!
-                let start = state.media.start_screen_share(
-                    state.creds.clone(),
-                    src_id.clone(),
-                    share_audio,
-                    state.local_screen_tx.clone(),
-                    Arc::clone(&state.perf),
-                );
-                let result = start.await;
-                apply_screen_share_start(result, &src_id, snap, signal, state).await;
+                state.start_screen_share(state.screen_share_gen, src_id, share_audio);
             } else {
                 tokio::spawn(state.media.stop_screen_share());
                 snap.sharing = false;

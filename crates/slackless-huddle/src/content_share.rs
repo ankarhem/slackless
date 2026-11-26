@@ -168,7 +168,7 @@ impl ContentShareSession {
 
         let running = Arc::new(AtomicBool::new(true));
         let running_audio = Arc::clone(&running);
-        let rtc_audio = Arc::clone(&rtc);
+        let opus = rtc.opus_sender();
         let loopback_pcm = Arc::new(SpscRing::<i16>::new(LOOPBACK_RING_CAPACITY));
         let loopback_capture_running = Arc::clone(&running);
         let loopback_pcm_tx = Arc::clone(&loopback_pcm);
@@ -346,12 +346,12 @@ impl ContentShareSession {
                 };
                 if has_audio {
                     if let Ok(n) = enc.encode(&pcm, &mut out) {
-                        let _ = rtc_audio
+                        let _ = opus
                             .write_opus_frame(bytes::Bytes::copy_from_slice(&out[..n]))
                             .await;
                     }
                 } else {
-                    let _ = rtc_audio.write_opus_frame(cached_silence.clone()).await;
+                    let _ = opus.write_opus_frame(cached_silence.clone()).await;
                 }
             }
         });

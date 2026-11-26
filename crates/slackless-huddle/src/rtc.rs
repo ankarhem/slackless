@@ -981,28 +981,18 @@ impl ChimeRtcPeer {
         }
     }
 
-    /// Write one encoded 20ms Opus audio packet onto the local track (zero-copy `Bytes`).
-    pub async fn write_opus_frame(&self, opus_bytes: Bytes) -> Result<()> {
-        let len = opus_bytes.len() as u64;
-        let sample = Sample {
-            data: opus_bytes,
-            duration: Duration::from_millis(20),
-            ..Sample::new(Instant::now())
-        };
-        self.audio_track
-            .write_sample(
-                self.audio_ssrc,
-                self.audio_payload_type.load(Ordering::Relaxed),
-                &sample,
-                &[],
-            )
-            .await
-            .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
-        self.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.total_packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.bytes_sent.fetch_add(len, Ordering::Relaxed);
-        self.total_bytes_sent.fetch_add(len, Ordering::Relaxed);
-        Ok(())
+    /// Cloneable handle for writing outbound Opus packets on a dedicated async task, so audio
+    /// keeps flowing while the signaling loop is busy.
+    pub fn opus_sender(&self) -> OpusTrackSender {
+        OpusTrackSender {
+            audio_track: Arc::clone(&self.audio_track),
+            audio_ssrc: self.audio_ssrc,
+            audio_payload_type: Arc::clone(&self.audio_payload_type),
+            packets_sent: Arc::clone(&self.packets_sent),
+            bytes_sent: Arc::clone(&self.bytes_sent),
+            total_packets_sent: Arc::clone(&self.total_packets_sent),
+            total_bytes_sent: Arc::clone(&self.total_bytes_sent),
+        }
     }
 
     /// Write one Annex-B H.264 video frame onto the local video track.
@@ -1081,6 +1071,45 @@ impl VideoTrackSender {
             .write_sample(
                 self.video_ssrc,
                 self.video_payload_type.load(Ordering::Relaxed),
+                &sample,
+                &[],
+            )
+            .await
+            .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
+        self.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.total_packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.bytes_sent.fetch_add(len, Ordering::Relaxed);
+        self.total_bytes_sent.fetch_add(len, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// Dedicated outbound Opus RTP track writer so 20 ms audio packets keep flowing concurrently with
+/// Chime signaling and video.
+#[derive(Clone)]
+pub struct OpusTrackSender {
+    audio_track: Arc<TrackLocalStaticSample>,
+    audio_ssrc: u32,
+    audio_payload_type: Arc<AtomicU8>,
+    packets_sent: Arc<AtomicU64>,
+    bytes_sent: Arc<AtomicU64>,
+    total_packets_sent: Arc<AtomicU64>,
+    total_bytes_sent: Arc<AtomicU64>,
+}
+
+impl OpusTrackSender {
+    /// Write one encoded 20ms Opus packet onto the local track (zero-copy `Bytes`).
+    pub async fn write_opus_frame(&self, opus_bytes: Bytes) -> Result<()> {
+        let len = opus_bytes.len() as u64;
+        let sample = Sample {
+            data: opus_bytes,
+            duration: Duration::from_millis(20),
+            ..Sample::new(Instant::now())
+        };
+        self.audio_track
+            .write_sample(
+                self.audio_ssrc,
+                self.audio_payload_type.load(Ordering::Relaxed),
                 &sample,
                 &[],
             )

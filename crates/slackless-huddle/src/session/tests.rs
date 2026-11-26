@@ -887,6 +887,7 @@ mod state_machine {
             parked_inbound_audio: None,
             audio_switch_in_flight: false,
             camera_gen: 0,
+            screen_share_gen: 0,
             shared: AudioSharedState::from_config(&HuddleAudioConfig::default()),
             remote_sources: Vec::new(),
             active_remote_tiles: HashSet::new(),
@@ -2116,8 +2117,8 @@ mod handshake_and_connected_loop_tests {
     use super::super::connected::run_connected_loop_with;
     use super::super::handshake::perform_handshake_with;
     use super::super::io::{
-        AudioSwitch, BoxFuture, MediaDevices, RtcController, RtcSession, SessionFactory,
-        SignalSession, SignalSink, VideoTrackOut,
+        AudioSwitch, BoxFuture, MediaDevices, OpusTrackOut, RtcController, RtcSession,
+        SessionFactory, SignalSession, SignalSink, VideoTrackOut,
     };
     use super::super::supervisor::LoopExit;
     use crate::audio::AudioSharedState;
@@ -2279,6 +2280,25 @@ mod handshake_and_connected_loop_tests {
         bytes_received: AtomicU64,
     }
 
+    #[derive(Clone)]
+    struct MockOpusSender {
+        log: Arc<MockLog>,
+        packets_sent: Arc<AtomicU64>,
+        bytes_sent: Arc<AtomicU64>,
+    }
+
+    impl OpusTrackOut for MockOpusSender {
+        fn write_opus_frame<'a>(&'a self, opus_bytes: bytes::Bytes) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                let len = opus_bytes.len() as u64;
+                self.packets_sent.fetch_add(1, Ordering::Relaxed);
+                self.bytes_sent.fetch_add(len, Ordering::Relaxed);
+                self.log.opus_written.lock().unwrap().push(opus_bytes);
+                Ok(())
+            })
+        }
+    }
+
     impl RtcController for MockRtc {
         fn set_remote_answer<'a>(&'a self, _answer: String) -> BoxFuture<'a, Result<()>> {
             Box::pin(async move {
@@ -2311,6 +2331,7 @@ mod handshake_and_connected_loop_tests {
 
     impl RtcSession for MockRtc {
         type VideoSender = MockVideoSender;
+        type OpusSender = MockOpusSender;
 
         fn attach_video_feedback<'a>(
             &'a self,
@@ -2327,14 +2348,12 @@ mod handshake_and_connected_loop_tests {
             }
         }
 
-        fn write_opus_frame<'a>(&'a self, opus_bytes: bytes::Bytes) -> BoxFuture<'a, Result<()>> {
-            Box::pin(async move {
-                let len = opus_bytes.len() as u64;
-                self.packets_sent.fetch_add(1, Ordering::Relaxed);
-                self.bytes_sent.fetch_add(len, Ordering::Relaxed);
-                self.log.opus_written.lock().unwrap().push(opus_bytes);
-                Ok(())
-            })
+        fn opus_sender(&self) -> Self::OpusSender {
+            MockOpusSender {
+                log: Arc::clone(&self.log),
+                packets_sent: Arc::clone(&self.packets_sent),
+                bytes_sent: Arc::clone(&self.bytes_sent),
+            }
         }
 
         fn request_keyframe<'a>(&'a self, ssrc: u32) -> BoxFuture<'a, ()> {

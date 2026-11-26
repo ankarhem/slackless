@@ -10,8 +10,8 @@ use webrtc::peer_connection::RTCPeerConnectionState;
 use super::controls::{apply_background_done, handle_control};
 use super::handshake::perform_handshake_with;
 use super::io::{
-    BackgroundDone, LiveMediaDevices, LiveSessionFactory, MediaDevices, RtcSession, SessionFactory,
-    SignalSession, SignalSink, VideoTrackOut,
+    BackgroundDone, LiveMediaDevices, LiveSessionFactory, MediaDevices, OpusTrackOut, RtcSession,
+    SessionFactory, SignalSession, SignalSink, VideoTrackOut,
 };
 use super::signaling_handlers::{
     apply_audio_stream_info, apply_index_frame, content_share_source_type, handle_signal_frame,
@@ -48,6 +48,8 @@ pub(super) struct SessionRuntime<'a, M: MediaDevices = LiveMediaDevices> {
     pub(super) audio_switch_in_flight: bool,
     /// Generation of the latest camera request; results of older starts are dropped on arrival.
     pub(super) camera_gen: u64,
+    /// Generation of the latest screen-share request; see `camera_gen`.
+    pub(super) screen_share_gen: u64,
     pub(super) shared: AudioSharedState,
     pub(super) remote_sources: Vec<(String, RemoteVideoSource)>,
     pub(super) active_remote_tiles: HashSet<VideoTileKey>,
@@ -218,9 +220,26 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
     }
     let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(12);
 
+    // A slow control or signaling arm must never hold back 20 ms audio, so Opus packets are
+    // written by their own task like camera video.
+    let opus_tx_task = {
+        let opus_sender = peer.opus_sender();
+        tokio::spawn(async move {
+            let mut write_warn = WriteWarn::default();
+            while let Some(opus_pkt) = outbound_opus_rx.recv().await {
+                if let Err(err) = opus_sender.write_opus_frame(opus_pkt).await {
+                    write_warn.log(&err, "opus");
+                }
+            }
+        })
+    };
+
     let mut metric_tick = tokio::time::interval(Duration::from_secs(1));
+    metric_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut perf_tick = tokio::time::interval(Duration::from_secs(5));
+    perf_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut level_tick = tokio::time::interval(Duration::from_millis(120));
+    level_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let self_user =
         parse_external_user_id(&creds.external_user_id).unwrap_or_else(|| UserId::from("U0SELF"));
@@ -254,6 +273,7 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
         parked_inbound_audio: None,
         audio_switch_in_flight: false,
         camera_gen: 0,
+        screen_share_gen: 0,
         shared: hs.shared,
         remote_sources: Vec::new(),
         active_remote_tiles: HashSet::new(),
@@ -302,7 +322,6 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
     let mut last_audio_rx = crate::audio::AudioRxSnapshot::default();
     let mut last_levels_speakers: Vec<(UserId, f32)> = Vec::new();
     let mut last_levels_muted: Vec<UserId> = Vec::new();
-    let mut opus_write_warn = WriteWarn::default();
 
     while exit_reason.is_none() {
         let connect_timeout = async {
@@ -315,11 +334,6 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
         tokio::select! {
             _ = connect_timeout => {
                 exit_reason = Some(classify_handshake_err(HuddleError::UdpBlocked, is_reconnect));
-            }
-            Some(opus_pkt) = outbound_opus_rx.recv() => {
-                if let Err(err) = peer.write_opus_frame(opus_pkt).await {
-                    opus_write_warn.log(&err, "opus");
-                }
             }
             Some(fb) = cam_fb_rx.recv() => {
                 match fb {
@@ -536,6 +550,7 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
         .send_leave_and_close(Duration::from_millis(800))
         .await;
     state.media.stop_audio();
+    opus_tx_task.abort();
     video_tx_task.abort();
     // Workers exit without decoding their backlog and the dispatcher drops its queue instead of
     // routing it, so the join is short; it still blocks, so it runs on the blocking pool.

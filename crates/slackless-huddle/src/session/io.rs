@@ -17,7 +17,8 @@ use crate::proto::{
     SdkJoinAckFrame, SdkPingPongFrame, SdkSignalFrame, SdkSubscribeAckFrame, SdkTurnCredentials,
 };
 use crate::rtc::{
-    ChimeRtcPeer, InboundAudioPacket, InboundVideoPacket, VideoSenderFeedback, VideoTrackSender,
+    ChimeRtcPeer, InboundAudioPacket, InboundVideoPacket, OpusTrackSender, VideoSenderFeedback,
+    VideoTrackSender,
 };
 use crate::signaling::{ChimeSignalClient, ClientMetricsSnapshot};
 use crate::video::{CameraCapture, VideoFrame};
@@ -116,6 +117,17 @@ impl VideoTrackOut for VideoTrackSender {
     }
 }
 
+/// Dedicated outbound Opus RTP track writer used by the connected loop's background audio task.
+pub(super) trait OpusTrackOut: Send + 'static {
+    fn write_opus_frame<'a>(&'a self, opus_bytes: bytes::Bytes) -> BoxFuture<'a, Result<()>>;
+}
+
+impl OpusTrackOut for OpusTrackSender {
+    fn write_opus_frame<'a>(&'a self, opus_bytes: bytes::Bytes) -> BoxFuture<'a, Result<()>> {
+        Box::pin(OpusTrackSender::write_opus_frame(self, opus_bytes))
+    }
+}
+
 /// WebRTC peer-connection operations needed by session control and signaling handlers.
 pub(super) trait RtcController {
     fn set_remote_answer<'a>(&'a self, answer: String) -> BoxFuture<'a, Result<()>>;
@@ -131,6 +143,7 @@ pub(super) trait RtcController {
 /// Full WebRTC peer session used by handshake and the connected event loop.
 pub(super) trait RtcSession: RtcController + Sync {
     type VideoSender: VideoTrackOut;
+    type OpusSender: OpusTrackOut;
 
     fn attach_video_feedback<'a>(
         &'a self,
@@ -139,7 +152,7 @@ pub(super) trait RtcSession: RtcController + Sync {
 
     fn video_sender(&self) -> Self::VideoSender;
 
-    fn write_opus_frame<'a>(&'a self, opus_bytes: bytes::Bytes) -> BoxFuture<'a, Result<()>>;
+    fn opus_sender(&self) -> Self::OpusSender;
 
     fn request_keyframe<'a>(&'a self, ssrc: u32) -> BoxFuture<'a, ()>;
 
@@ -177,6 +190,7 @@ impl RtcController for ChimeRtcPeer {
 
 impl RtcSession for ChimeRtcPeer {
     type VideoSender = VideoTrackSender;
+    type OpusSender = OpusTrackSender;
 
     fn attach_video_feedback<'a>(
         &'a self,
@@ -189,8 +203,8 @@ impl RtcSession for ChimeRtcPeer {
         ChimeRtcPeer::video_sender(self)
     }
 
-    fn write_opus_frame<'a>(&'a self, opus_bytes: bytes::Bytes) -> BoxFuture<'a, Result<()>> {
-        Box::pin(ChimeRtcPeer::write_opus_frame(self, opus_bytes))
+    fn opus_sender(&self) -> Self::OpusSender {
+        ChimeRtcPeer::opus_sender(self)
     }
 
     fn request_keyframe<'a>(&'a self, ssrc: u32) -> BoxFuture<'a, ()> {
@@ -253,6 +267,11 @@ pub(super) enum BackgroundDone<M: MediaDevices> {
     CameraStart {
         generation: u64,
         result: Result<M::Camera>,
+    },
+    ScreenShareStart {
+        generation: u64,
+        source_id: String,
+        result: Result<M::ScreenShare>,
     },
 }
 
