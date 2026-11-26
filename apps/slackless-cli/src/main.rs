@@ -44,7 +44,7 @@ use crate::commands::messages::{
 };
 use crate::commands::summarize::cmd_summarize;
 use crate::live::{HuddleJoinArgs, HuddleTranscriptsArgs};
-use crate::session::resolve_workspace;
+use crate::session::{resolve_workspace, validate_workspace_id};
 use crate::write::{
     run_delete, run_edit, run_mark_read, run_pin, run_pins, run_react, run_reply, run_schedule,
     run_scheduled, run_send, run_thread_live, run_unreact, run_unschedule, run_upload,
@@ -69,7 +69,17 @@ fn main() -> ExitCode {
     slackless_core::huddle::install_default_crypto_provider();
     let cli = Cli::parse();
     let ctx = Ctx { json: cli.json };
-    let flag = cli.workspace.clone();
+    // `--workspace` names `<data>/<TEAM_ID>.sqlite`: refuse anything but a plain team id before
+    // any command can open (or create) a file from it.
+    let flag = match cli
+        .workspace
+        .as_deref()
+        .map(validate_workspace_id)
+        .transpose()
+    {
+        Ok(flag) => flag,
+        Err(message) => return fail(&ctx, "invalid_args", &message),
+    };
     let workspace = resolve_workspace(flag.as_deref());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

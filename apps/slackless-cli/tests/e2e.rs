@@ -31,12 +31,17 @@ impl TempArchiveDir {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir_all(path.join("data")).unwrap();
         Self { path }
     }
 
+    /// `SLACKLESS_DATA_DIR` of every spawned binary: archives live at `<data>/<TEAM_ID>.sqlite`.
+    fn data(&self) -> PathBuf {
+        self.path.join("data")
+    }
+
     fn seed_workspace(&self, team_id: &str) {
-        let db = self.path.join(format!("{team_id}.sqlite"));
+        let db = self.data().join(format!("{team_id}.sqlite"));
         let mut store = Store::open(&db).unwrap();
         let ws = TeamId::from(team_id);
         store
@@ -129,8 +134,64 @@ impl Drop for TempArchiveDir {
 
 fn cli(dir: &TempArchiveDir) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_slackless"));
-    cmd.env("SLACKLESS_DATA_DIR", &dir.path);
+    // `HOME` locates the stored sessions: no test reads those of the machine running it.
+    cmd.env("SLACKLESS_DATA_DIR", dir.data())
+        .env("HOME", &dir.path);
     cmd
+}
+
+/// Runs `slackless --json <args>` with empty stdin: the exit code and the one JSON value printed.
+fn run_json(dir: &TempArchiveDir, args: &[&str]) -> (Option<i32>, Value) {
+    let out = cli(dir)
+        .arg("--json")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "{args:?}: stdout is not one JSON value ({err}): {stdout:?}; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code(), json)
+}
+
+/// Arguments the CLI refuses with `invalid_args` (exit 1) before it opens an archive, reads
+/// stored sessions, or talks to Slack.
+#[test]
+fn invalid_arguments_fail_locally_with_invalid_args() {
+    let dir = TempArchiveDir::new("invalid-args");
+    let clip = dir.path.join("clip.wav");
+    std::fs::write(&clip, b"RIFF").unwrap();
+    let clip = clip.to_str().unwrap();
+    for args in [
+        // `--workspace` names `<data>/<TEAM_ID>.sqlite`: `../escape` would create, then
+        // vacuum, a database outside the data dir.
+        vec![
+            "--workspace",
+            "../escape",
+            "transcribe",
+            "F0X",
+            "--file",
+            clip,
+        ],
+        vec!["--workspace", "../escape", "vacuum"],
+        vec!["--workspace", "", "stats"],
+    ] {
+        let (code, json) = run_json(&dir, &args);
+        assert_eq!(
+            (code, &json["error"]),
+            (Some(1), &json!("invalid_args")),
+            "{args:?}: {json}"
+        );
+        assert!(json["message"].is_string(), "{args:?}: {json}");
+    }
+    assert!(
+        !dir.path.join("escape.sqlite").exists(),
+        "a path-like --workspace created a database outside the data dir"
+    );
 }
 
 #[test]

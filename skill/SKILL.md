@@ -27,7 +27,7 @@ Sign-in is interactive: `slackless auth login` (or the desktop app's first launc
 ### Global flags & workspace selection
 
 - `--json` — emit machine-readable JSON (works anywhere on the command line).
-- `--workspace TEAM_ID` — workspace team id to act on. When omitted:
+- `--workspace TEAM_ID` — workspace team id to act on. Only ASCII letters, digits, `_`, and `-` are accepted; anything else fails with `invalid_args` before the command runs. When omitted:
   - Offline archive commands fall back to the first stored session, then to the sole archive on disk. When nothing is known, or several archives exist and no session disambiguates them, local commands return empty results rather than guess.
   - Live commands use the stored session of the flagged team id, or the first stored session. That session must have credentials, or the command fails with `not_signed_in`.
 
@@ -965,7 +965,7 @@ Human mode prints `slackless: <message>` on stderr instead. Error codes:
 | `client_error`          | building the Slack API/RTM client failed                                                       |
 | `session_rejected`      | Slack rejected the stored session; ask the user to run `slackless auth login`, then retry      |
 | `request_failed`        | the Slack API call failed for another reason                                                   |
-| `invalid_args`          | malformed CLI argument (e.g. invalid `--since`, `--at`, canvas flags, or missing upload files) |
+| `invalid_args`          | malformed CLI argument (e.g. invalid `--workspace`, `--since`, `--at`, or canvas flags)        |
 | `missing_ts`            | `mark-read` omitted `[TS]` and the local archive has no messages for the channel               |
 | `disconnected`          | `watch` websocket disconnected                                                                 |
 | `no_download_url`       | `download` target file has no private download URL                                             |

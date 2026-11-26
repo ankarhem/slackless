@@ -53,7 +53,9 @@ use crate::archive::{self, Archive};
 use crate::commands::{parse_since_cutoff, raw_channel_id};
 use crate::live::session::{classify_api_error, resolve_channel_with};
 use crate::output::MessageRow;
-use crate::session::{resolve_session_from, resolve_workspace_from};
+use crate::session::{
+    is_valid_workspace_id, resolve_session_from, resolve_workspace_from, validate_workspace_id,
+};
 use crate::write::normalize_emoji_shortcode;
 
 /// Protocol versions this server speaks. A client asking for anything else is answered with
@@ -100,14 +102,11 @@ const MAX_CATCHUP_LIMIT: usize = 100;
 const MAX_PROMPT_CONTEXT_CHARS: usize = 16_000;
 const MAX_EXCERPT_CHARS: usize = 200;
 
-/// Entrypoint for `slackless mcp`; `read_only` (`--read-only`) withholds the tools that change
-/// Slack. Serves MCP over stdin/stdout until the client closes the connection.
+/// Entrypoint for `slackless mcp`; `default_workspace` is the validated `--workspace`, and
+/// `read_only` (`--read-only`) withholds the tools that change Slack. Serves MCP over
+/// stdin/stdout until the client closes the connection.
 pub async fn run_mcp(default_workspace: Option<&str>, read_only: bool) -> Result<ExitCode> {
-    let validated_default = match default_workspace.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(ws) => Some(validate_workspace_id(ws).map_err(|msg| anyhow::anyhow!("{msg}"))?),
-        None => None,
-    };
-    let running = McpServer::new(validated_default, read_only)
+    let running = McpServer::new(default_workspace.map(str::to_owned), read_only)
         .serve(rmcp::transport::stdio())
         .await?;
     running.waiting().await?;
@@ -3626,25 +3625,6 @@ fn read_channel_window(
 
     collected.reverse();
     Ok(collected)
-}
-
-fn is_valid_workspace_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-fn validate_workspace_id(raw: &str) -> std::result::Result<String, String> {
-    let trimmed = raw.trim();
-    if is_valid_workspace_id(trimmed) {
-        Ok(trimmed.to_owned())
-    } else {
-        Err(format!(
-            "invalid `workspace` '{trimmed}': must contain only ASCII letters, digits, '_', or '-'"
-        ))
-    }
 }
 
 /// Round-robin interleave per-workspace ranked hit lists up to `limit` so an early workspace

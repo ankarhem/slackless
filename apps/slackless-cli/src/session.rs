@@ -15,6 +15,28 @@ impl std::fmt::Display for NotSignedIn {
     }
 }
 
+/// Whether `id` is a plain workspace (team) id. It names `<data>/<id>.sqlite`, so path
+/// separators, dots, and spaces are refused.
+pub(crate) fn is_valid_workspace_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// A workspace id from user input (`--workspace`, an MCP argument), trimmed and validated.
+pub(crate) fn validate_workspace_id(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if is_valid_workspace_id(trimmed) {
+        Ok(trimmed.to_owned())
+    } else {
+        Err(format!(
+            "invalid `workspace` '{trimmed}': must contain only ASCII letters, digits, '_', or '-'"
+        ))
+    }
+}
+
 /// The workspace local commands read: `--workspace`, else the first stored session's, else the
 /// only archive on disk. `None` means nothing is known; local commands then report empty
 /// results instead of guessing among several archives.
