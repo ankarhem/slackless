@@ -17,6 +17,10 @@ validate:
 test *args:
     cargo test --workspace {{args}}
 
+# Measure real LLVM line/function coverage for one crate (optional file path filter)
+coverage crate="slackless-core" filter="":
+    ./scripts/coverage.sh {{crate}} {{filter}}
+
 # Run the release micro-benchmarks (store, huddle audio/video, GUI messages)
 bench:
     cargo test --release -p slackless-store -p slackless-huddle -p slackless-gui -- bench --ignored --nocapture

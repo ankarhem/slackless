@@ -12,3 +12,6 @@
 
 # Agent scratch / research fetches
 .omo/
+
+# LLVM instrumentation profiles (coverage runs)
+*.profraw
