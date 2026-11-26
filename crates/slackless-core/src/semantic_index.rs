@@ -66,7 +66,8 @@ impl IndexPacing {
     }
 }
 
-/// Incremental progress update emitted during [`index_store_documents`] / [`index_disk_archives`].
+/// Incremental progress update emitted during [`index_store_documents_paced`] /
+/// [`index_disk_archives`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticIndexProgress {
     pub workspace: TeamId,
@@ -182,9 +183,10 @@ fn compose_message_index_text(
 }
 
 /// Incrementally index all messages, snippets, canvases, file transcripts, and huddle transcripts
-/// from `store` into `index` using `embedder`.
+/// from `store` into `index` using `embedder`, without pacing (for tests).
 ///
 /// Unchanged documents (matching `(workspace, doc_kind, doc_id, content_hash, dims)`) are skipped.
+#[cfg(any(test, feature = "test-support"))]
 pub fn index_store_documents(
     store: &Store,
     index: &mut SemanticIndex,
@@ -202,7 +204,8 @@ pub fn index_store_documents(
     )
 }
 
-/// [`index_store_documents`] with cooperative [`IndexPacing`] between embedding batches.
+/// Incrementally index everything in `store` (see [`index_store_documents`]) with cooperative
+/// [`IndexPacing`] between embedding batches.
 pub fn index_store_documents_paced(
     store: &Store,
     index: &mut SemanticIndex,

@@ -23,9 +23,10 @@ pub use file_transcripts::{
 pub use maintenance::{IntegrityMode, IntegrityReport, StoreFileInfo};
 pub use outbox::{NewOutboxItem, OutboxItem, OutboxKind, OutboxStatus};
 pub use search::WorkspaceStoredMessage;
+#[cfg(test)]
+pub use transcripts::WorkspaceHuddleTranscriptSegment;
 pub use transcripts::{
     HuddleTranscriptSegment, HuddleTranscriptSession, NewHuddleTranscriptSegment,
-    WorkspaceHuddleTranscriptSegment,
 };
 
 pub(crate) use messages::decode_json_value;
@@ -124,6 +125,8 @@ static MESSAGE_REVISION: AtomicU64 = AtomicU64::new(1);
 pub struct Store {
     pub(crate) conn: Connection,
     read_only: bool,
+    /// Per-handle revision, read only by the test probe [`Store::local_message_revision`].
+    #[cfg(test)]
     local_revision: AtomicU64,
 }
 
@@ -135,12 +138,14 @@ impl Store {
 
     /// Monotonic mutation revision scoped to this [`Store`] handle alone, so concurrent stores
     /// (and parallel tests) can observe exact local bumps without cross-store interference.
+    #[cfg(test)]
     pub fn local_message_revision(&self) -> u64 {
         self.local_revision.load(Ordering::Acquire)
     }
 
     #[inline]
     pub(super) fn bump_message_revision(&self) {
+        #[cfg(test)]
         self.local_revision.fetch_add(1, Ordering::Release);
         MESSAGE_REVISION.fetch_add(1, Ordering::Release);
     }
@@ -209,6 +214,7 @@ impl Store {
         Ok(Self {
             conn,
             read_only: true,
+            #[cfg(test)]
             local_revision: AtomicU64::new(0),
         })
     }
@@ -228,6 +234,7 @@ impl Store {
         let mut store = Self {
             conn,
             read_only: false,
+            #[cfg(test)]
             local_revision: AtomicU64::new(0),
         };
         store.migrate()?;

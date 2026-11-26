@@ -213,7 +213,8 @@ impl SlackApi {
         Self::with_http_client(http, base_url, token, d_cookie)
     }
 
-    /// As [`SlackApi::new`] for workspace domain `acme` (Grid: `acme.enterprise`).
+    /// As [`SlackApi::new`] for workspace domain `acme` (Grid: `acme.enterprise`); tests only.
+    #[cfg(test)]
     pub fn for_workspace(domain: &str, token: impl Into<String>, d_cookie: &str) -> Result<Self> {
         Self::new(&endpoints::workspace_api_base(domain), token, d_cookie)
     }
@@ -254,7 +255,9 @@ impl SlackApi {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Overrides the Edge cache API base URL (defaults to [`endpoints::EDGE_API_BASE`]).
+    /// Overrides the Edge cache API base URL (defaults to [`endpoints::EDGE_API_BASE`]), so
+    /// tests can point the Edge API at a mock server.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_edge_base(mut self, edge_base: &str) -> Result<Self> {
         let mut url = Url::parse(edge_base)?;
         if !url.path().ends_with('/') {

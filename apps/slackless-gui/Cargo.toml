@@ -43,6 +43,8 @@ objc2-core-video = "0.3.2"
 # engine's test-support only (the kit's would also resolve its optional gpui-fast backend,
 # which needs a proptest this environment's registry lacks).
 gpui = { version = "=0.3.14", package = "gpui-pre", features = ["test-support"] }
+# The deterministic hash embedder the semantic-search tests index with.
+slackless-core = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

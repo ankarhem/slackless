@@ -4,9 +4,6 @@
 //! method is renamed, the fix is a one-line edit here. Method names are the exact strings that go
 //! after `/api/` in `POST https://<workspace>.slack.com/api/<method>`.
 
-/// Generic API host; works for most methods with a session token + `d` cookie.
-pub const SLACK_API_BASE: &str = "https://slack.com/api/";
-
 /// Web origin sent on websocket handshakes and some HTTP calls.
 pub const WEB_ORIGIN: &str = "https://app.slack.com";
 
@@ -27,11 +24,6 @@ pub const WSS_PRIMARY: &str = "wss://wss-primary.slack.com/";
 /// Per-workspace API base, e.g. `https://acme.slack.com/api/` (Grid: `acme.enterprise`).
 pub fn workspace_api_base(domain: &str) -> String {
     format!("https://{domain}.slack.com/api/")
-}
-
-/// Joins an API base (ending in `/`) and a method name.
-pub fn method_url(base: &str, method: &str) -> String {
-    format!("{base}{method}")
 }
 
 /// Active Slack method names referenced across the workspace.
@@ -186,25 +178,4 @@ pub mod method {
     pub const VIEWS_SUBMIT: &str = "views.submit";
     pub const WORKFLOWS_TRIGGERS_INFO: &str = "workflows.triggers.info";
     pub const WORKFLOWS_TRIGGERS_TRIP: &str = "workflows.triggers.trip";
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn builds_method_urls() {
-        assert_eq!(
-            method_url(&workspace_api_base("acme"), method::CHAT_POST_MESSAGE),
-            "https://acme.slack.com/api/chat.postMessage"
-        );
-        assert_eq!(
-            method_url(SLACK_API_BASE, method::CLIENT_USER_BOOT),
-            "https://slack.com/api/client.userBoot"
-        );
-        assert_eq!(
-            method::FILES_GET_UPLOAD_URL_EXTERNAL,
-            method::FILES_GET_UPLOAD_U_R_L_EXTERNAL
-        );
-    }
 }

@@ -11,11 +11,14 @@ pub use parse::{
     InlineConstruct, InlineKind, ParsedDoc, ParsedLine, Piece, StyledRun, delimiter_ranges,
     empty_pair_at,
 };
-pub use rich_text::{from_rich_text, mrkdwn_to_rich_text, rich_text_to_mrkdwn};
+pub use rich_text::from_rich_text;
+#[cfg(any(test, feature = "test-support"))]
+pub use rich_text::{mrkdwn_to_rich_text, rich_text_to_mrkdwn};
+#[cfg(any(test, feature = "test-support"))]
+pub use spans::escape_mrkdwn;
 pub use spans::{
-    Directory, MrkdwnSpan, PlainDirectory, escape_mrkdwn, from_mrkdwn, mrkdwn_to_plain,
-    mrkdwn_to_plain_with, parse_mrkdwn_spans, parse_shortcode, replace_shortcodes_with,
-    unescape_mrkdwn,
+    Directory, MrkdwnSpan, PlainDirectory, from_mrkdwn, mrkdwn_to_plain, mrkdwn_to_plain_with,
+    parse_mrkdwn_spans, parse_shortcode, replace_shortcodes_with, unescape_mrkdwn,
 };
 
 #[cfg(test)]

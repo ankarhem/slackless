@@ -37,6 +37,14 @@ tokio = { workspace = true, features = ["net", "test-util"] }
 wiremock = "0.6"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# The integration tests in `tests/` link these libraries without `cfg(test)`.
+slackless-core = { path = ".", features = ["test-support"] }
+slackless-api = { workspace = true, features = ["test-support"] }
+
+[features]
+# Helpers that only tests call (the deterministic hash embedder, unpaced indexing, canvas and
+# mrkdwn round-trip helpers), for this crate's `tests/` and the GUI's and CLI's test builds.
+test-support = []
 
 [lints]
 workspace = true

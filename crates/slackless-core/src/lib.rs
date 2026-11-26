@@ -70,8 +70,7 @@ pub use command::{
 };
 pub use embeddings::{
     EMBEDDER_IDLE_TTL, Embedder, EmbeddingDownloadProgress, EmbeddingModel, EmbeddingModelStatus,
-    HashProjectionEmbedder, IdleSlot, OnnxEmbedder, TokenizedInput, WordPieceTokenizer,
-    cached_onnx_embedder, default_embedding_model_dir, delete_embedding_model,
+    OnnxEmbedder, cached_onnx_embedder, default_embedding_model_dir, delete_embedding_model,
     detect_embedding_model_setup, download_embedding_model, download_embedding_model_async,
     embedder_loaded, unload_cached_embedder,
 };
@@ -100,7 +99,7 @@ pub use rules::{
     CatchUpReminderStatus, DEFAULT_CATCHUP_REMINDER_TIME, DEFAULT_SEMANTIC_THRESHOLD,
     NotificationRule, RuleAction, RuleContext, RuleEvaluation, RuleTestResult, SemanticScorer,
     check_catchup_reminder, evaluate_rules, evaluate_rules_with_semantic, parse_csv_tokens,
-    parse_daily_time_hhmm, test_rule, test_rule_with_semantic, validate_regex,
+    parse_daily_time_hhmm, test_rule_with_semantic, validate_regex,
 };
 pub use search::{
     SearchHitKind, UnifiedSearchHit, UnifiedSearchResults, UnifiedTranscriptHit,
@@ -112,8 +111,8 @@ pub use semantic_index::{
     IndexPacing, SemanticIndexProgress, SemanticIndexReport, default_semantic_index_stats,
     hybrid_search_disk_archives, hybrid_search_huddle_transcripts_across_stores,
     hybrid_search_huddle_transcripts_in_disk_archives, hybrid_search_stores, index_disk_archives,
-    index_disk_archives_paced, index_store_documents, index_store_documents_paced,
-    open_default_semantic_index, open_existing_semantic_index,
+    index_disk_archives_paced, index_store_documents_paced, open_default_semantic_index,
+    open_existing_semantic_index,
 };
 pub use summarize::{
     AiProvider, AiSummaryConfig, ConnectionTestResult, SummarizeError, SummaryMessage,

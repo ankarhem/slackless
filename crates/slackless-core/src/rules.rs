@@ -234,7 +234,7 @@ impl NotificationRule {
     }
 }
 
-/// Incoming message metadata supplied to [`evaluate_rules`] and [`test_rule`].
+/// Incoming message metadata supplied to [`evaluate_rules`] and [`test_rule_with_semantic`].
 #[derive(Debug, Clone, Default)]
 pub struct RuleContext<'a> {
     pub sender_id: Option<&'a str>,
@@ -283,7 +283,7 @@ impl RuleEvaluation {
     }
 }
 
-/// Detailed result from [`test_rule`] for live rule testing in Preferences.
+/// Detailed result from [`test_rule_with_semantic`] for live rule testing in Preferences.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuleTestResult {
     pub matched: bool,
@@ -371,12 +371,8 @@ pub fn evaluate_rules_with_semantic(
 }
 
 /// Test one [`NotificationRule`] against a sample message and return a human-readable explanation
-/// suitable for live preview in the Preferences UI.
-pub fn test_rule(rule: &NotificationRule, sample: &RuleContext<'_>) -> RuleTestResult {
-    test_rule_with_semantic(rule, sample, None)
-}
-
-/// Like [`test_rule`], with an optional semantic similarity callback for topic testing.
+/// suitable for live preview in the Preferences UI. `semantic_scorer` optionally scores topic
+/// similarity.
 pub fn test_rule_with_semantic(
     rule: &NotificationRule,
     sample: &RuleContext<'_>,
@@ -522,7 +518,7 @@ fn match_single_rule(
     }
 
     // 6. Regex pattern (`regex_pattern`) — always validate even if earlier clauses failed so
-    //    `test_rule` surfaces invalid regex immediately.
+    //    `test_rule_with_semantic` surfaces invalid regex immediately.
     if let Some(raw_pat) = rule
         .regex_pattern
         .as_deref()
@@ -753,7 +749,7 @@ mod tests {
         assert_eq!(eval.action, None);
         assert!(eval.matched_rule_ids.is_empty());
 
-        let preview = test_rule(&empty, &sample_ctx());
+        let preview = test_rule_with_semantic(&empty, &sample_ctx(), None);
         assert!(!preview.matched);
         assert!(preview.summary.contains("at least one condition"));
 
@@ -768,8 +764,8 @@ mod tests {
         let eval = evaluate_rules(std::slice::from_ref(&disabled), &sample_ctx());
         assert_eq!(eval.action, None);
 
-        // `test_rule` still previews match semantics while flagging disabled status.
-        let preview = test_rule(&disabled, &sample_ctx());
+        // `test_rule_with_semantic` still previews match semantics while flagging disabled status.
+        let preview = test_rule_with_semantic(&disabled, &sample_ctx(), None);
         assert!(preview.matched);
         assert!(preview.disabled);
         assert!(preview.summary.contains("disabled"));
@@ -796,7 +792,7 @@ mod tests {
         let mut ctx = sample_ctx();
         let eval = evaluate_rules(std::slice::from_ref(&rule), &ctx);
         assert_eq!(eval.action, None);
-        let preview = test_rule(&rule, &ctx);
+        let preview = test_rule_with_semantic(&rule, &ctx, None);
         assert!(!preview.matched);
         assert!(preview.summary.contains("only_threads"));
         assert!(preview.summary.contains("mentions_me"));
@@ -810,7 +806,7 @@ mod tests {
         assert!(!eval.is_suppressed());
         assert_eq!(eval.matched_rule_ids, vec!["r-full"]);
 
-        let preview = test_rule(&rule, &ctx);
+        let preview = test_rule_with_semantic(&rule, &ctx, None);
         assert!(preview.matched);
         assert!(preview.regex_error.is_none());
         assert!(preview.summary.contains("Break through mute"));
@@ -866,7 +862,7 @@ mod tests {
         assert_eq!(eval.regex_errors.len(), 1);
         assert_eq!(eval.regex_errors[0].0, "bad-re");
 
-        let preview = test_rule(&bad_rule, &sample_ctx());
+        let preview = test_rule_with_semantic(&bad_rule, &sample_ctx(), None);
         assert!(!preview.matched);
         assert!(preview.regex_error.is_some());
         assert!(preview.summary.starts_with("Invalid regex:"));

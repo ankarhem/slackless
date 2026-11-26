@@ -51,7 +51,8 @@ impl Directory for PlainDirectory {
     }
 }
 
-/// Escape Slack's three mrkdwn control characters (`&`, `<`, `>`).
+/// Escape Slack's three mrkdwn control characters (`&`, `<`, `>`); tests only.
+#[cfg(any(test, feature = "test-support"))]
 pub fn escape_mrkdwn(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     escape_into(&mut out, text);

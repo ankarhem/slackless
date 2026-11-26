@@ -20,6 +20,7 @@ pub struct HuddleTranscriptSegment {
 }
 
 /// A huddle transcript segment attributed to its workspace (for cross-workspace search).
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceHuddleTranscriptSegment {
     pub workspace: TeamId,
@@ -168,7 +169,8 @@ impl Store {
     }
 
     /// Every persisted transcript segment linked to a `huddle_thread` message (`(channel, ts)`),
-    /// oldest first.
+    /// oldest first; tests only.
+    #[cfg(test)]
     pub fn huddle_transcript_for_thread(
         &self,
         workspace: &TeamId,
@@ -314,7 +316,8 @@ impl Store {
     }
 
     /// Full-text search across locally persisted huddle transcripts in EVERY workspace stored
-    /// in this database, returning workspace attribution per segment (newest first).
+    /// in this database, returning workspace attribution per segment (newest first); tests only.
+    #[cfg(test)]
     pub fn search_huddle_transcripts_all(
         &self,
         query: &str,

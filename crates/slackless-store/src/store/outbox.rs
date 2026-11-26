@@ -201,7 +201,8 @@ impl Store {
     }
 
     /// List outbox items for a specific channel (or specific thread when `thread_ts` is `Some`),
-    /// ordered FIFO (`id ASC`).
+    /// ordered FIFO (`id ASC`); tests only.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn list_outbox_for_channel(
         &self,
         workspace: &TeamId,
@@ -321,6 +322,7 @@ impl Store {
     }
 
     /// Delete every outbox row belonging to `workspace`.
+    #[cfg(test)]
     pub fn clear_outbox(&mut self, workspace: &TeamId) -> Result<usize> {
         self.ensure_writable()?;
         let mut stmt = self
@@ -334,6 +336,7 @@ impl Store {
     }
 
     /// Return `(pending_or_sending_count, failed_count)` for `workspace`.
+    #[cfg(test)]
     pub fn outbox_counts(&self, workspace: &TeamId) -> Result<(usize, usize)> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT

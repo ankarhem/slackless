@@ -12,14 +12,16 @@ use crate::types::{Block, RichTextBlock, RichTextContainer, RichTextElement, Tex
 
 use super::doc::{Atom, Doc, LineKind, Style};
 use super::parse::{ParsedDoc, Piece};
-use super::spans::{Directory, SOFT_INDENT, from_mrkdwn};
+use super::spans::{Directory, SOFT_INDENT};
 
-/// Convert Slack `mrkdwn` directly into a Slack [`RichTextBlock`].
+/// Convert Slack `mrkdwn` directly into a Slack [`RichTextBlock`] (tests only).
+#[cfg(any(test, feature = "test-support"))]
 pub fn mrkdwn_to_rich_text(text: &str, names: &dyn Directory) -> RichTextBlock {
-    from_mrkdwn(text, names).to_rich_text()
+    super::spans::from_mrkdwn(text, names).to_rich_text()
 }
 
-/// Convert Slack [`Block`]s containing `rich_text` directly into Slack `mrkdwn`.
+/// Convert Slack [`Block`]s containing `rich_text` directly into Slack `mrkdwn` (tests only).
+#[cfg(any(test, feature = "test-support"))]
 pub fn rich_text_to_mrkdwn(blocks: &[Block], names: &dyn Directory) -> Option<String> {
     from_rich_text(blocks, names).map(|doc| doc.to_mrkdwn())
 }

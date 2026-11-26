@@ -21,6 +21,8 @@ schemars = "1"
 
 [dev-dependencies]
 wiremock = "0.6"
+# The deterministic hash embedder the semantic-search test indexes with.
+slackless-core = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

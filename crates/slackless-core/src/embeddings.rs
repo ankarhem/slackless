@@ -272,16 +272,16 @@ pub fn delete_embedding_model(model: EmbeddingModel) -> std::result::Result<u64,
 
 /// Encoded token sequence ready for BERT/MiniLM/BGE ONNX Runtime inference.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TokenizedInput {
-    pub input_ids: Vec<i64>,
-    pub attention_mask: Vec<i64>,
-    pub token_type_ids: Vec<i64>,
+struct TokenizedInput {
+    input_ids: Vec<i64>,
+    attention_mask: Vec<i64>,
+    token_type_ids: Vec<i64>,
 }
 
 /// Pure-Rust BERT / WordPiece tokenizer compatible with Hugging Face `vocab.txt` files
 /// (`all-MiniLM-L6-v2`, `bge-small-en-v1.5`, BERT-uncased).
 #[derive(Debug, Clone)]
-pub struct WordPieceTokenizer {
+struct WordPieceTokenizer {
     vocab: HashMap<String, i64>,
     unk_id: i64,
     cls_id: i64,
@@ -326,7 +326,8 @@ impl WordPieceTokenizer {
         })
     }
 
-    pub fn vocab_size(&self) -> usize {
+    #[cfg(test)]
+    fn vocab_size(&self) -> usize {
         self.vocab.len()
     }
 
@@ -502,7 +503,8 @@ fn fold_bert_uncased(s: &str) -> String {
     out
 }
 
-/// Text embedding interface implemented by [`OnnxEmbedder`] and [`HashProjectionEmbedder`].
+/// Text embedding interface implemented by [`OnnxEmbedder`] and, in test builds, the
+/// deterministic `HashProjectionEmbedder`.
 pub trait Embedder: Send + Sync {
     /// Dimensionality of output vectors (e.g. `384`).
     fn dims(&self) -> usize;
@@ -786,7 +788,7 @@ struct IdleEntry<K, T> {
 
 /// Thread-safe slot holding one lazily loaded, idle-evictable shared value (e.g. an ONNX
 /// Runtime session, ~60-90 MB resident), keyed so a different key reloads it.
-pub struct IdleSlot<K, T> {
+struct IdleSlot<K, T> {
     inner: Mutex<Option<IdleEntry<K, T>>>,
 }
 
@@ -911,18 +913,21 @@ pub fn embedder_loaded() -> bool {
 /// Projects lowercased word unigrams, word bigrams, and character trigrams into an L2-normalized
 /// dense vector using SHA-256 hashing. Ideal for deterministic unit/integration tests and as an
 /// offline fallback when verifying end-to-end vector indexing & RRF pipelines without model weights.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
 pub struct HashProjectionEmbedder {
     dims: usize,
     model_id: String,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for HashProjectionEmbedder {
     fn default() -> Self {
         Self::new(384)
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl HashProjectionEmbedder {
     pub fn new(dims: usize) -> Self {
         Self {
@@ -931,6 +936,7 @@ impl HashProjectionEmbedder {
         }
     }
 
+    #[cfg(test)]
     pub fn with_model_id(dims: usize, model_id: impl Into<String>) -> Self {
         Self {
             dims: dims.max(8),
@@ -959,6 +965,7 @@ impl HashProjectionEmbedder {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Embedder for HashProjectionEmbedder {
     fn dims(&self) -> usize {
         self.dims

@@ -414,6 +414,7 @@ impl Store {
 
     /// Delete a persisted file transcript and refresh affected messages' `file_transcripts` (and
     /// `message_fts`). Returns `true` if a stored transcript existed and was deleted.
+    #[cfg(test)]
     pub fn delete_file_transcript(&mut self, workspace: &TeamId, file_id: &FileId) -> Result<bool> {
         self.ensure_writable()?;
         let tx = self.conn.transaction()?;

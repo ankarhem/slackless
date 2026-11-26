@@ -53,20 +53,6 @@ impl CanvasTable {
     pub fn to_markdown(&self) -> String {
         serialize_markdown_table(&self.header, &self.rows)
     }
-
-    pub fn add_row(&mut self) {
-        let cols = self.header.len().max(1);
-        self.rows.push(vec![String::new(); cols]);
-    }
-
-    pub fn add_column(&mut self) {
-        let next_col = self.header.len() + 1;
-        self.header.push(format!("Column {next_col}"));
-        let cols = self.header.len();
-        for row in &mut self.rows {
-            row.resize(cols, String::new());
-        }
-    }
 }
 
 impl From<CanvasTable> for CanvasBlock {
@@ -576,7 +562,8 @@ impl CanvasDoc {
         })
     }
 
-    /// Move block at `index` up (`delta = -1`) or down (`delta = 1`).
+    /// Move block at `index` up (`delta = -1`) or down (`delta = 1`); tests only.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn move_block(&mut self, index: usize, delta: isize) -> bool {
         if index >= self.blocks.len() {
             return false;
@@ -932,17 +919,6 @@ pub fn filename_from_url(url: &str) -> Option<String> {
     } else {
         Some(seg.to_owned())
     }
-}
-
-/// Decode common HTML character entities found in Slack Quip/Canvas HTML exports.
-pub fn decode_entities(s: &str) -> String {
-    s.replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&#x27;", "'")
 }
 
 /// Escape pipe characters inside a markdown table cell.
@@ -2609,10 +2585,6 @@ mod tests {
             filename_from_url("https://example.com/a/b/report.pdf?sig=1#top"),
             Some("report.pdf".into())
         );
-        assert_eq!(
-            decode_entities("A &amp; B &lt;C&gt; &quot;D&quot; &#39;E&#x27;&nbsp;F"),
-            "A & B <C> \"D\" 'E' F"
-        );
     }
 
     #[test]
@@ -2685,14 +2657,6 @@ mod tests {
         );
         let toggled = doc.toggle_checklist_item(2, 0).expect("toggle");
         assert_eq!(toggled, "- [x] Item");
-        let mut table = CanvasTable {
-            header: vec!["A".into()],
-            rows: vec![vec!["1".into()]],
-        };
-        table.add_column();
-        table.add_row();
-        assert_eq!(table.header, vec!["A", "Column 2"]);
-        assert_eq!(table.rows.len(), 2);
     }
 
     #[test]

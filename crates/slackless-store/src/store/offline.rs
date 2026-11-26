@@ -39,6 +39,7 @@ impl Store {
     }
 
     /// Remove all persisted offline mutations for `workspace`.
+    #[cfg(test)]
     pub fn clear_offline(&mut self, workspace: &TeamId) -> Result<()> {
         self.ensure_writable()?;
         let mut stmt = self

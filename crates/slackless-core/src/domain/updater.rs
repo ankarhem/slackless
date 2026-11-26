@@ -276,12 +276,6 @@ pub fn parse_github_release_for_channel(
     release_from_gh(rel, channel)
 }
 
-/// Parse a GitHub Releases JSON payload into [`ReleaseInfo`]. Draft and prerelease payloads return
-/// `Ok(None)` so neither CLI nor GUI accidentally installs an unpublished build.
-pub fn parse_github_release(payload: &[u8]) -> Result<Option<ReleaseInfo>, String> {
-    parse_github_release_for_channel(payload, UpdateChannel::Stable)
-}
-
 /// Parse a GitHub `/releases` array payload, selecting the newest non-draft release matching
 /// `channel` (including pre-releases when [`UpdateChannel::Beta`] is selected, skipping drafts
 /// and releases lacking a macOS arm64 archive).
@@ -327,7 +321,8 @@ fn encode_lower_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Compute the lowercase hex SHA-256 digest of `bytes` in pure Rust.
+/// Compute the lowercase hex SHA-256 digest of `bytes` in pure Rust; tests only.
+#[cfg(test)]
 pub fn sha256_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     encode_lower_hex(&digest)
@@ -1177,6 +1172,7 @@ mod tests {
 
     #[test]
     fn parse_github_release_skips_drafts_and_prereleases_and_extracts_highlights() {
+        use UpdateChannel::Stable;
         let draft = json!({
             "tag_name": "2026.11.25-01",
             "html_url": "https://example.com",
@@ -1185,7 +1181,10 @@ mod tests {
             "assets": []
         })
         .to_string();
-        assert_eq!(parse_github_release(draft.as_bytes()), Ok(None));
+        assert_eq!(
+            parse_github_release_for_channel(draft.as_bytes(), Stable),
+            Ok(None)
+        );
 
         let pre = json!({
             "tag_name": "2026.11.25-01",
@@ -1195,7 +1194,10 @@ mod tests {
             "assets": []
         })
         .to_string();
-        assert_eq!(parse_github_release(pre.as_bytes()), Ok(None));
+        assert_eq!(
+            parse_github_release_for_channel(pre.as_bytes(), Stable),
+            Ok(None)
+        );
 
         let good = json!({
             "tag_name": "2026.11.25-02",
@@ -1215,7 +1217,7 @@ mod tests {
             ]
         })
         .to_string();
-        let rel = parse_github_release(good.as_bytes())
+        let rel = parse_github_release_for_channel(good.as_bytes(), Stable)
             .expect("valid release")
             .expect("published release");
         assert_eq!(rel.version, "2026.11.25-02");

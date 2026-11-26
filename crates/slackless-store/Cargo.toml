@@ -16,6 +16,13 @@ flate2 = "1.1"
 [dev-dependencies]
 # `busy_handler` lets the `merge_conversation` test interleave a second writer deterministically.
 rusqlite = { version = "0.43", features = ["hooks"] }
+# The integration tests in `tests/` link this library without `cfg(test)`.
+slackless-store = { path = ".", features = ["test-support"] }
+
+[features]
+# `Store::list_outbox_for_channel`, so the integration tests in `tests/` can inspect one
+# channel's queue. Never enabled outside test builds.
+test-support = []
 
 [lints]
 workspace = true

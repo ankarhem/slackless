@@ -116,6 +116,7 @@ macro_rules! tagged_enum {
             }
 
             /// The tag string of this value.
+            #[cfg(test)]
             pub fn type_str(&self) -> &str {
                 match self {
                     $( Self::$variant(_) => $s, )*

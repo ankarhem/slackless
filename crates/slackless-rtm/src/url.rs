@@ -7,6 +7,7 @@
 use std::fmt;
 
 use slackless_types::TeamId;
+#[cfg(test)]
 use slackless_types::endpoints::WSS_PRIMARY;
 use url::Url;
 
@@ -105,7 +106,8 @@ impl ConnectParams {
     }
 }
 
-/// Builds the connect URL on [`WSS_PRIMARY`].
+/// Builds the connect URL on [`WSS_PRIMARY`]; tests only (production dials `base_url`).
+#[cfg(test)]
 pub fn connect_url(params: &ConnectParams) -> Url {
     connect_url_on(WSS_PRIMARY, params).expect("WSS_PRIMARY is a valid URL")
 }
