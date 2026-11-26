@@ -26,12 +26,17 @@ impl App {
         }
     }
 
+    /// A huddle event from the core of the workspace in slot `from`. Session events count only
+    /// from the workspace running the huddle (any workspace's starts one while none runs);
+    /// room updates, invites and links come from every workspace.
     pub(super) fn on_huddle_core_event(
         &mut self,
+        from: usize,
         event: &HuddleEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let runs_huddle = self.huddle_owner.is_none_or(|owner| owner == from);
         match event {
             HuddleEvent::Updated {
                 channel,
@@ -41,23 +46,27 @@ impl App {
                 background_id,
                 thread_root_ts,
             } => {
-                let prev_participants = self
-                    .ws
-                    .active_huddles
-                    .get(channel)
-                    .cloned()
-                    .unwrap_or_default();
-                if *ended {
-                    self.ws.active_huddles.remove(channel);
+                // The sending workspace's sidebar shows who is in its huddles.
+                let (rooms, sidebar) = if from == self.workspace {
+                    (&mut self.ws.active_huddles, Some(self.sidebar.clone()))
+                } else if let Some(slot) = self.slots.get_mut(from) {
+                    let sidebar = slot.parked.as_ref().map(|p| p.views.sidebar.clone());
+                    (&mut slot.state.active_huddles, sidebar)
                 } else {
-                    self.ws
-                        .active_huddles
-                        .insert(channel.clone(), participants.clone());
+                    return;
+                };
+                let prev_participants = rooms.get(channel).cloned().unwrap_or_default();
+                if *ended {
+                    rooms.remove(channel);
+                } else {
+                    rooms.insert(channel.clone(), participants.clone());
                 }
-                let huddles = self.ws.active_huddles.clone();
-                self.sidebar
-                    .update(cx, |sidebar, cx| sidebar.set_huddles(huddles, cx));
-                if let Some(state) = self.huddle_state.clone()
+                let huddles = rooms.clone();
+                if let Some(sidebar) = sidebar {
+                    sidebar.update(cx, |sidebar, cx| sidebar.set_huddles(huddles, cx));
+                }
+                if self.huddle_owner == Some(from)
+                    && let Some(state) = self.huddle_state.clone()
                     && state.read(cx).session().channel == *channel
                 {
                     let self_uid = &self.fixtures.self_user;
@@ -83,7 +92,7 @@ impl App {
                     if !*ended && participants.len() > 1 {
                         self.huddle_alone_music_task = None;
                         if alone_music && playing_jukebox {
-                            self.bridge.send(HuddleControlCommand::SetJukebox(None));
+                            self.send_huddle(HuddleControlCommand::SetJukebox(None));
                         }
                     } else if !*ended
                         && participants.len() <= 1
@@ -112,6 +121,9 @@ impl App {
                 cx.notify();
             }
             HuddleEvent::SessionChanged(snap) => {
+                if !runs_huddle {
+                    return;
+                }
                 let snap = (**snap).clone();
                 let prev_phase = self.huddle_session.as_ref().map(|s| s.phase);
                 if snap.phase == slackless_core::huddle::HuddlePhase::Idle {
@@ -127,7 +139,7 @@ impl App {
                     if let Some(state) = self.huddle_state.clone() {
                         state.update(cx, |s, cx| s.update_session(snap.clone(), cx));
                     } else {
-                        self.mount_huddle_dock(snap.clone(), window, cx);
+                        self.mount_huddle_dock(from, snap.clone(), window, cx);
                     }
                     if newly_connected {
                         self.play_huddle_chime(slackless_core::huddle::HuddleChime::Join, cx);
@@ -137,13 +149,10 @@ impl App {
                             && !snap.captions_enabled
                             && !self.fixtures.sample
                         {
-                            self.bridge.send(HuddleCommand::SetCaptions(true));
+                            self.send_huddle(HuddleCommand::SetCaptions(true));
                         }
-                        let peer_count = self
-                            .ws
-                            .active_huddles
-                            .get(&snap.channel)
-                            .map_or(0, Vec::len);
+                        let peer_count =
+                            (self.huddle_rooms(from).get(&snap.channel)).map_or(0, Vec::len);
                         if settings.huddle_music_when_alone
                             && peer_count <= 1
                             && snap.jukebox_song.is_none()
@@ -156,7 +165,7 @@ impl App {
                 cx.notify();
             }
             HuddleEvent::Data(ev) => {
-                if let Some(state) = self.huddle_state.clone() {
+                if runs_huddle && let Some(state) = self.huddle_state.clone() {
                     let show_reactions = self
                         .preferences
                         .read(cx)
@@ -176,6 +185,7 @@ impl App {
             } => {
                 if self.preferences.read(cx).settings().notify_huddle_invites {
                     self.show_huddle_invite(
+                        from,
                         crate::huddle_invite::PendingHuddleInvite {
                             channel: channel.clone(),
                             inviter: inviter.clone(),
@@ -184,7 +194,9 @@ impl App {
                         window,
                         cx,
                     );
-                    let sender = self.fixtures.user_name(inviter).to_owned();
+                    let fixtures =
+                        (self.workspace_fixtures(from)).unwrap_or_else(|| self.fixtures.clone());
+                    let sender = fixtures.user_name(inviter).to_owned();
                     let tag = format!("huddle-invite:{channel}:{call_id}");
                     self.system_notification_kind(
                         &tag,
@@ -208,7 +220,7 @@ impl App {
                 notify("Huddle link copied", url.clone(), window, cx);
             }
             HuddleEvent::VideoTileClosed(tile) => {
-                if let Some(state) = self.huddle_state.clone() {
+                if runs_huddle && let Some(state) = self.huddle_state.clone() {
                     state.update(cx, |s, cx| s.close_video_tile(tile, cx));
                 }
             }

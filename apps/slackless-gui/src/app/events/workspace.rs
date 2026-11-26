@@ -13,6 +13,11 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A huddle belongs to the workspace running it, whichever one is shown.
+        if let Event::Huddle(huddle) = event {
+            self.on_huddle_core_event(ws_index, huddle, window, cx);
+            return;
+        }
         if ws_index == self.workspace {
             match event {
                 Event::UsergroupUsersLoaded { usergroup, users } => {
@@ -290,25 +295,6 @@ impl App {
                     });
                 })
                 .detach();
-            }
-            Event::Huddle(HuddleEvent::Updated {
-                channel,
-                participants,
-                ended,
-                ..
-            }) => {
-                if *ended {
-                    slot.state.active_huddles.remove(channel);
-                } else {
-                    (slot.state.active_huddles).insert(channel.clone(), participants.clone());
-                }
-                if let Some(parked) = &slot.parked {
-                    let huddles = slot.state.active_huddles.clone();
-                    parked
-                        .views
-                        .sidebar
-                        .update(cx, |sidebar, cx| sidebar.set_huddles(huddles, cx));
-                }
             }
             _ => {}
         }

@@ -681,6 +681,130 @@ fn wired_multi_workspace_event_isolation_and_switching(cx: &mut gpui::TestAppCon
 }
 
 #[gpui::test]
+fn wired_huddle_commands_follow_the_workspace_running_it(cx: &mut gpui::TestAppContext) {
+    let people = [user("U0ME", "me"), user("U0PEER", "peer")];
+    let ((b1, c1), (b2, c2)) = cx.update(|cx| {
+        (
+            make_wired_workspace(
+                "T0ONE",
+                "Workspace One",
+                &[("C0ONE", "one-chan")],
+                &people,
+                cx,
+            ),
+            make_wired_workspace(
+                "T0TWO",
+                "Workspace Two",
+                &[("C0TWO", "two-chan")],
+                &people,
+                cx,
+            ),
+        )
+    });
+    let mut fx = b1.snapshot(&HashMap::new()).expect("ws1 snapshot");
+    fx.workspaces = vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()];
+    let (root, app, cx) = mount_wired(fx, vec![b1, b2], cx);
+    let one = ChannelId::from("C0ONE");
+    let session = |muted: bool| {
+        Event::Huddle(HuddleEvent::SessionChanged(Box::new(
+            HuddleSessionSnapshot {
+                phase: HuddlePhase::Connected,
+                channel: ChannelId::from("C0ONE"),
+                call_id: "R0ONE".into(),
+                muted,
+                ..Default::default()
+            },
+        )))
+    };
+    let huddle_commands = |core: &TestCoreHandle| -> Vec<Command> {
+        core.drain_commands()
+            .into_iter()
+            .filter(|c| matches!(c, Command::Huddle(_)))
+            .collect()
+    };
+
+    // 1. Join in workspace one, then show workspace two.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.join_huddle_in(one.clone(), window, cx));
+    });
+    cx.update(|_, cx| c1.emit(session(false), cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.switch_workspace(1, window, cx));
+    });
+    cx.run_until_parked();
+    let _ = (c1.drain_commands(), c2.drain_commands());
+
+    // 2. Workspace one's session events still reach the dock.
+    cx.update(|_, cx| c1.emit(session(true), cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let state = (app.read(cx).huddle_state.clone()).expect("the dock stays across a switch");
+        assert!(
+            state.read(cx).session().muted,
+            "the huddle's workspace keeps updating the dock while another one is shown"
+        );
+    });
+
+    // 3. A DM huddle invite from workspace one rings while workspace two is shown, and
+    // declining answers workspace one.
+    cx.update(|_, cx| {
+        c1.emit(
+            Event::Huddle(HuddleEvent::Invite {
+                channel: ChannelId::from("D0PEER"),
+                inviter: UserId::from("U0PEER"),
+                call_id: "R0RING".into(),
+            }),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    let banner = cx
+        .update(|_, cx| app.read(cx).huddle_invite.clone())
+        .expect("an invite from a workspace that is not shown still rings");
+    cx.update(|_, cx| {
+        banner.update(cx, |_, cx| {
+            cx.emit(crate::huddle_invite::HuddleInviteEvent::Decline);
+        });
+    });
+    cx.run_until_parked();
+
+    // 4. Mute and Leave, pressed with workspace two shown, reach workspace one's core only.
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.toggle_huddle_mute(cx);
+            app.leave_huddle(cx);
+        });
+    });
+    cx.run_until_parked();
+    let (one_cmds, two_cmds) = (huddle_commands(&c1), huddle_commands(&c2));
+    assert!(
+        one_cmds
+            .iter()
+            .any(|c| matches!(c, Command::Huddle(HuddleCommand::DeclineInvite { .. }))),
+        "declining answers the inviting workspace: {one_cmds:?}"
+    );
+    assert!(
+        one_cmds.iter().any(|c| matches!(
+            c,
+            Command::Huddle(HuddleCommand::Control(HuddleControlCommand::SetMuted(_)))
+        )),
+        "mute goes to the huddle's workspace: {one_cmds:?}"
+    );
+    assert!(
+        one_cmds
+            .iter()
+            .any(|c| matches!(c, Command::Huddle(HuddleCommand::Leave))),
+        "leave goes to the huddle's workspace: {one_cmds:?}"
+    );
+    assert!(
+        two_cmds.is_empty(),
+        "the shown workspace runs no huddle: {two_cmds:?}"
+    );
+    drop(root);
+}
+
+#[gpui::test]
 fn wired_pending_dm_delivers_only_to_the_dm_it_was_addressed_to(cx: &mut gpui::TestAppContext) {
     let people = [
         user("U0ME", "me"),

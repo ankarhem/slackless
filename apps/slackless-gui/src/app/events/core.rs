@@ -360,7 +360,9 @@ impl App {
                     view.set_remote_files(query, *sort, *page, mapped, cx);
                 });
             }
-            Event::Huddle(huddle_ev) => self.on_huddle_core_event(huddle_ev, window, cx),
+            Event::Huddle(huddle_ev) => {
+                self.on_huddle_core_event(self.workspace, huddle_ev, window, cx);
+            }
             Event::UserProfileLoaded {
                 user,
                 pronouns,

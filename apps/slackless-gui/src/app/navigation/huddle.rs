@@ -3,6 +3,24 @@
 use super::super::*;
 
 impl App {
+    /// Send a huddle command to the core of the workspace running the huddle (the shown one
+    /// while none runs).
+    pub(in crate::app) fn send_huddle(&self, command: impl Into<Command>) {
+        let owner = self.huddle_owner.unwrap_or(self.workspace);
+        if let Some(bridge) = self.workspace_bridge(owner) {
+            bridge.send(command);
+        }
+    }
+
+    /// Who is in which huddle in the workspace in slot `ix`, as its core last reported.
+    pub(in crate::app) fn huddle_rooms(&self, ix: usize) -> &HashMap<ChannelId, Vec<UserId>> {
+        if ix == self.workspace {
+            &self.ws.active_huddles
+        } else {
+            &self.slots[ix].state.active_huddles
+        }
+    }
+
     /// Slack's huddle link for the open conversation (its web client runs the call).
     pub(in crate::app) fn huddle_link(&self) -> String {
         crate::huddle_video::huddle_browser_url(&self.fixtures, &self.channel, None)
@@ -47,7 +65,7 @@ impl App {
                     agc: settings.huddle_agc,
                     ..Default::default()
                 };
-                self.mount_huddle_dock(snap, window, cx);
+                self.mount_huddle_dock(self.workspace, snap, window, cx);
             } else {
                 self.clear_huddle_dock(cx);
             }
@@ -211,6 +229,14 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         self.dismiss_huddle_invite(cx);
+        // One huddle at a time, as in Slack: one running in another workspace ends first.
+        if self
+            .huddle_owner
+            .is_some_and(|owner| owner != self.workspace)
+            && !self.fixtures.sample
+        {
+            self.send_huddle(HuddleCommand::Leave);
+        }
         let settings = self.preferences.read(cx).settings().clone();
         let audio = slackless_core::huddle::HuddleAudioConfig {
             muted: settings.huddle_join_muted,
@@ -241,11 +267,11 @@ impl App {
             agc: audio.agc,
             ..Default::default()
         };
-        self.mount_huddle_dock(initial, window, cx);
+        self.mount_huddle_dock(self.workspace, initial, window, cx);
         if self.fixtures.sample {
             self.play_huddle_chime(slackless_core::huddle::HuddleChime::Join, cx);
         } else {
-            self.bridge.send(HuddleCommand::Join {
+            self.send_huddle(HuddleCommand::Join {
                 channel: channel.clone(),
                 audio,
             });
@@ -256,15 +282,16 @@ impl App {
         cx.notify();
     }
 
+    /// Mount the dock for `snap`, the huddle the workspace in slot `owner` runs.
     pub(in crate::app) fn mount_huddle_dock(
         &mut self,
+        owner: usize,
         snap: slackless_core::huddle::HuddleSessionSnapshot,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let participants = self
-            .ws
-            .active_huddles
+            .huddle_rooms(owner)
             .get(&snap.channel)
             .cloned()
             .or_else(|| {
@@ -279,8 +306,10 @@ impl App {
                 })
             })
             .unwrap_or_default();
+        self.huddle_owner = Some(owner);
         self.huddle_session = Some(snap.clone());
-        let state = HuddleState::new(self.fixtures.clone(), snap, participants, cx);
+        let fixtures = (self.workspace_fixtures(owner)).unwrap_or_else(|| self.fixtures.clone());
+        let state = HuddleState::new(fixtures, snap, participants, cx);
         let state_sub = cx.subscribe_in(
             &state,
             window,
@@ -292,8 +321,7 @@ impl App {
                 HuddleStateEvent::CloseFloatingPanel => this.close_huddle_floating_panel(cx),
                 HuddleStateEvent::SendDraw(msg) => {
                     if !this.fixtures.sample {
-                        this.bridge
-                            .send(HuddleControlCommand::SendDraw(msg.clone()));
+                        this.send_huddle(HuddleControlCommand::SendDraw(msg.clone()));
                     }
                 }
                 HuddleStateEvent::OpenAudioSettings => {
@@ -318,6 +346,9 @@ impl App {
                     this.open_huddle_floating_panel(window, cx);
                 }
                 crate::huddle_dock::HuddleDockEvent::JumpToChannel(ch) => {
+                    if let Some(owner) = this.huddle_owner {
+                        this.switch_workspace(owner, window, cx);
+                    }
                     this.select(ch.clone(), cx);
                 }
                 crate::huddle_dock::HuddleDockEvent::OpenThread => this.toggle_huddle_thread(cx),
@@ -339,7 +370,7 @@ impl App {
                         .huddle_session
                         .as_ref()
                         .and_then(|s| s.output_device.clone());
-                    this.bridge.send(HuddleControlCommand::SetAudioDevices {
+                    this.send_huddle(HuddleControlCommand::SetAudioDevices {
                         input: input.clone(),
                         output,
                     });
@@ -349,7 +380,7 @@ impl App {
                         .huddle_session
                         .as_ref()
                         .and_then(|s| s.input_device.clone());
-                    this.bridge.send(HuddleControlCommand::SetAudioDevices {
+                    this.send_huddle(HuddleControlCommand::SetAudioDevices {
                         input,
                         output: output.clone(),
                     });
@@ -420,10 +451,11 @@ impl App {
                 {
                     return;
                 }
-                let peer_count = app.ws.active_huddles.get(&channel).map_or(0, Vec::len);
+                let peer_count = (app.huddle_owner).map_or(0, |owner| {
+                    app.huddle_rooms(owner).get(&channel).map_or(0, Vec::len)
+                });
                 if peer_count <= 1 {
-                    app.bridge
-                        .send(HuddleControlCommand::SetJukebox(Some("jazz".to_owned())));
+                    app.send_huddle(HuddleControlCommand::SetJukebox(Some("jazz".to_owned())));
                 }
             });
         }));
@@ -464,6 +496,7 @@ impl App {
             state.update(cx, |s, cx| s.clear_video_frames(cx));
         }
         self.huddle_session = None;
+        self.huddle_owner = None;
         self.huddle_state = None;
         self._huddle_state_sub = None;
         self.huddle_dock = None;
@@ -473,13 +506,13 @@ impl App {
     }
 
     pub(in crate::app) fn leave_huddle(&mut self, cx: &mut Context<Self>) {
+        if !self.fixtures.sample {
+            self.send_huddle(HuddleCommand::Leave);
+        }
         let was_active = self.huddle_session.is_some();
         self.clear_huddle_dock(cx);
         if was_active {
             self.play_huddle_chime(slackless_core::huddle::HuddleChime::Leave, cx);
-        }
-        if !self.fixtures.sample {
-            self.bridge.send(HuddleCommand::Leave);
         }
         cx.notify();
     }
@@ -494,7 +527,7 @@ impl App {
             state.update(cx, |s, cx| s.set_muted_local(next, cx));
         }
         if !self.fixtures.sample {
-            self.bridge.send(HuddleControlCommand::SetMuted(next));
+            self.send_huddle(HuddleControlCommand::SetMuted(next));
         }
         cx.notify();
     }
@@ -511,7 +544,7 @@ impl App {
             state.update(cx, |s, cx| s.set_camera_local(next, cx));
         }
         if !self.fixtures.sample {
-            self.bridge.send(HuddleControlCommand::SetCamera {
+            self.send_huddle(HuddleControlCommand::SetCamera {
                 enabled: next,
                 device_index: settings.huddle_camera_device,
                 blur: settings.huddle_blur_background,
@@ -535,7 +568,7 @@ impl App {
                 state.update(cx, |s, cx| s.set_sharing_local(None, cx));
             }
             if !self.fixtures.sample {
-                self.bridge.send(HuddleControlCommand::SetScreenShare {
+                self.send_huddle(HuddleControlCommand::SetScreenShare {
                     source_id: None,
                     share_audio: false,
                 });
@@ -558,7 +591,7 @@ impl App {
             cx.write_to_clipboard(ClipboardItem::new_string(url));
             notify("Huddle link copied", String::new(), window, cx);
         } else {
-            self.bridge.send(HuddleCommand::GetLink { channel });
+            self.send_huddle(HuddleCommand::GetLink { channel });
         }
     }
 
@@ -576,7 +609,13 @@ impl App {
             return;
         };
         let ch = state.read(cx).session().channel.clone();
-        let title = format!("Huddle — {}", self.label(&ch));
+        // The window talks to the workspace running the huddle, whichever one is shown.
+        let owner = self.huddle_owner.unwrap_or(self.workspace);
+        let bridge = self.workspace_bridge(owner).unwrap_or(&self.bridge);
+        let fixtures = (self.workspace_fixtures(owner)).unwrap_or_else(|| self.fixtures.clone());
+        let label = (fixtures.conversation(&ch))
+            .map_or_else(|| ch.to_string(), |c| fixtures.conversation_label(c));
+        let title = format!("Huddle — {label}");
         let on_jump = self.popout_jump_handler(window, cx);
         let this = cx.weak_entity();
         let on_open_canvas: crate::popout::CanvasOpenHandler = Rc::new(move |fid, cx| {
@@ -591,10 +630,10 @@ impl App {
                     on_open_canvas,
                 },
                 title,
-                fixtures: self.fixtures.clone(),
-                store: self.bridge.read_store_clone(),
-                team: self.bridge.team_id().cloned(),
-                send: self.bridge.forwarder(),
+                store: bridge.read_store_clone(),
+                team: bridge.team_id().cloned(),
+                send: bridge.forwarder(),
+                fixtures,
                 later_sync: None,
                 display_id,
             },
@@ -602,16 +641,19 @@ impl App {
         );
     }
 
+    /// Ring for a huddle invite from the workspace in slot `from`: accepting joins there,
+    /// declining answers its core.
     pub(in crate::app) fn show_huddle_invite(
         &mut self,
+        from: usize,
         invite: crate::huddle_invite::PendingHuddleInvite,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let call_id = invite.call_id.clone();
         let channel = invite.channel.clone();
-        let banner =
-            crate::huddle_invite::HuddleInviteBanner::new(self.fixtures.clone(), invite, cx);
+        let fixtures = (self.workspace_fixtures(from)).unwrap_or_else(|| self.fixtures.clone());
+        let banner = crate::huddle_invite::HuddleInviteBanner::new(fixtures, invite, cx);
         let decl_ch = channel.clone();
         let decl_call = call_id.clone();
         let sub = cx.subscribe_in(
@@ -625,13 +667,16 @@ impl App {
                 match event {
                     crate::huddle_invite::HuddleInviteEvent::Accept(ch) => {
                         this.dismiss_huddle_invite(cx);
+                        this.switch_workspace(from, window, cx);
                         this.select(ch.clone(), cx);
                         this.join_huddle_in(ch.clone(), window, cx);
                     }
                     crate::huddle_invite::HuddleInviteEvent::Decline => {
                         this.dismiss_huddle_invite(cx);
-                        if !this.fixtures.sample {
-                            this.bridge.send(HuddleCommand::DeclineInvite {
+                        if !this.fixtures.sample
+                            && let Some(bridge) = this.workspace_bridge(from)
+                        {
+                            bridge.send(HuddleCommand::DeclineInvite {
                                 channel: decl_ch.clone(),
                                 call_id: decl_call.clone(),
                             });

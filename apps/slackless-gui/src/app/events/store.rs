@@ -204,7 +204,10 @@ impl App {
         if let Some(viewer) = &self.image_viewer {
             viewer.update(cx, |viewer, cx| viewer.set_fixtures(fixtures.clone(), cx));
         }
-        if let Some(state) = &self.huddle_state {
+        // The dock names people from the workspace running the huddle.
+        if let Some(state) = &self.huddle_state
+            && self.huddle_owner == Some(self.workspace)
+        {
             state.update(cx, |state, cx| state.set_fixtures(fixtures, cx));
         }
     }

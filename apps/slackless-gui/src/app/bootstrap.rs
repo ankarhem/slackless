@@ -1869,6 +1869,7 @@ impl App {
                 right_pane: RightPane::None,
                 tab: ConversationTab::Messages,
                 huddle_session: None,
+                huddle_owner: None,
                 huddle_state: None,
                 _huddle_state_sub: None,
                 huddle_dock: None,

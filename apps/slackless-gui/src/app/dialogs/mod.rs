@@ -387,7 +387,7 @@ impl App {
                 if prev.huddle_input_device != settings.huddle_input_device
                     || prev.huddle_output_device != settings.huddle_output_device
                 {
-                    self.bridge.send(HuddleControlCommand::SetAudioDevices {
+                    self.send_huddle(HuddleControlCommand::SetAudioDevices {
                         input: settings.huddle_input_device.clone(),
                         output: settings.huddle_output_device.clone(),
                     });
@@ -396,14 +396,14 @@ impl App {
                     || prev.huddle_ns != settings.huddle_ns
                     || prev.huddle_agc != settings.huddle_agc
                 {
-                    self.bridge.send(HuddleControlCommand::SetAudioProcessing {
+                    self.send_huddle(HuddleControlCommand::SetAudioProcessing {
                         aec: settings.huddle_aec,
                         ns: settings.huddle_ns,
                         agc: settings.huddle_agc,
                     });
                 }
                 if prev.huddle_blur_background != settings.huddle_blur_background {
-                    self.bridge.send(HuddleControlCommand::SetBlurBackground(
+                    self.send_huddle(HuddleControlCommand::SetBlurBackground(
                         settings.huddle_blur_background,
                     ));
                 }

@@ -751,6 +751,9 @@ pub struct App {
     tab: ConversationTab,
     /// Active native audio huddle session snapshot (Chime SFU).
     huddle_session: Option<slackless_core::huddle::HuddleSessionSnapshot>,
+    /// Slot of the workspace running the huddle, set with the dock: its core gets every huddle
+    /// command and its session events drive the dock, whichever workspace is shown.
+    huddle_owner: Option<usize>,
     /// Shared huddle UI state observed by `HuddleDock`, `PopoutKind::Huddle`, and `HuddleFloatingPanel`.
     huddle_state: Option<Entity<HuddleState>>,
     _huddle_state_sub: Option<Subscription>,
