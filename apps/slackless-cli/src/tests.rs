@@ -820,6 +820,32 @@ fn cli_try_parse_from_covers_all_canvas_subcommands_and_conflicts() {
 }
 
 #[test]
+fn huddle_transcripts_rejects_flags_its_mode_would_ignore() {
+    let parses = |args: &[&str]| {
+        Cli::try_parse_from([&["slackless", "huddle", "transcripts"][..], args].concat()).is_ok()
+    };
+    for args in [
+        // `--call-id` prints that one call whole: no channel, search, language, or limit.
+        &["#eng", "--call-id", "R1"][..],
+        &["--call-id", "R1", "--search", "plan"],
+        &["--call-id", "R1", "--lang", "sv"],
+        &["--call-id", "R1", "--limit", "5"],
+        // `--format` shapes only a `--call-id` transcript.
+        &["--format", "md"],
+        &["--search", "plan", "--format", "json"],
+    ] {
+        assert!(!parses(args), "expected a clap error for {args:?}");
+    }
+    for args in [
+        &["--call-id", "R1", "--format", "md"][..],
+        &["#eng", "--search", "plan", "--lang", "sv", "--limit", "5"],
+        &["#eng", "--limit", "5"],
+    ] {
+        assert!(parses(args), "expected {args:?} to parse");
+    }
+}
+
+#[test]
 fn read_channel_messages_does_not_starve_limit_on_deleted_or_since() {
     use slackless_core::store::Store;
     use slackless_core::types::{ChannelId, Message, TeamId, Ts};

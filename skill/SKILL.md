@@ -340,6 +340,15 @@ JSON output:
 }
 ```
 
+#### huddle transcripts
+
+```sh
+slackless huddle transcripts [CHANNEL] [--search QUERY] [--lang LANG] [--limit N]
+slackless huddle transcripts --call-id CALL_ID [--format md|json]
+```
+
+List archived huddle transcript sessions (optionally in `CHANNEL`), search their lines (`--search`, narrowed to a detected language with `--lang`), or print one call's whole transcript (`--call-id`, as Markdown or JSON with `--format`). The two forms do not mix: `--call-id` with `CHANNEL`, `--search`, `--lang`, or `--limit`, or `--format` without `--call-id`, is a usage error (exit 2).
+
 ---
 
 ### Live messaging, reactions & uploads

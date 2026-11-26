@@ -941,10 +941,19 @@ pub(crate) enum HuddleCommand {
         #[arg(long, value_name = "LANG")]
         lang: Option<String>,
         /// Print the complete speaker-attributed transcript for a specific huddle call ID.
-        #[arg(long, value_name = "CALL_ID")]
+        #[arg(
+            long,
+            value_name = "CALL_ID",
+            conflicts_with_all = ["channel", "search", "lang", "limit"]
+        )]
         call_id: Option<String>,
-        /// Export format when printing a call transcript (`md` or `json`).
-        #[arg(long, value_enum)]
+        /// Export format of the `--call-id` transcript (`md` or `json`).
+        #[arg(
+            long,
+            value_enum,
+            requires = "call_id",
+            conflicts_with_all = ["channel", "search", "lang", "limit"]
+        )]
         format: Option<ExportFormat>,
         /// Maximum sessions or search hits to return.
         #[arg(long, default_value_t = 50)]
