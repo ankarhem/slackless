@@ -665,6 +665,17 @@ impl Store {
     }
 }
 
+/// Joins each `file_transcript ft` row with the newest live message carrying its file
+/// (`message_file` -> `message_current`) as `carrier`, whose columns are NULL when no live message
+/// carries the file. One correlated lookup per row, on `message_file`'s primary key.
+const NEWEST_FILE_CARRIER_JOIN: &str = "LEFT JOIN message_current carrier ON carrier.id = (
+        SELECT mf.message_id
+        FROM message_file mf
+        JOIN message_current mc ON mc.id = mf.message_id
+        WHERE mf.workspace_id = ft.workspace_id AND mf.file_id = ft.file_id AND mc.deleted = 0
+        ORDER BY mc.ts_key DESC
+        LIMIT 1)";
+
 use self::messages::*;
 
 /// The stored JSON of one conversation, decoded.

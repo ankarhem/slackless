@@ -373,7 +373,19 @@ fn archive_indexing_transcripts_digest_and_outbox_edge_cases() {
     assert!(indexed[0].2.contains("standup.m4a"));
     assert_eq!(indexed[1].0, dm);
 
-    // 5. `list_file_transcripts_for_indexing` joins carrying message (and keeps orphans).
+    // 5. `list_file_transcripts_for_indexing` joins the newest live carrying message (a newer
+    //    repost that was deleted does not count) and keeps orphans.
+    let repost = Message {
+        ts: Ts::from("1700000300.000100"),
+        user: Some(UserId::from("U0ALICE")),
+        text: "reposted clip".into(),
+        files: m1.files.clone(),
+        ..Default::default()
+    };
+    store.upsert_message(&ws, &ch, &repost).unwrap();
+    store
+        .record_deletion(&ws, &ch, &repost.ts, None, None)
+        .unwrap();
     store
         .upsert_file_transcript(
             &ws,

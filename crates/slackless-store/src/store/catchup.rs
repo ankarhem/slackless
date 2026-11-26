@@ -71,7 +71,7 @@ impl Store {
     }
 
     /// Recently updated audio/video file transcripts (`updated_at >= cutoff_secs`), newest first,
-    /// joined with the newest carrying message when linked via `message_file`.
+    /// joined with the newest live message carrying the file (`NEWEST_FILE_CARRIER_JOIN`).
     pub fn recent_file_transcripts_since(
         &self,
         workspace: &TeamId,
@@ -81,31 +81,15 @@ impl Store {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut stmt = self.conn.prepare_cached(
+        let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT ft.file_id, ft.source, ft.text, ft.updated_at,
-                    (SELECT mc.channel_id
-                     FROM message_file mf
-                     JOIN message_current mc ON mc.id = mf.message_id
-                     WHERE mf.workspace_id = ft.workspace_id AND mf.file_id = ft.file_id
-                       AND mc.deleted = 0
-                     ORDER BY mc.ts_key DESC LIMIT 1),
-                    (SELECT mc.ts
-                     FROM message_file mf
-                     JOIN message_current mc ON mc.id = mf.message_id
-                     WHERE mf.workspace_id = ft.workspace_id AND mf.file_id = ft.file_id
-                       AND mc.deleted = 0
-                     ORDER BY mc.ts_key DESC LIMIT 1),
-                    (SELECT mc.file_names
-                     FROM message_file mf
-                     JOIN message_current mc ON mc.id = mf.message_id
-                     WHERE mf.workspace_id = ft.workspace_id AND mf.file_id = ft.file_id
-                       AND mc.deleted = 0
-                     ORDER BY mc.ts_key DESC LIMIT 1)
+                    carrier.channel_id, carrier.ts, carrier.file_names
              FROM file_transcript ft
+             {NEWEST_FILE_CARRIER_JOIN}
              WHERE ft.workspace_id = ?1 AND ft.updated_at >= ?2
              ORDER BY ft.updated_at DESC, ft.file_id ASC
-             LIMIT ?3",
-        )?;
+             LIMIT ?3"
+        ))?;
         let rows = stmt.query_map(
             params![workspace.as_str(), cutoff_secs, limit as i64],
             |r| {

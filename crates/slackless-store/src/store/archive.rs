@@ -344,28 +344,20 @@ impl Store {
         Ok(())
     }
 
-    /// Every stored `file_transcript` row in `workspace` (with optional carrying message channel
-    /// & ts from `message_file`), for incremental semantic indexing.
+    /// Every stored `file_transcript` row in `workspace`, with the channel & ts of the newest live
+    /// message carrying the file (`NEWEST_FILE_CARRIER_JOIN`), for incremental semantic
+    /// indexing.
     pub fn list_file_transcripts_for_indexing(
         &self,
         workspace: &TeamId,
     ) -> Result<Vec<WorkspaceFileTranscript>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT ft.file_id, ft.source, ft.text, ft.updated_at,
-                    (SELECT mc.channel_id
-                     FROM message_file mf
-                     JOIN message_current mc ON mc.id = mf.message_id
-                     WHERE mf.workspace_id = ft.workspace_id AND mf.file_id = ft.file_id
-                     ORDER BY mc.ts_key DESC LIMIT 1),
-                    (SELECT mc.ts
-                     FROM message_file mf
-                     JOIN message_current mc ON mc.id = mf.message_id
-                     WHERE mf.workspace_id = ft.workspace_id AND mf.file_id = ft.file_id
-                     ORDER BY mc.ts_key DESC LIMIT 1)
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT ft.file_id, ft.source, ft.text, ft.updated_at, carrier.channel_id, carrier.ts
              FROM file_transcript ft
+             {NEWEST_FILE_CARRIER_JOIN}
              WHERE ft.workspace_id = ?1
-             ORDER BY ft.updated_at DESC, ft.file_id ASC",
-        )?;
+             ORDER BY ft.updated_at DESC, ft.file_id ASC"
+        ))?;
         let rows = stmt.query_map(params![workspace.as_str()], |row| {
             let file_id: String = row.get(0)?;
             let source: String = row.get(1)?;

@@ -26,7 +26,7 @@ fn decode_cues_json(raw: &str) -> Vec<TranscriptCue> {
 pub struct WorkspaceFileTranscript {
     pub workspace: TeamId,
     pub transcript: StoredFileTranscript,
-    /// First carrying message's channel & ts when linked via `message_file`.
+    /// Channel & ts of the newest live message carrying the file, if any.
     pub channel: Option<ChannelId>,
     pub message_ts: Option<Ts>,
 }
@@ -318,8 +318,8 @@ impl Store {
     /// Search persisted `file_transcript` entries in one `workspace` (or across ALL stored
     /// workspaces when `workspace` is `None`). Matches every positive term in `query`
     /// case-insensitively (with trailing `*` treated as a substring stem) and excludes any
-    /// `excluded_terms`, returning newest-updated transcripts first along with optional
-    /// carrying-message coordinates from `message_file`.
+    /// `excluded_terms`, returning newest-updated transcripts first along with the coordinates
+    /// of the newest live message carrying each file (`NEWEST_FILE_CARRIER_JOIN`).
     pub fn search_file_transcripts(
         &self,
         workspace: Option<&TeamId>,
@@ -345,19 +345,11 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT ft.workspace_id, ft.file_id, ft.source, ft.text, ft.cues_json, ft.updated_at,
-                    (SELECT mc.channel_id
-                     FROM message_file mf
-                     JOIN message_current mc ON mc.id = mf.message_id
-                     WHERE mf.workspace_id = ft.workspace_id AND mf.file_id = ft.file_id
-                     ORDER BY mc.ts_key DESC LIMIT 1),
-                    (SELECT mc.ts
-                     FROM message_file mf
-                     JOIN message_current mc ON mc.id = mf.message_id
-                     WHERE mf.workspace_id = ft.workspace_id AND mf.file_id = ft.file_id
-                     ORDER BY mc.ts_key DESC LIMIT 1)
-             FROM file_transcript ft",
+                    carrier.channel_id, carrier.ts
+             FROM file_transcript ft
+             {NEWEST_FILE_CARRIER_JOIN}"
         );
         let mut args: Vec<SqlValue> = Vec::new();
         if let Some(ws) = workspace {
