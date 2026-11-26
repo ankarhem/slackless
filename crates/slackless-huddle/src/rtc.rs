@@ -340,15 +340,15 @@ pub struct InboundAudioPacket {
     pub arrival: Instant,
 }
 
-/// One inbound RTP video packet read from a remote Chime video/content track.
+/// One inbound RTP video packet read from a remote Chime video/content track. `mid` and
+/// `mime_type` are resolved once per track and shared by its packets.
 #[derive(Debug, Clone)]
 pub struct InboundVideoPacket {
     pub ssrc: u32,
-    pub mid: String,
-    pub track_id: String,
-    pub mime_type: String,
+    pub mid: Arc<str>,
+    pub mime_type: Arc<str>,
     pub seq: u16,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub marker: bool,
 }
 
@@ -482,16 +482,18 @@ impl PeerConnectionEventHandler for ChimePeerHandler {
                 RtpCodecKind::Video => {
                     let mut ssrc = track.ssrcs().await.first().copied().unwrap_or(0);
                     let track_id = track.track_id().await;
-                    let mut mime_type = if ssrc != 0 {
+                    let mut mime_type: Arc<str> = if ssrc != 0 {
                         track
                             .codec(ssrc)
                             .await
                             .map(|c| c.mime_type)
                             .unwrap_or_default()
+                            .into()
                     } else {
-                        String::new()
+                        Arc::from("")
                     };
-                    let mut mid = resolve_track_mid(&pc_cell, None, &track_id).await;
+                    let mut mid: Arc<str> =
+                        resolve_track_mid(&pc_cell, None, &track_id).await.into();
                     if ssrc != 0
                         && let Ok(mut map) = remote_tracks.lock()
                     {
@@ -514,7 +516,8 @@ impl PeerConnectionEventHandler for ChimePeerHandler {
                                         .codec(ssrc)
                                         .await
                                         .map(|c| c.mime_type)
-                                        .unwrap_or_default();
+                                        .unwrap_or_default()
+                                        .into();
                                 }
                                 if mid.is_empty() {
                                     mid = resolve_track_mid(
@@ -522,7 +525,8 @@ impl PeerConnectionEventHandler for ChimePeerHandler {
                                         Some(init.receiver_id),
                                         &track_id,
                                     )
-                                    .await;
+                                    .await
+                                    .into();
                                 }
                                 if !logged_attach {
                                     logged_attach = true;
@@ -550,7 +554,8 @@ impl PeerConnectionEventHandler for ChimePeerHandler {
                                         .codec(ssrc)
                                         .await
                                         .map(|c| c.mime_type)
-                                        .unwrap_or_default();
+                                        .unwrap_or_default()
+                                        .into();
                                 }
                                 if !logged_attach {
                                     logged_attach = true;
@@ -582,11 +587,10 @@ impl PeerConnectionEventHandler for ChimePeerHandler {
                                 }
                                 let _ = video_tx.send(InboundVideoPacket {
                                     ssrc,
-                                    mid: mid.clone(),
-                                    track_id: track_id.clone(),
-                                    mime_type: mime_type.clone(),
+                                    mid: Arc::clone(&mid),
+                                    mime_type: Arc::clone(&mime_type),
                                     seq: rtp.header.sequence_number,
-                                    payload: rtp.payload.to_vec(),
+                                    payload: rtp.payload,
                                     marker: rtp.header.marker,
                                 });
                             }

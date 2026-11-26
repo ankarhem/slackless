@@ -508,10 +508,9 @@ fn remote_video_decoder_h264_propagates_seq_gaps_and_keyframe_requests() {
     let make_pkt = |seq: u16, payload: Vec<u8>, marker: bool| InboundVideoPacket {
         ssrc: 42,
         mid: "2".into(),
-        track_id: "v0".into(),
         mime_type: "video/H264".into(),
         seq,
-        payload,
+        payload: payload.into(),
         marker,
     };
 
@@ -1963,10 +1962,9 @@ mod state_machine {
             let _ = av1_dec.push(&InboundVideoPacket {
                 ssrc: 700,
                 mid: "3".into(),
-                track_id: "v1".into(),
                 mime_type: "video/AV1".into(),
                 seq: 1,
-                payload: vec![0x00, 0x01, 0x02],
+                payload: vec![0x00, 0x01, 0x02].into(),
                 marker: true,
             });
         }
@@ -2011,10 +2009,9 @@ mod state_machine {
         let make_pkt = |seq: u16| InboundVideoPacket {
             ssrc: 888,
             mid: "2".into(),
-            track_id: "v0".into(),
             mime_type: "video/H264".into(),
             seq,
-            payload: stap_a.clone(),
+            payload: stap_a.clone().into(),
             marker: true,
         };
         vdec_tx.send(Some(make_pkt(1))).unwrap();
@@ -2046,10 +2043,9 @@ mod state_machine {
             .send(Some(InboundVideoPacket {
                 ssrc: 901,
                 mid: "99".into(),
-                track_id: "v9".into(),
                 mime_type: "video/VP9".into(),
                 seq: 1,
-                payload: vec![1, 2, 3],
+                payload: vec![1, 2, 3].into(),
                 marker: true,
             }))
             .unwrap();
@@ -2057,10 +2053,9 @@ mod state_machine {
             .send(Some(InboundVideoPacket {
                 ssrc: 902,
                 mid: "99".into(),
-                track_id: "v10".into(),
                 mime_type: "video/H264".into(),
                 seq: 1,
-                payload: stap_a.clone(),
+                payload: stap_a.clone().into(),
                 marker: true,
             }))
             .unwrap();
@@ -3092,10 +3087,9 @@ mod handshake_and_connected_loop_tests {
             vtx.send(InboundVideoPacket {
                 ssrc: 888,
                 mid: "2".into(),
-                track_id: "v0".into(),
                 mime_type: "video/H264".into(),
                 seq: 1,
-                payload: stap_a.clone(),
+                payload: stap_a.clone().into(),
                 marker: true,
             })
             .unwrap();
@@ -3103,10 +3097,9 @@ mod handshake_and_connected_loop_tests {
             vtx.send(InboundVideoPacket {
                 ssrc: 888,
                 mid: "2".into(),
-                track_id: "v0".into(),
                 mime_type: "video/H264".into(),
                 seq: 8,
-                payload: stap_a,
+                payload: stap_a.into(),
                 marker: true,
             })
             .unwrap();

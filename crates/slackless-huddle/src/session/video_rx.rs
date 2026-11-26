@@ -232,7 +232,7 @@ pub(super) fn spawn_video_decoder_thread(
                             "initialized parallel per-track remote video decoder worker"
                         );
                         perf.set_rx_backend(backend);
-                        let _ = codec_tx.send(pkt.mime_type.clone());
+                        let _ = codec_tx.send(pkt.mime_type.to_string());
                         let _ = keyframe_req_tx.send(ssrc);
 
                         let (tx, rx) =
