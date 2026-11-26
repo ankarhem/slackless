@@ -1738,7 +1738,7 @@ impl App {
                 .into_iter()
                 .map(|f| slackless_core::api::UploadFile {
                     filename: f.filename,
-                    bytes: f.bytes,
+                    bytes: f.bytes.into(),
                 })
                 .collect();
             self.bridge.send(CollabCommand::UploadFiles {

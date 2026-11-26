@@ -3909,11 +3909,11 @@ async fn upload_files_calls_backend_and_emits_uploaded_count() {
         files: vec![
             api::UploadFile {
                 filename: "a.png".into(),
-                bytes: vec![1, 2, 3],
+                bytes: vec![1, 2, 3].into(),
             },
             api::UploadFile {
                 filename: "b.txt".into(),
-                bytes: vec![4, 5],
+                bytes: vec![4, 5].into(),
             },
         ],
     }))

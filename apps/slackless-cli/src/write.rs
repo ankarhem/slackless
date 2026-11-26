@@ -366,7 +366,10 @@ pub async fn run_upload(
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", path.display()))?
             .to_owned();
-        uploads.push(UploadFile { filename, bytes });
+        uploads.push(UploadFile {
+            filename,
+            bytes: bytes.into(),
+        });
     }
     let thread_ts = thread_ts.map(|t| Ts::from(t.to_owned()));
     let content = comment.map(MessageContent::plain);

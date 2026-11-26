@@ -417,10 +417,10 @@ impl SlackApi {
     }
 
     /// Uploads raw bytes to an external upload slot returned by `files.getUploadURLExternal`.
-    /// No Slack session cookie or token is sent; retries on HTTP 429.
-    pub(crate) async fn post_upload_bytes(&self, upload_url: &str, bytes: &[u8]) -> Result<()> {
+    /// No Slack session cookie or token is sent; retries on HTTP 429, each attempt sharing
+    /// `payload`'s buffer.
+    pub(crate) async fn post_upload_bytes(&self, upload_url: &str, payload: Bytes) -> Result<()> {
         let url = Url::parse(upload_url)?;
-        let payload = Bytes::copy_from_slice(bytes);
         let resp = self
             .send_with_retry(|| {
                 Ok(self

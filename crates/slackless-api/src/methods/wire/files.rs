@@ -1,5 +1,6 @@
 //! File listing, external upload v2, favorites, collections, and recently deleted wire types.
 
+use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::de::{lenient_vec, or_default};
@@ -9,7 +10,8 @@ use crate::types::{ChannelId, File, UserId};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadFile {
     pub filename: String,
-    pub bytes: Vec<u8>,
+    /// The contents; clones share one buffer, so queuing or retrying an upload never copies it.
+    pub bytes: Bytes,
 }
 
 /// Answer to `files.getUploadURLExternal`.

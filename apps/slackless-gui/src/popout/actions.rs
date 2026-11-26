@@ -573,7 +573,7 @@ impl PopoutWindow {
             .into_iter()
             .map(|attachment| slackless_core::api::UploadFile {
                 filename: attachment.filename,
-                bytes: attachment.bytes,
+                bytes: attachment.bytes.into(),
             })
             .collect();
         if uploads.is_empty() {

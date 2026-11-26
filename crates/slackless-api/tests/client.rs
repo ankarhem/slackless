@@ -1296,7 +1296,7 @@ async fn upload_files_runs_get_url_raw_post_and_complete_external() {
 
     let files = vec![slackless_api::UploadFile {
         filename: "hello.txt".into(),
-        bytes: b"hello".to_vec(),
+        bytes: bytes::Bytes::from_static(b"hello"),
     }];
     let uploaded = api
         .upload_files(
@@ -2028,7 +2028,7 @@ async fn blocks_suggestions_upload_errors_canvas_html_workflows_and_asset_client
                 None,
                 &[UploadFile {
                     filename: "empty.txt".into(),
-                    bytes: Vec::new(),
+                    bytes: bytes::Bytes::new(),
                 }],
             )
             .await
@@ -2070,7 +2070,7 @@ async fn blocks_suggestions_upload_errors_canvas_html_workflows_and_asset_client
                 None,
                 &[UploadFile {
                     filename: "a.txt".into(),
-                    bytes: b"abc".to_vec(),
+                    bytes: bytes::Bytes::from_static(b"abc"),
                 }],
             )
             .await

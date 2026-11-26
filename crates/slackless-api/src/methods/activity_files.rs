@@ -319,7 +319,7 @@ impl SlackApi {
             let slot = self
                 .files_get_upload_url_external(&file.filename, file.bytes.len())
                 .await?;
-            self.post_upload_bytes(&slot.upload_url, &file.bytes)
+            self.post_upload_bytes(&slot.upload_url, file.bytes.clone())
                 .await?;
             completed.push((slot.file_id, file.filename.clone()));
         }

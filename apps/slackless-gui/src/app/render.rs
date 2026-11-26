@@ -285,7 +285,7 @@ impl App {
                                         content: None,
                                         files: vec![slackless_core::api::UploadFile {
                                             filename: filename.clone(),
-                                            bytes,
+                                            bytes: bytes.into(),
                                         }],
                                     });
                                 });
