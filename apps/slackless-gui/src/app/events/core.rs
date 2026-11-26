@@ -1133,6 +1133,7 @@ impl App {
                             thread_ts: None,
                             broadcast: false,
                             content: pending.content,
+                            files: None,
                         },
                         window,
                         cx,

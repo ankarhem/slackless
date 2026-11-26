@@ -1,6 +1,8 @@
 //! Message actions, inline editing, emoji picker, image viewer, and message/file sending for
 //! popped-out secondary windows.
 
+use std::cell::Cell;
+
 use gpui_kit::component::input::TextareaState;
 use gpui_kit::gpui::{
     AppContext as _, ClipboardItem, Context, Focusable as _, Pixels, Point, Window,
@@ -16,6 +18,13 @@ use crate::image_viewer::{self, ImageOrigin, ImageViewer, ViewerEvent};
 use crate::later::SaveRequest;
 
 use super::{JumpHandler, PopoutKind, PopoutPickerTarget, PopoutWindow};
+
+/// A popped-out composer's send on its way through the main window's checks.
+struct Outgoing {
+    content: MessageContent,
+    /// Staged files the message uploads with (empty for a plain message).
+    files: Vec<slackless_core::api::UploadFile>,
+}
 
 impl PopoutWindow {
     pub(super) fn open_picker(
@@ -458,25 +467,85 @@ impl PopoutWindow {
 
     pub(super) fn send_content_guarded(
         &mut self,
-        mut content: MessageContent,
+        content: MessageContent,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        composer::apply_outgoing_transforms(&mut content, &self.fixtures, cx);
-        if let Some(window) = window
-            && composer::outgoing_guard_prefs(cx).warn_before_sending_secrets
-        {
-            let matches = slackless_core::detect_secrets(&content.text);
+        let outgoing = Outgoing {
+            content,
+            files: Vec::new(),
+        };
+        self.send_guarded(outgoing, window, cx);
+    }
+
+    /// Send `outgoing` after the main window's checks: the outgoing transforms, the secret
+    /// warning and the `@channel` confirmation (`F-CORE-083`).
+    fn send_guarded(
+        &mut self,
+        mut outgoing: Outgoing,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        composer::apply_outgoing_transforms(&mut outgoing.content, &self.fixtures, cx);
+        let Some(window) = window else {
+            self.deliver(outgoing, cx);
+            return;
+        };
+        if composer::outgoing_guard_prefs(cx).warn_before_sending_secrets {
+            let matches = slackless_core::detect_secrets(&outgoing.content.text);
             if !matches.is_empty() {
                 let this = cx.entity().downgrade();
-                let pending = content;
-                composer::confirm_secret_send_dialog(matches, window, cx, move |_, cx| {
-                    let _ = this.update(cx, |win, cx| win.deliver_content(pending.clone(), cx));
+                let pending = Cell::new(Some(outgoing));
+                composer::confirm_secret_send_dialog(matches, window, cx, move |window, cx| {
+                    if let Some(outgoing) = pending.take() {
+                        let _ =
+                            this.update(cx, |win, cx| win.guard_broadcast(outgoing, window, cx));
+                    }
                 });
                 return;
             }
         }
-        self.deliver_content(content, cx);
+        self.guard_broadcast(outgoing, window, cx);
+    }
+
+    /// [`Self::send_guarded`] once the text holds no secret: ask before a broadcast goes out, as
+    /// the main window does; canceling puts the text back in the composer.
+    fn guard_broadcast(&mut self, outgoing: Outgoing, window: &mut Window, cx: &mut Context<Self>) {
+        let guard = self.send_target().and_then(|(channel, _)| {
+            crate::app::broadcast_guard(&outgoing.content, &self.fixtures, &channel, None)
+        });
+        let Some(guard) = guard else {
+            self.deliver(outgoing, cx);
+            return;
+        };
+        let (this_send, this_cancel) = (cx.entity().downgrade(), cx.entity().downgrade());
+        let text = outgoing.content.text.clone();
+        let pending = Cell::new(Some(outgoing));
+        crate::app::confirm_broadcast(
+            guard,
+            move |_, cx| {
+                if let Some(outgoing) = pending.take() {
+                    let _ = this_send.update(cx, |win, cx| win.deliver(outgoing, cx));
+                }
+            },
+            move |_, cx| {
+                let _ = this_cancel.update(cx, |win, cx| {
+                    if let Some(composer) = &win.composer {
+                        composer.update(cx, |composer, cx| composer.load_draft(&text, cx));
+                    }
+                });
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn deliver(&mut self, outgoing: Outgoing, cx: &mut Context<Self>) {
+        if outgoing.files.is_empty() {
+            self.deliver_content(outgoing.content, cx);
+        } else {
+            self.upload(outgoing, cx);
+        }
     }
 
     #[cfg(test)]
@@ -544,56 +613,66 @@ impl PopoutWindow {
         cx.notify();
     }
 
+    /// Upload staged `files` with the composer's text (if any), through the same checks as a
+    /// message.
     pub(super) fn send_files(
         &mut self,
-        mut content: Option<MessageContent>,
+        content: Option<MessageContent>,
         files: Vec<crate::composer::PendingAttachment>,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        let (channel, thread_ts) = match &self.kind {
-            PopoutKind::Conversation { channel, .. } => (channel.clone(), None),
-            PopoutKind::Thread {
-                channel, thread_ts, ..
-            } => (channel.clone(), Some(thread_ts.clone())),
-            PopoutKind::Huddle { .. } => {
-                let Some(state) = &self.huddle_state else {
-                    return;
-                };
-                let channel = state.session.channel.clone();
-                let thread_ts = self.resolve_huddle_thread_root(&state.session);
-                (channel, thread_ts)
-            }
-            PopoutKind::Activity { .. }
-            | PopoutKind::Later { .. }
-            | PopoutKind::Canvas { .. }
-            | PopoutKind::Files { .. } => return,
-        };
-        let uploads: Vec<slackless_core::api::UploadFile> = files
+        if files.is_empty() && content.is_none() {
+            return;
+        }
+        let files = files
             .into_iter()
             .map(|attachment| slackless_core::api::UploadFile {
                 filename: attachment.filename,
                 bytes: attachment.bytes.into(),
             })
             .collect();
-        if uploads.is_empty() {
-            if let Some(content) = content {
-                self.send_content_guarded(content, window, cx);
-            }
+        let outgoing = Outgoing {
+            content: content.unwrap_or_default(),
+            files,
+        };
+        self.send_guarded(outgoing, window, cx);
+    }
+
+    /// Upload `outgoing`'s files with its text (if any).
+    fn upload(&mut self, outgoing: Outgoing, cx: &mut Context<Self>) {
+        let Some((channel, thread_ts)) = self.send_target() else {
             return;
-        }
-        if let Some(ref mut c) = content {
-            composer::apply_outgoing_transforms(c, &self.fixtures, cx);
-        }
+        };
+        let Outgoing { content, files } = outgoing;
         (self.send)(
             CollabCommand::UploadFiles {
                 channel,
                 thread_ts,
-                content,
-                files: uploads,
+                content: (content != MessageContent::default()).then_some(content),
+                files,
             }
             .into(),
         );
         cx.notify();
+    }
+
+    /// Where the composer sends: its conversation, its thread, or the huddle's thread.
+    fn send_target(&self) -> Option<(ChannelId, Option<Ts>)> {
+        match &self.kind {
+            PopoutKind::Conversation { channel, .. } => Some((channel.clone(), None)),
+            PopoutKind::Thread {
+                channel, thread_ts, ..
+            } => Some((channel.clone(), Some(thread_ts.clone()))),
+            PopoutKind::Huddle { .. } => {
+                let state = self.huddle_state.as_ref()?;
+                let thread_ts = self.resolve_huddle_thread_root(&state.session);
+                Some((state.session.channel.clone(), thread_ts))
+            }
+            PopoutKind::Activity { .. }
+            | PopoutKind::Later { .. }
+            | PopoutKind::Canvas { .. }
+            | PopoutKind::Files { .. } => None,
+        }
     }
 }

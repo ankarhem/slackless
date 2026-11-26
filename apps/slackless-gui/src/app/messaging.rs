@@ -724,6 +724,7 @@ impl App {
             thread_ts: None,
             broadcast: false,
             content: composer::content_of(&entry.text, &self.fixtures),
+            files: None,
         };
         if self.submit(msg, window, cx) {
             notify(
@@ -745,6 +746,9 @@ pub(super) struct OutgoingMessage {
     pub thread_ts: Option<Ts>,
     pub broadcast: bool,
     pub content: MessageContent,
+    /// Staged files the message uploads with (`None` for a plain message), shared so a held
+    /// confirmation does not copy them.
+    pub files: Option<Rc<Vec<composer::PendingAttachment>>>,
 }
 
 /// A New-message send waiting for [`ChannelCommand::OpenDm`] to open the DM with `users`.
@@ -895,6 +899,160 @@ pub(crate) fn broadcast_autocomplete_hint(
         return Some(format!("{member_count} members"));
     }
     None
+}
+
+/// The `@channel` confirmation `content` needs in `channel` (`F-CORE-083`), if any, for the main
+/// window and popped-out composers alike. `fresh_members`: a member count newer than the
+/// snapshot's (`conversations.info`).
+pub(crate) fn broadcast_guard(
+    content: &MessageContent,
+    fixtures: &Fixtures,
+    channel: &ChannelId,
+    fresh_members: Option<u32>,
+) -> Option<BroadcastGuard> {
+    let range = broadcast_kind(content)?;
+    let conv = fixtures.conversation(channel)?;
+    let members = (fresh_members.or(conv.num_members)).map_or(conv.members.len(), |n| {
+        usize::try_from(n).unwrap_or(usize::MAX)
+    });
+    evaluate_broadcast_guard(&range, conv, members, fixtures.user(&fixtures.self_user))
+}
+
+/// Ask before `guard`'s broadcast goes out: "Send" runs `on_send`, "Cancel" `on_cancel`.
+pub(crate) fn confirm_broadcast(
+    guard: BroadcastGuard,
+    on_send: impl Fn(&mut Window, &mut gpui::App) + 'static,
+    on_cancel: impl Fn(&mut Window, &mut gpui::App) + 'static,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    let (on_send, on_cancel) = (Rc::new(on_send), Rc::new(on_cancel));
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let theme = cx.theme();
+        let (muted, warning, border, card_bg) = (
+            theme.muted_foreground,
+            theme.warning,
+            theme.border,
+            theme.secondary.opacity(0.4),
+        );
+        let (on_send, on_cancel) = (on_send.clone(), on_cancel.clone());
+        let count_badge = if guard.is_large_enterprise {
+            format!(
+                "{} members \u{b7} Large Enterprise channel",
+                guard.member_count
+            )
+        } else if guard.member_count > 0 {
+            format!(
+                "{} {}",
+                guard.member_count,
+                if guard.member_count == 1 {
+                    "member"
+                } else {
+                    "members"
+                }
+            )
+        } else {
+            "Channel broadcast".to_owned()
+        };
+        dialog.title(guard.title.clone()).w(px(480.)).child(
+            v_flex()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .px_2()
+                                .py_0p5()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(border)
+                                .bg(card_bg)
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(Icon::new(IconName::Users).size(px(12.)).text_color(muted))
+                                .child(count_badge),
+                        )
+                        .when(guard.is_restricted, |row| {
+                            row.child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(warning.opacity(0.45))
+                                    .bg(warning.opacity(0.14))
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(warning)
+                                    .child(
+                                        Icon::new(IconName::TriangleAlert)
+                                            .size(px(12.))
+                                            .text_color(warning),
+                                    )
+                                    .child("Restricted mention"),
+                            )
+                        }),
+                )
+                .child(div().text_sm().text_color(muted).child(guard.body.clone()))
+                .when_some(guard.restriction_note.clone(), |col, note| {
+                    col.child(
+                        h_flex()
+                            .items_start()
+                            .gap_2()
+                            .p_2p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(warning.opacity(0.4))
+                            .bg(warning.opacity(0.1))
+                            .text_xs()
+                            .child(
+                                Icon::new(IconName::TriangleAlert)
+                                    .size(px(14.))
+                                    .text_color(warning),
+                            )
+                            .child(div().flex_1().min_w_0().child(note)),
+                    )
+                })
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .pt_1()
+                        .child(
+                            preferences::form_button(
+                                Button::new("broadcast-cancel").outline().label("Cancel"),
+                                cx,
+                            )
+                            .debug_selector(|| "broadcast-cancel".into())
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                on_cancel(window, cx);
+                            }),
+                        )
+                        .child(
+                            preferences::form_button(
+                                if guard.is_restricted {
+                                    Button::new("broadcast-send").danger().label("Send anyway")
+                                } else {
+                                    Button::new("broadcast-send").primary().label("Send")
+                                },
+                                cx,
+                            )
+                            .debug_selector(|| "broadcast-send".into())
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                on_send(window, cx);
+                            }),
+                        ),
+                ),
+        )
+    });
 }
 
 /// Evaluate whether sending `range` in `conversation` requires a confirmation / restricted-mention
@@ -1158,6 +1316,7 @@ impl App {
                 thread_ts: None,
                 broadcast: false,
                 content,
+                files: None,
             },
             window,
             cx,
@@ -1204,163 +1363,35 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let guard = broadcast_kind(&msg.content).and_then(|range| {
-            let conv = self.fixtures.conversation(&msg.channel)?;
-            let members = self
-                .ws
-                .member_counts
-                .get(&msg.channel)
-                .map(|&n| n as usize)
-                .or_else(|| conv.num_members.map(|n| n as usize))
-                .unwrap_or(conv.members.len());
-            let me = self.fixtures.user(&self.fixtures.self_user);
-            evaluate_broadcast_guard(&range, conv, members, me)
-        });
-        let Some(guard) = guard else {
+        let fresh_members = self.ws.member_counts.get(&msg.channel).copied();
+        let Some(guard) =
+            broadcast_guard(&msg.content, &self.fixtures, &msg.channel, fresh_members)
+        else {
             self.dispatch(msg, cx);
             return true;
         };
-        let this = cx.weak_entity();
+        let (this_send, this_cancel) = (cx.weak_entity(), cx.weak_entity());
         let cancel_text = msg.content.text.clone();
         let restore = (msg.thread_ts.is_none()).then(|| msg.channel.clone());
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let theme = cx.theme();
-            let (muted, warning, border, card_bg) = (
-                theme.muted_foreground,
-                theme.warning,
-                theme.border,
-                theme.secondary.opacity(0.4),
-            );
-            let this_cancel = this.clone();
-            let this_send = this.clone();
-            let send = msg.clone();
-            let cancel_text = cancel_text.clone();
-            let restore_cancel = restore.clone();
-            let count_badge = if guard.is_large_enterprise {
-                format!(
-                    "{} members \u{b7} Large Enterprise channel",
-                    guard.member_count
-                )
-            } else if guard.member_count > 0 {
-                format!(
-                    "{} {}",
-                    guard.member_count,
-                    if guard.member_count == 1 {
-                        "member"
-                    } else {
-                        "members"
-                    }
-                )
-            } else {
-                "Channel broadcast".to_owned()
-            };
-            dialog.title(guard.title.clone()).w(px(480.)).child(
-                v_flex()
-                    .gap_3()
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(border)
-                                    .bg(card_bg)
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(
-                                        Icon::new(IconName::Users).size(px(12.)).text_color(muted),
-                                    )
-                                    .child(count_badge),
-                            )
-                            .when(guard.is_restricted, |row| {
-                                row.child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(warning.opacity(0.45))
-                                        .bg(warning.opacity(0.14))
-                                        .text_xs()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(warning)
-                                        .child(
-                                            Icon::new(IconName::TriangleAlert)
-                                                .size(px(12.))
-                                                .text_color(warning),
-                                        )
-                                        .child("Restricted mention"),
-                                )
-                            }),
-                    )
-                    .child(div().text_sm().text_color(muted).child(guard.body.clone()))
-                    .when_some(guard.restriction_note.clone(), |col, note| {
-                        col.child(
-                            h_flex()
-                                .items_start()
-                                .gap_2()
-                                .p_2p5()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(warning.opacity(0.4))
-                                .bg(warning.opacity(0.1))
-                                .text_xs()
-                                .child(
-                                    Icon::new(IconName::TriangleAlert)
-                                        .size(px(14.))
-                                        .text_color(warning),
-                                )
-                                .child(div().flex_1().min_w_0().child(note)),
-                        )
-                    })
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .justify_end()
-                            .pt_1()
-                            .child(
-                                preferences::form_button(
-                                    Button::new("broadcast-cancel").outline().label("Cancel"),
-                                    cx,
-                                )
-                                .debug_selector(|| "broadcast-cancel".into())
-                                .on_click(move |_, window, cx| {
-                                    window.close_dialog(cx);
-                                    let _ = this_cancel.update(cx, |app, cx| {
-                                        if let Some(channel) = restore_cancel.clone() {
-                                            app.restore_composer_text(&channel, &cancel_text, cx);
-                                        }
-                                    });
-                                }),
-                            )
-                            .child(
-                                preferences::form_button(
-                                    if guard.is_restricted {
-                                        Button::new("broadcast-send").danger().label("Send anyway")
-                                    } else {
-                                        Button::new("broadcast-send").primary().label("Send")
-                                    },
-                                    cx,
-                                )
-                                .debug_selector(|| "broadcast-send".into())
-                                .on_click(move |_, window, cx| {
-                                    window.close_dialog(cx);
-                                    let _ = this_send.update(cx, |app, cx| {
-                                        app.dispatch(send.clone(), cx);
-                                    });
-                                }),
-                            ),
-                    ),
-            )
-        });
+        // Taken once on Send, so staged files go out without a copy.
+        let pending = Cell::new(Some(msg));
+        confirm_broadcast(
+            guard,
+            move |_, cx| {
+                if let Some(msg) = pending.take() {
+                    let _ = this_send.update(cx, |app, cx| app.dispatch(msg, cx));
+                }
+            },
+            move |_, cx| {
+                if let Some(channel) = &restore {
+                    let _ = this_cancel.update(cx, |app, cx| {
+                        app.restore_composer_text(channel, &cancel_text, cx);
+                    });
+                }
+            },
+            window,
+            cx,
+        );
         false
     }
 
@@ -1620,15 +1651,21 @@ impl App {
     }
 
     /// Hand `msg` to the core after the outgoing transforms (tracking-param strip, emoticon
-    /// conversion). A thread reply goes straight out; a top-level message also echoes into the
-    /// transcript, joins the sent list and drops the composer's saved draft for its channel.
+    /// conversion). Staged files upload with it; a thread reply goes straight out; a top-level
+    /// message also echoes into the transcript, joins the sent list and drops the composer's
+    /// saved draft for its channel.
     fn dispatch(&mut self, mut msg: OutgoingMessage, cx: &mut Context<Self>) {
         composer::apply_outgoing_transforms(&mut msg.content, &self.fixtures, cx);
+        if let Some(files) = msg.files.take() {
+            self.upload(msg, files, cx);
+            return;
+        }
         let OutgoingMessage {
             channel,
             thread_ts,
             broadcast,
             content,
+            files: _,
         } = msg;
         let Some(thread_ts) = thread_ts else {
             self.send_to_conversation(channel, content, cx);
@@ -1731,9 +1768,44 @@ impl App {
         if valid_files.is_empty() {
             return;
         }
-        let files = valid_files;
+        let count = valid_files.len();
+        // The message rides the one send pipeline (secret check, `@channel` guard) with its files.
+        let msg = OutgoingMessage {
+            channel,
+            thread_ts,
+            broadcast: false,
+            content: content.unwrap_or_default(),
+            files: Some(Rc::new(valid_files)),
+        };
+        if self.submit(msg, window, cx) && self.bridge.store().is_some() {
+            let label = if count == 1 { "file" } else { "files" };
+            notify(
+                "Uploading",
+                format!("Uploading {count} {label}\u{2026}"),
+                window,
+                cx,
+            );
+        }
+        self.save_draft(cx);
+    }
+
+    /// Upload `files` with `msg`'s text (if any) to its channel or thread, or echo them in
+    /// sample mode.
+    fn upload(
+        &mut self,
+        msg: OutgoingMessage,
+        files: Rc<Vec<composer::PendingAttachment>>,
+        cx: &mut Context<Self>,
+    ) {
+        let files = Rc::try_unwrap(files).unwrap_or_else(|shared| (*shared).clone());
+        let OutgoingMessage {
+            channel,
+            thread_ts,
+            content,
+            ..
+        } = msg;
+        let content = (content != MessageContent::default()).then_some(content);
         if self.bridge.store().is_some() {
-            let count = files.len();
             let uploads = files
                 .into_iter()
                 .map(|f| slackless_core::api::UploadFile {
@@ -1747,13 +1819,6 @@ impl App {
                 content,
                 files: uploads,
             });
-            let label = if count == 1 { "file" } else { "files" };
-            notify(
-                "Uploading",
-                format!("Uploading {count} {label}\u{2026}"),
-                window,
-                cx,
-            );
         } else {
             // Fixture mode: echo the message locally with stub file entries.
             let text = content.as_ref().map(|c| c.text.clone()).unwrap_or_default();
@@ -1776,7 +1841,6 @@ impl App {
             self.messages
                 .update(cx, |list, cx| list.append(channel, message, cx));
         }
-        self.save_draft(cx);
     }
 
     /// Dispatch a message-level action triggered from an unread row's hover toolbar, reaction
@@ -2092,6 +2156,7 @@ impl App {
                     thread_ts: Some(thread_ts.clone()),
                     broadcast: true,
                     content: crate::composer::content_of(&message.text, &self.fixtures),
+                    files: None,
                 };
                 if self.submit(msg, window, cx) {
                     window.push_notification("Sent reply to channel", cx);

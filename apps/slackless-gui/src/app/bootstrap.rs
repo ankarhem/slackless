@@ -791,6 +791,7 @@ fn wire_feature_view_subscriptions(
                             thread_ts: Some(thread_ts.clone()),
                             broadcast: *broadcast,
                             content: content.clone(),
+                            files: None,
                         },
                         window,
                         cx,
@@ -900,6 +901,7 @@ fn wire_feature_view_subscriptions(
                         thread_ts: None,
                         broadcast: false,
                         content: slackless_core::api::MessageContent::plain(text.clone()),
+                        files: None,
                     };
                     if this.submit(msg, window, cx) {
                         actions::notify("Reply sent", this.label(channel), window, cx);

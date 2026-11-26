@@ -473,6 +473,50 @@ fn wired_confirmed_send_stays_on_the_channel_it_was_submitted_to(cx: &mut gpui::
         "a canceled send sends nothing"
     );
 
+    // 4. An upload's message passes the same guard: nothing uploads until it is confirmed, and
+    // then into the channel it was submitted to.
+    let uploaded_to = |cmds: &[Command], channel: &ChannelId| {
+        cmds.iter().any(|c| {
+            matches!(
+                c,
+                Command::Collab(CollabCommand::UploadFiles { channel: target, .. })
+                    if target == channel
+            )
+        })
+    };
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.select(big.clone(), cx);
+            let content = crate::composer::content_of("<!channel> notes attached", &app.fixtures);
+            let file = crate::composer::PendingAttachment {
+                filename: "notes.txt".into(),
+                bytes: b"notes".to_vec(),
+                preview: None,
+            };
+            app.upload_files(big.clone(), None, Some(content), vec![file], window, cx);
+            app.select(small.clone(), cx);
+        });
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        !uploaded_to(&core.drain_commands(), &big),
+        "the @channel guard must hold an upload's message until confirmed"
+    );
+    let send = cx
+        .debug_bounds("broadcast-send")
+        .expect("the upload's confirmation is on screen");
+    cx.simulate_click(send.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let cmds = core.drain_commands();
+    assert!(
+        uploaded_to(&cmds, &big),
+        "confirming uploads into the channel the message was submitted to: {cmds:?}"
+    );
+    assert!(
+        !uploaded_to(&cmds, &small),
+        "nothing may upload into the channel open at confirm time: {cmds:?}"
+    );
     drop(root);
 }
 

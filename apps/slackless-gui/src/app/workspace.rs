@@ -465,6 +465,7 @@ pub(super) fn subscribe_workspace(
                         thread_ts: Some(thread_ts.clone()),
                         broadcast: true,
                         content: content.clone(),
+                        files: None,
                     };
                     if this.submit(msg, window, cx) {
                         window.push_notification("Sent reply to channel", cx);
@@ -482,6 +483,7 @@ pub(super) fn subscribe_workspace(
                             thread_ts: Some(thread_ts.clone()),
                             broadcast: *broadcast,
                             content: content.clone(),
+                            files: None,
                         },
                         window,
                         cx,
