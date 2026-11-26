@@ -207,6 +207,11 @@ impl App {
                 cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
                 notify("Huddle link copied", url.clone(), window, cx);
             }
+            HuddleEvent::VideoTileClosed(tile) => {
+                if let Some(state) = self.huddle_state.clone() {
+                    state.update(cx, |s, cx| s.close_video_tile(tile, cx));
+                }
+            }
         }
     }
 }

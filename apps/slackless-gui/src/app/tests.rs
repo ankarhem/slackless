@@ -1149,6 +1149,16 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
                 cx,
             );
             assert_eq!(video_store.read(cx).frames().len(), 1);
+            // The ordered-stream copy of a closure (the one a full media lane cannot drop)
+            // removes the tile too.
+            app.on_core_event(
+                &Event::Huddle(HuddleEvent::VideoTileClosed(
+                    slackless_core::huddle::VideoTileKey::RemoteScreen(inviter.clone()),
+                )),
+                window,
+                cx,
+            );
+            assert!(video_store.read(cx).frames().is_empty());
 
             // 5. Incoming DM huddle invite banner mounts and cancels cleanly.
             app.on_core_event(

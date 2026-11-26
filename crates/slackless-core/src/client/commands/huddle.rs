@@ -290,10 +290,10 @@ pub(in crate::client) fn spawn_huddle_watcher(
     );
 }
 
-/// Forward huddle session updates from `upd_rx` to `events` (control/lifecycle/data) and
-/// `huddle_media` (high-frequency video frames, tile closures, audio meters via non-blocking
-/// `try_send`), tagged with `my_gen` so an older session transitioning to `Idle`/`Failed` can
-/// never clobber a newer active session's state.
+/// Forward huddle session updates from `upd_rx` to `events` (control/lifecycle/data and tile
+/// closures) and `huddle_media` (high-frequency video frames, audio meters and best-effort tile
+/// closures via non-blocking `try_send`), tagged with `my_gen` so an older session transitioning
+/// to `Idle`/`Failed` can never clobber a newer active session's state.
 ///
 /// High-frequency media updates check the atomic `generation` counter lock-free instead of taking
 /// the `HuddleSlot` mutex.
@@ -343,7 +343,11 @@ fn spawn_huddle_watcher_tracked(
                 }
                 HuddleUpdate::VideoTileClosed(tile) => {
                     if gen_counter.load(Ordering::Acquire) == my_gen {
-                        let _ = huddle_media.try_send(HuddleMediaEvent::VideoTileClosed(tile));
+                        // On the media lane the closure stays behind the tile's queued frames,
+                        // but a full lane drops it; the ordered stream never does.
+                        let _ =
+                            huddle_media.try_send(HuddleMediaEvent::VideoTileClosed(tile.clone()));
+                        events.emit(Event::Huddle(HuddleEvent::VideoTileClosed(tile)));
                     }
                 }
                 HuddleUpdate::DataEvent(ev) => {

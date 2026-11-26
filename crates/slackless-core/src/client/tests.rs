@@ -6983,7 +6983,12 @@ async fn huddle_media_uses_dedicated_bounded_channel_and_drops_overflow_without_
         .unwrap();
     drop(upd_tx);
 
-    // The ordered `Event` channel receives ONLY the session state change — zero media frames!
+    // The ordered `Event` channel carries the tile closure the full media lane dropped, then the
+    // session state change — zero media frames!
+    assert_eq!(
+        next(&mut event_rx).await,
+        Event::Huddle(HuddleEvent::VideoTileClosed(tile.clone()))
+    );
     let ev = next(&mut event_rx).await;
     assert!(matches!(
         ev,
@@ -7002,6 +7007,38 @@ async fn huddle_media_uses_dedicated_bounded_channel_and_drops_overflow_without_
     assert!(
         received <= HUDDLE_MEDIA_CHANNEL_CAPACITY + 1,
         "media channel must stay bounded, got {received}"
+    );
+
+    // With room on the media lane the closure also queues behind the tile's frames, so the UI
+    // never repaints a closed tile from a frame that was still queued.
+    let (event_tx, mut event_rx) = mpsc::unbounded();
+    let (media_tx, mut media_rx) = mpsc::channel(HUDDLE_MEDIA_CHANNEL_CAPACITY);
+    let (upd_tx, upd_rx) = tokio::sync::mpsc::unbounded_channel();
+    commands::spawn_huddle_watcher(huddle, 1, upd_rx, Emitter(event_tx), media_tx, None);
+    upd_tx
+        .send(crate::huddle::HuddleUpdate::VideoFrame {
+            tile: tile.clone(),
+            frame: crate::huddle::VideoFrame {
+                width: 2,
+                height: 2,
+                data: crate::huddle::VideoFrameData::Bgra(Arc::new(vec![0; 16])),
+            },
+        })
+        .unwrap();
+    upd_tx
+        .send(crate::huddle::HuddleUpdate::VideoTileClosed(tile.clone()))
+        .unwrap();
+    assert_eq!(
+        next(&mut event_rx).await,
+        Event::Huddle(HuddleEvent::VideoTileClosed(tile.clone()))
+    );
+    assert!(matches!(
+        media_rx.try_recv(),
+        Ok(HuddleMediaEvent::VideoFrame { .. })
+    ));
+    assert_eq!(
+        media_rx.try_recv().ok(),
+        Some(HuddleMediaEvent::VideoTileClosed(tile))
     );
 }
 

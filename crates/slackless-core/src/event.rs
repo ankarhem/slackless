@@ -23,7 +23,9 @@ pub enum HuddleMediaEvent {
         tile: huddle::VideoTileKey,
         frame: huddle::VideoFrame,
     },
-    /// A camera or screen-share video tile stopped publishing and should be removed.
+    /// A camera or screen-share video tile stopped publishing and should be removed. Best effort,
+    /// ordered behind the tile's queued frames; [`HuddleEvent::VideoTileClosed`] is the
+    /// guaranteed copy.
     VideoTileClosed(huddle::VideoTileKey),
     /// Live local RMS level and remote active-speaker / mute states from the active Chime session.
     AudioLevels(huddle::HuddleAudioLevels),
@@ -58,6 +60,9 @@ pub enum HuddleEvent {
     LinkLoaded { channel: ChannelId, url: String },
     /// Ephemeral collaboration event over Chime `DATA_MESSAGE` (reaction, hand raise, topic, caption).
     Data(huddle::HuddleDataEvent),
+    /// A camera or screen-share video tile stopped publishing. Unlike its best-effort copy on the
+    /// lossy media lane, this one is never dropped, so a tile cannot stay frozen.
+    VideoTileClosed(huddle::VideoTileKey),
 }
 
 impl From<HuddleEvent> for Event {
