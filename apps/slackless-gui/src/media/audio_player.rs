@@ -41,8 +41,6 @@ pub struct AudioSnapshot {
     pub duration_secs: f64,
     pub rate: f32,
     pub muted: bool,
-    #[allow(dead_code)]
-    pub elapsed_ms: u64,
     pub duration_ms: Option<u64>,
 }
 
@@ -89,7 +87,6 @@ impl MediaPlayer {
                 duration_secs: fallback_secs,
                 rate: 1.0,
                 muted: false,
-                elapsed_ms: 0,
                 duration_ms: active.fallback_duration_ms,
             });
         }
@@ -107,7 +104,6 @@ impl MediaPlayer {
         } else {
             active.fallback_duration_ms
         };
-        let elapsed_ms = (position_secs * 1000.0).round() as u64;
         let playing = st.playing && !st.ended;
         let paused = !playing && !st.ended;
         let rate = if st.rate.is_finite() && st.rate > 0.0 {
@@ -123,7 +119,6 @@ impl MediaPlayer {
             duration_secs,
             rate,
             muted: st.muted,
-            elapsed_ms,
             duration_ms,
         })
     }
