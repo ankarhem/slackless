@@ -579,8 +579,8 @@ impl App {
                 .keys()
                 .all(|id| self.fixtures.conversation(id).is_some());
         if all_known {
-            let updated = Arc::new(self.fixtures.with_counts(self.ws.counts.clone()));
-            self.apply_snapshot(updated, window, cx);
+            self.sync_counts_to_views(cx);
+            self.keep_or_pick_conversation(cx);
         } else {
             self.reload_live(window, cx);
         }

@@ -977,6 +977,74 @@ fn wired_unread_counts_fold_alike_in_shown_and_background_workspaces(
 }
 
 #[gpui::test]
+fn wired_count_changes_redraw_only_the_views_that_show_counts(cx: &mut gpui::TestAppContext) {
+    let people = [user("U0ME", "me"), user("U0PEER", "peer")];
+    let channels = [("C0OPEN", "open"), ("C0CHAN", "chan")];
+    let (bridge, core) =
+        cx.update(|cx| make_wired_workspace("T0CNT", "Counts Co", &channels, &people, cx));
+    let fx = bridge.snapshot(&HashMap::new()).expect("snapshot");
+    let (root, app, cx) = mount_wired(fx, vec![bridge], cx);
+    cx.update(|_, cx| app.update(cx, |app, cx| app.select(ChannelId::from("C0OPEN"), cx)));
+    cx.run_until_parked();
+    // The quick switcher lists names, never unread state.
+    let redrawn = Rc::new(Cell::new(0));
+    let _watch = cx.update(|_, cx| {
+        let switcher = app.read(cx).switcher.clone();
+        let redrawn = redrawn.clone();
+        cx.observe(&switcher, move |_, _| redrawn.set(redrawn.get() + 1))
+    });
+    let chan = ChannelId::from("C0CHAN");
+    let unread = slackless_core::api::ClientCounts {
+        channels: vec![ConversationCounts {
+            id: chan.clone(),
+            has_unreads: true,
+            latest: Some(Ts::from("1700000001.000100")),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let rows = [
+        ("Slack counts an unread", Event::Counts(Box::new(unread))),
+        (
+            "another device reads it",
+            Event::ReadMarker {
+                channel: chan.clone(),
+                ts: Ts::from("1700000001.000100"),
+            },
+        ),
+        (
+            "a peer posts",
+            Event::MessagePosted {
+                channel: chan.clone(),
+                message: Box::new(Message {
+                    ts: Ts::from("1700000002.000100"),
+                    user: Some(UserId::from("U0PEER")),
+                    text: "hi".into(),
+                    ..Default::default()
+                }),
+            },
+        ),
+    ];
+    for (what, event) in rows {
+        cx.update(|_, cx| core.emit(event, cx));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let app = app.read(cx);
+            assert_eq!(
+                app.fixtures.counts, app.ws.counts,
+                "{what}: the snapshot follows"
+            );
+            assert_eq!(
+                redrawn.get(),
+                0,
+                "{what}: a view showing no counts stays as it is"
+            );
+        });
+    }
+    drop(root);
+}
+
+#[gpui::test]
 fn wired_pending_dm_delivers_only_to_the_dm_it_was_addressed_to(cx: &mut gpui::TestAppContext) {
     let people = [
         user("U0ME", "me"),

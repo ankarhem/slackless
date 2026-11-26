@@ -213,20 +213,41 @@ impl App {
     }
 
     /// Fast in-memory update pushing `self.ws.counts` (and updated per-conversation `last_read`
-    /// cursors) into `self.fixtures` and the views that read unread state, without touching SQLite
-    /// or requiring `&mut Window`.
+    /// cursors) into `self.fixtures` and the views that draw unread state, without touching
+    /// SQLite or requiring `&mut Window`. The other views keep the snapshot they hold: its
+    /// workspace data is the same, and unchanged counts redraw nothing.
     pub(in crate::app) fn sync_counts_to_views(&mut self, cx: &mut Context<Self>) {
         if self.fixtures.sample {
             return;
         }
-        let fixtures = Arc::new(self.fixtures.with_counts(self.ws.counts.clone()));
-        self.sync_all_views_fixtures(fixtures.clone(), cx);
-        self.fixtures = fixtures;
-        self.sync_badge(cx);
-        if self.page == MainPage::Unreads {
-            self.refresh_unreads(cx);
+        if self.fixtures.counts != self.ws.counts {
+            let fixtures = Arc::new(self.fixtures.with_counts(self.ws.counts.clone()));
+            self.sidebar
+                .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+            self.messages
+                .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+            self.activity
+                .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+            self.unreads
+                .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+            self.compose
+                .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+            self.fixtures = fixtures;
+            if self.page == MainPage::Unreads {
+                self.refresh_unreads(cx);
+            }
+            cx.notify();
         }
-        cx.notify();
+        self.sync_badge(cx);
+    }
+
+    /// Until the user opens a conversation, live updates open the one most recently read in
+    /// Slack; one that is gone from the snapshot is left for it too.
+    pub(in crate::app) fn keep_or_pick_conversation(&mut self, cx: &mut Context<Self>) {
+        let keep = self.ws.chosen && self.fixtures.conversation(&self.channel).is_some();
+        if !keep {
+            self.show_conversation(first_conversation(&self.fixtures), cx);
+        }
     }
 
     /// Fold an RTM `*_marked` (`im_marked`, `mpim_marked`, `channel_marked`, `group_marked`) event
@@ -261,7 +282,6 @@ impl App {
         // Refresh the views in place, as Slack does: a status change or a new channel keeps
         // every scroll position, collapsed section and open panel.
         self.sync_all_views_fixtures(fixtures.clone(), cx);
-        let keep = self.ws.chosen && fixtures.conversation(&self.channel).is_some();
         self.fixtures = fixtures;
         // Hydrate custom status from Slack's live self profile (preserving active focus mode).
         if !self.self_state.focused()
@@ -274,9 +294,7 @@ impl App {
         }
         self.sync_connect_orgs(cx);
         self.resolve_users(self.fixtures.dms.iter().filter_map(|dm| dm.user.clone()));
-        if !keep {
-            self.show_conversation(first_conversation(&self.fixtures), cx);
-        }
+        self.keep_or_pick_conversation(cx);
         self.sync_composer_placeholder(cx);
         self.apply_preferences(window, cx);
         if self.page == MainPage::Unreads {
