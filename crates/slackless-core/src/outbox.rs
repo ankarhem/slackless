@@ -86,16 +86,10 @@ impl OutboxPayload {
         }
     }
 
-    /// Compact summary label (truncated to 48 chars) for menus and logs.
+    /// Compact one-line summary label (at most 49 characters, ellipsis included) for menus and
+    /// logs.
     pub fn summary(&self) -> String {
-        let raw = self.preview_text();
-        let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-        let preview: String = collapsed.chars().take(48).collect();
-        if collapsed.chars().count() > 48 {
-            format!("{preview}…")
-        } else {
-            preview
-        }
+        crate::search::truncate_chars(&self.preview_text(), 49)
     }
 }
 
