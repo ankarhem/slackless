@@ -187,27 +187,47 @@ pub struct ExportedHuddleTranscriptDoc {
     pub segments: Vec<ExportedHuddleSegment>,
 }
 
-/// Read up to `limit` newest matching messages from `channel`, ordered oldest first.
+/// The messages [`read_channel_window`] returns, all ordered oldest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelWindow {
+    /// Only messages strictly older than this `ts`.
+    pub before: Option<Ts>,
+    /// Only messages at or after this unix-seconds cutoff.
+    pub since_secs: Option<i64>,
+    /// At most this many messages.
+    pub limit: usize,
+    /// Include deleted tombstones.
+    pub include_deleted: bool,
+}
+
+/// Read up to `window.limit` newest messages of `channel` that fall inside `window`, ordered
+/// oldest first.
 ///
-/// Paginates backwards via `before` when `include_deleted` is false so deleted tombstones at the
-/// tail of a channel never starve `limit`.
-fn read_channel_messages_window(
+/// Paginates backwards via `before` when a filter would otherwise hide rows (deleted tombstones
+/// at the tail of a channel, messages behind `since_secs`) so they never starve the limit.
+pub fn read_channel_window(
     store: &Store,
     workspace: &TeamId,
     channel: &ChannelId,
-    limit: usize,
-    include_deleted: bool,
+    window: &ChannelWindow,
 ) -> StoreResult<Vec<StoredMessage>> {
+    let ChannelWindow {
+        since_secs,
+        limit,
+        include_deleted,
+        ..
+    } = window;
+    let (limit, include_deleted) = (*limit, *include_deleted);
     if limit == 0 {
         return Ok(Vec::new());
     }
-    if include_deleted {
-        return store.channel_history(workspace, channel, None, limit);
+    if include_deleted && since_secs.is_none() {
+        return store.channel_history(workspace, channel, window.before.as_ref(), limit);
     }
 
     let page_size = limit.clamp(64, 500);
     let mut collected: Vec<StoredMessage> = Vec::with_capacity(limit.min(512));
-    let mut before: Option<Ts> = None;
+    let mut before: Option<Ts> = window.before.clone();
 
     'pages: loop {
         let page = store.channel_history(workspace, channel, before.as_ref(), page_size)?;
@@ -218,7 +238,14 @@ fn read_channel_messages_window(
         let oldest_ts = page[0].message.ts.clone();
 
         for msg in page.into_iter().rev() {
-            if msg.deleted {
+            if let Some(cutoff) = *since_secs {
+                match msg.message.ts.secs() {
+                    Some(secs) if secs < cutoff => break 'pages,
+                    Some(_) => {}
+                    None => continue,
+                }
+            }
+            if !include_deleted && msg.deleted {
                 continue;
             }
             collected.push(msg);
@@ -259,8 +286,16 @@ pub fn export_channel(
         HashMap::new()
     };
 
-    let raw =
-        read_channel_messages_window(store, workspace, channel, opts.limit, opts.include_deleted)?;
+    let raw = read_channel_window(
+        store,
+        workspace,
+        channel,
+        &ChannelWindow {
+            limit: opts.limit,
+            include_deleted: opts.include_deleted,
+            ..ChannelWindow::default()
+        },
+    )?;
     let mut messages = Vec::with_capacity(raw.len());
     for stored in raw {
         let mut row =
@@ -1102,6 +1137,77 @@ mod tests {
             .map(|m| m["text"].as_str().unwrap())
             .collect();
         assert_eq!(texts, vec!["entry-2", "entry-3", "entry-4"]);
+    }
+
+    #[test]
+    fn read_channel_window_skips_deleted_and_cutoff_rows_without_starving_the_limit() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ws = TeamId::from("T1");
+        let ch = ChannelId::from("C1");
+        // Ten messages (ts 1000..=1009); the newest five are deleted tombstones.
+        let msgs: Vec<Message> = (0..10)
+            .map(|i| Message {
+                ts: Ts::from(format!("{}.000000", 1_700_001_000 + i)),
+                text: format!("msg {i}"),
+                ..Message::default()
+            })
+            .collect();
+        store.upsert_messages(&ws, &ch, &msgs).unwrap();
+        for i in 5..10 {
+            store
+                .record_deletion(
+                    &ws,
+                    &ch,
+                    &Ts::from(format!("{}.000000", 1_700_001_000 + i)),
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+
+        let texts = |window: &ChannelWindow| -> Vec<String> {
+            read_channel_window(&store, &ws, &ch, window)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.message.text)
+                .collect()
+        };
+        let base = ChannelWindow {
+            limit: 3,
+            include_deleted: false,
+            ..ChannelWindow::default()
+        };
+        // Deleted tombstones at the tail are skipped without spending the limit.
+        assert_eq!(
+            texts(&base),
+            vec!["msg 2", "msg 3", "msg 4"],
+            "deleted tombstones must not starve the limit"
+        );
+        // A cutoff stops the walk at the first older message.
+        assert_eq!(
+            texts(&ChannelWindow {
+                limit: 5,
+                since_secs: Some(1_700_001_003),
+                ..base.clone()
+            }),
+            vec!["msg 3", "msg 4"]
+        );
+        // `before` starts the walk older than the cursor.
+        assert_eq!(
+            texts(&ChannelWindow {
+                before: Some(Ts::from("1700001003.000000")),
+                ..base.clone()
+            }),
+            vec!["msg 0", "msg 1", "msg 2"]
+        );
+        // Without filters the newest page is read in one query, tombstones included.
+        assert_eq!(
+            texts(&ChannelWindow {
+                include_deleted: true,
+                ..base
+            }),
+            vec!["msg 7", "msg 8", "msg 9"]
+        );
     }
 
     #[test]

@@ -78,10 +78,10 @@ pub use event::{
     Event, FailedMutation, HUDDLE_MEDIA_CHANNEL_CAPACITY, HuddleEvent, HuddleMediaEvent,
 };
 pub use export::{
-    ExportArtifact, ExportFormat, ExportOptions, ExportTarget, ExportedChannelMeta, ExportedFile,
-    ExportedFileTranscriptDoc, ExportedHuddleSegment, ExportedHuddleTranscriptDoc, ExportedMessage,
-    ExportedMessagesDoc, ExportedReaction, export_channel, export_file_transcript,
-    export_huddle_transcript, export_target, export_thread,
+    ChannelWindow, ExportArtifact, ExportFormat, ExportOptions, ExportTarget, ExportedChannelMeta,
+    ExportedFile, ExportedFileTranscriptDoc, ExportedHuddleSegment, ExportedHuddleTranscriptDoc,
+    ExportedMessage, ExportedMessagesDoc, ExportedReaction, export_channel, export_file_transcript,
+    export_huddle_transcript, export_target, export_thread, read_channel_window,
 };
 pub use fetcher::Fetcher;
 pub use maintenance::{
