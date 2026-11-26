@@ -9,9 +9,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::PoisonError;
 
 use crate::SharedStore;
+use crate::client::read_store;
 use crate::domain::mrkdwn::mrkdwn_to_plain;
 use crate::notify::{NotifyLevel, notify_levels};
 use crate::store::{Result as StoreResult, Store, StoredMessage};
@@ -299,7 +299,7 @@ pub fn build_catchup_across_stores(
         if !seen_ws.insert(target.workspace.clone()) {
             continue;
         }
-        let store = target.store.lock().unwrap_or_else(PoisonError::into_inner);
+        let store = read_store(&target.store);
         let last_visit = read_catchup_last_visit(&store, &target.workspace)?;
         let cutoff = window.cutoff_secs(now_secs, last_visit);
         min_cutoff = Some(min_cutoff.map_or(cutoff, |prev| prev.min(cutoff)));

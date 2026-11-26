@@ -245,6 +245,14 @@ impl Store {
         schema::schema_version(&self.conn)
     }
 
+    /// The database file this store reads and writes; `None` for an in-memory store.
+    pub fn path(&self) -> Option<&Path> {
+        self.conn
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(Path::new)
+    }
+
     pub fn upsert_conversation(&mut self, workspace: &TeamId, conv: &Conversation) -> Result<()> {
         self.upsert_conversations(workspace, std::slice::from_ref(conv))
     }

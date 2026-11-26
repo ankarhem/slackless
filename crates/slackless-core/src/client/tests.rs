@@ -8859,3 +8859,61 @@ async fn channels_tabs_dnd_presence_profile_usergroups_and_sign_out_commands() {
     assert!(saw_profile && saw_team_dnd && saw_away && saw_active);
     core.shutdown().await;
 }
+
+/// A front-end query (search, catch-up, semantic hydration) that holds its read open must not
+/// stall the core: `on_rtm` applies websocket events under the writer lock meanwhile.
+#[tokio::test]
+async fn front_end_read_in_flight_does_not_block_the_writer() {
+    let dir =
+        std::env::temp_dir().join(format!("slackless-core-read-store-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ws = TeamId::from("T1");
+    let mut writer = Store::open(dir.join("T1.sqlite")).unwrap();
+    writer
+        .upsert_team(
+            &ws,
+            &Team {
+                id: ws.clone(),
+                name: "Acme".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let store: SharedStore = Arc::new(Mutex::new(writer));
+
+    let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let query = {
+        let store = Arc::clone(&store);
+        let ws = ws.clone();
+        std::thread::spawn(move || {
+            let read = read_store(&store);
+            opened_tx
+                .send(read.team(&ws).unwrap().map(|team| team.name))
+                .unwrap();
+            // Circuit breaker: a writer stuck behind this read fails the test, not hangs it.
+            let _ = done_rx.recv_timeout(Duration::from_secs(10));
+        })
+    };
+    let seen = opened_rx.recv().unwrap();
+
+    let event: SlackEvent = serde_json::from_str(
+        r#"{"type":"message","channel":"C1","user":"U1","text":"hi","ts":"1700000000.000100"}"#,
+    )
+    .unwrap();
+    let applied = tokio::time::timeout(
+        Duration::from_secs(3),
+        with_store_opt(&store, move |s| apply_event(s, &ws, event)),
+    )
+    .await;
+    drop(done_tx);
+    query.join().unwrap();
+
+    assert_eq!(seen.as_deref(), Some("Acme"), "read the core's database");
+    assert!(
+        matches!(applied, Ok(Some(Some(Event::StoreChanged { .. })))),
+        "apply_event waited for a front-end read to finish: {applied:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

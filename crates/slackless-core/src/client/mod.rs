@@ -9,8 +9,10 @@ use self::hydrate::*;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::ops::Deref;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
 use futures::StreamExt;
@@ -43,8 +45,52 @@ use crate::{
 
 /// The store shared between the core (writer) and front-ends (readers).
 ///
-/// SQLite is blocking: front-ends should lock it off their UI thread (or keep reads short).
+/// SQLite is blocking: front-ends should lock it off their UI thread (or keep reads short). The
+/// core's own front-end queries (search, catch-up, semantic hydration) read a file-backed store
+/// through private read-only connections, so however long they run they never hold this lock.
 pub type SharedStore = Arc<Mutex<Store>>;
+
+/// One front-end read of a [`SharedStore`], opened by [`read_store`].
+pub(crate) enum StoreRead<'a> {
+    /// A private read-only connection to the store's database file.
+    Private(Store),
+    /// An in-memory store, which no second connection can see, under its lock.
+    Locked(MutexGuard<'a, Store>),
+}
+
+impl Deref for StoreRead<'_> {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        match self {
+            Self::Private(store) => store,
+            Self::Locked(store) => store,
+        }
+    }
+}
+
+/// Opens `store` for one front-end query (search, catch-up, semantic hydration). A file-backed
+/// store is read through a private read-only WAL connection, so the query runs while the core
+/// applies websocket events under the store's lock (and never holds up a front-end's shared read
+/// handle either): the lock is held only to look up the file.
+pub(crate) fn read_store(store: &SharedStore) -> StoreRead<'_> {
+    let path = store
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .path()
+        .map(Path::to_path_buf);
+    if let Some(path) = path {
+        match Store::open_read_only(&path) {
+            Ok(private) => return StoreRead::Private(private),
+            Err(err) => tracing::warn!(
+                path = %path.display(),
+                %err,
+                "could not open a private read connection; reading under the store lock"
+            ),
+        }
+    }
+    StoreRead::Locked(store.lock().unwrap_or_else(PoisonError::into_inner))
+}
 
 /// Cloneable sender for front-end [`Command`]s into the core.
 pub type CommandSender = UnboundedSender<Command>;

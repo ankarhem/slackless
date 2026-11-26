@@ -7,9 +7,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::PoisonError;
 
 use crate::SharedStore;
+use crate::client::read_store;
 use crate::paths;
 use crate::store::{
     HuddleTranscriptSegment, Result as StoreResult, SearchQuery, SearchSort, Store,
@@ -202,7 +202,7 @@ pub fn search_across_stores(
     let mut hits: Vec<UnifiedSearchHit> = Vec::new();
 
     for target in targets {
-        let store = target.store.lock().unwrap_or_else(PoisonError::into_inner);
+        let store = read_store(&target.store);
         let ws = &target.workspace;
         let ws_meta = load_workspace_meta(&store, ws, target.workspace_name.as_deref())?;
         if seen_ws.insert(ws.clone()) {
@@ -335,7 +335,7 @@ pub fn search_huddle_transcripts_across_stores(
     let mut out = Vec::new();
     let mut seen: HashSet<(TeamId, i64)> = HashSet::new();
     for target in targets {
-        let store = target.store.lock().unwrap_or_else(PoisonError::into_inner);
+        let store = read_store(&target.store);
         let ws = &target.workspace;
         let Ok(meta) = load_workspace_meta(&store, ws, target.workspace_name.as_deref()) else {
             continue;

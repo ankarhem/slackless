@@ -3,7 +3,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::PoisonError;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +13,7 @@ use slackless_store::{
 };
 use slackless_types::{ChannelId, File, FileId, Message, TeamId, Ts};
 
+use crate::client::read_store;
 use crate::domain::mrkdwn::mrkdwn_to_plain;
 use crate::embeddings::{Embedder, content_hash};
 use crate::paths;
@@ -685,52 +685,52 @@ pub fn hybrid_search_huddle_transcripts_across_stores(
         )
         .map_err(|e| format!("semantic huddle transcript search failed: {e}"))?;
 
-    let mut by_ws: HashMap<&str, &WorkspaceSearchTarget> = HashMap::new();
-    for t in targets {
-        by_ws.insert(t.workspace.as_str(), t);
-    }
-
-    let mut semantic_hits = Vec::new();
-    let mut channel_names: HashMap<TeamId, HashMap<String, String>> = HashMap::new();
     let lang_prefix = lang
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_ascii_lowercase);
-    for hit in sem_raw {
-        let Ok(seg_id) = hit.doc_id.parse::<i64>() else {
-            continue;
-        };
-        let Some(target) = by_ws.get(hit.workspace.as_str()) else {
-            continue;
-        };
-        let store = target.store.lock().unwrap_or_else(PoisonError::into_inner);
-        let Ok(Some(segment)) = store.huddle_transcript_segment(&hit.workspace, seg_id) else {
-            continue;
-        };
-        if let Some(ref lp) = lang_prefix
-            && !segment
-                .lang
-                .as_deref()
-                .is_some_and(|l| l.to_ascii_lowercase().starts_with(lp))
-        {
+    // One read per workspace, not per hit; each hit fills its own slot so the similarity order
+    // holds.
+    let mut slots: Vec<Option<UnifiedTranscriptHit>> = sem_raw.iter().map(|_| None).collect();
+    for target in targets {
+        if !sem_raw.iter().any(|hit| hit.workspace == target.workspace) {
             continue;
         }
-        let channels = channel_names
-            .entry(hit.workspace.clone())
-            .or_insert_with(|| store.channel_names(&hit.workspace).unwrap_or_default());
-        let channel_name = channels.get(segment.channel.as_str()).cloned();
-        let speaker_name = segment
-            .speaker_id
-            .as_ref()
-            .and_then(|u| store.user_display(&hit.workspace, u).ok().flatten());
-        semantic_hits.push(UnifiedTranscriptHit {
-            workspace: hit.workspace,
-            workspace_name: target.workspace_name.clone(),
-            channel_name,
-            speaker_name,
-            segment,
-        });
+        let store = read_store(&target.store);
+        let channels = store.channel_names(&target.workspace).unwrap_or_default();
+        for (slot, hit) in slots.iter_mut().zip(&sem_raw) {
+            if hit.workspace != target.workspace {
+                continue;
+            }
+            let Ok(seg_id) = hit.doc_id.parse::<i64>() else {
+                continue;
+            };
+            let Ok(Some(segment)) = store.huddle_transcript_segment(&target.workspace, seg_id)
+            else {
+                continue;
+            };
+            if let Some(ref lp) = lang_prefix
+                && !segment
+                    .lang
+                    .as_deref()
+                    .is_some_and(|l| l.to_ascii_lowercase().starts_with(lp))
+            {
+                continue;
+            }
+            let speaker_name = segment
+                .speaker_id
+                .as_ref()
+                .and_then(|u| store.user_display(&target.workspace, u).ok().flatten());
+            *slot = Some(UnifiedTranscriptHit {
+                workspace: target.workspace.clone(),
+                workspace_name: target.workspace_name.clone(),
+                channel_name: channels.get(segment.channel.as_str()).cloned(),
+                speaker_name,
+                segment,
+            });
+        }
     }
+    let mut semantic_hits: Vec<UnifiedTranscriptHit> = slots.into_iter().flatten().collect();
 
     if mode == SearchMode::Semantic {
         semantic_hits.truncate(limit);
@@ -985,30 +985,27 @@ fn hydrate_semantic_hits_from_targets(
     raw_hits: &[SemanticHit],
     query: &SearchQuery,
 ) -> std::result::Result<Vec<UnifiedSearchHit>, String> {
-    let mut by_ws: HashMap<&str, &WorkspaceSearchTarget> = HashMap::new();
-    for t in targets {
-        by_ws.insert(t.workspace.as_str(), t);
-    }
-    let mut meta_cache: HashMap<TeamId, HydrateMeta> = HashMap::new();
-    let mut out = Vec::new();
-    let mut seen_keys: HashSet<HitKey> = HashSet::new();
-
-    for sem in raw_hits {
-        let Some(target) = by_ws.get(sem.workspace.as_str()) else {
+    // One read per workspace, not per hit; each hit fills its own slot so the similarity order
+    // holds.
+    let mut slots: Vec<Option<UnifiedSearchHit>> = raw_hits.iter().map(|_| None).collect();
+    for target in targets {
+        if !raw_hits.iter().any(|sem| sem.workspace == target.workspace) {
             continue;
-        };
-        let store = target.store.lock().unwrap_or_else(PoisonError::into_inner);
-        let meta = meta_cache.entry(sem.workspace.clone()).or_insert_with(|| {
-            load_hydrate_meta(&store, &sem.workspace, target.workspace_name.as_deref())
-        });
-        if let Some(hit) = hydrate_one_hit(&store, sem, meta, query) {
-            let key = hit_key(&hit);
-            if seen_keys.insert(key) {
-                out.push(hit);
+        }
+        let store = read_store(&target.store);
+        let meta = load_hydrate_meta(&store, &target.workspace, target.workspace_name.as_deref());
+        for (slot, sem) in slots.iter_mut().zip(raw_hits) {
+            if sem.workspace == target.workspace {
+                *slot = hydrate_one_hit(&store, sem, &meta, query);
             }
         }
     }
-    Ok(out)
+    let mut seen_keys: HashSet<HitKey> = HashSet::new();
+    Ok(slots
+        .into_iter()
+        .flatten()
+        .filter(|hit| seen_keys.insert(hit_key(hit)))
+        .collect())
 }
 
 fn hydrate_semantic_hits_from_stores(
