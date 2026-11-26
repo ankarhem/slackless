@@ -278,6 +278,9 @@ fn current_process_rss_mb() -> u32 {
 
     let mut info = MachTaskBasicInfo::default();
     let mut count = (std::mem::size_of::<MachTaskBasicInfo>() / std::mem::size_of::<u32>()) as u32;
+    // SAFETY: `MachTaskBasicInfo` mirrors `mach_task_basic_info` field for field, `count` is its
+    // size in 32-bit words as `task_info` expects, and `mach_task_self_` is this task's port,
+    // which libSystem sets at process start.
     let kr = unsafe { task_info(mach_task_self_, MACH_TASK_BASIC_INFO, &mut info, &mut count) };
     if kr == 0 {
         (info.resident_size / (1024 * 1024)) as u32

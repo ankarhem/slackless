@@ -28,6 +28,8 @@ unsafe extern "C" fn on_audio_device_change_cb(ctx: *mut c_void, is_input: bool)
     if ctx.is_null() {
         return;
     }
+    // SAFETY: `ctx` is the `AudioHotplugCtx` leaked by `CoreAudioDeviceMonitor::start`, freed only
+    // after `slackless_audio_device_monitor_stop` has drained the listener queue.
     let state = unsafe { &*(ctx as *const AudioHotplugCtx) };
     (state.callback)(is_input);
 }
@@ -46,10 +48,13 @@ impl CoreAudioDeviceMonitor {
         let ctx = NonNull::from(Box::leak(Box::new(AudioHotplugCtx {
             callback: Box::new(on_change),
         })));
+        // SAFETY: `ctx` stays valid until `Drop` frees it after stopping the monitor, and the
+        // callback has the signature the monitor invokes.
         let handle = unsafe {
             slackless_audio_device_monitor_start(ctx.as_ptr().cast(), on_audio_device_change_cb)
         };
         let Some(handle) = NonNull::new(handle) else {
+            // SAFETY: the monitor did not start, so nothing else holds `ctx`; reclaim the leak.
             unsafe { drop(Box::from_raw(ctx.as_ptr())) };
             return None;
         };
@@ -59,7 +64,10 @@ impl CoreAudioDeviceMonitor {
 
 impl Drop for CoreAudioDeviceMonitor {
     fn drop(&mut self) {
+        // SAFETY: `handle` came from a successful start and is stopped once, here.
         unsafe { slackless_audio_device_monitor_stop(self.handle.as_ptr()) };
+        // SAFETY: the stop drained the listener queue, so no callback can still read `ctx`, which
+        // `start` leaked from a `Box`.
         unsafe { drop(Box::from_raw(self.ctx.as_ptr())) };
     }
 }
@@ -80,7 +88,10 @@ unsafe extern "C" fn on_vpio_capture_cb(ctx: *mut c_void, samples: *const f32, c
     if ctx.is_null() || samples.is_null() || count == 0 {
         return;
     }
+    // SAFETY: `ctx` is the `VpioCtx` leaked by `MacVoiceProcessingIo::start`, freed only after
+    // `slackless_vpio_stop` has disposed of the AudioUnit that calls this.
     let state = unsafe { &*(ctx as *const VpioCtx) };
+    // SAFETY: the AudioUnit passes `count` rendered samples that stay valid for this call.
     let slice = unsafe { std::slice::from_raw_parts(samples, count) };
     (state.on_capture)(slice);
 }
@@ -89,7 +100,9 @@ unsafe extern "C" fn on_vpio_render_cb(ctx: *mut c_void, samples: *mut f32, coun
     if ctx.is_null() || samples.is_null() || count == 0 {
         return;
     }
+    // SAFETY: as in `on_vpio_capture_cb`, `ctx` outlives every AudioUnit callback.
     let state = unsafe { &*(ctx as *const VpioCtx) };
+    // SAFETY: the AudioUnit lends this call alone its `count`-sample output buffer.
     let slice = unsafe { std::slice::from_raw_parts_mut(samples, count) };
     (state.on_render)(slice);
 }
@@ -116,6 +129,8 @@ impl MacVoiceProcessingIo {
             on_capture: Box::new(on_capture),
             on_render: Box::new(on_render),
         })));
+        // SAFETY: `ctx` stays valid until `Drop` frees it after `slackless_vpio_stop`, and both
+        // callbacks have the signatures the AudioUnit invokes.
         let handle = unsafe {
             slackless_vpio_start(
                 sample_rate,
@@ -127,6 +142,7 @@ impl MacVoiceProcessingIo {
             )
         };
         let Some(handle) = NonNull::new(handle) else {
+            // SAFETY: the AudioUnit did not start, so nothing else holds `ctx`; reclaim the leak.
             unsafe { drop(Box::from_raw(ctx.as_ptr())) };
             return Err(HuddleError::Audio(
                 "CoreAudio VoiceProcessingIO unavailable".into(),
@@ -142,13 +158,17 @@ impl MacVoiceProcessingIo {
     }
 
     pub fn set_processing(&self, enable_vp: bool, enable_agc: bool) {
+        // SAFETY: `handle` is live until `Drop` stops it.
         unsafe { slackless_vpio_set_processing(self.handle.as_ptr(), enable_vp, enable_agc) };
     }
 }
 
 impl Drop for MacVoiceProcessingIo {
     fn drop(&mut self) {
+        // SAFETY: `handle` came from a successful start and is stopped once, here.
         unsafe { slackless_vpio_stop(self.handle.as_ptr()) };
+        // SAFETY: the stop disposed of the AudioUnit, so no callback can still read `ctx`, which
+        // `start` leaked from a `Box`.
         unsafe { drop(Box::from_raw(self.ctx.as_ptr())) };
     }
 }
@@ -160,6 +180,7 @@ impl Drop for MacVoiceProcessingIo {
 /// Measure gated linear RMS loudness of an audio file via CoreAudio `ExtAudioFile`.
 pub fn measure_audio_file_rms(path: &std::path::Path) -> Option<f32> {
     let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok()?;
+    // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
     let rms = unsafe { slackless_audio_file_measure_rms(c_path.as_ptr()) };
     (rms.is_finite() && rms > 1e-5).then_some(rms)
 }
@@ -178,6 +199,8 @@ pub fn play_routed_audio_oneshot(
         .filter(|s| !s.is_empty())
         .and_then(|s| std::ffi::CString::new(s).ok());
     let dev_ptr = c_dev.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+    // SAFETY: `c_path` and `dev_ptr` (null or `c_dev`) are NUL-terminated strings that outlive
+    // the call.
     unsafe { slackless_audio_file_play_oneshot(c_path.as_ptr(), dev_ptr, volume) }
 }
 
@@ -196,12 +219,16 @@ impl MacRoutedAudioLoop {
             .filter(|s| !s.is_empty())
             .and_then(|s| std::ffi::CString::new(s).ok());
         let dev_ptr = c_dev.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+        // SAFETY: `c_path` and `dev_ptr` (null or `c_dev`) are NUL-terminated strings that
+        // outlive the call.
         let handle = unsafe { slackless_audio_file_start_loop(c_path.as_ptr(), dev_ptr, volume) };
         (!handle.is_null()).then_some(Self { handle })
     }
 
     pub fn stop(&mut self) {
         if !self.handle.is_null() {
+            // SAFETY: `handle` is a live loop handle; nulling it right after makes this the only
+            // stop, which frees it.
             unsafe { slackless_audio_file_stop_loop(self.handle) };
             self.handle = std::ptr::null_mut();
         }
@@ -220,7 +247,7 @@ impl Drop for MacRoutedAudioLoop {
 
 /// Returns `true` when macOS 14.2+ CoreAudio Process Taps (`CATapDescription`) are available.
 pub fn supports_native_system_audio_tap() -> bool {
-    unsafe { slackless_audio_tap_is_supported() }
+    slackless_audio_tap_is_supported()
 }
 
 struct TapRingCtx {
@@ -232,7 +259,10 @@ unsafe extern "C" fn on_audio_tap_pcm_cb(ctx: *mut c_void, samples: *const i16, 
         return;
     }
     // Real-time CoreAudio IOProc: lock-free, allocation-free push into SPSC ring.
+    // SAFETY: `ctx` is the `TapRingCtx` leaked by `MacSystemAudioTap::start`, freed only after
+    // `slackless_audio_tap_stop` has destroyed the IOProc that calls this.
     let state = unsafe { &*(ctx as *const TapRingCtx) };
+    // SAFETY: the IOProc passes `count` converted samples that stay valid for this call.
     let slice = unsafe { std::slice::from_raw_parts(samples, count) };
     let _ = state.ring.push_slice(slice);
 }
@@ -250,6 +280,8 @@ impl MacSystemAudioTap {
     pub(crate) fn start(ring: Arc<SpscRing<i16>>) -> Result<Self> {
         let ctx = NonNull::from(Box::leak(Box::new(TapRingCtx { ring })));
         let mut err_buf = [0 as c_char; 256];
+        // SAFETY: `ctx` stays valid until `Drop` frees it after `slackless_audio_tap_stop`, the
+        // callback has the signature the IOProc invokes, and `err_buf` is writable for its length.
         let handle = unsafe {
             slackless_audio_tap_start(
                 ctx.as_ptr().cast(),
@@ -259,7 +291,10 @@ impl MacSystemAudioTap {
             )
         };
         let Some(handle) = NonNull::new(handle) else {
+            // SAFETY: the tap did not start, so nothing else holds `ctx`; reclaim the leak.
             unsafe { drop(Box::from_raw(ctx.as_ptr())) };
+            // SAFETY: `err_buf` starts zeroed and the native side only `snprintf`s into it, so it
+            // holds a NUL-terminated string.
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_str()
                 .unwrap_or("macOS CoreAudio Process Tap failed")
@@ -273,7 +308,10 @@ impl MacSystemAudioTap {
 
 impl Drop for MacSystemAudioTap {
     fn drop(&mut self) {
+        // SAFETY: `handle` came from a successful start and is stopped once, here.
         unsafe { slackless_audio_tap_stop(self.handle.as_ptr()) };
+        // SAFETY: the stop destroyed the IOProc, so no callback can still read `ctx`, which
+        // `start` leaked from a `Box`.
         unsafe { drop(Box::from_raw(self.ctx.as_ptr())) };
     }
 }

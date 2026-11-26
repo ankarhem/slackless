@@ -3,6 +3,8 @@
 //! macOS; `nokhwa` + `openh264` on Linux/Windows), screen sharing (`ScreenCaptureKit` / `xcap` +
 //! `openh264`), and Chime `DATA_MESSAGE` extras for Slack Huddles.
 
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 pub mod audio;
 pub mod av1;
 pub mod backend;

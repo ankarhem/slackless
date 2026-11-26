@@ -106,10 +106,12 @@ pub(crate) type SlacklessAudioDeviceChangeCallback =
     unsafe extern "C" fn(ctx: *mut c_void, is_input: bool);
 
 unsafe extern "C" {
-    pub(crate) fn slackless_has_screen_capture_permission() -> bool;
-    pub(crate) fn slackless_request_screen_capture_permission() -> bool;
-    pub(crate) fn slackless_macos_supports_hw_h264_decode() -> bool;
-    pub(crate) fn slackless_macos_supports_hw_av1_decode() -> bool;
+    // Argument-free capability and permission queries: nothing for a caller to uphold.
+    pub(crate) safe fn slackless_has_screen_capture_permission() -> bool;
+    pub(crate) safe fn slackless_request_screen_capture_permission() -> bool;
+    pub(crate) safe fn slackless_macos_supports_hw_h264_decode() -> bool;
+    pub(crate) safe fn slackless_macos_supports_hw_av1_decode() -> bool;
+    pub(crate) safe fn slackless_audio_tap_is_supported() -> bool;
 
     pub(crate) fn slackless_cvpb_retain(pb: *mut c_void) -> *mut c_void;
     pub(crate) fn slackless_cvpb_release(pb: *mut c_void);
@@ -234,7 +236,6 @@ unsafe extern "C" {
     pub(crate) fn slackless_audio_file_stop_loop(handle: *mut SlacklessAudioHandle);
     pub(crate) fn slackless_audio_file_measure_rms(path: *const c_char) -> f32;
 
-    pub(crate) fn slackless_audio_tap_is_supported() -> bool;
     pub(crate) fn slackless_audio_tap_start(
         ctx: *mut c_void,
         on_pcm: SlacklessAudioTapCallback,
@@ -312,7 +313,10 @@ pub(crate) unsafe extern "C" fn on_h264_cb(
     if ctx.is_null() || data.is_null() || len == 0 {
         return;
     }
+    // SAFETY: `ctx` is the `CaptureCallbackCtx` the camera or screen capture was started with,
+    // freed only once the capture's stop guarantees no further callback (see their `Drop`).
     let state = unsafe { &*(ctx as *const CaptureCallbackCtx) };
+    // SAFETY: the encoder passes `len` initialized bytes that stay valid for this call.
     let slice = unsafe { std::slice::from_raw_parts(data, len) };
     if let Some(perf) = &state.perf {
         perf.record_tx_frame(width, height, len as u64, encode_us);
@@ -330,11 +334,14 @@ pub(crate) unsafe extern "C" fn on_surface_preview_cb(
 ) {
     if ctx.is_null() || cv_pb.is_null() {
         if !cv_pb.is_null() {
+            // SAFETY: the capture hands over a +1 retain on `cv_pb` that nothing else releases.
             unsafe { slackless_cvpb_release(cv_pb) };
         }
         return;
     }
+    // SAFETY: as in `on_h264_cb`, `ctx` outlives every callback of the capture it was given to.
     let state = unsafe { &*(ctx as *const CaptureCallbackCtx) };
+    // SAFETY: the capture hands over a +1 retain on `cv_pb`, which the surface takes over.
     if let Some(surface) = unsafe { MacVideoSurface::from_retained(cv_pb, width, height) } {
         (state.on_preview)(VideoFrame::from_mac_surface(surface));
     }
@@ -344,6 +351,7 @@ pub(crate) unsafe extern "C" fn on_error_cb(_ctx: *mut c_void, message: *const c
     let msg = if message.is_null() {
         "macOS capture stream stopped with unknown error"
     } else {
+        // SAFETY: a non-null `message` is a NUL-terminated string valid for this call.
         unsafe { CStr::from_ptr(message) }
             .to_str()
             .unwrap_or("macOS capture stream stopped")

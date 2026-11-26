@@ -57,6 +57,9 @@ impl ScVtScreenCapture {
             perf: Some(perf),
         })));
         let mut err_buf = [0 as c_char; 512];
+        // SAFETY: `ctx` stays valid until the stop in `Drop` releases it through
+        // `on_released_cb`, the callbacks have the signatures the capture invokes, and `err_buf` is
+        // writable for its length.
         let handle = unsafe {
             slackless_sc_capture_start(
                 is_monitor,
@@ -74,7 +77,10 @@ impl ScVtScreenCapture {
             )
         };
         let Some(handle) = NonNull::new(handle) else {
+            // SAFETY: the capture did not start, so nothing else holds `ctx`; reclaim the leak.
             unsafe { drop(Box::from_raw(ctx.as_ptr())) };
+            // SAFETY: `err_buf` starts zeroed and the native side only `snprintf`s into it, so it
+            // holds a NUL-terminated string.
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_str()
                 .unwrap_or("ScreenCaptureKit startup failed")
@@ -93,16 +99,20 @@ impl ScVtScreenCapture {
     }
 
     pub fn force_keyframe(&self) {
+        // SAFETY: `handle` is live until `Drop` stops it.
         unsafe { slackless_sc_capture_force_keyframe(self.handle.as_ptr()) };
     }
 
     pub fn set_target_bitrate(&self, bitrate_bps: u32) {
+        // SAFETY: `handle` is live until `Drop` stops it.
         unsafe { slackless_sc_capture_set_bitrate(self.handle.as_ptr(), bitrate_bps) };
     }
 }
 
 unsafe extern "C" fn on_released_cb(ctx: *mut c_void) {
     if !ctx.is_null() {
+        // SAFETY: the stopped capture calls this once, after its last callback, with the `ctx`
+        // that `ScVtScreenCapture::start` leaked from a `Box`.
         unsafe { drop(Box::from_raw(ctx.cast::<CaptureCallbackCtx>())) };
     }
 }
@@ -112,6 +122,8 @@ impl Drop for ScVtScreenCapture {
         // Native code releases `ctx` from its stop completion handler, once no ScreenCaptureKit
         // callback can still reach it (which may be after this returns if the stop is slow).
         let (handle, ctx) = (self.handle.as_ptr(), self.ctx.as_ptr().cast());
+        // SAFETY: `handle` came from a successful start and is stopped once, here; the stop takes
+        // over `ctx` and frees it through `on_released_cb`.
         unsafe { slackless_sc_capture_stop(handle, ctx, Some(on_released_cb)) };
     }
 }
@@ -127,10 +139,15 @@ unsafe extern "C" fn on_thumb_cb(
     if ctx.is_null() || source_id.is_null() || bgra.is_null() || len == 0 {
         return;
     }
+    // SAFETY: `ctx` is the `Vec` that `capture_macos_thumbnails` lends the native call, which
+    // runs this under its batch mutex and cancels the batch before returning, so calls never
+    // overlap or outlive the borrow.
     let out = unsafe { &mut *(ctx as *mut Vec<(String, VideoFrame)>) };
+    // SAFETY: `source_id` is a NUL-terminated string valid for this call.
     let Ok(id) = unsafe { CStr::from_ptr(source_id) }.to_str() else {
         return;
     };
+    // SAFETY: `bgra` holds `len` initialized bytes that stay valid for this call.
     let slice = unsafe { std::slice::from_raw_parts(bgra, len) };
     out.push((
         id.to_owned(),
@@ -145,11 +162,13 @@ unsafe extern "C" fn should_skip_system_window_cb(
     let app_str = if app.is_null() {
         ""
     } else {
+        // SAFETY: a non-null `app` is a NUL-terminated string valid for this call.
         unsafe { CStr::from_ptr(app) }.to_str().unwrap_or("")
     };
     let title_str = if title.is_null() {
         ""
     } else {
+        // SAFETY: a non-null `title` is a NUL-terminated string valid for this call.
         unsafe { CStr::from_ptr(title) }.to_str().unwrap_or("")
     };
     crate::screen::is_system_chrome_window(app_str, title_str)
@@ -163,6 +182,8 @@ pub fn capture_macos_thumbnails(
     max_h: u32,
 ) -> Option<Vec<(String, VideoFrame)>> {
     let mut out = Vec::new();
+    // SAFETY: `out` outlives the call and is what `on_thumb_cb` reads `ctx` as; both callbacks
+    // have the signatures the native code invokes.
     let ok = unsafe {
         slackless_capture_thumbnails(
             monitors_only,

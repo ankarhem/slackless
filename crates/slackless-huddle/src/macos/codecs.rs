@@ -20,11 +20,15 @@ unsafe extern "C" fn on_decoded_surface_cb(
 ) {
     if ctx.is_null() || cv_pb.is_null() {
         if !cv_pb.is_null() {
+            // SAFETY: the decoder hands over a +1 retain on `cv_pb` that nothing else releases.
             unsafe { slackless_cvpb_release(cv_pb) };
         }
         return;
     }
+    // SAFETY: `ctx` is the `Option<VideoFrame>` a `decode_*` call lends the decoder, which decodes
+    // synchronously (no async flag), so this runs inside that call and nothing else touches it.
     let out = unsafe { &mut *(ctx as *mut Option<VideoFrame>) };
+    // SAFETY: the decoder hands over a +1 retain on `cv_pb`, which the surface takes over.
     if let Some(surface) = unsafe { MacVideoSurface::from_retained(cv_pb, width, height) } {
         *out = Some(VideoFrame::from_mac_surface(surface));
     }
@@ -40,6 +44,7 @@ unsafe impl Send for VtH264Decoder {}
 
 impl VtH264Decoder {
     pub fn new() -> Result<Self> {
+        // SAFETY: argument-free constructor; a null result is rejected below.
         let handle = unsafe { slackless_vt_decoder_new() };
         let handle = NonNull::new(handle).ok_or_else(|| {
             HuddleError::Codec("failed to allocate VideoToolbox H.264 decoder".into())
@@ -52,6 +57,8 @@ impl VtH264Decoder {
             return None;
         }
         let mut frame: Option<VideoFrame> = None;
+        // SAFETY: `handle` is live until `Drop`, `annex_b` is valid for its length, and `frame`
+        // is what `on_decoded_surface_cb` reads `ctx` as, for the duration of this call.
         let ok = unsafe {
             slackless_vt_decoder_decode(
                 self.handle.as_ptr(),
@@ -67,6 +74,7 @@ impl VtH264Decoder {
 
 impl Drop for VtH264Decoder {
     fn drop(&mut self) {
+        // SAFETY: `handle` came from `slackless_vt_decoder_new` and is freed once, here.
         unsafe { slackless_vt_decoder_free(self.handle.as_ptr()) };
     }
 }
@@ -82,6 +90,7 @@ unsafe impl Send for VtAv1Decoder {}
 
 impl VtAv1Decoder {
     pub fn new() -> Result<Self> {
+        // SAFETY: argument-free constructor; a null result is rejected below.
         let handle = unsafe { slackless_vt_av1_decoder_new() };
         let handle = NonNull::new(handle).ok_or_else(|| {
             HuddleError::Codec("hardware AV1 decode not supported on this Mac".into())
@@ -94,6 +103,8 @@ impl VtAv1Decoder {
             return None;
         }
         let mut frame: Option<VideoFrame> = None;
+        // SAFETY: `handle` is live until `Drop`, `unit` is valid for its length, and `frame` is
+        // what `on_decoded_surface_cb` reads `ctx` as, for the duration of this call.
         let ok = unsafe {
             slackless_vt_av1_decoder_decode(
                 self.handle.as_ptr(),
@@ -109,6 +120,7 @@ impl VtAv1Decoder {
 
 impl Drop for VtAv1Decoder {
     fn drop(&mut self) {
+        // SAFETY: `handle` came from `slackless_vt_av1_decoder_new` and is freed once, here.
         unsafe { slackless_vt_av1_decoder_free(self.handle.as_ptr()) };
     }
 }

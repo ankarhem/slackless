@@ -247,11 +247,14 @@ pub(crate) fn with_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
     {
         #[link(name = "objc")]
         unsafe extern "C" {
-            fn objc_autoreleasePoolPush() -> *mut std::ffi::c_void;
+            // Pushing a pool has no preconditions; it only returns the token to pop.
+            safe fn objc_autoreleasePoolPush() -> *mut std::ffi::c_void;
             fn objc_autoreleasePoolPop(pool: *mut std::ffi::c_void);
         }
-        let pool = unsafe { objc_autoreleasePoolPush() };
+        let pool = objc_autoreleasePoolPush();
         let res = f();
+        // SAFETY: `pool` is the token pushed on this thread above and not popped yet; popping it
+        // also drains any pool `f` left pushed.
         unsafe { objc_autoreleasePoolPop(pool) };
         res
     }

@@ -157,6 +157,8 @@ mod tests {
         let blank = std::ffi::CString::new("   ").unwrap();
         let invalid_utf8: [c_char; 2] = [-1, 0];
 
+        // SAFETY: `ctx` points to `raw`, which outlives these calls, and every name is null or a
+        // NUL-terminated buffer that is still alive.
         unsafe {
             camera::on_cam_enum_cb(std::ptr::null_mut(), 99, valid.as_ptr());
             camera::on_cam_enum_cb(ctx, 0, valid.as_ptr());

@@ -95,6 +95,7 @@ mod imp {
     // SAFETY: All FFI operations on `SlacklessVideoPlayer` synchronize via an internal
     // `pthread_mutex_t`, and teardown happens exclusively in `Drop`.
     unsafe impl Send for NativeVideoPlayer {}
+    // SAFETY: the same internal mutex serializes `&self` calls made from several threads.
     unsafe impl Sync for NativeVideoPlayer {}
 
     impl NativeVideoPlayer {
@@ -243,6 +244,7 @@ mod imp {
             // retained `CVPixelBufferRef` (or null) whose ownership transfers to `MacVideoSurface`.
             let pb =
                 unsafe { slackless_video_player_copy_frame(self.handle.as_ptr(), &mut w, &mut h) };
+            // SAFETY: `pb` is null or carries the +1 retain the copy above handed over.
             unsafe { MacVideoSurface::from_retained(pb, w, h) }
         }
     }

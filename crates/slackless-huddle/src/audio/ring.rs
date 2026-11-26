@@ -75,9 +75,11 @@ pub struct SpscRing<T: Copy> {
     tail: AtomicUsize,
 }
 
-// SAFETY: Access to disjoint ring slots is synchronized via acquire-release atomic indices
-// `head` (consumer-owned) and `tail` (producer-owned), and `T: Copy + Send`.
+// SAFETY: the ring owns its slots, so moving it moves `T: Send` values to another thread.
 unsafe impl<T: Copy + Send> Send for SpscRing<T> {}
+// SAFETY: Access to disjoint ring slots is synchronized via acquire-release atomic indices
+// `head` (consumer-owned) and `tail` (producer-owned), and `T: Copy + Send`; the one-producer,
+// one-consumer rule above keeps each index to a single writer.
 unsafe impl<T: Copy + Send> Sync for SpscRing<T> {}
 
 impl<T: Copy + Default> SpscRing<T> {

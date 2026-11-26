@@ -316,7 +316,11 @@ impl Av1Decoder {
         }
     }
 
-    unsafe fn drain_picture(&mut self) -> Result<Option<VideoFrame>> {
+    fn drain_picture(&mut self) -> Result<Option<VideoFrame>> {
+        // SAFETY: every `Dav1dPicture` field is an integer or an `Option` of a non-null pointer, so
+        // all-zero bytes are the empty picture `dav1d_get_picture` fills; `self.ctx` is the
+        // context opened in `new`; a returned picture stays live until the `dav1d_picture_unref`
+        // after `picture_to_bgra` has read it.
         unsafe {
             let mut pic = std::mem::MaybeUninit::<Dav1dPicture>::zeroed().assume_init();
             let res = dav1d_get_picture(self.ctx, NonNull::new(&mut pic as *mut _));
@@ -347,6 +351,14 @@ impl Drop for Av1Decoder {
 
 /// Fast integer fixed-point conversion of an 8-bit or 10-bit `Dav1dPicture` (`I420`, `I422`,
 /// `I444`, or `I400`) into a BGRA8888 [`VideoFrame`] for GPUI.
+///
+/// # Safety
+///
+/// `pic` must describe live planes, as a picture from `dav1d_get_picture` does until it is
+/// unreferenced: `data[0]` holds `p.h` rows of `p.w` luma samples, `stride[0]` bytes apart, and
+/// for a chroma layout `data[1]` and `data[2]` each hold the subsampled rows (`p.h` and `p.w`
+/// halved, rounding up, along each subsampled axis), `stride[1]` bytes apart. A sample is one
+/// `u8` at 8 bits per component and one native-endian `u16` at 10; strides count bytes for both.
 unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
     let w = pic.p.w.max(0) as usize;
     let h = pic.p.h.max(0) as usize;
@@ -408,18 +420,27 @@ unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
             let out_row1 = (row + 1) * w * 4;
             for col in (0..pairs_w).step_by(2) {
                 let cx = (col >> 1) as isize;
-                let u = unsafe { *up.offset(c_row + cx) } as i32;
-                let v = unsafe { *vp.offset(c_row + cx) } as i32;
-                let d = u - 128;
-                let e = v - 128;
+                // SAFETY: `row < h` and `col < w`, so chroma sample `(row / 2, col / 2)` lies in
+                // both chroma planes.
+                let (u, v) = unsafe { (*up.offset(c_row + cx), *vp.offset(c_row + cx)) };
+                let d = u as i32 - 128;
+                let e = v as i32 - 128;
                 let r_add = 409 * e + 128;
                 let g_add = -100 * d - 208 * e + 128;
                 let b_add = 516 * d + 128;
 
-                let c00 = (unsafe { *y_ptr.offset(y_row0 + col as isize) } as i32 - 16) * 298;
-                let c01 = (unsafe { *y_ptr.offset(y_row0 + (col + 1) as isize) } as i32 - 16) * 298;
-                let c10 = (unsafe { *y_ptr.offset(y_row1 + col as isize) } as i32 - 16) * 298;
-                let c11 = (unsafe { *y_ptr.offset(y_row1 + (col + 1) as isize) } as i32 - 16) * 298;
+                let x = col as isize;
+                // SAFETY: `row + 1 < h` and `col + 1 < w`, so all four samples lie in the luma
+                // plane.
+                let luma = unsafe {
+                    [
+                        *y_ptr.offset(y_row0 + x),
+                        *y_ptr.offset(y_row0 + x + 1),
+                        *y_ptr.offset(y_row1 + x),
+                        *y_ptr.offset(y_row1 + x + 1),
+                    ]
+                };
+                let [c00, c01, c10, c11] = luma.map(|y| (y as i32 - 16) * 298);
 
                 let o00 = out_row0 + col * 4;
                 let o01 = o00 + 4;
@@ -440,12 +461,18 @@ unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
             let col = pairs_w;
             let cx = (col >> 1) as isize;
             for row in 0..pairs_h {
-                let y = unsafe { *y_ptr.offset((row as isize) * y_stride + col as isize) } as i32;
                 let c_row = ((row >> 1) as isize) * c_stride;
-                let u = unsafe { *up.offset(c_row + cx) } as i32;
-                let v = unsafe { *vp.offset(c_row + cx) } as i32;
+                // SAFETY: `row < h` and `col == w - 1`, so the luma sample and chroma sample
+                // `(row / 2, col / 2)` lie in their planes.
+                let (y, u, v) = unsafe {
+                    (
+                        *y_ptr.offset((row as isize) * y_stride + col as isize),
+                        *up.offset(c_row + cx),
+                        *vp.offset(c_row + cx),
+                    )
+                };
                 let o = (row * w + col) * 4;
-                write_yuv_pixel(&mut bgra[o..o + 4], y, u, v);
+                write_yuv_pixel(&mut bgra[o..o + 4], y as i32, u as i32, v as i32);
             }
         }
         if pairs_h < h {
@@ -455,11 +482,17 @@ unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
             let out_row = row * w * 4;
             for col in 0..w {
                 let cx = (col >> 1) as isize;
-                let y = unsafe { *y_ptr.offset(y_row + col as isize) } as i32;
-                let u = unsafe { *up.offset(c_row + cx) } as i32;
-                let v = unsafe { *vp.offset(c_row + cx) } as i32;
+                // SAFETY: `row == h - 1` and `col < w`, so the luma sample and chroma sample
+                // `(row / 2, col / 2)` lie in their planes.
+                let (y, u, v) = unsafe {
+                    (
+                        *y_ptr.offset(y_row + col as isize),
+                        *up.offset(c_row + cx),
+                        *vp.offset(c_row + cx),
+                    )
+                };
                 let o = out_row + col * 4;
-                write_yuv_pixel(&mut bgra[o..o + 4], y, u, v);
+                write_yuv_pixel(&mut bgra[o..o + 4], y as i32, u as i32, v as i32);
             }
         }
         return Some(VideoFrame::from_bgra(w as u32, h as u32, bgra));
@@ -472,36 +505,35 @@ unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
         let out_row = row * w * 4;
         for col in 0..w {
             let (y, u, v) = if bpc == 8 {
+                // SAFETY: `row < h` and `col < w`, so the sample lies in the luma plane.
                 let y = unsafe { *y_ptr.offset(y_row + col as isize) } as i32;
                 let (u, v) = match (u_ptr, v_ptr) {
                     (Some(up), Some(vp)) => {
                         let cx = (col >> cw_shift) as isize;
-                        (
-                            unsafe { *up.offset(c_row + cx) } as i32,
-                            unsafe { *vp.offset(c_row + cx) } as i32,
-                        )
+                        // SAFETY: chroma sample `(row >> ch_shift, col >> cw_shift)` lies in both
+                        // chroma planes.
+                        let (u, v) = unsafe { (*up.offset(c_row + cx), *vp.offset(c_row + cx)) };
+                        (u as i32, v as i32)
                     }
                     _ => (128, 128),
                 };
                 (y, u, v)
             } else {
-                // SAFETY: `read_unaligned` safely loads 16-bit samples regardless of plane stride
-                // or base pointer alignment.
+                // SAFETY: `row < h` and `col < w`, so the two-byte sample lies in the luma plane;
+                // `read_unaligned` makes no alignment demand on the plane or its stride.
                 let y16 = unsafe {
                     std::ptr::read_unaligned(y_ptr.offset(y_row + (col * 2) as isize) as *const u16)
                 };
                 let y = (y16 >> shift16) as i32;
                 let (u, v) = match (u_ptr, v_ptr) {
                     (Some(up), Some(vp)) => {
-                        let cx = col >> cw_shift;
-                        let u16v = unsafe {
-                            std::ptr::read_unaligned(
-                                up.offset(c_row + (cx * 2) as isize) as *const u16
-                            )
-                        };
-                        let v16v = unsafe {
-                            std::ptr::read_unaligned(
-                                vp.offset(c_row + (cx * 2) as isize) as *const u16
+                        let cx = ((col >> cw_shift) * 2) as isize;
+                        // SAFETY: two-byte chroma sample `(row >> ch_shift, col >> cw_shift)` lies
+                        // in both chroma planes; `read_unaligned` makes no alignment demand.
+                        let (u16v, v16v) = unsafe {
+                            (
+                                std::ptr::read_unaligned(up.offset(c_row + cx) as *const u16),
+                                std::ptr::read_unaligned(vp.offset(c_row + cx) as *const u16),
                             )
                         };
                         ((u16v >> shift16) as i32, (v16v >> shift16) as i32)
@@ -904,7 +936,9 @@ mod tests {
             c_stride: isize,
         }
 
-        unsafe fn build_pic(spec: TestPicSpec) -> Dav1dPicture {
+        fn build_pic(spec: TestPicSpec) -> Dav1dPicture {
+            // SAFETY: every `Dav1dPicture` field is an integer or an `Option` of a non-null
+            // pointer, so all-zero bytes are valid.
             let mut pic = unsafe { std::mem::MaybeUninit::<Dav1dPicture>::zeroed().assume_init() };
             pic.p.w = spec.w;
             pic.p.h = spec.h;
@@ -936,19 +970,18 @@ mod tests {
                 v_buf[r * c_stride + c] = 128;
             }
         }
-        let pic = unsafe {
-            build_pic(TestPicSpec {
-                w: w as i32,
-                h: h as i32,
-                bpc: 8,
-                layout: DAV1D_PIXEL_LAYOUT_I420,
-                y_ptr: y_buf.as_ptr(),
-                u_ptr: Some(u_buf.as_ptr()),
-                v_ptr: Some(v_buf.as_ptr()),
-                y_stride: y_stride as isize,
-                c_stride: c_stride as isize,
-            })
-        };
+        let pic = build_pic(TestPicSpec {
+            w: w as i32,
+            h: h as i32,
+            bpc: 8,
+            layout: DAV1D_PIXEL_LAYOUT_I420,
+            y_ptr: y_buf.as_ptr(),
+            u_ptr: Some(u_buf.as_ptr()),
+            v_ptr: Some(v_buf.as_ptr()),
+            y_stride: y_stride as isize,
+            c_stride: c_stride as isize,
+        });
+        // SAFETY: `pic` points into `y_buf`, `u_buf` and `v_buf`, sized for its dims and strides.
         let frame = unsafe { picture_to_bgra(&pic) }.expect("8-bit I420");
         let (fw, fh, bgra) = frame.into_bgra().unwrap();
         assert_eq!((fw, fh), (4, 4));
@@ -961,19 +994,18 @@ mod tests {
         let oy = vec![16u8; ow * oh]; // studio black Y=16
         let ou = vec![128u8; ow.div_ceil(2) * oh.div_ceil(2)];
         let ov = vec![128u8; ow.div_ceil(2) * oh.div_ceil(2)];
-        let pic_odd = unsafe {
-            build_pic(TestPicSpec {
-                w: ow as i32,
-                h: oh as i32,
-                bpc: 8,
-                layout: DAV1D_PIXEL_LAYOUT_I420,
-                y_ptr: oy.as_ptr(),
-                u_ptr: Some(ou.as_ptr()),
-                v_ptr: Some(ov.as_ptr()),
-                y_stride: ow as isize,
-                c_stride: ow.div_ceil(2) as isize,
-            })
-        };
+        let pic_odd = build_pic(TestPicSpec {
+            w: ow as i32,
+            h: oh as i32,
+            bpc: 8,
+            layout: DAV1D_PIXEL_LAYOUT_I420,
+            y_ptr: oy.as_ptr(),
+            u_ptr: Some(ou.as_ptr()),
+            v_ptr: Some(ov.as_ptr()),
+            y_stride: ow as isize,
+            c_stride: ow.div_ceil(2) as isize,
+        });
+        // SAFETY: `pic_odd` points into `oy`, `ou` and `ov`, sized for 5x3 and its strides.
         let frame_odd = unsafe { picture_to_bgra(&pic_odd) }.expect("odd I420");
         let (fw, fh, bgra_odd) = frame_odd.into_bgra().unwrap();
         assert_eq!((fw, fh), (5, 3));
@@ -985,19 +1017,18 @@ mod tests {
         let y422 = [81u8; 4 * 2];
         let u422 = [90u8; 2 * 2];
         let v422 = [240u8; 2 * 2];
-        let pic_422 = unsafe {
-            build_pic(TestPicSpec {
-                w: 4,
-                h: 2,
-                bpc: 8,
-                layout: DAV1D_PIXEL_LAYOUT_I422,
-                y_ptr: y422.as_ptr(),
-                u_ptr: Some(u422.as_ptr()),
-                v_ptr: Some(v422.as_ptr()),
-                y_stride: 4,
-                c_stride: 2,
-            })
-        };
+        let pic_422 = build_pic(TestPicSpec {
+            w: 4,
+            h: 2,
+            bpc: 8,
+            layout: DAV1D_PIXEL_LAYOUT_I422,
+            y_ptr: y422.as_ptr(),
+            u_ptr: Some(u422.as_ptr()),
+            v_ptr: Some(v422.as_ptr()),
+            y_stride: 4,
+            c_stride: 2,
+        });
+        // SAFETY: `pic_422` points into the 4x2 luma and 2x2 chroma arrays above.
         let (_, _, bgra_422) = unsafe { picture_to_bgra(&pic_422) }
             .expect("I422")
             .into_bgra()
@@ -1008,19 +1039,18 @@ mod tests {
         let y444 = [41u8; 2 * 2];
         let u444 = [240u8; 2 * 2];
         let v444 = [110u8; 2 * 2];
-        let pic_444 = unsafe {
-            build_pic(TestPicSpec {
-                w: 2,
-                h: 2,
-                bpc: 8,
-                layout: DAV1D_PIXEL_LAYOUT_I444,
-                y_ptr: y444.as_ptr(),
-                u_ptr: Some(u444.as_ptr()),
-                v_ptr: Some(v444.as_ptr()),
-                y_stride: 2,
-                c_stride: 2,
-            })
-        };
+        let pic_444 = build_pic(TestPicSpec {
+            w: 2,
+            h: 2,
+            bpc: 8,
+            layout: DAV1D_PIXEL_LAYOUT_I444,
+            y_ptr: y444.as_ptr(),
+            u_ptr: Some(u444.as_ptr()),
+            v_ptr: Some(v444.as_ptr()),
+            y_stride: 2,
+            c_stride: 2,
+        });
+        // SAFETY: `pic_444` points into the three 2x2 arrays above.
         let (_, _, bgra_444) = unsafe { picture_to_bgra(&pic_444) }
             .expect("I444")
             .into_bgra()
@@ -1029,19 +1059,18 @@ mod tests {
 
         // 5. I400 (grayscale, no chroma pointers).
         let y400 = [126u8; 3 * 2];
-        let pic_400 = unsafe {
-            build_pic(TestPicSpec {
-                w: 3,
-                h: 2,
-                bpc: 8,
-                layout: DAV1D_PIXEL_LAYOUT_I400,
-                y_ptr: y400.as_ptr(),
-                u_ptr: None,
-                v_ptr: None,
-                y_stride: 3,
-                c_stride: 0,
-            })
-        };
+        let pic_400 = build_pic(TestPicSpec {
+            w: 3,
+            h: 2,
+            bpc: 8,
+            layout: DAV1D_PIXEL_LAYOUT_I400,
+            y_ptr: y400.as_ptr(),
+            u_ptr: None,
+            v_ptr: None,
+            y_stride: 3,
+            c_stride: 0,
+        });
+        // SAFETY: `pic_400` points into the 3x2 `y400` and reads no chroma.
         let (_, _, bgra_400) = unsafe { picture_to_bgra(&pic_400) }
             .expect("I400")
             .into_bgra()
@@ -1061,19 +1090,18 @@ mod tests {
             u10_raw[1 + i * 2..1 + i * 2 + 2].copy_from_slice(&(128u16 << 2).to_ne_bytes());
             v10_raw[1 + i * 2..1 + i * 2 + 2].copy_from_slice(&(128u16 << 2).to_ne_bytes());
         }
-        let pic_10 = unsafe {
-            build_pic(TestPicSpec {
-                w: 4,
-                h: 2,
-                bpc: 10,
-                layout: DAV1D_PIXEL_LAYOUT_I420,
-                y_ptr: y10_raw.as_ptr().add(1),
-                u_ptr: Some(u10_raw.as_ptr().add(1)),
-                v_ptr: Some(v10_raw.as_ptr().add(1)),
-                y_stride: (4 * 2) as isize,
-                c_stride: (2 * 2) as isize,
-            })
-        };
+        let pic_10 = build_pic(TestPicSpec {
+            w: 4,
+            h: 2,
+            bpc: 10,
+            layout: DAV1D_PIXEL_LAYOUT_I420,
+            y_ptr: y10_raw.as_ptr().wrapping_add(1),
+            u_ptr: Some(u10_raw.as_ptr().wrapping_add(1)),
+            v_ptr: Some(v10_raw.as_ptr().wrapping_add(1)),
+            y_stride: (4 * 2) as isize,
+            c_stride: (2 * 2) as isize,
+        });
+        // SAFETY: `pic_10` points one byte into the `*_raw` arrays holding its two-byte samples.
         let (_, _, bgra_10) = unsafe { picture_to_bgra(&pic_10) }
             .expect("10-bit I420")
             .into_bgra()
@@ -1083,33 +1111,31 @@ mod tests {
         }
 
         // 7. Invalid dimensions or unsupported bpc return None.
-        let pic_zero = unsafe {
-            build_pic(TestPicSpec {
-                w: 0,
-                h: 4,
-                bpc: 8,
-                layout: DAV1D_PIXEL_LAYOUT_I400,
-                y_ptr: y400.as_ptr(),
-                u_ptr: None,
-                v_ptr: None,
-                y_stride: 0,
-                c_stride: 0,
-            })
-        };
+        let pic_zero = build_pic(TestPicSpec {
+            w: 0,
+            h: 4,
+            bpc: 8,
+            layout: DAV1D_PIXEL_LAYOUT_I400,
+            y_ptr: y400.as_ptr(),
+            u_ptr: None,
+            v_ptr: None,
+            y_stride: 0,
+            c_stride: 0,
+        });
+        // SAFETY: a zero width is rejected before any plane is read.
         assert!(unsafe { picture_to_bgra(&pic_zero) }.is_none());
-        let pic_12bit = unsafe {
-            build_pic(TestPicSpec {
-                w: 2,
-                h: 2,
-                bpc: 12,
-                layout: DAV1D_PIXEL_LAYOUT_I400,
-                y_ptr: y400.as_ptr(),
-                u_ptr: None,
-                v_ptr: None,
-                y_stride: 4,
-                c_stride: 0,
-            })
-        };
+        let pic_12bit = build_pic(TestPicSpec {
+            w: 2,
+            h: 2,
+            bpc: 12,
+            layout: DAV1D_PIXEL_LAYOUT_I400,
+            y_ptr: y400.as_ptr(),
+            u_ptr: None,
+            v_ptr: None,
+            y_stride: 4,
+            c_stride: 0,
+        });
+        // SAFETY: 12 bits per component is rejected before any plane is read.
         assert!(unsafe { picture_to_bgra(&pic_12bit) }.is_none());
     }
 }
