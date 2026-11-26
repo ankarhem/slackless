@@ -32,7 +32,8 @@ pub struct RtmConfig {
     pub backoff: Backoff,
     /// A session that lived this long resets the backoff to its first step.
     pub healthy_after: Duration,
-    /// Capacity of the event channel (backpressure: the read loop waits when it is full).
+    /// Capacity of the event channel. While it is full the driver reads no further frames
+    /// (backpressure on the socket) but keeps sending pings and frames and honors close.
     pub event_buffer: usize,
     /// Capacity of the bounded outgoing command channel.
     pub command_buffer: usize,

@@ -1,5 +1,6 @@
 //! Background websocket driver: dial, read/write loop, keepalive, and reconnect backoff.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -51,6 +52,9 @@ pub(crate) struct Driver {
     pub(crate) commands: mpsc::Receiver<Command>,
     pub(crate) close: watch::Receiver<bool>,
     pub(crate) events: mpsc::Sender<RtmEvent>,
+    /// Parsed events the receiver has no room for yet, oldest first. While any wait, the session
+    /// reads no further frames, so they never outnumber one frame's events.
+    pub(crate) pending: VecDeque<RtmEvent>,
     pub(crate) next_id: u64,
     pub(crate) reconnect_url: Option<String>,
     pub(crate) presence_sub: Option<Vec<UserId>>,
@@ -64,6 +68,13 @@ async fn wait_for_close(close: &mut watch::Receiver<bool>) {
         if close.changed().await.is_err() || *close.borrow_and_update() {
             return;
         }
+    }
+}
+
+/// Keeps the latest `presence_sub` frame so it is replayed after the next `hello`.
+fn remember(presence_sub: &mut Option<Vec<UserId>>, frame: &Outgoing) {
+    if let Outgoing::PresenceSub(ids) = frame {
+        *presence_sub = Some(ids.clone());
     }
 }
 
@@ -130,15 +141,9 @@ impl Driver {
                 }
                 cmd = self.commands.recv() => match cmd {
                     None => return Err(End::Stop("closed by client".into())),
-                    Some(Command::Send(frame)) => self.remember(&frame),
+                    Some(Command::Send(frame)) => remember(&mut self.presence_sub, &frame),
                 },
             }
-        }
-    }
-
-    fn remember(&mut self, frame: &Outgoing) {
-        if let Outgoing::PresenceSub(ids) = frame {
-            self.presence_sub = Some(ids.clone());
         }
     }
 
@@ -236,7 +241,11 @@ impl Driver {
 
         loop {
             let outgoing = tokio::select! {
-                frame = stream.next() => {
+                // A frame is read only once the last one's events reached the receiver, so a
+                // receiver that falls behind pauses the socket, not this loop: pings, sends and
+                // close keep flowing. Pongs left unread count as missed, so a receiver stalled for
+                // `max_missed_pongs` pings gets the socket reconnected.
+                frame = stream.next(), if self.pending.is_empty() => {
                     let text = match frame {
                         None => return End::Lost("socket closed".into()),
                         Some(Err(e)) => return End::Lost(e.to_string()),
@@ -262,9 +271,7 @@ impl Driver {
                     match &event {
                         SlackEvent::Hello(hello) => {
                             let state = ConnectionState::Connected { fast_reconnect: hello.fast_reconnect };
-                            if !self.emit(RtmEvent::State(state)).await {
-                                return End::Stop("event receiver dropped".into());
-                            }
+                            self.pending.push_back(RtmEvent::State(state));
                             resubscribe = self.presence_sub.clone().map(Outgoing::PresenceSub);
                         }
                         SlackEvent::Pong(_) => unanswered = 0,
@@ -289,9 +296,7 @@ impl Driver {
                         },
                         _ => {}
                     }
-                    if !self.emit(RtmEvent::Event(event)).await {
-                        return End::Stop("event receiver dropped".into());
-                    }
+                    self.pending.push_back(RtmEvent::Event(event));
                     if let Some(end) = end {
                         return end;
                     }
@@ -299,6 +304,13 @@ impl Driver {
                         Some(frame) => frame,
                         None => continue,
                     }
+                }
+                reserved = self.events.reserve(), if !self.pending.is_empty() => {
+                    let (Ok(permit), Some(event)) = (reserved, self.pending.pop_front()) else {
+                        return End::Stop("event receiver dropped".into());
+                    };
+                    permit.send(event);
+                    continue;
                 }
                 _ = ping.tick() => {
                     if unanswered >= self.config.max_missed_pongs {
@@ -319,7 +331,7 @@ impl Driver {
                         return End::Stop("closed by client".into());
                     }
                     Some(Command::Send(frame)) => {
-                        self.remember(&frame);
+                        remember(&mut self.presence_sub, &frame);
                         frame
                     }
                 },
@@ -339,8 +351,14 @@ impl Driver {
         }
     }
 
-    /// Forwards to the caller; `false` when the receiver is gone.
-    async fn emit(&self, event: RtmEvent) -> bool {
+    /// Forwards `event` to the caller after the events the last session left pending; `false`
+    /// when the receiver is gone.
+    async fn emit(&mut self, event: RtmEvent) -> bool {
+        while let Some(pending) = self.pending.pop_front() {
+            if self.events.send(pending).await.is_err() {
+                return false;
+            }
+        }
         self.events.send(event).await.is_ok()
     }
 }

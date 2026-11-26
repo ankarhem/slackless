@@ -1,5 +1,6 @@
 //! Thin send-handle facade over the background websocket [`Driver`].
 
+use std::collections::VecDeque;
 use std::future::Future;
 
 use slackless_types::{ChannelId, Ts, UserId};
@@ -45,6 +46,7 @@ impl RtmClient {
             commands: cmd_rx,
             close: close_rx,
             events: event_tx,
+            pending: VecDeque::new(),
             next_id: 1,
             reconnect_url: None,
             presence_sub: None,

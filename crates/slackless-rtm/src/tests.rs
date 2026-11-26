@@ -9,7 +9,7 @@ use slackless_types::endpoints::{BROWSER_USER_AGENT, WEB_ORIGIN};
 use slackless_types::{ChannelId, SlackEvent, UserId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::{COOKIE, ORIGIN, USER_AGENT};
@@ -223,6 +223,82 @@ async fn ping_pong_liveness_resets_on_pong_and_reconnects_after_max_missed_pongs
     client.close();
     let _ = tokio::time::timeout(Duration::from_secs(2), drv).await;
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn full_event_channel_keeps_pings_and_close_flowing() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (pinged_tx, pinged_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        ws.send(Message::text(r#"{"type":"hello"}"#)).await.unwrap();
+        // Nobody reads the events, so `hello` cannot be handed over: pings must still come...
+        for _ in 0..2 {
+            let ping: serde_json::Value =
+                serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap())
+                    .unwrap();
+            assert_eq!(ping["type"], "ping");
+        }
+        pinged_tx.send(()).unwrap();
+        // ...and so must the close.
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(_))) => {}
+                closed => break closed,
+            }
+        }
+    });
+
+    let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-stalled"));
+    cfg.base_url = format!("ws://{addr}/link/");
+    cfg.ping_interval = Duration::from_millis(20);
+    // Liveness never ends this session: only a stalled driver can stop the pings.
+    cfg.max_missed_pongs = 1_000;
+    // `Connecting` alone fills the channel; the receiver reads nothing until the end.
+    cfg.event_buffer = 1;
+    let (client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+    let drv = tokio::spawn(driver);
+
+    tokio::time::timeout(Duration::from_secs(3), pinged_rx)
+        .await
+        .expect("pings stopped while the event channel was full")
+        .unwrap();
+    client.close();
+    let closed = tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .expect("close stalled behind the full event channel")
+        .unwrap();
+    assert!(
+        matches!(closed, Some(Ok(Message::Close(_)))),
+        "got: {closed:?}"
+    );
+
+    // Once the receiver reads again, every event arrives in order.
+    assert_eq!(
+        next_event(&mut rx).await,
+        RtmEvent::State(ConnectionState::Connecting)
+    );
+    assert_eq!(
+        next_event(&mut rx).await,
+        RtmEvent::State(ConnectionState::Connected {
+            fast_reconnect: false
+        })
+    );
+    assert!(matches!(
+        next_event(&mut rx).await,
+        RtmEvent::Event(SlackEvent::Hello(_))
+    ));
+    assert!(matches!(
+        next_event(&mut rx).await,
+        RtmEvent::State(ConnectionState::Disconnected { .. })
+    ));
+    tokio::time::timeout(Duration::from_secs(2), drv)
+        .await
+        .expect("driver should exit once its events are read")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -906,6 +982,7 @@ async fn untrusted_reconnect_url_is_rejected_and_never_receives_d_cookie() {
             commands: cmd_rx,
             close: close_rx,
             events: event_tx,
+            pending: Default::default(),
             next_id: 1,
             reconnect_url: None,
             presence_sub: None,
