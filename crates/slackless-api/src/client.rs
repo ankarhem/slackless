@@ -130,8 +130,11 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default end-to-end request timeout for standard API and asset calls.
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// Extended timeout for file uploads and downloads.
-const UPLOAD_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// Extended timeout for file uploads.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// Longest a Slack-hosted file download waits for its next bytes. Downloads have no total
+/// deadline: a large file on a slow link takes as long as it needs while bytes keep arriving.
+const FILE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Largest Slack-hosted file [`SlackApi::download_file_to_path`] writes: Slack caps uploads at
 /// 1 GB, and the headroom covers transcoded copies such as `mp4` renditions.
 pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -147,15 +150,25 @@ pub fn install_default_crypto_provider() {
 }
 
 pub(crate) fn build_http_client(proxy: Option<&str>, timeout: Duration) -> Result<reqwest::Client> {
+    Ok(http_client_builder(proxy)?.timeout(timeout).build()?)
+}
+
+/// The client for Slack-hosted file downloads: no total deadline, [`FILE_IDLE_TIMEOUT`] per read.
+fn build_file_client(proxy: Option<&str>) -> Result<reqwest::Client> {
+    Ok(http_client_builder(proxy)?
+        .read_timeout(FILE_IDLE_TIMEOUT)
+        .build()?)
+}
+
+fn http_client_builder(proxy: Option<&str>) -> Result<reqwest::ClientBuilder> {
     install_default_crypto_provider();
     let mut builder = reqwest::Client::builder()
         .user_agent(endpoints::BROWSER_USER_AGENT)
-        .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-        .timeout(timeout);
+        .connect_timeout(DEFAULT_CONNECT_TIMEOUT);
     if let Some(proxy) = proxy {
         builder = builder.proxy(reqwest::Proxy::all(proxy)?);
     }
-    Ok(builder.build()?)
+    Ok(builder)
 }
 
 /// Returns whether `url` uses HTTPS on `slack.com` or any `*.slack.com` subdomain.
@@ -175,6 +188,8 @@ pub(crate) type Params = Vec<(&'static str, String)>;
 #[derive(Clone)]
 pub struct SlackApi {
     http: reqwest::Client,
+    /// Downloads Slack-hosted files (see [`FILE_IDLE_TIMEOUT`]).
+    files: reqwest::Client,
     /// API base ending in `/`, e.g. `https://acme.slack.com/api/`.
     base: Url,
     /// Edge cache API base ending in `/`, e.g. `https://edgeapi.slack.com/cache/`.
@@ -233,6 +248,7 @@ impl SlackApi {
         cookie.set_sensitive(true);
         Ok(Self {
             http,
+            files: build_file_client(proxy_url().as_deref())?,
             base,
             edge_base: Url::parse(endpoints::EDGE_API_BASE).expect("EDGE_API_BASE is a valid URL"),
             token: token.into(),
@@ -430,10 +446,9 @@ impl SlackApi {
         }
         self.send_with_retry(|| {
             Ok(self
-                .http
+                .files
                 .get(url.clone())
                 .header(COOKIE, self.cookie.clone())
-                .timeout(UPLOAD_DOWNLOAD_TIMEOUT)
                 .build()?)
         })
         .await
@@ -450,7 +465,7 @@ impl SlackApi {
                     .http
                     .post(url.clone())
                     .header(CONTENT_TYPE, "application/octet-stream")
-                    .timeout(UPLOAD_DOWNLOAD_TIMEOUT)
+                    .timeout(UPLOAD_TIMEOUT)
                     .body(payload.clone())
                     .build()?)
             })
@@ -490,7 +505,7 @@ impl SlackApi {
                     .http
                     .post(url.clone())
                     .header(COOKIE, self.cookie.clone())
-                    .timeout(UPLOAD_DOWNLOAD_TIMEOUT)
+                    .timeout(UPLOAD_TIMEOUT)
                     .multipart(form)
                     .build()?)
             })
