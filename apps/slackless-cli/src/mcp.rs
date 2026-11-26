@@ -2945,23 +2945,35 @@ impl McpServer {
                 }
             }
         } else {
-            let effective_query = match (query_arg.as_deref(), channel_arg.as_deref()) {
-                (Some(q), Some(ch)) => format!("{q} in:{ch}"),
-                (Some(q), None) => q.to_owned(),
-                (None, _) => "decided".to_owned(),
-            };
-            let parsed = SearchQuery::parse(&effective_query);
+            let effective_query = query_arg.as_deref().unwrap_or("decided");
+            let base_parsed = SearchQuery::parse(effective_query);
             let (_, workspaces) = self
                 .resolve_scope_workspaces(workspace_arg.as_deref(), None)
                 .map_err(|(_, msg)| RpcError::invalid_params(msg))?;
-            context.push_str(&format!("Query: `{effective_query}`\n\n"));
+            if let Some(ch_arg) = channel_arg.as_deref() {
+                context.push_str(&format!(
+                    "Query: `{effective_query}` · Channel: `{ch_arg}`\n\n"
+                ));
+            } else {
+                context.push_str(&format!("Query: `{effective_query}`\n\n"));
+            }
             for ws in &workspaces {
                 let Some(archive) = self.open_archive(ws).map_err(RpcError::internal)? else {
                     continue;
                 };
+                let mut ws_query = base_parsed.clone();
+                if let Some(ch_arg) = channel_arg.as_deref() {
+                    let resolved = archive
+                        .resolve_channel(ws, ch_arg)
+                        .map_err(|err| RpcError::internal(format!("resolving channel: {err}")))?;
+                    let ch_id = resolved
+                        .as_ref()
+                        .map_or_else(|| raw_channel_id(ch_arg), |r| r.id.clone());
+                    ws_query.filters.in_channels.push(ch_id.as_str().to_owned());
+                }
                 let hits = archive
                     .store()
-                    .search_sorted(ws, &parsed, SearchSort::Recent, 40)
+                    .search_sorted(ws, &ws_query, SearchSort::Recent, 40)
                     .map_err(|err| RpcError::internal(format!("searching {ws}: {err}")))?;
                 if hits.is_empty() {
                     continue;
@@ -3636,6 +3648,8 @@ fn percent_decode_segment(raw: &str) -> std::result::Result<String, String> {
     let decoded =
         String::from_utf8(out).map_err(|_| format!("invalid UTF-8 in URI segment '{raw}'"))?;
     if decoded.is_empty()
+        || decoded == "."
+        || decoded == ".."
         || decoded.contains('/')
         || decoded.contains('\\')
         || decoded.bytes().any(|b| b < 0x20 || b == 0x7f)
@@ -5964,6 +5978,8 @@ mod tests {
             "slackless://workspace/secret_outside.sqlite/channels",
             r"slackless://workspace/T1\..\secret_outside/channels",
             "slackless://workspace/T1/channel/foo%2Fbar",
+            "slackless://workspace/T1/channel/%2e%2e",
+            "slackless://workspace/T1/transcript/%2e",
             "slackless://workspace/T1/channel/%ZZ",
             "slackless://workspace/T1/channel/",
             "slackless://workspace/T1/channels?foo=bar",
@@ -6022,6 +6038,17 @@ mod tests {
                 },
             )
             .expect("decision msg");
+            s1.upsert_message(
+                &t1,
+                &ChannelId::from("D_ANA"),
+                &Message {
+                    ts: Ts::from(format!("{}.000000", now_epoch_secs() - 90)),
+                    user: Some(UserId::from("U1")),
+                    text: "DM decision: approved the staging cutover with Ana.".into(),
+                    ..Message::default()
+                },
+            )
+            .expect("dm decision msg");
             s1.insert_huddle_transcript_segment(
                 &t1,
                 &NewHuddleTranscriptSegment {
@@ -6121,7 +6148,7 @@ mod tests {
         assert!(text.contains("context truncated to stay within prompt budget"));
         assert!(text.chars().count() < MAX_PROMPT_CONTEXT_CHARS + 512);
 
-        // 4. find_decisions
+        // 4. find_decisions (channel + query, plus @handle DM + query)
         let r = server
             .handle_line(
                 r##"{"jsonrpc":"2.0","id":5,"method":"prompts/get","params":{"name":"find_decisions","arguments":{"query":"decided","channel":"#eng"}}}"##,
@@ -6132,6 +6159,18 @@ mod tests {
             .as_str()
             .expect("decisions prompt text");
         assert!(text.contains("ship the eu-north canary on Friday"));
+
+        let r = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":51,"method":"prompts/get","params":{"name":"find_decisions","arguments":{"query":"cutover","channel":"@ana"}}}"#,
+            )
+            .await
+            .expect("find_decisions dm");
+        let text = r["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .expect("dm decisions prompt text");
+        assert!(text.contains("approved the staging cutover with Ana"));
+        assert!(!text.contains("ship the eu-north canary on Friday"));
 
         // 5. search_transcripts (hits both file transcript F_CLIP1 and huddle R_PROMPT1)
         let r = server

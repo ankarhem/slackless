@@ -849,7 +849,7 @@ Each prompt returns ready-to-use MCP prompt messages pre-populated with bounded 
 | ------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
 | `catch_up`          | `workspace` (opt), `since_hours` (opt, default `24`)                       | Executive catch-up briefing across active/unread channels, mentions, threads, and transcripts |
 | `summarize_thread`  | `channel` (req), `thread_ts` (req), `workspace` (opt)                      | Summarize a thread's decisions, action items, and open questions                 |
-| `summarize_channel` | `channel` (req), `since` (opt, default `24h`), `limit` (opt), `workspace` (opt) | Summarize recent discussions, themes, and blockers in a channel or DM       |
+| `summarize_channel` | `channel` (req), `since` (opt), `limit` (opt), `workspace` (opt)           | Summarize recent discussions, themes, and blockers in a channel or DM       |
 | `find_decisions`    | `channel` (opt), `query` (opt), `since` (opt), `workspace` (opt)           | Extract concrete decisions, owners, rationale, and open questions                |
 | `search_transcripts`| `query` (req), `workspace` (opt)                                           | Search and synthesize audio/video clip and huddle transcripts for a topic        |
 
