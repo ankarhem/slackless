@@ -143,7 +143,7 @@ impl App {
                     }
                     if newly_connected {
                         self.play_huddle_chime(slackless_core::huddle::HuddleChime::Join, cx);
-                        let settings = self.preferences.read(cx).settings().clone();
+                        let settings = self.preferences.read(cx).settings();
                         if settings.huddle_auto_captions
                             && !settings.transcription_provider().is_local()
                             && !snap.captions_enabled

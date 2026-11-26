@@ -133,9 +133,15 @@ impl App {
                 cx.notify();
             }
             Event::MessagePosted { channel, message } => {
-                let settings = self.preferences.read(cx).settings().clone();
                 let bg_ctx = (slot.bridge.as_ref())
                     .and_then(|b| b.bg_message_context(channel, message.user.as_ref()));
+                let (mentioned, notifications_on) = {
+                    let settings = self.preferences.read(cx).settings();
+                    let mentioned = (bg_ctx.as_ref()).is_some_and(|ctx| {
+                        mentions_me(&message.text, &ctx.self_user, &settings.keywords)
+                    });
+                    (mentioned, settings.desktop_notifications)
+                };
                 let reply = message
                     .thread_ts
                     .as_ref()
@@ -156,9 +162,7 @@ impl App {
                             mention: matches!(
                                 kind,
                                 Some(ConversationKind::Im | ConversationKind::Mpim)
-                            ) || me.is_some_and(|me| {
-                                mentions_me(&message.text, me, &settings.keywords)
-                            }),
+                            ) || mentioned,
                             im: kind == Some(ConversationKind::Im),
                         }
                     };
@@ -175,7 +179,7 @@ impl App {
                         cx.notify();
                     }
                 }
-                if !settings.desktop_notifications {
+                if !notifications_on {
                     return;
                 }
                 let Some(bg_ctx) = bg_ctx else {
@@ -189,7 +193,6 @@ impl App {
                     return;
                 };
                 let dm = matches!(conv.kind(), ConversationKind::Im | ConversationKind::Mpim);
-                let mentioned = mentions_me(&message.text, &bg_ctx.self_user, &settings.keywords);
                 let owned_ctx = super::notifications::OwnedRuleContext {
                     sender_id: message
                         .user
@@ -213,21 +216,23 @@ impl App {
                     is_thread_reply: reply,
                     mentions_me: mentioned,
                 };
-                let has_semantic_rule = settings.smart_notification_rules.iter().any(|r| {
+                let rules = &self
+                    .preferences
+                    .read(cx)
+                    .settings()
+                    .smart_notification_rules;
+                let has_semantic_rule = rules.iter().any(|r| {
                     r.enabled
                         && r.semantic_topic
                             .as_deref()
                             .is_some_and(|t| !t.trim().is_empty())
                 });
                 if !has_semantic_rule {
-                    let rule_eval = if settings.smart_notification_rules.is_empty() {
+                    let rule_eval = if rules.is_empty() {
                         slackless_core::rules::RuleEvaluation::default()
                     } else {
                         let rule_ctx = owned_ctx.as_rule_context();
-                        slackless_core::rules::evaluate_rules(
-                            &settings.smart_notification_rules,
-                            &rule_ctx,
-                        )
+                        slackless_core::rules::evaluate_rules(rules, &rule_ctx)
                     };
                     self.dispatch_bg_message_notification(
                         ws_index,
@@ -238,13 +243,12 @@ impl App {
                         level,
                         dm,
                         mentioned,
-                        &settings,
                         &rule_eval,
                         cx,
                     );
                     return;
                 }
-                let rules = settings.smart_notification_rules.clone();
+                let rules = rules.clone();
                 let channel_owned = channel.clone();
                 let message_owned = message.clone();
                 let conv_owned = conv.clone();
@@ -263,7 +267,6 @@ impl App {
                         })
                         .await;
                     let _ = this.update(cx, |app, cx| {
-                        let fresh_settings = app.preferences.read(cx).settings().clone();
                         app.dispatch_bg_message_notification(
                             ws_index,
                             &channel_owned,
@@ -273,7 +276,6 @@ impl App {
                             level,
                             dm,
                             mentioned,
-                            &fresh_settings,
                             &rule_eval,
                             cx,
                         );
@@ -296,10 +298,10 @@ impl App {
         level: Option<NotifyLevel>,
         dm: bool,
         mentioned: bool,
-        settings: &crate::preferences::Settings,
         rule_eval: &slackless_core::rules::RuleEvaluation,
         cx: &mut Context<Self>,
     ) {
+        let settings = self.preferences.read(cx).settings();
         if !settings.desktop_notifications || rule_eval.is_suppressed() {
             return;
         }

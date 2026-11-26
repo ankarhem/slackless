@@ -277,21 +277,24 @@ impl App {
         }
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_workspace_badges(badges, cx));
-        let settings = self.preferences.read(cx).settings().clone();
+        let (show_dock_badge, badge_on_unreads, show_menu_bar_icon) = {
+            let settings = self.preferences.read(cx).settings();
+            (
+                settings.show_dock_badge,
+                settings.badge_on_unreads,
+                settings.show_menu_bar_icon,
+            )
+        };
         let prev_badge = self.badge;
-        self.badge = Some(if settings.show_dock_badge {
-            total_dock
-        } else {
-            0
-        });
+        self.badge = Some(if show_dock_badge { total_dock } else { 0 });
         if self.badge != prev_badge {
             self.sync_window_title(cx);
         }
-        let next_label = if !settings.show_dock_badge {
+        let next_label = if !show_dock_badge {
             None
         } else if total_dock > 0 {
             Some(total_dock.to_string())
-        } else if settings.badge_on_unreads && any_unreads {
+        } else if badge_on_unreads && any_unreads {
             Some("\u{2022}".to_owned())
         } else {
             None
@@ -301,7 +304,7 @@ impl App {
             self.os.set_badge(next_label.as_deref());
         }
         let status_bar_state = StatusBarState {
-            visible: settings.show_menu_bar_icon,
+            visible: show_menu_bar_icon,
             unread_mentions: total_dock,
             has_unreads: any_unreads,
             dnd_active: self.self_state.paused(),

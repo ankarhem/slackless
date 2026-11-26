@@ -272,7 +272,8 @@ impl App {
         self.sync_counts_to_views(cx);
     }
 
-    /// Push a freshly built (or in-memory counts-updated) `Arc<Fixtures>` snapshot to all views.
+    /// Push a freshly built `Arc<Fixtures>` snapshot to all views. Preferences are applied
+    /// when they change, not here: a snapshot only brings the self status and the badge along.
     pub(in crate::app) fn apply_snapshot(
         &mut self,
         fixtures: Arc<Fixtures>,
@@ -290,13 +291,14 @@ impl App {
             let remote = crate::status::UserStatus::from_profile(&me.profile);
             if self.self_state.status != remote {
                 self.self_state.set_status(remote);
+                self.push_self_state(cx);
             }
         }
         self.sync_connect_orgs(cx);
         self.resolve_users(self.fixtures.dms.iter().filter_map(|dm| dm.user.clone()));
         self.keep_or_pick_conversation(cx);
         self.sync_composer_placeholder(cx);
-        self.apply_preferences(window, cx);
+        self.sync_badge(cx);
         if self.page == MainPage::Unreads {
             self.refresh_unreads(cx);
         }
@@ -357,8 +359,10 @@ impl App {
                                 .filter(|c| c.is_unread())
                                 .and_then(|c| c.latest.clone())
                         });
-                    let settings = app.preferences.read(cx).settings().clone();
-                    let mark_read_mode = settings.mark_read;
+                    let (mark_read_mode, no_bg_mark_read) = {
+                        let settings = app.preferences.read(cx).settings();
+                        (settings.mark_read, settings.no_bg_mark_read)
+                    };
                     app.messages.update(cx, |list, cx| {
                         list.set_history(channel.clone(), history, cx);
                         if mark_read_mode == 0 {
@@ -367,7 +371,7 @@ impl App {
                     });
                     let allow_mark = app.transcript_visible(cx)
                         && mark_read_mode != 2
-                        && (!settings.no_bg_mark_read || app.window_active);
+                        && (!no_bg_mark_read || app.window_active);
                     if allow_mark && let Some(newest) = newest {
                         app.mark_read(&channel, newest, cx);
                     }
@@ -515,7 +519,7 @@ impl App {
                         panel.set_thread(channel.clone(), thread_ts.clone(), messages, cx)
                     });
                     if app.right_pane.is_thread() {
-                        let settings = app.preferences.read(cx).settings().clone();
+                        let settings = app.preferences.read(cx).settings();
                         let allow_mark = settings.mark_read != 2
                             && (!settings.no_bg_mark_read || app.window_active);
                         if allow_mark && let Some(newest) = newest {

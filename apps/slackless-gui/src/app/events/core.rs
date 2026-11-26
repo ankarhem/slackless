@@ -128,7 +128,7 @@ impl App {
                         .update(cx, |s, cx| s.set_thread_counts(false, 0, cx));
                     self.sync_badge(cx);
                 } else if self.page == MainPage::Threads {
-                    let settings = self.preferences.read(cx).settings().clone();
+                    let settings = self.preferences.read(cx).settings();
                     let allow_mark = settings.mark_read != 2
                         && (!settings.no_bg_mark_read || self.window_active);
                     if allow_mark {

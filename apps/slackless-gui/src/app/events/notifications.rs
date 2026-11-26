@@ -244,7 +244,7 @@ impl App {
         let counts_in_channel = !message.hidden && !message.is_ephemeral && (!reply || broadcast);
         if !self.fixtures.sample && counts_in_channel {
             let from_self = message.user.as_ref() == Some(&self.fixtures.self_user);
-            let settings = self.preferences.read(cx).settings().clone();
+            let settings = self.preferences.read(cx).settings();
             let allow_mark =
                 settings.mark_read != 2 && (!settings.no_bg_mark_read || self.window_active);
             let viewing = *channel == self.channel && self.transcript_visible(cx);
