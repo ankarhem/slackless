@@ -81,7 +81,7 @@ pub use export::{
     ChannelWindow, ExportArtifact, ExportFormat, ExportOptions, ExportTarget, ExportedChannelMeta,
     ExportedFile, ExportedFileTranscriptDoc, ExportedHuddleSegment, ExportedHuddleTranscriptDoc,
     ExportedMessage, ExportedMessagesDoc, ExportedReaction, export_channel, export_file_transcript,
-    export_huddle_transcript, export_target, export_thread, read_channel_window,
+    export_huddle_transcript, export_target, export_thread, read_channel_window, user_display_map,
 };
 pub use fetcher::Fetcher;
 pub use maintenance::{
@@ -104,7 +104,7 @@ pub use search::{
     SearchHitKind, UnifiedSearchHit, UnifiedSearchResults, UnifiedTranscriptHit,
     WorkspaceSearchTarget, discover_disk_archives, discover_local_archives, search_across_stores,
     search_all_local_workspaces, search_disk_archives, search_huddle_transcripts_across_stores,
-    search_huddle_transcripts_in_disk_archives, search_single_store_all_workspaces,
+    search_huddle_transcripts_in_disk_archives, search_single_store_all_workspaces, truncate_chars,
 };
 pub use semantic_index::{
     IndexPacing, SemanticIndexProgress, SemanticIndexReport, default_semantic_index_stats,

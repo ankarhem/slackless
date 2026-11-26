@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 
 use crate::SharedStore;
 use crate::client::read_store;
+use crate::export::user_display_map;
 use crate::paths;
 use crate::store::{
     HuddleTranscriptSegment, Result as StoreResult, SearchQuery, SearchSort, Store,
     WorkspaceStoredMessage, extract_inline_file_body, extract_inline_file_transcript,
 };
-use crate::types::{ChannelId, File, FileId, FileMode, Message, TeamId, Ts};
+use crate::types::{ChannelId, File, FileId, FileMode, Message, TeamId, Ts, UserId};
 
 /// Content classification for a unified search hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -118,7 +119,7 @@ pub fn discover_local_archives() -> Vec<(TeamId, PathBuf)> {
 }
 
 /// Open an existing SQLite archive read-only (falling back once to RW if WAL lacks its shm file).
-fn open_archive_ro(path: &Path) -> StoreResult<Store> {
+pub(crate) fn open_archive_ro(path: &Path) -> StoreResult<Store> {
     match Store::open_read_only(path) {
         Ok(store) => Ok(store),
         Err(_) => Store::open(path),
@@ -351,7 +352,7 @@ pub fn search_huddle_transcripts_across_stores(
             let speaker_name = segment
                 .speaker_id
                 .as_ref()
-                .and_then(|u| meta.users.get(u.as_str()).cloned());
+                .and_then(|u| meta.users.get(u).cloned());
             out.push(UnifiedTranscriptHit {
                 workspace: ws.clone(),
                 workspace_name: meta.name.clone(),
@@ -410,7 +411,7 @@ pub fn search_huddle_transcripts_in_disk_archives(
                 let speaker_name = segment
                     .speaker_id
                     .as_ref()
-                    .and_then(|u| meta.users.get(u.as_str()).cloned());
+                    .and_then(|u| meta.users.get(u).cloned());
                 out.push(UnifiedTranscriptHit {
                     workspace: inner_ws.clone(),
                     workspace_name: meta.name.clone(),
@@ -434,7 +435,7 @@ pub fn search_huddle_transcripts_in_disk_archives(
 struct WorkspaceMeta {
     name: Option<String>,
     channels: HashMap<String, String>,
-    users: HashMap<String, String>,
+    users: HashMap<UserId, String>,
 }
 
 fn load_workspace_meta(
@@ -452,22 +453,10 @@ fn load_workspace_meta(
                 .filter(|n| !n.is_empty())
                 .map(ToOwned::to_owned)
         });
-    let channels = store.channel_names(workspace)?;
-    let users_list = store.list_users(workspace, None, true)?;
-    let mut users = HashMap::with_capacity(users_list.len());
-    for u in users_list {
-        let display = u
-            .display_name
-            .or(u.real_name)
-            .or_else(|| (!u.name.is_empty()).then_some(u.name));
-        if let Some(label) = display {
-            users.insert(u.id.as_str().to_owned(), label);
-        }
-    }
     Ok(WorkspaceMeta {
         name: team_name,
-        channels,
-        users,
+        channels: store.channel_names(workspace)?,
+        users: user_display_map(store, workspace)?,
     })
 }
 
@@ -509,7 +498,7 @@ fn record_message_hit(
         .message
         .user
         .as_ref()
-        .and_then(|u| meta.and_then(|m| m.users.get(u.as_str()).cloned()))
+        .and_then(|u| meta.and_then(|m| m.users.get(u).cloned()))
         .or_else(|| hit.message.bot_profile.as_ref().map(|b| b.name.clone()));
 
     let (kind, transcript_file_id, transcript_excerpt) =
@@ -733,7 +722,8 @@ pub(crate) fn match_excerpt(body: &str, terms: &[String]) -> Option<String> {
     Some(out)
 }
 
-pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
+/// Collapse whitespace and cap `text` at `max_chars` characters, ending a cut with an ellipsis.
+pub fn truncate_chars(text: &str, max_chars: usize) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= max_chars {
         collapsed

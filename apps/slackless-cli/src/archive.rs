@@ -224,21 +224,10 @@ impl Archive {
         self.store.user_display(workspace, user)
     }
 
-    /// Batch-loads every user's best display name (`display_name` -> `real_name` -> `name`)
-    /// for `workspace` in one query, preventing N+1 lookups across message/DM/pin/transcript rows.
+    /// Every user's best display name (`display_name` -> `real_name` -> `name`) for
+    /// `workspace` in one query, preventing N+1 lookups across message/DM/pin/transcript rows.
     pub fn user_display_map(&self, workspace: &TeamId) -> store::Result<HashMap<UserId, String>> {
-        let users = self.store.list_users(workspace, None, true)?;
-        let mut map = HashMap::with_capacity(users.len());
-        for user in users {
-            let best = user
-                .display_name
-                .or(user.real_name)
-                .or_else(|| (!user.name.is_empty()).then_some(user.name));
-            if let Some(name) = best {
-                map.insert(user.id, name);
-            }
-        }
-        Ok(map)
+        slackless_core::export::user_display_map(&self.store, workspace)
     }
 
     /// Number of stored current-state messages.

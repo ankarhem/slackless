@@ -418,7 +418,7 @@ pub fn index_disk_archives_paced(
         if !path.is_file() {
             continue;
         }
-        let store = open_archive_ro(path)
+        let store = crate::search::open_archive_ro(path)
             .map_err(|e| format!("failed to open archive {}: {e}", path.display()))?;
         let mut inner_workspaces = store.list_workspaces().unwrap_or_default();
         if inner_workspaces.is_empty() {
@@ -581,7 +581,7 @@ pub fn hybrid_search_disk_archives(
         if !path.is_file() {
             continue;
         }
-        let store = open_archive_ro(path)
+        let store = crate::search::open_archive_ro(path)
             .map_err(|e| format!("failed to open archive {}: {e}", path.display()))?;
         let mut inner_ws = store.list_workspaces().unwrap_or_default();
         if inner_ws.is_empty() {
@@ -792,7 +792,7 @@ pub fn hybrid_search_huddle_transcripts_in_disk_archives(
         };
         if !store_cache.contains_key(hit.workspace.as_str())
             && let Some(path) = path_by_ws.get(hit.workspace.as_str())
-            && let Ok(s) = open_archive_ro(path)
+            && let Ok(s) = crate::search::open_archive_ro(path)
         {
             store_cache.insert(hit.workspace.as_str().to_owned(), s);
         }
@@ -1271,13 +1271,6 @@ fn message_matches_filters(
         }
     }
     true
-}
-
-fn open_archive_ro(path: &Path) -> slackless_store::Result<Store> {
-    match Store::open_read_only(path) {
-        Ok(store) => Ok(store),
-        Err(_) => Store::open(path),
-    }
 }
 
 #[cfg(test)]

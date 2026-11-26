@@ -4,8 +4,8 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use slackless_core::embeddings::{
-    Embedder, EmbeddingModel, OnnxEmbedder, delete_embedding_model, detect_embedding_model_setup,
-    download_embedding_model_async,
+    Embedder, EmbeddingDownloadProgress, EmbeddingModel, OnnxEmbedder, delete_embedding_model,
+    detect_embedding_model_setup, download_embedding_model_async,
 };
 use slackless_core::read_synced_spans;
 use slackless_core::semantic_index::{
@@ -539,6 +539,28 @@ pub(crate) fn build_archive_status_report(
     Ok((json, human))
 }
 
+/// Reports embedding-model download progress on stderr for humans; `--json` output stays clean.
+fn download_progress(json_mode: bool) -> impl Fn(EmbeddingDownloadProgress) {
+    move |p| {
+        if json_mode {
+            return;
+        }
+        let pct = p
+            .total_bytes
+            .filter(|&t| t > 0)
+            .map(|t| format!(" ({}%)", (p.downloaded_bytes * 100 / t).min(100)))
+            .unwrap_or_default();
+        eprintln!(
+            "[{}/{}] {} {}{}",
+            p.file_index,
+            p.file_count,
+            p.file_name,
+            format_bytes(p.downloaded_bytes),
+            pct
+        );
+    }
+}
+
 /// `archive semantic-model status | download | delete`.
 pub(crate) async fn cmd_archive_semantic_model(
     ctx: &Ctx,
@@ -554,26 +576,9 @@ pub(crate) async fn cmd_archive_semantic_model(
                     &format!("unknown embedding model '{model}'; expected 'minilm' or 'bge-small'"),
                 ));
             };
-            let json_mode = ctx.json;
-            let dir = download_embedding_model_async(parsed, move |p| {
-                if !json_mode {
-                    let pct = p
-                        .total_bytes
-                        .filter(|&t| t > 0)
-                        .map(|t| format!(" ({}%)", (p.downloaded_bytes * 100 / t).min(100)))
-                        .unwrap_or_default();
-                    eprintln!(
-                        "[{}/{}] {} {}{}",
-                        p.file_index,
-                        p.file_count,
-                        p.file_name,
-                        format_bytes(p.downloaded_bytes),
-                        pct
-                    );
-                }
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("downloading embedding model: {e}"))?;
+            let dir = download_embedding_model_async(parsed, download_progress(ctx.json))
+                .await
+                .map_err(|e| anyhow::anyhow!("downloading embedding model: {e}"))?;
             let status = detect_embedding_model_setup(parsed);
             let human = format!(
                 "Downloaded {} to {} ({})\n",
@@ -703,26 +708,9 @@ pub(crate) async fn cmd_archive_index_semantic(
     let mut setup = detect_embedding_model_setup(model);
     if !setup.model_ready {
         if args.download {
-            let json_mode = ctx.json;
-            download_embedding_model_async(model, move |p| {
-                if !json_mode {
-                    let pct = p
-                        .total_bytes
-                        .filter(|&t| t > 0)
-                        .map(|t| format!(" ({}%)", (p.downloaded_bytes * 100 / t).min(100)))
-                        .unwrap_or_default();
-                    eprintln!(
-                        "[{}/{}] {} {}{}",
-                        p.file_index,
-                        p.file_count,
-                        p.file_name,
-                        format_bytes(p.downloaded_bytes),
-                        pct
-                    );
-                }
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("downloading embedding model: {e}"))?;
+            download_embedding_model_async(model, download_progress(ctx.json))
+                .await
+                .map_err(|e| anyhow::anyhow!("downloading embedding model: {e}"))?;
             setup = detect_embedding_model_setup(model);
         } else {
             return Ok(fail(

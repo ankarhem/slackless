@@ -279,7 +279,7 @@ pub fn export_channel(
         .conversation_summary(workspace, channel)?
         .map(|c| c.label())
         .unwrap_or_else(|| channel.as_str().to_owned());
-    let users = load_user_displays(store, workspace)?;
+    let users = user_display_map(store, workspace)?;
     let transcripts = if opts.include_transcripts {
         store.all_file_transcripts(workspace)?
     } else {
@@ -362,7 +362,7 @@ pub fn export_thread(
         .conversation_summary(workspace, channel)?
         .map(|c| c.label())
         .unwrap_or_else(|| channel.as_str().to_owned());
-    let users = load_user_displays(store, workspace)?;
+    let users = user_display_map(store, workspace)?;
     let transcripts = if opts.include_transcripts {
         store.all_file_transcripts(workspace)?
     } else {
@@ -452,7 +452,7 @@ pub fn export_huddle_transcript(
         .conversation_summary(workspace, &channel)?
         .map(|c| c.label())
         .unwrap_or_else(|| channel.as_str().to_owned());
-    let users = load_user_displays(store, workspace)?;
+    let users = user_display_map(store, workspace)?;
     let doc = build_huddle_transcript_doc(
         workspace, ws_name, call_id, &channel, &label, &segments, &users,
     );
@@ -844,7 +844,9 @@ pub fn sanitize_export_filename(label: &str, fallback: &str) -> String {
     "export".to_owned()
 }
 
-fn load_user_displays(store: &Store, workspace: &TeamId) -> StoreResult<HashMap<UserId, String>> {
+/// Every user of `workspace` whose best display name is known (`display_name` -> `real_name` ->
+/// `name`), in one query, so message rows never look users up one at a time.
+pub fn user_display_map(store: &Store, workspace: &TeamId) -> StoreResult<HashMap<UserId, String>> {
     let users = store.list_users(workspace, None, true)?;
     let mut map = HashMap::with_capacity(users.len());
     for user in users {

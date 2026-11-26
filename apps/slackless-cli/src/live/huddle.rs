@@ -5,13 +5,13 @@ use std::process::ExitCode;
 use anyhow::Result;
 use slackless_core::api::RoomJoinResponse;
 use slackless_core::domain::huddles::{CaptionDeduper, resolve_segment_at_ms};
+use slackless_core::export::format_utc_timestamp;
 use slackless_core::huddle::{
     AudioDevices, CameraDeviceInfo, HuddleAudioConfig, HuddleControl, HuddleCredentials,
     HuddleDataEvent, HuddlePhase, HuddleReactionKind, HuddleSessionSnapshot, HuddleUpdate,
     ScreenSource, list_audio_devices, list_cameras, list_screen_sources, spawn_huddle_session,
 };
 use slackless_core::types::net::huddle_fallback_url;
-use slackless_core::types::time::civil_from_days;
 use slackless_core::types::{ChannelId, TeamId, Ts, UserId};
 
 use crate::archive::Archive;
@@ -452,16 +452,6 @@ pub async fn run_huddle_join(
     Ok(exit_code)
 }
 
-/// Format unix milliseconds as `YYYY-MM-DD HH:MM:SS` (UTC) for human/Markdown transcript output.
-pub(crate) fn format_ms_utc(ms: i64) -> String {
-    let secs = ms.div_euclid(1_000);
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let (y, mo, d) = civil_from_days(days);
-    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
-}
-
 fn empty_transcripts_json(args: &HuddleTranscriptsArgs) -> serde_json::Value {
     if let Some(cid) = args.call_id.as_deref() {
         serde_json::json!({ "ok": true, "call_id": cid, "count": 0, "segments": [] })
@@ -569,7 +559,7 @@ pub fn run_huddle_transcripts(ctx: &Ctx, args: HuddleTranscriptsArgs) -> Result<
             human.push_str(&format!("# Huddle Transcript — {ch_label} (`{cid}`)\n\n"));
             for seg in &segments {
                 let who = resolve_user(seg.speaker_id.as_ref());
-                let stamp = format_ms_utc(seg.at_ms);
+                let stamp = format_utc_timestamp(seg.at_ms.div_euclid(1_000));
                 let lang_tag = seg
                     .lang
                     .as_deref()
@@ -580,7 +570,7 @@ pub fn run_huddle_transcripts(ctx: &Ctx, args: HuddleTranscriptsArgs) -> Result<
         } else {
             for seg in &segments {
                 let who = resolve_user(seg.speaker_id.as_ref());
-                let stamp = format_ms_utc(seg.at_ms);
+                let stamp = format_utc_timestamp(seg.at_ms.div_euclid(1_000));
                 let lang_tag = seg.lang.as_deref().unwrap_or("-");
                 human.push_str(&format!("{stamp}\t{who}\t[{lang_tag}]\t{}\n", seg.text));
             }
@@ -622,7 +612,7 @@ pub fn run_huddle_transcripts(ctx: &Ctx, args: HuddleTranscriptsArgs) -> Result<
         for seg in &hits {
             let who = resolve_user(seg.speaker_id.as_ref());
             let ch = resolve_channel_label(&seg.channel);
-            let stamp = format_ms_utc(seg.at_ms);
+            let stamp = format_utc_timestamp(seg.at_ms.div_euclid(1_000));
             let lang_tag = seg.lang.as_deref().unwrap_or("-");
             human.push_str(&format!(
                 "{stamp}\t{ch}\t{}\t{who}\t[{lang_tag}]\t{}\n",
@@ -665,7 +655,7 @@ pub fn run_huddle_transcripts(ctx: &Ctx, args: HuddleTranscriptsArgs) -> Result<
     let mut human = String::new();
     for s in &sessions {
         let ch = resolve_channel_label(&s.channel);
-        let stamp = format_ms_utc(s.started_at_ms);
+        let stamp = format_utc_timestamp(s.started_at_ms.div_euclid(1_000));
         let langs = if s.languages.is_empty() {
             "-".to_owned()
         } else {

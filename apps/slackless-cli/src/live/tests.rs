@@ -1656,10 +1656,6 @@ fn backfill_stuck_cursor_guard_status_spacing_and_huddle_helpers() {
         creds.huddle_link.as_deref(),
         Some("https://app.slack.com/huddle/T1/C1")
     );
-
-    // format_ms_utc uses shared civil_from_days accurately.
-    assert_eq!(format_ms_utc(0), "1970-01-01 00:00:00");
-    assert_eq!(format_ms_utc(1_709_208_000_000), "2024-02-29 12:00:00");
 }
 
 #[test]

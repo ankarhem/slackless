@@ -13,7 +13,9 @@ use std::path::PathBuf;
 use crate::SharedStore;
 use crate::client::read_store;
 use crate::domain::mrkdwn::mrkdwn_to_plain;
+use crate::export::user_display_map;
 use crate::notify::{NotifyLevel, notify_levels};
+use crate::search::{open_archive_ro, truncate_chars};
 use crate::store::{Result as StoreResult, Store, StoredMessage};
 use crate::types::{
     ChannelId, Conversation, ConversationKind, FileId, MessageSubtype, TeamId, Ts, UserId,
@@ -340,10 +342,7 @@ pub fn build_catchup_disk_archives(
         if !path.is_file() {
             continue;
         }
-        let store = match Store::open_read_only(path) {
-            Ok(s) => s,
-            Err(_) => Store::open(path)?,
-        };
+        let store = open_archive_ro(path)?;
         let mut inner_workspaces = store.list_workspaces()?;
         if inner_workspaces.is_empty() {
             inner_workspaces.push(ws.clone());
@@ -404,7 +403,7 @@ fn collect_workspace_into(
         .into_iter()
         .map(|c| (c.id.clone(), c))
         .collect();
-    let users = load_user_displays(store, workspace)?;
+    let users = user_display_map(store, workspace)?;
     let levels = store
         .prefs(workspace)?
         .map(|p| notify_levels(&p))
@@ -702,31 +701,16 @@ fn detect_mention_kind(text: &str, self_user: Option<&UserId>, is_dm: bool) -> O
     None
 }
 
-fn load_user_displays(store: &Store, workspace: &TeamId) -> StoreResult<HashMap<String, String>> {
-    let users = store.list_users(workspace, None, true)?;
-    let mut map = HashMap::with_capacity(users.len());
-    for u in users {
-        let best = u
-            .display_name
-            .or(u.real_name)
-            .or_else(|| (!u.name.is_empty()).then_some(u.name));
-        if let Some(label) = best {
-            map.insert(u.id.as_str().to_owned(), label);
-        }
-    }
-    Ok(map)
-}
-
 fn format_channel_label(
     channel: &ChannelId,
     conv: Option<&Conversation>,
-    users: &HashMap<String, String>,
+    users: &HashMap<UserId, String>,
 ) -> String {
     match conv {
         Some(c) if c.kind() == ConversationKind::Im => c
             .user
             .as_ref()
-            .and_then(|u| users.get(u.as_str()))
+            .and_then(|u| users.get(u))
             .map(|name| format!("@{name}"))
             .or_else(|| c.name.as_ref().map(|n| format!("@{n}")))
             .unwrap_or_else(|| channel.to_string()),
@@ -739,12 +723,12 @@ fn format_channel_label(
     }
 }
 
-fn format_author(stored: &StoredMessage, users: &HashMap<String, String>) -> String {
+fn format_author(stored: &StoredMessage, users: &HashMap<UserId, String>) -> String {
     stored
         .message
         .user
         .as_ref()
-        .and_then(|u| users.get(u.as_str()).cloned())
+        .and_then(|u| users.get(u).cloned())
         .or_else(|| stored.message.username.clone())
         .or_else(|| {
             stored
@@ -759,18 +743,7 @@ fn format_author(stored: &StoredMessage, users: &HashMap<String, String>) -> Str
 }
 
 fn clean_excerpt(raw: &str, max_chars: usize) -> String {
-    let plain = mrkdwn_to_plain(raw);
-    let collapsed = plain.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= max_chars {
-        collapsed
-    } else {
-        let mut s: String = collapsed
-            .chars()
-            .take(max_chars.saturating_sub(1))
-            .collect();
-        s.push('…');
-        s
-    }
+    truncate_chars(&mrkdwn_to_plain(raw), max_chars)
 }
 
 /// Format a [`CatchUpBriefing`] into concise, scannable plain text for the CLI.
