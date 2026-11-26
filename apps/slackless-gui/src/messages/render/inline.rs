@@ -1051,21 +1051,14 @@ pub(in crate::messages) fn jumbomoji_elements(
         if rest.is_empty() {
             break;
         }
-        let after_open = rest.strip_prefix(':')?;
-        let close = after_open.find(':')?;
-        let code = &after_open[..close];
-        if code.is_empty()
-            || !code
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+'))
-        {
+        // One shortcode, skin tone suffix included (`:+1::skin-tone-2:` is one emoji).
+        let (len, code) = emoji::parse_shortcode(rest)?;
+        let art = emoji::EmojiArt::of(&code, fixtures);
+        if matches!(art, emoji::EmojiArt::Text(_)) {
             return None;
         }
-        if crate::emoji::glyph(code).is_none() && !fixtures.custom_emoji.contains_key(code) {
-            return None;
-        }
-        out.push(crate::emoji::emoji_element(code, fixtures, px(32.)).into_any_element());
-        rest = &after_open[close + 1..];
+        out.push(art.element(px(32.)).into_any_element());
+        rest = &rest[len..];
         if out.len() > 5 {
             return None;
         }

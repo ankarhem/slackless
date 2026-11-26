@@ -944,6 +944,13 @@ fn jumbomoji_elements_accepts_one_to_five_standard_and_custom_and_rejects_others
             .len(),
         5
     );
+    // A skin tone is part of its emoji, not a second one.
+    assert_eq!(
+        jumbomoji_elements(":+1::skin-tone-2:", &fixtures)
+            .unwrap()
+            .len(),
+        1
+    );
 
     // >5 emojis, empty, mixed text, or unknown shortcodes return None.
     assert!(
