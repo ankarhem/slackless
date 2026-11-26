@@ -109,13 +109,18 @@ impl ScVtScreenCapture {
 
     pub fn stop(&mut self) {
         if !self.handle.is_null() {
-            unsafe { slackless_sc_capture_stop(self.handle) };
+            // Native code releases `ctx` from its stop completion handler, once no ScreenCaptureKit
+            // callback can still reach it (which may be after this returns if the stop is slow).
+            let ctx = std::mem::take(&mut self.ctx);
+            unsafe { slackless_sc_capture_stop(self.handle, ctx.cast(), Some(on_released_cb)) };
             self.handle = std::ptr::null_mut();
         }
-        if !self.ctx.is_null() {
-            unsafe { drop(Box::from_raw(self.ctx)) };
-            self.ctx = std::ptr::null_mut();
-        }
+    }
+}
+
+unsafe extern "C" fn on_released_cb(ctx: *mut c_void) {
+    if !ctx.is_null() {
+        unsafe { drop(Box::from_raw(ctx.cast::<CaptureCallbackCtx>())) };
     }
 }
 

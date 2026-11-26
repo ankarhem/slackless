@@ -9,6 +9,8 @@
 
 typedef struct SlacklessScCapture SlacklessScCapture;
 
+void slackless_sc_capture_stop(SlacklessScCapture *cap, SlacklessCaptureReleasedCallback on_released);
+
 @interface SlacklessStreamDelegate : NSObject <SCStreamOutput, SCStreamDelegate>
 @property(nonatomic, assign) SlacklessScCapture *owner;
 @end
@@ -17,6 +19,7 @@ struct SlacklessScCapture {
     VtEncoderCommon enc;
     SlacklessSurfaceCallback on_surface_preview;
     SlacklessErrorCallback on_error;
+    SlacklessCaptureReleasedCallback on_released;
 
     uint64_t last_preview_us;
     dispatch_queue_t sample_queue;
@@ -78,18 +81,18 @@ struct SlacklessScCapture {
 
 @end
 
-static void cleanup_failed_sc_capture(
-    SlacklessScCapture *cap,
-    SlacklessStreamDelegate *delegate) {
+// Frees `cap` and hands `ctx` back through `on_released`. Must run on the serial sample queue
+// after every already-queued sample block (so none can dereference freed `cap`), or when the
+// stream never started and nothing was queued.
+static void slackless_sc_capture_release(SlacklessScCapture *cap) {
     if (!cap) return;
-    atomic_store(&cap->enc.stopped, true);
-    if (delegate) {
-        delegate.owner = NULL;
+    cap->sample_queue = nil;
+    if (cap->delegate_obj) {
+        ((__bridge_transfer SlacklessStreamDelegate *)cap->delegate_obj).owner = NULL;
+        cap->delegate_obj = NULL;
     }
-    if (cap->sample_queue) {
-        dispatch_sync(cap->sample_queue, ^{});
-        cap->sample_queue = nil;
-    }
+    (void)(__bridge_transfer SCStream *)cap->stream_obj;
+    cap->stream_obj = NULL;
     if (cap->enc.vt) {
         VTCompressionSessionCompleteFrames(cap->enc.vt, kCMTimeInvalid);
         VTCompressionSessionInvalidate(cap->enc.vt);
@@ -97,6 +100,9 @@ static void cleanup_failed_sc_capture(
         cap->enc.vt = NULL;
     }
     free(cap->enc.annex_b_buf);
+    if (cap->on_released) {
+        cap->on_released(cap->enc.ctx);
+    }
     free(cap);
 }
 
@@ -241,6 +247,8 @@ SlacklessScCapture *slackless_sc_capture_start(
 
             SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:delegate];
             cap->sample_queue = dispatch_queue_create("dev.slackless.sckit.video", DISPATCH_QUEUE_SERIAL);
+            cap->stream_obj = (__bridge_retained void *)stream;
+            cap->delegate_obj = (__bridge_retained void *)delegate;
 
             NSError *addErr = nil;
             if (![stream addStreamOutput:delegate
@@ -251,7 +259,8 @@ SlacklessScCapture *slackless_sc_capture_start(
                     err_buf,
                     err_buf_len,
                     addErr ? addErr.localizedDescription.UTF8String : "addStreamOutput failed");
-                cleanup_failed_sc_capture(cap, delegate);
+                // Never started: no callback was queued, so the handle can be freed in place.
+                slackless_sc_capture_release(cap);
                 return NULL;
             }
 
@@ -267,15 +276,12 @@ SlacklessScCapture *slackless_sc_capture_start(
                     err_buf,
                     err_buf_len,
                     startErr ? startErr.localizedDescription.UTF8String : "SCStream startCapture timed out");
-                [stream stopCaptureWithCompletionHandler:^(NSError *e) {
-                    (void)e;
-                }];
-                cleanup_failed_sc_capture(cap, delegate);
+                // A timed-out start may still come up: go through the stop path so a late sample
+                // never reaches freed memory.
+                slackless_sc_capture_stop(cap, NULL);
                 return NULL;
             }
 
-            cap->stream_obj = (__bridge_retained void *)stream;
-            cap->delegate_obj = (__bridge_retained void *)delegate;
             return cap;
         } else {
             slackless_write_err(err_buf, err_buf_len, "ScreenCaptureKit requires macOS 12.3+");
@@ -298,39 +304,37 @@ void slackless_sc_capture_set_bitrate(SlacklessScCapture *cap, uint32_t bitrate_
     });
 }
 
-void slackless_sc_capture_stop(SlacklessScCapture *cap) {
+void slackless_sc_capture_stop(SlacklessScCapture *cap, SlacklessCaptureReleasedCallback on_released) {
     if (!cap) return;
     @autoreleasepool {
         atomic_store(&cap->enc.stopped, true);
+        cap->on_released = on_released;
         if (@available(macOS 12.3, *)) {
             if (cap->stream_obj) {
-                SCStream *stream = (__bridge_transfer SCStream *)cap->stream_obj;
-                cap->stream_obj = NULL;
+                SCStream *stream = (__bridge SCStream *)cap->stream_obj;
                 dispatch_semaphore_t sem = dispatch_semaphore_create(0);
                 [stream stopCaptureWithCompletionHandler:^(NSError *e) {
                     (void)e;
+                    // No further sample buffers are delivered once the stop completes; release on
+                    // the serial sample queue so blocks already queued run (and see `stopped`) first.
+                    if (cap->sample_queue) {
+                        dispatch_async(cap->sample_queue, ^{ slackless_sc_capture_release(cap); });
+                    } else {
+                        slackless_sc_capture_release(cap);
+                    }
                     dispatch_semaphore_signal(sem);
                 }];
-                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 1500LL * NSEC_PER_MSEC));
+                if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 1500LL * NSEC_PER_MSEC)) != 0) {
+                    // ScreenCaptureKit has not confirmed the stop. `cap` stays alive (every callback
+                    // returns early on `stopped`) and the completion handler still releases it; if
+                    // it never fires, this one handle and its callback context leak instead of being
+                    // freed where a late sample callback could still reach them.
+                    NSLog(@"slackless: SCStream stopCapture did not complete within 1.5s; deferring capture release");
+                }
+                return;
             }
-            if (cap->delegate_obj) {
-                SlacklessStreamDelegate *del = (__bridge_transfer SlacklessStreamDelegate *)cap->delegate_obj;
-                del.owner = NULL;
-                cap->delegate_obj = NULL;
-            }
         }
-        if (cap->sample_queue) {
-            dispatch_sync(cap->sample_queue, ^{});
-            cap->sample_queue = nil;
-        }
-        if (cap->enc.vt) {
-            VTCompressionSessionCompleteFrames(cap->enc.vt, kCMTimeInvalid);
-            VTCompressionSessionInvalidate(cap->enc.vt);
-            CFRelease(cap->enc.vt);
-            cap->enc.vt = NULL;
-        }
-        free(cap->enc.annex_b_buf);
-        free(cap);
+        slackless_sc_capture_release(cap);
     }
 }
 

@@ -95,6 +95,10 @@ pub(crate) type SlacklessSurfaceCallback = unsafe extern "C" fn(
 pub(crate) type SlacklessErrorCallback =
     unsafe extern "C" fn(ctx: *mut c_void, message: *const c_char);
 
+/// Invoked by the native capture once it is stopped and freed, so `ctx` can be released knowing
+/// no callback can dereference it anymore.
+pub(crate) type SlacklessCaptureReleasedCallback = unsafe extern "C" fn(ctx: *mut c_void);
+
 pub(crate) type SlacklessCameraEnumCallback =
     unsafe extern "C" fn(ctx: *mut c_void, index: u32, name: *const c_char);
 
@@ -137,7 +141,11 @@ unsafe extern "C" {
     ) -> *mut SlacklessScCapture;
     pub(crate) fn slackless_sc_capture_force_keyframe(cap: *mut SlacklessScCapture);
     pub(crate) fn slackless_sc_capture_set_bitrate(cap: *mut SlacklessScCapture, bitrate_bps: u32);
-    pub(crate) fn slackless_sc_capture_stop(cap: *mut SlacklessScCapture);
+    pub(crate) fn slackless_sc_capture_stop(
+        cap: *mut SlacklessScCapture,
+        ctx: *mut c_void,
+        on_released: Option<SlacklessCaptureReleasedCallback>,
+    );
 
     pub(crate) fn slackless_list_cameras(ctx: *mut c_void, cb: SlacklessCameraEnumCallback);
     pub(crate) fn slackless_cam_capture_start(

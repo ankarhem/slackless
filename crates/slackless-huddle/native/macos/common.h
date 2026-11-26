@@ -53,6 +53,8 @@ typedef void (*SlacklessSurfaceCallback)(
     uint32_t height);
 
 typedef void (*SlacklessErrorCallback)(void *ctx, const char *message);
+/// Invoked once a capture handle has stopped and been freed, so no callback can reach `ctx` anymore.
+typedef void (*SlacklessCaptureReleasedCallback)(void *ctx);
 typedef void (*SlacklessCameraEnumCallback)(void *ctx, uint32_t index, const char *name);
 typedef void (*SlacklessAudioDeviceChangeCallback)(void *ctx, bool is_input);
 
