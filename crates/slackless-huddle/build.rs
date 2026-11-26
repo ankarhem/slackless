@@ -22,6 +22,7 @@ fn main() {
             "native/macos/audio_player.m",
             "native/macos/audio_tap.m",
             "native/macos/video_player.m",
+            "native/macos/pdf_render.m",
         ];
         println!("cargo:rerun-if-changed=native/macos/common.h");
         let mut build = cc::Build::new();
@@ -44,6 +45,7 @@ fn main() {
             "CoreMedia",
             "CoreVideo",
             "Foundation",
+            "ImageIO",
             "Metal",
             "ScreenCaptureKit",
             "VideoToolbox",

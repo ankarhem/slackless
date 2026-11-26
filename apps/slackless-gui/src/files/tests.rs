@@ -587,3 +587,103 @@ fn snippet_card_renders_and_persists_expansion_across_unmount(cx: &mut TestAppCo
     });
     cx.run_until_parked();
 }
+
+#[test]
+fn pdf_detection_and_thumbnail_filtering() {
+    let mut pdf = File {
+        id: FileId::from("F_PDF_META"),
+        name: Some("q4-plan.pdf".into()),
+        mimetype: Some("application/pdf".into()),
+        filetype: Some("pdf".into()),
+        thumb_pdf: Some("https://files.slack.com/tmb/q4-plan.png".into()),
+        url_private: Some("https://files.slack.com/pri/q4-plan.pdf".into()),
+        ..Default::default()
+    };
+    assert!(super::is_pdf(&pdf));
+    assert_eq!(
+        super::pdf_thumb_url(&pdf).as_deref(),
+        Some("https://files.slack.com/tmb/q4-plan.png")
+    );
+
+    // Non-decodable `.pdf` URL in thumb_pdf is skipped in favor of PNG/JPG fallback.
+    pdf.thumb_pdf = Some("https://files.slack.com/tmb/raw.pdf".into());
+    pdf.thumb_360 = Some("https://files.slack.com/tmb/q4-plan_360.jpg".into());
+    assert_eq!(
+        super::pdf_thumb_url(&pdf).as_deref(),
+        Some("https://files.slack.com/tmb/q4-plan_360.jpg")
+    );
+
+    // Detection also works from filename extension alone.
+    let by_name = File {
+        id: FileId::from("F_PDF_NAME"),
+        name: Some("handbook.PDF".into()),
+        ..Default::default()
+    };
+    assert!(super::is_pdf(&by_name));
+
+    let img = File {
+        id: FileId::from("F_PNG"),
+        name: Some("photo.png".into()),
+        mimetype: Some("image/png".into()),
+        ..Default::default()
+    };
+    assert!(!super::is_pdf(&img));
+}
+
+#[gpui::test]
+fn pdf_attachment_card_renders_with_click_to_preview(cx: &mut gpui::TestAppContext) {
+    use gpui::{Context, IntoElement, ParentElement as _, Render, Window, div};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::init(cx);
+    });
+    let opened = Rc::new(Cell::new(false));
+    let opened_cb = Rc::clone(&opened);
+    let on_open: crate::image_viewer::ImageClick = Rc::new(move |origin, _, _| {
+        if origin == crate::image_viewer::ImageOrigin::File(0) {
+            opened_cb.set(true);
+        }
+    });
+    let msg = slackless_core::types::Message {
+        ts: slackless_core::types::Ts::from("1700000100.000100"),
+        files: vec![File {
+            id: FileId::from("F_PDF_CARD"),
+            name: Some("spec.pdf".into()),
+            mimetype: Some("application/pdf".into()),
+            filetype: Some("pdf".into()),
+            size: Some(204_800),
+            url_private: Some("https://files.slack.com/pri/spec.pdf".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let fixtures = crate::fixtures::load();
+    struct PdfHost {
+        fixtures: crate::fixtures::Fixtures,
+        msg: slackless_core::types::Message,
+        on_open: crate::image_viewer::ImageClick,
+    }
+    impl Render for PdfHost {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().children(super::attachments(
+                &self.fixtures,
+                &self.msg,
+                Some(&self.on_open),
+                cx,
+            ))
+        }
+    }
+    let (_view, cx) = cx.add_window_view(|_, _| PdfHost {
+        fixtures,
+        msg,
+        on_open,
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(!opened.get());
+    cx.run_until_parked();
+}

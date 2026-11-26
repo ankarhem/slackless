@@ -287,8 +287,151 @@ fn search_view_local_fts_exclusions_remote_query_pagination_and_channel_dedup(
     cx.run_until_parked();
     view.read_with(cx, |v, _| {
         assert_eq!(v.transcript_results.len(), 1);
-        assert_eq!(v.transcript_results[0].call_id, "R0HUDDLE1");
-        assert_eq!(v.transcript_results[0].lang.as_deref(), Some("sv"));
+        assert_eq!(v.transcript_results[0].segment.call_id, "R0HUDDLE1");
+        assert_eq!(v.transcript_results[0].segment.lang.as_deref(), Some("sv"));
+    });
+}
+
+#[gpui::test]
+fn search_view_all_workspaces_scope_merges_hits_and_snippets_across_stores(
+    cx: &mut TestAppContext,
+) {
+    use super::state::{SearchScope, SearchWorkspaceSource};
+    use slackless_core::search::SearchHitKind;
+    use slackless_core::types::{FileId, FileMode};
+
+    let ws_a = TeamId::from("T_A");
+    let ws_b = TeamId::from("T_B");
+
+    let mut store_a = Store::open_in_memory().expect("store_a");
+    store_a
+        .upsert_team(
+            &ws_a,
+            &Team {
+                id: ws_a.clone(),
+                name: "Alpha".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store_a
+        .upsert_conversation(
+            &ws_a,
+            &Conversation {
+                id: ChannelId::from("C_A1"),
+                name: Some("ops".into()),
+                is_channel: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store_a
+        .upsert_message(
+            &ws_a,
+            &ChannelId::from("C_A1"),
+            &Message {
+                ts: Ts::from("1700000100.000000"),
+                text: "Deploying hyperion cluster".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut store_b = Store::open_in_memory().expect("store_b");
+    store_b
+        .upsert_team(
+            &ws_b,
+            &Team {
+                id: ws_b.clone(),
+                name: "Beta".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store_b
+        .upsert_conversation(
+            &ws_b,
+            &Conversation {
+                id: ChannelId::from("C_B1"),
+                name: Some("platform".into()),
+                is_channel: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store_b
+        .upsert_message(
+            &ws_b,
+            &ChannelId::from("C_B1"),
+            &Message {
+                ts: Ts::from("1700000200.000000"),
+                text: "Attached config".into(),
+                files: vec![File {
+                    id: FileId::from("F_SNIP"),
+                    name: Some("hyperion.toml".into()),
+                    mode: Some(FileMode::Snippet),
+                    preview: Some("cluster = \"hyperion\"".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let shared_a: SharedStore = Arc::new(Mutex::new(store_a));
+    let shared_b: SharedStore = Arc::new(Mutex::new(store_b));
+
+    let mut fx = crate::fixtures::load();
+    fx.sample = true;
+    fx.workspaces = vec![
+        Team {
+            id: ws_a.clone(),
+            name: "Alpha".into(),
+            ..Default::default()
+        },
+        Team {
+            id: ws_b.clone(),
+            name: "Beta".into(),
+            ..Default::default()
+        },
+    ];
+
+    let view = cx.update(|cx| SearchView::new(Arc::new(fx), Some(shared_a.clone()), cx));
+    view.update(cx, |v, cx| {
+        v.set_workspace_sources(
+            vec![
+                SearchWorkspaceSource {
+                    team_id: ws_a.clone(),
+                    name: "Alpha".into(),
+                    store: shared_a.clone(),
+                },
+                SearchWorkspaceSource {
+                    team_id: ws_b.clone(),
+                    name: "Beta".into(),
+                    store: shared_b.clone(),
+                },
+            ],
+            cx,
+        );
+        v.run("hyperion".into(), cx);
+    });
+    cx.run_until_parked();
+    // CurrentWorkspace scope returns only Alpha's hit.
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.local_results.len(), 1);
+        assert_eq!(v.local_results[0].workspace, ws_a);
+    });
+
+    // Switching to AllWorkspaces merges Beta's snippet + Alpha's message, newest first.
+    view.update(cx, |v, cx| v.set_scope(SearchScope::AllWorkspaces, cx));
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.local_results.len(), 2);
+        assert_eq!(v.local_results[0].workspace, ws_b);
+        assert_eq!(v.local_results[0].workspace_name.as_deref(), Some("Beta"));
+        assert_eq!(v.local_results[0].kind, SearchHitKind::Snippet);
+        assert_eq!(v.local_results[1].workspace, ws_a);
+        assert_eq!(v.local_results[1].kind, SearchHitKind::Message);
     });
 }
 

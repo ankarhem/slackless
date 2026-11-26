@@ -380,7 +380,14 @@ END;
 INSERT INTO message_fts(message_fts) VALUES('rebuild');
 "#;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
+/// Version 12: preserve timed transcript cues JSON (`cues_json`) alongside plain searchable text
+/// in `file_transcript` so video/audio transcripts support clickable seek and live cue highlight
+/// without polluting the `message_fts` full-text index.
+const V12: &str = r#"
+ALTER TABLE file_transcript ADD COLUMN cues_json TEXT NOT NULL DEFAULT '';
+"#;
+
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
 
 /// The schema version this build migrates to.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;

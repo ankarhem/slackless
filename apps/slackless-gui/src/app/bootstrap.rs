@@ -285,6 +285,8 @@ fn wire_window_and_input_subscriptions(
                             if viewer.is_video() {
                                 viewer.seek_video_relative(-5.0, window, cx);
                                 true
+                            } else if viewer.is_pdf() {
+                                viewer.step_pdf_page(-1, window, cx)
                             } else {
                                 false
                             }
@@ -298,6 +300,8 @@ fn wire_window_and_input_subscriptions(
                             if viewer.is_video() {
                                 viewer.seek_video_relative(5.0, window, cx);
                                 true
+                            } else if viewer.is_pdf() {
+                                viewer.step_pdf_page(1, window, cx)
                             } else {
                                 false
                             }
@@ -307,12 +311,76 @@ fn wire_window_and_input_subscriptions(
                         }
                     }
                     "left" => {
-                        viewer.update(cx, |viewer, cx| viewer.step(-1, window, cx));
+                        viewer.update(cx, |viewer, cx| {
+                            if viewer.is_pdf() && viewer.item_count() == 1 {
+                                viewer.step_pdf_page(-1, window, cx);
+                            } else {
+                                viewer.step(-1, window, cx);
+                            }
+                        });
                         cx.stop_propagation();
                     }
                     "right" => {
-                        viewer.update(cx, |viewer, cx| viewer.step(1, window, cx));
+                        viewer.update(cx, |viewer, cx| {
+                            if viewer.is_pdf() && viewer.item_count() == 1 {
+                                viewer.step_pdf_page(1, window, cx);
+                            } else {
+                                viewer.step(1, window, cx);
+                            }
+                        });
                         cx.stop_propagation();
+                    }
+                    "pageup" | "[" if no_cmd => {
+                        let handled = viewer.update(cx, |viewer, cx| {
+                            if viewer.is_pdf() {
+                                viewer.step_pdf_page(-1, window, cx);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if handled {
+                            cx.stop_propagation();
+                        }
+                    }
+                    "pagedown" | "]" if no_cmd => {
+                        let handled = viewer.update(cx, |viewer, cx| {
+                            if viewer.is_pdf() {
+                                viewer.step_pdf_page(1, window, cx);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if handled {
+                            cx.stop_propagation();
+                        }
+                    }
+                    "up" if no_cmd && !mods.shift => {
+                        let handled = viewer.update(cx, |viewer, cx| {
+                            if viewer.is_video() {
+                                viewer.adjust_video_volume(0.1, cx);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if handled {
+                            cx.stop_propagation();
+                        }
+                    }
+                    "down" if no_cmd && !mods.shift => {
+                        let handled = viewer.update(cx, |viewer, cx| {
+                            if viewer.is_video() {
+                                viewer.adjust_video_volume(-0.1, cx);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if handled {
+                            cx.stop_propagation();
+                        }
                     }
                     "+" | "=" => {
                         viewer.update(cx, |viewer, cx| viewer.zoom_step(1, window, cx));
@@ -330,6 +398,19 @@ fn wire_window_and_input_subscriptions(
                         let handled = viewer.update(cx, |viewer, cx| {
                             if viewer.is_video() {
                                 viewer.toggle_video_play(window, cx);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if handled {
+                            cx.stop_propagation();
+                        }
+                    }
+                    "c" if no_cmd && !mods.shift => {
+                        let handled = viewer.update(cx, |viewer, cx| {
+                            if viewer.is_video() {
+                                viewer.toggle_transcript(window, cx);
                                 true
                             } else {
                                 false
@@ -635,6 +716,12 @@ fn wire_feature_view_subscriptions(
                 }
                 PreferencesEvent::CheckForUpdates => this.check_for_updates(true, cx),
                 PreferencesEvent::InstallUpdate => this.install_available_update(cx),
+                PreferencesEvent::OpenStorageDialog => this.open_storage_dialog(window, cx),
+                PreferencesEvent::StartWorkspaceBackfill => {
+                    this.start_workspace_backfill(window, cx);
+                }
+                PreferencesEvent::PauseBackfill => this.pause_backfill(window, cx),
+                PreferencesEvent::ResumeBackfill => this.resume_backfill(window, cx),
             },
         ),
         cx.subscribe_in(

@@ -72,6 +72,12 @@ pub enum ThreadPanelEvent {
         channel: ChannelId,
         ts: Ts,
     },
+    /// Export the open thread (root + replies) to Markdown (`markdown = true`) or JSON.
+    Export {
+        channel: ChannelId,
+        thread_ts: Ts,
+        markdown: bool,
+    },
     /// Broadcast an existing thread reply back into the parent channel (`F-CORE-106`).
     SendToChannel {
         channel: ChannelId,
@@ -1170,31 +1176,66 @@ impl Render for ThreadPanel {
         // nothing behind them here, so they are left out.
         let more = self.root.as_ref().map(|root| {
             let (panel, root_ts) = (cx.entity().downgrade(), root.ts.clone());
+            let open_thread = self.thread.clone();
             let following = root.subscribed == Some(true);
             Button::new("thread-more")
                 .ghost()
                 .with_size(Size::Small)
                 .icon(IconName::EllipsisVertical)
                 .tooltip("More actions")
-                .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
                     let (toggle, copy, root_ts) = (panel.clone(), panel.clone(), root_ts.clone());
-                    menu.item(
-                        PopupMenuItem::new(if following {
-                            "Turn off notifications for replies"
-                        } else {
-                            "Get notified about new replies"
-                        })
-                        .on_click(move |_, _, cx| {
-                            let _ = toggle.update(cx, |panel, cx| panel.toggle_subscribed(cx));
-                        }),
-                    )
-                    .item(
-                        PopupMenuItem::new("Copy link").on_click(move |_, window, cx| {
-                            let _ = copy.update(cx, |panel, cx| {
-                                panel.run_action(&root_ts, MessageAction::CopyLink, window, cx)
-                            });
-                        }),
-                    )
+                    menu = menu
+                        .item(
+                            PopupMenuItem::new(if following {
+                                "Turn off notifications for replies"
+                            } else {
+                                "Get notified about new replies"
+                            })
+                            .on_click(move |_, _, cx| {
+                                let _ = toggle.update(cx, |panel, cx| panel.toggle_subscribed(cx));
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::new("Copy link").on_click(move |_, window, cx| {
+                                let _ = copy.update(cx, |panel, cx| {
+                                    panel.run_action(&root_ts, MessageAction::CopyLink, window, cx)
+                                });
+                            }),
+                        );
+                    if let Some((ch, tts)) = open_thread.clone() {
+                        let (exp_md, ch_md, tts_md) = (panel.clone(), ch.clone(), tts.clone());
+                        let (exp_json, ch_json, tts_json) = (panel.clone(), ch, tts);
+                        menu = menu
+                            .separator()
+                            .item(
+                                PopupMenuItem::new("Export thread (Markdown\u{2026})")
+                                    .icon(IconName::Download)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = exp_md.update(cx, |_, cx| {
+                                            cx.emit(ThreadPanelEvent::Export {
+                                                channel: ch_md.clone(),
+                                                thread_ts: tts_md.clone(),
+                                                markdown: true,
+                                            });
+                                        });
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new("Export thread (JSON\u{2026})")
+                                    .icon(IconName::FileCode)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = exp_json.update(cx, |_, cx| {
+                                            cx.emit(ThreadPanelEvent::Export {
+                                                channel: ch_json.clone(),
+                                                thread_ts: tts_json.clone(),
+                                                markdown: false,
+                                            });
+                                        });
+                                    }),
+                            );
+                    }
+                    menu
                 })
         });
         // Slack's header is just the bold title; the conversation is not repeated under it.

@@ -281,6 +281,7 @@ pub fn live(
     let status_presets = status_presets_from_prefs(&workspace.extra, &prefs);
     let cached_bots = store.bot_profiles(team).unwrap_or_default();
     let file_transcripts = store.all_file_transcripts(team).unwrap_or_default();
+    let file_transcript_cues = store.all_file_transcript_cues(team).unwrap_or_default();
     Fixtures::from_parts(
         WorkspaceData {
             workspaces: vec![workspace],
@@ -304,6 +305,7 @@ pub fn live(
             skin_tone: crate::emoji::skin_tone_from_prefs(&prefs),
             thumbnails: HashMap::new(),
             file_transcripts,
+            file_transcript_cues,
             profile_extras: HashMap::new(),
             custom_emoji,
             block_images: HashMap::new(),

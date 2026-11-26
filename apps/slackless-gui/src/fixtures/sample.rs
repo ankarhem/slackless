@@ -812,6 +812,7 @@ pub fn load() -> Fixtures {
             skin_tone: 1,
             thumbnails,
             file_transcripts: HashMap::new(),
+            file_transcript_cues: HashMap::new(),
             profile_extras,
             custom_emoji,
             block_images,

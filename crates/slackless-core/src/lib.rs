@@ -22,22 +22,28 @@ pub use slackless_store as store;
 pub use slackless_types as types;
 
 mod backend;
-mod backfill;
+pub mod backfill;
 mod client;
 pub mod command;
 pub mod diff;
 pub mod domain;
 pub mod event;
+pub mod export;
 mod fetcher;
 mod notify;
 pub mod paths;
 pub mod privacy;
 mod reducer;
+pub mod search;
 mod unfurl;
 
 pub use backend::{
     Backend, ChannelsBackend, CollabBackend, FilesBackend, HuddleBackend, MessagingBackend,
     UsersBackend, WorkspaceBackend,
+};
+pub use backfill::{
+    BACKFILL_SYNCED_KEY, BackfillStatus, ChannelBackfillProgress, Synced,
+    WorkspaceBackfillProgress, decode_synced_spans, read_synced_spans, write_synced_spans,
 };
 pub use client::{
     Client, ClientHandle, ClientHandles, Closed, CommandSender, EventReceiver, HuddleMediaReceiver,
@@ -51,12 +57,24 @@ pub use diff::{DiffKind, DiffSegment, diff_words};
 pub use event::{
     Event, FailedMutation, HUDDLE_MEDIA_CHANNEL_CAPACITY, HuddleEvent, HuddleMediaEvent,
 };
+pub use export::{
+    ExportArtifact, ExportFormat, ExportOptions, ExportTarget, ExportedChannelMeta, ExportedFile,
+    ExportedFileTranscriptDoc, ExportedHuddleSegment, ExportedHuddleTranscriptDoc, ExportedMessage,
+    ExportedMessagesDoc, ExportedReaction, export_channel, export_file_transcript,
+    export_huddle_transcript, export_target, export_thread,
+};
 pub use fetcher::Fetcher;
 pub use notify::{NotifyLevel, notify_levels};
 pub use privacy::{
     SecretMatch, detect_secrets, strip_tracking_params, strip_tracking_params_in_text,
 };
 pub use reducer::apply_event;
+pub use search::{
+    SearchHitKind, UnifiedSearchHit, UnifiedSearchResults, UnifiedTranscriptHit,
+    WorkspaceSearchTarget, discover_disk_archives, discover_local_archives, search_across_stores,
+    search_all_local_workspaces, search_disk_archives, search_huddle_transcripts_across_stores,
+    search_huddle_transcripts_in_disk_archives, search_single_store_all_workspaces,
+};
 
 /// Transcribe a local video or audio file with `preferred` (or any ready local provider), store
 /// the transcript under `(workspace, file_id)`, and re-index every carrying message in `message_fts`.
@@ -69,10 +87,16 @@ pub fn transcribe_and_index_file(
     local_path: &std::path::Path,
     preferred: huddle::TranscriptionProvider,
 ) -> std::result::Result<(huddle::TranscriptionProvider, String, usize), String> {
-    let (used, text) = huddle::transcribe_media_file(local_path, preferred)?;
-    let trimmed = text.trim().to_owned();
+    let timed = huddle::transcribe_media_file_timed(local_path, preferred)?;
+    let trimmed = timed.text.trim().to_owned();
     let updated = store
-        .upsert_file_transcript(workspace, file_id, used.source_tag(), &trimmed)
+        .upsert_file_transcript_with_cues(
+            workspace,
+            file_id,
+            timed.provider.source_tag(),
+            &trimmed,
+            &timed.cues,
+        )
         .map_err(|e| format!("failed to index transcript in local store: {e}"))?;
-    Ok((used, trimmed, updated))
+    Ok((timed.provider, trimmed, updated))
 }

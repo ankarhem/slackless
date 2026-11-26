@@ -30,7 +30,7 @@ pub use event::{
     HuddleInviteCancelEvent, HuddleInviteEvent, HuddleRef, HuddleRoom, HuddleRoomEvent,
     MessageEvent, SlackEvent,
 };
-pub use file::{File, FileMode};
+pub use file::{File, FileMode, TranscriptCue};
 pub use ids::{BotId, ChannelId, FileId, TeamId, Ts, UserId, UsergroupId};
 pub use message::{Attachment, BotProfile, Edited, Message, MessageSubtype};
 pub use reaction::Reaction;

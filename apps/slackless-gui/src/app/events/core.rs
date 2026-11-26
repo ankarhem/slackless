@@ -326,13 +326,18 @@ impl App {
             | Event::FilesExtrasLoaded { .. }
             | Event::FileRestored { .. }
             | Event::FileDeleted { .. } => self.on_files_event(event, window, cx),
-            Event::FileTranscriptReady { file_id, text } => {
+            Event::FileTranscriptReady {
+                file_id,
+                text,
+                cues,
+            } => {
                 let was_manual = crate::media::finish_transcription(file_id, cx);
                 if !text.trim().is_empty() {
-                    let updated = Arc::new(
-                        self.fixtures
-                            .with_file_transcript(file_id.clone(), text.clone()),
-                    );
+                    let updated = Arc::new(self.fixtures.with_file_transcript_cues(
+                        file_id.clone(),
+                        text.clone(),
+                        cues.clone(),
+                    ));
                     self.fixtures = updated.clone();
                     self.sync_all_views_fixtures(updated, cx);
                     if self.page == MainPage::Search {
@@ -365,6 +370,15 @@ impl App {
             }
             Event::AppHomeLoaded { .. } | Event::AppHomeUpdated(_) => {
                 self.on_app_home_event(event, cx)
+            }
+            Event::BackfillProgress(progress) => {
+                self.ws.backfill_progress = Some(progress.clone());
+                let snap = progress.clone();
+                self.preferences.update(cx, |prefs, cx| {
+                    prefs.set_backfill_progress(Some(snap), cx);
+                });
+                window.refresh();
+                cx.notify();
             }
             Event::WorkflowTripped { .. } => {
                 notify(

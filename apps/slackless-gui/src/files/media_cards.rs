@@ -8,9 +8,9 @@ use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, Div, FontWeight, Global, ImageSource, ImgResourceLoader,
     InteractiveElement as _, IntoElement, MouseButton, ObjectFit, ParentElement as _, RenderOnce,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, canvas, div, px,
 };
-use slackless_core::types::{File, FileId};
+use slackless_core::types::{ChannelId, File, FileId, TranscriptCue, Ts, UserId};
 
 use crate::fixtures::Fixtures;
 use crate::image_viewer::{ImageClick, ImageOrigin};
@@ -18,7 +18,7 @@ use crate::image_viewer::{ImageClick, ImageOrigin};
 use super::gallery::download_button;
 use super::meta::{
     CARD_W, audio_wave_bars, clip_vtt_url, download_url, file_ext, file_name, format_duration,
-    human_size, inline_clip_transcript, media_duration_ms, parse_webvtt,
+    human_size, inline_clip_transcript, media_duration_ms, parse_webvtt, parse_webvtt_cues,
     resolve_video_preview_size, video_dimensions, video_playback_url, video_poster_url,
 };
 
@@ -29,6 +29,7 @@ struct ClipTranscriptState {
     expanded: bool,
     loading: bool,
     text: Option<String>,
+    cues: Vec<TranscriptCue>,
     error: Option<String>,
 }
 
@@ -38,6 +39,7 @@ struct ClipTranscriptState {
 pub(crate) struct ClipTranscriptStatus {
     pub loading: bool,
     pub text: Option<String>,
+    pub cues: Vec<TranscriptCue>,
     pub error: Option<String>,
 }
 
@@ -64,6 +66,7 @@ pub(crate) fn clip_transcript_status(file_id: &FileId, cx: &App) -> ClipTranscri
         .map(|entry| ClipTranscriptStatus {
             loading: entry.loading,
             text: entry.text.clone(),
+            cues: entry.cues.clone(),
             error: entry.error.clone(),
         })
         .unwrap_or_default()
@@ -79,7 +82,7 @@ pub(crate) fn fetch_clip_vtt_if_needed(
     let should_fetch = {
         let store = cx.default_global::<ClipTranscriptStore>();
         let entry = store.entries.entry(file_id.clone()).or_default();
-        if entry.text.is_none() && !entry.loading {
+        if entry.text.is_none() && entry.cues.is_empty() && !entry.loading {
             entry.loading = true;
             entry.error = None;
             true
@@ -109,7 +112,13 @@ pub(crate) fn fetch_clip_vtt_if_needed(
             match res {
                 Ok(bytes) => {
                     let raw = String::from_utf8_lossy(&bytes);
-                    let parsed = parse_webvtt(&raw);
+                    let cues = parse_webvtt_cues(&raw);
+                    let parsed = if !cues.is_empty() {
+                        TranscriptCue::plain_text(&cues)
+                    } else {
+                        parse_webvtt(&raw)
+                    };
+                    entry.cues = cues;
                     entry.text = Some(if parsed.is_empty() {
                         raw.trim().to_owned()
                     } else {
@@ -681,6 +690,10 @@ const COMPACT_TRANSPORT_MAX_W: f32 = 260.;
 struct VideoFrame {
     file: File,
     ix: usize,
+    channel: Option<ChannelId>,
+    message_ts: Option<Ts>,
+    message_user: Option<UserId>,
+    message_taken_at: Option<i64>,
     poster_source: Option<ImageSource>,
     video_url: Option<String>,
     ext: String,
@@ -972,6 +985,23 @@ impl RenderOnce for VideoFrame {
                 None
             };
 
+            let id_vis = id_str.clone();
+            let visibility_probe = canvas(
+                move |bounds, window, cx| {
+                    let vp = window.viewport_size();
+                    let visible = bounds.size.width > px(0.)
+                        && bounds.size.height > px(0.)
+                        && bounds.bottom() > px(48.)
+                        && bounds.top() < vp.height - px(12.)
+                        && bounds.right() > px(0.)
+                        && bounds.left() < vp.width;
+                    crate::media::report_inline_video_painted(&id_vis, visible, cx);
+                },
+                |_, (), _, _| {},
+            )
+            .absolute()
+            .inset_0();
+
             div()
                 .id(SharedString::from(format!("video-active-{}", file.id)))
                 .group(group)
@@ -994,6 +1024,7 @@ impl RenderOnce for VideoFrame {
                     self.poster_source,
                     px(8.),
                 ))
+                .child(visibility_probe)
                 .children(center_overlay)
                 .child(transport)
                 .children(top_actions)
@@ -1040,19 +1071,28 @@ impl RenderOnce for VideoFrame {
                 );
             if let Some(url) = self.video_url {
                 let ext = self.ext;
+                let title = file_name(&file);
+                let meta = crate::media::InlineVideoMeta {
+                    file_id: id_str.clone(),
+                    title: title.clone(),
+                    channel: self.channel,
+                    message_ts: self.message_ts,
+                    url,
+                    ext,
+                    duration_ms: self.meta_duration_ms,
+                    poster_url: video_poster_url(&file),
+                    inline_transcript: inline_clip_transcript(&file),
+                    vtt_url: clip_vtt_url(&file),
+                    download: download_url(&file).map(|dl| (dl, title)),
+                    user: file.user.clone().or(self.message_user),
+                    taken_at: file.timestamp.or(self.message_taken_at),
+                };
                 play_circle = play_circle
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(move |_, window, cx| {
                         cx.stop_propagation();
-                        crate::media::play_inline_video(
-                            id_str.clone(),
-                            url.clone(),
-                            ext.clone(),
-                            None,
-                            window,
-                            cx,
-                        );
+                        crate::media::play_inline_video_with_meta(meta.clone(), None, window, cx);
                     });
             }
             let play_badge = div()
@@ -1090,10 +1130,15 @@ impl RenderOnce for VideoFrame {
 /// the chat card with compact transport controls; clicking anywhere else on the poster preview
 /// (or clicking the top-right Expand button while playing) opens the video inside
 /// [`crate::image_viewer::ImageViewer`].
+#[allow(clippy::too_many_arguments)]
 pub(super) fn video_card(
     fixtures: &Fixtures,
     file: &File,
     ix: usize,
+    channel: Option<ChannelId>,
+    message_ts: Option<Ts>,
+    message_user: Option<UserId>,
+    message_taken_at: Option<i64>,
     order_base: u64,
     on_open: Option<&ImageClick>,
     cx: &App,
@@ -1128,6 +1173,10 @@ pub(super) fn video_card(
         .child(VideoFrame {
             file: file.clone(),
             ix,
+            channel,
+            message_ts,
+            message_user,
+            message_taken_at,
             poster_source,
             video_url,
             ext,

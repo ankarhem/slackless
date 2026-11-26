@@ -829,25 +829,30 @@ impl<B: Backend> Core<B> {
                 ctx.events.emit(Event::FileTranscriptReady {
                     file_id,
                     text: existing.text,
+                    cues: existing.cues,
                 });
                 return Ok(());
             }
 
             let path_for_task = local_path.clone();
             let transcribed = tokio::task::spawn_blocking(move || {
-                crate::huddle::transcribe_media_file(&path_for_task, provider)
+                crate::huddle::transcribe_media_file_timed(&path_for_task, provider)
             })
             .await;
 
             match transcribed {
-                Ok(Ok((used_provider, text))) => {
-                    let trimmed = text.trim().to_owned();
+                Ok(Ok(timed)) => {
+                    let trimmed = timed.text.trim().to_owned();
+                    let cues = timed.cues;
                     let ws_save = ctx.workspace.clone();
                     let fid_save = file_id.clone();
                     let text_save = trimmed.clone();
-                    let source = used_provider.source_tag().to_owned();
+                    let cues_save = cues.clone();
+                    let source = timed.provider.source_tag().to_owned();
                     if let Err(err) = with_store(&ctx.store, move |s| {
-                        s.upsert_file_transcript(&ws_save, &fid_save, &source, &text_save)
+                        s.upsert_file_transcript_with_cues(
+                            &ws_save, &fid_save, &source, &text_save, &cues_save,
+                        )
                     })
                     .await
                     {
@@ -860,6 +865,7 @@ impl<B: Backend> Core<B> {
                     ctx.events.emit(Event::FileTranscriptReady {
                         file_id,
                         text: trimmed,
+                        cues,
                     });
                 }
                 Ok(Err(error)) => {

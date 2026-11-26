@@ -675,6 +675,19 @@ pub enum WorkspaceCommand {
     SetSaveHuddleTranscripts(bool),
     /// Write a single user preference key/value back to Slack (`users.prefs.set`).
     SetUserPref { name: String, value: String },
+    /// Explicitly backfill one conversation's history (and optionally thread replies) into SQLite.
+    BackfillChannel {
+        channel: ChannelId,
+        include_threads: bool,
+    },
+    /// Backfill every stored conversation in the workspace into SQLite sequentially.
+    BackfillWorkspace { include_threads: bool },
+    /// Pause active background archive backfill workers cleanly between pages.
+    PauseBackfill,
+    /// Resume paused archive backfill workers.
+    ResumeBackfill,
+    /// Request a fresh [`crate::Event::BackfillProgress`] snapshot from SQLite & running workers.
+    QueryBackfillProgress,
     /// Revoke the workspace token server-side (`auth.revoke`, `F-CORE-009`).
     SignOut,
 }

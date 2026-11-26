@@ -778,6 +778,14 @@ impl App {
                 window.close_dialog(cx);
                 self.open_profile(user.clone(), cx);
             }
+            ChannelDetailsEvent::Export { channel, markdown } => {
+                window.close_dialog(cx);
+                self.export_channel_transcript(channel.clone(), *markdown, window, cx);
+            }
+            ChannelDetailsEvent::Backfill(channel) => {
+                window.close_dialog(cx);
+                self.start_channel_backfill(channel.clone(), window, cx);
+            }
         }
     }
 

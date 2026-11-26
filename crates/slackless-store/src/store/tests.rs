@@ -2983,9 +2983,9 @@ fn v10_to_v11_migration_backfills_message_file_and_inline_clip_transcripts() {
         .unwrap();
     }
 
-    // Opening via Store::open migrates V10 -> V11 and runs the post-V11 backfill.
+    // Opening via Store::open migrates V10 -> latest and runs the post-V11 backfill.
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 11);
+    assert_eq!(store.schema_version().unwrap(), crate::SCHEMA_VERSION);
 
     // Inline `transcription.preview.content` from compressed BLOB JSON is searchable immediately!
     let hits = store
@@ -3306,4 +3306,272 @@ fn extract_inline_file_transcript_precedence_and_empty_filtering() {
         extract_inline_file_transcript(&file).as_deref(),
         Some("fallback text")
     );
+}
+
+#[test]
+fn file_transcripts_preserve_timed_cues_while_indexing_plain_text_in_fts5() {
+    let mut store = Store::open_in_memory().unwrap();
+    let video_id = FileId::from("F_TIMED_VID");
+    let msg = Message {
+        ts: Ts::from("1700001000.000100"),
+        user: Some(UserId::from("U1")),
+        text: "Check out this demo".into(),
+        files: vec![File {
+            id: video_id.clone(),
+            name: Some("demo.mp4".into()),
+            mimetype: Some("video/mp4".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    store
+        .upsert_message(&ws(), &ChannelId::from("C1"), &msg)
+        .unwrap();
+
+    let cues = vec![
+        crate::types::TranscriptCue {
+            start_secs: 0.5,
+            end_secs: 3.25,
+            text: "Welcome to the checkout demo.".into(),
+        },
+        crate::types::TranscriptCue {
+            start_secs: 3.5,
+            end_secs: 7.0,
+            text: "Latency dropped by half.".into(),
+        },
+    ];
+    let updated = store
+        .upsert_file_transcript_with_cues(
+            &ws(),
+            &video_id,
+            "parakeet-v3",
+            "Welcome to the checkout demo. Latency dropped by half.",
+            &cues,
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    let stored = store.file_transcript(&ws(), &video_id).unwrap().unwrap();
+    assert_eq!(stored.source, "parakeet-v3");
+    assert_eq!(
+        stored.text,
+        "Welcome to the checkout demo. Latency dropped by half."
+    );
+    assert_eq!(stored.cues, cues);
+
+    let all_cues = store.all_file_transcript_cues(&ws()).unwrap();
+    assert_eq!(all_cues.get(&video_id), Some(&cues));
+    assert!(
+        store
+            .all_file_transcript_cues(&TeamId::from("T_OTHER"))
+            .unwrap()
+            .is_empty()
+    );
+
+    // Plain transcript words are searchable in FTS5, while JSON cue metadata keys are NOT indexed.
+    assert_eq!(
+        store
+            .search(&ws(), &SearchQuery::parse("checkout latency"), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .search(&ws(), &SearchQuery::parse("start_secs"), 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn cross_workspace_search_covers_messages_snippets_canvases_and_file_transcripts() {
+    let mut store = Store::open_in_memory().unwrap();
+    let ws1 = TeamId::from("T_ACME");
+    let ws2 = TeamId::from("T_BETA");
+    let c1 = ChannelId::from("C_ENG");
+    let c2 = ChannelId::from("C_OPS");
+
+    store
+        .upsert_conversation(
+            &ws1,
+            &Conversation {
+                id: c1.clone(),
+                name: Some("engineering".into()),
+                is_channel: true,
+                is_member: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .upsert_conversation(
+            &ws2,
+            &Conversation {
+                id: c2.clone(),
+                name: Some("ops".into()),
+                is_channel: true,
+                is_member: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Plain message in ws1.
+    store
+        .upsert_message(
+            &ws1,
+            &c1,
+            &msg("1700030001.000100", "U1", "aurora rollout checklist"),
+        )
+        .unwrap();
+
+    // Snippet attachment in ws2 (searchable via File::preview).
+    let mut snippet_msg = msg("1700030002.000100", "U2", "Shared snippet");
+    snippet_msg.files = vec![File {
+        id: FileId::from("F_SNIP"),
+        name: Some("deploy.sh".into()),
+        mode: Some(crate::types::FileMode::Snippet),
+        preview: Some("export AURORA_REGION=eu-north-1".into()),
+        ..Default::default()
+    }];
+    store.upsert_message(&ws2, &c2, &snippet_msg).unwrap();
+
+    // Canvas attachment in ws1 (searchable via extra["canvas_markdown"]).
+    let mut canvas_file = File {
+        id: FileId::from("F_CANVAS"),
+        title: Some("Q4 Architecture".into()),
+        filetype: Some("quip".into()),
+        ..Default::default()
+    };
+    canvas_file.extra.insert(
+        "canvas_markdown".into(),
+        serde_json::json!("# Aurora Architecture\nMulti-region failover plan"),
+    );
+    let mut canvas_msg = msg("1700030003.000100", "U1", "Updated docs");
+    canvas_msg.files = vec![canvas_file];
+    store.upsert_message(&ws1, &c1, &canvas_msg).unwrap();
+
+    // Video message in ws2 whose transcript is added via `upsert_file_transcript`.
+    let mut clip_msg = msg("1700030004.000100", "U2", "Weekly sync recording");
+    clip_msg.files = vec![File {
+        id: FileId::from("F_CLIP"),
+        name: Some("sync.mp4".into()),
+        ..Default::default()
+    }];
+    store.upsert_message(&ws2, &c2, &clip_msg).unwrap();
+    store
+        .upsert_file_transcript(
+            &ws2,
+            &FileId::from("F_CLIP"),
+            "parakeet-v3",
+            "We confirmed aurora failover completed in twelve seconds",
+        )
+        .unwrap();
+
+    // Standalone file_transcript (not attached to any message) in ws1.
+    store
+        .upsert_file_transcript(
+            &ws1,
+            &FileId::from("F_ORPHAN"),
+            "whisper-turbo",
+            "Standalone aurora audio memo",
+        )
+        .unwrap();
+
+    // Cross-workspace FTS5 search finds all 4 message hits newest-first with workspace attribution.
+    let hits = store
+        .search_all_workspaces(&SearchQuery::parse("aurora"), SearchSort::Recent, 20)
+        .unwrap();
+    assert_eq!(hits.len(), 4);
+    assert_eq!(hits[0].workspace, ws2);
+    assert_eq!(hits[0].message.ts, Ts::from("1700030004.000100"));
+    assert_eq!(hits[1].workspace, ws1);
+    assert_eq!(hits[1].message.ts, Ts::from("1700030003.000100"));
+    assert_eq!(hits[2].workspace, ws2);
+    assert_eq!(hits[2].message.ts, Ts::from("1700030002.000100"));
+    assert_eq!(hits[3].workspace, ws1);
+    assert_eq!(hits[3].message.ts, Ts::from("1700030001.000100"));
+
+    // Relevant sort populates BM25 ranks.
+    let ranked = store
+        .search_all_workspaces(&SearchQuery::parse("aurora"), SearchSort::Relevant, 20)
+        .unwrap();
+    assert_eq!(ranked.len(), 4);
+    assert!(ranked.iter().all(|h| h.rank.is_some()));
+
+    // Channel modifier filters accurately per workspace.
+    let ops_only = store
+        .search_all_workspaces(
+            &SearchQuery::parse("aurora in:#ops"),
+            SearchSort::Recent,
+            20,
+        )
+        .unwrap();
+    assert_eq!(ops_only.len(), 2);
+    assert!(ops_only.iter().all(|h| h.workspace == ws2));
+
+    // Standalone + attached file transcripts are both found via `search_file_transcripts(None, ...)`.
+    let ft_hits = store
+        .search_file_transcripts(None, &SearchQuery::parse("aurora"), 10)
+        .unwrap();
+    assert_eq!(ft_hits.len(), 2);
+    let orphan = ft_hits
+        .iter()
+        .find(|f| f.transcript.file_id == FileId::from("F_ORPHAN"))
+        .expect("orphan transcript");
+    assert_eq!(orphan.workspace, ws1);
+    assert_eq!(orphan.channel, None);
+    let attached = ft_hits
+        .iter()
+        .find(|f| f.transcript.file_id == FileId::from("F_CLIP"))
+        .expect("attached transcript");
+    assert_eq!(attached.workspace, ws2);
+    assert_eq!(attached.channel, Some(c2.clone()));
+
+    // Huddle transcripts cross-workspace search.
+    store
+        .insert_huddle_transcript_segment(
+            &ws1,
+            &NewHuddleTranscriptSegment {
+                channel: &c1,
+                call_id: "R1",
+                thread_root_ts: None,
+                speaker_id: Some(&UserId::from("U1")),
+                lang: Some("en"),
+                source: "parakeet-v3",
+                text: "Aurora kickoff in engineering",
+                at_ms: 1_700_030_010_000,
+            },
+        )
+        .unwrap();
+    store
+        .insert_huddle_transcript_segment(
+            &ws2,
+            &NewHuddleTranscriptSegment {
+                channel: &c2,
+                call_id: "R2",
+                thread_root_ts: None,
+                speaker_id: Some(&UserId::from("U2")),
+                lang: Some("sv"),
+                source: "parakeet-v3",
+                text: "Aurora driftsättning i ops",
+                at_ms: 1_700_030_020_000,
+            },
+        )
+        .unwrap();
+    let huddle_hits = store
+        .search_huddle_transcripts_all("aurora", None, 10)
+        .unwrap();
+    assert_eq!(huddle_hits.len(), 2);
+    assert_eq!(huddle_hits[0].workspace, ws2);
+    assert_eq!(huddle_hits[1].workspace, ws1);
+
+    // `list_workspaces` & `channel_message_counts`.
+    assert_eq!(
+        store.list_workspaces().unwrap(),
+        vec![ws1.clone(), ws2.clone()]
+    );
+    let counts = store.channel_message_counts(&ws1).unwrap();
+    assert_eq!(counts.get(&c1), Some(&2));
 }

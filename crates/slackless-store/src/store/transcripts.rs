@@ -19,6 +19,13 @@ pub struct HuddleTranscriptSegment {
     pub at_ms: i64,
 }
 
+/// A huddle transcript segment attributed to its workspace (for cross-workspace search).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceHuddleTranscriptSegment {
+    pub workspace: TeamId,
+    pub segment: HuddleTranscriptSegment,
+}
+
 /// Summary of one recorded huddle transcript session (grouped by `call_id`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HuddleTranscriptSession {
@@ -302,6 +309,72 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(bind), row_to_segment)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Full-text search across locally persisted huddle transcripts in EVERY workspace stored
+    /// in this database, returning workspace attribution per segment (newest first).
+    pub fn search_huddle_transcripts_all(
+        &self,
+        query: &str,
+        lang: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceHuddleTranscriptSegment>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let fts = crate::query::fts_prefix_match(query);
+        let lang_prefix = lang
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("{}%", s.to_ascii_lowercase()));
+
+        let (mut sql, mut bind) = if let Some(fts) = fts {
+            (
+                String::from(
+                    "SELECT t.id, t.channel_id, t.call_id, t.thread_root_ts, t.speaker_id,
+                            t.lang, t.source, t.text, t.at_ms, t.workspace_id
+                     FROM huddle_transcript_fts f
+                     JOIN huddle_transcript t ON t.id = f.rowid
+                     WHERE huddle_transcript_fts MATCH ?1",
+                ),
+                vec![SqlValue::Text(fts)],
+            )
+        } else {
+            (
+                String::from(
+                    "SELECT t.id, t.channel_id, t.call_id, t.thread_root_ts, t.speaker_id,
+                            t.lang, t.source, t.text, t.at_ms, t.workspace_id
+                     FROM huddle_transcript t
+                     WHERE 1 = 1",
+                ),
+                Vec::new(),
+            )
+        };
+        if let Some(lp) = lang_prefix {
+            bind.push(SqlValue::Text(lp));
+            sql.push_str(&format!(
+                " AND LOWER(COALESCE(t.lang, '')) LIKE ?{}",
+                bind.len()
+            ));
+        }
+        bind.push(SqlValue::Integer(limit as i64));
+        sql.push_str(&format!(
+            " ORDER BY t.at_ms DESC, t.id DESC LIMIT ?{}",
+            bind.len()
+        ));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(bind), |row| {
+                let seg = row_to_segment(row)?;
+                let ws: String = row.get(9)?;
+                Ok(WorkspaceHuddleTranscriptSegment {
+                    workspace: TeamId::from(ws),
+                    segment: seg,
+                })
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
