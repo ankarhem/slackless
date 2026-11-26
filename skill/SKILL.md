@@ -579,19 +579,19 @@ JSON output (`scheduled`):
 #### saved
 
 ```sh
-slackless saved list [--filter in_progress|completed|archived] [--limit N]
+slackless saved list [--filter saved|completed|archived] [--limit N]
 slackless saved add <CHANNEL> <TS> [--due UNIX_SECS]
 slackless saved done <CHANNEL> <TS>
 slackless saved delete <CHANNEL> <TS>
 ```
 
-List (`--filter` default `in_progress`, `--limit` default `50`), add (`saved.add`), complete (`saved.update`), or remove (`saved.delete`) Later / Saved items.
+List (`--filter` default `saved`, the items still in progress, also accepted as `in_progress`; `--limit` default `50`), add (`saved.add`), complete (`saved.update`), or remove (`saved.delete`) Later / Saved items.
 
 JSON output (`saved list`):
 
 ```json
 {
-  "filter": "in_progress",
+  "filter": "saved",
   "count": 1,
   "items": [
     {
@@ -982,7 +982,7 @@ Success exits 0, and so do read commands that found nothing to read: they print 
 { "ok": false, "error": "<code>", "message": "<what to do about it>" }
 ```
 
-Human mode prints `slackless: <message>` on stderr instead. Error codes:
+Human mode prints `slackless: <message>` on stderr instead. A usage error (an unknown command, flag, or value such as `--model bogus` or `--filter bogus`) exits 2 with clap's message on stderr before anything runs. Error codes:
 
 | Code                     | When it happens                                                                                                            |
 | ------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
@@ -1004,7 +1004,6 @@ Human mode prints `slackless: <message>` on stderr instead. Error codes:
 | `file_not_found`         | `transcribe --file` names a file that does not exist                                                                       |
 | `write_failed`           | `download` or `transcribe` could not write a file                                                                          |
 | `transcribe_failed`      | local transcription failed (e.g. no transcription model is downloaded)                                                     |
-| `invalid_model`          | unknown embedding model (expected `minilm` or `bge-small`)                                                                 |
 | `semantic_model_missing` | `--semantic`/`--hybrid` search or `archive index-semantic` ran without the embedding model downloaded                      |
 | `semantic_index_missing` | semantic search ran before `slackless archive index-semantic` built the index                                              |
 | `invalid_config`         | `summarize` provider, endpoint, model, or API key settings are invalid                                                     |

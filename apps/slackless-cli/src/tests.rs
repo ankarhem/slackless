@@ -3,8 +3,9 @@ use clap::Parser as _;
 use slackless_core::types::time::days_from_civil;
 
 use crate::cli::{
-    AuthCommand, CanvasAccessArg, CanvasCommand, Cli, Commands, ExportFormat, HuddleCommand,
-    ListCommand, ListReadFormat, READ_LIMIT, SEARCH_LIMIT, SavedCommand, StatusCommand,
+    AuthCommand, CanvasAccessArg, CanvasCommand, Cli, Commands, EmbeddingModelArg, ExportFormat,
+    HuddleCommand, HuddleTranscriberArg, ListCommand, ListReadFormat, LocalTranscriberArg,
+    READ_LIMIT, SEARCH_LIMIT, SavedCommand, SavedFilterArg, StatusCommand,
 };
 use crate::commands::maintenance::{StatsSummary, format_stats_human};
 use crate::commands::messages::{SearchCmdOpts, cmd_search_in_archive, format_markdown_export};
@@ -409,7 +410,7 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
         .unwrap()
         .command,
         Commands::Huddle { command }
-            if matches!(command.as_ref(), HuddleCommand::Join { transcribe, .. } if transcribe == "parakeet")
+            if matches!(command.as_ref(), HuddleCommand::Join { transcribe: HuddleTranscriberArg::Parakeet, .. })
     ));
 
     // Thread live, digest defaults, upload multi-file, export defaults, nested subcommands.
@@ -460,7 +461,7 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
     assert!(matches!(
         Cli::try_parse_from(["slackless", "saved", "list"]).unwrap().command,
         Commands::Saved { command }
-            if matches!(command.as_ref(), SavedCommand::List { filter, limit: 50 } if filter == "saved")
+            if matches!(command.as_ref(), SavedCommand::List { filter: SavedFilterArg::Saved, limit: 50 })
     ));
     assert!(matches!(
         Cli::try_parse_from(["slackless", "unschedule", "#eng", "Dr01"]).unwrap().command,
@@ -565,7 +566,7 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
                 args.file.as_deref(),
                 Some(std::path::Path::new("/tmp/demo.mp4"))
             );
-            assert_eq!(args.provider.as_deref(), Some("whisper"));
+            assert_eq!(args.provider, LocalTranscriberArg::Whisper);
         }
         _ => panic!("expected Transcribe"),
     }
@@ -596,6 +597,30 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
         vec!["slackless", "unread"],
         vec!["slackless", "download", "F123"],
         vec!["slackless", "transcribe", "F123"],
+        vec![
+            "slackless",
+            "transcribe",
+            "F123",
+            "--provider",
+            "Whisper-Turbo",
+        ],
+        vec![
+            "slackless",
+            "search",
+            "q",
+            "--hybrid",
+            "--model",
+            "BGE-small-en-v1.5",
+        ],
+        vec![
+            "slackless",
+            "huddle",
+            "join",
+            "#eng",
+            "--transcribe",
+            "chime",
+        ],
+        vec!["slackless", "saved", "list", "--filter", "in_progress"],
         vec!["slackless", "backfill", "#eng", "--pages", "2"],
         vec!["slackless", "auth", "status"],
         vec!["slackless", "auth", "logout"],
@@ -612,6 +637,33 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
     assert!(Cli::try_parse_from(["slackless", "upload", "#eng"]).is_err());
     assert!(Cli::try_parse_from(["slackless", "schedule", "#eng", "hi"]).is_err());
     assert!(Cli::try_parse_from(["slackless", "export", "#eng", "--format", "xml"]).is_err());
+    // Unknown models, transcribers, and saved filters are usage errors before anything runs.
+    for argv in [
+        vec!["slackless", "search", "q", "--semantic", "--model", "bogus"],
+        vec![
+            "slackless",
+            "archive",
+            "semantic-model",
+            "download",
+            "--model",
+            "bogus",
+        ],
+        vec!["slackless", "transcribe", "F123", "--provider", "slack"],
+        vec![
+            "slackless",
+            "huddle",
+            "join",
+            "#eng",
+            "--transcribe",
+            "bogus",
+        ],
+        vec!["slackless", "saved", "list", "--filter", "bogus"],
+    ] {
+        assert!(
+            Cli::try_parse_from(&argv).is_err(),
+            "expected a usage error for {argv:?}"
+        );
+    }
     assert!(Cli::try_parse_from(["slackless", "transcribe"]).is_err());
     assert!(Cli::try_parse_from(["slackless", "bogus-cmd"]).is_err());
     // `--count 0` would still wait for, and print, one event.
@@ -1481,7 +1533,7 @@ fn cli_semantic_and_hybrid_search_and_archive_index_semantic_end_to_end() {
     match parsed_idx.command {
         Commands::Archive { command } => match *command {
             ArchiveCommand::IndexSemantic(args) => {
-                assert_eq!(args.model, "bge-small");
+                assert_eq!(args.model, EmbeddingModelArg::BgeSmall);
                 assert!(args.download);
             }
             _ => panic!("expected IndexSemantic"),
@@ -1605,7 +1657,7 @@ fn cli_semantic_and_hybrid_search_and_archive_index_semantic_end_to_end() {
         "kubernetes cluster autoscaler",
         SemanticSearchCmdOpts {
             mode: SearchMode::Hybrid,
-            model: "minilm",
+            model: slackless_core::embeddings::EmbeddingModel::AllMiniLmL6V2,
             all_workspaces: true,
             limit: 10,
             sort: SearchSort::Relevant,

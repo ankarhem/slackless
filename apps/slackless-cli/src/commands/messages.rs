@@ -418,7 +418,7 @@ pub(crate) fn cmd_search(
 
 pub(crate) struct SemanticSearchCmdOpts<'a> {
     pub(crate) mode: SearchMode,
-    pub(crate) model: &'a str,
+    pub(crate) model: EmbeddingModel,
     pub(crate) all_workspaces: bool,
     pub(crate) limit: usize,
     pub(crate) sort: SearchSort,
@@ -433,16 +433,7 @@ pub(crate) fn cmd_search_semantic(
     query: &str,
     opts: SemanticSearchCmdOpts<'_>,
 ) -> Result<ExitCode> {
-    let Some(model) = EmbeddingModel::parse(opts.model) else {
-        return Ok(fail(
-            ctx,
-            "invalid_model",
-            &format!(
-                "unknown embedding model '{}'; expected 'minilm' or 'bge-small'",
-                opts.model
-            ),
-        ));
-    };
+    let model = opts.model;
     let setup = detect_embedding_model_setup(model);
     if !setup.model_ready {
         return Ok(fail(

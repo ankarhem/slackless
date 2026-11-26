@@ -32,7 +32,7 @@ pub struct HuddleJoinArgs {
     pub camera: bool,
     pub blur: bool,
     pub screen: Option<String>,
-    pub transcribe: String,
+    pub transcribe: slackless_core::huddle::TranscriptionProvider,
 }
 
 /// Options for `huddle transcripts`.
@@ -276,20 +276,7 @@ pub async fn run_huddle_join(
     flag: Option<&str>,
     args: HuddleJoinArgs,
 ) -> Result<ExitCode> {
-    let provider = match args.transcribe.trim().to_ascii_lowercase().as_str() {
-        "" | "slack" | "chime" => slackless_core::huddle::TranscriptionProvider::SlackBuiltIn,
-        "parakeet" | "parakeet-v3" => slackless_core::huddle::TranscriptionProvider::ParakeetV3,
-        "whisper" | "whisper-turbo" => slackless_core::huddle::TranscriptionProvider::WhisperTurbo,
-        other => {
-            return Ok(fail(
-                ctx,
-                "invalid_args",
-                &format!(
-                    "unknown --transcribe provider '{other}' (expected slack, parakeet, or whisper)"
-                ),
-            ));
-        }
-    };
+    let provider = args.transcribe;
     let session = match api_for(ctx, flag) {
         Ok(s) => s,
         Err(exit) => return Ok(exit),

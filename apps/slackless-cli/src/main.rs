@@ -123,7 +123,7 @@ async fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
                 &args.query,
                 SemanticSearchCmdOpts {
                     mode,
-                    model: &args.model,
+                    model: args.model.into(),
                     all_workspaces: args.all_workspaces,
                     limit: args.limit,
                     sort,
@@ -306,7 +306,7 @@ async fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
                 ctx.workspace(),
                 &args.file_id,
                 args.file.as_deref(),
-                args.provider.as_deref(),
+                args.provider.into(),
             )
             .await
         }
@@ -348,7 +348,7 @@ async fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
 async fn dispatch_saved(ctx: &Ctx, flag: Option<&str>, command: SavedCommand) -> Result<ExitCode> {
     match command {
         SavedCommand::List { filter, limit } => {
-            live::run_saved_list(ctx, flag, &filter, limit).await
+            live::run_saved_list(ctx, flag, filter.as_str(), limit).await
         }
         SavedCommand::Add { channel, ts, due } => {
             live::run_saved_add(ctx, flag, &channel, &ts, due).await
@@ -477,7 +477,7 @@ async fn dispatch_huddle(
                     camera,
                     blur,
                     screen,
-                    transcribe,
+                    transcribe: transcribe.into(),
                 },
             )
             .await

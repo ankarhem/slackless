@@ -595,20 +595,6 @@ fn status_normalization_download_sanitization_and_mark_thread_cursor() {
         "webm"
     );
 
-    assert_eq!(
-        parse_transcribe_provider(None),
-        Ok(slackless_core::huddle::TranscriptionProvider::ParakeetV3)
-    );
-    assert_eq!(
-        parse_transcribe_provider(Some("parakeet")),
-        Ok(slackless_core::huddle::TranscriptionProvider::ParakeetV3)
-    );
-    assert_eq!(
-        parse_transcribe_provider(Some("Whisper")),
-        Ok(slackless_core::huddle::TranscriptionProvider::WhisperTurbo)
-    );
-    assert!(parse_transcribe_provider(Some("bogus")).is_err());
-
     let (t_json, t_human) = format_transcribe_result(
         "FVID1",
         slackless_core::huddle::TranscriptionProvider::ParakeetV3,
@@ -825,11 +811,6 @@ fn saved_mark_thread_and_files_formatters_cover_edge_cases() {
             message: None,
         },
     ];
-    assert_eq!(normalize_saved_filter("in_progress"), "saved");
-    assert_eq!(normalize_saved_filter(""), "saved");
-    assert_eq!(normalize_saved_filter("saved"), "saved");
-    assert_eq!(normalize_saved_filter("completed"), "completed");
-    assert_eq!(normalize_saved_filter("archived"), "archived");
     let (json, human) = format_saved_list("saved", &saved_items);
     assert_eq!(json["filter"], "saved");
     assert_eq!(json["count"], 2);

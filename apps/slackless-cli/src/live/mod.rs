@@ -56,7 +56,7 @@ pub(crate) use channels::{
 #[cfg(test)]
 pub(crate) use files::{
     clamp_files_limit, create_numbered_file, format_files_list, format_transcribe_result,
-    infer_media_extension, parse_transcribe_provider, sanitize_download_name, select_download_url,
+    infer_media_extension, sanitize_download_name, select_download_url,
     select_transcribe_media_url,
 };
 #[cfg(test)]
@@ -67,9 +67,7 @@ pub(crate) use huddle::{
 #[cfg(test)]
 pub(crate) use list::{effective_list_format, select_list_primary_column};
 #[cfg(test)]
-pub(crate) use saved::{
-    format_mark_thread_output, format_saved_list, mark_thread_cursor, normalize_saved_filter,
-};
+pub(crate) use saved::{format_mark_thread_output, format_saved_list, mark_thread_cursor};
 #[cfg(test)]
 pub(crate) use session::{classify_api_error, display_channel, resolve_channel_with};
 #[cfg(test)]

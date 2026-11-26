@@ -67,8 +67,14 @@ pub(crate) struct SearchArgs {
     #[arg(long, conflicts_with = "semantic")]
     pub(crate) hybrid: bool,
     /// Local embedding model for `--semantic` / `--hybrid` (`minilm` or `bge-small`).
-    #[arg(long, value_name = "MODEL", default_value = "minilm")]
-    pub(crate) model: String,
+    #[arg(
+        long,
+        value_name = "MODEL",
+        value_enum,
+        ignore_case = true,
+        default_value_t = EmbeddingModelArg::Minilm
+    )]
+    pub(crate) model: EmbeddingModelArg,
     /// Optional export format (`md` or `json`) for search results.
     #[arg(long, value_enum)]
     pub(crate) format: Option<ExportFormat>,
@@ -294,6 +300,84 @@ impl From<AiProviderArg> for slackless_core::summarize::AiProvider {
     }
 }
 
+/// Local ONNX embedding model for semantic search: `minilm` (all-MiniLM-L6-v2) or `bge-small`
+/// (bge-small-en-v1.5), also accepted by their full names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum EmbeddingModelArg {
+    #[value(alias = "all-minilm", alias = "all-minilm-l6-v2", alias = "default")]
+    Minilm,
+    #[value(alias = "bge", alias = "bge-small-en", alias = "bge-small-en-v1.5")]
+    BgeSmall,
+}
+
+impl From<EmbeddingModelArg> for slackless_core::embeddings::EmbeddingModel {
+    fn from(arg: EmbeddingModelArg) -> Self {
+        match arg {
+            EmbeddingModelArg::Minilm => Self::AllMiniLmL6V2,
+            EmbeddingModelArg::BgeSmall => Self::BgeSmallEnV15,
+        }
+    }
+}
+
+/// Local model for `transcribe --provider`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum LocalTranscriberArg {
+    #[value(alias = "parakeet-v3", alias = "auto")]
+    Parakeet,
+    #[value(alias = "whisper-turbo")]
+    Whisper,
+}
+
+impl From<LocalTranscriberArg> for slackless_core::huddle::TranscriptionProvider {
+    fn from(arg: LocalTranscriberArg) -> Self {
+        match arg {
+            LocalTranscriberArg::Parakeet => Self::ParakeetV3,
+            LocalTranscriberArg::Whisper => Self::WhisperTurbo,
+        }
+    }
+}
+
+/// Caption source for `huddle join --transcribe`: Slack's own captions or a local model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum HuddleTranscriberArg {
+    #[value(alias = "chime")]
+    Slack,
+    #[value(alias = "parakeet-v3")]
+    Parakeet,
+    #[value(alias = "whisper-turbo")]
+    Whisper,
+}
+
+impl From<HuddleTranscriberArg> for slackless_core::huddle::TranscriptionProvider {
+    fn from(arg: HuddleTranscriberArg) -> Self {
+        match arg {
+            HuddleTranscriberArg::Slack => Self::SlackBuiltIn,
+            HuddleTranscriberArg::Parakeet => Self::ParakeetV3,
+            HuddleTranscriberArg::Whisper => Self::WhisperTurbo,
+        }
+    }
+}
+
+/// Which Later items `saved list` shows; `in_progress` also names the default `saved`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum SavedFilterArg {
+    #[value(alias = "in_progress")]
+    Saved,
+    Completed,
+    Archived,
+}
+
+impl SavedFilterArg {
+    /// The `saved.list` filter value Slack expects.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Saved => "saved",
+            Self::Completed => "completed",
+            Self::Archived => "archived",
+        }
+    }
+}
+
 #[derive(Args)]
 pub(crate) struct SummarizeArgs {
     /// Channel id, #name, or @handle (required unless `--transcript` or `--catchup` is set).
@@ -376,8 +460,14 @@ pub(crate) struct ArchiveIndexSemanticArgs {
     #[arg(long)]
     pub(crate) single_workspace: bool,
     /// Local ONNX embedding model (`minilm` = all-MiniLM-L6-v2, `bge-small` = bge-small-en-v1.5).
-    #[arg(long, value_name = "MODEL", default_value = "minilm")]
-    pub(crate) model: String,
+    #[arg(
+        long,
+        value_name = "MODEL",
+        value_enum,
+        ignore_case = true,
+        default_value_t = EmbeddingModelArg::Minilm
+    )]
+    pub(crate) model: EmbeddingModelArg,
     /// Automatically download the local embedding model if it is not installed yet.
     #[arg(long)]
     pub(crate) download: bool,
@@ -420,20 +510,38 @@ pub(crate) enum SemanticModelCommand {
     /// Show download status, disk usage, and sidecar vector index statistics (offline).
     Status {
         /// Local ONNX embedding model (`minilm` or `bge-small`).
-        #[arg(long, value_name = "MODEL", default_value = "minilm")]
-        model: String,
+        #[arg(
+            long,
+            value_name = "MODEL",
+            value_enum,
+            ignore_case = true,
+            default_value_t = EmbeddingModelArg::Minilm
+        )]
+        model: EmbeddingModelArg,
     },
     /// Download quantized ONNX weights and WordPiece vocab into the local app-data models directory.
     Download {
         /// Local ONNX embedding model (`minilm` or `bge-small`).
-        #[arg(long, value_name = "MODEL", default_value = "minilm")]
-        model: String,
+        #[arg(
+            long,
+            value_name = "MODEL",
+            value_enum,
+            ignore_case = true,
+            default_value_t = EmbeddingModelArg::Minilm
+        )]
+        model: EmbeddingModelArg,
     },
     /// Remove downloaded local embedding model weights to reclaim disk space.
     Delete {
         /// Local ONNX embedding model (`minilm` or `bge-small`).
-        #[arg(long, value_name = "MODEL", default_value = "minilm")]
-        model: String,
+        #[arg(
+            long,
+            value_name = "MODEL",
+            value_enum,
+            ignore_case = true,
+            default_value_t = EmbeddingModelArg::Minilm
+        )]
+        model: EmbeddingModelArg,
     },
 }
 
@@ -463,9 +571,16 @@ pub(crate) struct TranscribeArgs {
     /// Local video or audio file path to transcribe directly (offline, skips Slack download).
     #[arg(long, value_name = "PATH")]
     pub(crate) file: Option<PathBuf>,
-    /// Preferred local transcription provider (`parakeet` or `whisper`; defaults to auto-detect).
-    #[arg(long, value_name = "PROVIDER")]
-    pub(crate) provider: Option<String>,
+    /// Preferred local transcription provider (`parakeet` or `whisper`); the other downloaded
+    /// model is used when it is missing.
+    #[arg(
+        long,
+        value_name = "PROVIDER",
+        value_enum,
+        ignore_case = true,
+        default_value_t = LocalTranscriberArg::Parakeet
+    )]
+    pub(crate) provider: LocalTranscriberArg,
 }
 
 #[derive(Args)]
@@ -685,8 +800,8 @@ pub(crate) enum Commands {
 pub(crate) enum SavedCommand {
     /// List saved items (`saved`, `completed`, or `archived`).
     List {
-        #[arg(long, default_value = "saved")]
-        filter: String,
+        #[arg(long, value_enum, default_value_t = SavedFilterArg::Saved)]
+        filter: SavedFilterArg,
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
@@ -919,8 +1034,14 @@ pub(crate) enum HuddleCommand {
         #[arg(long, value_name = "SOURCE_ID")]
         screen: Option<String>,
         /// Transcription provider: `slack` (default), `parakeet` (local ONNX EN+SV), or `whisper` (local Whisper Turbo EN+SV).
-        #[arg(long, value_name = "PROVIDER", default_value = "slack")]
-        transcribe: String,
+        #[arg(
+            long,
+            value_name = "PROVIDER",
+            value_enum,
+            ignore_case = true,
+            default_value_t = HuddleTranscriberArg::Slack
+        )]
+        transcribe: HuddleTranscriberArg,
     },
     /// Search, list, or export locally archived text-only huddle transcripts (offline).
     Transcripts {

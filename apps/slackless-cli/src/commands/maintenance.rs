@@ -574,22 +574,16 @@ pub(crate) async fn cmd_archive_semantic_model(
     command: SemanticModelCommand,
 ) -> Result<ExitCode> {
     match command {
-        SemanticModelCommand::Status { model } => emit_semantic_model_status(ctx, &model),
+        SemanticModelCommand::Status { model } => emit_semantic_model_status(ctx, model.into()),
         SemanticModelCommand::Download { model } => {
-            let Some(parsed) = EmbeddingModel::parse(&model) else {
-                return Ok(fail(
-                    ctx,
-                    "invalid_model",
-                    &format!("unknown embedding model '{model}'; expected 'minilm' or 'bge-small'"),
-                ));
-            };
-            let dir = download_embedding_model_async(parsed, download_progress(ctx.json))
+            let model = EmbeddingModel::from(model);
+            let dir = download_embedding_model_async(model, download_progress(ctx.json))
                 .await
                 .map_err(|e| anyhow::anyhow!("downloading embedding model: {e}"))?;
-            let status = detect_embedding_model_setup(parsed);
+            let status = detect_embedding_model_setup(model);
             let human = format!(
                 "Downloaded {} to {} ({})\n",
-                parsed.slug(),
+                model.slug(),
                 dir.display(),
                 format_bytes(status.disk_bytes)
             );
@@ -597,7 +591,7 @@ pub(crate) async fn cmd_archive_semantic_model(
                 ctx.json,
                 &serde_json::json!({
                     "ok": true,
-                    "model": parsed.slug(),
+                    "model": model.slug(),
                     "model_ready": status.model_ready,
                     "model_path": status.model_path.display().to_string(),
                     "disk_bytes": status.disk_bytes,
@@ -608,25 +602,19 @@ pub(crate) async fn cmd_archive_semantic_model(
             Ok(ExitCode::SUCCESS)
         }
         SemanticModelCommand::Delete { model } => {
-            let Some(parsed) = EmbeddingModel::parse(&model) else {
-                return Ok(fail(
-                    ctx,
-                    "invalid_model",
-                    &format!("unknown embedding model '{model}'; expected 'minilm' or 'bge-small'"),
-                ));
-            };
-            let reclaimed = delete_embedding_model(parsed)
+            let model = EmbeddingModel::from(model);
+            let reclaimed = delete_embedding_model(model)
                 .map_err(|e| anyhow::anyhow!("deleting embedding model: {e}"))?;
             let human = format!(
                 "Removed {} (reclaimed {})\n",
-                parsed.slug(),
+                model.slug(),
                 format_bytes(reclaimed)
             );
             output::emit(
                 ctx.json,
                 &serde_json::json!({
                     "ok": true,
-                    "model": parsed.slug(),
+                    "model": model.slug(),
                     "reclaimed_bytes": reclaimed,
                 }),
                 &human,
@@ -636,14 +624,7 @@ pub(crate) async fn cmd_archive_semantic_model(
     }
 }
 
-fn emit_semantic_model_status(ctx: &Ctx, model_arg: &str) -> Result<ExitCode> {
-    let Some(model) = EmbeddingModel::parse(model_arg) else {
-        return Ok(fail(
-            ctx,
-            "invalid_model",
-            &format!("unknown embedding model '{model_arg}'; expected 'minilm' or 'bge-small'"),
-        ));
-    };
+fn emit_semantic_model_status(ctx: &Ctx, model: EmbeddingModel) -> Result<ExitCode> {
     let setup = detect_embedding_model_setup(model);
     let idx_stats = default_semantic_index_stats();
     let idx_path = slackless_core::paths::semantic_index_path();
@@ -699,18 +680,9 @@ pub(crate) async fn cmd_archive_index_semantic(
     args: ArchiveIndexSemanticArgs,
 ) -> Result<ExitCode> {
     if args.status {
-        return emit_semantic_model_status(ctx, &args.model);
+        return emit_semantic_model_status(ctx, args.model.into());
     }
-    let Some(model) = EmbeddingModel::parse(&args.model) else {
-        return Ok(fail(
-            ctx,
-            "invalid_model",
-            &format!(
-                "unknown embedding model '{}'; expected 'minilm' or 'bge-small'",
-                args.model
-            ),
-        ));
-    };
+    let model = EmbeddingModel::from(args.model);
 
     let mut setup = detect_embedding_model_setup(model);
     if !setup.model_ready {

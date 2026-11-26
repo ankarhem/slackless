@@ -210,21 +210,6 @@ fn download_fail(ctx: &Ctx, err: &DownloadError, dest: &Path) -> ExitCode {
     }
 }
 
-/// Parse `--provider` for `slackless transcribe` into a preferred local [`TranscriptionProvider`].
-pub(crate) fn parse_transcribe_provider(
-    raw: Option<&str>,
-) -> std::result::Result<TranscriptionProvider, String> {
-    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        None | Some("") | Some("auto") | Some("parakeet") | Some("parakeet-v3") => {
-            Ok(TranscriptionProvider::ParakeetV3)
-        }
-        Some("whisper") | Some("whisper-turbo") => Ok(TranscriptionProvider::WhisperTurbo),
-        Some(other) => Err(format!(
-            "unknown --provider '{other}' (expected parakeet or whisper)"
-        )),
-    }
-}
-
 /// Select the preferred authenticated media URL for transcribing a Slack video/audio file:
 /// `extra["mp4"]` -> `url_private` -> `url_private_download`.
 pub(crate) fn select_transcribe_media_url(file: &File) -> Option<&str> {
@@ -334,16 +319,12 @@ pub async fn run_transcribe(
     workspace: Option<&TeamId>,
     file_id: &str,
     local_file: Option<&Path>,
-    provider_arg: Option<&str>,
+    preferred: TranscriptionProvider,
 ) -> Result<ExitCode> {
     let file_id = file_id.trim();
     if file_id.is_empty() {
         return Ok(fail(ctx, "invalid_args", "file_id cannot be empty"));
     }
-    let preferred = match parse_transcribe_provider(provider_arg) {
-        Ok(p) => p,
-        Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
-    };
 
     let (target_workspace, media_path, _temp_guard): (TeamId, PathBuf, Option<TempFileGuard>) =
         if let Some(local_path) = local_file {
