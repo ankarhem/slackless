@@ -130,8 +130,6 @@ struct ListUiStore {
     record_comments: HashMap<(String, String), Vec<(String, String)>>,
     /// Server-fetched list access/sharing/limit metadata keyed by `file_id`.
     list_meta: HashMap<String, ListMeta>,
-    /// Server-reported sharing status banner keyed by `list_id`.
-    list_status: HashMap<String, (bool, String)>,
 }
 
 impl Global for ListUiStore {}
@@ -156,10 +154,14 @@ pub fn set_list_meta(file_id: &str, meta: ListMeta, cx: &mut App) {
 }
 
 /// Store the latest sharing/access operation banner for `list_id` (`Event::ListAccessUpdated`).
+/// Unified with [`ListPanelState::share_status`] so server responses and local validation/settings
+/// feedback never shadow each other.
 pub fn set_list_status(list_id: &str, is_err: bool, msg: String, cx: &mut App) {
     cx.default_global::<ListUiStore>()
-        .list_status
-        .insert(list_id.to_owned(), (is_err, msg));
+        .panels
+        .entry(list_id.to_owned())
+        .or_default()
+        .share_status = Some((is_err, msg));
 }
 
 /// Pre-select a list row by `record_id` (e.g., when navigating from a list item thread in
@@ -181,10 +183,11 @@ pub(super) fn list_meta(file_id: &str, cx: &App) -> Option<ListMeta> {
         .cloned()
 }
 
+#[cfg(test)]
 pub(super) fn list_status(list_id: &str, cx: &App) -> Option<(bool, String)> {
     cx.try_global::<ListUiStore>()
-        .and_then(|s| s.list_status.get(list_id))
-        .cloned()
+        .and_then(|s| s.panels.get(list_id))
+        .and_then(|p| p.share_status.clone())
 }
 
 fn record_comments(list_id: &str, record_id: &str, cx: &App) -> Vec<(String, String)> {

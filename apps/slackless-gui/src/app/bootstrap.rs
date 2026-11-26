@@ -834,7 +834,7 @@ fn wire_feature_view_subscriptions(
                 ThreadsEvent::OpenListItem { list_id, record_id } => {
                     if this.fixtures.sample || list_id == "fixture" {
                         crate::lists::select_fixture_record(record_id, cx);
-                        this.page = MainPage::Channel;
+                        this.close_full_column_views(cx);
                         this.select_tab(ConversationTab::List, cx);
                     } else {
                         if let Some(Ok(data)) = this.ws.lists.get(list_id) {

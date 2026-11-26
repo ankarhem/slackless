@@ -938,7 +938,7 @@ impl Render for ThreadsView {
                                         .child(format!("{unread} unread")),
                                 )
                             })
-                            .when(list_count > 0, |title| {
+                            .when(list_count > 0 || filter != ThreadsFilter::All, |title| {
                                 title.child(
                                     h_flex()
                                         .ml_2()

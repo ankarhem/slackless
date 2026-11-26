@@ -21,7 +21,7 @@ pub use slackless_core::domain::lists::{
 };
 use slackless_core::types::{ChannelId, UserId};
 
-use super::{ListActions, ListPanelState, list_meta, list_status, mutate_panel};
+use super::{ListActions, ListPanelState, list_meta, mutate_panel};
 use crate::fixtures::Fixtures;
 
 /// Callback invoked when granting/updating list access (`CollabCommand::SetListAccess`).
@@ -48,6 +48,7 @@ pub(super) fn open_share_panel(
             s.share_open = true;
             s.share_tab = tab;
             s.share_item_id = item_record_id;
+            s.share_status = None;
             if s.share_target_input.is_none() {
                 s.share_target_input = Some(input);
             }
@@ -93,33 +94,31 @@ pub(super) fn render_list_share_panel(
             format!("https://{domain}.slack.com/lists/{team}/{list_key}")
         });
 
-    let status_banner = list_status(list_key, cx)
-        .or_else(|| state.share_status.clone())
-        .map(|(is_err, msg)| {
-            let bg = if is_err {
-                theme.danger.opacity(0.14)
-            } else {
-                theme.success.opacity(0.14)
-            };
-            let fg = if is_err { theme.danger } else { theme.success };
-            let icon = if is_err {
-                IconName::TriangleAlert
-            } else {
-                IconName::Check
-            };
-            h_flex()
-                .items_start()
-                .gap_1p5()
-                .p_2()
-                .rounded_md()
-                .border_1()
-                .border_color(fg.opacity(0.4))
-                .bg(bg)
-                .text_xs()
-                .text_color(theme.foreground)
-                .child(Icon::new(icon).size(px(14.)).text_color(fg))
-                .child(div().flex_1().child(format_list_error(&msg)))
-        });
+    let status_banner = state.share_status.clone().map(|(is_err, msg)| {
+        let bg = if is_err {
+            theme.danger.opacity(0.14)
+        } else {
+            theme.success.opacity(0.14)
+        };
+        let fg = if is_err { theme.danger } else { theme.success };
+        let icon = if is_err {
+            IconName::TriangleAlert
+        } else {
+            IconName::Check
+        };
+        h_flex()
+            .items_start()
+            .gap_1p5()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(fg.opacity(0.4))
+            .bg(bg)
+            .text_xs()
+            .text_color(theme.foreground)
+            .child(Icon::new(icon).size(px(14.)).text_color(fg))
+            .child(div().flex_1().child(format_list_error(&msg)))
+    });
 
     let tab_bar = {
         let tabs = [

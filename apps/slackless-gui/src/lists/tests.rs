@@ -515,6 +515,26 @@ fn list_share_drawer_and_ui_store_round_trip(cx: &mut gpui::TestAppContext) {
             list_status("F0SHARE", cx),
             Some((false, "Shared with #engineering".to_owned()))
         );
+        // Subsequent client-side validation error replaces prior server status cleanly (never shadowed).
+        cx.default_global::<ListUiStore>()
+            .panels
+            .entry("F0SHARE".to_owned())
+            .or_default()
+            .share_status = Some((true, "Enter at least one channel or user ID.".into()));
+        assert_eq!(
+            panel_state("F0SHARE", cx).share_status,
+            Some((true, "Enter at least one channel or user ID.".to_owned()))
+        );
+        assert_eq!(
+            list_status("F0SHARE", cx),
+            Some((true, "Enter at least one channel or user ID.".to_owned()))
+        );
+        // And a subsequent server response replaces the client-side error.
+        set_list_status("F0SHARE", false, "Access updated".into(), cx);
+        assert_eq!(
+            panel_state("F0SHARE", cx).share_status,
+            Some((false, "Access updated".to_owned()))
+        );
 
         let data = SlackListData {
             file_id: "F0SHARE".into(),
