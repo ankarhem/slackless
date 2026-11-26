@@ -254,11 +254,12 @@ impl App {
                 Arrival::Seen
             } else {
                 let kind = self.fixtures.conversation(channel).map(Conversation::kind);
-                Arrival::Unread {
-                    mention: matches!(kind, Some(ConversationKind::Im | ConversationKind::Mpim))
-                        || mentions_me(&message.text, &self.fixtures.self_user, &settings.keywords),
-                    im: kind == Some(ConversationKind::Im),
-                }
+                let me = &self.fixtures.self_user;
+                super::unread_arrival(
+                    channel,
+                    kind,
+                    mentions_me(&message.text, me, &settings.keywords),
+                )
             };
             let unread = matches!(arrival, Arrival::Unread { .. });
             self.ws.fold_message(channel, &message.ts, arrival);

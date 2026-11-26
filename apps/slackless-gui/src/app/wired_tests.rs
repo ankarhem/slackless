@@ -922,6 +922,8 @@ fn wired_unread_counts_fold_alike_in_shown_and_background_workspaces(
     // The shown workspace reads #open, so neither workspace sees the rows below arrive.
     cx.update(|_, cx| app.update(cx, |app, cx| app.select(ChannelId::from("C0OPEN"), cx)));
     let (chan, dm) = (ChannelId::from("C0CHAN"), ChannelId::from("D0PEER"));
+    // A DM opened by its first message: neither snapshot nor store holds it yet.
+    let new_dm = ChannelId::from("D0NEW");
     let post = |channel: &ChannelId, ts: &str, user: &str, text: &str| Event::MessagePosted {
         channel: channel.clone(),
         message: Box::new(Message {
@@ -972,6 +974,12 @@ fn wired_unread_counts_fold_alike_in_shown_and_background_workspaces(
             post(&chan, "1700000004.000100", "U0ME", "on it"),
             &chan,
             (true, 1, 0, Some("1700000004.000100")),
+        ),
+        (
+            "a peer opens a new DM",
+            post(&new_dm, "1700000005.000100", "U0PEER", "hi"),
+            &new_dm,
+            (true, 1, 1, None),
         ),
     ];
     for (what, event, channel, expected) in rows {

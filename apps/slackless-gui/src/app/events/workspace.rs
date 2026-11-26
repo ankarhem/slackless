@@ -169,13 +169,7 @@ impl App {
                         let kind = (bg_ctx.as_ref())
                             .and_then(|ctx| ctx.conversation.as_ref())
                             .map(Conversation::kind);
-                        Arrival::Unread {
-                            mention: matches!(
-                                kind,
-                                Some(ConversationKind::Im | ConversationKind::Mpim)
-                            ) || mentioned,
-                            im: kind == Some(ConversationKind::Im),
-                        }
+                        super::unread_arrival(channel, kind, mentioned)
                     };
                     let unread = matches!(arrival, Arrival::Unread { .. });
                     slot.state.fold_message(channel, &message.ts, arrival);

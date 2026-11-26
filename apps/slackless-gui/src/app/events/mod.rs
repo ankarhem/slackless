@@ -8,6 +8,22 @@ mod workspace;
 
 use super::*;
 
+/// How someone else's unread message moves `channel`'s counts, `kind` being the conversation
+/// as the workspace knows it: a DM counts as a mention, also one this very message opens, which
+/// neither snapshot nor store holds yet and only its id names (`D…`).
+fn unread_arrival(channel: &ChannelId, kind: Option<ConversationKind>, mentioned: bool) -> Arrival {
+    let kind = kind.or_else(|| {
+        channel
+            .as_str()
+            .starts_with('D')
+            .then_some(ConversationKind::Im)
+    });
+    Arrival::Unread {
+        mention: mentioned || matches!(kind, Some(ConversationKind::Im | ConversationKind::Mpim)),
+        im: kind == Some(ConversationKind::Im),
+    }
+}
+
 impl App {
     /// Rebuild the menu bar when its moving parts change: the workspaces (File > Workspace,
     /// Sign Out) and the History menu's places, labelled as Slack's.
