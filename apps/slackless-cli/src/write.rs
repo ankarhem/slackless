@@ -429,8 +429,9 @@ pub async fn run_thread_live(
         Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let mut archive = Archive::open_or_create_rw(&session.workspace).ok();
-    let (channel, label) = resolve_channel_with(archive.as_ref(), &session.workspace, channel_arg);
+    let mut archive = Archive::open_or_create_rw(&session.workspace);
+    let (channel, label) =
+        resolve_channel_with(archive.as_ref().ok(), &session.workspace, channel_arg);
     let thread_ts = Ts::from(thread_ts_arg.to_owned());
     let opts = HistoryOpts {
         limit: Some(limit.clamp(1, 999)),
@@ -446,17 +447,22 @@ pub async fn run_thread_live(
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
 
-    if let Some(archive) = archive.as_mut() {
-        let _ = archive.store_mut().upsert_replies_page(
-            &session.workspace,
-            &channel,
-            &page.items,
-            fetched_at,
-        );
+    let mirrored = archive
+        .as_mut()
+        .map_err(|err| format!("{err:#}"))
+        .and_then(|a| {
+            a.store_mut()
+                .upsert_replies_page(&session.workspace, &channel, &page.items, fetched_at)
+                .map_err(|err| err.to_string())
+        });
+    // stderr: `--json` consumers read only the replies on stdout.
+    if let Err(err) = mirrored {
+        eprintln!("slackless: could not mirror the live replies into the local archive ({err})");
     }
 
     let user_names = archive
         .as_ref()
+        .ok()
         .and_then(|a| a.user_display_map(&session.workspace).ok())
         .unwrap_or_default();
     let rows: Vec<MessageRow> = page

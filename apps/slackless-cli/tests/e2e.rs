@@ -5,17 +5,21 @@
 //! - Archive CLI JSON/Markdown output contracts and non-zero structured error envelopes.
 //! - Live stdio MCP JSON-RPC protocol (`initialize`, `tools/list`, `tools/call`, `resources/list`)
 //!   including `--read-only` write-tool enforcement.
+//! - Live commands against a local wiremock Slack API, signed in with fake credentials.
 
 #![allow(clippy::unwrap_used)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
+use slackless_core::auth::{Session, SessionStore};
 use slackless_core::store::Store;
 use slackless_core::types::{ChannelId, Conversation, Message, Team, TeamId, Ts, User, UserId};
+use wiremock::matchers::path;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
 
@@ -134,10 +138,31 @@ impl Drop for TempArchiveDir {
 
 fn cli(dir: &TempArchiveDir) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_slackless"));
-    // `HOME` locates the stored sessions: no test reads those of the machine running it.
+    // `HOME` (and on Linux `XDG_CONFIG_HOME`) locates the stored sessions: no test reads those
+    // of the machine running it.
     cmd.env("SLACKLESS_DATA_DIR", dir.data())
-        .env("HOME", &dir.path);
+        .env("HOME", &dir.path)
+        .env_remove("XDG_CONFIG_HOME");
     cmd
+}
+
+/// Signs the isolated `HOME` in to `team_id` with fake credentials whose API base is `server`,
+/// so live commands run their real code paths without reaching Slack.
+fn sign_in(dir: &TempArchiveDir, team_id: &str, server: &MockServer) {
+    let config = if cfg!(target_os = "macos") {
+        dir.path.join("Library/Application Support")
+    } else {
+        dir.path.join(".config")
+    };
+    SessionStore::with_path(config.join("slackless/sessions.json"))
+        .save(&[Session::new(
+            server.uri(),
+            team_id,
+            "xoxc-e2e",
+            "xoxd-e2e",
+            "U0E2E",
+        )])
+        .unwrap();
 }
 
 /// Runs `slackless --json <args>` with empty stdin: the exit code and the one JSON value printed.
@@ -297,19 +322,16 @@ fn mcp_rpc(stdin: &mut impl Write, stdout: &mut impl BufRead, req: &Value) -> Va
         .unwrap_or_else(|e| panic!("invalid JSON-RPC response {line:?}: {e}"))
 }
 
-#[test]
-fn mcp_stdio_server_handshake_tools_resources_and_read_only_enforcement() {
-    let dir = TempArchiveDir::new("mcp");
-    dir.seed_workspace("T0MCP");
-
-    let mut child = cli(&dir)
-        .args(["mcp", "--read-only"])
+/// Spawns `slackless mcp <args>` (stderr captured) and completes the `initialize` handshake.
+fn start_mcp(dir: &TempArchiveDir, args: &[&str]) -> (Child, ChildStdin, BufReader<ChildStdout>) {
+    let mut child = cli(dir)
+        .arg("mcp")
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -342,6 +364,14 @@ fn mcp_stdio_server_handshake_tools_resources_and_read_only_enforcement() {
     )
     .unwrap();
     stdin.flush().unwrap();
+    (child, stdin, stdout)
+}
+
+#[test]
+fn mcp_stdio_server_handshake_tools_resources_and_read_only_enforcement() {
+    let dir = TempArchiveDir::new("mcp");
+    dir.seed_workspace("T0MCP");
+    let (mut child, mut stdin, mut stdout) = start_mcp(&dir, &["--read-only"]);
 
     // 3. `tools/list`: read tools present, mutating tools MUST be absent in `--read-only` mode.
     let list = mcp_rpc(
@@ -534,5 +564,93 @@ fn mcp_stdio_server_handshake_tools_resources_and_read_only_enforcement() {
     assert!(
         status.success(),
         "MCP server did not exit cleanly on EOF: {status}"
+    );
+}
+/// Live reads and sends mirror what Slack returned into the local archive. When that write
+/// fails, the command still answers, and the failure is reported on stderr (never on stdout,
+/// which carries the JSON or the MCP protocol).
+#[tokio::test]
+async fn live_commands_report_local_mirror_failures_on_stderr() {
+    let dir = TempArchiveDir::new("mirror");
+    let server = MockServer::start().await;
+    let root = json!({"type": "message", "user": "U0E2E", "text": "live root",
+        "ts": "1700000100.000100", "thread_ts": "1700000100.000100"});
+    for (method, body) in [
+        (
+            "conversations.history",
+            json!({"ok": true, "messages": [root], "has_more": false}),
+        ),
+        (
+            "conversations.replies",
+            json!({"ok": true, "messages": [root], "has_more": false}),
+        ),
+        (
+            "chat.postMessage",
+            json!({"ok": true, "channel": "C0LIVE", "ts": "1700000200.000100",
+                "message": {"type": "message", "user": "U0E2E", "text": "sent", "ts": "1700000200.000100"}}),
+        ),
+    ] {
+        Mock::given(path(format!("/api/{method}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+    }
+    sign_in(&dir, "T0LIVE", &server);
+    // A directory where the archive file belongs: opening it for writing fails.
+    std::fs::create_dir_all(dir.data().join("T0LIVE.sqlite")).unwrap();
+
+    let out = cli(&dir)
+        .args(["--json", "thread", "C0LIVE", "1700000100.000100", "--live"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "thread --live failed: {stderr}");
+    let thread: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(thread["count"], 1);
+    assert!(
+        stderr.contains("could not mirror"),
+        "thread --live: {stderr:?}"
+    );
+
+    let (child, mut stdin, mut stdout) = start_mcp(&dir, &[]);
+    for (id, name, arguments) in [
+        (
+            2,
+            "read_channel",
+            json!({"channel": "C0LIVE", "live": true}),
+        ),
+        (
+            3,
+            "read_thread",
+            json!({"channel": "C0LIVE", "thread_ts": "1700000100.000100", "live": true}),
+        ),
+        (
+            4,
+            "send_message",
+            json!({"channel": "C0LIVE", "text": "sent"}),
+        ),
+    ] {
+        let call = mcp_rpc(
+            &mut stdin,
+            &mut stdout,
+            &json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}}),
+        );
+        assert!(
+            call["result"]["isError"] != true && call["result"]["content"][0]["text"].is_string(),
+            "{name}: {call}"
+        );
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("could not mirror").count(),
+        2,
+        "MCP live reads: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("could not record the echo"),
+        "MCP send_message: {stderr:?}"
     );
 }

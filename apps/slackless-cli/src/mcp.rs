@@ -450,10 +450,15 @@ impl McpServer {
         let Some(message) = message else {
             return;
         };
-        if let Ok(mut archive) = self.open_archive_rw(workspace) {
-            let _ = archive
+        let recorded = self.open_archive_rw(workspace).and_then(|mut archive| {
+            archive
                 .store_mut()
-                .upsert_message(workspace, channel, message);
+                .upsert_message(workspace, channel, message)
+                .map_err(|err| format!("recording the sent message: {err}"))
+        });
+        // stderr: stdout carries the MCP protocol.
+        if let Err(err) = recorded {
+            eprintln!("slackless: sent, but could not record the echo locally ({err})");
         }
     }
 
@@ -1705,9 +1710,9 @@ impl McpServer {
                 Ok(pair) => pair,
                 Err((code, msg)) => return Err(tool_err(code, msg)),
             };
-            let mut archive = self.open_archive_rw(&workspace).ok();
+            let mut archive = self.open_archive_rw(&workspace);
             let (channel_id, label) =
-                resolve_channel_with(archive.as_ref(), &workspace, channel.as_str());
+                resolve_channel_with(archive.as_ref().ok(), &workspace, channel.as_str());
             let opts = HistoryOpts {
                 oldest: cutoff_secs.map(|s| Ts::from(format!("{s}.000000"))),
                 latest: before,
@@ -1722,16 +1727,19 @@ impl McpServer {
                     return Err(tool_err(code, msg));
                 }
             };
-            if let Some(archive) = archive.as_mut() {
-                let _ = archive.store_mut().upsert_history_page(
-                    &workspace,
-                    &channel_id,
-                    &page.items,
-                    fetched_at,
+            let mirrored = archive.as_mut().map_err(|err| err.clone()).and_then(|a| {
+                a.store_mut()
+                    .upsert_history_page(&workspace, &channel_id, &page.items, fetched_at)
+                    .map_err(|err| err.to_string())
+            });
+            if let Err(err) = mirrored {
+                eprintln!(
+                    "slackless: could not mirror the live messages into the local archive ({err})"
                 );
             }
             let user_names = archive
                 .as_ref()
+                .ok()
                 .and_then(|a| a.user_display_map(&workspace).ok())
                 .unwrap_or_default();
             // Slack returns newest-first; reverse so output is oldest-first like local read.
@@ -1857,9 +1865,9 @@ impl McpServer {
                 Ok(pair) => pair,
                 Err((code, msg)) => return Err(tool_err(code, msg)),
             };
-            let mut archive = self.open_archive_rw(&workspace).ok();
+            let mut archive = self.open_archive_rw(&workspace);
             let (channel_id, label) =
-                resolve_channel_with(archive.as_ref(), &workspace, channel.as_str());
+                resolve_channel_with(archive.as_ref().ok(), &workspace, channel.as_str());
             let opts = HistoryOpts {
                 limit: Some(u32::try_from(limit).unwrap_or(200)),
                 ..HistoryOpts::default()
@@ -1875,16 +1883,19 @@ impl McpServer {
                     return Err(tool_err(code, msg));
                 }
             };
-            if let Some(archive) = archive.as_mut() {
-                let _ = archive.store_mut().upsert_replies_page(
-                    &workspace,
-                    &channel_id,
-                    &page.items,
-                    fetched_at,
+            let mirrored = archive.as_mut().map_err(|err| err.clone()).and_then(|a| {
+                a.store_mut()
+                    .upsert_replies_page(&workspace, &channel_id, &page.items, fetched_at)
+                    .map_err(|err| err.to_string())
+            });
+            if let Err(err) = mirrored {
+                eprintln!(
+                    "slackless: could not mirror the live replies into the local archive ({err})"
                 );
             }
             let user_names = archive
                 .as_ref()
+                .ok()
                 .and_then(|a| a.user_display_map(&workspace).ok())
                 .unwrap_or_default();
             let messages: Vec<McpMessage> = page
