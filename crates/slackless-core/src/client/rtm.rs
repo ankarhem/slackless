@@ -45,6 +45,7 @@ impl<B: Backend> Core<B> {
                             self.events.emit(Event::OfflineQueueChanged(0));
                             self.flush_queued_mutations_sequentially(queued);
                         }
+                        self.outbox_retry.reset();
                         self.flush_outbox();
                     }
                     ConnectionState::Reconnecting { .. } | ConnectionState::Disconnected { .. } => {

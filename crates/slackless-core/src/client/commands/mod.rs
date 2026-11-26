@@ -8,7 +8,10 @@ mod offline;
 
 #[cfg(test)]
 pub(super) use huddle::spawn_huddle_watcher;
-pub(super) use offline::QueuedMutation;
+pub(super) use offline::{OutboxRetry, QueuedMutation};
+
+#[cfg(test)]
+pub(super) use offline::next_outbox_retry_delay;
 
 use super::*;
 

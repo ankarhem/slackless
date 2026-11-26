@@ -4,7 +4,7 @@ mod commands;
 mod hydrate;
 mod rtm;
 
-use self::commands::QueuedMutation;
+use self::commands::{OutboxRetry, QueuedMutation};
 use self::hydrate::*;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -488,6 +488,8 @@ pub(crate) struct Core<B: Backend> {
     /// Serializes durable V13 `outbox` flushes per workspace so reconnect / manual flushes are
     /// strictly FIFO and idempotent.
     outbox_flush_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Scheduled re-flush of the outbox after a transient send failure while connected.
+    outbox_retry: OutboxRetry,
     /// True Stealth Mode: suppresses outbound typing, read-cursor updates, and active presence
     /// (shared atomically with background offline-queue flushers).
     stealth_mode: Arc<AtomicBool>,
@@ -581,6 +583,7 @@ impl<B: Backend> Core<B> {
             has_connected_once: false,
             offline_queue: persisted,
             outbox_flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+            outbox_retry: OutboxRetry::default(),
             stealth_mode: Arc::new(AtomicBool::new(false)),
             save_huddle_transcripts: Arc::new(AtomicBool::new(true)),
             huddle: Arc::new(Mutex::new(HuddleSlot::default())),

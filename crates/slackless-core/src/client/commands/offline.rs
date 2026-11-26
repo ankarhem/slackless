@@ -1,11 +1,175 @@
 //! Persisted offline mutation queue (`offline_queue`) and durable send outbox (`outbox`, V13)
-//! with idempotent sequential FIFO flushing on reconnect.
+//! with idempotent sequential FIFO flushing on reconnect and capped-backoff re-flush after a
+//! transient failure while connected.
+
+use std::time::Duration;
 
 use super::super::*;
 use super::messaging::{mark_read_and_store, post_message_and_store};
 use crate::api::new_client_msg_id;
 use crate::outbox::{OutboxPayload, decode_outbox_payload, is_transient_send_error};
 use crate::store::{NewOutboxItem, OutboxItem};
+
+/// Delay before the first automatic outbox re-flush after a transient send failure.
+const OUTBOX_RETRY_INITIAL: Duration = Duration::from_secs(5);
+/// Ceiling of the automatic outbox re-flush backoff.
+const OUTBOX_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+
+/// The next re-flush backoff: double the previous delay, capped at [`OUTBOX_RETRY_MAX`].
+pub(in crate::client) fn next_outbox_retry_delay(prev: Duration) -> Duration {
+    prev.saturating_mul(2).min(OUTBOX_RETRY_MAX)
+}
+
+/// Automatic re-flush of the outbox after a flush pass stops on a transient send failure while
+/// the socket stays connected. The backoff for the next retry and the single pending timer, so
+/// overlapping flushes never pile up retries. A timer that fires while offline still runs its
+/// pass: the HTTP API is independent of the websocket, and a failure just backs off further.
+#[derive(Clone, Default)]
+pub(in crate::client) struct OutboxRetry(Arc<Mutex<RetryState>>);
+
+struct RetryState {
+    /// Backoff of the next retry; starts at [`OUTBOX_RETRY_INITIAL`].
+    delay: Duration,
+    /// The pending timer task, if any.
+    pending: Option<AbortHandle>,
+}
+
+impl Default for RetryState {
+    fn default() -> Self {
+        Self {
+            delay: OUTBOX_RETRY_INITIAL,
+            pending: None,
+        }
+    }
+}
+
+impl OutboxRetry {
+    /// Schedules the single re-flush with the current backoff (then doubles it), replacing any
+    /// pending timer.
+    fn schedule<B: Backend>(&self, flush: OutboxFlush<B>) {
+        let mut state = self.lock();
+        let delay = state.delay;
+        state.delay = next_outbox_retry_delay(delay);
+        state.abort_pending();
+        let retry = self.clone();
+        let tasks = flush.tasks.clone();
+        state.pending = tasks.spawn(async move {
+            tokio::time::sleep(delay).await;
+            // This timer has fired: take it out (without aborting) so the pass's own outcome
+            // never aborts the task running it.
+            retry.lock().pending = None;
+            flush.run().await;
+        });
+    }
+
+    /// Cancels the pending re-flush and resets the backoff (a drained queue, or `Connected`,
+    /// which flushes at once).
+    pub(in crate::client) fn reset(&self) {
+        let mut state = self.lock();
+        state.delay = OUTBOX_RETRY_INITIAL;
+        state.abort_pending();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RetryState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl RetryState {
+    /// Aborts the pending timer, if any (dropping an [`AbortHandle`] alone does not abort).
+    fn abort_pending(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            pending.abort();
+        }
+    }
+}
+
+/// What a flush pass does after one item.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flush {
+    Proceed,
+    /// The item is still `pending` (transient send failure, busy store), so another flush is due.
+    RetryLater,
+    /// Auth expired or shutdown: a retry cannot fix it.
+    Stop,
+}
+
+/// One serialized FIFO flush pass over the pending outbox items, with the state the automatic
+/// re-flush needs to repeat it.
+#[derive(Clone)]
+pub(super) struct OutboxFlush<B: Backend> {
+    ctx: TaskCtx<B>,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    retry: OutboxRetry,
+    tasks: TaskTracker,
+}
+
+impl<B: Backend> OutboxFlush<B> {
+    /// Delivers every pending item in order under the flush lock, then schedules the re-flush a
+    /// transient failure needs or resets the backoff once the queue is drained.
+    async fn run(&self) {
+        let outcome = {
+            let _guard = self.lock.lock().await;
+            let ws = self.ctx.workspace.clone();
+            match with_store(&self.ctx.store, move |s| s.list_outbox_pending(&ws)).await {
+                Ok(pending) => {
+                    let mut outcome = Flush::Proceed;
+                    for item in pending {
+                        outcome = deliver_claimed_outbox_item(&self.ctx, item).await;
+                        if outcome != Flush::Proceed {
+                            break;
+                        }
+                    }
+                    outcome
+                }
+                // Another process may hold the database (SQLITE_BUSY): retry later instead of
+                // dropping the pass.
+                Err(err) => {
+                    tracing::warn!(%err, "failed to load pending outbox items");
+                    Flush::RetryLater
+                }
+            }
+        };
+        match outcome {
+            Flush::Proceed => self.retry.reset(),
+            Flush::RetryLater => self.retry.schedule(self.clone()),
+            Flush::Stop => {}
+        }
+    }
+
+    /// Delivers one item under the flush lock. Only a transient failure touches the backoff: one
+    /// delivered item says nothing about the items still queued behind it.
+    async fn run_one(&self, item: OutboxItem) {
+        let outcome = {
+            let _guard = self.lock.lock().await;
+            deliver_claimed_outbox_item(&self.ctx, item).await
+        };
+        if outcome == Flush::RetryLater {
+            self.retry.schedule(self.clone());
+        }
+    }
+}
+
+/// Park a send or reaction that failed transiently while online: enqueue it in the outbox and
+/// arm the automatic re-flush, since no reconnect will come to flush it.
+pub(super) async fn park_transient_send<B: Backend>(
+    flush: &OutboxFlush<B>,
+    channel: ChannelId,
+    thread_ts: Option<Ts>,
+    payload: OutboxPayload,
+    err: &ApiError,
+) -> Result<OutboxItem, CoreError> {
+    let item = enqueue_outbox_with_ctx(
+        &flush.ctx,
+        channel,
+        thread_ts,
+        payload,
+        Some(err.to_string()),
+    )
+    .await?;
+    flush.retry.schedule(flush.clone());
+    Ok(item)
+}
 
 /// Serializable offline mutation stored in SQLite `offline_queue` until flushed on reconnect.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -228,10 +392,10 @@ async fn execute_outbox_item<B: Backend>(
     Ok(())
 }
 
-/// Claim, execute, and finalize one outbox item inside the serialized flush lock.
-/// Returns `false` if the caller should stop flushing further items: auth expired, cancelled, or
-/// a transient failure that the items queued behind this one must not overtake.
-async fn deliver_claimed_outbox_item<B: Backend>(ctx: &TaskCtx<B>, item: OutboxItem) -> bool {
+/// Claim, execute, and finalize one outbox item inside the serialized flush lock. Returns the
+/// action for the items queued behind this one: proceed, retry later (a transient failure they
+/// must not overtake), or stop (auth expired, cancelled).
+async fn deliver_claimed_outbox_item<B: Backend>(ctx: &TaskCtx<B>, item: OutboxItem) -> Flush {
     let id = item.id;
     let ws = ctx.workspace.clone();
     let claimed = match with_store(&ctx.store, move |s| {
@@ -254,11 +418,11 @@ async fn deliver_claimed_outbox_item<B: Backend>(ctx: &TaskCtx<B>, item: OutboxI
         Ok((false, _)) => false,
         Err(err) => {
             tracing::warn!(id, %err, "failed to claim outbox item for sending");
-            false
+            return Flush::RetryLater;
         }
     };
     if !claimed {
-        return true;
+        return Flush::Proceed;
     }
 
     match execute_outbox_item(ctx, &item).await {
@@ -275,7 +439,7 @@ async fn deliver_claimed_outbox_item<B: Backend>(ctx: &TaskCtx<B>, item: OutboxI
                 }
                 Err(err) => tracing::warn!(id, %err, "failed to delete sent outbox item"),
             }
-            true
+            Flush::Proceed
         }
         Err(CoreError::Api(ApiError::AuthExpired(code))) => {
             let ws = ctx.workspace.clone();
@@ -292,7 +456,7 @@ async fn deliver_claimed_outbox_item<B: Backend>(ctx: &TaskCtx<B>, item: OutboxI
                 Err(err) => tracing::warn!(id, %err, "failed to mark outbox item failed"),
             }
             ctx.events.emit(Event::AuthExpired(code));
-            false
+            Flush::Stop
         }
         Err(CoreError::Cancelled) => {
             let ws = ctx.workspace.clone();
@@ -304,13 +468,13 @@ async fn deliver_claimed_outbox_item<B: Backend>(ctx: &TaskCtx<B>, item: OutboxI
             {
                 ctx.events.emit(Event::OutboxUpdated(all));
             }
-            false
+            Flush::Stop
         }
-        // Slack or the network may recover: back to `pending` for the next reconnect or flush
-        // (which reuses the message's `client_msg_id`), and stop this pass so later items cannot
-        // overtake it.
+        // Slack or the network may recover: back to `pending` for the scheduled re-flush (which
+        // reuses the message's `client_msg_id`), and stop this pass so later items cannot overtake
+        // it.
         Err(CoreError::Api(ref err)) if is_transient_send_error(err) => {
-            tracing::info!(id, %err, "outbox send failed transiently; retrying on the next flush");
+            tracing::info!(id, %err, "outbox send failed transiently; re-flushing with backoff");
             let ws = ctx.workspace.clone();
             match with_store(&ctx.store, move |s| {
                 s.reset_outbox_item_pending(id)?;
@@ -325,7 +489,7 @@ async fn deliver_claimed_outbox_item<B: Backend>(ctx: &TaskCtx<B>, item: OutboxI
                     tracing::warn!(id, %store_err, "failed to return outbox item to pending");
                 }
             }
-            false
+            Flush::RetryLater
         }
         Err(err) => {
             let ws = ctx.workspace.clone();
@@ -343,7 +507,7 @@ async fn deliver_claimed_outbox_item<B: Backend>(ctx: &TaskCtx<B>, item: OutboxI
                     tracing::warn!(id, %store_err, "failed to mark outbox item failed");
                 }
             }
-            true
+            Flush::Proceed
         }
     }
 }
@@ -401,24 +565,17 @@ impl<B: Backend> Core<B> {
         if self.is_offline {
             return;
         }
-        let ctx = self.ctx();
-        let lock = Arc::clone(&self.outbox_flush_lock);
-        self.tasks.spawn(async move {
-            let _guard = lock.lock().await;
-            let ws = ctx.workspace.clone();
-            let pending = match with_store(&ctx.store, move |s| s.list_outbox_pending(&ws)).await {
-                Ok(items) => items,
-                Err(err) => {
-                    tracing::warn!(%err, "failed to load pending outbox items");
-                    return;
-                }
-            };
-            for item in pending {
-                if !deliver_claimed_outbox_item(&ctx, item).await {
-                    break;
-                }
-            }
-        });
+        let flush = self.outbox_flush();
+        self.tasks.spawn(async move { flush.run().await });
+    }
+
+    pub(super) fn outbox_flush(&self) -> OutboxFlush<B> {
+        OutboxFlush {
+            ctx: self.ctx(),
+            lock: Arc::clone(&self.outbox_flush_lock),
+            retry: self.outbox_retry.clone(),
+            tasks: self.tasks.clone(),
+        }
     }
 
     /// Retry a single V13 outbox item (whether `failed` or `pending`).
@@ -449,12 +606,8 @@ impl<B: Backend> Core<B> {
             }
             return;
         }
-        let ctx = self.ctx();
-        let lock = Arc::clone(&self.outbox_flush_lock);
-        self.tasks.spawn(async move {
-            let _guard = lock.lock().await;
-            let _ = deliver_claimed_outbox_item(&ctx, item).await;
-        });
+        let flush = self.outbox_flush();
+        self.tasks.spawn(async move { flush.run_one(item).await });
     }
 
     /// Permanently remove a V13 outbox item owned by this workspace and emit

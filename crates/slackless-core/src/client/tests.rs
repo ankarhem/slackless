@@ -8073,7 +8073,7 @@ async fn outbox_retry_offline_resets_to_pending_and_discard_removes_row() {
     assert!(store.lock().unwrap().list_outbox(&ws).unwrap().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn outbox_retry_reuses_the_client_msg_id_of_the_first_attempt() {
     let fake = FakeBackend::default();
     fake.state.lock().unwrap().post_message_error =
@@ -8102,9 +8102,9 @@ async fn outbox_retry_reuses_the_client_msg_id_of_the_first_attempt() {
         other => panic!("expected OutboxUpdated, got {other:?}"),
     }
 
+    // Slack recovers; the parked message goes out on the scheduled re-flush, with no reconnect.
     fake.state.lock().unwrap().post_message_error = None;
-    core.handle(Command::Messaging(MessagingCommand::FlushOutbox))
-        .await;
+    tokio::time::advance(Duration::from_secs(5)).await;
     loop {
         if let Event::OutboxUpdated(items) = next(&mut rx).await
             && items.is_empty()
@@ -8193,6 +8193,99 @@ async fn outbox_flush_stops_at_a_transient_failure_and_keeps_the_item_pending() 
     assert_eq!(
         fake.state.lock().unwrap().post_message_client_msg_ids.len(),
         1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbox_reflusses_a_transient_failure_with_backoff_while_connected() {
+    use crate::store::{NewOutboxItem, OutboxKind, OutboxStatus};
+
+    let fake = FakeBackend::default();
+    fake.state.lock().unwrap().post_message_error =
+        Some(FakeSendError::Status(503, "service unavailable"));
+    let (store, events, mut rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+    let payload = crate::outbox::OutboxPayload::Message {
+        content: MessageContent::plain("retry me"),
+        client_msg_id: None,
+    }
+    .encode();
+    store
+        .lock()
+        .unwrap()
+        .enqueue_outbox(
+            &ws,
+            &NewOutboxItem {
+                channel_id: &c1(),
+                thread_ts: None,
+                kind: OutboxKind::Message,
+                payload_json: &payload,
+                last_error: None,
+            },
+        )
+        .unwrap();
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+    assert!(matches!(next(&mut rx).await, Event::OutboxUpdated(_)));
+
+    core.handle(Command::Messaging(MessagingCommand::FlushOutbox))
+        .await;
+    for expected in [OutboxStatus::Sending, OutboxStatus::Pending] {
+        match next(&mut rx).await {
+            Event::OutboxUpdated(items) => assert_eq!(items[0].status, expected),
+            other => panic!("expected OutboxUpdated, got {other:?}"),
+        }
+    }
+    // A flush pass holds this lock until it ends: once acquired, the pass is over.
+    drop(core.outbox_flush_lock.lock().await);
+
+    // Slack recovers while the socket stays up and nobody presses flush.
+    fake.state.lock().unwrap().post_message_error = None;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    // The re-flush claims the item, stores the sent message, then reports the empty outbox.
+    loop {
+        if let Event::OutboxUpdated(items) = next(&mut rx).await
+            && items.is_empty()
+        {
+            break;
+        }
+    }
+    drop(core.outbox_flush_lock.lock().await);
+
+    let state = fake.state.lock().unwrap();
+    assert_eq!(
+        state.posted_messages,
+        vec![(c1(), "retry me".to_owned())],
+        "the scheduled re-flush delivers the item exactly once"
+    );
+    let ids = &state.post_message_client_msg_ids;
+    assert_eq!(ids.len(), 2, "one failed attempt, one scheduled retry");
+    assert_eq!(
+        ids[0], ids[1],
+        "the retry reuses the first attempt's client_msg_id"
+    );
+    drop(state);
+    assert!(store.lock().unwrap().list_outbox(&ws).unwrap().is_empty());
+}
+
+#[test]
+fn outbox_reflush_backoff_doubles_from_5s_to_a_5min_cap() {
+    use super::commands::next_outbox_retry_delay;
+
+    let steps: Vec<Duration> = std::iter::successors(Some(Duration::from_secs(5)), |delay| {
+        Some(next_outbox_retry_delay(*delay))
+    })
+    .take(8)
+    .collect();
+    assert_eq!(
+        steps,
+        [5, 10, 20, 40, 80, 160, 300, 300].map(Duration::from_secs)
     );
 }
 

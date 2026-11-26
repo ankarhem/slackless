@@ -2,7 +2,7 @@
 //! scheduled messages, pins, bookmarks, and saved/Later command handlers.
 
 use super::super::*;
-use super::offline::enqueue_outbox_with_ctx;
+use super::offline::park_transient_send;
 use crate::api::{ActionContainer, ActivityEntry, MessageContent, SavedMark, new_client_msg_id};
 use crate::outbox::{OutboxPayload, is_transient_send_error};
 use crate::reducer::update_conversation_last_read;
@@ -29,6 +29,7 @@ impl<B: Backend> Core<B> {
         // Minted before the first attempt so it and any outbox retry share one id: Slack then
         // drops a retry of a post it accepted before the connection failed.
         let client_msg_id = new_client_msg_id();
+        let flush = self.outbox_flush();
         self.spawn("chat.postMessage", async move {
             let outcome = post_message_and_store(
                 &ctx,
@@ -42,27 +43,19 @@ impl<B: Backend> Core<B> {
             match outcome {
                 Ok(()) => Ok(()),
                 Err(CoreError::Api(ref err)) if is_transient_send_error(err) => {
-                    let client_msg_id = Some(client_msg_id);
                     let payload = if thread_ts.is_some() {
                         OutboxPayload::Reply {
                             content,
                             broadcast,
-                            client_msg_id,
+                            client_msg_id: Some(client_msg_id),
                         }
                     } else {
                         OutboxPayload::Message {
                             content,
-                            client_msg_id,
+                            client_msg_id: Some(client_msg_id),
                         }
                     };
-                    enqueue_outbox_with_ctx(
-                        &ctx,
-                        channel,
-                        thread_ts,
-                        payload,
-                        Some(err.to_string()),
-                    )
-                    .await?;
+                    park_transient_send(&flush, channel, thread_ts, payload, err).await?;
                     Ok(())
                 }
                 Err(err) => Err(err),
@@ -89,6 +82,7 @@ impl<B: Backend> Core<B> {
 
     pub(super) fn add_reaction(&self, channel: ChannelId, ts: Ts, name: String) {
         let ctx = self.ctx();
+        let flush = self.outbox_flush();
         self.spawn("reactions.add", async move {
             match ctx
                 .backend
@@ -97,12 +91,12 @@ impl<B: Backend> Core<B> {
             {
                 Ok(()) => Ok(()),
                 Err(ref err) if is_transient_send_error(err) => {
-                    enqueue_outbox_with_ctx(
-                        &ctx,
+                    park_transient_send(
+                        &flush,
                         channel,
                         None,
                         OutboxPayload::ReactionAdd { ts, name },
-                        Some(err.to_string()),
+                        err,
                     )
                     .await?;
                     Ok(())
@@ -114,6 +108,7 @@ impl<B: Backend> Core<B> {
 
     pub(super) fn remove_reaction(&self, channel: ChannelId, ts: Ts, name: String) {
         let ctx = self.ctx();
+        let flush = self.outbox_flush();
         self.spawn("reactions.remove", async move {
             match ctx
                 .backend
@@ -122,12 +117,12 @@ impl<B: Backend> Core<B> {
             {
                 Ok(()) => Ok(()),
                 Err(ref err) if is_transient_send_error(err) => {
-                    enqueue_outbox_with_ctx(
-                        &ctx,
+                    park_transient_send(
+                        &flush,
                         channel,
                         None,
                         OutboxPayload::ReactionRemove { ts, name },
-                        Some(err.to_string()),
+                        err,
                     )
                     .await?;
                     Ok(())
