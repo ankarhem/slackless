@@ -115,7 +115,8 @@ impl ChimeSignalClient {
     }
 
     /// Wait up to `timeout` for an expected signaling ACK frame, handling clean-close and
-    /// Chime protocol error frames uniformly while passing intermediate frames to `match_frame`.
+    /// Chime protocol error frames uniformly, answering server `PING`s (the server closes the
+    /// socket on missed liveness checks) and passing every other frame to `match_frame`.
     pub async fn wait_for_ack<T>(
         &mut self,
         timeout: Duration,
@@ -129,6 +130,12 @@ impl ChimeSignalClient {
                         status: err.status.unwrap_or(500),
                         description: err.description.unwrap_or_default(),
                     });
+                }
+                if let Some(pp) = frame.ping_pong
+                    && self.reply_ping_if_needed(&pp).await
+                {
+                    tracing::debug!(ack_name, ping_id = ?pp.ping_id, "answered server PING");
+                    continue;
                 }
                 if let Some(val) = match_frame(frame)? {
                     return Ok(val);
@@ -925,10 +932,35 @@ mod tests {
             .unwrap();
             assert!(saw_subprotocol, "Chime JoinToken subprotocol must be sent");
 
-            // Expect JOIN -> reply JOIN_ACK.
+            // Expect JOIN -> send a PING, which the client must answer with a PONG *while it is
+            // waiting for JOIN_ACK* -> only then reply JOIN_ACK.
             if let Some(Ok(WsMessage::Binary(b))) = ws.next().await {
                 let frame = decode_wire_frame(&b).unwrap().unwrap();
                 assert_eq!(frame.r#type, Some(sdk_signal_frame::Type::Join as i32));
+                let ping = SdkSignalFrame {
+                    timestamp_ms: Some(now_ms()),
+                    r#type: Some(sdk_signal_frame::Type::PingPong as i32),
+                    ping_pong: Some(SdkPingPongFrame {
+                        r#type: Some(SdkPingPongType::Ping as i32),
+                        ping_id: Some(7),
+                    }),
+                    ..Default::default()
+                };
+                ws.send(WsMessage::Binary(encode_wire_frame(&ping).into()))
+                    .await
+                    .unwrap();
+                let pong = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                    .await
+                    .expect("client must PONG while waiting for JOIN_ACK")
+                    .unwrap()
+                    .unwrap();
+                let WsMessage::Binary(pong_bytes) = pong else {
+                    panic!("expected binary PONG frame");
+                };
+                let pong = decode_wire_frame(&pong_bytes).unwrap().unwrap();
+                let pp = pong.ping_pong.unwrap();
+                assert_eq!(pp.r#type, Some(SdkPingPongType::Pong as i32));
+                assert_eq!(pp.ping_id, Some(7));
                 let ack = SdkSignalFrame {
                     timestamp_ms: Some(now_ms()),
                     r#type: Some(sdk_signal_frame::Type::JoinAck as i32),
@@ -974,9 +1006,11 @@ mod tests {
         };
         let mut client = ChimeSignalClient::connect(&creds).await.unwrap();
         client.send_frame(&build_join_frame(77)).await.unwrap();
-        let ack = client.next_frame().await.unwrap().unwrap();
-        assert_eq!(ack.r#type, Some(sdk_signal_frame::Type::JoinAck as i32));
-        assert_eq!(ack.joinack.unwrap().video_subscription_limit, Some(25));
+        let ack = client
+            .wait_for_join_ack(Duration::from_secs(2), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(ack.video_subscription_limit, Some(25));
 
         client.send_frame(&build_leave_frame()).await.unwrap();
         let leave_ack = client.next_frame().await.unwrap().unwrap();

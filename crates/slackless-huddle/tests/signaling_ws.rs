@@ -78,7 +78,8 @@ async fn chime_signal_client_full_ws_handshake_ping_pong_and_leave() {
         assert_eq!(join_frame.r#type, Some(sdk_signal_frame::Type::Join as i32));
         assert!(join_frame.join.is_some());
 
-        // 2. Send an interleaved server PING before JOIN_ACK, then JOIN_ACK.
+        // 2. Send an interleaved server PING before JOIN_ACK: the client must answer it while it
+        //    is still waiting for the ack, so the PONG arrives before JOIN_ACK is even sent.
         let ping = SdkSignalFrame {
             r#type: Some(sdk_signal_frame::Type::PingPong as i32),
             ping_pong: Some(SdkPingPongFrame {
@@ -90,6 +91,16 @@ async fn chime_signal_client_full_ws_handshake_ping_pong_and_leave() {
         ws.send(WsMessage::Binary(encode_wire_frame(&ping).into()))
             .await
             .unwrap();
+
+        let pong_msg = ws.next().await.unwrap().unwrap();
+        let WsMessage::Binary(pong_bytes) = pong_msg else {
+            panic!("expected binary PONG frame");
+        };
+        let pong = decode_wire_frame(&pong_bytes).unwrap().unwrap();
+        assert_eq!(pong.r#type, Some(sdk_signal_frame::Type::PingPong as i32));
+        let pp = pong.ping_pong.unwrap();
+        assert_eq!(pp.r#type, Some(SdkPingPongType::Pong as i32));
+        assert_eq!(pp.ping_id, Some(77));
 
         let join_ack = SdkSignalFrame {
             r#type: Some(sdk_signal_frame::Type::JoinAck as i32),
@@ -140,16 +151,10 @@ async fn chime_signal_client_full_ws_handshake_ping_pong_and_leave() {
     let mut client = ChimeSignalClient::connect(&creds).await.unwrap();
     client.send_frame(&build_join_frame(12345)).await.unwrap();
 
-    let mut saw_interleaved_ping = false;
     let ack = client
-        .wait_for_join_ack(Duration::from_secs(3), |frame| {
-            if frame.ping_pong.is_some() {
-                saw_interleaved_ping = true;
-            }
-        })
+        .wait_for_join_ack(Duration::from_secs(3), |_| {})
         .await
         .unwrap();
-    assert!(saw_interleaved_ping);
     assert_eq!(ack.wants_compressed_sdp, Some(true));
 
     let next = client.next_frame().await.unwrap().unwrap();
