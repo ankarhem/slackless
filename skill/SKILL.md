@@ -40,10 +40,13 @@ Channel arguments (`<CHANNEL>`) across commands accept a channel id (`C0123ABC`,
 #### search
 
 ```sh
-slackless search <QUERY> [--limit N] [--all-workspaces] [--format md|json] [--out PATH]
+slackless search <QUERY> [--limit N] [--all-workspaces] [--sort recent|relevant] [--include-deleted] [--format md|json] [--out PATH]
+slackless search <QUERY> --semantic|--hybrid [--model minilm|bge-small] [--all-workspaces] [--limit N]
 ```
 
-Full-text search of the local archive. Pass `--all-workspaces` to search across every locally archived workspace and merge hits newest first. Pass `--format md|json` and/or `--out PATH` (single-workspace mode) to export matches as Markdown or pretty JSON.
+Full-text search of the local archive. Pass `--all-workspaces` to search every locally archived workspace. `--sort recent` (newest first, the keyword default) or `--sort relevant` (best match first, ranked across workspaces) orders the hits; `--include-deleted` keeps deleted messages. Pass `--format md|json` and/or `--out PATH` to export matches as Markdown or pretty JSON.
+
+`--semantic` ranks by local ONNX embeddings and `--hybrid` blends them with keyword ranking; both sort by relevance unless `--sort recent` is given. They need the embedding model (`archive semantic-model download`) and the vector index (`archive index-semantic`); `--model` picks the model (`minilm`, the default, or `bge-small`). They return the all-workspaces document below with `mode` and `model` added.
 
 The query is one quoted string with Slack-style modifiers:
 
@@ -69,10 +72,14 @@ JSON output (`--all-workspaces` adds `workspace` to each `MessageRow`):
   "query": "launch",
   "all_workspaces": true,
   "workspaces_searched": ["T0123ABC", "T9999XYZ"],
+  "workspaces": [{ "id": "T0123ABC", "name": "Acme" }],
+  "sort": "recent",
   "count": 1,
-  "messages": [{ "workspace": "T0123ABC", "channel": "C0123ABC", "ts": "..." }]
+  "messages": [{ "workspace": "T0123ABC", "workspace_name": "Acme", "channel": "C0123ABC", "ts": "...", "kind": "message" }]
 }
 ```
+
+Each row is a `MessageRow` plus `workspace`, `workspace_name`, `channel_name`, `kind` (`message`, `snippet`, `canvas`, or `file_transcript`), and `file_refs`.
 
 JSON output (`--out PATH --json`):
 
@@ -95,6 +102,7 @@ JSON output:
   "channel": {
     "id": "C0123ABC",
     "name": "eng",
+    "label": "#eng",
     "kind": "public_channel",
     "user": null
   },
@@ -103,7 +111,7 @@ JSON output:
 }
 ```
 
-`channel.name`, `channel.kind`, and `channel.user` are omitted when the archive does not know the conversation.
+When the archive does not know the conversation, `channel` holds only `id` and, when the argument named one, `label`.
 
 #### thread
 
@@ -234,6 +242,63 @@ JSON output:
 }
 ```
 
+#### catchup
+
+```sh
+slackless catchup [--since WHEN] [--all-workspaces] [--limit N]
+```
+
+The Catch-Up briefing from the local archive: mentions and DMs, unread channels with their newest excerpts, threads with new replies, and newly transcribed clips and huddles. `--since` takes `24h`, `7d`, `since-last-visit` (the default; 24 hours before the first visit), or any duration or date cutoff; `--limit N` caps each section (default `25`); `--all-workspaces` covers every archived workspace. MCP `get_catchup_summary` returns the same document.
+
+JSON output:
+
+```json
+{
+  "generated_at_secs": 1739280000,
+  "window": { "kind": "custom", "since_secs": 1739193600 },
+  "cutoff_secs": 1739193600,
+  "workspaces": [{ "team_id": "T0123ABC", "name": "Acme", "cutoff_secs": 1739193600 }],
+  "mentions": [],
+  "unread_channels": [],
+  "active_threads": [],
+  "transcripts": []
+}
+```
+
+- `window.kind` is `since_last_visit`, `last24h`, `last7d`, or `custom` (with `since_secs`).
+- `mentions`: `{ workspace, workspace_name, channel, channel_label, ts, thread_ts, author_id, author_name, excerpt, created_at, kind }` with `kind` one of `direct_mention`, `direct_message`, `broadcast`.
+- `unread_channels`: `{ workspace, workspace_name, channel, channel_label, is_dm, message_count, mention_count, latest_ts, latest_at, excerpts: [{ ts, author_name, text, created_at }] }`.
+- `active_threads`: `{ workspace, workspace_name, channel, channel_label, thread_ts, root_author, root_excerpt, new_reply_count, total_reply_count, latest_reply_ts, latest_reply_author, latest_reply_excerpt, latest_reply_at }`.
+- `transcripts`: `{ workspace, workspace_name, kind, channel, channel_label, message_ts, file_id, call_id, title, source, excerpt, updated_at }`, newest first.
+
+#### summarize
+
+```sh
+slackless summarize <CHANNEL> [--thread TS] [--limit N] [PROVIDER FLAGS]
+slackless summarize --transcript FILE_ID [PROVIDER FLAGS]
+slackless summarize --catchup [--since WHEN] [--all-workspaces] [--limit N] [PROVIDER FLAGS]
+```
+
+Summarize archived messages, one thread, a stored audio/video transcript, or the Catch-Up briefing with an OpenAI-compatible model. Provider flags: `--provider ollama|lmstudio|openai|custom` (inferred from `--endpoint` when omitted), `--endpoint URL`, `--model NAME` (each provider has a default), `--api-key-env VAR` (`openai` otherwise reads `OPENAI_API_KEY` or the key saved in the app), and `--timeout SECS`. `--limit N` caps the messages or briefing items sent.
+
+JSON output:
+
+```json
+{
+  "summary": "Decisions: ...",
+  "provider": "ollama",
+  "endpoint": "http://localhost:11434/v1",
+  "model": "llama3.2",
+  "target_kind": "channel",
+  "title": "#eng",
+  "source_items": 42,
+  "truncated": false,
+  "elapsed_ms": 5300
+}
+```
+
+`prompt_tokens`, `completion_tokens`, and `total_tokens` are added when the provider reports them.
+
 #### threads
 
 ```sh
@@ -273,21 +338,38 @@ JSON output:
 #### export
 
 ```sh
-slackless export <CHANNEL> [--format md|json] [--limit N] [--out PATH]
+slackless export <CHANNEL> [--thread TS] [--include-threads] [--exclude-deleted] [--format md|json] [--limit N] [--out PATH]
+slackless export --transcript FILE_ID [--format md|json] [--out PATH]
+slackless export --huddle CALL_ID [--format md|json] [--out PATH]
 ```
 
-Export a conversation's archived messages (default `--format md`, `--limit 10000`, oldest first) to stdout or `--out PATH`.
+Export a conversation's archived messages (default `--format md`, `--limit 10000` newest, oldest first), one thread (`--thread TS`), a stored audio/video transcript, or a huddle transcript to stdout or `--out PATH`. `--include-threads` nests stored replies under their roots; `--exclude-deleted` leaves deleted messages out.
 
-JSON output (stdout via `--json` or `--format json`):
+JSON output for a channel or thread (stdout via `--json` or `--format json`):
 
 ```json
 {
+  "kind": "channel",
   "workspace": "T0123ABC",
+  "workspace_name": "Acme",
   "channel": { "id": "C0123ABC", "label": "#eng" },
   "count": 1,
-  "messages": ["<MessageRow>"]
+  "messages": [
+    {
+      "ts": "1739280000.000100",
+      "timestamp_utc": "2025-02-11 12:00:00 UTC",
+      "user": "U0123ABC",
+      "author": "Ana",
+      "text": "Deploy is *green*",
+      "plain_text": "Deploy is green",
+      "deleted": false,
+      "edited": false
+    }
+  ]
 }
 ```
+
+A thread adds `thread_ts`; messages carry `thread_ts`, `reply_count`, `reactions`, `files`, `permalink`, and (with `--include-threads`) `replies` when they have them.
 
 JSON output (`--out PATH --json`):
 
@@ -339,6 +421,93 @@ JSON output:
   "reclaimed_bytes": 1048576
 }
 ```
+
+#### archive status
+
+```sh
+slackless archive status
+```
+
+Per-channel backfill coverage of the local archive (offline).
+
+JSON output:
+
+```json
+{
+  "workspace": "T0123ABC",
+  "archive_exists": true,
+  "total_channels": 2,
+  "completed_channels": 1,
+  "synced_channels": 2,
+  "total_messages": 4200,
+  "db_bytes": 1048576,
+  "channels": [
+    {
+      "id": "C0123ABC",
+      "label": "#eng",
+      "kind": "public_channel",
+      "messages": 1500,
+      "complete": true,
+      "oldest_ts": "1700000000.000100",
+      "newest_ts": "1739280000.000100"
+    }
+  ]
+}
+```
+
+#### archive check
+
+```sh
+slackless archive check [--full]
+```
+
+Verify the archive with `PRAGMA quick_check`, or the exhaustive `PRAGMA integrity_check` with `--full` (offline). A damaged archive exits 1 with `ok: false` and its `problems`.
+
+JSON output: `{ "ok": true, "workspace", "db_path", "mode", "check", "problems": [], "elapsed_ms", "db_bytes", "wal_bytes", "freelist_bytes" }`.
+
+#### archive backup
+
+```sh
+slackless archive backup <OUTPUT_PATH>
+```
+
+Write a consistent snapshot of the live archive to `OUTPUT_PATH` (`VACUUM INTO`; an existing backup file is replaced).
+
+JSON output: `{ "ok": true, "workspace", "source", "output", "bytes", "elapsed_ms" }`.
+
+#### archive prune
+
+```sh
+slackless archive prune [--max-mb MB] [--max-days DAYS] [--semantic]
+```
+
+Apply size and age limits to the cached media files (`0` turns a limit off); `--semantic` also drops semantic vectors of workspaces whose archive is gone.
+
+JSON output: `{ "ok": true, "policy", "media", "semantic_vectors_pruned" }`.
+
+#### archive index-semantic
+
+```sh
+slackless archive index-semantic [--single-workspace] [--model minilm|bge-small] [--download] [--rebuild]
+```
+
+Embed new or changed messages, snippets, canvases, and transcripts of every archived workspace (or only `--workspace` with `--single-workspace`) into the sidecar vector index that `search --semantic|--hybrid` reads. `--download` fetches a missing model first; `--rebuild` re-embeds everything.
+
+JSON output: `{ "ok": true, "report": { "workspaces_indexed", "total_seen", "embedded", "skipped_unchanged", "pruned", ... }, "index": { "total_docs", "db_bytes", ... } }`.
+
+#### archive semantic-model
+
+```sh
+slackless archive semantic-model status|download|delete [--model minilm|bge-small]
+```
+
+Show, download, or delete a local embedding model (default `minilm`). `status` also reports the vector index.
+
+JSON output:
+
+- `status`: `{ "model", "model_ready", "model_path", "model_bytes", "download_size_hint", "dims", "index_path", "index" }`
+- `download`: `{ "ok": true, "model", "model_ready", "model_path", "disk_bytes", "dims" }`
+- `delete`: `{ "ok": true, "model", "reclaimed_bytes" }`
 
 #### huddle transcripts
 
@@ -539,14 +708,15 @@ JSON output:
 { "ok": true, "channel": "C0123ABC", "ts": "1739280000.000100", "pinned": true }
 ```
 
-#### schedule / scheduled
+#### schedule / scheduled / unschedule
 
 ```sh
 slackless schedule <CHANNEL> <TEXT> --at <WHEN> [--thread-ts TS]
 slackless scheduled [--channel CHANNEL]
+slackless unschedule <CHANNEL> <ID>
 ```
 
-Queue a future message (`chat.scheduleMessage`) or list pending scheduled messages (`chat.scheduledMessages.list`). Pass `-` as `<TEXT>` to read from stdin. `--at` accepts a relative offset (`+90s`, `+15m`, `+2h`, `+1d`, `+2w`) or a future unix epoch timestamp.
+Queue a future message (`chat.scheduleMessage`), list pending scheduled messages (`chat.scheduledMessages.list`), or cancel one by its id (`chat.deleteScheduledMessage`; returns `{ "ok": true, "channel", "scheduled_message_id" }`). Pass `-` as `<TEXT>` to read from stdin. `--at` accepts a relative offset (`+90s`, `+15m`, `+2h`, `+1d`, `+2w`) or a future unix epoch timestamp.
 
 JSON output (`schedule`):
 
@@ -657,6 +827,17 @@ JSON output:
   "path": "./report.pdf"
 }
 ```
+
+#### transcribe
+
+```sh
+slackless transcribe <FILE_ID> [--provider parakeet|whisper]
+slackless transcribe <FILE_ID> --file PATH [--provider parakeet|whisper]
+```
+
+Transcribe a Slack audio/video file, or a local file with `--file` (offline), with a downloaded local model and index the text so `search` finds it. `--provider` prefers `parakeet` (the default) or `whisper`; the other downloaded model is used when the preferred one is missing.
+
+JSON output: `{ "ok": true, "file_id", "provider", "indexed_messages", "text" }`.
 
 #### canvas
 
@@ -812,7 +993,7 @@ JSON output:
 slackless huddle devices
 slackless huddle cameras
 slackless huddle screens
-slackless huddle join <CHANNEL> [--muted] [--duration SECS] [--input NAME] [--output NAME] [--react EMOJI]
+slackless huddle join <CHANNEL> [--muted] [--duration SECS] [--input NAME] [--output NAME] [--react EMOJI] [--camera] [--blur] [--screen SOURCE_ID] [--transcribe slack|parakeet|whisper]
 slackless huddle link <CHANNEL>
 slackless huddle invite <CHANNEL> <USER>
 ```
@@ -820,7 +1001,7 @@ slackless huddle invite <CHANNEL> <USER>
 Native Amazon Chime huddles from the terminal:
 
 - `devices`, `cameras`, `screens` (offline): enumerate local microphones/speakers (`{ "inputs", "outputs" }`), cameras (`{ "cameras": [{ "index", "name" }] }`), and screen-share monitors/windows (`{ "sources": [{ "id", "name", "monitor", "width", "height" }] }`).
-- `join`: connects to Slack `rooms.join` + Chime DTLS-SRTP media until Ctrl+C or `--duration SECS`; under `--json`, streams NDJSON state/data events (`{ "event": "state", "phase", "channel", "call_id", "muted", "packets_sent", "packets_received", "pongs_sent", "error", "udp_blocked" }` with `phase` one of `idle`, `joining`, `connecting`, `connected`, `reconnecting`, `leaving`, `failed`; `{ "event": "data", "detail": { "caption": { "user", "text", "is_partial", "at_ms", "lang" } } }` and likewise `reaction`, `hand_raise`, `sticky_emoji`, `topic`, `draw`, `jukebox`, `muted_by_peer`; `{ "event": "video_frame", "tile", "width", "height", "frames" }` with `tile` `"local_camera"`, `"local_screen"`, `{ "remote_camera": USER }`, or `{ "remote_screen": USER }`).
+- `join`: connects to Slack `rooms.join` + Chime DTLS-SRTP media until Ctrl+C or `--duration SECS`, optionally with the camera (`--camera`, `--blur`) or a screen share (`--screen SOURCE_ID`), storing captions from Slack (`--transcribe slack`, the default) or a local model (`parakeet`, `whisper`) in the archive; under `--json`, streams NDJSON state/data events (`{ "event": "state", "phase", "channel", "call_id", "muted", "packets_sent", "packets_received", "pongs_sent", "error", "udp_blocked" }` with `phase` one of `idle`, `joining`, `connecting`, `connected`, `reconnecting`, `leaving`, `failed`; `{ "event": "data", "detail": { "caption": { "user", "text", "is_partial", "at_ms", "lang" } } }` and likewise `reaction`, `hand_raise`, `sticky_emoji`, `topic`, `draw`, `jukebox`, `muted_by_peer`; `{ "event": "video_frame", "tile", "width", "height", "frames" }` with `tile` `"local_camera"`, `"local_screen"`, `{ "remote_camera": USER }`, or `{ "remote_screen": USER }`).
 - `link`: fetches shareable huddle URL (`rooms.getLink`) -> `{ "ok": true, "channel", "url" }`.
 - `invite`: rings a workspace member (`rooms.notifyMember`) -> `{ "ok": true, "channel", "user" }`.
 
@@ -851,7 +1032,7 @@ Tool arguments are validated against each tool's `inputSchema` before the tool r
 | `get_transcript`      | Offline      | Fetch stored audio/video file transcript by `file_id` (with timed cues and duration when available)                                                                                                                  |
 | `list_transcripts`    | Offline      | List stored audio/video file transcripts and huddle transcript sessions (`kind`: `all`/`file`/`huddle`, excerpts, durations, cue counts)                                                                             |
 | `export_conversation` | Offline      | Export a channel (`include_threads`, `include_deleted`, `limit`), thread (`thread_ts`), file transcript (`file_id`), or huddle transcript (`huddle_id`) as Markdown (`md`) or JSON (`json`) returned as tool content |
-| `get_catchup_summary` | Offline      | Local SQLite activity digest over `since_hours` (default `24`): unread/recent channels, mentions, active threads, and new transcripts (single or all-workspace)                                                      |
+| `get_catchup_summary` | Offline      | The `catchup --json` briefing over `since_hours` (default `24`): mentions, unread channels, active threads, and new transcripts (single or all-workspace)                                                           |
 | `send_message`        | Live         | Post a message (`chat.postMessage`) with pre-send secret detection and local archive echo                                                                                                                            |
 | `reply_thread`        | Live         | Reply in a thread (`chat.postMessage` + `thread_ts`, optional `reply_broadcast`)                                                                                                                                     |
 | `add_reaction`        | Live         | Add an emoji reaction (`reactions.add`)                                                                                                                                                                              |
@@ -931,10 +1112,10 @@ JSON output (`auth status`):
 #### update
 
 ```sh
-slackless update [--check] [--force] [--restart]
+slackless update [--check] [--force] [--restart] [--beta]
 ```
 
-Checks GitHub Releases for a newer Slackless release. Without `--check`, downloads and SHA-256-verifies the macOS `.app.tar.gz`, atomically replaces `Slackless.app` (with `.prev` rollback), refreshes the CLI symlink, and optionally relaunches `Slackless.app` (`--restart`).
+Checks GitHub Releases for a newer Slackless release (`--beta` includes pre-releases). Without `--check`, downloads and SHA-256-verifies the macOS `.app.tar.gz`, atomically replaces `Slackless.app` (with `.prev` rollback), refreshes the CLI symlink, and optionally relaunches `Slackless.app` (`--restart`).
 
 JSON output:
 
@@ -955,7 +1136,7 @@ When installed (`updated: true`), also includes `"restarted"`, `"app_path"`, and
 
 ## The message row
 
-`search`, `read`, `thread`, `threads`, and `export` return the same shape. Fields are always present; optional ones are `null` rather than omitted.
+`search`, `read`, `thread`, and `threads` return the same shape. Fields are always present; optional ones are `null` rather than omitted, except the two that `read`, `thread`, and `search` add, which are left out when empty: `channel_name` (`#eng` or `@ana`, when the archive knows the conversation) and `file_refs` (`[{ "id", "name", "title", "filetype" }]`, the file ids `download` and `transcribe` take).
 
 | Field         | Type             | Meaning                                                               |
 | ------------- | ---------------- | --------------------------------------------------------------------- |

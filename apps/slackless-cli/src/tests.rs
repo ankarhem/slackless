@@ -2087,7 +2087,7 @@ fn skill_error_table_lists_exactly_the_emitted_error_codes() {
     read_sources(&manifest.join("src"), &mut sources);
     let compact: String = sources.split_whitespace().collect();
     let mut emitted = BTreeSet::new();
-    for (helper, code_arg) in [("fail(", 1), ("tool_err(", 0)] {
+    for (helper, code_arg) in [("fail(", 1), ("tool_err(", 0), ("CmdError::new(", 0)] {
         for (at, _) in compact.match_indices(helper) {
             // `api_fail(` and friends are other functions.
             if compact[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
@@ -2136,5 +2136,40 @@ fn skill_error_table_lists_exactly_the_emitted_error_codes() {
     assert!(
         stale.is_empty(),
         "SKILL.md lists error codes nothing emits: {stale:?}"
+    );
+}
+
+/// Agents look a command up by its SKILL.md heading, so every subcommand (and every `archive`
+/// subcommand) has a `#### <command>` heading; one heading may name several, split by ` / `.
+#[test]
+fn skill_has_a_heading_for_every_command() {
+    use clap::CommandFactory;
+
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let skill = std::fs::read_to_string(manifest.join("../../skill/SKILL.md")).unwrap();
+    let headings: Vec<&str> = skill
+        .lines()
+        .filter_map(|line| line.strip_prefix("#### "))
+        .flat_map(|heading| heading.split(" / "))
+        .collect();
+    let cli = Cli::command();
+    let archive = cli.find_subcommand("archive").expect("archive subcommand");
+    let missing: Vec<String> = cli
+        .get_subcommands()
+        .map(|cmd| cmd.get_name().to_owned())
+        .chain(
+            archive
+                .get_subcommands()
+                .map(|cmd| format!("archive {}", cmd.get_name())),
+        )
+        .filter(|name| {
+            !headings
+                .iter()
+                .any(|h| h == name || h.starts_with(&format!("{name} ")))
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "commands without a `#### <command>` heading in SKILL.md: {missing:?}"
     );
 }
