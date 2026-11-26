@@ -41,10 +41,6 @@ impl ScreenShareHandle for ScVtScreenCapture {
     fn set_target_bitrate(&self, bitrate_bps: u32) {
         ScVtScreenCapture::set_target_bitrate(self, bitrate_bps);
     }
-
-    fn stop(&mut self) {
-        ScVtScreenCapture::stop(self);
-    }
 }
 
 impl CameraHandle for AvVtCameraCapture {
@@ -63,19 +59,11 @@ impl CameraHandle for AvVtCameraCapture {
     fn set_compact(&self, compact: bool) {
         AvVtCameraCapture::set_compact(self, compact);
     }
-
-    fn stop(&mut self) {
-        AvVtCameraCapture::stop(self);
-    }
 }
 
 impl CameraPreviewHandle for AvVtCameraCapture {
     fn set_blur(&self, enabled: bool) {
         AvVtCameraCapture::set_blur(self, enabled);
-    }
-
-    fn stop(&mut self) {
-        AvVtCameraCapture::stop(self);
     }
 }
 
@@ -569,7 +557,10 @@ mod tests {
         fn set_blur(&self, _enabled: bool) {}
         fn force_keyframe(&self) {}
         fn set_target_bitrate(&self, _bitrate_bps: u32) {}
-        fn stop(&mut self) {
+    }
+
+    impl Drop for StubCameraHandle {
+        fn drop(&mut self) {
             self.stopped
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -642,7 +633,7 @@ mod tests {
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopped_cb = Arc::clone(&stopped);
 
-        let mut handle = start_camera_with(
+        let handle = start_camera_with(
             sample_camera_config(Some(5)),
             h264_tx,
             Arc::clone(&no_preview),
@@ -656,7 +647,7 @@ mod tests {
         )
         .expect("start_camera_with should succeed with fallback index");
         assert_eq!(*seen_idx.lock().unwrap(), Some(0));
-        handle.stop();
+        drop(handle);
         assert!(stopped.load(std::sync::atomic::Ordering::Relaxed));
 
         // Empty device list fails before invoking native starter.

@@ -2,6 +2,7 @@
 //! `Vision`/Metal person-segmented background blur.
 
 use std::ffi::{CStr, c_char, c_void};
+use std::ptr::NonNull;
 
 use tokio::sync::mpsc;
 
@@ -46,8 +47,8 @@ pub fn list_macos_cameras() -> Vec<CameraDeviceInfo> {
 /// Hardware-accelerated macOS `AVCaptureSession` (`420f`) + `VideoToolbox` H.264 webcam with
 /// Apple Neural Engine (`Vision`) + Metal (`CoreImage`) person-segmented background blur.
 pub struct AvVtCameraCapture {
-    handle: *mut SlacklessCamCapture,
-    ctx: *mut CaptureCallbackCtx,
+    handle: NonNull<SlacklessCamCapture>,
+    ctx: NonNull<CaptureCallbackCtx>,
 }
 
 // SAFETY: `SlacklessCamCapture` synchronizes blur/keyframe/bitrate updates and stops once on Drop.
@@ -96,11 +97,11 @@ impl AvVtCameraCapture {
         let h264_cb = outbound_h264_tx
             .is_some()
             .then_some(on_h264_cb as SlacklessH264Callback);
-        let ctx = Box::into_raw(Box::new(CaptureCallbackCtx {
+        let ctx = NonNull::from(Box::leak(Box::new(CaptureCallbackCtx {
             outbound_h264_tx,
             on_preview,
             perf: None,
-        }));
+        })));
         let mut err_buf = [0 as c_char; 512];
         let dev_idx = config.device_index.map(|i| i as i32).unwrap_or(0);
         let handle = unsafe {
@@ -111,7 +112,7 @@ impl AvVtCameraCapture {
                 config.max_fps,
                 config.bitrate_bps,
                 config.blur_background,
-                ctx.cast(),
+                ctx.as_ptr().cast(),
                 h264_cb,
                 on_surface_preview_cb,
                 on_error_cb,
@@ -119,14 +120,14 @@ impl AvVtCameraCapture {
                 err_buf.len(),
             )
         };
-        if handle.is_null() {
-            unsafe { drop(Box::from_raw(ctx)) };
+        let Some(handle) = NonNull::new(handle) else {
+            unsafe { drop(Box::from_raw(ctx.as_ptr())) };
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_str()
                 .unwrap_or("AVFoundation camera startup failed")
                 .to_owned();
             return Err(HuddleError::Video(msg));
-        }
+        };
         tracing::info!(
             device_index = dev_idx,
             fps = config.max_fps,
@@ -139,43 +140,25 @@ impl AvVtCameraCapture {
     }
 
     pub fn set_blur(&self, enabled: bool) {
-        if !self.handle.is_null() {
-            unsafe { slackless_cam_capture_set_blur(self.handle, enabled) };
-        }
+        unsafe { slackless_cam_capture_set_blur(self.handle.as_ptr(), enabled) };
     }
 
     pub fn force_keyframe(&self) {
-        if !self.handle.is_null() {
-            unsafe { slackless_cam_capture_force_keyframe(self.handle) };
-        }
+        unsafe { slackless_cam_capture_force_keyframe(self.handle.as_ptr()) };
     }
 
     pub fn set_target_bitrate(&self, bitrate_bps: u32) {
-        if !self.handle.is_null() {
-            unsafe { slackless_cam_capture_set_bitrate(self.handle, bitrate_bps) };
-        }
+        unsafe { slackless_cam_capture_set_bitrate(self.handle.as_ptr(), bitrate_bps) };
     }
 
     pub fn set_compact(&self, compact: bool) {
-        if !self.handle.is_null() {
-            unsafe { slackless_cam_capture_set_compact(self.handle, compact) };
-        }
-    }
-
-    pub fn stop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe { slackless_cam_capture_stop(self.handle) };
-            self.handle = std::ptr::null_mut();
-        }
-        if !self.ctx.is_null() {
-            unsafe { drop(Box::from_raw(self.ctx)) };
-            self.ctx = std::ptr::null_mut();
-        }
+        unsafe { slackless_cam_capture_set_compact(self.handle.as_ptr(), compact) };
     }
 }
 
 impl Drop for AvVtCameraCapture {
     fn drop(&mut self) {
-        self.stop();
+        unsafe { slackless_cam_capture_stop(self.handle.as_ptr()) };
+        unsafe { drop(Box::from_raw(self.ctx.as_ptr())) };
     }
 }

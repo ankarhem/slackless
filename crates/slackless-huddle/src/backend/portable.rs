@@ -205,18 +205,14 @@ impl ScreenShareHandle for SoftwareScreenShare {
     fn set_target_bitrate(&self, _bitrate_bps: u32) {
         // OpenH264 wrapper uses fixed initial target bitrate; future backends override dynamically.
     }
-
-    fn stop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
-        }
-    }
 }
 
 impl Drop for SoftwareScreenShare {
     fn drop(&mut self) {
-        self.stop();
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -334,19 +330,15 @@ impl CameraHandle for SoftwareCamera {
     }
 
     fn set_target_bitrate(&self, _bitrate_bps: u32) {}
-
-    fn stop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
-        }
-    }
 }
 
 #[cfg(not(target_os = "macos"))]
 impl Drop for SoftwareCamera {
     fn drop(&mut self) {
-        self.stop();
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -439,19 +431,15 @@ impl CameraPreviewHandle for SoftwareCameraPreview {
     fn set_blur(&self, enabled: bool) {
         self.blur.store(enabled, Ordering::Relaxed);
     }
-
-    fn stop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
-        }
-    }
 }
 
 #[cfg(not(target_os = "macos"))]
 impl Drop for SoftwareCameraPreview {
     fn drop(&mut self) {
-        self.stop();
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
     }
 }
 

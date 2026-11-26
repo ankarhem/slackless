@@ -1,6 +1,7 @@
 //! Hardware-accelerated macOS `ScreenCaptureKit` screen capture and `SCScreenshotManager` thumbnails.
 
 use std::ffi::{CStr, c_char, c_void};
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -29,8 +30,8 @@ pub fn parse_screen_source_id(source_id: &str) -> Option<(bool, u32)> {
 
 /// Hardware-accelerated macOS `ScreenCaptureKit` (`420f`) + `VideoToolbox` H.264 High/CABAC screen share.
 pub struct ScVtScreenCapture {
-    handle: *mut SlacklessScCapture,
-    ctx: *mut CaptureCallbackCtx,
+    handle: NonNull<SlacklessScCapture>,
+    ctx: NonNull<CaptureCallbackCtx>,
 }
 
 // SAFETY: `SlacklessScCapture` is thread-safe for keyframe/bitrate control and stopped once on `Drop`.
@@ -50,11 +51,11 @@ impl ScVtScreenCapture {
         };
 
         perf.set_tx_backend("ScreenCaptureKit + VideoToolbox H.264 High (HW)");
-        let ctx = Box::into_raw(Box::new(CaptureCallbackCtx {
+        let ctx = NonNull::from(Box::leak(Box::new(CaptureCallbackCtx {
             outbound_h264_tx: Some(outbound_h264_tx),
             on_preview: Box::new(move |frame| on_preview(frame)),
             perf: Some(perf),
-        }));
+        })));
         let mut err_buf = [0 as c_char; 512];
         let handle = unsafe {
             slackless_sc_capture_start(
@@ -64,7 +65,7 @@ impl ScVtScreenCapture {
                 config.max_h,
                 config.max_fps,
                 config.bitrate_bps,
-                ctx.cast(),
+                ctx.as_ptr().cast(),
                 on_h264_cb,
                 on_surface_preview_cb,
                 on_error_cb,
@@ -72,16 +73,14 @@ impl ScVtScreenCapture {
                 err_buf.len(),
             )
         };
-        if handle.is_null() {
-            unsafe {
-                drop(Box::from_raw(ctx));
-            }
+        let Some(handle) = NonNull::new(handle) else {
+            unsafe { drop(Box::from_raw(ctx.as_ptr())) };
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_str()
                 .unwrap_or("ScreenCaptureKit startup failed")
                 .to_owned();
             return Err(HuddleError::Video(msg));
-        }
+        };
         tracing::info!(
             source_id = %config.source_id,
             max_w = config.max_w,
@@ -94,25 +93,11 @@ impl ScVtScreenCapture {
     }
 
     pub fn force_keyframe(&self) {
-        if !self.handle.is_null() {
-            unsafe { slackless_sc_capture_force_keyframe(self.handle) };
-        }
+        unsafe { slackless_sc_capture_force_keyframe(self.handle.as_ptr()) };
     }
 
     pub fn set_target_bitrate(&self, bitrate_bps: u32) {
-        if !self.handle.is_null() {
-            unsafe { slackless_sc_capture_set_bitrate(self.handle, bitrate_bps) };
-        }
-    }
-
-    pub fn stop(&mut self) {
-        if !self.handle.is_null() {
-            // Native code releases `ctx` from its stop completion handler, once no ScreenCaptureKit
-            // callback can still reach it (which may be after this returns if the stop is slow).
-            let ctx = std::mem::take(&mut self.ctx);
-            unsafe { slackless_sc_capture_stop(self.handle, ctx.cast(), Some(on_released_cb)) };
-            self.handle = std::ptr::null_mut();
-        }
+        unsafe { slackless_sc_capture_set_bitrate(self.handle.as_ptr(), bitrate_bps) };
     }
 }
 
@@ -124,7 +109,10 @@ unsafe extern "C" fn on_released_cb(ctx: *mut c_void) {
 
 impl Drop for ScVtScreenCapture {
     fn drop(&mut self) {
-        self.stop();
+        // Native code releases `ctx` from its stop completion handler, once no ScreenCaptureKit
+        // callback can still reach it (which may be after this returns if the stop is slow).
+        let (handle, ctx) = (self.handle.as_ptr(), self.ctx.as_ptr().cast());
+        unsafe { slackless_sc_capture_stop(handle, ctx, Some(on_released_cb)) };
     }
 }
 

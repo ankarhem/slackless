@@ -2,6 +2,7 @@
 //! macOS 14.2+ CoreAudio Process Tap system audio capture.
 
 use std::ffi::{CStr, c_char, c_void};
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use super::ffi::{
@@ -33,8 +34,8 @@ unsafe extern "C" fn on_audio_device_change_cb(ctx: *mut c_void, is_input: bool)
 
 /// Event-driven CoreAudio listener for default microphone/speaker hot-plug (zero polling).
 pub struct CoreAudioDeviceMonitor {
-    handle: *mut SlacklessAudioDeviceMonitor,
-    ctx: *mut AudioHotplugCtx,
+    handle: NonNull<SlacklessAudioDeviceMonitor>,
+    ctx: NonNull<AudioHotplugCtx>,
 }
 
 // SAFETY: Stopped and joined synchronously on Drop before freeing `ctx`.
@@ -42,29 +43,24 @@ unsafe impl Send for CoreAudioDeviceMonitor {}
 
 impl CoreAudioDeviceMonitor {
     pub fn start(on_change: impl Fn(bool) + Send + Sync + 'static) -> Option<Self> {
-        let ctx = Box::into_raw(Box::new(AudioHotplugCtx {
+        let ctx = NonNull::from(Box::leak(Box::new(AudioHotplugCtx {
             callback: Box::new(on_change),
-        }));
-        let handle =
-            unsafe { slackless_audio_device_monitor_start(ctx.cast(), on_audio_device_change_cb) };
-        if handle.is_null() {
-            unsafe { drop(Box::from_raw(ctx)) };
+        })));
+        let handle = unsafe {
+            slackless_audio_device_monitor_start(ctx.as_ptr().cast(), on_audio_device_change_cb)
+        };
+        let Some(handle) = NonNull::new(handle) else {
+            unsafe { drop(Box::from_raw(ctx.as_ptr())) };
             return None;
-        }
+        };
         Some(Self { handle, ctx })
     }
 }
 
 impl Drop for CoreAudioDeviceMonitor {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe { slackless_audio_device_monitor_stop(self.handle) };
-            self.handle = std::ptr::null_mut();
-        }
-        if !self.ctx.is_null() {
-            unsafe { drop(Box::from_raw(self.ctx)) };
-            self.ctx = std::ptr::null_mut();
-        }
+        unsafe { slackless_audio_device_monitor_stop(self.handle.as_ptr()) };
+        unsafe { drop(Box::from_raw(self.ctx.as_ptr())) };
     }
 }
 
@@ -101,8 +97,8 @@ unsafe extern "C" fn on_vpio_render_cb(ctx: *mut c_void, samples: *mut f32, coun
 /// Native macOS CoreAudio `kAudioUnitSubType_VoiceProcessingIO` full-duplex 48 kHz mono stream
 /// with hardware-tuned AEC, noise suppression, and AGC (skips software `sonora` DSP completely).
 pub struct MacVoiceProcessingIo {
-    handle: *mut SlacklessVpio,
-    ctx: *mut VpioCtx,
+    handle: NonNull<SlacklessVpio>,
+    ctx: NonNull<VpioCtx>,
 }
 
 // SAFETY: `slackless_vpio_stop` halts and disposes the AudioUnit synchronously before freeing `ctx`.
@@ -116,26 +112,26 @@ impl MacVoiceProcessingIo {
         on_capture: impl Fn(&[f32]) + Send + Sync + 'static,
         on_render: impl Fn(&mut [f32]) + Send + Sync + 'static,
     ) -> Result<Self> {
-        let ctx = Box::into_raw(Box::new(VpioCtx {
+        let ctx = NonNull::from(Box::leak(Box::new(VpioCtx {
             on_capture: Box::new(on_capture),
             on_render: Box::new(on_render),
-        }));
+        })));
         let handle = unsafe {
             slackless_vpio_start(
                 sample_rate,
                 enable_vp,
                 enable_agc,
-                ctx.cast(),
+                ctx.as_ptr().cast(),
                 on_vpio_capture_cb,
                 on_vpio_render_cb,
             )
         };
-        if handle.is_null() {
-            unsafe { drop(Box::from_raw(ctx)) };
+        let Some(handle) = NonNull::new(handle) else {
+            unsafe { drop(Box::from_raw(ctx.as_ptr())) };
             return Err(HuddleError::Audio(
                 "CoreAudio VoiceProcessingIO unavailable".into(),
             ));
-        }
+        };
         tracing::info!(
             sample_rate,
             enable_vp,
@@ -146,22 +142,14 @@ impl MacVoiceProcessingIo {
     }
 
     pub fn set_processing(&self, enable_vp: bool, enable_agc: bool) {
-        if !self.handle.is_null() {
-            unsafe { slackless_vpio_set_processing(self.handle, enable_vp, enable_agc) };
-        }
+        unsafe { slackless_vpio_set_processing(self.handle.as_ptr(), enable_vp, enable_agc) };
     }
 }
 
 impl Drop for MacVoiceProcessingIo {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe { slackless_vpio_stop(self.handle) };
-            self.handle = std::ptr::null_mut();
-        }
-        if !self.ctx.is_null() {
-            unsafe { drop(Box::from_raw(self.ctx)) };
-            self.ctx = std::ptr::null_mut();
-        }
+        unsafe { slackless_vpio_stop(self.handle.as_ptr()) };
+        unsafe { drop(Box::from_raw(self.ctx.as_ptr())) };
     }
 }
 
@@ -251,8 +239,8 @@ unsafe extern "C" fn on_audio_tap_pcm_cb(ctx: *mut c_void, samples: *const i16, 
 
 /// Live macOS 14.2+ CoreAudio Process Tap streaming stereo `i16` PCM into a lock-free SPSC ring.
 pub struct MacSystemAudioTap {
-    handle: *mut SlacklessAudioTap,
-    ctx: *mut TapRingCtx,
+    handle: NonNull<SlacklessAudioTap>,
+    ctx: NonNull<TapRingCtx>,
 }
 
 // SAFETY: `slackless_audio_tap_stop` stops and destroys the IOProc synchronously before freeing `ctx`.
@@ -260,24 +248,24 @@ unsafe impl Send for MacSystemAudioTap {}
 
 impl MacSystemAudioTap {
     pub(crate) fn start(ring: Arc<SpscRing<i16>>) -> Result<Self> {
-        let ctx = Box::into_raw(Box::new(TapRingCtx { ring }));
+        let ctx = NonNull::from(Box::leak(Box::new(TapRingCtx { ring })));
         let mut err_buf = [0 as c_char; 256];
         let handle = unsafe {
             slackless_audio_tap_start(
-                ctx.cast(),
+                ctx.as_ptr().cast(),
                 on_audio_tap_pcm_cb,
                 err_buf.as_mut_ptr(),
                 err_buf.len(),
             )
         };
-        if handle.is_null() {
-            unsafe { drop(Box::from_raw(ctx)) };
+        let Some(handle) = NonNull::new(handle) else {
+            unsafe { drop(Box::from_raw(ctx.as_ptr())) };
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_str()
                 .unwrap_or("macOS CoreAudio Process Tap failed")
                 .to_owned();
             return Err(HuddleError::Audio(msg));
-        }
+        };
         tracing::info!("macOS CoreAudio Process Tap started (ARC native)");
         Ok(Self { handle, ctx })
     }
@@ -285,13 +273,7 @@ impl MacSystemAudioTap {
 
 impl Drop for MacSystemAudioTap {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe { slackless_audio_tap_stop(self.handle) };
-            self.handle = std::ptr::null_mut();
-        }
-        if !self.ctx.is_null() {
-            unsafe { drop(Box::from_raw(self.ctx)) };
-            self.ctx = std::ptr::null_mut();
-        }
+        unsafe { slackless_audio_tap_stop(self.handle.as_ptr()) };
+        unsafe { drop(Box::from_raw(self.ctx.as_ptr())) };
     }
 }

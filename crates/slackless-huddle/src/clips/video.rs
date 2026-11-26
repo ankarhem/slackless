@@ -55,7 +55,8 @@ pub(super) struct CapturedClipFrame {
 }
 
 /// Injectable frame capture seam for [`VideoClipRecorder`]: implemented by the platform
-/// [`crate::backend::MediaBackend`] camera preview, `xcap` screen capture, and test fakes.
+/// [`crate::backend::MediaBackend`] camera preview, `xcap` screen capture, and test fakes. The
+/// recorder drops the source when capture ends, which stops it.
 pub(super) trait ClipFrameSource {
     fn next_frame(&mut self) -> Option<CapturedRgbFrame>;
 
@@ -63,8 +64,6 @@ pub(super) trait ClipFrameSource {
         self.next_frame()
             .map(|rgb| CapturedClipFrame { rgb, preview: None })
     }
-
-    fn stop(&mut self) {}
 }
 
 /// Convert a [`VideoFrame`] (zero-copy macOS `MacVideoSurface` or portable BGRA) into a tightly
@@ -92,7 +91,8 @@ pub(super) fn video_frame_to_clip_pair(
 
 /// Cross-platform camera source routed cleanly through [`crate::backend::MediaBackend`].
 struct BackendClipCamera {
-    capture: Box<dyn CameraPreviewHandle>,
+    /// Held for its `Drop`, which stops the camera.
+    _capture: Box<dyn CameraPreviewHandle>,
     latest: Arc<Mutex<Option<VideoFrame>>>,
     max_w: u32,
     max_h: u32,
@@ -117,7 +117,7 @@ impl BackendClipCamera {
             }),
         )?;
         Ok(Self {
-            capture,
+            _capture: capture,
             latest,
             max_w,
             max_h,
@@ -133,13 +133,6 @@ impl ClipFrameSource for BackendClipCamera {
     fn next_clip_frame(&mut self) -> Option<CapturedClipFrame> {
         let frame = self.latest.lock().ok().and_then(|mut g| g.take())?;
         video_frame_to_clip_pair(&frame, self.max_w, self.max_h)
-    }
-
-    fn stop(&mut self) {
-        self.capture.stop();
-        if let Ok(mut guard) = self.latest.lock() {
-            *guard = None;
-        }
     }
 }
 
@@ -325,7 +318,7 @@ impl VideoClipRecorder {
                         std::thread::sleep(sleep);
                     }
                 }
-                source.stop();
+                drop(source);
             })
             .map_err(|e| HuddleError::Video(e.to_string()))?;
 

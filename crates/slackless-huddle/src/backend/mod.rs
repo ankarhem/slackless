@@ -100,27 +100,24 @@ pub struct HwAudioDuplexConfig<'a> {
     pub enable_agc: bool,
 }
 
-/// Active screen/window share capture & encode session.
+/// Active screen/window share capture & encode session; dropping it stops the capture.
 pub trait ScreenShareHandle: Send {
     fn force_keyframe(&self);
     fn set_target_bitrate(&self, bitrate_bps: u32);
-    fn stop(&mut self);
 }
 
-/// Active local webcam capture & encode session.
+/// Active local webcam capture & encode session; dropping it stops the capture.
 pub trait CameraHandle: Send {
     fn set_blur(&self, enabled: bool);
     fn force_keyframe(&self);
     fn set_target_bitrate(&self, bitrate_bps: u32);
     /// Switch between compact resolution (`640x480` while screen-sharing) and standard (`1280x720`).
     fn set_compact(&self, _compact: bool) {}
-    fn stop(&mut self);
 }
 
-/// Active preview-only camera capture handle (no H.264 encoder).
+/// Active preview-only camera capture handle (no H.264 encoder); dropping it stops the capture.
 pub trait CameraPreviewHandle: Send {
     fn set_blur(&self, enabled: bool);
-    fn stop(&mut self);
 }
 
 /// Active single-stream video decoder (H.264 Annex-B access unit or AV1 temporal unit).

@@ -459,8 +459,10 @@ impl ClipFrameSource for MockClipFrameSource {
     fn next_frame(&mut self) -> Option<CapturedRgbFrame> {
         self.frames.pop_front().flatten()
     }
+}
 
-    fn stop(&mut self) {
+impl Drop for MockClipFrameSource {
+    fn drop(&mut self) {
         self.stopped.store(true, Ordering::Relaxed);
     }
 }
@@ -602,7 +604,7 @@ fn video_clip_recorder_pipeline_captures_locks_dims_muxes_mp4_and_handles_errors
     assert!(empty_err.to_string().contains("no video frames captured"));
     assert!(empty_stopped.load(Ordering::Relaxed));
 
-    // 4. Cancel stops worker and invokes source.stop() cleanly.
+    // 4. Cancel stops the worker, which drops (stops) the source.
     let cancel_stopped = Arc::new(AtomicBool::new(false));
     let cancel_stopped_cb = Arc::clone(&cancel_stopped);
     let cancel_rec = VideoClipRecorder::start_with_source_factory(

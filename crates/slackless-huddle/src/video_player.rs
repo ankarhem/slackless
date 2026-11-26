@@ -71,6 +71,7 @@ pub(crate) fn next_playback_rate(current: f32) -> f32 {
 mod imp {
     use std::ffi::CString;
     use std::path::Path;
+    use std::ptr::NonNull;
 
     use crate::macos::MacVideoSurface;
     use crate::macos::ffi::{
@@ -86,22 +87,15 @@ mod imp {
 
     /// Thread-safe handle to a native macOS `AVPlayer` + `AVPlayerItemVideoOutput` media player
     /// supporting local video/audio files as well as authenticated HTTP/HLS URLs.
+    #[derive(Debug)]
     pub struct NativeVideoPlayer {
-        handle: *mut SlacklessVideoPlayer,
+        handle: NonNull<SlacklessVideoPlayer>,
     }
 
     // SAFETY: All FFI operations on `SlacklessVideoPlayer` synchronize via an internal
     // `pthread_mutex_t`, and teardown happens exclusively in `Drop`.
     unsafe impl Send for NativeVideoPlayer {}
     unsafe impl Sync for NativeVideoPlayer {}
-
-    impl std::fmt::Debug for NativeVideoPlayer {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("NativeVideoPlayer")
-                .field("open", &(!self.handle.is_null()))
-                .finish()
-        }
-    }
 
     impl NativeVideoPlayer {
         /// Open a local video or audio file for hardware-accelerated playback.
@@ -117,13 +111,11 @@ mod imp {
             })?;
             // SAFETY: `c_path` is a valid NUL-terminated UTF-8 string.
             let handle = unsafe { slackless_video_player_open(c_path.as_ptr()) };
-            if handle.is_null() {
-                return Err(HuddleError::Video(format!(
-                    "failed to open video file: {}",
-                    path.display()
-                )));
-            }
-            Ok(Self { handle })
+            NonNull::new(handle)
+                .map(|handle| Self { handle })
+                .ok_or_else(|| {
+                    HuddleError::Video(format!("failed to open video file: {}", path.display()))
+                })
         }
 
         /// Open an authenticated HTTP/HTTPS or HLS (`m3u8`) media URL with optional `Cookie` header.
@@ -147,28 +139,21 @@ mod imp {
             // SAFETY: `c_url` is a valid NUL-terminated UTF-8 string and `cookie_ptr` is either
             // NULL or a valid NUL-terminated UTF-8 string.
             let handle = unsafe { slackless_video_player_open_url(c_url.as_ptr(), cookie_ptr) };
-            if handle.is_null() {
-                return Err(HuddleError::Video(format!(
-                    "failed to open media URL: {trimmed}"
-                )));
-            }
-            Ok(Self { handle })
+            NonNull::new(handle)
+                .map(|handle| Self { handle })
+                .ok_or_else(|| HuddleError::Video(format!("failed to open media URL: {trimmed}")))
         }
 
         /// Start or resume playback (restarting from `0.0` if playback already reached the end).
         pub fn play(&self) {
-            if !self.handle.is_null() {
-                // SAFETY: `self.handle` is valid for the lifetime of `self`.
-                unsafe { slackless_video_player_play(self.handle) };
-            }
+            // SAFETY: `self.handle` is valid for the lifetime of `self`.
+            unsafe { slackless_video_player_play(self.handle.as_ptr()) };
         }
 
         /// Pause playback.
         pub fn pause(&self) {
-            if !self.handle.is_null() {
-                // SAFETY: `self.handle` is valid for the lifetime of `self`.
-                unsafe { slackless_video_player_pause(self.handle) };
-            }
+            // SAFETY: `self.handle` is valid for the lifetime of `self`.
+            unsafe { slackless_video_player_pause(self.handle.as_ptr()) };
         }
 
         /// Toggle between playing and paused states.
@@ -182,19 +167,15 @@ mod imp {
 
         /// Mute or unmute the media's audio track.
         pub fn set_muted(&self, muted: bool) {
-            if !self.handle.is_null() {
-                // SAFETY: `self.handle` is valid for the lifetime of `self`.
-                unsafe { slackless_video_player_set_muted(self.handle, muted) };
-            }
+            // SAFETY: `self.handle` is valid for the lifetime of `self`.
+            unsafe { slackless_video_player_set_muted(self.handle.as_ptr(), muted) };
         }
 
         /// Set playback volume (`0.0..=1.0`, unmuting when raised above zero).
         pub fn set_volume(&self, volume: f32) {
-            if !self.handle.is_null() {
-                let clamped = clamp_volume(volume);
-                // SAFETY: `self.handle` is valid for the lifetime of `self`.
-                unsafe { slackless_video_player_set_volume(self.handle, clamped) };
-            }
+            let clamped = clamp_volume(volume);
+            // SAFETY: `self.handle` is valid for the lifetime of `self`.
+            unsafe { slackless_video_player_set_volume(self.handle.as_ptr(), clamped) };
         }
 
         /// Adjust playback volume by `delta` (`-1.0..=1.0`) and return the resulting clamped level.
@@ -213,11 +194,9 @@ mod imp {
         /// Set playback rate (clamped to `0.5..=2.0`, preserving audio pitch via time-domain
         /// scaling). Takes effect immediately if playing and is preserved across pause/resume.
         pub fn set_rate(&self, rate: f32) {
-            if !self.handle.is_null() {
-                let clamped = clamp_playback_rate(rate);
-                // SAFETY: `self.handle` is valid for the lifetime of `self`.
-                unsafe { slackless_video_player_set_rate(self.handle, clamped) };
-            }
+            let clamped = clamp_playback_rate(rate);
+            // SAFETY: `self.handle` is valid for the lifetime of `self`.
+            unsafe { slackless_video_player_set_rate(self.handle.as_ptr(), clamped) };
         }
 
         /// Cycle playback speed through `1.0x -> 1.5x -> 2.0x -> 1.0x` and return the new rate.
@@ -229,22 +208,17 @@ mod imp {
 
         /// Seek to `secs` seconds with zero-tolerance frame accuracy.
         pub fn seek(&self, secs: f64) {
-            if !self.handle.is_null() {
-                // SAFETY: `self.handle` is valid for the lifetime of `self`.
-                unsafe { slackless_video_player_seek(self.handle, secs) };
-            }
+            // SAFETY: `self.handle` is valid for the lifetime of `self`.
+            unsafe { slackless_video_player_seek(self.handle.as_ptr(), secs) };
         }
 
         /// Read a consistent snapshot of playback position, duration, dimensions, speed, and status flags.
         pub fn state(&self) -> VideoPlayerState {
             let mut st = VideoPlayerState::default();
-            if self.handle.is_null() {
-                return st;
-            }
             // SAFETY: `self.handle` is valid and all out-pointers reference local stack variables.
             unsafe {
                 slackless_video_player_state(
-                    self.handle,
+                    self.handle.as_ptr(),
                     &mut st.playing,
                     &mut st.muted,
                     &mut st.ended,
@@ -263,25 +237,20 @@ mod imp {
         /// Copy the latest zero-copy `420f` IOSurface frame for rendering, or `None` if no frame
         /// has been decoded yet (or if the media has no video track).
         pub fn copy_frame(&self) -> Option<MacVideoSurface> {
-            if self.handle.is_null() {
-                return None;
-            }
             let mut w = 0u32;
             let mut h = 0u32;
             // SAFETY: `self.handle` is valid; `slackless_video_player_copy_frame` returns a +1
             // retained `CVPixelBufferRef` (or null) whose ownership transfers to `MacVideoSurface`.
-            let pb = unsafe { slackless_video_player_copy_frame(self.handle, &mut w, &mut h) };
+            let pb =
+                unsafe { slackless_video_player_copy_frame(self.handle.as_ptr(), &mut w, &mut h) };
             unsafe { MacVideoSurface::from_retained(pb, w, h) }
         }
     }
 
     impl Drop for NativeVideoPlayer {
         fn drop(&mut self) {
-            if !self.handle.is_null() {
-                // SAFETY: `self.handle` is destroyed exactly once here.
-                unsafe { slackless_video_player_destroy(self.handle) };
-                self.handle = std::ptr::null_mut();
-            }
+            // SAFETY: `self.handle` is destroyed exactly once here.
+            unsafe { slackless_video_player_destroy(self.handle.as_ptr()) };
         }
     }
 }

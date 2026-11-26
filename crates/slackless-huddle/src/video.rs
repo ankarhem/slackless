@@ -931,12 +931,6 @@ impl CameraPreviewProbe {
     }
 }
 
-impl Drop for CameraPreviewProbe {
-    fn drop(&mut self) {
-        self.capture.stop();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

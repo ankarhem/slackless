@@ -2,6 +2,7 @@
 
 use std::ffi::c_void;
 use std::fmt;
+use std::ptr::NonNull;
 
 use super::ffi::{
     slackless_cvpb_dimensions, slackless_cvpb_release, slackless_cvpb_retain,
@@ -40,7 +41,7 @@ pub fn supports_hw_av1_decode() -> bool {
 
 /// Zero-copy retained handle to a macOS `IOSurface`-backed `420f` `CVPixelBuffer`.
 pub struct MacVideoSurface {
-    pb: *mut c_void,
+    pb: NonNull<c_void>,
     width: u32,
     height: u32,
 }
@@ -60,18 +61,17 @@ impl fmt::Debug for MacVideoSurface {
 }
 
 impl MacVideoSurface {
-    /// Wrap an already-retained `CVPixelBufferRef` (transfers +1 retain ownership).
+    /// Wrap an already-retained `CVPixelBufferRef` (transfers +1 retain ownership); `None` for
+    /// null.
     ///
     /// # Safety
-    /// `pb` must be a non-null, retained `CVPixelBufferRef`.
+    /// `pb` must be null or a `CVPixelBufferRef` the caller holds a +1 retain on.
     pub(crate) unsafe fn from_retained(pb: *mut c_void, width: u32, height: u32) -> Option<Self> {
-        if pb.is_null() {
-            return None;
-        }
+        let pb = NonNull::new(pb)?;
         let (mut w, mut h) = (width, height);
         if w == 0 || h == 0 {
             unsafe {
-                slackless_cvpb_dimensions(pb, &mut w, &mut h);
+                slackless_cvpb_dimensions(pb.as_ptr(), &mut w, &mut h);
             }
         }
         Some(Self {
@@ -92,7 +92,7 @@ impl MacVideoSurface {
     /// Returns a newly `CFRetain`ed `CVPixelBufferRef` pointer for GPUI `CFRetained::from_raw`.
     /// Caller owns the +1 retain count and MUST release it (e.g. via `CFRetained::from_raw`).
     pub fn retain_cv_pixel_buffer_ptr(&self) -> *mut c_void {
-        unsafe { slackless_cvpb_retain(self.pb) }
+        unsafe { slackless_cvpb_retain(self.pb.as_ptr()) }
     }
 
     /// Convert (and optionally high-quality downscale) this GPU surface to tightly-packed BGRA8888
@@ -104,7 +104,13 @@ impl MacVideoSurface {
         let mut out_h: u32 = 0;
         let ok = unsafe {
             slackless_cvpb_to_bgra(
-                self.pb, max_w, max_h, &mut ptr, &mut len, &mut out_w, &mut out_h,
+                self.pb.as_ptr(),
+                max_w,
+                max_h,
+                &mut ptr,
+                &mut len,
+                &mut out_w,
+                &mut out_h,
             )
         };
         if !ok || ptr.is_null() || len == 0 {
@@ -121,9 +127,6 @@ impl MacVideoSurface {
 
 impl Drop for MacVideoSurface {
     fn drop(&mut self) {
-        if !self.pb.is_null() {
-            unsafe { slackless_cvpb_release(self.pb) };
-            self.pb = std::ptr::null_mut();
-        }
+        unsafe { slackless_cvpb_release(self.pb.as_ptr()) };
     }
 }
