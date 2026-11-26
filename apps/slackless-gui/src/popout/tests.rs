@@ -629,8 +629,30 @@ fn popout_mark_unread_edit_mrkdwn_refresh_edits_and_readonly_skips_composer(
     let later = cx.update(LaterView::new);
     let mut conv_slot: Option<Entity<PopoutWindow>> = None;
     let mut readonly_slot: Option<Entity<PopoutWindow>> = None;
+    let mut thread_slot: Option<Entity<PopoutWindow>> = None;
     let vcx = cx.add_window(|window, cx| {
         let list = MessageList::new(fixtures.clone(), channel.clone(), window, cx);
+        thread_slot = Some(cx.new(|cx| {
+            PopoutWindow::new(
+                PopoutRequest {
+                    kind: PopoutKind::Thread {
+                        channel: channel.clone(),
+                        thread_ts: Ts::from("1700000000.000100"),
+                        source: list.downgrade(),
+                        on_jump: on_jump.clone(),
+                    },
+                    title: "Thread".to_owned(),
+                    fixtures: fixtures.clone(),
+                    store: None,
+                    team: None,
+                    send: send.clone(),
+                    later_sync: None,
+                    display_id: None,
+                },
+                window,
+                cx,
+            )
+        }));
         let conv = cx.new(|cx| {
             PopoutWindow::new(
                 PopoutRequest {
@@ -741,6 +763,37 @@ fn popout_mark_unread_edit_mrkdwn_refresh_edits_and_readonly_skips_composer(
             assert!(content.text.contains("keep=1"));
         }
         other => panic!("expected SendMessage, got {other:?}"),
+    }
+    drop(cmds);
+
+    // 6. "Send to channel" on a reply goes through the same checks as a typed message.
+    let thread = thread_slot.unwrap();
+    vcx.update(|window, cx| {
+        let reply = Message {
+            ts: Ts::from("1700000998.000100"),
+            text: "see https://example.com/?utm_source=test&keep=1".to_owned(),
+            ..Default::default()
+        };
+        thread.update(cx, |win, cx| {
+            win.handle_message_action(
+                channel.clone(),
+                reply,
+                MessageAction::SendToChannel,
+                window,
+                cx,
+            );
+        });
+    });
+    match sent.lock().unwrap().last() {
+        Some(Command::Messaging(MessagingCommand::SendMessage {
+            content,
+            broadcast: true,
+            ..
+        })) => {
+            assert!(!content.text.contains("utm_source"));
+            assert!(content.text.contains("keep=1"));
+        }
+        other => panic!("expected a broadcast SendMessage, got {other:?}"),
     }
 }
 

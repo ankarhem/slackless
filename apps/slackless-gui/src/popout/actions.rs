@@ -19,11 +19,13 @@ use crate::later::SaveRequest;
 
 use super::{JumpHandler, PopoutKind, PopoutPickerTarget, PopoutWindow};
 
-/// A popped-out composer's send on its way through the main window's checks.
+/// A popped-out window's send on its way through the main window's checks.
 struct Outgoing {
     content: MessageContent,
     /// Staged files the message uploads with (empty for a plain message).
     files: Vec<slackless_core::api::UploadFile>,
+    /// A thread reply posted to its channel too ("Send to channel"), not the composer's text.
+    broadcast: bool,
 }
 
 impl PopoutWindow {
@@ -446,20 +448,13 @@ impl PopoutWindow {
             MessageAction::AddToList => {}
             MessageAction::JoinHuddle => {}
             MessageAction::SendToChannel => {
-                if let PopoutKind::Thread {
-                    channel, thread_ts, ..
-                } = &self.kind
-                {
-                    let content = crate::composer::content_of(&message.text, &self.fixtures);
-                    (self.send)(
-                        MessagingCommand::SendMessage {
-                            channel: channel.clone(),
-                            content,
-                            thread_ts: Some(thread_ts.clone()),
-                            broadcast: true,
-                        }
-                        .into(),
-                    );
+                if matches!(self.kind, PopoutKind::Thread { .. }) {
+                    let outgoing = Outgoing {
+                        content: crate::composer::content_of(&message.text, &self.fixtures),
+                        files: Vec::new(),
+                        broadcast: true,
+                    };
+                    self.send_guarded(outgoing, Some(window), cx);
                 }
             }
         }
@@ -474,6 +469,7 @@ impl PopoutWindow {
         let outgoing = Outgoing {
             content,
             files: Vec::new(),
+            broadcast: false,
         };
         self.send_guarded(outgoing, window, cx);
     }
@@ -519,7 +515,8 @@ impl PopoutWindow {
             return;
         };
         let (this_send, this_cancel) = (cx.entity().downgrade(), cx.entity().downgrade());
-        let text = outgoing.content.text.clone();
+        // Canceling puts typed text back; a reply sent to the channel was never typed here.
+        let typed = (!outgoing.broadcast).then(|| outgoing.content.text.clone());
         let pending = Cell::new(Some(outgoing));
         crate::app::confirm_broadcast(
             guard,
@@ -530,8 +527,8 @@ impl PopoutWindow {
             },
             move |_, cx| {
                 let _ = this_cancel.update(cx, |win, cx| {
-                    if let Some(composer) = &win.composer {
-                        composer.update(cx, |composer, cx| composer.load_draft(&text, cx));
+                    if let (Some(composer), Some(text)) = (&win.composer, &typed) {
+                        composer.update(cx, |composer, cx| composer.load_draft(text, cx));
                     }
                 });
             },
@@ -542,7 +539,7 @@ impl PopoutWindow {
 
     fn deliver(&mut self, outgoing: Outgoing, cx: &mut Context<Self>) {
         if outgoing.files.is_empty() {
-            self.deliver_content(outgoing.content, cx);
+            self.deliver_content(outgoing.content, outgoing.broadcast, cx);
         } else {
             self.upload(outgoing, cx);
         }
@@ -551,20 +548,25 @@ impl PopoutWindow {
     #[cfg(test)]
     pub(super) fn send_content(&mut self, mut content: MessageContent, cx: &mut Context<Self>) {
         composer::apply_outgoing_transforms(&mut content, &self.fixtures, cx);
-        self.deliver_content(content, cx);
+        self.deliver_content(content, false, cx);
     }
 
-    fn deliver_content(&mut self, content: MessageContent, cx: &mut Context<Self>) {
+    /// Post `content` where this window sends; `broadcast` posts a thread reply to its channel too.
+    fn deliver_content(
+        &mut self,
+        content: MessageContent,
+        broadcast: bool,
+        cx: &mut Context<Self>,
+    ) {
         if matches!(&self.kind, PopoutKind::Huddle { .. }) {
             let Some(state) = &self.huddle_state else {
                 return;
             };
             let channel = state.session.channel.clone();
             let thread_ts = self.resolve_huddle_thread_root(&state.session);
-            let broadcast = self
-                .composer
-                .as_ref()
-                .is_some_and(|c| c.update(cx, |composer, cx| composer.take_also_send(cx)));
+            let broadcast = broadcast
+                || (self.composer.as_ref())
+                    .is_some_and(|c| c.update(cx, |composer, cx| composer.take_also_send(cx)));
             let mut local =
                 self.fixtures
                     .local_message(&channel, content.text.clone(), thread_ts.clone());
@@ -606,7 +608,7 @@ impl PopoutWindow {
                 channel,
                 content,
                 thread_ts,
-                broadcast: false,
+                broadcast,
             }
             .into(),
         );
@@ -635,6 +637,7 @@ impl PopoutWindow {
         let outgoing = Outgoing {
             content: content.unwrap_or_default(),
             files,
+            broadcast: false,
         };
         self.send_guarded(outgoing, window, cx);
     }
@@ -644,7 +647,7 @@ impl PopoutWindow {
         let Some((channel, thread_ts)) = self.send_target() else {
             return;
         };
-        let Outgoing { content, files } = outgoing;
+        let Outgoing { content, files, .. } = outgoing;
         (self.send)(
             CollabCommand::UploadFiles {
                 channel,
