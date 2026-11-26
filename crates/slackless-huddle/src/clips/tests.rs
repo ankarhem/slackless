@@ -1,7 +1,7 @@
 use super::audio::{
     downsample_waveform, encode_wav_pcm16, parse_adts_frames, transcode_wav_to_aac_adts,
 };
-use super::video::{CapturedRgbFrame, ClipFrameSource, video_frame_to_clip_rgb};
+use super::video::{CapturedRgbFrame, ClipFrameSource, video_frame_to_clip_pair};
 use super::*;
 use crate::HuddleError;
 use crate::video::{CAMERA_MAX_H, CAMERA_MAX_W, H264VideoEncoder, VideoFrame, split_annex_b_nals};
@@ -473,6 +473,10 @@ fn solid_rgb_frame(width: u32, height: u32, r: u8, g: u8, b: u8) -> CapturedRgbF
     CapturedRgbFrame { width, height, rgb }
 }
 
+fn video_frame_to_clip_rgb(frame: &VideoFrame, max_w: u32, max_h: u32) -> Option<CapturedRgbFrame> {
+    video_frame_to_clip_pair(frame, max_w, max_h).map(|c| c.rgb)
+}
+
 #[test]
 fn video_frame_to_clip_rgb_converts_bgra_and_macos_surface_without_camera_hardware() {
     // Guards: tiny or truncated frames return None.
@@ -498,7 +502,7 @@ fn video_frame_to_clip_rgb_converts_bgra_and_macos_surface_without_camera_hardwa
         let bs = enc
             .encode_rgb(&src.rgb, src.width as usize, src.height as usize)
             .unwrap();
-        let mut vt = crate::macos_media::VtH264Decoder::new().unwrap();
+        let mut vt = crate::macos::VtH264Decoder::new().unwrap();
         let surface_vf = vt
             .decode_annex_b(&bs)
             .expect("VT should decode synthetic frame");

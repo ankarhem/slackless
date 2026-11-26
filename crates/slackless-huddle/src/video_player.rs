@@ -2,11 +2,8 @@
 //!
 //! On macOS this wraps `AVPlayer` + `AVPlayerItemVideoOutput` configured for zero-copy `420f`
 //! IOSurface `CVPixelBuffer` frames ([`crate::MacVideoSurface`]) that GPUI renders directly via
-//! Metal. On non-macOS targets, [`NativeVideoPlayer::open`] returns [`HuddleError::Unsupported`].
-
-use std::path::Path;
-
-use crate::{HuddleError, Result};
+//! Metal. On non-macOS targets, [`NativeVideoPlayer::open`] returns
+//! [`crate::HuddleError::Unsupported`].
 
 /// Snapshot of playback state returned by [`NativeVideoPlayer::state`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -346,20 +343,10 @@ mod imp {
 
 pub use imp::NativeVideoPlayer;
 
-/// Open a local video file with [`NativeVideoPlayer::open`].
-pub fn open_video_player(path: &Path) -> Result<NativeVideoPlayer> {
-    if !path.is_file() {
-        return Err(HuddleError::Video(format!(
-            "video file not found: {}",
-            path.display()
-        )));
-    }
-    NativeVideoPlayer::open(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::HuddleError;
 
     #[test]
     fn open_missing_file_returns_error() {

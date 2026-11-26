@@ -68,17 +68,8 @@ pub(super) trait ClipFrameSource {
 }
 
 /// Convert a [`VideoFrame`] (zero-copy macOS `MacVideoSurface` or portable BGRA) into a tightly
-/// packed [`CapturedRgbFrame`] fit within `(max_w, max_h)`.
-#[cfg(test)]
-pub(crate) fn video_frame_to_clip_rgb(
-    frame: &VideoFrame,
-    max_w: u32,
-    max_h: u32,
-) -> Option<CapturedRgbFrame> {
-    video_frame_to_clip_pair(frame, max_w, max_h).map(|c| c.rgb)
-}
-
-fn video_frame_to_clip_pair(
+/// packed [`CapturedRgbFrame`] fit within `(max_w, max_h)`, plus the BGRA preview it came from.
+pub(super) fn video_frame_to_clip_pair(
     frame: &VideoFrame,
     max_w: u32,
     max_h: u32,

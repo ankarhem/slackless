@@ -1,7 +1,7 @@
 //! Audio clip recording, resampling, WAV encoding, waveform downsampling, and AAC transcoding.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,7 +26,6 @@ pub struct AudioClipRecorder {
     running: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     samples: Arc<Mutex<Vec<i16>>>,
-    rms_bits: Arc<AtomicU32>,
     bars: Arc<Mutex<VecDeque<f32>>>,
     started_at: Instant,
 }
@@ -80,7 +79,6 @@ impl AudioClipRecorder {
         let samples = Arc::new(Mutex::new(Vec::<i16>::with_capacity(
             (SAMPLE_RATE as usize) * 15,
         )));
-        let rms_bits = Arc::new(AtomicU32::new(0));
         let bars = Arc::new(Mutex::new(VecDeque::from(vec![0.0f32; LIVE_BARS])));
         let running = Arc::new(AtomicBool::new(true));
         // Lock-free SPSC ring (~1.3s at 48 kHz mono) decouples the real-time cpal callback from
@@ -131,7 +129,6 @@ impl AudioClipRecorder {
         };
 
         let samples_worker = Arc::clone(&samples);
-        let rms_worker = Arc::clone(&rms_bits);
         let bars_worker = Arc::clone(&bars);
         let run_worker = Arc::clone(&running);
         let ring_worker = Arc::clone(&ring);
@@ -190,7 +187,6 @@ impl AudioClipRecorder {
                     if count > 0 {
                         let rms = (sum_sq / count as f32).sqrt().min(1.0);
                         let visual = (rms * 3.2).min(1.0);
-                        rms_worker.store(visual.to_bits(), Ordering::Relaxed);
                         bar_accum = bar_accum.max(visual);
                         bar_chunks += 1;
                         if bar_chunks >= 4 {
@@ -240,7 +236,6 @@ impl AudioClipRecorder {
             running,
             worker: Some(worker),
             samples,
-            rms_bits,
             bars,
             started_at: Instant::now(),
         })
@@ -248,10 +243,6 @@ impl AudioClipRecorder {
 
     pub fn elapsed_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis() as u64
-    }
-
-    pub fn current_rms(&self) -> f32 {
-        f32::from_bits(self.rms_bits.load(Ordering::Relaxed))
     }
 
     pub fn live_bars(&self) -> Vec<f32> {
