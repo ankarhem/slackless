@@ -15,14 +15,6 @@ use crate::api::AssetClient;
 /// GitHub repository hosting official Slackless releases.
 pub const RELEASES_REPO: &str = "ankarhem/slackless";
 
-/// GitHub REST endpoint for the latest official Slackless release.
-pub const LATEST_RELEASE_API: &str =
-    "https://api.github.com/repos/ankarhem/slackless/releases/latest";
-
-/// GitHub REST endpoint for listing Slackless releases (used by the Beta channel).
-pub const RELEASES_LIST_API: &str =
-    "https://api.github.com/repos/ankarhem/slackless/releases?per_page=20";
-
 /// Release channel for the Slackless auto-updater (`F-SHELL-164`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UpdateChannel {

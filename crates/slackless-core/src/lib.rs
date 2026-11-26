@@ -73,7 +73,7 @@ pub use embeddings::{
     HashProjectionEmbedder, IdleSlot, OnnxEmbedder, TokenizedInput, WordPieceTokenizer,
     cached_onnx_embedder, default_embedding_model_dir, delete_embedding_model,
     detect_embedding_model_setup, download_embedding_model, download_embedding_model_async,
-    embedder_loaded, unload_cached_embedder, unload_idle_embedder,
+    embedder_loaded, unload_cached_embedder,
 };
 pub use event::{
     Event, FailedMutation, HUDDLE_MEDIA_CHANNEL_CAPACITY, HuddleEvent, HuddleMediaEvent,
@@ -99,8 +99,8 @@ pub use reducer::apply_event;
 pub use rules::{
     CatchUpReminderStatus, DEFAULT_CATCHUP_REMINDER_TIME, DEFAULT_SEMANTIC_THRESHOLD,
     NotificationRule, RuleAction, RuleContext, RuleEvaluation, RuleTestResult, SemanticScorer,
-    check_catchup_reminder, evaluate_rules, evaluate_rules_with_semantic, format_local_day,
-    parse_csv_tokens, parse_daily_time_hhmm, test_rule, test_rule_with_semantic, validate_regex,
+    check_catchup_reminder, evaluate_rules, evaluate_rules_with_semantic, parse_csv_tokens,
+    parse_daily_time_hhmm, test_rule, test_rule_with_semantic, validate_regex,
 };
 pub use search::{
     SearchHitKind, UnifiedSearchHit, UnifiedSearchResults, UnifiedTranscriptHit,

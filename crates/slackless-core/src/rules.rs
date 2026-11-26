@@ -655,14 +655,6 @@ pub fn parse_daily_time_hhmm(raw: &str) -> Option<(u8, u8)> {
     }
 }
 
-/// Format the local calendar date (`"YYYY-MM-DD"`) for `utc_secs` at `tz_offset_secs`.
-pub fn format_local_day(utc_secs: i64, tz_offset_secs: i64) -> String {
-    let local_secs = utc_secs.saturating_add(tz_offset_secs);
-    let local_day = local_secs.div_euclid(86_400);
-    let (y, m, d) = civil_from_days(local_day);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
 /// Pure, deterministic check for the Daily Catch-Up reminder.
 ///
 /// Guarantees the reminder fires **at most once per local calendar day** once `last_fired_day`

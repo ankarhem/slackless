@@ -901,11 +901,6 @@ pub fn unload_cached_embedder() -> bool {
     ONNX_EMBEDDER.unload()
 }
 
-/// Unload the shared ONNX session if idle for at least `ttl` and not in use.
-pub fn unload_idle_embedder(ttl: Duration) -> bool {
-    ONNX_EMBEDDER.unload_if_idle(ttl)
-}
-
 /// Whether the shared ONNX session is currently resident in memory.
 pub fn embedder_loaded() -> bool {
     ONNX_EMBEDDER.is_loaded()
