@@ -266,12 +266,22 @@ impl App {
                             let Some(path) = paths.into_iter().next() else {
                                 return;
                             };
-                            let Ok(bytes) = std::fs::read(&path) else {
-                                return;
+                            // A picked file can be gigabytes: read it off the UI thread.
+                            let read_path = path.clone();
+                            let bytes = cx
+                                .background_executor()
+                                .spawn(async move { std::fs::read(&read_path) })
+                                .await;
+                            let bytes = match bytes {
+                                Ok(bytes) if !bytes.is_empty() => bytes,
+                                Ok(_) => return,
+                                Err(err) => {
+                                    let _ = cx.update(|window, cx| {
+                                        notify("Could not read file", err.to_string(), window, cx)
+                                    });
+                                    return;
+                                }
                             };
-                            if bytes.is_empty() {
-                                return;
-                            }
                             let filename = path
                                 .file_name()
                                 .and_then(|n| n.to_str())

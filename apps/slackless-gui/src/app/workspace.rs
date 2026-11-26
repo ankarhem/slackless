@@ -618,14 +618,9 @@ pub(super) fn subscribe_workspace(
                 }
                 SwitcherEvent::OpenRemoteChannel(conv) => {
                     window.close_dialog(cx);
-                    if this.fixtures.conversation(&conv.id).is_none()
-                        && let Some((store, ws)) = this.bridge.store().zip(this.bridge.team_id())
-                    {
-                        if let Ok(mut guard) = store.lock() {
-                            let _ = guard.upsert_conversation(ws, conv);
-                        }
-                        this.reload_live(window, cx);
-                    }
+                    // The core's `conversations.info` (asked by `select`'s `OpenConversation`)
+                    // stores the channel and its `Conversations` event lists it in the sidebar;
+                    // the UI thread never writes to the core's store.
                     this.select(conv.id.clone(), cx);
                     this.focus.focus(window, cx);
                 }

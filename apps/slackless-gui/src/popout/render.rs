@@ -612,8 +612,27 @@ impl PopoutWindow {
                             .and_then(|n| n.to_str())
                             .unwrap_or("attachment")
                             .to_owned();
+                        // A picked file can be gigabytes: read it off the UI thread.
                         let bytes = if is_live {
-                            std::fs::read(&path).ok().filter(|b| !b.is_empty())
+                            let read_path = path.clone();
+                            match cx
+                                .background_executor()
+                                .spawn(async move { std::fs::read(&read_path) })
+                                .await
+                            {
+                                Ok(bytes) => Some(bytes).filter(|b| !b.is_empty()),
+                                Err(err) => {
+                                    let _ = cx.update(|window, cx| {
+                                        actions::notify(
+                                            "Could not read file",
+                                            err.to_string(),
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                    return;
+                                }
+                            }
                         } else {
                             None
                         };

@@ -360,9 +360,15 @@ impl App {
                                                 .file_name()
                                                 .map(|n| n.to_string_lossy().into_owned())
                                                 .unwrap_or_else(|| "avatar.png".to_owned());
-                                            let bytes = match std::fs::read(&path) {
-                                                Ok(b) if b.len() <= 10 * 1024 * 1024 => b,
-                                                Ok(_) => {
+                                            // Off the UI thread; the 10 MB limit is checked on
+                                            // the file's size before anything is read.
+                                            let bytes = match cx
+                                                .background_executor()
+                                                .spawn(read_profile_photo(path))
+                                                .await
+                                            {
+                                                Ok(bytes) => bytes,
+                                                Err(PhotoReadError::TooLarge) => {
                                                     let _ = cx.update(|window, cx| {
                                                         notify(
                                                             "Photo too large",
@@ -373,7 +379,7 @@ impl App {
                                                     });
                                                     return;
                                                 }
-                                                Err(err) => {
+                                                Err(PhotoReadError::Unreadable(err)) => {
                                                     let _ = cx.update(|window, cx| {
                                                         notify(
                                                             "Could not read photo",
@@ -686,5 +692,27 @@ impl App {
         if closed {
             cx.notify();
         }
+    }
+}
+
+/// Slack's `users.setPhoto` limit.
+const MAX_PROFILE_PHOTO_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Why a picked profile photo was not read: over the 10 MB limit (decided on the file's size
+/// before anything is read), or unreadable.
+enum PhotoReadError {
+    TooLarge,
+    Unreadable(std::io::Error),
+}
+
+/// Read a picked profile photo off the UI thread.
+async fn read_profile_photo(path: std::path::PathBuf) -> Result<Vec<u8>, PhotoReadError> {
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > MAX_PROFILE_PHOTO_BYTES => Err(PhotoReadError::TooLarge),
+        _ => match std::fs::read(&path) {
+            Ok(bytes) if bytes.len() as u64 <= MAX_PROFILE_PHOTO_BYTES => Ok(bytes),
+            Ok(_) => Err(PhotoReadError::TooLarge),
+            Err(err) => Err(PhotoReadError::Unreadable(err)),
+        },
     }
 }

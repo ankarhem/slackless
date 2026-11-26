@@ -989,3 +989,47 @@ fn wired_preferences_stealth_and_transcript_toggles_forward_commands_to_core(
     );
     drop(root);
 }
+
+#[gpui::test]
+fn wired_remote_channel_pick_leaves_the_store_to_the_core(cx: &mut gpui::TestAppContext) {
+    let people = [user("U0ME", "me")];
+    let (bridge, core) = cx.update(|cx| {
+        make_wired_workspace("T0SW", "Switcher Co", &[("C0HOME", "home")], &people, cx)
+    });
+    let fx = bridge.snapshot(&HashMap::new()).expect("snapshot");
+    let (root, app, cx) = mount_wired(fx, vec![bridge], cx);
+    let _ = core.drain_commands();
+    let remote = ChannelId::from("C0REMOTE");
+
+    cx.update(|_, cx| {
+        app.read(cx).switcher.clone().update(cx, |_, cx| {
+            cx.emit(SwitcherEvent::OpenRemoteChannel(Box::new(Conversation {
+                id: remote.clone(),
+                name: Some("remote".into()),
+                is_channel: true,
+                ..Default::default()
+            })));
+        });
+    });
+    cx.run_until_parked();
+
+    let cmds = core.drain_commands();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Channel(ChannelCommand::OpenConversation(ch)) if *ch == remote
+        )),
+        "picking a remote channel opens it: {cmds:?}"
+    );
+    let stored = core
+        .store()
+        .lock()
+        .expect("store lock")
+        .conversation(&TeamId::from("T0SW"), &remote)
+        .expect("read conversation");
+    assert!(
+        stored.is_none(),
+        "the UI thread must never write the picked channel into the core's store (its conversations.info does): {stored:?}"
+    );
+    drop(root);
+}
