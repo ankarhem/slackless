@@ -446,7 +446,6 @@ pub struct Settings {
     pub show_menu_bar_icon: bool,
     /// Hide to menu bar instead of quitting when closing the main window (`F-SHELL-141`).
     pub close_to_tray: bool,
-    pub hardware_acceleration: bool,
     pub debug_logging: bool,
     pub open_links: usize,
     /// Opt-in: automatically query Slack's remote search alongside instant local FTS5.
@@ -639,7 +638,6 @@ impl Default for Settings {
             launch_at_login: false,
             show_menu_bar_icon: true,
             close_to_tray: false,
-            hardware_acceleration: true,
             debug_logging: false,
             open_links: 0,
             remote_search_auto: false,

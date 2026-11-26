@@ -34,12 +34,6 @@ impl Preferences {
             |s| &mut s.close_to_tray,
             cx,
         );
-        let hardware = self.checkbox(
-            "adv-hw",
-            "Use hardware acceleration (Metal GPU — active on macOS)",
-            |s| &mut s.hardware_acceleration,
-            cx,
-        );
         let debug = self.checkbox(
             "adv-debug",
             "Enable debug logging",
@@ -361,7 +355,6 @@ impl Preferences {
                     .child(login)
                     .child(menu_bar)
                     .child(close_tray)
-                    .child(hardware)
                     .child(debug),
                 cx,
             ))
