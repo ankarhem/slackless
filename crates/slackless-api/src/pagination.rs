@@ -35,21 +35,35 @@ where
     F: FnMut(Option<String>) -> Fut,
     Fut: Future<Output = Result<Page<T>, ApiError>>,
 {
-    // State: Some(cursor) while there is a page to fetch (None when done), and every cursor
-    // followed so far.
+    paginate_at_most(usize::MAX, fetch)
+}
+
+/// [`paginate`] that also stops after `max_pages` pages, for walks a server could keep going with
+/// ever-new cursors.
+pub(crate) fn paginate_at_most<T, F, Fut>(
+    max_pages: usize,
+    fetch: F,
+) -> impl Stream<Item = Result<T, ApiError>>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<Page<T>, ApiError>>,
+{
+    // State: Some(cursor) while there is a page to fetch (None when done), every cursor followed
+    // so far, and how many more pages may be fetched.
     stream::try_unfold(
-        (fetch, Some(None::<String>), HashSet::new()),
-        |(mut fetch, state, mut followed)| async move {
+        (fetch, Some(None::<String>), HashSet::new(), max_pages),
+        |(mut fetch, state, mut followed, pages_left)| async move {
             let Some(cursor) = state else {
                 return Ok::<_, ApiError>(None);
             };
             let page = fetch(cursor).await?;
+            let pages_left = pages_left.saturating_sub(1);
             // `insert` is false for a cursor already followed: a cycle ends the walk.
             let next = page
                 .next_cursor
-                .filter(|c| !c.is_empty() && followed.insert(c.clone()))
+                .filter(|c| pages_left > 0 && !c.is_empty() && followed.insert(c.clone()))
                 .map(Some);
-            Ok(Some((page.items, (fetch, next, followed))))
+            Ok(Some((page.items, (fetch, next, followed, pages_left))))
         },
     )
     .map_ok(|items| stream::iter(items.into_iter().map(Ok)))
@@ -137,5 +151,21 @@ mod tests {
         .await;
 
         assert!(matches!(res, Err(ApiError::Slack(ref e)) if e == "internal_error"));
+    }
+
+    #[tokio::test]
+    async fn paginate_at_most_stops_after_max_pages() {
+        // A server handing out a fresh cursor on every page.
+        let items: Vec<u32> = paginate_at_most(3, |cursor| async move {
+            let n = cursor.map_or(0, |c| c.parse::<u32>().unwrap());
+            Ok(Page {
+                items: vec![n],
+                next_cursor: Some((n + 1).to_string()),
+            })
+        })
+        .try_collect()
+        .await
+        .unwrap();
+        assert_eq!(items, [0, 1, 2]);
     }
 }

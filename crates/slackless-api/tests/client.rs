@@ -1445,7 +1445,8 @@ async fn slack_lists_dual_endpoint_fallbacks_work() {
     let (server, api) = setup().await;
 
     // fetch_list: files.info has no schema, lists.records.list fails -> falls back to
-    // slackLists.items.list and backfills title/description/columns from `list`.
+    // slackLists.items.list and backfills title/description/columns from `list`. The second
+    // page follows `response_metadata.next_cursor` on the same fallback method.
     Mock::given(method("POST"))
         .and(path("/api/files.info"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1461,6 +1462,22 @@ async fn slack_lists_dual_endpoint_fallbacks_work() {
             ResponseTemplate::new(200)
                 .set_body_json(json!({"ok": false, "error": "unknown_method"})),
         )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/slackLists.items.list"))
+        .and(body_string_contains("cursor=items2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "items": [
+                {
+                    "id": "It2",
+                    "fields": [{ "column_id": "Col1", "key": "name", "text": "Second page item" }]
+                }
+            ],
+            "response_metadata": { "next_cursor": "" }
+        })))
         .expect(1)
         .mount(&server)
         .await;
@@ -1483,7 +1500,8 @@ async fn slack_lists_dual_endpoint_fallbacks_work() {
                     "id": "It1",
                     "fields": [{ "column_id": "Col1", "key": "name", "text": "Fallback item" }]
                 }
-            ]
+            ],
+            "response_metadata": { "next_cursor": "items2" }
         })))
         .expect(1)
         .mount(&server)
@@ -1493,10 +1511,13 @@ async fn slack_lists_dual_endpoint_fallbacks_work() {
     assert_eq!(data.title, "Backfilled Title");
     assert_eq!(data.description, "From items.list");
     assert_eq!(data.columns.len(), 1);
-    assert_eq!(data.rows.len(), 1);
+    let cells: Vec<_> = data.rows.iter().map(|row| row.cells.get("Col1")).collect();
     assert_eq!(
-        data.rows[0].cells.get("Col1"),
-        Some(&SlackListCellValue::Text("Fallback item".into()))
+        cells,
+        [
+            Some(&SlackListCellValue::Text("Fallback item".into())),
+            Some(&SlackListCellValue::Text("Second page item".into())),
+        ]
     );
 
     // lists_records_create: private endpoint fails -> falls back to slackLists.items.create
@@ -2401,9 +2422,23 @@ async fn canvas_access_delete_quip_threads_meta_and_comments_round_trips() {
         assert_eq!(html2, "<p>Fetched via getContent</p>");
     }
 
-    // 5. canvas_comments_list (threads + replies, and channel_not_found -> empty) & canvas_comment_post
+    // 5. canvas_comments_list (every history and reply page, and channel_not_found -> empty) &
+    //    canvas_comment_post
     {
         let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/conversations.history"))
+            .and(body_string_contains("cursor=hist2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "messages": [
+                    { "ts": "1700.3", "user": "U4", "text": "Typo in the title", "reply_count": 1 }
+                ],
+                "response_metadata": { "next_cursor": "" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/api/conversations.history"))
             .and(body_string_contains("channel=C0CMT1"))
@@ -2423,6 +2458,20 @@ async fn canvas_access_delete_quip_threads_meta_and_comments_round_trips() {
                         "text": "Resolved note",
                         "is_archived": true
                     }
+                ],
+                "response_metadata": { "next_cursor": "hist2" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/conversations.replies"))
+            .and(body_string_contains("ts=1700.1"))
+            .and(body_string_contains("cursor=rep2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "messages": [
+                    { "ts": "1700.12", "thread_ts": "1700.1", "user": "U1", "text": "Thanks" }
                 ]
             })))
             .expect(1)
@@ -2437,6 +2486,20 @@ async fn canvas_access_delete_quip_threads_meta_and_comments_round_trips() {
                 "messages": [
                     { "ts": "1700.1", "user": "U1", "text": "Please clarify section 2" },
                     { "ts": "1700.11", "thread_ts": "1700.1", "user": "U3", "text": "Updated!" }
+                ],
+                "response_metadata": { "next_cursor": "rep2" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/conversations.replies"))
+            .and(body_string_contains("ts=1700.3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "messages": [
+                    { "ts": "1700.3", "user": "U4", "text": "Typo in the title" },
+                    { "ts": "1700.31", "thread_ts": "1700.3", "user": "U1", "text": "Fixed" }
                 ]
             })))
             .expect(1)
@@ -2465,12 +2528,15 @@ async fn canvas_access_delete_quip_threads_meta_and_comments_round_trips() {
             .await;
 
         let threads = api.canvas_comments_list("F0CMT1").await.unwrap();
-        assert_eq!(threads.len(), 2);
-        assert_eq!(threads[0].root_ts, Ts::from("1700.1"));
+        let roots: Vec<_> = threads.iter().map(|t| t.root_ts.as_str()).collect();
+        assert_eq!(roots, ["1700.1", "1700.2", "1700.3"], "both history pages");
+        let replies = |i: usize| -> Vec<&str> {
+            threads[i].replies.iter().map(|r| r.text.as_str()).collect()
+        };
         assert!(!threads[0].resolved);
-        assert_eq!(threads[0].replies.len(), 1);
-        assert_eq!(threads[0].replies[0].text, "Updated!");
+        assert_eq!(replies(0), ["Updated!", "Thanks"], "both reply pages");
         assert!(threads[1].resolved);
+        assert_eq!(replies(2), ["Fixed"]);
 
         let empty = api.canvas_comments_list("F0EMPTY").await.unwrap();
         assert!(empty.is_empty());

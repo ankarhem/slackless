@@ -1,6 +1,15 @@
 //! Canvases, Slack Lists, file collections/favorites/trash, and profile photos.
 
+use futures::stream::{self, StreamExt};
+
 use super::*;
+use crate::pagination::paginate_at_most;
+
+/// Most pages read from one List, canvas comment history or comment thread: bounds a server that
+/// keeps handing out fresh cursors.
+const MAX_PAGES: usize = 50;
+/// Comment threads whose replies are fetched at once.
+const REPLY_FETCH_CONCURRENCY: usize = 4;
 
 /// Returns whether a failed private `lists.*` call should fall back to the public
 /// `slackLists.items.*` endpoint. Only expected method/token/scope rejections qualify; auth
@@ -39,6 +48,18 @@ fn canvases_access_params(
     Ok(params)
 }
 
+/// The raw records of a `lists.records.list` (`records`) or `slackLists.items.list` (`items`)
+/// response page.
+fn take_list_records(mut data: Value) -> Vec<Value> {
+    let records = data
+        .as_object_mut()
+        .and_then(|fields| fields.remove("records").or_else(|| fields.remove("items")));
+    match records {
+        Some(Value::Array(records)) => records,
+        _ => Vec::new(),
+    }
+}
+
 fn lists_access_params(
     list_id: &str,
     access_level: Option<ListAccessLevel>,
@@ -71,8 +92,8 @@ impl SlackApi {
             .map(|(data, _)| data)
     }
 
-    /// Load a live Slack List together with its parsed [`ListMeta`] (permalink, access level,
-    /// editors, shared channels, and item limits).
+    /// Load a live Slack List, every page of its records, together with its parsed [`ListMeta`]
+    /// (permalink, access level, editors, shared channels, and item limits).
     pub async fn fetch_list_with_meta(&self, list_id: &str) -> Result<(SlackListData, ListMeta)> {
         let info_val: Value = self
             .call(
@@ -89,35 +110,33 @@ impl SlackApi {
             meta.comment_channel_id = list_comment_channel_id(list_id);
         }
 
-        let private_res = self
-            .call::<Value>(
-                method::LISTS_RECORDS_LIST,
-                vec![
+        // The first page settles which method answers (later pages stay on it) and carries the
+        // List's own schema.
+        let private_params = vec![
+            ("list_id", list_id.to_owned()),
+            ("limit", "200".to_owned()),
+            ("archived", "false".to_owned()),
+        ];
+        let (records_method, records_params, first) = match self
+            .call::<Value>(method::LISTS_RECORDS_LIST, private_params.clone())
+            .await
+        {
+            Ok(resp) => (method::LISTS_RECORDS_LIST, private_params, resp),
+            Err(ref err) if should_fallback_list_method(err) => {
+                let params = vec![
                     ("list_id", list_id.to_owned()),
                     ("limit", "200".to_owned()),
-                    ("archived", "false".to_owned()),
-                ],
-            )
-            .await;
-
-        let records_val = match private_res {
-            Ok(resp) => resp.data,
-            Err(ref err) if should_fallback_list_method(err) => {
-                self.call::<Value>(
-                    method::SLACK_LISTS_ITEMS_LIST,
-                    vec![
-                        ("list_id", list_id.to_owned()),
-                        ("limit", "200".to_owned()),
-                        ("include_list", "true".to_owned()),
-                    ],
-                )
-                .await?
-                .data
+                    ("include_list", "true".to_owned()),
+                ];
+                let resp = self
+                    .call::<Value>(method::SLACK_LISTS_ITEMS_LIST, params.clone())
+                    .await?;
+                (method::SLACK_LISTS_ITEMS_LIST, params, resp)
             }
             Err(err) => return Err(err),
         };
 
-        if let Some(list_obj) = records_val.get("list") {
+        if let Some(list_obj) = first.data.get("list") {
             if columns.is_empty() {
                 let (t, d, cols) = parse_list_schema(list_obj);
                 if !t.is_empty() {
@@ -157,13 +176,25 @@ impl SlackApi {
             }
         }
 
-        let raw_records = records_val
-            .get("records")
-            .or_else(|| records_val.get("items"))
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let rows = parse_list_records(raw_records);
+        // `paginate_at_most` asks for the first page (cursor `None`) first: that one is in hand.
+        let mut first_page = Some(page(first, take_list_records));
+        let raw_records: Vec<Value> = paginate_at_most(MAX_PAGES, |cursor| {
+            let fetched = first_page.take();
+            let mut params = records_params.clone();
+            params.extend(cursor.map(|cursor| ("cursor", cursor)));
+            async move {
+                match fetched {
+                    Some(fetched) => Ok(fetched),
+                    None => Ok(page(
+                        self.call::<Value>(records_method, params).await?,
+                        take_list_records,
+                    )),
+                }
+            }
+        })
+        .try_collect()
+        .await?;
+        let rows = parse_list_records(&raw_records);
         if meta.row_count.is_none() {
             meta.row_count = u32::try_from(rows.len()).ok();
         }
@@ -440,18 +471,21 @@ impl SlackApi {
         self.call_ok(method::QUIP_THREAD_ARCHIVE_ALL, params).await
     }
 
-    /// List comment threads on a canvas by reading its derived file comment channel (`C…`).
+    /// List comment threads on a canvas by reading its derived file comment channel (`C…`): every
+    /// history page, then every reply page of each thread, a few threads at a time.
     pub async fn canvas_comments_list(&self, canvas_id: &str) -> Result<Vec<CanvasCommentThread>> {
         let comment_channel = canvas_comment_channel_id(canvas_id);
         let history_opts = HistoryOpts {
             limit: Some(100),
             ..Default::default()
         };
-        let history = match self
-            .conversations_history(&comment_channel, &history_opts, None)
-            .await
+        let history: Vec<Message> = match paginate_at_most(MAX_PAGES, |cursor| {
+            self.conversations_history(&comment_channel, &history_opts, cursor)
+        })
+        .try_collect()
+        .await
         {
-            Ok(page) => page.items,
+            Ok(history) => history,
             Err(ApiError::Slack(ref code)) if code == "channel_not_found" => {
                 return Ok(Vec::new());
             }
@@ -462,19 +496,30 @@ impl SlackApi {
             limit: Some(200),
             ..Default::default()
         };
-        let mut replies_by_root: HashMap<Ts, Vec<Message>> = HashMap::new();
-        for msg in &history {
-            if msg.ts.as_str().is_empty()
-                || msg.is_thread_reply()
-                || msg.reply_count.unwrap_or(0) == 0
-            {
-                continue;
-            }
-            let replies = self
-                .conversations_replies(&comment_channel, &msg.ts, &reply_opts, None)
+        let (channel, reply_opts) = (&comment_channel, &reply_opts);
+        // Owned timestamps, not `&Message`: a future built from a borrowed root is not provably
+        // `Send` (rust-lang/rust#100013), which core's backend traits require of this one.
+        let roots: Vec<Ts> = history
+            .iter()
+            .filter(|msg| {
+                !msg.ts.as_str().is_empty()
+                    && !msg.is_thread_reply()
+                    && msg.reply_count.unwrap_or(0) > 0
+            })
+            .map(|msg| msg.ts.clone())
+            .collect();
+        let replies_by_root: HashMap<Ts, Vec<Message>> = stream::iter(roots)
+            .map(|root| async move {
+                let replies: Vec<Message> = paginate_at_most(MAX_PAGES, |cursor| {
+                    self.conversations_replies(channel, &root, reply_opts, cursor)
+                })
+                .try_collect()
                 .await?;
-            replies_by_root.insert(msg.ts.clone(), replies.items);
-        }
+                Ok::<_, ApiError>((root, replies))
+            })
+            .buffered(REPLY_FETCH_CONCURRENCY)
+            .try_collect()
+            .await?;
 
         Ok(parse_canvas_comment_threads(&history, &replies_by_root))
     }
