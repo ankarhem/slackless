@@ -13,7 +13,7 @@
 //! prompts are ever written there.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -34,28 +34,32 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt, tool, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
-use slackless_core::NotifyLevel;
-use slackless_core::api::{HistoryOpts, MessageContent, SlackApi};
+use slackless_core::api::{MessageContent, SlackApi};
 use slackless_core::auth::Session;
+use slackless_core::catchup::{CatchUpWindow, format_catchup_human};
 use slackless_core::domain::mrkdwn::mrkdwn_to_plain;
-use slackless_core::export::{
-    ExportFormat, ExportOptions, export_channel, export_file_transcript, export_huddle_transcript,
-    export_thread, format_utc_timestamp,
-};
+use slackless_core::export::format_utc_timestamp;
+use slackless_core::export::{ChannelWindow, ExportFormat, ExportOptions, ExportRequest};
+use slackless_core::search::truncate_chars;
 use slackless_core::store::{
     Has, SearchQuery, SearchSort, Store, StoredFileTranscript, StoredMessage,
 };
 use slackless_core::types::time::now_epoch_secs;
-use slackless_core::types::{ChannelId, FileId, Message, TeamId, TranscriptCue, Ts};
+use slackless_core::types::{ChannelId, FileId, Message, TeamId, TranscriptCue, Ts, UserId};
 
 use crate::archive::{self, Archive};
-use crate::commands::{parse_since_cutoff, raw_channel_id};
+use crate::commands::browse::catchup_briefing;
+use crate::commands::messages::{
+    ChannelRead, ThreadRead, channel_payload, export_archive, export_not_found, live_channel_read,
+    live_thread_read, local_channel, local_thread, search_all_document, search_all_in_archives,
+    search_document, thread_payload,
+};
+use crate::commands::{CmdError, all_workspace_ids, parse_since_cutoff, raw_channel_id};
 use crate::live::session::{classify_api_error, resolve_channel_with};
-use crate::output::MessageRow;
 use crate::session::{
     is_valid_workspace_id, resolve_session_from, resolve_workspace_from, validate_workspace_id,
 };
-use crate::write::normalize_emoji_shortcode;
+use crate::write::{detect_secret_hits, normalize_emoji_shortcode};
 use crate::{CLI_VERSION, Ctx};
 
 /// Protocol versions this server speaks. A client asking for anything else is answered with
@@ -131,54 +135,6 @@ pub(crate) struct McpServer {
 }
 
 #[derive(Serialize)]
-struct FileRef {
-    id: String,
-    name: Option<String>,
-    title: Option<String>,
-    filetype: Option<String>,
-}
-
-#[derive(Serialize)]
-struct McpMessage {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    workspace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    channel_name: Option<String>,
-    #[serde(flatten)]
-    row: MessageRow,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    file_refs: Vec<FileRef>,
-}
-
-impl McpMessage {
-    fn from_stored(
-        stored: &StoredMessage,
-        user_names: &HashMap<slackless_core::types::UserId, String>,
-        channel_name: Option<String>,
-        workspace: Option<String>,
-    ) -> Self {
-        let file_refs = stored
-            .message
-            .files
-            .iter()
-            .filter(|f| !f.id.as_str().is_empty())
-            .map(|f| FileRef {
-                id: f.id.as_str().to_owned(),
-                name: f.name.clone(),
-                title: f.title.clone(),
-                filetype: f.filetype.clone(),
-            })
-            .collect();
-        Self {
-            workspace,
-            channel_name,
-            row: MessageRow::from_stored(stored, user_names),
-            file_refs,
-        }
-    }
-}
-
-#[derive(Serialize)]
 struct WorkspaceEntry {
     team_id: String,
     workspace_url: Option<String>,
@@ -228,65 +184,6 @@ struct TranscriptListItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     uri: Option<String>,
     excerpt: String,
-}
-
-#[derive(Serialize)]
-struct CatchupChannelEntry {
-    workspace: String,
-    channel: String,
-    label: String,
-    message_count: u64,
-    author_count: u64,
-    unread_count: u32,
-    is_unread: bool,
-    muted: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    latest_ts: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    latest_author: Option<String>,
-    latest_text: String,
-}
-
-#[derive(Serialize)]
-struct CatchupMentionEntry {
-    workspace: String,
-    channel: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    channel_name: Option<String>,
-    ts: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thread_ts: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    user: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    user_name: Option<String>,
-    excerpt: String,
-}
-
-#[derive(Serialize)]
-struct CatchupThreadEntry {
-    workspace: String,
-    channel: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    channel_name: Option<String>,
-    thread_ts: String,
-    reply_count: u32,
-    latest_activity_ts: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    author: Option<String>,
-    root_excerpt: String,
-}
-
-struct CatchupSummaryData {
-    since_hours: usize,
-    cutoff_secs: i64,
-    all_workspaces: bool,
-    workspaces: Vec<String>,
-    total_messages: u64,
-    channels: Vec<CatchupChannelEntry>,
-    mentions: Vec<CatchupMentionEntry>,
-    active_threads: Vec<CatchupThreadEntry>,
-    new_transcripts: Vec<TranscriptListItem>,
 }
 
 enum ResourceUri {
@@ -361,19 +258,7 @@ impl McpServer {
     }
 
     fn all_workspace_ids(&self) -> Vec<TeamId> {
-        let mut seen = HashSet::new();
-        let mut ids = Vec::new();
-        for s in &self.sessions {
-            if is_valid_workspace_id(s.team_id.as_str()) && seen.insert(s.team_id.clone()) {
-                ids.push(s.team_id.clone());
-            }
-        }
-        for tid in self.stored_team_ids() {
-            if is_valid_workspace_id(tid.as_str()) && seen.insert(tid.clone()) {
-                ids.push(tid);
-            }
-        }
-        ids
+        all_workspace_ids(&self.sessions, self.stored_team_ids())
     }
 
     fn effective_workspace_flag<'a>(
@@ -767,7 +652,7 @@ impl McpServer {
                         cue_count,
                         languages: Vec::new(),
                         uri: Some(uri),
-                        excerpt: collapse_excerpt(&tr.text, MAX_EXCERPT_CHARS),
+                        excerpt: truncate_chars(&tr.text, MAX_EXCERPT_CHARS),
                     });
                 }
             }
@@ -808,7 +693,7 @@ impl McpServer {
                         cue_count: session.segment_count,
                         languages: session.languages,
                         uri: None,
-                        excerpt: collapse_excerpt(&session.preview, MAX_EXCERPT_CHARS),
+                        excerpt: truncate_chars(&session.preview, MAX_EXCERPT_CHARS),
                     });
                 }
             }
@@ -823,249 +708,6 @@ impl McpServer {
         items.truncate(limit);
         Ok(items)
     }
-    fn collect_catchup_summary(
-        &self,
-        all_workspaces: bool,
-        workspaces: &[TeamId],
-        since_hours: usize,
-        limit: usize,
-        explicit_user_id: Option<&str>,
-    ) -> std::result::Result<CatchupSummaryData, String> {
-        let now = now_epoch_secs();
-        let cutoff_secs = now.saturating_sub((since_hours as i64).saturating_mul(3_600));
-
-        let session_users: HashMap<TeamId, String> = self
-            .sessions
-            .iter()
-            .filter(|s| !s.user_id.as_str().is_empty())
-            .map(|s| (s.team_id.clone(), s.user_id.as_str().to_owned()))
-            .collect();
-
-        let mut total_messages: u64 = 0;
-        let mut channels: Vec<CatchupChannelEntry> = Vec::new();
-        let mut mentions: Vec<CatchupMentionEntry> = Vec::new();
-        let mut active_threads: Vec<CatchupThreadEntry> = Vec::new();
-
-        for ws in workspaces {
-            let Some(archive) = self.open_archive(ws)? else {
-                continue;
-            };
-
-            let user_names = archive.user_display_map(ws).unwrap_or_default();
-            let channel_names = archive.channel_names(ws).unwrap_or_default();
-            let notify = archive.notify_levels(ws).unwrap_or_default();
-
-            // 1. Active & unread channels in the window.
-            let conv_map: HashMap<ChannelId, slackless_core::types::Conversation> = archive
-                .store()
-                .conversations(ws)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|c| (c.id.clone(), c))
-                .collect();
-            let digest_rows = archive
-                .digest_since(ws, cutoff_secs, limit)
-                .map_err(|err| format!("building digest for {ws}: {err}"))?;
-            let mut seen_channels: HashSet<ChannelId> = HashSet::new();
-            for row in digest_rows {
-                total_messages = total_messages.saturating_add(row.message_count);
-                let ch_id = ChannelId::from(row.channel.as_str());
-                seen_channels.insert(ch_id.clone());
-                let conv = conv_map.get(&ch_id);
-                let unread_count = conv
-                    .and_then(|c| c.unread_count_display.or(c.unread_count))
-                    .unwrap_or(0);
-                let newer_than_read = conv
-                    .and_then(|c| c.last_read.as_ref())
-                    .is_some_and(|lr| Ts::from(row.latest_ts.as_str()) > *lr);
-                let is_unread = unread_count > 0 || newer_than_read;
-                let muted = notify.get(&ch_id) == Some(&NotifyLevel::Muted);
-                channels.push(CatchupChannelEntry {
-                    workspace: ws.as_str().to_owned(),
-                    channel: row.channel,
-                    label: row.label,
-                    message_count: row.message_count,
-                    author_count: row.author_count,
-                    unread_count,
-                    is_unread,
-                    muted,
-                    latest_ts: Some(row.latest_ts),
-                    latest_author: row.latest_author,
-                    latest_text: row.latest_text,
-                });
-            }
-            // Include unread conversations that had unread_count > 0 locally even without messages
-            // in the time-window digest.
-            for (ch_id, conv) in &conv_map {
-                if seen_channels.contains(ch_id) || conv.is_archived {
-                    continue;
-                }
-                let unread_count = conv.unread_count_display.or(conv.unread_count).unwrap_or(0);
-                if unread_count == 0 {
-                    continue;
-                }
-                let label = if let Some(name) = conv.name.as_deref() {
-                    format!("#{name}")
-                } else if conv.is_im {
-                    conv.user
-                        .as_ref()
-                        .and_then(|u| user_names.get(u))
-                        .map(|n| format!("@{n}"))
-                        .unwrap_or_else(|| ch_id.as_str().to_owned())
-                } else {
-                    ch_id.as_str().to_owned()
-                };
-                let muted = notify.get(ch_id) == Some(&NotifyLevel::Muted);
-                let latest_ts = conv.latest.as_ref().map(|l| l.ts().as_str().to_owned());
-                channels.push(CatchupChannelEntry {
-                    workspace: ws.as_str().to_owned(),
-                    channel: ch_id.as_str().to_owned(),
-                    label,
-                    message_count: 0,
-                    author_count: 0,
-                    unread_count,
-                    is_unread: true,
-                    muted,
-                    latest_ts,
-                    latest_author: None,
-                    latest_text: String::new(),
-                });
-            }
-
-            // 2. Direct mentions of the workspace user within the window.
-            let mention_uid = explicit_user_id
-                .map(str::to_owned)
-                .or_else(|| session_users.get(ws).cloned());
-            if let Some(uid) = mention_uid {
-                let mut q = SearchQuery::default();
-                q.filters.includes_user = Some(uid);
-                q.filters.include_deleted = false;
-                let hits = archive
-                    .store()
-                    .search_sorted(ws, &q, SearchSort::Recent, limit.saturating_mul(2))
-                    .map_err(|err| format!("searching mentions for {ws}: {err}"))?;
-                for stored in hits {
-                    if stored.message.ts.secs().is_none_or(|s| s < cutoff_secs) {
-                        continue;
-                    }
-                    let ch_name = channel_names.get(stored.channel.as_str()).cloned();
-                    let u_name = stored
-                        .message
-                        .user
-                        .as_ref()
-                        .and_then(|u| user_names.get(u).cloned());
-                    let plain = mrkdwn_to_plain(&stored.message.text);
-                    let body = if plain.trim().is_empty() {
-                        &stored.message.text
-                    } else {
-                        &plain
-                    };
-                    mentions.push(CatchupMentionEntry {
-                        workspace: ws.as_str().to_owned(),
-                        channel: stored.channel.as_str().to_owned(),
-                        channel_name: ch_name,
-                        ts: stored.message.ts.as_str().to_owned(),
-                        thread_ts: stored
-                            .message
-                            .thread_ts
-                            .as_ref()
-                            .map(|t| t.as_str().to_owned()),
-                        user: stored.message.user.as_ref().map(|u| u.as_str().to_owned()),
-                        user_name: u_name,
-                        excerpt: collapse_excerpt(body, MAX_EXCERPT_CHARS),
-                    });
-                }
-            }
-
-            // 3. Active threads in the window.
-            let thread_roots = archive
-                .store()
-                .recent_threads(ws, None, limit.saturating_mul(3).max(50))
-                .map_err(|err| format!("loading active threads for {ws}: {err}"))?;
-            for root in thread_roots {
-                let latest_activity = if let Some(lr) = root.message.latest_reply.clone() {
-                    lr
-                } else {
-                    archive
-                        .store()
-                        .thread_replies(ws, &root.channel, &root.message.ts)
-                        .ok()
-                        .and_then(|replies| {
-                            replies
-                                .into_iter()
-                                .rev()
-                                .find(|m| !m.deleted)
-                                .map(|m| m.message.ts)
-                        })
-                        .unwrap_or_else(|| root.message.ts.clone())
-                };
-                let active_in_window = latest_activity.secs().is_some_and(|s| s >= cutoff_secs)
-                    || root.message.ts.secs().is_some_and(|s| s >= cutoff_secs);
-                if !active_in_window {
-                    continue;
-                }
-                let ch_name = channel_names.get(root.channel.as_str()).cloned();
-                let author = root
-                    .message
-                    .user
-                    .as_ref()
-                    .and_then(|u| user_names.get(u).cloned())
-                    .or_else(|| root.message.user.as_ref().map(|u| u.as_str().to_owned()));
-                let plain = mrkdwn_to_plain(&root.message.text);
-                let body = if plain.trim().is_empty() {
-                    &root.message.text
-                } else {
-                    &plain
-                };
-                active_threads.push(CatchupThreadEntry {
-                    workspace: ws.as_str().to_owned(),
-                    channel: root.channel.as_str().to_owned(),
-                    channel_name: ch_name,
-                    thread_ts: root.message.ts.as_str().to_owned(),
-                    reply_count: root.message.reply_count.unwrap_or(0),
-                    latest_activity_ts: latest_activity.as_str().to_owned(),
-                    author,
-                    root_excerpt: collapse_excerpt(body, MAX_EXCERPT_CHARS),
-                });
-            }
-        }
-
-        // 4. New file and huddle transcripts in the window.
-        let new_transcripts = self.collect_transcripts(
-            workspaces,
-            TranscriptKind::All,
-            None,
-            Some(cutoff_secs),
-            limit,
-        )?;
-
-        channels.sort_by(|a, b| {
-            b.is_unread
-                .cmp(&a.is_unread)
-                .then_with(|| b.message_count.cmp(&a.message_count))
-                .then_with(|| b.latest_ts.cmp(&a.latest_ts))
-        });
-        channels.truncate(limit);
-
-        mentions.sort_by(|a, b| b.ts.cmp(&a.ts));
-        mentions.truncate(limit);
-
-        active_threads.sort_by(|a, b| b.latest_activity_ts.cmp(&a.latest_activity_ts));
-        active_threads.truncate(limit);
-
-        Ok(CatchupSummaryData {
-            since_hours,
-            cutoff_secs,
-            all_workspaces,
-            workspaces: workspaces.iter().map(|w| w.as_str().to_owned()).collect(),
-            total_messages,
-            channels,
-            mentions,
-            active_threads,
-            new_transcripts,
-        })
-    }
-
     /// The one workspace a tool should read, or the `no_workspace`/`invalid_args` tool error.
     fn require_workspace(&self, explicit: Option<&str>) -> Result<TeamId, ToolError> {
         match self.resolve_workspace(explicit) {
@@ -1559,68 +1201,14 @@ impl McpServer {
         };
 
         if search_all {
-            let team_ids = self.all_workspace_ids();
-            let mut per_workspace: Vec<Vec<(i64, String, McpMessage)>> = Vec::new();
-            for ws in &team_ids {
-                let archive = match self.open_archive(ws) {
-                    Ok(Some(a)) => a,
-                    Ok(None) => continue,
-                    Err(msg) => return Err(tool_err("store_error", msg)),
-                };
-                let messages = match archive.store().search_sorted(ws, &parsed, ranking, limit) {
-                    Ok(m) => m,
-                    Err(err) => {
-                        return Err(tool_err(
-                            "store_error",
-                            format!("searching archive of {ws}: {err}"),
-                        ));
-                    }
-                };
-                if messages.is_empty() {
-                    continue;
-                }
-                let names = archive.channel_names(ws).unwrap_or_default();
-                let user_names = archive.user_display_map(ws).unwrap_or_default();
-                let mut ws_hits = Vec::with_capacity(messages.len());
-                for msg in &messages {
-                    let ch_name = names.get(msg.channel.as_str()).cloned();
-                    let ts_secs = msg.message.ts.secs().unwrap_or(0);
-                    let ts_raw = msg.message.ts.as_str().to_owned();
-                    let mcp_msg = McpMessage::from_stored(
-                        msg,
-                        &user_names,
-                        ch_name,
-                        Some(ws.as_str().to_owned()),
-                    );
-                    ws_hits.push((ts_secs, ts_raw, mcp_msg));
-                }
-                per_workspace.push(ws_hits);
-            }
-            let messages: Vec<McpMessage> = match ranking {
-                SearchSort::Recent => {
-                    let mut all_hits: Vec<(i64, String, McpMessage)> =
-                        per_workspace.into_iter().flatten().collect();
-                    all_hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-                    all_hits.truncate(limit);
-                    all_hits.into_iter().map(|(_, _, m)| m).collect()
-                }
-                SearchSort::Relevant => {
-                    let lists: Vec<Vec<McpMessage>> = per_workspace
-                        .into_iter()
-                        .map(|hits| hits.into_iter().map(|(_, _, m)| m).collect())
-                        .collect();
-                    interleave_round_robin(lists, limit)
-                }
-            };
-            let searched: Vec<&str> = team_ids.iter().map(TeamId::as_str).collect();
-            return Ok(tool_ok(&json!({
-                "query": query.as_str(),
-                "all_workspaces": true,
-                "workspaces_searched": searched,
-                "sort": sort,
-                "count": messages.len(),
-                "messages": messages,
-            })));
+            let archives: Vec<(TeamId, PathBuf)> = self
+                .all_workspace_ids()
+                .into_iter()
+                .filter_map(|ws| self.archive_path_for(&ws).map(|path| (ws, path)))
+                .collect();
+            let results = search_all_in_archives(&archives, &parsed, ranking, limit)?;
+            let (json, _) = search_all_document(query.as_str(), None, ranking, &results);
+            return Ok(tool_ok(&json));
         }
 
         let workspace = match self.resolve_workspace(workspace.as_deref()) {
@@ -1637,40 +1225,15 @@ impl McpServer {
             Ok(a) => a,
             Err(msg) => return Err(tool_err("store_error", msg)),
         };
-        let messages = match archive.as_ref() {
-            Some(archive) => {
-                let raw = match archive
-                    .store()
-                    .search_sorted(&workspace, &parsed, ranking, limit)
-                {
-                    Ok(m) => m,
-                    Err(err) => {
-                        return Err(tool_err(
-                            "store_error",
-                            format!("searching archive of {workspace}: {err}"),
-                        ));
-                    }
-                };
-                let names = archive.channel_names(&workspace).unwrap_or_default();
-                let user_names = archive.user_display_map(&workspace).unwrap_or_default();
-                raw.iter()
-                    .map(|msg| {
-                        let ch_name = names.get(msg.channel.as_str()).cloned();
-                        McpMessage::from_stored(msg, &user_names, ch_name, None)
-                    })
-                    .collect::<Vec<_>>()
-            }
-            None => Vec::new(),
-        };
-
-        Ok(tool_ok(&json!({
-            "query": query.as_str(),
-            "workspace": workspace.as_str(),
-            "all_workspaces": false,
-            "sort": sort,
-            "count": messages.len(),
-            "messages": messages,
-        })))
+        let ((json, _), _) = search_document(
+            &workspace,
+            archive.as_ref(),
+            query.as_str(),
+            &parsed,
+            ranking,
+            limit,
+        )?;
+        Ok(tool_ok(&json))
     }
 
     #[tool(
@@ -1701,8 +1264,12 @@ impl McpServer {
             Some(spec) => Some(parse_since_cutoff(spec, now_epoch_secs()).map_err(invalid_args)?),
             None => None,
         };
-        let before = before.filter(|s| !s.trim().is_empty()).map(Ts::from);
-        let include_deleted = include_deleted.unwrap_or(false);
+        let window = ChannelWindow {
+            before: before.filter(|s| !s.trim().is_empty()).map(Ts::from),
+            since_secs: cutoff_secs,
+            limit,
+            include_deleted: include_deleted.unwrap_or(false),
+        };
         let live = live.unwrap_or(false);
 
         if live {
@@ -1711,58 +1278,13 @@ impl McpServer {
                 Err((code, msg)) => return Err(tool_err(code, msg)),
             };
             let mut archive = self.open_archive_rw(&workspace);
-            let (channel_id, label) =
-                resolve_channel_with(archive.as_ref().ok(), &workspace, channel.as_str());
-            let opts = HistoryOpts {
-                oldest: cutoff_secs.map(|s| Ts::from(format!("{s}.000000"))),
-                latest: before,
-                inclusive: false,
-                limit: Some(u32::try_from(limit).unwrap_or(200)),
-            };
-            let fetched_at = now_epoch_secs();
-            let page = match api.conversations_history(&channel_id, &opts, None).await {
-                Ok(page) => page,
-                Err(err) => {
+            let read = live_channel_read(&api, &workspace, &mut archive, channel.as_str(), &window)
+                .await
+                .map_err(|err| {
                     let (code, msg) = classify_api_error(&err);
-                    return Err(tool_err(code, msg));
-                }
-            };
-            let mirrored = archive.as_mut().map_err(|err| err.clone()).and_then(|a| {
-                a.store_mut()
-                    .upsert_history_page(&workspace, &channel_id, &page.items, fetched_at)
-                    .map_err(|err| err.to_string())
-            });
-            if let Err(err) = mirrored {
-                eprintln!(
-                    "slackless: could not mirror the live messages into the local archive ({err})"
-                );
-            }
-            let user_names = archive
-                .as_ref()
-                .ok()
-                .and_then(|a| a.user_display_map(&workspace).ok())
-                .unwrap_or_default();
-            // Slack returns newest-first; reverse so output is oldest-first like local read.
-            let messages: Vec<McpMessage> = page
-                .items
-                .into_iter()
-                .rev()
-                .map(|message| {
-                    let stored = StoredMessage {
-                        channel: channel_id.clone(),
-                        message,
-                        deleted: false,
-                    };
-                    McpMessage::from_stored(&stored, &user_names, label.clone(), None)
-                })
-                .collect();
-            return Ok(tool_ok(&json!({
-                "workspace": workspace.as_str(),
-                "channel": { "id": channel_id.as_str(), "label": label },
-                "live": true,
-                "count": messages.len(),
-                "messages": messages,
-            })));
+                    tool_err(code, msg)
+                })?;
+            return Ok(tool_ok(&channel_json(&read, &workspace, true)));
         }
 
         let workspace = self.require_workspace(workspace.as_deref())?;
@@ -1770,70 +1292,8 @@ impl McpServer {
             Ok(a) => a,
             Err(msg) => return Err(tool_err("store_error", msg)),
         };
-        let (resolved, channel_id, stored_messages, user_names) = match archive.as_ref() {
-            Some(archive) => {
-                let resolved = match archive.resolve_channel(&workspace, channel.as_str()) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        return Err(tool_err("store_error", format!("resolving channel: {err}")));
-                    }
-                };
-                let channel_id = resolved
-                    .as_ref()
-                    .map_or_else(|| raw_channel_id(channel.as_str()), |row| row.id.clone());
-                let msgs = match read_channel_window(
-                    archive.store(),
-                    &workspace,
-                    &channel_id,
-                    before.as_ref(),
-                    limit,
-                    cutoff_secs,
-                    include_deleted,
-                ) {
-                    Ok(m) => m,
-                    Err(err) => {
-                        return Err(tool_err("store_error", format!("reading channel: {err}")));
-                    }
-                };
-                let user_names = archive.user_display_map(&workspace).unwrap_or_default();
-                (resolved, channel_id, msgs, user_names)
-            }
-            None => (
-                None,
-                raw_channel_id(channel.as_str()),
-                Vec::new(),
-                HashMap::new(),
-            ),
-        };
-
-        let channel_row = match resolved {
-            Some(row) => Some(row),
-            None => archive
-                .as_ref()
-                .and_then(|a| a.conversation_by_id(&workspace, &channel_id).ok().flatten()),
-        };
-        let ch_label = channel_row.as_ref().map(|r| r.label());
-        let messages: Vec<McpMessage> = stored_messages
-            .iter()
-            .map(|msg| McpMessage::from_stored(msg, &user_names, ch_label.clone(), None))
-            .collect();
-        let channel_json = match channel_row {
-            Some(row) => json!({
-                "id": channel_id.as_str(),
-                "name": row.name,
-                "kind": row.kind,
-                "user": row.user.as_ref().map(|u| u.as_str()),
-            }),
-            None => json!({ "id": channel_id.as_str() }),
-        };
-
-        Ok(tool_ok(&json!({
-            "workspace": workspace.as_str(),
-            "channel": channel_json,
-            "live": false,
-            "count": messages.len(),
-            "messages": messages,
-        })))
+        let read = local_channel(&workspace, archive.as_ref(), channel.as_str(), &window)?;
+        Ok(tool_ok(&channel_json(&read, &workspace, false)))
     }
 
     #[tool(
@@ -1866,58 +1326,26 @@ impl McpServer {
                 Err((code, msg)) => return Err(tool_err(code, msg)),
             };
             let mut archive = self.open_archive_rw(&workspace);
-            let (channel_id, label) =
-                resolve_channel_with(archive.as_ref().ok(), &workspace, channel.as_str());
-            let opts = HistoryOpts {
-                limit: Some(u32::try_from(limit).unwrap_or(200)),
-                ..HistoryOpts::default()
-            };
-            let fetched_at = now_epoch_secs();
-            let page = match api
-                .conversations_replies(&channel_id, &thread_ts, &opts, None)
-                .await
-            {
-                Ok(page) => page,
-                Err(err) => {
-                    let (code, msg) = classify_api_error(&err);
-                    return Err(tool_err(code, msg));
-                }
-            };
-            let mirrored = archive.as_mut().map_err(|err| err.clone()).and_then(|a| {
-                a.store_mut()
-                    .upsert_replies_page(&workspace, &channel_id, &page.items, fetched_at)
-                    .map_err(|err| err.to_string())
-            });
-            if let Err(err) = mirrored {
-                eprintln!(
-                    "slackless: could not mirror the live replies into the local archive ({err})"
-                );
-            }
-            let user_names = archive
-                .as_ref()
-                .ok()
-                .and_then(|a| a.user_display_map(&workspace).ok())
-                .unwrap_or_default();
-            let messages: Vec<McpMessage> = page
-                .items
-                .into_iter()
-                .map(|message| {
-                    let stored = StoredMessage {
-                        channel: channel_id.clone(),
-                        message,
-                        deleted: false,
-                    };
-                    McpMessage::from_stored(&stored, &user_names, label.clone(), None)
-                })
-                .collect();
-            return Ok(tool_ok(&json!({
-                "workspace": workspace.as_str(),
-                "channel": channel_id.as_str(),
-                "thread_ts": thread_ts.as_str(),
-                "live": true,
-                "count": messages.len(),
-                "messages": messages,
-            })));
+            let mut read = live_thread_read(
+                &api,
+                &workspace,
+                &mut archive,
+                channel.as_str(),
+                &thread_ts,
+                u32::try_from(limit).unwrap_or(u32::MAX),
+            )
+            .await
+            .map_err(|err| {
+                let (code, msg) = classify_api_error(&err);
+                tool_err(code, msg)
+            })?;
+            read.messages.truncate(limit);
+            return Ok(tool_ok(&thread_json(
+                &read,
+                &thread_ts,
+                true,
+                Some(&workspace),
+            )));
         }
 
         let workspace = self.require_workspace(workspace.as_deref())?;
@@ -1925,50 +1353,14 @@ impl McpServer {
             Ok(a) => a,
             Err(msg) => return Err(tool_err("store_error", msg)),
         };
-        let (label, channel_id, mut stored_messages, user_names) = match archive.as_ref() {
-            Some(archive) => {
-                let resolved = match archive.resolve_channel(&workspace, channel.as_str()) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        return Err(tool_err("store_error", format!("resolving channel: {err}")));
-                    }
-                };
-                let channel_id = resolved
-                    .as_ref()
-                    .map_or_else(|| raw_channel_id(channel.as_str()), |row| row.id.clone());
-                let msgs = match archive
-                    .store()
-                    .thread_replies(&workspace, &channel_id, &thread_ts)
-                {
-                    Ok(m) => m,
-                    Err(err) => {
-                        return Err(tool_err("store_error", format!("reading thread: {err}")));
-                    }
-                };
-                let user_names = archive.user_display_map(&workspace).unwrap_or_default();
-                (resolved.map(|r| r.label()), channel_id, msgs, user_names)
-            }
-            None => (
-                None,
-                raw_channel_id(channel.as_str()),
-                Vec::new(),
-                HashMap::new(),
-            ),
-        };
-        stored_messages.truncate(limit);
-        let messages: Vec<McpMessage> = stored_messages
-            .iter()
-            .map(|msg| McpMessage::from_stored(msg, &user_names, label.clone(), None))
-            .collect();
-
-        Ok(tool_ok(&json!({
-            "workspace": workspace.as_str(),
-            "channel": channel_id.as_str(),
-            "thread_ts": thread_ts.as_str(),
-            "live": false,
-            "count": messages.len(),
-            "messages": messages,
-        })))
+        let mut read = local_thread(&workspace, archive.as_ref(), channel.as_str(), &thread_ts)?;
+        read.messages.truncate(limit);
+        Ok(tool_ok(&thread_json(
+            &read,
+            &thread_ts,
+            false,
+            Some(&workspace),
+        )))
     }
 
     #[tool(
@@ -2091,13 +1483,15 @@ impl McpServer {
             limit,
         } = args.get()?;
         let format = format.unwrap_or(ExportKind::Md);
-        let export_fmt = ExportFormat::from(format);
-        let include_threads = include_threads.unwrap_or(false);
-        let include_deleted = include_deleted.unwrap_or(false);
-        let include_transcripts = include_transcripts.unwrap_or(true);
-        let limit = limit
-            .unwrap_or(DEFAULT_EXPORT_LIMIT)
-            .clamp(1, MAX_EXPORT_LIMIT);
+        let export_opts = ExportOptions {
+            format: ExportFormat::from(format),
+            limit: limit
+                .unwrap_or(DEFAULT_EXPORT_LIMIT)
+                .clamp(1, MAX_EXPORT_LIMIT),
+            include_deleted: include_deleted.unwrap_or(false),
+            include_threads: include_threads.unwrap_or(false),
+            include_transcripts: include_transcripts.unwrap_or(true),
+        };
 
         if thread_ts.is_some() && channel_arg.is_none() {
             return Err(invalid_args("`thread_ts` requires `channel`"));
@@ -2115,188 +1509,58 @@ impl McpServer {
                 "`channel`, `file_id`, and `huddle_id` are mutually exclusive",
             ));
         }
-
-        if let Some(file_id) = file_id {
-            let candidates = match self.workspace_candidates(workspace.as_deref()) {
-                Ok(v) => v,
-                Err(msg) => return Err(tool_err("invalid_args", msg)),
-            };
-            if candidates.is_empty() {
-                return Err(tool_err(
-                    "no_workspace",
-                    "no local archive workspaces found; pass `workspace` or sync the desktop app first",
-                ));
-            }
-            let fid = FileId::from(file_id.as_str());
-            for ws in &candidates {
-                let archive = match self.open_archive(ws) {
-                    Ok(Some(a)) => a,
-                    Ok(None) => continue,
-                    Err(msg) => return Err(tool_err("store_error", msg)),
-                };
-                match export_file_transcript(archive.store(), ws, &fid, export_fmt) {
-                    Ok(Some(artifact)) => {
-                        return Ok(tool_ok(&json!({
-                            "workspace": ws.as_str(),
-                            "target": "file_transcript",
-                            "file_id": file_id,
-                            "format": format,
-                            "title": artifact.title,
-                            "suggested_filename": artifact.suggested_filename,
-                            "item_count": artifact.item_count,
-                            "content": artifact.content,
-                        })));
-                    }
-                    Ok(None) => continue,
-                    Err(err) => {
-                        return Err(tool_err(
-                            "store_error",
-                            format!("exporting file transcript '{file_id}': {err}"),
-                        ));
-                    }
-                }
-            }
-            return Err(tool_err(
-                "not_found",
-                format!("no stored file transcript found for file_id '{file_id}'"),
-            ));
-        }
-
-        if let Some(huddle_id) = huddle_id {
-            let candidates = match self.workspace_candidates(workspace.as_deref()) {
-                Ok(v) => v,
-                Err(msg) => return Err(tool_err("invalid_args", msg)),
-            };
-            if candidates.is_empty() {
-                return Err(tool_err(
-                    "no_workspace",
-                    "no local archive workspaces found; pass `workspace` or sync the desktop app first",
-                ));
-            }
-            for ws in &candidates {
-                let archive = match self.open_archive(ws) {
-                    Ok(Some(a)) => a,
-                    Ok(None) => continue,
-                    Err(msg) => return Err(tool_err("store_error", msg)),
-                };
-                match export_huddle_transcript(archive.store(), ws, huddle_id.as_str(), export_fmt)
-                {
-                    Ok(Some(artifact)) => {
-                        return Ok(tool_ok(&json!({
-                            "workspace": ws.as_str(),
-                            "target": "huddle_transcript",
-                            "huddle_id": huddle_id,
-                            "format": format,
-                            "title": artifact.title,
-                            "suggested_filename": artifact.suggested_filename,
-                            "item_count": artifact.item_count,
-                            "content": artifact.content,
-                        })));
-                    }
-                    Ok(None) => continue,
-                    Err(err) => {
-                        return Err(tool_err(
-                            "store_error",
-                            format!("exporting huddle transcript '{huddle_id}': {err}"),
-                        ));
-                    }
-                }
-            }
-            return Err(tool_err(
-                "not_found",
-                format!("no stored huddle transcript found for huddle_id '{huddle_id}'"),
-            ));
-        }
-
-        let channel_arg = channel_arg.expect("checked channel_arg.is_some()");
-        let workspace = self.require_workspace(workspace.as_deref())?;
-        let archive = match self.open_archive(&workspace) {
-            Ok(a) => a,
-            Err(msg) => return Err(tool_err("store_error", msg)),
-        };
-        let export_opts = ExportOptions {
-            format: export_fmt,
-            limit,
-            include_deleted,
-            include_threads,
-            include_transcripts,
-        };
-
-        let (channel_id, artifact) = match archive.as_ref() {
-            Some(archive) => {
-                let resolved = match archive.resolve_channel(&workspace, &channel_arg) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        return Err(tool_err("store_error", format!("resolving channel: {err}")));
-                    }
-                };
-                let channel_id = resolved
-                    .as_ref()
-                    .map_or_else(|| raw_channel_id(&channel_arg), |row| row.id.clone());
-                let artifact = match thread_ts.as_deref() {
-                    Some(ts) => export_thread(
-                        archive.store(),
-                        &workspace,
-                        &channel_id,
-                        &Ts::from(ts),
-                        &export_opts,
-                    ),
-                    None => export_channel(archive.store(), &workspace, &channel_id, &export_opts),
-                };
-                match artifact {
-                    Ok(a) => (channel_id, a),
-                    Err(err) => {
-                        return Err(tool_err("store_error", format!("exporting archive: {err}")));
-                    }
-                }
-            }
-            None => {
-                let channel_id = raw_channel_id(&channel_arg);
-                let fallback = match Store::open_in_memory() {
-                    Ok(s) => s,
-                    Err(err) => {
-                        return Err(tool_err(
-                            "store_error",
-                            format!("opening fallback store: {err}"),
-                        ));
-                    }
-                };
-                let artifact = match thread_ts.as_deref() {
-                    Some(ts) => export_thread(
-                        &fallback,
-                        &workspace,
-                        &channel_id,
-                        &Ts::from(ts),
-                        &export_opts,
-                    ),
-                    None => export_channel(&fallback, &workspace, &channel_id, &export_opts),
-                };
-                match artifact {
-                    Ok(a) => (channel_id, a),
-                    Err(err) => {
-                        return Err(tool_err("store_error", format!("exporting archive: {err}")));
-                    }
-                }
-            }
-        };
-
-        let target_kind = if thread_ts.is_some() {
-            "thread"
+        let thread_ts = thread_ts.as_deref().map(Ts::from);
+        let file_id = file_id.as_deref().map(FileId::from);
+        let req = if let Some(file_id) = file_id.as_ref() {
+            ExportRequest::FileTranscript { file_id }
+        } else if let Some(call_id) = huddle_id.as_deref() {
+            ExportRequest::HuddleTranscript { call_id }
         } else {
-            "channel"
+            ExportRequest::Channel {
+                channel: channel_arg
+                    .as_deref()
+                    .expect("checked channel_arg.is_some()"),
+                thread_ts: thread_ts.as_ref(),
+            }
         };
 
-        Ok(tool_ok(&json!({
-            "workspace": workspace.as_str(),
-            "target": target_kind,
-            "channel": channel_id.as_str(),
-            "thread_ts": thread_ts,
-            "format": format,
-            "title": artifact.title,
-            "suggested_filename": artifact.suggested_filename,
-            "item_count": artifact.item_count,
-            "content": artifact.content,
-        })))
+        // A transcript or huddle may live in any archived workspace; a channel is read from the
+        // resolved one, from an empty archive at worst.
+        let stored = |ws: &TeamId, archive: Option<&Archive>| -> Result<_, ToolError> {
+            Ok(export_archive(ws, archive, &req, &export_opts)?
+                .map(|(artifact, channel)| export_json(ws, &req, artifact, channel, format)))
+        };
+        if matches!(req, ExportRequest::Channel { .. }) {
+            let workspace = self.require_workspace(workspace.as_deref())?;
+            let archive = match self.open_archive(&workspace) {
+                Ok(a) => a,
+                Err(msg) => return Err(tool_err("store_error", msg)),
+            };
+            let json = stored(&workspace, archive.as_ref())?
+                .ok_or_else(|| invalid_args("nothing to export"))?;
+            return Ok(tool_ok(&json));
+        }
+        let candidates = match self.workspace_candidates(workspace.as_deref()) {
+            Ok(v) => v,
+            Err(msg) => return Err(tool_err("invalid_args", msg)),
+        };
+        if candidates.is_empty() {
+            return Err(tool_err(
+                "no_workspace",
+                "no local archive workspaces found; pass `workspace` or sync the desktop app first",
+            ));
+        }
+        for ws in &candidates {
+            let archive = match self.open_archive(ws) {
+                Ok(Some(a)) => a,
+                Ok(None) => continue,
+                Err(msg) => return Err(tool_err("store_error", msg)),
+            };
+            if let Some(json) = stored(ws, Some(&archive))? {
+                return Ok(tool_ok(&json));
+            }
+        }
+        Err(tool_err("not_found", export_not_found(&req)))
     }
 
     #[tool(
@@ -2326,41 +1590,11 @@ impl McpServer {
         let limit = limit
             .unwrap_or(DEFAULT_CATCHUP_LIMIT)
             .clamp(1, MAX_CATCHUP_LIMIT);
-        let (all_workspaces, workspaces) = self
+        let (_, workspaces) = self
             .resolve_scope_workspaces(workspace.as_deref(), all_workspaces)
             .map_err(|(code, msg)| tool_err(code, msg))?;
-
-        let data = match self.collect_catchup_summary(
-            all_workspaces,
-            &workspaces,
-            since_hours,
-            limit,
-            user_id.as_deref(),
-        ) {
-            Ok(d) => d,
-            Err(msg) => return Err(tool_err("store_error", msg)),
-        };
-
-        let unread_channels = data.channels.iter().filter(|c| c.is_unread).count();
-
-        Ok(tool_ok(&json!({
-            "since_hours": data.since_hours,
-            "cutoff_secs": data.cutoff_secs,
-            "all_workspaces": data.all_workspaces,
-            "workspaces": data.workspaces,
-            "totals": {
-                "messages": data.total_messages,
-                "active_channels": data.channels.len(),
-                "unread_channels": unread_channels,
-                "mentions": data.mentions.len(),
-                "active_threads": data.active_threads.len(),
-                "new_transcripts": data.new_transcripts.len(),
-            },
-            "channels": data.channels,
-            "mentions": data.mentions,
-            "active_threads": data.active_threads,
-            "new_transcripts": data.new_transcripts,
-        })))
+        let briefing = self.catchup_over(&workspaces, since_hours, limit, user_id.as_deref())?;
+        Ok(tool_ok(&briefing))
     }
 
     #[tool(
@@ -2863,60 +2097,17 @@ impl McpServer {
         channel_arg: &str,
     ) -> Result<Value, ErrorData> {
         let archive = self.open_archive(workspace).map_err(internal_error)?;
-        let (resolved, channel_id, stored_messages, user_names) = match archive.as_ref() {
-            Some(archive) => {
-                let resolved = archive
-                    .resolve_channel(workspace, channel_arg)
-                    .map_err(|err| internal_error(format!("resolving channel: {err}")))?;
-                let channel_id = resolved
-                    .as_ref()
-                    .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
-                let msgs = read_channel_window(
-                    archive.store(),
-                    workspace,
-                    &channel_id,
-                    None,
-                    DEFAULT_READ_LIMIT,
-                    None,
-                    false,
-                )
-                .map_err(|err| internal_error(format!("reading channel: {err}")))?;
-                let user_names = archive.user_display_map(workspace).unwrap_or_default();
-                (resolved, channel_id, msgs, user_names)
-            }
-            None => (
-                None,
-                raw_channel_id(channel_arg),
-                Vec::new(),
-                HashMap::new(),
-            ),
-        };
-        let channel_row = match resolved {
-            Some(row) => Some(row),
-            None => archive
-                .as_ref()
-                .and_then(|a| a.conversation_by_id(workspace, &channel_id).ok().flatten()),
-        };
-        let ch_label = channel_row.as_ref().map(|r| r.label());
-        let messages: Vec<McpMessage> = stored_messages
-            .iter()
-            .map(|msg| McpMessage::from_stored(msg, &user_names, ch_label.clone(), None))
-            .collect();
-        let channel_json = match channel_row {
-            Some(row) => json!({
-                "id": channel_id.as_str(),
-                "name": row.name,
-                "kind": row.kind,
-                "user": row.user.as_ref().map(|u| u.as_str()),
-            }),
-            None => json!({ "id": channel_id.as_str() }),
-        };
-        Ok(json!({
-            "workspace": workspace.as_str(),
-            "channel": channel_json,
-            "count": messages.len(),
-            "messages": messages,
-        }))
+        let read = local_channel(
+            workspace,
+            archive.as_ref(),
+            channel_arg,
+            &ChannelWindow {
+                limit: DEFAULT_READ_LIMIT,
+                ..ChannelWindow::default()
+            },
+        )
+        .map_err(|err| internal_error(err.message))?;
+        Ok(channel_json(&read, workspace, false))
     }
 
     fn read_thread_resource(
@@ -2926,45 +2117,47 @@ impl McpServer {
         thread_ts: &Ts,
     ) -> Result<Value, ErrorData> {
         let archive = self.open_archive(workspace).map_err(internal_error)?;
-        let (label, channel_id, mut stored_messages, user_names) = match archive.as_ref() {
-            Some(archive) => {
-                let resolved = archive
-                    .resolve_channel(workspace, channel_arg)
-                    .map_err(|err| internal_error(format!("resolving channel: {err}")))?;
-                let channel_id = resolved
-                    .as_ref()
-                    .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
-                let msgs = archive
-                    .store()
-                    .thread_replies(workspace, &channel_id, thread_ts)
-                    .map_err(|err| internal_error(format!("reading thread: {err}")))?;
-                let user_names = archive.user_display_map(workspace).unwrap_or_default();
-                (resolved.map(|r| r.label()), channel_id, msgs, user_names)
-            }
-            None => (
-                None,
-                raw_channel_id(channel_arg),
-                Vec::new(),
-                HashMap::new(),
-            ),
-        };
-        stored_messages.truncate(DEFAULT_THREAD_LIMIT);
-        let messages: Vec<McpMessage> = stored_messages
-            .iter()
-            .map(|msg| McpMessage::from_stored(msg, &user_names, label.clone(), None))
-            .collect();
-        Ok(json!({
-            "workspace": workspace.as_str(),
-            "channel": channel_id.as_str(),
-            "thread_ts": thread_ts.as_str(),
-            "count": messages.len(),
-            "messages": messages,
-        }))
+        let mut read = local_thread(workspace, archive.as_ref(), channel_arg, thread_ts)
+            .map_err(|err| internal_error(err.message))?;
+        read.messages.truncate(DEFAULT_THREAD_LIMIT);
+        Ok(thread_json(&read, thread_ts, false, Some(workspace)))
     }
 
     // -------------------------------------------------------------------------
     // MCP Prompts (`prompts/get`)
     // -------------------------------------------------------------------------
+
+    /// The catch-up briefing over the last `since_hours` of `workspaces`, looking for
+    /// mentions of `user_id` or, by default, of each workspace's signed-in user.
+    fn catchup_over(
+        &self,
+        workspaces: &[TeamId],
+        since_hours: usize,
+        limit: usize,
+        user_id: Option<&str>,
+    ) -> Result<slackless_core::catchup::CatchUpBriefing, CmdError> {
+        let now = now_epoch_secs();
+        let window = CatchUpWindow::Custom {
+            since_secs: now.saturating_sub((since_hours as i64).saturating_mul(3_600)),
+        };
+        let self_users: HashMap<TeamId, UserId> = workspaces
+            .iter()
+            .filter_map(|ws| {
+                let user = user_id.map(UserId::from).or_else(|| {
+                    self.sessions
+                        .iter()
+                        .find(|session| &session.team_id == ws)
+                        .map(|session| session.user_id.clone())
+                })?;
+                Some((ws.clone(), user))
+            })
+            .collect();
+        let archives: Vec<(TeamId, PathBuf)> = workspaces
+            .iter()
+            .filter_map(|ws| self.archive_path_for(ws).map(|path| (ws.clone(), path)))
+            .collect();
+        catchup_briefing(&archives, &self_users, window, now, limit)
+    }
 
     fn prompt_catch_up(&self, args: &Map<String, Value>) -> Result<GetPromptResult, ErrorData> {
         let workspace_arg = prompt_opt_workspace(args)?;
@@ -2975,107 +2168,24 @@ impl McpServer {
             1,
             MAX_CATCHUP_HOURS,
         )?;
-        let (all_workspaces, workspaces) = self
+        let (_, workspaces) = self
             .resolve_scope_workspaces(workspace_arg.as_deref(), None)
             .map_err(|(_, msg)| invalid_params(msg))?;
-
-        let data = self
-            .collect_catchup_summary(all_workspaces, &workspaces, since_hours, 15, None)
-            .map_err(internal_error)?;
-
-        let mut context = format!(
-            "## Local Slack Activity (last {}h)\nWorkspaces: {}\nTotal messages: {}\n\n",
-            data.since_hours,
-            if data.workspaces.is_empty() {
-                "(none)".to_owned()
-            } else {
-                data.workspaces.join(", ")
-            },
-            data.total_messages
-        );
-
-        context.push_str("### Active & Unread Channels\n");
-        if data.channels.is_empty() {
-            context.push_str("_No recent channel activity in this window._\n");
-        } else {
-            for ch in &data.channels {
-                let unread_tag = if ch.is_unread {
-                    if ch.unread_count > 0 {
-                        format!(" [UNREAD: {}]", ch.unread_count)
-                    } else {
-                        " [UNREAD]".to_owned()
-                    }
-                } else {
-                    String::new()
-                };
-                let muted_tag = if ch.muted { " [muted]" } else { "" };
-                let who = ch.latest_author.as_deref().unwrap_or("unknown");
-                context.push_str(&format!(
-                    "- [{}] {} ({} msgs, {} people){unread_tag}{muted_tag}: {who}: {}\n",
-                    ch.workspace, ch.label, ch.message_count, ch.author_count, ch.latest_text
-                ));
-            }
-        }
-
-        context.push_str("\n### Direct Mentions\n");
-        if data.mentions.is_empty() {
-            context.push_str("_No direct mentions found in this window._\n");
-        } else {
-            for m in &data.mentions {
-                let ch = m.channel_name.as_deref().unwrap_or(&m.channel);
-                let who = m
-                    .user_name
-                    .as_deref()
-                    .or(m.user.as_deref())
-                    .unwrap_or("unknown");
-                context.push_str(&format!(
-                    "- [{}] {} `{}` **{who}**: {}\n",
-                    m.workspace, ch, m.ts, m.excerpt
-                ));
-            }
-        }
-
-        context.push_str("\n### Active Threads\n");
-        if data.active_threads.is_empty() {
-            context.push_str("_No active threads in this window._\n");
-        } else {
-            for t in &data.active_threads {
-                let ch = t.channel_name.as_deref().unwrap_or(&t.channel);
-                let who = t.author.as_deref().unwrap_or("unknown");
-                context.push_str(&format!(
-                    "- [{}] {} `{}` ({} replies) **{who}**: {}\n",
-                    t.workspace, ch, t.thread_ts, t.reply_count, t.root_excerpt
-                ));
-            }
-        }
-
-        context.push_str("\n### New Audio/Video & Huddle Transcripts\n");
-        if data.new_transcripts.is_empty() {
-            context.push_str("_No new transcripts in this window._\n");
-        } else {
-            for tr in &data.new_transcripts {
-                let dur = tr
-                    .duration_secs
-                    .map(|d| format!(", {d:.0}s"))
-                    .unwrap_or_default();
-                context.push_str(&format!(
-                    "- [{}] ({}) `{}` ({} cues{dur}): {}\n",
-                    tr.workspace, tr.kind, tr.id, tr.cue_count, tr.excerpt
-                ));
-            }
-        }
-
+        let briefing = self
+            .catchup_over(&workspaces, since_hours, 15, None)
+            .map_err(|err| internal_error(err.message))?;
+        let context = format_catchup_human(&briefing, workspaces.len() > 1);
         let bounded = bound_prompt_context(&context, MAX_PROMPT_CONTEXT_CHARS);
         let text = format!(
-            "Prepare a concise executive Slack catch-up briefing from the local archive snapshot below.\n\
-             Group your response into:\n\
-             1. Urgent mentions & items needing my reply\n\
-             2. Key channel highlights\n\
-             3. Active threads worth following up on\n\
-             4. Notable takeaways from new audio/video or huddle transcripts\n\n\
+            "Prepare a concise executive Slack catch-up briefing from the local archive snapshot below.
+             Group your response into:
+             1. Urgent mentions & items needing my reply
+             2. Key channel highlights
+             3. Active threads worth following up on
+             4. Notable takeaways from new audio/video or huddle transcripts
+
              {bounded}"
         );
-
         Ok(prompt_result(
             "Summarize recent Slack activity, mentions, active threads, and new transcripts.",
             text,
@@ -3098,37 +2208,19 @@ impl McpServer {
             })?;
 
         let archive = self.open_archive(&workspace).map_err(internal_error)?;
-        let (label, channel_id, messages, user_names) = match archive.as_ref() {
-            Some(archive) => {
-                let resolved = archive
-                    .resolve_channel(&workspace, &channel_arg)
-                    .map_err(|err| internal_error(format!("resolving channel: {err}")))?;
-                let channel_id = resolved
-                    .as_ref()
-                    .map_or_else(|| raw_channel_id(&channel_arg), |r| r.id.clone());
-                let label = resolved
-                    .as_ref()
-                    .map(|r| r.label())
-                    .unwrap_or_else(|| channel_id.as_str().to_owned());
-                let mut msgs = archive
-                    .store()
-                    .thread_replies(&workspace, &channel_id, &Ts::from(thread_ts_arg.as_str()))
-                    .map_err(|err| internal_error(format!("reading thread: {err}")))?;
-                msgs.retain(|m| !m.deleted);
-                msgs.truncate(100);
-                let users = archive.user_display_map(&workspace).unwrap_or_default();
-                (label, channel_id, msgs, users)
-            }
-            None => {
-                let channel_id = raw_channel_id(&channel_arg);
-                (
-                    channel_id.as_str().to_owned(),
-                    channel_id,
-                    Vec::new(),
-                    HashMap::new(),
-                )
-            }
-        };
+        let read = local_thread(
+            &workspace,
+            archive.as_ref(),
+            &channel_arg,
+            &Ts::from(thread_ts_arg.as_str()),
+        )
+        .map_err(|err| internal_error(err.message))?;
+        let channel_id = read.channel;
+        let label = read.label.unwrap_or_else(|| channel_id.as_str().to_owned());
+        let user_names = read.user_names;
+        let mut messages = read.messages;
+        messages.retain(|m| !m.deleted);
+        messages.truncate(100);
 
         let mut context = format!(
             "## Thread Context\nWorkspace: `{}` · Channel: {} (`{}`) · Thread: `{}` · Messages: {}\n\n",
@@ -3184,41 +2276,22 @@ impl McpServer {
             })?;
 
         let archive = self.open_archive(&workspace).map_err(internal_error)?;
-        let (label, channel_id, messages, user_names) = match archive.as_ref() {
-            Some(archive) => {
-                let resolved = archive
-                    .resolve_channel(&workspace, &channel_arg)
-                    .map_err(|err| internal_error(format!("resolving channel: {err}")))?;
-                let channel_id = resolved
-                    .as_ref()
-                    .map_or_else(|| raw_channel_id(&channel_arg), |r| r.id.clone());
-                let label = resolved
-                    .as_ref()
-                    .map(|r| r.label())
-                    .unwrap_or_else(|| channel_id.as_str().to_owned());
-                let msgs = read_channel_window(
-                    archive.store(),
-                    &workspace,
-                    &channel_id,
-                    None,
-                    limit,
-                    cutoff_secs,
-                    false,
-                )
-                .map_err(|err| internal_error(format!("reading channel: {err}")))?;
-                let users = archive.user_display_map(&workspace).unwrap_or_default();
-                (label, channel_id, msgs, users)
-            }
-            None => {
-                let channel_id = raw_channel_id(&channel_arg);
-                (
-                    channel_id.as_str().to_owned(),
-                    channel_id,
-                    Vec::new(),
-                    HashMap::new(),
-                )
-            }
-        };
+        let read = local_channel(
+            &workspace,
+            archive.as_ref(),
+            &channel_arg,
+            &ChannelWindow {
+                since_secs: cutoff_secs,
+                limit,
+                include_deleted: false,
+                ..ChannelWindow::default()
+            },
+        )
+        .map_err(|err| internal_error(err.message))?;
+        let channel_id = read.channel;
+        let label = read.label.unwrap_or_else(|| channel_id.as_str().to_owned());
+        let user_names = read.user_names;
+        let messages = read.messages;
 
         let window_desc = since.as_deref().unwrap_or("recent");
         let mut context = format!(
@@ -3281,29 +2354,26 @@ impl McpServer {
                     invalid_params("no workspace resolved; pass `workspace` in prompt arguments")
                 })?;
             if let Some(archive) = self.open_archive(&workspace).map_err(internal_error)? {
-                let resolved = archive
-                    .resolve_channel(&workspace, ch_arg)
-                    .map_err(|err| internal_error(format!("resolving channel: {err}")))?;
-                let ch_id = resolved
-                    .as_ref()
-                    .map_or_else(|| raw_channel_id(ch_arg), |r| r.id.clone());
-                let label = resolved
-                    .as_ref()
-                    .map(|r| r.label())
-                    .unwrap_or_else(|| ch_id.as_str().to_owned());
-                let msgs = read_channel_window(
-                    archive.store(),
+                let read = local_channel(
                     &workspace,
-                    &ch_id,
-                    None,
-                    80,
-                    cutoff_secs,
-                    false,
+                    Some(&archive),
+                    ch_arg,
+                    &ChannelWindow {
+                        since_secs: cutoff_secs,
+                        limit: 80,
+                        include_deleted: false,
+                        ..ChannelWindow::default()
+                    },
                 )
-                .map_err(|err| internal_error(format!("reading channel: {err}")))?;
-                let users = archive.user_display_map(&workspace).unwrap_or_default();
+                .map_err(|err| internal_error(err.message))?;
+                let ch_id = read.channel;
+                let label = read.label.unwrap_or_else(|| ch_id.as_str().to_owned());
+                let msgs = read.messages;
+                let users = read.user_names;
                 context.push_str(&format!(
-                    "Scope: workspace `{}` · channel {} (`{}`)\n\n",
+                    "Scope: workspace `{}` · channel {} (`{}`)
+
+",
                     workspace.as_str(),
                     label,
                     ch_id.as_str()
@@ -3431,7 +2501,7 @@ impl McpServer {
                     .as_ref()
                     .map(|c| format!(" · channel `{}`", c.as_str()))
                     .unwrap_or_default();
-                let body = collapse_excerpt(&entry.transcript.text, 800);
+                let body = truncate_chars(&entry.transcript.text, 800);
                 context.push_str(&format!(
                     "- [{}] file `{}` (`{}`{dur}{ch_part}): {body}\n",
                     ws.as_str(),
@@ -3528,6 +2598,66 @@ fn invalid_args(message: impl Into<String>) -> ToolError {
     tool_err("invalid_args", message)
 }
 
+impl From<CmdError> for ToolError {
+    fn from(err: CmdError) -> Self {
+        tool_err(err.code, err.message)
+    }
+}
+
+/// `read_channel`'s document for a live or archived channel read.
+fn channel_json(read: &ChannelRead, workspace: &TeamId, live: bool) -> Value {
+    let (mut json, _) = channel_payload(read);
+    json["workspace"] = json!(workspace.as_str());
+    json["live"] = json!(live);
+    json
+}
+
+/// `read_thread`'s (and the thread resource's) document; the resource names no workspace.
+fn thread_json(read: &ThreadRead, thread_ts: &Ts, live: bool, workspace: Option<&TeamId>) -> Value {
+    let (mut json, _) = thread_payload(read, thread_ts, live);
+    if let Some(workspace) = workspace {
+        json["workspace"] = json!(workspace.as_str());
+    }
+    json
+}
+
+/// `export_conversation`'s document: the rendered artifact and what it was rendered from.
+fn export_json(
+    workspace: &TeamId,
+    req: &ExportRequest<'_>,
+    artifact: slackless_core::export::ExportArtifact,
+    channel: Option<ChannelId>,
+    format: ExportKind,
+) -> Value {
+    let mut json = json!({
+        "workspace": workspace.as_str(),
+        "target": match req {
+            ExportRequest::FileTranscript { .. } => "file_transcript",
+            ExportRequest::HuddleTranscript { .. } => "huddle_transcript",
+            ExportRequest::Channel { thread_ts: Some(_), .. } => "thread",
+            ExportRequest::Channel { .. } => "channel",
+        },
+        "format": format,
+        "title": artifact.title,
+        "suggested_filename": artifact.suggested_filename,
+        "item_count": artifact.item_count,
+        "content": artifact.content,
+    });
+    match req {
+        ExportRequest::FileTranscript { file_id } => json["file_id"] = json!(file_id.as_str()),
+        ExportRequest::HuddleTranscript { call_id } => json["huddle_id"] = json!(call_id),
+        ExportRequest::Channel { thread_ts, .. } => {
+            if let Some(channel) = channel {
+                json["channel"] = json!(channel.as_str());
+            }
+            if let Some(ts) = thread_ts {
+                json["thread_ts"] = json!(ts.as_str());
+            }
+        }
+    }
+    json
+}
+
 /// A successful tool result: the payload as compact JSON in a single text block.
 fn tool_ok(payload: &impl Serialize) -> CallToolResult {
     let text = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_owned());
@@ -3550,108 +2680,14 @@ fn check_secrets_mcp(text: &str, allow_secrets: bool) -> Option<ToolError> {
     if allow_secrets {
         return None;
     }
-    let hits = slackless_core::detect_secrets(text);
-    if hits.is_empty() {
-        return None;
-    }
-    let summary: Vec<String> = hits
-        .iter()
-        .map(|h| format!("{} ({})", h.kind, h.preview))
-        .collect();
-    Some(tool_err(
-        "secret_detected",
-        format!(
-            "refused to send possible secret(s): {}; pass `allow_secrets: true` to override",
-            summary.join(", ")
-        ),
-    ))
-}
-
-/// Paginated local channel read supporting both `before` (ts cursor) and `since` (epoch cutoff)
-/// without letting deleted tombstones starve `limit`.
-fn read_channel_window(
-    store: &Store,
-    workspace: &TeamId,
-    channel: &ChannelId,
-    initial_before: Option<&Ts>,
-    limit: usize,
-    cutoff_secs: Option<i64>,
-    include_deleted: bool,
-) -> slackless_core::store::Result<Vec<StoredMessage>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    if include_deleted && cutoff_secs.is_none() {
-        return store.channel_history(workspace, channel, initial_before, limit);
-    }
-
-    let page_size = limit.clamp(64, 500);
-    let mut collected: Vec<StoredMessage> = Vec::with_capacity(limit.min(512));
-    let mut before: Option<Ts> = initial_before.cloned();
-
-    'pages: loop {
-        let page = store.channel_history(workspace, channel, before.as_ref(), page_size)?;
-        if page.is_empty() {
-            break;
-        }
-        let page_len = page.len();
-        let oldest_ts = page[0].message.ts.clone();
-
-        for msg in page.into_iter().rev() {
-            if let Some(cutoff) = cutoff_secs {
-                match msg.message.ts.secs() {
-                    Some(secs) if secs < cutoff => break 'pages,
-                    Some(_) => {}
-                    None => continue,
-                }
-            }
-            if !include_deleted && msg.deleted {
-                continue;
-            }
-            collected.push(msg);
-            if collected.len() >= limit {
-                break 'pages;
-            }
-        }
-
-        if page_len < page_size || before.as_ref() == Some(&oldest_ts) {
-            break;
-        }
-        before = Some(oldest_ts);
-    }
-
-    collected.reverse();
-    Ok(collected)
-}
-
-/// Round-robin interleave per-workspace ranked hit lists up to `limit` so an early workspace
-/// with `>= limit` hits cannot starve later workspaces when sorting by local BM25 relevance.
-fn interleave_round_robin<T>(lists: Vec<Vec<T>>, limit: usize) -> Vec<T> {
-    if limit == 0 {
-        return Vec::new();
-    }
-    let mut queues: Vec<VecDeque<T>> = lists
-        .into_iter()
-        .filter(|list| !list.is_empty())
-        .map(VecDeque::from)
-        .collect();
-    let mut out = Vec::with_capacity(limit);
-    while out.len() < limit {
-        let mut progressed = false;
-        for queue in &mut queues {
-            if let Some(item) = queue.pop_front() {
-                out.push(item);
-                progressed = true;
-                if out.len() >= limit {
-                    break;
-                }
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-    out
+    detect_secret_hits(text).map(|summary| {
+        tool_err(
+            "secret_detected",
+            format!(
+                "refused to send possible secret(s): {summary}; pass `allow_secrets: true` to override"
+            ),
+        )
+    })
 }
 
 fn prompt_req_str(args: &Map<String, Value>, key: &str) -> Result<String, ErrorData> {
@@ -3753,23 +2789,6 @@ fn transcript_duration_secs(cues: &[TranscriptCue]) -> Option<f64> {
     max_secs
 }
 
-fn collapse_excerpt(text: &str, max_chars: usize) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if max_chars == 0 {
-        return String::new();
-    }
-    if collapsed.chars().count() > max_chars {
-        let mut out: String = collapsed
-            .chars()
-            .take(max_chars.saturating_sub(1))
-            .collect();
-        out.push('…');
-        out
-    } else {
-        collapsed
-    }
-}
-
 fn bound_prompt_context(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_owned();
@@ -3806,9 +2825,9 @@ fn format_prompt_message(
         .unwrap_or_default();
     let plain = mrkdwn_to_plain(&msg.text);
     let body = if plain.trim().is_empty() {
-        collapse_excerpt(&msg.text, 600)
+        truncate_chars(&msg.text, 600)
     } else {
-        collapse_excerpt(&plain, 600)
+        truncate_chars(&plain, 600)
     };
     let replies = msg
         .reply_count
@@ -4643,9 +3662,10 @@ mod tests {
                 tool_err(35, "export_conversation", json!({"channel":"#eng","file_id":"F_CLIP1"}), "invalid_args"),
                 tool_err(36, "export_conversation", json!({"huddle_id":"R_MISSING"}), "not_found"),
                 tool(37, "get_catchup_summary", json!({"since_hours":24}), vec![
-                    ("since_hours", json!(24)),
-                    ("all_workspaces", json!(false)),
-                    ("workspaces", json!(["T1"])),
+                    ("workspaces[0].team_id", json!("T1")),
+                    ("window.kind", json!("custom")),
+                    // Newest first; the 2023 huddle R_HUDDLE1 is outside the 24-hour window.
+                    ("transcripts[*].call_id", json!([null, "R_PROMPT1"])),
                 ]),
                 // The secret guard runs before any session or network use.
                 tool_err(38, "send_message", json!({"channel":"#eng","text":fake_secret}), "secret_detected"),
@@ -4700,8 +3720,8 @@ mod tests {
                 (json!({"jsonrpc":"2.0","id":55,"method":"prompts/get","params":{"name":"catch_up","arguments":{"since_hours":"24"}}}), Expect::Result(vec![
                     ("messages[0].role", json!("user")),
                     ("messages[0].content.type", json!("text")),
-                    ("messages[0].content.text~", json!("#eng")),
-                    ("messages[0].content.text~", json!("R_PROMPT1")),
+                    ("messages[0].content.text~", json!("TRANSCRIPTS (2)")),
+                    ("messages[0].content.text~", json!("failover drill passed in 14 seconds")),
                     ("description~", json!("Summarize recent Slack activity")),
                 ])),
                 (json!({"jsonrpc":"2.0","id":56,"method":"prompts/get","params":{"name":"summarize_thread","arguments":{"channel":"#eng","thread_ts":"1700000200.000100"}}}), Expect::Result(vec![
@@ -4834,6 +3854,8 @@ mod tests {
         .await;
     }
 
+    /// `get_catchup_summary` is the core catch-up briefing: only activity inside the window,
+    /// with self-posts and muted chatter left out.
     #[tokio::test]
     async fn catchup_summary_windows_activity_and_excludes_old_items() {
         let dir = TempDir::new("catchup");
@@ -4929,44 +3951,48 @@ mod tests {
                     "get_catchup_summary",
                     json!({"since_hours":24}),
                     vec![
-                        ("totals.active_channels", json!(2)),
-                        ("totals.unread_channels", json!(1)),
-                        ("totals.mentions", json!(1)),
-                        ("totals.active_threads", json!(1)),
-                        ("totals.new_transcripts", json!(2)),
-                        ("channels[*].channel", json!(["C_ENG", "C_NOISE"])),
-                        ("channels[0].unread_count", json!(2)),
-                        ("channels[1].muted", json!(true)),
-                        ("mentions[0].ts", json!(thread_root)),
-                        ("mentions[0].user_name", json!("Bob")),
-                        ("active_threads[0].thread_ts", json!(thread_root)),
-                        ("new_transcripts[*].id", json!(["F_NEW", "R_NEW"])),
+                        ("workspaces[*].team_id", json!(["T1"])),
+                        ("window.kind", json!("custom")),
+                        // Bob's <@U1> mention; Ana's own reply and the 100h-old message are out.
+                        ("mentions[*].ts", json!([thread_root])),
+                        ("mentions[0].kind", json!("direct_mention")),
+                        ("mentions[0].author_name", json!("Bob")),
+                        ("unread_channels[*].channel", json!(["C_ENG"])),
+                        ("unread_channels[0].mention_count", json!(1)),
+                        ("active_threads[*].thread_ts", json!([thread_root])),
+                        ("active_threads[0].new_reply_count", json!(1)),
+                        ("transcripts[*].file_id", json!(["F_NEW", null])),
+                        ("transcripts[1].call_id", json!("R_NEW")),
                     ],
+                ),
+                // An explicit user id replaces the signed-in one for every workspace.
+                tool(
+                    3,
+                    "get_catchup_summary",
+                    json!({"since_hours":24,"user_id":"U2"}),
+                    vec![("mentions", json!([]))],
                 ),
             ],
         )
         .await;
     }
 
-    /// With `sort: "relevant"`, per-workspace ranked lists are interleaved round-robin so the
-    /// first workspace cannot starve later ones.
+    /// With `sort: "relevant"`, hits are merged by BM25 rank across workspaces instead of
+    /// interleaved per workspace, so the strongest hit wins whatever archive it lives in.
     #[tokio::test]
-    async fn relevant_search_interleaves_workspaces() {
-        let dir = TempDir::new("interleave");
-        for (team, channel, stamps) in [
-            ("T1", "C1", &[100, 200, 300][..]),
-            ("T2", "C2", &[400, 500][..]),
-        ] {
+    async fn relevant_search_ranks_hits_across_workspaces() {
+        let dir = TempDir::new("rank");
+        for (team, body) in [("T1", "aurora notes"), ("T2", "aurora aurora aurora notes")] {
             let team_id = TeamId::from(team);
             let mut store =
                 Store::open(dir.path().join(format!("{team}.sqlite"))).expect("open store");
-            let messages: Vec<Message> = stamps
-                .iter()
-                .map(|s| msg(format!("1700000{s:04}.000000"), None, "aurora notes"))
-                .collect();
             store
-                .upsert_messages(&team_id, &ChannelId::from(channel), &messages)
-                .expect("upsert messages");
+                .upsert_message(
+                    &team_id,
+                    &ChannelId::from("C1"),
+                    &msg("1700000100.000000", None, body),
+                )
+                .expect("upsert message");
         }
         run_table(
             McpServer::for_test(dir.path().to_path_buf(), Vec::new(), None, false),
@@ -4975,17 +4001,14 @@ mod tests {
                 tool(
                     2,
                     "search_messages",
-                    json!({"query":"aurora","all_workspaces":true,"sort":"relevant","limit":2}),
-                    vec![
-                        ("count", json!(2)),
-                        ("messages[*].workspace", json!(["T1", "T2"])),
-                    ],
+                    json!({"query":"aurora","all_workspaces":true,"sort":"relevant","limit":1}),
+                    vec![("count", json!(1)), ("messages[0].workspace", json!("T2"))],
                 ),
                 tool(
                     3,
                     "search_messages",
                     json!({"query":"aurora","all_workspaces":true,"sort":"relevant","limit":4}),
-                    vec![("messages[*].workspace", json!(["T1", "T2", "T1", "T2"]))],
+                    vec![("messages[*].workspace", json!(["T2", "T1"]))],
                 ),
             ],
         )

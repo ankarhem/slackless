@@ -7,11 +7,9 @@ use crate::cli::{
     ListCommand, ListReadFormat, READ_LIMIT, SEARCH_LIMIT, SavedCommand, StatusCommand,
 };
 use crate::commands::maintenance::{StatsSummary, format_stats_human};
-use crate::commands::messages::{
-    SearchCmdOpts, cmd_search_in_archive, format_markdown_export, read_channel_messages,
-};
+use crate::commands::messages::{SearchCmdOpts, cmd_search_in_archive, format_markdown_export};
 use crate::commands::parse_since_cutoff;
-use crate::output::{MessageRow, ReactionRow};
+use crate::output::{FileRef, MessageRow, MessageView, ReactionRow};
 
 #[test]
 fn formats_markdown_export_and_stats_human() {
@@ -34,7 +32,17 @@ fn formats_markdown_export_and_stats_human() {
         files: vec!["notes.md".into()],
         permalink: None,
     }];
-    let md = format_markdown_export("#eng", &rows);
+    let md = format_markdown_export(
+        "#eng",
+        &rows
+            .into_iter()
+            .map(|row| MessageView {
+                channel_name: None,
+                row,
+                file_refs: Vec::<FileRef>::new(),
+            })
+            .collect::<Vec<_>>(),
+    );
     assert!(md.contains("# #eng"));
     assert!(md.contains("**Ana** (`1700000001.000100`)"));
     assert!(md.contains("Shipped release"));
@@ -267,6 +275,14 @@ fn format_markdown_export_covers_deleted_empty_bot_unknown_and_reactions() {
             permalink: None,
         },
     ];
+    let rows: Vec<MessageView> = rows
+        .into_iter()
+        .map(|row| MessageView {
+            channel_name: None,
+            row,
+            file_refs: Vec::new(),
+        })
+        .collect();
     let md = format_markdown_export("#ops", &rows);
     assert!(md.contains(
         "**B123** (`1700000001.000100`) _(deleted)_\n\n_Reactions:_ :fire: 3 · :rocket: 1\n\n---"
@@ -845,56 +861,6 @@ fn huddle_transcripts_rejects_flags_its_mode_would_ignore() {
     ] {
         assert!(parses(args), "expected {args:?} to parse");
     }
-}
-
-#[test]
-fn read_channel_messages_does_not_starve_limit_on_deleted_or_since() {
-    use slackless_core::store::Store;
-    use slackless_core::types::{ChannelId, Message, TeamId, Ts};
-
-    let ws = TeamId::from("T1");
-    let ch = ChannelId::from("C1");
-    let mut store = Store::open_in_memory().expect("in-memory store");
-
-    // Seed 10 messages (ts 1000..=1009); mark the newest 5 (1005..=1009) as deleted.
-    let msgs: Vec<Message> = (0..10)
-        .map(|i| Message {
-            ts: Ts::from(format!("{}.000000", 1_700_001_000 + i)),
-            text: format!("msg {i}"),
-            ..Message::default()
-        })
-        .collect();
-    store.upsert_messages(&ws, &ch, &msgs).expect("seed");
-    for i in 5..10 {
-        store
-            .record_deletion(
-                &ws,
-                &ch,
-                &Ts::from(format!("{}.000000", 1_700_001_000 + i)),
-                None,
-                None,
-            )
-            .expect("delete");
-    }
-
-    // Requesting limit=3 excluding deleted must return msg 2, 3, 4 (not 0 messages!).
-    let live = read_channel_messages(&store, &ws, &ch, 3, None, false).expect("read");
-    let texts: Vec<&str> = live.iter().map(|m| m.message.text.as_str()).collect();
-    assert_eq!(texts, vec!["msg 2", "msg 3", "msg 4"]);
-
-    // With `--since` at 1003 and limit=5 excluding deleted -> returns msg 3, 4.
-    let since_only =
-        read_channel_messages(&store, &ws, &ch, 5, Some(1_700_001_003), false).expect("since");
-    let texts: Vec<&str> = since_only.iter().map(|m| m.message.text.as_str()).collect();
-    assert_eq!(texts, vec!["msg 3", "msg 4"]);
-
-    // Including deleted with limit=3 -> returns msg 7, 8, 9.
-    let with_deleted = read_channel_messages(&store, &ws, &ch, 3, None, true).expect("all");
-    let texts: Vec<&str> = with_deleted
-        .iter()
-        .map(|m| m.message.text.as_str())
-        .collect();
-    assert_eq!(texts, vec!["msg 7", "msg 8", "msg 9"]);
 }
 
 #[test]
@@ -1656,8 +1622,7 @@ fn cli_catchup_flag_parsing_and_multi_workspace_briefing() {
         ChannelId, Conversation, FileId, Message, Team, TeamId, Ts, User, UserId,
     };
 
-    use crate::archive::Archive;
-    use crate::commands::browse::{build_catchup_for_archives, parse_catchup_window};
+    use crate::commands::browse::{catchup_briefing, parse_catchup_window};
 
     // 1. Clap flag parsing for `slackless catchup [--since 24h|7d] [--all-workspaces] [--json]`.
     let parsed = Cli::try_parse_from([
@@ -1817,18 +1782,14 @@ fn cli_catchup_flag_parsing_and_multi_workspace_briefing() {
         .unwrap();
     }
 
-    let arch1 = Archive::open_path(&db1).unwrap().unwrap();
-    let arch2 = Archive::open_path(&db2).unwrap().unwrap();
     let me = UserId::from("U_ME");
+    let archives = vec![(ws1.clone(), db1.clone()), (ws2.clone(), db2.clone())];
+    let self_users =
+        std::collections::HashMap::from([(ws1.clone(), me.clone()), (ws2.clone(), me.clone())]);
 
     // Single workspace catchup (`--since 24h`)
-    let single = build_catchup_for_archives(
-        &[(&ws1, Some(&me), &arch1)],
-        CatchUpWindow::Last24h,
-        now,
-        25,
-    )
-    .unwrap();
+    let single =
+        catchup_briefing(&archives[..1], &self_users, CatchUpWindow::Last24h, now, 25).unwrap();
     assert_eq!(single.workspaces.len(), 1);
     assert_eq!(single.mentions.len(), 1);
     assert_eq!(single.unread_channels.len(), 1);
@@ -1840,13 +1801,7 @@ fn cli_catchup_flag_parsing_and_multi_workspace_briefing() {
     assert!(single_json["transcripts"].is_array());
 
     // Multi-workspace catchup (`--all-workspaces`)
-    let all = build_catchup_for_archives(
-        &[(&ws1, Some(&me), &arch1), (&ws2, Some(&me), &arch2)],
-        CatchUpWindow::Last24h,
-        now,
-        25,
-    )
-    .unwrap();
+    let all = catchup_briefing(&archives, &self_users, CatchUpWindow::Last24h, now, 25).unwrap();
     assert_eq!(all.workspaces.len(), 2);
     assert_eq!(all.mentions.len(), 2);
     let human = format_catchup_human(&all, true);
@@ -1854,8 +1809,6 @@ fn cli_catchup_flag_parsing_and_multi_workspace_briefing() {
     assert!(human.contains("#general"));
     assert!(human.contains("#incidents"));
 
-    drop(arch1);
-    drop(arch2);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 

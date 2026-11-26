@@ -1,72 +1,75 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use slackless_core::types::time::now_epoch_secs;
-use slackless_core::types::{TeamId, Ts};
-
-use super::{
-    all_workspace_ids, empty_local, open_archive_with_hint, parse_since_cutoff, raw_channel_id,
+use slackless_core::auth::Session;
+use slackless_core::catchup::{
+    CatchUpBriefing, CatchUpWindow, build_catchup_disk_archives, format_catchup_human,
 };
-use crate::archive::Archive;
+use slackless_core::types::time::now_epoch_secs;
+use slackless_core::types::{TeamId, Ts, UserId};
+
+use super::{CmdError, Payload, all_workspace_ids, parse_since_cutoff, raw_channel_id};
+use crate::archive::{self, Archive};
 use crate::output::{self, ChannelView, DmView, MessageRow};
-use crate::{Ctx, fail};
+use crate::{Ctx, emit_payload, fail, run_local};
 
 pub(crate) fn cmd_channels(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode> {
-    let Some(workspace) = workspace else {
-        return Ok(empty_local(
-            ctx,
-            serde_json::json!({"count": 0, "channels": []}),
-            "listing channels",
-        ));
-    };
-    let archive = open_archive_with_hint(ctx, workspace)?;
-    let rows: Vec<ChannelView> = match archive.as_ref() {
+    run_local(
+        ctx,
+        workspace,
+        serde_json::json!({"count": 0, "channels": []}),
+        "listing channels",
+        |workspace, archive| Ok(emit_payload(ctx, channels_payload(workspace, archive))),
+    )
+}
+
+fn channels_payload(workspace: &TeamId, archive: Option<&Archive>) -> Result<Payload, CmdError> {
+    let rows: Vec<ChannelView> = match archive {
         Some(archive) => archive
             .channels(workspace)
-            .with_context(|| format!("listing channels for {workspace}"))?
+            .map_err(|err| CmdError::store(err, format!("listing channels for {workspace}")))?
             .iter()
             .map(ChannelView::from_row)
             .collect(),
         None => Vec::new(),
     };
-    output::emit(
-        ctx.json,
-        &serde_json::json!({"count": rows.len(), "channels": rows}),
-        &output::channels_human(&rows),
-    );
-    Ok(ExitCode::SUCCESS)
+    Ok((
+        serde_json::json!({"count": rows.len(), "channels": rows}),
+        output::channels_human(&rows),
+    ))
 }
 
 pub(crate) fn cmd_dms(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode> {
-    let Some(workspace) = workspace else {
-        return Ok(empty_local(
-            ctx,
-            serde_json::json!({"count": 0, "dms": []}),
-            "listing DMs",
-        ));
-    };
-    let archive = open_archive_with_hint(ctx, workspace)?;
-    let rows: Vec<DmView> = match archive.as_ref() {
+    run_local(
+        ctx,
+        workspace,
+        serde_json::json!({"count": 0, "dms": []}),
+        "listing DMs",
+        |workspace, archive| Ok(emit_payload(ctx, dms_payload(workspace, archive))),
+    )
+}
+
+fn dms_payload(workspace: &TeamId, archive: Option<&Archive>) -> Result<Payload, CmdError> {
+    let rows: Vec<DmView> = match archive {
         Some(archive) => {
             let user_names = archive
                 .user_display_map(workspace)
-                .with_context(|| format!("loading users for {workspace}"))?;
+                .map_err(|err| CmdError::store(err, format!("loading users for {workspace}")))?;
             archive
                 .dms(workspace)
-                .with_context(|| format!("listing DMs for {workspace}"))?
+                .map_err(|err| CmdError::store(err, format!("listing DMs for {workspace}")))?
                 .iter()
                 .map(|row| DmView::from_row(row, &user_names))
                 .collect()
         }
         None => Vec::new(),
     };
-    output::emit(
-        ctx.json,
-        &serde_json::json!({"count": rows.len(), "dms": rows}),
-        &output::dms_human(&rows),
-    );
-    Ok(ExitCode::SUCCESS)
+    Ok((
+        serde_json::json!({"count": rows.len(), "dms": rows}),
+        output::dms_human(&rows),
+    ))
 }
 
 pub(crate) fn cmd_users(
@@ -75,47 +78,52 @@ pub(crate) fn cmd_users(
     query: Option<&str>,
     include_deleted: bool,
 ) -> Result<ExitCode> {
-    let Some(workspace) = workspace else {
-        return Ok(empty_local(
-            ctx,
-            serde_json::json!({"count": 0, "users": []}),
-            "listing users",
-        ));
-    };
-    let archive = open_archive_with_hint(ctx, workspace)?;
-    let users = match archive.as_ref() {
-        Some(archive) => archive
-            .users(workspace, query, include_deleted)
-            .with_context(|| format!("listing users for {workspace}"))?,
-        None => Vec::new(),
-    };
-    let mut human = String::new();
-    for u in &users {
-        let display = u
-            .display_name
-            .as_deref()
-            .or(u.real_name.as_deref())
-            .unwrap_or(&u.name);
-        let mut flags = Vec::new();
-        if u.is_bot {
-            flags.push("bot");
-        }
-        if u.deleted {
-            flags.push("deleted");
-        }
-        let flag_str = if flags.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", flags.join(", "))
-        };
-        human.push_str(&format!("{}\t@{}\t{}{flag_str}\n", u.id, u.name, display));
-    }
-    output::emit(
-        ctx.json,
-        &serde_json::json!({"count": users.len(), "users": users}),
-        &human,
-    );
-    Ok(ExitCode::SUCCESS)
+    run_local(
+        ctx,
+        workspace,
+        serde_json::json!({"count": 0, "users": []}),
+        "listing users",
+        |workspace, archive| {
+            let users = match archive {
+                Some(archive) => {
+                    archive
+                        .users(workspace, query, include_deleted)
+                        .map_err(|err| {
+                            CmdError::store(err, format!("listing users for {workspace}"))
+                        })?
+                }
+                None => Vec::new(),
+            };
+            let mut human = String::new();
+            for u in &users {
+                let display = u
+                    .display_name
+                    .as_deref()
+                    .or(u.real_name.as_deref())
+                    .unwrap_or(&u.name);
+                let mut flags = Vec::new();
+                if u.is_bot {
+                    flags.push("bot");
+                }
+                if u.deleted {
+                    flags.push("deleted");
+                }
+                let flag_str = if flags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", flags.join(", "))
+                };
+                human.push_str(&format!("{}\t@{}\t{}{flag_str}\n", u.id, u.name, display));
+            }
+            Ok(emit_payload(
+                ctx,
+                Ok((
+                    serde_json::json!({"count": users.len(), "users": users}),
+                    human,
+                )),
+            ))
+        },
+    )
 }
 
 pub(crate) fn cmd_threads(
@@ -124,67 +132,72 @@ pub(crate) fn cmd_threads(
     channel_arg: Option<&str>,
     limit: usize,
 ) -> Result<ExitCode> {
-    let Some(workspace) = workspace else {
-        return Ok(empty_local(
-            ctx,
-            serde_json::json!({"count": 0, "threads": []}),
-            "listing threads",
-        ));
-    };
-    let archive = open_archive_with_hint(ctx, workspace)?;
-    let (messages, names, user_names) = match archive.as_ref() {
-        Some(archive) => {
-            let resolved_ch = match channel_arg {
-                Some(arg) => Some(
-                    archive
-                        .resolve_channel(workspace, arg)
-                        .with_context(|| format!("resolving channel {arg}"))?
-                        .map_or_else(|| raw_channel_id(arg), |row| row.id),
-                ),
-                None => None,
+    run_local(
+        ctx,
+        workspace,
+        serde_json::json!({"count": 0, "threads": []}),
+        "listing threads",
+        |workspace, archive| {
+            let (messages, names, user_names) = match archive {
+                Some(archive) => {
+                    let resolved_ch = match channel_arg {
+                        Some(arg) => Some(
+                            archive
+                                .resolve_channel(workspace, arg)
+                                .map_err(|err| {
+                                    CmdError::store(err, format!("resolving channel {arg}"))
+                                })?
+                                .map_or_else(|| raw_channel_id(arg), |row| row.id),
+                        ),
+                        None => None,
+                    };
+                    (
+                        archive
+                            .store()
+                            .recent_threads(workspace, resolved_ch.as_ref(), limit)
+                            .map_err(|err| {
+                                CmdError::store(
+                                    err,
+                                    format!("listing archived threads for {workspace}"),
+                                )
+                            })?,
+                        archive.channel_names(workspace)?,
+                        archive.user_display_map(workspace)?,
+                    )
+                }
+                None => (Vec::new(), HashMap::new(), HashMap::new()),
             };
-            let messages = archive
-                .store()
-                .recent_threads(workspace, resolved_ch.as_ref(), limit)
-                .with_context(|| format!("listing archived threads for {workspace}"))?;
-            let names = archive
-                .channel_names(workspace)
-                .with_context(|| format!("reading channel names for {workspace}"))?;
-            let user_names = archive
-                .user_display_map(workspace)
-                .with_context(|| format!("reading user names for {workspace}"))?;
-            (messages, names, user_names)
-        }
-        None => (Vec::new(), HashMap::new(), HashMap::new()),
-    };
-    let rows: Vec<MessageRow> = messages
-        .iter()
-        .map(|m| MessageRow::from_stored(m, &user_names))
-        .collect();
-    let mut human = String::new();
-    for row in &rows {
-        let label = names
-            .get(row.channel.as_str())
-            .map(String::as_str)
-            .unwrap_or(&row.channel);
-        let replies = row.reply_count.unwrap_or(0);
-        let author = row
-            .user_name
-            .as_deref()
-            .or(row.user.as_deref())
-            .unwrap_or("unknown");
-        let snippet: String = row.text.chars().take(80).collect();
-        human.push_str(&format!(
-            "{label}\t{}\t{replies} replies\t{author}: {snippet}\n",
-            row.ts
-        ));
-    }
-    output::emit(
-        ctx.json,
-        &serde_json::json!({"count": rows.len(), "threads": rows}),
-        &human,
-    );
-    Ok(ExitCode::SUCCESS)
+            let rows: Vec<MessageRow> = messages
+                .iter()
+                .map(|m| MessageRow::from_stored(m, &user_names))
+                .collect();
+            let mut human = String::new();
+            for row in &rows {
+                let label = names
+                    .get(row.channel.as_str())
+                    .map(String::as_str)
+                    .unwrap_or(&row.channel);
+                let replies = row.reply_count.unwrap_or(0);
+                let author = row
+                    .user_name
+                    .as_deref()
+                    .or(row.user.as_deref())
+                    .unwrap_or("unknown");
+                let snippet: String = row.text.chars().take(80).collect();
+                human.push_str(&format!(
+                    "{label}\t{}\t{replies} replies\t{author}: {snippet}\n",
+                    row.ts
+                ));
+            }
+            Ok(emit_payload(
+                ctx,
+                Ok((
+                    serde_json::json!({"count": rows.len(), "threads": rows}),
+                    human,
+                )),
+            ))
+        },
+    )
 }
 
 pub(crate) fn cmd_revisions(
@@ -193,69 +206,74 @@ pub(crate) fn cmd_revisions(
     channel_arg: &str,
     ts: &str,
 ) -> Result<ExitCode> {
-    let Some(workspace) = workspace else {
-        return Ok(empty_local(
-            ctx,
-            serde_json::json!({"count": 0, "revisions": []}),
-            "reading revisions",
-        ));
-    };
-    let archive = open_archive_with_hint(ctx, workspace)?;
-    let (channel_id, revisions) = match archive.as_ref() {
-        Some(archive) => {
-            let channel_id = archive
-                .resolve_channel(workspace, channel_arg)
-                .with_context(|| format!("resolving channel {channel_arg}"))?
-                .map_or_else(|| raw_channel_id(channel_arg), |row| row.id);
-            let revisions = archive
-                .store()
-                .revisions(workspace, &channel_id, &Ts::from(ts))
-                .with_context(|| format!("reading revisions of {channel_id} {ts}"))?;
-            (channel_id, revisions)
-        }
-        None => (raw_channel_id(channel_arg), Vec::new()),
-    };
-    let json_rows: Vec<_> = revisions
-        .iter()
-        .map(|rev| {
-            serde_json::json!({
-                "edit_ts": rev.edit_ts,
-                "deleted": rev.deleted,
-                "text": rev.message.text,
-            })
-        })
-        .collect();
-    let mut human = String::new();
-    for (ix, rev) in revisions.iter().enumerate() {
-        let kind = if rev.edit_ts.is_empty() {
-            "original"
-        } else if rev.deleted {
-            "deleted"
-        } else {
-            "edited"
-        };
-        let stamp = if rev.edit_ts.is_empty() {
-            ts
-        } else {
-            rev.edit_ts.as_str()
-        };
-        human.push_str(&format!(
-            "#{}\t{kind}\t{stamp}\t{}\n",
-            ix + 1,
-            rev.message.text
-        ));
-    }
-    output::emit(
-        ctx.json,
-        &serde_json::json!({
-            "channel": channel_id.as_str(),
-            "ts": ts,
-            "count": json_rows.len(),
-            "revisions": json_rows,
-        }),
-        &human,
-    );
-    Ok(ExitCode::SUCCESS)
+    run_local(
+        ctx,
+        workspace,
+        serde_json::json!({"count": 0, "revisions": []}),
+        "reading revisions",
+        |workspace, archive| {
+            let (channel_id, revisions) = match archive {
+                Some(archive) => {
+                    let channel_id = archive
+                        .resolve_channel(workspace, channel_arg)
+                        .map_err(|err| {
+                            CmdError::store(err, format!("resolving channel {channel_arg}"))
+                        })?
+                        .map_or_else(|| raw_channel_id(channel_arg), |row| row.id);
+                    let revisions = archive
+                        .store()
+                        .revisions(workspace, &channel_id, &Ts::from(ts))
+                        .map_err(|err| {
+                            CmdError::store(err, format!("reading revisions of {channel_id} {ts}"))
+                        })?;
+                    (channel_id, revisions)
+                }
+                None => (raw_channel_id(channel_arg), Vec::new()),
+            };
+            let json_rows: Vec<_> = revisions
+                .iter()
+                .map(|rev| {
+                    serde_json::json!({
+                        "edit_ts": rev.edit_ts,
+                        "deleted": rev.deleted,
+                        "text": rev.message.text,
+                    })
+                })
+                .collect();
+            let mut human = String::new();
+            for (ix, rev) in revisions.iter().enumerate() {
+                let kind = if rev.edit_ts.is_empty() {
+                    "original"
+                } else if rev.deleted {
+                    "deleted"
+                } else {
+                    "edited"
+                };
+                let stamp = if rev.edit_ts.is_empty() {
+                    ts
+                } else {
+                    rev.edit_ts.as_str()
+                };
+                human.push_str(&format!(
+                    "#{}\t{kind}\t{stamp}\t{}\n",
+                    ix + 1,
+                    rev.message.text
+                ));
+            }
+            Ok(emit_payload(
+                ctx,
+                Ok((
+                    serde_json::json!({
+                        "channel": channel_id.as_str(),
+                        "ts": ts,
+                        "count": json_rows.len(),
+                        "revisions": json_rows,
+                    }),
+                    human,
+                )),
+            ))
+        },
+    )
 }
 
 pub(crate) fn cmd_digest(
@@ -270,12 +288,12 @@ pub(crate) fn cmd_digest(
         Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
     };
     let team_ids: Vec<TeamId> = if all_workspaces {
-        all_workspace_ids(ctx.sessions())
+        all_workspace_ids(ctx.sessions(), archive::stored_team_ids())
     } else {
         workspace.into_iter().cloned().collect()
     };
     if team_ids.is_empty() {
-        return Ok(empty_local(
+        return Ok(output::empty_local(
             ctx,
             serde_json::json!({
                 "since": since,
@@ -338,13 +356,15 @@ pub(crate) fn cmd_digest(
     Ok(ExitCode::SUCCESS)
 }
 
+// -----------------------------------------------------------------------------
+// Catch-Up
+// -----------------------------------------------------------------------------
+
 /// Parse CLI `--since` into a [`slackless_core::catchup::CatchUpWindow`].
 pub(crate) fn parse_catchup_window(
     since: Option<&str>,
     now_secs: i64,
 ) -> Result<slackless_core::catchup::CatchUpWindow, String> {
-    use slackless_core::catchup::CatchUpWindow;
-
     let Some(raw) = since.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(CatchUpWindow::SinceLastVisit);
     };
@@ -358,66 +378,55 @@ pub(crate) fn parse_catchup_window(
     }
 }
 
-/// Build a [`slackless_core::catchup::CatchUpBriefing`] from explicit `(workspace, self_user, archive)`
-/// slices — shared between `cmd_catchup` and deterministic offline CLI tests.
-pub(crate) fn build_catchup_for_archives(
-    archives: &[(&TeamId, Option<&slackless_core::types::UserId>, &Archive)],
-    window: slackless_core::catchup::CatchUpWindow,
+/// The archives a catch-up covers (`workspace`, or every known workspace) and, for each, the
+/// signed-in user whose mentions and DMs it looks for.
+pub(crate) fn catchup_scope(
+    sessions: &[Session],
+    workspace: Option<&TeamId>,
+    all_workspaces: bool,
+) -> (Vec<(TeamId, PathBuf)>, HashMap<TeamId, UserId>) {
+    let team_ids: Vec<TeamId> = if all_workspaces {
+        all_workspace_ids(sessions, archive::stored_team_ids())
+    } else {
+        workspace.into_iter().cloned().collect()
+    };
+    let archives = team_ids
+        .iter()
+        .filter_map(|ws| archive::store_path(ws).map(|path| (ws.clone(), path)))
+        .collect();
+    let self_users = team_ids
+        .into_iter()
+        .filter_map(|ws| {
+            sessions
+                .iter()
+                .find(|session| session.team_id == ws)
+                .map(|session| (ws, session.user_id.clone()))
+        })
+        .collect();
+    (archives, self_users)
+}
+
+/// The catch-up briefing across every existing archive in `archives`.
+pub(crate) fn catchup_briefing(
+    archives: &[(TeamId, PathBuf)],
+    self_users: &HashMap<TeamId, UserId>,
+    window: CatchUpWindow,
     now_secs: i64,
     limit: usize,
-) -> Result<slackless_core::catchup::CatchUpBriefing> {
-    use slackless_core::catchup::{CatchUpBriefing, build_workspace_catchup};
+) -> Result<CatchUpBriefing, CmdError> {
+    build_catchup_disk_archives(archives, self_users, window, now_secs, limit)
+        .map_err(|err| CmdError::store(err, "building the catch-up briefing"))
+}
 
-    if archives.is_empty() || limit == 0 {
-        return Ok(CatchUpBriefing::empty(window, now_secs));
-    }
-    let mut merged = CatchUpBriefing::empty(window, now_secs);
-    let mut min_cutoff: Option<i64> = None;
-    for (ws, self_user, archive) in archives {
-        let part = build_workspace_catchup(
-            archive.store(),
-            ws,
-            None,
-            *self_user,
-            window,
-            now_secs,
-            limit,
-        )
-        .with_context(|| format!("building catch-up briefing for {ws}"))?;
-        min_cutoff = Some(min_cutoff.map_or(part.cutoff_secs, |p| p.min(part.cutoff_secs)));
-        merged.workspaces.extend(part.workspaces);
-        merged.mentions.extend(part.mentions);
-        merged.unread_channels.extend(part.unread_channels);
-        merged.active_threads.extend(part.active_threads);
-        merged.transcripts.extend(part.transcripts);
-    }
-    if let Some(cutoff) = min_cutoff {
-        merged.cutoff_secs = cutoff;
-    }
-    merged.mentions.sort_by(|a, b| {
-        b.created_at
-            .cmp(&a.created_at)
-            .then_with(|| b.ts.cmp(&a.ts))
-    });
-    merged.mentions.truncate(limit);
-    merged.unread_channels.sort_by(|a, b| {
-        b.mention_count
-            .cmp(&a.mention_count)
-            .then_with(|| b.message_count.cmp(&a.message_count))
-            .then_with(|| b.latest_at.cmp(&a.latest_at))
-    });
-    merged.unread_channels.truncate(limit);
-    merged.active_threads.sort_by(|a, b| {
-        b.latest_reply_at
-            .cmp(&a.latest_reply_at)
-            .then_with(|| b.new_reply_count.cmp(&a.new_reply_count))
-    });
-    merged.active_threads.truncate(limit);
-    merged
-        .transcripts
-        .sort_by_key(|a| std::cmp::Reverse(a.updated_at));
-    merged.transcripts.truncate(limit);
-    Ok(merged)
+/// A catch-up briefing as both surfaces return it: the briefing document and its human text.
+pub(crate) fn catchup_payload(
+    briefing: &CatchUpBriefing,
+    multi_workspace: bool,
+) -> Result<Payload, CmdError> {
+    Ok((
+        serde_json::to_value(briefing)?,
+        format_catchup_human(briefing, multi_workspace),
+    ))
 }
 
 pub(crate) fn cmd_catchup(
@@ -427,44 +436,23 @@ pub(crate) fn cmd_catchup(
     all_workspaces: bool,
     limit: usize,
 ) -> Result<ExitCode> {
-    use slackless_core::catchup::{CatchUpBriefing, format_catchup_human};
-
     let now_secs = now_epoch_secs();
     let window = match parse_catchup_window(since, now_secs) {
         Ok(w) => w,
         Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
     };
-    let team_ids: Vec<TeamId> = if all_workspaces {
-        all_workspace_ids(ctx.sessions())
-    } else {
-        workspace.into_iter().cloned().collect()
-    };
-    if team_ids.is_empty() {
+    let (archives, self_users) = catchup_scope(ctx.sessions(), workspace, all_workspaces);
+    if archives.is_empty() {
         let empty = CatchUpBriefing::empty(window, now_secs);
-        return Ok(empty_local(
+        return Ok(output::empty_local(
             ctx,
-            serde_json::to_value(&empty).unwrap_or_default(),
+            serde_json::to_value(&empty)?,
             "building catch-up briefing",
         ));
     }
-
-    let mut opened: Vec<(TeamId, Option<slackless_core::types::UserId>, Archive)> = Vec::new();
-    for ws in team_ids {
-        let Some(archive) =
-            Archive::open(&ws).with_context(|| format!("opening local archive for {ws}"))?
-        else {
-            continue;
-        };
-        let self_user = ctx.session_user(&ws);
-        opened.push((ws, self_user, archive));
-    }
-
-    let refs: Vec<(&TeamId, Option<&slackless_core::types::UserId>, &Archive)> = opened
-        .iter()
-        .map(|(ws, user, arch)| (ws, user.as_ref(), arch))
-        .collect();
-    let briefing = build_catchup_for_archives(&refs, window, now_secs, limit)?;
-    let human = format_catchup_human(&briefing, all_workspaces || briefing.workspaces.len() > 1);
-    output::emit(ctx.json, &briefing, &human);
-    Ok(ExitCode::SUCCESS)
+    let briefing = catchup_briefing(&archives, &self_users, window, now_secs, limit)?;
+    Ok(emit_payload(
+        ctx,
+        catchup_payload(&briefing, all_workspaces || briefing.workspaces.len() > 1),
+    ))
 }

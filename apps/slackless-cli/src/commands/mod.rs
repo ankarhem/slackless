@@ -5,117 +5,86 @@ pub(crate) mod messages;
 pub(crate) mod summarize;
 
 use std::collections::HashSet;
-use std::path::Path;
-use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use slackless_core::auth::Session;
+use slackless_core::store::StoreError;
 use slackless_core::types::time::{days_from_civil, days_in_month};
 use slackless_core::types::{ChannelId, TeamId};
 
-use crate::archive::{self, Archive};
+use crate::session::is_valid_workspace_id;
 use crate::write::parse_duration_secs;
-use crate::{Ctx, fail, output};
 
-/// Opens a workspace archive read-only, propagating genuine SQLite errors while printing a
-/// stderr hint in human mode when no archive file exists yet.
-pub(crate) fn open_archive_with_hint(ctx: &Ctx, workspace: &TeamId) -> Result<Option<Archive>> {
-    let archive = Archive::open(workspace)
-        .with_context(|| format!("opening local archive for {workspace}"))?;
-    if archive.is_none() && !ctx.json {
-        archive_hint(workspace);
-    }
-    Ok(archive)
+/// A command's output: the `--json` document and the tab-separated text. Commands build it and
+/// never print; the CLI emits it and the MCP server returns the JSON.
+pub(crate) type Payload = (serde_json::Value, String);
+
+/// A command failure with the code agents branch on. Store failures map to `store_error` and
+/// anything else to `command_failed`, as the CLI's top-level handler does.
+#[derive(Debug)]
+pub(crate) struct CmdError {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
-/// Every workspace known from stored sessions or local archive files, deduplicated in O(n)
-/// while preserving session-first order.
-pub(crate) fn all_workspace_ids(sessions: &[Session]) -> Vec<TeamId> {
+impl CmdError {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// A failed archive read or write, naming the operation that failed.
+    pub(crate) fn store(err: impl std::fmt::Display, doing: impl std::fmt::Display) -> Self {
+        Self::new("store_error", format!("{doing}: {err}"))
+    }
+}
+
+impl From<StoreError> for CmdError {
+    fn from(err: StoreError) -> Self {
+        Self::new("store_error", err.to_string())
+    }
+}
+
+impl From<anyhow::Error> for CmdError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::new("command_failed", format!("{err:#}"))
+    }
+}
+
+impl From<serde_json::Error> for CmdError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::new("command_failed", err.to_string())
+    }
+}
+
+impl std::fmt::Display for CmdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CmdError {}
+
+/// Every workspace from `sessions` then `archive_ids`, deduplicated while preserving that
+/// order and skipping ids that are not safe archive file names.
+pub(crate) fn all_workspace_ids(
+    sessions: &[Session],
+    archive_ids: impl IntoIterator<Item = TeamId>,
+) -> Vec<TeamId> {
     let mut seen = HashSet::new();
-    let mut ids = Vec::new();
-    for s in sessions {
-        if seen.insert(s.team_id.clone()) {
-            ids.push(s.team_id.clone());
-        }
-    }
-    for tid in archive::stored_team_ids() {
-        if seen.insert(tid.clone()) {
-            ids.push(tid);
-        }
-    }
-    ids
-}
-
-/// Write rendered export output to `out` (emitting a JSON or human confirmation) or print to stdout.
-pub(crate) fn write_or_print_export(
-    ctx: &Ctx,
-    rendered: &str,
-    out: Option<&Path>,
-    count: usize,
-    item_noun: &str,
-) -> Result<()> {
-    if let Some(path) = out {
-        std::fs::write(path, rendered)
-            .with_context(|| format!("writing export to {}", path.display()))?;
-        if ctx.json {
-            output::emit_json(&serde_json::json!({
-                "ok": true,
-                "path": path.display().to_string(),
-                "count": count,
-            }));
-        } else {
-            eprintln!("Exported {count} {item_noun} to {}", path.display());
-        }
-    } else {
-        print!("{rendered}");
-        if !rendered.ends_with('\n') {
-            println!();
-        }
-    }
-    Ok(())
+    sessions
+        .iter()
+        .map(|s| s.team_id.clone())
+        .chain(archive_ids)
+        .filter(|id| is_valid_workspace_id(id.as_str()) && seen.insert(id.clone()))
+        .collect()
 }
 
 /// The channel id when the archive cannot resolve the argument.
 pub(crate) fn raw_channel_id(arg: &str) -> ChannelId {
     ChannelId::from(arg.strip_prefix('#').unwrap_or(arg))
-}
-
-/// Prints empty `--json` results (or a human hint) when no workspace is known: local read
-/// commands succeed with empty output rather than failing hard offline.
-pub(crate) fn empty_local(ctx: &Ctx, empty: serde_json::Value, action: &str) -> ExitCode {
-    if ctx.json {
-        output::emit_json(&empty);
-    } else {
-        eprintln!("slackless: {}", no_workspace_message(action));
-    }
-    ExitCode::SUCCESS
-}
-
-/// Fails an archive action (vacuum, check, backup, summarize) when no workspace is known.
-pub(crate) fn fail_no_workspace(ctx: &Ctx, action: &str) -> ExitCode {
-    fail(ctx, "no_workspace", &no_workspace_message(action))
-}
-
-fn no_workspace_message(action: &str) -> String {
-    format!(
-        "no workspace known for {action}; pass --workspace TEAM_ID (run `slackless auth login` first)"
-    )
-}
-
-/// A note on stderr when a workspace has no local archive to read.
-pub(crate) fn archive_hint(workspace: &TeamId) {
-    eprintln!("slackless: {}", no_archive_message(workspace));
-}
-
-/// Fails an archive action when the workspace has no local archive file yet.
-pub(crate) fn fail_no_archive(ctx: &Ctx, workspace: &TeamId) -> ExitCode {
-    fail(ctx, "no_archive", &no_archive_message(workspace))
-}
-
-fn no_archive_message(workspace: &TeamId) -> String {
-    format!(
-        "no local archive for workspace {workspace} yet; it fills up once the desktop app syncs"
-    )
 }
 
 /// Parse a `--since` cutoff (`30m`, `24h`, `7d`, `2w`, `YYYY-MM-DD`, or unix seconds) into

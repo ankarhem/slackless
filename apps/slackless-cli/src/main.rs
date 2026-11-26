@@ -21,14 +21,17 @@ mod write;
 
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
+use slackless_core::types::TeamId;
 
+use crate::archive::Archive;
 use crate::cli::{
     ArchiveCommand, AuthCommand, CanvasCommand, Cli, Commands, HuddleCommand, ListCommand,
     SavedCommand, StatusCommand,
 };
 pub(crate) use crate::cli::{CLI_VERSION, CanvasAccessArg, ListReadFormat};
+use crate::commands::CmdError;
 use crate::commands::auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
 use crate::commands::browse::{
     cmd_catchup, cmd_channels, cmd_digest, cmd_dms, cmd_revisions, cmd_threads, cmd_users,
@@ -38,11 +41,13 @@ use crate::commands::maintenance::{
     cmd_archive_semantic_model, cmd_archive_status, cmd_stats, cmd_vacuum,
 };
 use crate::commands::messages::{
-    ExportCmdOpts, SearchAllOpts, SemanticSearchCmdOpts, cmd_export, cmd_read, cmd_search,
-    cmd_search_all_workspaces, cmd_search_semantic, cmd_thread,
+    ExportCmdOpts, SearchAllOpts, SearchCmdOpts, SemanticSearchCmdOpts, cmd_export, cmd_read,
+    cmd_search, cmd_search_all_workspaces, cmd_search_semantic, cmd_thread,
 };
 use crate::commands::summarize::cmd_summarize;
 use crate::live::{HuddleJoinArgs, HuddleTranscriptsArgs};
+pub(crate) use crate::output::fail;
+use crate::output::{archive_hint, emit_payload};
 pub(crate) use crate::session::Ctx;
 use crate::session::validate_workspace_id;
 use crate::write::{
@@ -50,14 +55,32 @@ use crate::write::{
     run_scheduled, run_send, run_thread_live, run_unreact, run_unschedule, run_upload,
 };
 
-/// A user-actionable failure: message + JSON envelope, not an error dump.
-pub(crate) fn fail(ctx: &Ctx, code: &str, message: &str) -> ExitCode {
-    if ctx.json {
-        output::emit_json(&serde_json::json!({"ok": false, "error": code, "message": message}));
-    } else {
-        eprintln!("slackless: {message}");
+/// Opens a workspace archive read-only, hinting on stderr in human mode when no archive file
+/// exists yet; genuine SQLite errors propagate.
+fn open_archive_with_hint(ctx: &Ctx, workspace: &TeamId) -> Result<Option<Archive>> {
+    let archive = Archive::open(workspace)
+        .with_context(|| format!("opening local archive for {workspace}"))?;
+    if archive.is_none() && !ctx.json {
+        archive_hint(workspace);
     }
-    ExitCode::FAILURE
+    Ok(archive)
+}
+
+/// Runs a local read command on `workspace`'s archive. With no workspace it prints the empty
+/// `--json` document (or the human hint) for `action`; otherwise it opens the archive, hinting
+/// when none exists, and `run` decides what to print. A [`CmdError`] becomes the failure envelope.
+fn run_local(
+    ctx: &Ctx,
+    workspace: Option<&TeamId>,
+    empty: serde_json::Value,
+    action: &str,
+    run: impl FnOnce(&TeamId, Option<&Archive>) -> Result<ExitCode, CmdError>,
+) -> Result<ExitCode> {
+    let Some(workspace) = workspace else {
+        return Ok(output::empty_local(ctx, empty, action));
+    };
+    let archive = open_archive_with_hint(ctx, workspace)?;
+    Ok(run(workspace, archive.as_ref()).unwrap_or_else(|err| fail(ctx, err.code, &err.message)))
 }
 
 fn main() -> ExitCode {
@@ -82,7 +105,10 @@ fn main() -> ExitCode {
         Ok(rt) => rt.block_on(dispatch(cli, &ctx)),
         Err(err) => Err(anyhow::anyhow!("starting the async runtime: {err}")),
     };
-    result.unwrap_or_else(|err| fail(&ctx, "command_failed", &format!("{err:#}")))
+    result.unwrap_or_else(|err| match err.downcast_ref::<CmdError>() {
+        Some(cmd) => fail(&ctx, cmd.code, &cmd.message),
+        None => fail(&ctx, "command_failed", &format!("{err:#}")),
+    })
 }
 
 async fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
@@ -122,11 +148,13 @@ async fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
             ctx,
             ctx.workspace(),
             &args.query,
-            args.limit,
-            args.resolved_sort(),
-            args.format,
-            args.out.as_deref(),
-            args.include_deleted,
+            SearchCmdOpts {
+                limit: args.limit,
+                sort: args.resolved_sort(),
+                format: args.format,
+                out: args.out.as_deref(),
+                include_deleted: args.include_deleted,
+            },
         ),
         Commands::Read(args) => cmd_read(
             ctx,

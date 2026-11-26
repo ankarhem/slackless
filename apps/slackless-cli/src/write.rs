@@ -10,16 +10,16 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use slackless_core::api::{HistoryOpts, MessageContent, UploadFile};
-use slackless_core::store::StoredMessage;
+use slackless_core::api::{MessageContent, UploadFile};
 use slackless_core::types::time::now_epoch_secs;
 use slackless_core::types::{ChannelId, Message, TeamId, Ts};
 
 use crate::archive::Archive;
+use crate::commands::messages::{live_thread_read, thread_payload};
 use crate::live::session::{
     api_fail, api_for, display_channel, resolve_channel, resolve_channel_with,
 };
-use crate::output::{self, MessageRow};
+use crate::output::{self, emit_payload};
 use crate::{Ctx, fail};
 
 /// Resolve a message text argument: when `text == "-"`, read the body from stdin.
@@ -48,6 +48,18 @@ pub(crate) fn normalize_emoji_shortcode(emoji: &str) -> String {
     emoji.trim_matches(':').to_owned()
 }
 
+/// The secrets `text` appears to hold, as `kind (preview)` entries, when the pre-send
+/// detector finds any.
+pub(crate) fn detect_secret_hits(text: &str) -> Option<String> {
+    let hits = slackless_core::detect_secrets(text);
+    (!hits.is_empty()).then(|| {
+        hits.iter()
+            .map(|h| format!("{} ({})", h.kind, h.preview))
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+}
+
 /// Pre-send guard shared across `send`, `reply`, `edit`, `schedule`, `upload`, and
 /// `canvas comment`: refuses a blank body locally (Slack answers `no_text` only after a round
 /// trip), then possible secrets unless `allow_secrets`.
@@ -55,25 +67,20 @@ pub(crate) fn check_outgoing_text(ctx: &Ctx, text: &str, allow_secrets: bool) ->
     if text.trim().is_empty() {
         return Some(fail(ctx, "invalid_args", "the message text is empty"));
     }
-    if allow_secrets {
-        return None;
-    }
-    let hits = slackless_core::detect_secrets(text);
-    if hits.is_empty() {
-        return None;
-    }
-    let summary: Vec<String> = hits
-        .iter()
-        .map(|h| format!("{} ({})", h.kind, h.preview))
-        .collect();
-    Some(fail(
-        ctx,
-        "secret_detected",
-        &format!(
-            "refused to send possible secret(s): {}; pass --allow-secrets to override",
-            summary.join(", ")
-        ),
-    ))
+    let summary = if allow_secrets {
+        None
+    } else {
+        detect_secret_hits(text)
+    };
+    summary.map(|summary| {
+        fail(
+            ctx,
+            "secret_detected",
+            &format!(
+                "refused to send possible secret(s): {summary}; pass --allow-secrets to override"
+            ),
+        )
+    })
 }
 
 /// `send <channel> <text>`: posts and mirrors the echo into the local archive.
@@ -424,7 +431,7 @@ pub async fn run_upload(
 }
 
 /// `thread <channel> <thread_ts> --live`: fetches live thread replies via `conversations.replies`,
-/// mirrors them into the local SQLite archive in one batch transaction, and prints them oldest first.
+/// mirrors them into the local SQLite archive, and prints them oldest first.
 pub async fn run_thread_live(
     ctx: &Ctx,
     flag: Option<&str>,
@@ -436,70 +443,22 @@ pub async fn run_thread_live(
         Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let mut archive = Archive::open_or_create_rw(&session.workspace);
-    let (channel, label) =
-        resolve_channel_with(archive.as_ref().ok(), &session.workspace, channel_arg);
+    let mut archive =
+        Archive::open_or_create_rw(&session.workspace).map_err(|err| format!("{err:#}"));
     let thread_ts = Ts::from(thread_ts_arg.to_owned());
-    let opts = HistoryOpts {
-        limit: Some(limit.clamp(1, 999)),
-        ..HistoryOpts::default()
-    };
-    let fetched_at = now_epoch_secs();
-    let page = match session
-        .api
-        .conversations_replies(&channel, &thread_ts, &opts, None)
-        .await
-    {
-        Ok(page) => page,
-        Err(err) => return Ok(api_fail(ctx, &err)),
-    };
-
-    let mirrored = archive
-        .as_mut()
-        .map_err(|err| format!("{err:#}"))
-        .and_then(|a| {
-            a.store_mut()
-                .upsert_replies_page(&session.workspace, &channel, &page.items, fetched_at)
-                .map_err(|err| err.to_string())
-        });
-    // stderr: `--json` consumers read only the replies on stdout.
-    if let Err(err) = mirrored {
-        eprintln!("slackless: could not mirror the live replies into the local archive ({err})");
-    }
-
-    let user_names = archive
-        .as_ref()
-        .ok()
-        .and_then(|a| a.user_display_map(&session.workspace).ok())
-        .unwrap_or_default();
-    let rows: Vec<MessageRow> = page
-        .items
-        .into_iter()
-        .map(|message| {
-            let stored = StoredMessage {
-                channel: channel.clone(),
-                message,
-                deleted: false,
-            };
-            MessageRow::from_stored(&stored, &user_names)
-        })
-        .collect();
-    let mut human = String::new();
-    for row in &rows {
-        human.push_str(&row.human_line(label.as_deref()));
-    }
-    output::emit(
-        ctx.json,
-        &serde_json::json!({
-            "channel": channel.as_str(),
-            "thread_ts": thread_ts.as_str(),
-            "live": true,
-            "count": rows.len(),
-            "messages": rows,
-        }),
-        &human,
-    );
-    Ok(ExitCode::SUCCESS)
+    let read = live_thread_read(
+        &session.api,
+        &session.workspace,
+        &mut archive,
+        channel_arg,
+        &thread_ts,
+        limit,
+    )
+    .await;
+    Ok(match read {
+        Ok(read) => emit_payload(ctx, Ok(thread_payload(&read, &thread_ts, true))),
+        Err(err) => api_fail(ctx, &err),
+    })
 }
 
 /// `mark-read <channel> [ts]`: marks `channel` read up to `ts` (or newest locally archived message)

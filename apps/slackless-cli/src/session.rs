@@ -74,14 +74,6 @@ impl Ctx {
         })
     }
 
-    /// The signed-in user of `workspace`, when a session for it is stored.
-    pub(crate) fn session_user(&self, workspace: &TeamId) -> Option<UserId> {
-        self.sessions()
-            .iter()
-            .find(|session| &session.team_id == workspace)
-            .map(|session| session.user_id.clone())
-    }
-
     /// The workspace local commands read: `--workspace`, else the first stored session's, else
     /// the only archive on disk. `None` means nothing is known; local commands then report empty
     /// results instead of guessing among several archives.

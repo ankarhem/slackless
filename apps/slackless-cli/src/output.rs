@@ -1,14 +1,111 @@
-//! Machine (`--json`) and human output shaping for every command.
+//! Machine (`--json`) and human output shaping for every command: the emitters, the failure
+//! envelope, the empty-result and archive hints, and the row shapes commands share.
 
 use std::collections::HashMap;
+use std::path::Path;
 
+use anyhow::Result;
 use serde::Serialize;
 use slackless_core::domain::mrkdwn::mrkdwn_to_plain;
 use slackless_core::store::StoredMessage;
-use slackless_core::types::UserId;
+use slackless_core::types::{TeamId, UserId};
 
+use crate::Ctx;
 use crate::archive::ConversationRow;
+use crate::commands::{CmdError, Payload};
 use crate::session::StatusEntry;
+
+/// A user-actionable failure: message + JSON envelope, not an error dump.
+pub(crate) fn fail(ctx: &Ctx, code: &str, message: &str) -> std::process::ExitCode {
+    if ctx.json {
+        emit_json(&serde_json::json!({"ok": false, "error": code, "message": message}));
+    } else {
+        eprintln!("slackless: {message}");
+    }
+    std::process::ExitCode::FAILURE
+}
+
+/// Prints a command's payload, or the failure envelope of the error that replaced it.
+pub(crate) fn emit_payload(ctx: &Ctx, result: Result<Payload, CmdError>) -> std::process::ExitCode {
+    match result {
+        Ok((json, human)) => {
+            emit(ctx.json, &json, &human);
+            std::process::ExitCode::SUCCESS
+        }
+        Err(err) => fail(ctx, err.code, &err.message),
+    }
+}
+
+/// Prints empty `--json` results (or a human hint) when no workspace is known: local read
+/// commands succeed with empty output rather than failing hard offline.
+pub(crate) fn empty_local(
+    ctx: &Ctx,
+    empty: serde_json::Value,
+    action: &str,
+) -> std::process::ExitCode {
+    if ctx.json {
+        emit_json(&empty);
+    } else {
+        eprintln!("slackless: {}", no_workspace_message(action));
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// A note on stderr when a workspace has no local archive to read.
+pub(crate) fn archive_hint(workspace: &TeamId) {
+    eprintln!("slackless: {}", no_archive_message(workspace));
+}
+
+/// Fails an archive action (vacuum, check, backup, summarize) when no workspace is known.
+pub(crate) fn fail_no_workspace(ctx: &Ctx, action: &str) -> std::process::ExitCode {
+    fail(ctx, "no_workspace", &no_workspace_message(action))
+}
+
+/// Fails an archive action when the workspace has no local archive file yet.
+pub(crate) fn fail_no_archive(ctx: &Ctx, workspace: &TeamId) -> std::process::ExitCode {
+    fail(ctx, "no_archive", &no_archive_message(workspace))
+}
+
+fn no_workspace_message(action: &str) -> String {
+    format!(
+        "no workspace known for {action}; pass --workspace TEAM_ID (run `slackless auth login` first)"
+    )
+}
+
+fn no_archive_message(workspace: &TeamId) -> String {
+    format!(
+        "no local archive for workspace {workspace} yet; it fills up once the desktop app syncs"
+    )
+}
+
+/// Write rendered export output to `out` (emitting a JSON or human confirmation) or print to stdout.
+pub(crate) fn write_or_print_export(
+    ctx: &Ctx,
+    rendered: &str,
+    out: Option<&Path>,
+    count: usize,
+    item_noun: &str,
+) -> Result<()> {
+    if let Some(path) = out {
+        std::fs::write(path, rendered)
+            .map_err(|err| anyhow::anyhow!("writing export to {}: {err}", path.display()))?;
+        if ctx.json {
+            emit_json(&serde_json::json!({
+                "ok": true,
+                "path": path.display().to_string(),
+                "count": count,
+            }));
+        } else {
+            eprintln!("Exported {count} {item_noun} to {}", path.display());
+        }
+    } else {
+        print!("{rendered}");
+        if !rendered.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
+}
 
 /// Prints `value` as one JSON line without panicking on serialization errors.
 pub fn emit_json(value: &impl Serialize) {
@@ -106,6 +203,58 @@ impl MessageRow {
         let deleted = if self.deleted { " (deleted)" } else { "" };
         let plain = mrkdwn_to_plain(&self.text);
         format!("{channel}\t{}\t{who}:{deleted} {plain}\n", self.ts)
+    }
+}
+
+/// One file attached to a message, by id, for `download`, `transcribe`, and `export --transcript`.
+#[derive(Serialize)]
+pub struct FileRef {
+    pub id: String,
+    pub name: Option<String>,
+    pub title: Option<String>,
+    pub filetype: Option<String>,
+}
+
+/// One message as `read`, `thread`, and single-workspace `search` return it: the message row,
+/// the label of the channel it was read from, and the files it carries.
+#[derive(Serialize)]
+pub struct MessageView {
+    /// `#eng` or `@ana` when the archive knows the conversation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_name: Option<String>,
+    #[serde(flatten)]
+    pub row: MessageRow,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub file_refs: Vec<FileRef>,
+}
+
+impl MessageView {
+    pub fn from_stored(
+        stored: &StoredMessage,
+        user_names: &HashMap<UserId, String>,
+        channel_name: Option<&str>,
+    ) -> Self {
+        Self {
+            channel_name: channel_name.map(ToOwned::to_owned),
+            row: MessageRow::from_stored(stored, user_names),
+            file_refs: stored
+                .message
+                .files
+                .iter()
+                .filter(|f| !f.id.as_str().is_empty())
+                .map(|f| FileRef {
+                    id: f.id.as_str().to_owned(),
+                    name: f.name.clone(),
+                    title: f.title.clone(),
+                    filetype: f.filetype.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// One tab-separated line, under `channel_name` or the message's own channel.
+    pub fn human_line(&self) -> String {
+        self.row.human_line(self.channel_name.as_deref())
     }
 }
 

@@ -466,7 +466,7 @@ fn empty_transcripts_json(args: &HuddleTranscriptsArgs) -> serde_json::Value {
 /// offline query, full-text FTS5 search, and export over locally archived text-only huddle transcripts.
 pub fn run_huddle_transcripts(ctx: &Ctx, args: HuddleTranscriptsArgs) -> Result<ExitCode> {
     let Some(workspace) = ctx.workspace().cloned() else {
-        return Ok(crate::commands::empty_local(
+        return Ok(output::empty_local(
             ctx,
             empty_transcripts_json(&args),
             "huddle transcripts",
@@ -478,7 +478,7 @@ pub fn run_huddle_transcripts(ctx: &Ctx, args: HuddleTranscriptsArgs) -> Result<
             if ctx.json {
                 output::emit_json(&empty_transcripts_json(&args));
             } else {
-                crate::commands::archive_hint(&workspace);
+                output::archive_hint(&workspace);
             }
             return Ok(ExitCode::SUCCESS);
         }

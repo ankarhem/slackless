@@ -11,8 +11,9 @@ use slackless_core::types::{FileId, TeamId, Ts};
 
 use crate::archive::Archive;
 use crate::cli::SummarizeArgs;
-use crate::commands::browse::{build_catchup_for_archives, parse_catchup_window};
-use crate::commands::{all_workspace_ids, fail_no_archive, fail_no_workspace, raw_channel_id};
+use crate::commands::browse::{catchup_briefing, catchup_scope, parse_catchup_window};
+use crate::commands::raw_channel_id;
+use crate::output::{fail_no_archive, fail_no_workspace};
 use crate::{Ctx, fail, output};
 
 fn infer_provider_from_endpoint(endpoint: Option<&str>) -> AiProvider {
@@ -119,29 +120,11 @@ pub(crate) async fn cmd_summarize(
             Ok(w) => w,
             Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
         };
-        let team_ids: Vec<TeamId> = if args.all_workspaces {
-            all_workspace_ids(ctx.sessions())
-        } else {
-            workspace.into_iter().cloned().collect()
-        };
-        if team_ids.is_empty() {
+        let (archives, self_users) = catchup_scope(ctx.sessions(), workspace, args.all_workspaces);
+        if archives.is_empty() {
             return Ok(fail_no_workspace(ctx, "summarizing the catch-up"));
         }
-        let mut opened = Vec::new();
-        for ws in team_ids {
-            let Some(archive) =
-                Archive::open(&ws).with_context(|| format!("opening local archive for {ws}"))?
-            else {
-                continue;
-            };
-            let self_user = ctx.session_user(&ws);
-            opened.push((ws, self_user, archive));
-        }
-        let refs: Vec<(&TeamId, Option<&slackless_core::types::UserId>, &Archive)> = opened
-            .iter()
-            .map(|(ws, user, arch)| (ws, user.as_ref(), arch))
-            .collect();
-        let briefing = build_catchup_for_archives(&refs, window, now_secs, args.limit)?;
+        let briefing = catchup_briefing(&archives, &self_users, window, now_secs, args.limit)?;
         return run_summarize_target(ctx, &config, SummaryTarget::CatchUp { briefing }).await;
     }
 
@@ -545,8 +528,11 @@ mod tests {
             .await;
 
         let (ws, archive) = seeded_archive();
-        let briefing = build_catchup_for_archives(
-            &[(&ws, None, &archive)],
+        let briefing = slackless_core::catchup::build_workspace_catchup(
+            archive.store(),
+            &ws,
+            None,
+            None,
             slackless_core::catchup::CatchUpWindow::Custom { since_secs: 1 },
             1_760_000_000,
             25,

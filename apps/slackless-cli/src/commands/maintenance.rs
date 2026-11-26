@@ -16,9 +16,10 @@ use slackless_core::store::SemanticIndex;
 use slackless_core::types::time::format_bytes;
 use slackless_core::types::{ChannelId, TeamId};
 
-use super::{all_workspace_ids, archive_hint, empty_local, fail_no_archive, fail_no_workspace};
+use super::all_workspace_ids;
 use crate::archive::{self, Archive, format_channel_name};
 use crate::cli::{ArchiveIndexSemanticArgs, ArchivePruneArgs, SemanticModelCommand};
+use crate::output::{archive_hint, empty_local, fail_no_archive, fail_no_workspace};
 use crate::{Ctx, fail, output};
 use slackless_core::maintenance::{
     MediaCachePolicy, PruneReport, prune_default_media_caches, prune_default_semantic_index,
@@ -735,7 +736,7 @@ pub(crate) async fn cmd_archive_index_semantic(
         };
         vec![(ws.clone(), path)]
     } else {
-        all_workspace_ids(ctx.sessions())
+        all_workspace_ids(ctx.sessions(), archive::stored_team_ids())
             .into_iter()
             .filter_map(|ws| archive::store_path(&ws).map(|p| (ws, p)))
             .collect()
