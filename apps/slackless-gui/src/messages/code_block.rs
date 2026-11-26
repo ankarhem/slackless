@@ -1,4 +1,6 @@
-//! Syntax-highlighted code blocks (with bounded LRU cache) and hover Copy button.
+//! Syntax-highlighted code blocks and the hover Copy button: a block's highlight and copy text
+//! are modeled once per render ([`CodeModel`]); snippet lines highlight through a bounded LRU
+//! cache.
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -16,23 +18,70 @@ use slackless_core::types::rich_text::{RichTextElement, RichTextPreformatted};
 use super::render::{DEFAULT_FLAGS, RunFlags, RunTheme, paragraph_id};
 use super::selectable::SelectableParagraph;
 
-pub(super) fn render_code(block: &RichTextPreformatted, theme: &RunTheme) -> Div {
-    let code = block
-        .elements
+/// A code block's model: the text the copy button and the selection read, its language label
+/// and its highlighted tokens, built once so rendering reads them.
+pub(in crate::messages) struct CodeModel {
+    pub(super) code: SharedString,
+    pub(super) language: Option<SharedString>,
+    tokens: Vec<(usize, crate::syntax::TokenKind)>,
+}
+
+impl CodeModel {
+    /// A fenced mrkdwn block: its language detected from the `language` hint and the code.
+    pub(super) fn new(code: String, language: Option<String>) -> Self {
+        let lang = crate::syntax::Lang::detect(language.as_deref(), None, &code);
+        let tokens = crate::syntax::highlight(lang, &code);
+        Self {
+            code: code.into(),
+            language: language.map(SharedString::from),
+            tokens,
+        }
+    }
+
+    /// A Block Kit `rich_text_preformatted` block: its text elements joined, trailing line
+    /// breaks dropped, with its language.
+    pub(super) fn preformatted(block: &RichTextPreformatted) -> Self {
+        let code = block
+            .elements
+            .iter()
+            .filter_map(|element| match element {
+                RichTextElement::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        Self::new(
+            code.trim_end_matches('\n').to_owned(),
+            block
+                .language
+                .clone()
+                .filter(|language| !language.is_empty()),
+        )
+    }
+
+    fn runs(&self, theme: &RunTheme) -> Vec<TextRun> {
+        code_runs(&self.tokens, theme)
+    }
+}
+
+/// A highlighted block's tokens as mono runs in the theme's token colors.
+fn code_runs(tokens: &[(usize, crate::syntax::TokenKind)], theme: &RunTheme) -> Vec<TextRun> {
+    tokens
         .iter()
-        .filter_map(|element| match element {
-            RichTextElement::Text(text) => Some(text.text.as_str()),
-            _ => None,
+        .map(|&(len, kind)| {
+            let color = crate::syntax::token_color(kind, theme.dark, theme.foreground);
+            let mut run = theme.run(
+                RunFlags {
+                    code: true,
+                    ..DEFAULT_FLAGS
+                },
+                Some(color),
+                None,
+                len,
+            );
+            run.font = theme.mono_font.clone();
+            run
         })
-        .collect::<String>();
-    code_block(
-        code.trim_end_matches('\n').to_owned(),
-        block
-            .language
-            .clone()
-            .filter(|language| !language.is_empty()),
-        theme,
-    )
+        .collect()
 }
 
 fn highlight_hash(code: &str, lang: crate::syntax::Lang) -> u64 {
@@ -90,23 +139,7 @@ fn highlighted_code_runs(code: &str, lang: crate::syntax::Lang, theme: &RunTheme
     if code.is_empty() {
         return Vec::new();
     }
-    cached_highlight(code, lang)
-        .into_iter()
-        .map(|(len, kind)| {
-            let color = crate::syntax::token_color(kind, theme.dark, theme.foreground);
-            let mut run = theme.run(
-                RunFlags {
-                    code: true,
-                    ..DEFAULT_FLAGS
-                },
-                Some(color),
-                None,
-                len,
-            );
-            run.font = theme.mono_font.clone();
-            run
-        })
-        .collect()
+    code_runs(&cached_highlight(code, lang), theme)
 }
 
 /// One selectable monospaced code line/block (used by [`crate::files::SnippetCard`]) that
@@ -163,23 +196,22 @@ pub(crate) fn selectable_text(
 
 /// Slack's pre block: 12px code on an 18px line, 8px in from a 13% foreground ring with 4px
 /// corners, 32px kept clear at the right for the copy button a hover shows there.
-pub(super) fn code_block(code: String, language: Option<String>, theme: &RunTheme) -> Div {
+pub(super) fn code_block(model: &CodeModel, theme: &RunTheme) -> Div {
     // Code blocks select like the paragraphs around them: one participant, its own order.
     let paragraph = theme.paragraphs.get();
     theme.paragraphs.set(paragraph + 1);
     let order = theme.order.map(|base| base + paragraph as u64);
-    let lang = crate::syntax::Lang::detect(language.as_deref(), None, &code);
-    let runs = highlighted_code_runs(&code, lang, theme);
+    let runs = model.runs(theme);
     let group = SharedString::from(format!("code-{}-{paragraph}", theme.key));
     let copy = CopyCode {
         id: ElementId::Name(format!("copy-{}-{paragraph}", theme.key).into()),
         group: group.clone(),
-        code: code.clone(),
+        code: model.code.to_string(),
     };
     let text = match order {
         Some(order) => SelectableParagraph::new(
-            paragraph_id(&theme.key, paragraph, 0, &code),
-            code,
+            paragraph_id(&theme.key, paragraph, 0, &model.code),
+            model.code.to_string(),
             runs,
             Vec::new(),
             order,
@@ -187,12 +219,14 @@ pub(super) fn code_block(code: String, language: Option<String>, theme: &RunThem
         )
         .with_code_block()
         .into_any_element(),
-        None => StyledText::new(code).with_runs(runs).into_any_element(),
+        None => StyledText::new(model.code.clone())
+            .with_runs(runs)
+            .into_any_element(),
     };
     v_flex()
         .min_w_0()
         .gap_1()
-        .when_some(language, |column, language| {
+        .when_some(model.language.clone(), |column, language| {
             column.child(div().text_xs().text_color(theme.muted).child(language))
         })
         .child(

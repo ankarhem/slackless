@@ -6,7 +6,7 @@ mod inline;
 #[cfg(test)]
 mod tests;
 
-pub(super) use super::code_block::{code_block, render_code};
+pub(super) use super::code_block::{CodeModel, code_block};
 pub(crate) use super::code_block::{selectable_code, selectable_text};
 pub(super) use super::selectable::SelectableParagraph;
 pub(super) use super::time::{

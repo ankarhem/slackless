@@ -18,7 +18,7 @@ use super::inline::{
     ParagraphBuilder, RunFlags, RunTheme, flags, hex_color, jumbomoji_elements, mention_flags,
     mrkdwn_fences, mrkdwn_lines, render_segments, unicode_glyph,
 };
-use super::{CivilTime, code_block, date_label_absolute, render_code};
+use super::{CivilTime, CodeModel, code_block, date_label_absolute};
 use crate::blockkit::{self, KitCx};
 use crate::emoji;
 use crate::fixtures::Fixtures;
@@ -234,9 +234,9 @@ pub(in crate::messages) fn render_containers(
                             .into_any_element()
                     })
                 }
-                RichTextContainer::Preformatted(preformatted) => {
-                    Some(render_code(preformatted, theme).into_any_element())
-                }
+                RichTextContainer::Preformatted(preformatted) => Some(
+                    code_block(&CodeModel::preformatted(preformatted), theme).into_any_element(),
+                ),
                 RichTextContainer::Header(header) => {
                     paragraph(&header.elements, fixtures, theme, false).map(|paragraph| {
                         // Slack's `.p-rich_text_header`: 18px Black for Big, 15px Black for
@@ -467,8 +467,7 @@ pub(crate) fn mrkdwn_with_verbatim(
     for (n, (fenced, piece)) in pieces.iter().enumerate() {
         column = if *fenced {
             column.child(div().my_1().child(code_block(
-                unescape_mrkdwn(piece).into_owned(),
-                None,
+                &CodeModel::new(unescape_mrkdwn(piece).into_owned(), None),
                 &theme,
             )))
         } else {
