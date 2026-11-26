@@ -4,7 +4,8 @@ use std::sync::atomic::Ordering;
 use slackless_types::UserId;
 
 use super::connected::{SessionRuntime, announce_screen_share_capabilities};
-use super::io::{MediaDevices, RtcController, SignalSink};
+use super::io::{RtcController, SignalSink};
+use super::media::MediaDevices;
 use super::supervisor::LoopExit;
 use super::video_rx::same_remote_video_sources;
 use crate::peer_message::{

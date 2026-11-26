@@ -10,9 +10,10 @@ use webrtc::peer_connection::RTCPeerConnectionState;
 use super::controls::{apply_background_done, handle_control};
 use super::handshake::perform_handshake_with;
 use super::io::{
-    BackgroundDone, LiveMediaDevices, LiveSessionFactory, MediaDevices, OpusTrackOut, RtcSession,
-    SessionFactory, SignalSession, SignalSink, VideoTrackOut,
+    LiveSessionFactory, OpusTrackOut, RtcSession, SessionFactory, SignalSession, SignalSink,
+    VideoTrackOut,
 };
+use super::media::{BackgroundDone, LiveMediaDevices, MediaDevices};
 use super::signaling_handlers::{
     apply_audio_stream_info, apply_index_frame, content_share_source_type, handle_signal_frame,
 };

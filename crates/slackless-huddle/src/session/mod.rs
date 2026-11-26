@@ -12,6 +12,7 @@ mod controls;
 mod handshake;
 mod io;
 mod signaling_handlers;
+mod media;
 mod supervisor;
 #[cfg(test)]
 mod tests;

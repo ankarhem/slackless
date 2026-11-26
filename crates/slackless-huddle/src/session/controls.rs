@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::connected::{SessionRuntime, announce_screen_share_capabilities};
-use super::io::{AudioSwitch, BackgroundDone, MediaDevices, RtcController, SignalSink};
+use super::io::{RtcController, SignalSink};
+use super::media::{AudioSwitch, BackgroundDone, MediaDevices};
 use super::supervisor::LoopExit;
 use crate::backend::VideoFrameSink;
 use crate::peer_message::{

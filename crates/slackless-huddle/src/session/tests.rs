@@ -561,9 +561,8 @@ mod state_machine {
     };
     use crate::session::connected::SessionRuntime;
     use crate::session::controls::{apply_background_done, handle_control};
-    use crate::session::io::{
-        AudioSwitch, BackgroundDone, MediaDevices, RtcController, SignalSink,
-    };
+    use crate::session::io::{RtcController, SignalSink};
+    use crate::session::media::{AudioSwitch, BackgroundDone, MediaDevices};
     use crate::session::signaling_handlers::handle_signal_frame;
     use crate::session::video_rx::VideoRoutingTable;
     use crate::{
@@ -2108,9 +2107,10 @@ mod handshake_and_connected_loop_tests {
     use super::super::connected::run_connected_loop_with;
     use super::super::handshake::perform_handshake_with;
     use super::super::io::{
-        AudioSwitch, BoxFuture, MediaDevices, OpusTrackOut, RtcController, RtcSession,
-        SessionFactory, SignalSession, SignalSink, VideoTrackOut,
+        BoxFuture, OpusTrackOut, RtcController, RtcSession, SessionFactory, SignalSession,
+        SignalSink, VideoTrackOut,
     };
+    use super::super::media::{AudioSwitch, MediaDevices};
     use super::super::supervisor::LoopExit;
     use crate::audio::AudioSharedState;
     use crate::backend::VideoFrameSink;

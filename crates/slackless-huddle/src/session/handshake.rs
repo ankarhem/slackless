@@ -5,9 +5,8 @@ use rand::RngExt as _;
 use tokio::sync::mpsc;
 use webrtc::peer_connection::RTCPeerConnectionState;
 
-use super::io::{
-    MediaDevices, RtcController, RtcSession, SessionFactory, SignalSession, SignalSink,
-};
+use super::io::{RtcController, RtcSession, SessionFactory, SignalSession, SignalSink};
+use super::media::MediaDevices;
 use super::supervisor::{LoopExit, classify_handshake_err};
 use crate::audio::AudioSharedState;
 use crate::backend::platform_backend;
