@@ -6868,25 +6868,26 @@ async fn collab_endpoints_propagate_auth_expired() {
         page: 1,
     }))
     .await;
-    assert_eq!(
-        next(&mut rx).await,
-        Event::AuthExpired("token_revoked".into())
-    );
+    // Loads answer first, then report the expired session (`answer_load`).
     assert!(matches!(
         next(&mut rx).await,
         Event::RemoteMessagesPage { result: Err(_), .. }
     ));
-
-    core.handle(Command::Collab(CollabCommand::LoadAppHome(c1())))
-        .await;
     assert_eq!(
         next(&mut rx).await,
         Event::AuthExpired("token_revoked".into())
     );
+
+    core.handle(Command::Collab(CollabCommand::LoadAppHome(c1())))
+        .await;
     assert!(matches!(
         next(&mut rx).await,
         Event::AppHomeLoaded { home: Err(_), .. }
     ));
+    assert_eq!(
+        next(&mut rx).await,
+        Event::AuthExpired("token_revoked".into())
+    );
 
     core.handle(Command::Collab(CollabCommand::LoadList {
         file_id: "FL1".into(),

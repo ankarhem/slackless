@@ -45,20 +45,14 @@ impl<B: Backend> Core<B> {
                 .backend
                 .search_remote_messages(query.clone(), sort, page)
                 .await;
-            let emit = match res {
-                Ok(data) => Ok(Box::new(data)),
-                Err(e) => {
-                    emit_if_auth_expired(&ctx.events, &e);
-                    Err(e.to_string())
+            answer_load(&ctx.events, res.map(Box::new), |result| {
+                Event::RemoteMessagesPage {
+                    query,
+                    sort,
+                    page,
+                    result,
                 }
-            };
-            ctx.events.emit(Event::RemoteMessagesPage {
-                query,
-                sort,
-                page,
-                result: emit,
-            });
-            Ok(())
+            })
         });
     }
 
@@ -69,20 +63,14 @@ impl<B: Backend> Core<B> {
                 .backend
                 .search_remote_files(query.clone(), sort, page)
                 .await;
-            let emit = match res {
-                Ok(data) => Ok(Box::new(data)),
-                Err(e) => {
-                    emit_if_auth_expired(&ctx.events, &e);
-                    Err(e.to_string())
+            answer_load(&ctx.events, res.map(Box::new), |result| {
+                Event::RemoteFilesPage {
+                    query,
+                    sort,
+                    page,
+                    result,
                 }
-            };
-            ctx.events.emit(Event::RemoteFilesPage {
-                query,
-                sort,
-                page,
-                result: emit,
-            });
-            Ok(())
+            })
         });
     }
 
@@ -593,15 +581,10 @@ impl<B: Backend> Core<B> {
     pub(super) fn load_app_home(&self, channel: ChannelId) {
         let ctx = self.ctx();
         self.spawn("conversations.info(app_home)", async move {
-            let home = match ctx.backend.load_app_home(channel.clone()).await {
-                Ok(home) => Ok(Box::new(home)),
-                Err(e) => {
-                    emit_if_auth_expired(&ctx.events, &e);
-                    Err(e.to_string())
-                }
-            };
-            ctx.events.emit(Event::AppHomeLoaded { channel, home });
-            Ok(())
+            let home = ctx.backend.load_app_home(channel.clone()).await;
+            answer_load(&ctx.events, home.map(Box::new), |home| {
+                Event::AppHomeLoaded { channel, home }
+            })
         });
     }
 
@@ -634,16 +617,10 @@ impl<B: Backend> Core<B> {
     pub(super) fn fetch_workflow_trigger_info(&self, trigger_id: String) {
         let ctx = self.ctx();
         self.spawn("workflows.triggers.info", async move {
-            let info = match ctx.backend.workflow_trigger_info(trigger_id.clone()).await {
-                Ok(info) => Ok(Box::new(info)),
-                Err(e) => {
-                    emit_if_auth_expired(&ctx.events, &e);
-                    Err(e.to_string())
-                }
-            };
-            ctx.events
-                .emit(Event::WorkflowTriggerInfoLoaded { trigger_id, info });
-            Ok(())
+            let info = ctx.backend.workflow_trigger_info(trigger_id.clone()).await;
+            answer_load(&ctx.events, info.map(Box::new), |info| {
+                Event::WorkflowTriggerInfoLoaded { trigger_id, info }
+            })
         });
     }
 
@@ -655,20 +632,14 @@ impl<B: Backend> Core<B> {
     ) {
         let ctx = self.ctx();
         self.spawn("views.submit", async move {
-            let outcome = match ctx
+            let outcome = ctx
                 .backend
                 .views_submit(view_id.clone(), hash, state_values)
-                .await
-            {
-                Ok(resp) => Ok(resp),
-                Err(e) => {
-                    emit_if_auth_expired(&ctx.events, &e);
-                    Err(e.to_string())
-                }
-            };
-            ctx.events
-                .emit(Event::ModalSubmitResult { view_id, outcome });
-            Ok(())
+                .await;
+            answer_load(&ctx.events, outcome, |outcome| Event::ModalSubmitResult {
+                view_id,
+                outcome,
+            })
         });
     }
 
@@ -688,15 +659,10 @@ impl<B: Backend> Core<B> {
     pub(super) fn fetch_call_info(&self, call_id: String) {
         let ctx = self.ctx();
         self.spawn("calls.info", async move {
-            let call = match ctx.backend.calls_info(call_id.clone()).await {
-                Ok(call) => Ok(Box::new(call)),
-                Err(e) => {
-                    emit_if_auth_expired(&ctx.events, &e);
-                    Err(e.to_string())
-                }
-            };
-            ctx.events.emit(Event::CallInfoLoaded { call_id, call });
-            Ok(())
+            let call = ctx.backend.calls_info(call_id.clone()).await;
+            answer_load(&ctx.events, call.map(Box::new), |call| {
+                Event::CallInfoLoaded { call_id, call }
+            })
         });
     }
 
