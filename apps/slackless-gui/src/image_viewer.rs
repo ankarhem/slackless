@@ -24,10 +24,10 @@ use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity, EventEmitter,
-    FontWeight, Image, ImageFormat, ImageSource, InteractiveElement as _, IntoElement, MouseButton,
-    MouseDownEvent, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div,
-    px, relative,
+    FontWeight, Image, ImageFormat, ImageSource, InteractiveElement as _, IntoElement,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit,
+    ParentElement as _, Pixels, Point, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, WeakEntity, Window, div, list, px, relative,
 };
 use slackless_core::huddle::NativeVideoPlayer;
 use slackless_core::types::{Block, FileId, Message, TranscriptCue, UserId, time};
@@ -51,6 +51,8 @@ const SLIDER_WIDTH: f32 = 120.;
 const ARROW_GUTTER: f32 = 72.;
 /// Width of the toggleable right-side video transcript drawer.
 const TRANSCRIPT_PANEL_WIDTH: f32 = 320.;
+/// How far past its edges the transcript's cue list lays rows out ahead of a scroll.
+const CUE_LIST_OVERDRAW: f32 = 200.;
 /// Disjoint selection document order for the overlay's selectable transcript text.
 const VIEWER_TRANSCRIPT_ORDER: u64 = 1u64 << 62;
 
@@ -514,10 +516,8 @@ pub struct ImageViewer {
     pdf_playback: Option<ViewerPdfPlayback>,
     pdf_load_task: Option<Task<()>>,
     show_transcript: bool,
-    transcript_copied: bool,
-    /// Pending single-click mouse-down `(cue_index, position)` persisted across 30fps video
-    /// re-renders so clicking a transcript cue row seeks reliably while drag-selection stays intact.
-    cue_mouse_down: Option<(usize, Point<Pixels>)>,
+    /// The shown video's transcript drawer while it is open.
+    transcript: Option<(Entity<ViewerTranscript>, Subscription)>,
 }
 
 impl Drop for ImageViewer {
@@ -747,8 +747,7 @@ impl ImageViewer {
                 pdf_playback: None,
                 pdf_load_task: None,
                 show_transcript: false,
-                transcript_copied: false,
-                cue_mouse_down: None,
+                transcript: None,
             }
         });
         viewer.update(cx, |v, cx| v.sync_current_media(window, cx));
@@ -767,6 +766,13 @@ impl ImageViewer {
 
     /// Update workspace fixtures (e.g. when a newly transcribed video's transcript lands live).
     pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        if let Some((transcript, _)) = &self.transcript {
+            let fixtures = fixtures.clone();
+            transcript.update(cx, |transcript, cx| {
+                transcript.fixtures = fixtures;
+                cx.notify();
+            });
+        }
         self.fixtures = fixtures;
         cx.notify();
     }
@@ -949,12 +955,59 @@ impl ImageViewer {
             return;
         }
         self.show_transcript = !self.show_transcript;
-        self.transcript_copied = false;
-        self.cue_mouse_down = None;
+        self.sync_transcript(window, cx);
         if self.show_transcript {
             self.ensure_transcript_loaded(window, cx);
         }
         cx.notify();
+    }
+
+    /// Mount the transcript drawer for the shown video while it is open (a fresh one per
+    /// video), and drop it otherwise.
+    fn sync_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(video) = self
+            .show_transcript
+            .then(|| self.current().video.clone())
+            .flatten()
+        else {
+            self.transcript = None;
+            return;
+        };
+        if self
+            .transcript
+            .as_ref()
+            .is_some_and(|(transcript, _)| transcript.read(cx).video.file_id == video.file_id)
+        {
+            return;
+        }
+        let (fixtures, title) = (self.fixtures.clone(), self.current().name.clone());
+        let transcript = cx.new(|_| ViewerTranscript::new(fixtures, video, title));
+        let subscription = cx.subscribe_in(&transcript, window, Self::on_transcript_event);
+        self.transcript = Some((transcript, subscription));
+    }
+
+    fn on_transcript_event(
+        &mut self,
+        _: &Entity<ViewerTranscript>,
+        event: &TranscriptEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TranscriptEvent::Seek(secs) => self.seek_video(*secs, window, cx),
+            TranscriptEvent::Close => self.toggle_transcript(window, cx),
+            TranscriptEvent::Summarize {
+                file_id,
+                title,
+                text,
+                cues,
+            } => cx.emit(ViewerEvent::SummarizeTranscript {
+                file_id: file_id.clone(),
+                title: title.clone(),
+                text: text.clone(),
+                cues: cues.clone(),
+            }),
+        }
     }
 
     fn ensure_transcript_loaded(&self, window: &mut Window, cx: &mut App) {
@@ -973,58 +1026,12 @@ impl ImageViewer {
         }
     }
 
-    fn resolve_video_transcript(
-        &self,
-        video: &ViewerVideo,
-        cx: &App,
-    ) -> (Option<String>, Vec<TranscriptCue>, bool, Option<String>) {
-        let fid = FileId::from(video.file_id.clone());
-        let cached = crate::files::clip_transcript_status(&fid, cx);
-        let cues = self
-            .fixtures
-            .file_transcript_cues(&fid)
-            .map(|s| s.to_vec())
-            .unwrap_or(cached.cues);
-        let text = self
-            .fixtures
-            .file_transcript(&fid)
-            .map(str::to_owned)
-            .or(cached.text)
-            .or_else(|| (!cues.is_empty()).then(|| TranscriptCue::plain_text(&cues)))
-            .or_else(|| video.inline_transcript.clone());
-        (text, cues, cached.loading, cached.error)
-    }
-
     /// Stop and drop any active video player and background tasks immediately.
     pub fn stop_video(&mut self) {
         self.video_gen = self.video_gen.wrapping_add(1);
         self.video_load_task = None;
         self.video_tick_task = None;
         self.video_playback = None;
-        self.cue_mouse_down = None;
-    }
-
-    /// Record a transcript cue mouse-down on the entity so it survives 30fps video re-renders.
-    fn record_cue_mouse_down(&mut self, cue_idx: usize, click_count: usize, pos: Point<Pixels>) {
-        if click_count == 1 {
-            self.cue_mouse_down = Some((cue_idx, pos));
-        } else {
-            self.cue_mouse_down = None;
-        }
-    }
-
-    /// Resolve a transcript cue mouse-up: returns `true` when the press-and-release stayed within
-    /// the click threshold on the same cue row (not a text drag-selection).
-    fn take_cue_click(&mut self, cue_idx: usize, pos: Point<Pixels>) -> bool {
-        let Some((down_idx, origin)) = self.cue_mouse_down.take() else {
-            return false;
-        };
-        if down_idx != cue_idx {
-            return false;
-        }
-        let dx: f32 = (pos.x - origin.x).into();
-        let dy: f32 = (pos.y - origin.y).into();
-        dx.abs() < 4.0 && dy.abs() < 4.0
     }
 
     /// Sync video or PDF playback to `self.current()`: stops any previous video/PDF, and starts
@@ -1181,9 +1188,19 @@ impl ImageViewer {
                             pb.last_frame = Some(frame);
                         }
                         let st = player.state();
-                        cx.notify();
                         if st.failed {
                             pb.error = Some("Video playback failed.".to_owned());
+                        }
+                        // The transport bar follows every tick; the transcript only repaints
+                        // when the cue under the playhead changes.
+                        if let Some((transcript, _)) = &viewer.transcript {
+                            let position = crate::media::sanitize_secs(st.position_secs);
+                            transcript.update(cx, |transcript, cx| {
+                                transcript.set_playhead(position, st.playing, cx);
+                            });
+                        }
+                        cx.notify();
+                        if st.failed {
                             return false;
                         }
                         if st.playing && !st.ended {
@@ -1308,9 +1325,9 @@ impl ImageViewer {
             return;
         }
         self.index = next as usize;
-        self.transcript_copied = false;
         self.zoom_to(FIT_INDEX, window, cx);
         self.sync_current_media(window, cx);
+        self.sync_transcript(window, cx);
         if self.show_transcript {
             self.ensure_transcript_loaded(window, cx);
         }
@@ -1506,8 +1523,7 @@ impl Render for ImageViewer {
             if let Some(pb) = self.video_playback.as_ref() {
                 if let Some(player) = pb.player.as_ref() {
                     let st = player.state();
-                    let surface =
-                        crate::media::copy_player_surface(player).or_else(|| pb.last_frame.clone());
+                    let surface = pb.last_frame.clone();
                     let dur = crate::media::sanitize_secs(st.duration_secs);
                     let effective_dur = if dur > 0.0 {
                         dur
@@ -1726,357 +1742,20 @@ impl Render for ImageViewer {
                 .into_any_element()
         };
 
-        let transcript_panel = if self.show_transcript
-            && let Some(video) = image.video.clone()
-        {
-            let fid = FileId::from(video.file_id.clone());
-            let (transcript_text, transcript_cues, loading_vtt, vtt_error) =
-                self.resolve_video_transcript(&video, cx);
-            let transcribing = crate::media::is_transcribing(&fid, cx);
-            let copied = self.transcript_copied;
-            let copy_text = transcript_text.clone();
-            let summarize_cues = transcript_cues.clone();
-            let can_transcribe = transcript_text.is_none()
-                && transcript_cues.is_empty()
-                && !loading_vtt
-                && !transcribing
-                && !video.url.is_empty()
-                && !crate::media::is_hls_url(&video.url);
-            let active_cue_idx = if vid_playing || vid_pos > 0.0 {
-                TranscriptCue::active_index(&transcript_cues, vid_pos)
-            } else {
-                None
-            };
-            let body_el: AnyElement = if !transcript_cues.is_empty() {
-                v_flex()
-                    .gap_1()
-                    .children(transcript_cues.into_iter().enumerate().map(|(idx, cue)| {
-                        let is_active = active_cue_idx == Some(idx);
-                        let start_secs = cue.start_secs;
-                        let stamp_label = TranscriptCue::format_timestamp(start_secs);
-                        let text_el = crate::messages::selectable_text(
-                            &format!("viewer-transcript-{}-{idx}", video.file_id),
-                            0,
-                            cue.text,
-                            Some(if is_active {
-                                chrome.text
-                            } else {
-                                chrome.text_muted
-                            }),
-                            VIEWER_TRANSCRIPT_ORDER + (idx as u64 + 1) * 16,
-                            cx,
-                        );
-                        h_flex()
-                            .id(SharedString::from(format!("viewer-cue-{idx}")))
-                            .items_start()
-                            .gap_2()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_l_2()
-                            .border_color(if is_active {
-                                chrome.text
-                            } else {
-                                gpui_kit::gpui::transparent_black()
-                            })
-                            .when(is_active, |row| row.bg(chrome.button_hover))
-                            .hover(move |row| row.bg(chrome.button))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |viewer, ev: &MouseDownEvent, _, _| {
-                                    viewer.record_cue_mouse_down(idx, ev.click_count, ev.position);
-                                }),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |viewer, ev: &MouseUpEvent, window, cx| {
-                                    if viewer.take_cue_click(idx, ev.position) {
-                                        viewer.seek_video(start_secs, window, cx);
-                                    }
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("viewer-cue-ts-{idx}")))
-                                    .flex_none()
-                                    .px_1p5()
-                                    .py(px(1.))
-                                    .rounded_sm()
-                                    .bg(if is_active {
-                                        chrome.button
-                                    } else {
-                                        gpui_kit::gpui::transparent_black()
-                                    })
-                                    .text_size(px(11.))
-                                    .font_weight(if is_active {
-                                        FontWeight::SEMIBOLD
-                                    } else {
-                                        FontWeight::MEDIUM
-                                    })
-                                    .text_color(if is_active {
-                                        chrome.text
-                                    } else {
-                                        chrome.text_dim
-                                    })
-                                    .cursor_pointer()
-                                    .hover(move |b| {
-                                        b.bg(chrome.button_hover).text_color(chrome.text)
-                                    })
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .on_click(cx.listener(move |viewer, _, window, cx| {
-                                        cx.stop_propagation();
-                                        viewer.seek_video(start_secs, window, cx);
-                                    }))
-                                    .child(stamp_label),
-                            )
-                            .child(div().flex_1().min_w_0().child(text_el))
-                    }))
-                    .into_any_element()
-            } else if let Some(text) = transcript_text {
-                crate::messages::selectable_text(
-                    &format!("viewer-transcript-{}", video.file_id),
-                    0,
-                    text,
-                    Some(chrome.text),
-                    VIEWER_TRANSCRIPT_ORDER,
-                    cx,
+        // The drawer is a cached view of its own: the tick repaints the viewer (this transport)
+        // every frame without rebuilding the cue list.
+        let transcript_panel = self.transcript.as_ref().map(|(transcript, _)| {
+            div()
+                .flex_none()
+                .w(px(TRANSCRIPT_PANEL_WIDTH))
+                .h_full()
+                .mr(px(12.))
+                .child(
+                    transcript
+                        .clone()
+                        .cached(gpui_kit::gpui::StyleRefinement::default().size_full()),
                 )
-            } else if loading_vtt {
-                div()
-                    .text_color(chrome.text_muted)
-                    .child("Loading transcript\u{2026}")
-                    .into_any_element()
-            } else if transcribing {
-                div()
-                    .text_color(chrome.text_muted)
-                    .child("Transcribing\u{2026}")
-                    .into_any_element()
-            } else if let Some(err) = vtt_error {
-                div()
-                    .text_color(chrome.text_muted)
-                    .child(format!("Could not load transcript: {err}"))
-                    .into_any_element()
-            } else {
-                let transcribe_fid = fid.clone();
-                let transcribe_url = video.url.clone();
-                let transcribe_ext = video.ext.clone();
-                v_flex()
-                    .gap_2()
-                    .items_start()
-                    .child(
-                        div()
-                            .text_color(chrome.text_muted)
-                            .child("No transcript available yet."),
-                    )
-                    .when(can_transcribe, |col| {
-                        col.child(
-                            h_flex()
-                                .id("viewer-transcript-generate")
-                                .items_center()
-                                .gap_1p5()
-                                .px_2p5()
-                                .py_1()
-                                .rounded_md()
-                                .bg(chrome.button)
-                                .border_1()
-                                .border_color(chrome.border)
-                                .text_xs()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(chrome.text)
-                                .cursor_pointer()
-                                .hover(move |b| b.bg(chrome.button_hover))
-                                .child(
-                                    Icon::new(IconName::Captions)
-                                        .size(px(13.))
-                                        .text_color(chrome.text),
-                                )
-                                .child("Transcribe")
-                                .on_click(move |_, window, cx| {
-                                    crate::media::transcribe_media(
-                                        transcribe_fid.clone(),
-                                        transcribe_url.clone(),
-                                        transcribe_ext.clone(),
-                                        false,
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                        )
-                    })
-                    .into_any_element()
-            };
-
-            let summarize_payload = copy_text.as_ref().map(|text| {
-                (
-                    fid.clone(),
-                    image.name.clone(),
-                    text.clone(),
-                    summarize_cues,
-                )
-            });
-
-            Some(
-                v_flex()
-                    .id("viewer-transcript-panel")
-                    .w(px(TRANSCRIPT_PANEL_WIDTH))
-                    .flex_none()
-                    .h_full()
-                    .mr(px(12.))
-                    .rounded_lg()
-                    .bg(chrome.glass)
-                    .border_1()
-                    .border_color(chrome.border)
-                    .overflow_hidden()
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .px_3()
-                            .py_2()
-                            .border_b_1()
-                            .border_color(chrome.border)
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(chrome.text)
-                                    .child(
-                                        Icon::new(IconName::Captions)
-                                            .size(px(14.))
-                                            .text_color(chrome.text_muted),
-                                    )
-                                    .child("Transcript"),
-                            )
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .when_some(
-                                        summarize_payload,
-                                        |row, (sum_fid, sum_title, sum_text, sum_cues)| {
-                                            row.child(
-                                                h_flex()
-                                                    .id("viewer-transcript-summarize")
-                                                    .items_center()
-                                                    .gap_1()
-                                                    .px_1p5()
-                                                    .py(px(2.))
-                                                    .rounded_sm()
-                                                    .text_xs()
-                                                    .text_color(chrome.text)
-                                                    .cursor_pointer()
-                                                    .hover(move |b| b.bg(chrome.button_hover))
-                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                        cx.stop_propagation()
-                                                    })
-                                                    .child(
-                                                        Icon::new(IconName::Sparkles)
-                                                            .size(px(12.))
-                                                            .text_color(chrome.text),
-                                                    )
-                                                    .child("Summarize")
-                                                    .on_click(cx.listener(move |_, _, _, cx| {
-                                                        cx.emit(ViewerEvent::SummarizeTranscript {
-                                                            file_id: sum_fid.clone(),
-                                                            title: sum_title.clone(),
-                                                            text: sum_text.clone(),
-                                                            cues: sum_cues.clone(),
-                                                        });
-                                                    })),
-                                            )
-                                        },
-                                    )
-                                    .when_some(copy_text, |row, text| {
-                                        row.child(
-                                            h_flex()
-                                                .id("viewer-transcript-copy")
-                                                .items_center()
-                                                .gap_1()
-                                                .px_1p5()
-                                                .py(px(2.))
-                                                .rounded_sm()
-                                                .text_xs()
-                                                .text_color(if copied {
-                                                    chrome.text
-                                                } else {
-                                                    chrome.text_muted
-                                                })
-                                                .cursor_pointer()
-                                                .hover(move |b| b.bg(chrome.button_hover))
-                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                    cx.stop_propagation()
-                                                })
-                                                .child(
-                                                    Icon::new(if copied {
-                                                        IconName::Check
-                                                    } else {
-                                                        IconName::Copy
-                                                    })
-                                                    .size(px(12.))
-                                                    .text_color(if copied {
-                                                        chrome.text
-                                                    } else {
-                                                        chrome.text_muted
-                                                    }),
-                                                )
-                                                .child(if copied { "Copied" } else { "Copy" })
-                                                .on_click(cx.listener(move |viewer, _, _, cx| {
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(text.clone()),
-                                                    );
-                                                    viewer.transcript_copied = true;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                    })
-                                    .child(
-                                        div()
-                                            .id("viewer-transcript-close")
-                                            .size(px(24.))
-                                            .rounded_sm()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .cursor_pointer()
-                                            .hover(move |b| b.bg(chrome.button_hover))
-                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                cx.stop_propagation()
-                                            })
-                                            .child(
-                                                Icon::new(IconName::X)
-                                                    .size(px(13.))
-                                                    .text_color(chrome.text_muted),
-                                            )
-                                            .on_click(cx.listener(|viewer, _, window, cx| {
-                                                viewer.toggle_transcript(window, cx);
-                                            })),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("viewer-transcript-body")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .px_3()
-                            .py_2p5()
-                            .text_xs()
-                            .line_height(px(18.))
-                            .text_color(chrome.text)
-                            .on_scroll(|_, _, cx| cx.stop_propagation())
-                            .child(body_el),
-                    ),
-            )
-        } else {
-            None
-        };
+        });
 
         let bottom_controls = if is_video {
             let progress = crate::media::progress_fraction(vid_pos, vid_dur);
@@ -2566,6 +2245,474 @@ impl Render for ImageViewer {
     }
 }
 
+/// What the transcript drawer asks of the viewer.
+enum TranscriptEvent {
+    /// Seek the video to a cue's start, in seconds.
+    Seek(f64),
+    Close,
+    Summarize {
+        file_id: FileId,
+        title: String,
+        text: String,
+        cues: Vec<TranscriptCue>,
+    },
+}
+
+/// A video's transcript drawer: a view of its own that the viewer mounts cached, so the
+/// playback tick, which repaints the viewer's transport bar every frame, never rebuilds it. It
+/// resolves the transcript when it renders (opened, new fixtures, or a fetched WebVTT or a
+/// finished transcription refreshing the window) and repaints when the cue under the playhead
+/// changes. The cues are a virtual list: a long recording has hundreds.
+struct ViewerTranscript {
+    fixtures: Arc<Fixtures>,
+    video: ViewerVideo,
+    /// The video's name, for Summarize.
+    title: String,
+    /// The transcript as the last render resolved it.
+    text: Option<SharedString>,
+    cues: Rc<[TranscriptCue]>,
+    list: ListState,
+    active_cue: Option<usize>,
+    copied: bool,
+    /// A pending single-click mouse-down `(cue_index, position)`: a click on a cue seeks, a drag
+    /// selecting its text does not.
+    cue_mouse_down: Option<(usize, Point<Pixels>)>,
+}
+
+impl EventEmitter<TranscriptEvent> for ViewerTranscript {}
+
+impl ViewerTranscript {
+    fn new(fixtures: Arc<Fixtures>, video: ViewerVideo, title: String) -> Self {
+        Self {
+            fixtures,
+            video,
+            title,
+            text: None,
+            cues: Vec::new().into(),
+            list: ListState::new(0, ListAlignment::Top, px(CUE_LIST_OVERDRAW)),
+            active_cue: None,
+            copied: false,
+            cue_mouse_down: None,
+        }
+    }
+
+    /// Follow the playhead, repainting only when the cue under it changes.
+    fn set_playhead(&mut self, position: f64, playing: bool, cx: &mut Context<Self>) {
+        let active = (playing || position > 0.0)
+            .then(|| TranscriptCue::active_index(&self.cues, position))
+            .flatten();
+        if active != self.active_cue {
+            self.active_cue = active;
+            cx.notify();
+        }
+    }
+
+    /// The transcript the fixtures, a fetched WebVTT or the clip's inline preview hold, whether
+    /// a WebVTT is loading, and why it failed.
+    fn resolve(&self, cx: &App) -> (Option<String>, Vec<TranscriptCue>, bool, Option<String>) {
+        let fid = FileId::from(self.video.file_id.clone());
+        let cached = crate::files::clip_transcript_status(&fid, cx);
+        let cues = self
+            .fixtures
+            .file_transcript_cues(&fid)
+            .map(<[TranscriptCue]>::to_vec)
+            .unwrap_or(cached.cues);
+        let text = self
+            .fixtures
+            .file_transcript(&fid)
+            .map(str::to_owned)
+            .or(cached.text)
+            .or_else(|| (!cues.is_empty()).then(|| TranscriptCue::plain_text(&cues)))
+            .or_else(|| self.video.inline_transcript.clone());
+        (text, cues, cached.loading, cached.error)
+    }
+
+    /// Record a cue mouse-down; a double or triple click (selecting a word or the line) is no
+    /// click on the cue.
+    fn record_cue_mouse_down(&mut self, cue_ix: usize, click_count: usize, pos: Point<Pixels>) {
+        self.cue_mouse_down = (click_count == 1).then_some((cue_ix, pos));
+    }
+
+    /// Whether a mouse-up on cue `cue_ix` ends a click on it, within the click threshold of its
+    /// mouse-down, rather than a drag selecting text.
+    fn take_cue_click(&mut self, cue_ix: usize, pos: Point<Pixels>) -> bool {
+        let Some((down_ix, origin)) = self.cue_mouse_down.take() else {
+            return false;
+        };
+        let dx: f32 = (pos.x - origin.x).into();
+        let dy: f32 = (pos.y - origin.y).into();
+        down_ix == cue_ix && dx.abs() < 4.0 && dy.abs() < 4.0
+    }
+
+    fn cue_released(&mut self, cue_ix: usize, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.take_cue_click(cue_ix, pos)
+            && let Some(cue) = self.cues.get(cue_ix)
+        {
+            cx.emit(TranscriptEvent::Seek(cue.start_secs));
+        }
+    }
+
+    fn summarize(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = &self.text {
+            cx.emit(TranscriptEvent::Summarize {
+                file_id: FileId::from(self.video.file_id.clone()),
+                title: self.title.clone(),
+                text: text.to_string(),
+                cues: self.cues.to_vec(),
+            });
+        }
+    }
+
+    fn copy(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = &self.text {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+            self.copied = true;
+            cx.notify();
+        }
+    }
+
+    fn header(&self, chrome: ViewerChrome, cx: &mut Context<Self>) -> impl IntoElement {
+        let copied = self.copied;
+        let has_text = self.text.is_some();
+        h_flex()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(chrome.border)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(chrome.text)
+                    .child(
+                        Icon::new(IconName::Captions)
+                            .size(px(14.))
+                            .text_color(chrome.text_muted),
+                    )
+                    .child("Transcript"),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .when(has_text, |row| {
+                        row.child(
+                            h_flex()
+                                .id("viewer-transcript-summarize")
+                                .items_center()
+                                .gap_1()
+                                .px_1p5()
+                                .py(px(2.))
+                                .rounded_sm()
+                                .text_xs()
+                                .text_color(chrome.text)
+                                .cursor_pointer()
+                                .hover(move |b| b.bg(chrome.button_hover))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    Icon::new(IconName::Sparkles)
+                                        .size(px(12.))
+                                        .text_color(chrome.text),
+                                )
+                                .child("Summarize")
+                                .on_click(cx.listener(|transcript, _, _, cx| {
+                                    transcript.summarize(cx);
+                                })),
+                        )
+                        .child(
+                            h_flex()
+                                .id("viewer-transcript-copy")
+                                .items_center()
+                                .gap_1()
+                                .px_1p5()
+                                .py(px(2.))
+                                .rounded_sm()
+                                .text_xs()
+                                .text_color(if copied {
+                                    chrome.text
+                                } else {
+                                    chrome.text_muted
+                                })
+                                .cursor_pointer()
+                                .hover(move |b| b.bg(chrome.button_hover))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    Icon::new(if copied {
+                                        IconName::Check
+                                    } else {
+                                        IconName::Copy
+                                    })
+                                    .size(px(12.))
+                                    .text_color(if copied {
+                                        chrome.text
+                                    } else {
+                                        chrome.text_muted
+                                    }),
+                                )
+                                .child(if copied { "Copied" } else { "Copy" })
+                                .on_click(cx.listener(|transcript, _, _, cx| transcript.copy(cx))),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("viewer-transcript-close")
+                            .size(px(24.))
+                            .rounded_sm()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(move |b| b.bg(chrome.button_hover))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Icon::new(IconName::X)
+                                    .size(px(13.))
+                                    .text_color(chrome.text_muted),
+                            )
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(TranscriptEvent::Close))),
+                    ),
+            )
+    }
+
+    /// What shows without timed cues: the plain transcript, its loading or transcription state,
+    /// the error, or the Transcribe button.
+    fn message(&self, state: (bool, Option<String>), chrome: ViewerChrome, cx: &App) -> AnyElement {
+        let (loading_vtt, vtt_error) = state;
+        let fid = FileId::from(self.video.file_id.clone());
+        let transcribing = crate::media::is_transcribing(&fid, cx);
+        if let Some(text) = &self.text {
+            return crate::messages::selectable_text(
+                &format!("viewer-transcript-{}", self.video.file_id),
+                0,
+                text.to_string(),
+                Some(chrome.text),
+                VIEWER_TRANSCRIPT_ORDER,
+                cx,
+            );
+        }
+        let status = if loading_vtt {
+            Some("Loading transcript\u{2026}".to_owned())
+        } else if transcribing {
+            Some("Transcribing\u{2026}".to_owned())
+        } else {
+            vtt_error.map(|err| format!("Could not load transcript: {err}"))
+        };
+        if let Some(status) = status {
+            return div()
+                .text_color(chrome.text_muted)
+                .child(status)
+                .into_any_element();
+        }
+        let can_transcribe =
+            !self.video.url.is_empty() && !crate::media::is_hls_url(&self.video.url);
+        let (url, ext) = (self.video.url.clone(), self.video.ext.clone());
+        v_flex()
+            .gap_2()
+            .items_start()
+            .child(
+                div()
+                    .text_color(chrome.text_muted)
+                    .child("No transcript available yet."),
+            )
+            .when(can_transcribe, |col| {
+                col.child(
+                    h_flex()
+                        .id("viewer-transcript-generate")
+                        .items_center()
+                        .gap_1p5()
+                        .px_2p5()
+                        .py_1()
+                        .rounded_md()
+                        .bg(chrome.button)
+                        .border_1()
+                        .border_color(chrome.border)
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(chrome.text)
+                        .cursor_pointer()
+                        .hover(move |b| b.bg(chrome.button_hover))
+                        .child(
+                            Icon::new(IconName::Captions)
+                                .size(px(13.))
+                                .text_color(chrome.text),
+                        )
+                        .child("Transcribe")
+                        .on_click(move |_, window, cx| {
+                            crate::media::transcribe_media(
+                                fid.clone(),
+                                url.clone(),
+                                ext.clone(),
+                                false,
+                                window,
+                                cx,
+                            );
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+impl Render for ViewerTranscript {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let chrome = theme::viewer_chrome();
+        let (text, cues, loading_vtt, vtt_error) = self.resolve(cx);
+        if *self.cues != *cues {
+            self.list.reset(cues.len());
+            self.cues = cues.into();
+            self.active_cue = None;
+        }
+        self.text = text.map(SharedString::from);
+        let body = if self.cues.is_empty() {
+            div()
+                .id("viewer-transcript-text")
+                .size_full()
+                .overflow_y_scroll()
+                .px_3()
+                .py_2p5()
+                .child(self.message((loading_vtt, vtt_error), chrome, cx))
+                .into_any_element()
+        } else {
+            let rows = CueRows {
+                cues: self.cues.clone(),
+                active: self.active_cue,
+                key: SharedString::from(self.video.file_id.clone()),
+                transcript: cx.weak_entity(),
+                chrome,
+            };
+            list(self.list.clone(), move |ix, _, cx| rows.row(ix, cx))
+                .size_full()
+                .px_3()
+                .py_2p5()
+                .into_any_element()
+        };
+        v_flex()
+            .id("viewer-transcript-panel")
+            .size_full()
+            .rounded_lg()
+            .bg(chrome.glass)
+            .border_1()
+            .border_color(chrome.border)
+            .overflow_hidden()
+            .child(self.header(chrome, cx))
+            .child(
+                div()
+                    .id("viewer-transcript-body")
+                    .flex_1()
+                    .min_h_0()
+                    .text_xs()
+                    .line_height(px(18.))
+                    .text_color(chrome.text)
+                    .on_scroll(|_, _, cx| cx.stop_propagation())
+                    .child(body),
+            )
+    }
+}
+
+/// What the cue list's rows render from, built per drawer render and owned by the list.
+struct CueRows {
+    cues: Rc<[TranscriptCue]>,
+    active: Option<usize>,
+    /// The video's file id, keying each cue's selectable text.
+    key: SharedString,
+    transcript: WeakEntity<ViewerTranscript>,
+    chrome: ViewerChrome,
+}
+
+impl CueRows {
+    fn row(&self, ix: usize, cx: &App) -> AnyElement {
+        let Some(cue) = self.cues.get(ix) else {
+            return div().into_any_element();
+        };
+        let chrome = self.chrome;
+        let is_active = self.active == Some(ix);
+        let start_secs = cue.start_secs;
+        let text = crate::messages::selectable_text(
+            &format!("viewer-transcript-{}-{ix}", self.key),
+            0,
+            cue.text.clone(),
+            Some(if is_active {
+                chrome.text
+            } else {
+                chrome.text_muted
+            }),
+            VIEWER_TRANSCRIPT_ORDER + (ix as u64 + 1) * 16,
+            cx,
+        );
+        let (pressed, released, seek) = (
+            self.transcript.clone(),
+            self.transcript.clone(),
+            self.transcript.clone(),
+        );
+        h_flex()
+            .id(("viewer-cue", ix))
+            .items_start()
+            .gap_2()
+            .mb_1()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_l_2()
+            .border_color(if is_active {
+                chrome.text
+            } else {
+                gpui_kit::gpui::transparent_black()
+            })
+            .when(is_active, |row| row.bg(chrome.button_hover))
+            .hover(move |row| row.bg(chrome.button))
+            .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _, cx| {
+                let _ = pressed.update(cx, |transcript, _| {
+                    transcript.record_cue_mouse_down(ix, ev.click_count, ev.position);
+                });
+            })
+            .on_mouse_up(MouseButton::Left, move |ev: &MouseUpEvent, _, cx| {
+                let _ = released.update(cx, |transcript, cx| {
+                    transcript.cue_released(ix, ev.position, cx);
+                });
+            })
+            .child(
+                div()
+                    .id(("viewer-cue-ts", ix))
+                    .flex_none()
+                    .px_1p5()
+                    .py(px(1.))
+                    .rounded_sm()
+                    .bg(if is_active {
+                        chrome.button
+                    } else {
+                        gpui_kit::gpui::transparent_black()
+                    })
+                    .text_size(px(11.))
+                    .font_weight(if is_active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
+                    .text_color(if is_active {
+                        chrome.text
+                    } else {
+                        chrome.text_dim
+                    })
+                    .cursor_pointer()
+                    .hover(move |b| b.bg(chrome.button_hover).text_color(chrome.text))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        let _ = seek.update(cx, |_, cx| cx.emit(TranscriptEvent::Seek(start_secs)));
+                    })
+                    .child(TranscriptCue::format_timestamp(start_secs)),
+            )
+            .child(div().flex_1().min_w_0().child(text))
+            .into_any_element()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2860,43 +3007,61 @@ mod tests {
             }
             Host(entity)
         });
-        cx.update(|window, cx| {
+        let (iv, transcript) = cx.update(|window, cx| {
             let iv = host.read(cx).0.clone();
             iv.update(cx, |v, cx| v.toggle_transcript(window, cx));
             assert!(iv.read(cx).showing_transcript());
-            let (text, resolved_cues, _, _) = iv
+            let _ = window.draw(cx);
+            let transcript = iv
                 .read(cx)
-                .resolve_video_transcript(iv.read(cx).current().video.as_ref().unwrap(), cx);
+                .transcript
+                .as_ref()
+                .map(|(transcript, _)| transcript.clone())
+                .expect("the open drawer is mounted");
             assert_eq!(
-                text.as_deref(),
+                transcript.read(cx).text.as_deref(),
                 Some("First spoken segment. Second spoken segment.")
             );
-            assert_eq!(resolved_cues, cues);
-            let _ = window.draw(cx);
-            // Verify cue row click tracking persists across 30fps playback re-renders while
-            // rejecting drag selections and mismatched cue indices.
-            iv.update(cx, |v, cx| {
-                v.record_cue_mouse_down(1, 1, gpui::point(px(40.), px(60.)));
+            assert_eq!(&*transcript.read(cx).cues, cues.as_slice());
+            // Verify cue row click tracking persists across re-renders while rejecting drag
+            // selections and mismatched cue indices.
+            transcript.update(cx, |t, cx| {
+                t.record_cue_mouse_down(1, 1, gpui::point(px(40.), px(60.)));
                 cx.notify();
             });
             let _ = window.draw(cx);
             assert!(
-                iv.update(cx, |v, _| v
+                transcript.update(cx, |t, _| t
                     .take_cue_click(1, gpui::point(px(41.), px(61.)))),
                 "cue click must survive a re-render between mouse-down and mouse-up"
             );
-            iv.update(cx, |v, cx| {
-                v.record_cue_mouse_down(1, 1, gpui::point(px(40.), px(60.)));
+            transcript.update(cx, |t, cx| {
+                t.record_cue_mouse_down(1, 1, gpui::point(px(40.), px(60.)));
                 cx.notify();
             });
             let _ = window.draw(cx);
             assert!(
-                !iv.update(cx, |v, _| v
+                !transcript.update(cx, |t, _| t
                     .take_cue_click(1, gpui::point(px(75.), px(60.)))),
                 "text drag-selection must NOT trigger a cue click seek"
             );
-            iv.update(cx, |v, cx| v.evict_assets(window, cx));
+            (iv, transcript)
         });
+
+        // The playhead repaints the drawer only when the cue under it changes, so the 30 fps
+        // playback tick leaves the cue list alone.
+        let repaints = Rc::new(std::cell::Cell::new(0));
+        let counter = repaints.clone();
+        let _watch =
+            cx.update(|_, cx| cx.observe(&transcript, move |_, _| counter.set(counter.get() + 1)));
+        for position in [0.5, 1.0, 2.5, 4.0, 4.5] {
+            cx.update(|_, cx| {
+                transcript.update(cx, |t, cx| t.set_playhead(position, true, cx));
+            });
+        }
+        assert_eq!(repaints.get(), 2);
+        assert_eq!(transcript.read_with(cx, |t, _| t.active_cue), Some(1));
+        cx.update(|window, cx| iv.update(cx, |v, cx| v.evict_assets(window, cx)));
         cx.run_until_parked();
     }
 
