@@ -115,7 +115,6 @@ actions!(
         OpenHome,
         OpenLater,
         OpenFiles,
-        OpenMore,
         OpenPeople,
         OpenOwnProfile,
         CreateChannelAction,

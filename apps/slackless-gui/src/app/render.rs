@@ -1174,9 +1174,6 @@ impl App {
                     .update(cx, |m, cx| m.jump(crate::messages::Jump::Recent, cx));
             }
         }))
-        .on_action(cx.listener(|this, _: &OpenMore, _, cx| {
-            this.open_directory(cx);
-        }))
         .on_action(cx.listener(|this, _: &NextSection, _, cx| {
             if let Some(next) = this.sidebar.read(cx).step_section(&this.channel, true) {
                 this.select(next, cx);
