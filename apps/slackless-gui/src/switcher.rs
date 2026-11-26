@@ -7,6 +7,7 @@
 //! emits `SwitcherEvent::Open(ChannelId)`
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +39,7 @@ pub enum SwitcherEvent {
     SearchRemote(String),
 }
 
+#[derive(Clone)]
 enum Target {
     Channel(ChannelId),
     RemoteChannel(Box<Conversation>),
@@ -45,11 +47,59 @@ enum Target {
     RemoteUser(Box<User>),
 }
 
+/// What a [`Candidate`] opens, by id or position, so listing every candidate copies no
+/// conversation or person.
+enum Pick {
+    Conversation(ChannelId),
+    /// An unjoined channel of the snapshot's directory.
+    Directory(usize),
+    Person(UserId),
+    RemoteChannel(usize),
+    RemoteUser(usize),
+}
+
+/// A conversation or person the filter can match, lowercased once.
+struct Candidate {
+    pick: Pick,
+    label: String,
+    /// `label` lowercased: what rows of one match quality and frecency sort by.
+    sort_key: String,
+    /// Where the matched name starts in `sort_key` (past a channel's "# ").
+    name_at: usize,
+    /// A person's handle, lowercased: they match by it too.
+    handle: Option<String>,
+    /// Conversations, people, unjoined channels, remote people: the order of rows that tie.
+    group: u8,
+    /// A remote Edge result, listed even when only Slack matched it.
+    remote: bool,
+}
+
+impl Candidate {
+    fn new(pick: Pick, label: String, handle: Option<&str>, group: u8, remote: bool) -> Self {
+        let sort_key = label.to_lowercase();
+        let name_at = sort_key.len() - sort_key.trim_start_matches("# ").len();
+        Self {
+            pick,
+            label,
+            sort_key,
+            name_at,
+            handle: handle.map(str::to_lowercase),
+            group,
+            remote,
+        }
+    }
+}
+
 pub struct QuickSwitcher {
     fixtures: Arc<Fixtures>,
     input: Entity<TextareaState>,
     query: String,
     selected: usize,
+    /// What the filter matches in `fixtures`, built on the first match after a snapshot.
+    candidates: Option<Rc<[Candidate]>>,
+    /// The rows for the current query, ranked once per change of query, snapshot, frecency or
+    /// remote results.
+    rows: Option<Rc<[(Target, String)]>>,
     /// Recently visited conversation ids (newest first) for frecency ordering.
     recent: Vec<ChannelId>,
     /// Visit count per conversation id for frecency tie-breaking.
@@ -81,8 +131,7 @@ impl QuickSwitcher {
                 window,
                 |this: &mut QuickSwitcher, input, event: &InputEvent, _, cx| match event {
                     InputEvent::Change => {
-                        this.query = input.read(cx).value().trim().to_lowercase();
-                        this.selected = 0;
+                        this.set_query(input.read(cx).value().trim().to_lowercase());
                         this.schedule_remote_search(cx);
                         cx.notify();
                     }
@@ -95,6 +144,8 @@ impl QuickSwitcher {
                 input,
                 query: String::new(),
                 selected: 0,
+                candidates: None,
+                rows: None,
                 recent: Vec::new(),
                 visits: HashMap::new(),
                 remote_query: String::new(),
@@ -109,6 +160,8 @@ impl QuickSwitcher {
     /// Live refresh: match the query against the conversations in `fixtures`.
     pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
         self.fixtures = fixtures;
+        self.candidates = None;
+        self.rows = None;
         cx.notify();
     }
 
@@ -121,6 +174,7 @@ impl QuickSwitcher {
     ) {
         self.recent = recent;
         self.visits = visits;
+        self.rows = None;
         cx.notify();
     }
 
@@ -137,13 +191,20 @@ impl QuickSwitcher {
         self.remote_query = self.query.clone();
         self.remote_channels = results.channels;
         self.remote_users = results.users;
+        self.rows = None;
         cx.notify();
+    }
+
+    /// Filter by `query` (lowercased), from the first row.
+    fn set_query(&mut self, query: String) {
+        self.query = query;
+        self.selected = 0;
+        self.rows = None;
     }
 
     /// Clear the filter and focus the field; call when the dialog opens.
     pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.query.clear();
-        self.selected = 0;
+        self.set_query(String::new());
         self.remote_query.clear();
         self.remote_channels.clear();
         self.remote_users.clear();
@@ -192,168 +253,118 @@ impl QuickSwitcher {
         recency + freq
     }
 
+    /// The rows for the current query (see [`Self::rank`]), ranked once per change of query,
+    /// snapshot, frecency or remote results however often the switcher draws.
+    fn matches(&mut self) -> Rc<[(Target, String)]> {
+        if let Some(rows) = &self.rows {
+            return Rc::clone(rows);
+        }
+        let rows: Rc<[(Target, String)]> = self.rank().into();
+        self.rows = Some(Rc::clone(&rows));
+        rows
+    }
+
     /// Conversations and colleagues matching the filter, ranked by match quality (exact > prefix >
     /// word prefix > substring) and frecency, merging live remote Edge results for unjoined
-    /// channels and colleagues not yet in local fixtures.
-    fn matches(&self) -> Vec<(Target, String)> {
-        let with_dm: HashSet<&UserId> = self
-            .fixtures
-            .dms
-            .iter()
-            .filter_map(|dm| dm.user.as_ref())
-            .collect();
-        let known_channels: HashSet<&ChannelId> = self
-            .fixtures
-            .dms
-            .iter()
-            .chain(&self.fixtures.channels)
-            .map(|c| &c.id)
-            .collect();
-        let known_users: HashSet<&UserId> = self.fixtures.users.iter().map(|u| &u.id).collect();
-
-        // Tuple: (match_tier, reverse_frecency, tie_group, label_lower, target, display_label)
-        let mut scored: Vec<(u8, u32, u8, String, Target, String)> = Vec::new();
+    /// channels and colleagues not yet in local fixtures. Only the [`MAX_ROWS`] shown are sorted.
+    fn rank(&mut self) -> Vec<(Target, String)> {
+        let fixtures = Arc::clone(&self.fixtures);
+        let local = Rc::clone(
+            self.candidates
+                .get_or_insert_with(|| candidates(&fixtures).into()),
+        );
         let q = self.query.as_str();
-        let match_tier = |label: &str| -> Option<u8> {
-            let key = label.trim_start_matches("# ").to_lowercase();
-            if q.is_empty() {
-                return Some(0);
-            }
-            if key == q {
-                Some(0)
-            } else if key.starts_with(q) {
-                Some(1)
-            } else if key
-                .split(|c: char| !c.is_alphanumeric())
-                .any(|word| word.starts_with(q))
-            {
-                Some(2)
-            } else if key.contains(q) {
-                Some(3)
-            } else {
-                None
-            }
+        let remote = if !q.is_empty() && self.remote_query == q {
+            self.remote_candidates()
+        } else {
+            Vec::new()
         };
+        // (match tier, reverse frecency, group, sort key, position): unique, so ties keep the
+        // order candidates were listed in.
+        type Rank<'a> = (u8, u32, u8, &'a str, usize);
+        let mut scored: Vec<(Rank<'_>, &Candidate)> = local
+            .iter()
+            .chain(&remote)
+            .enumerate()
+            .filter(|(_, c)| !q.is_empty() || c.group != 2)
+            .filter_map(|(ix, c)| {
+                let tier = match_tier(q, &c.sort_key[c.name_at..])
+                    .or_else(|| c.handle.as_deref().and_then(|handle| match_tier(q, handle)))
+                    .or_else(|| c.remote.then_some(3))?;
+                let frecency = match &c.pick {
+                    Pick::Conversation(id) => u32::MAX - self.frecency_score(id),
+                    _ => u32::MAX,
+                };
+                Some(((tier, frecency, c.group, c.sort_key.as_str(), ix), c))
+            })
+            .collect();
+        if scored.len() > MAX_ROWS {
+            scored.select_nth_unstable_by(MAX_ROWS - 1, |a, b| a.0.cmp(&b.0));
+            scored.truncate(MAX_ROWS);
+        }
+        scored.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        scored
+            .into_iter()
+            .filter_map(|(_, c)| Some((self.target(&c.pick)?, c.label.clone())))
+            .collect()
+    }
 
-        for c in self.fixtures.dms.iter().chain(&self.fixtures.channels) {
-            let label = self.fixtures.conversation_label(c);
-            if let Some(tier) = match_tier(&label) {
-                let frec = self.frecency_score(&c.id);
-                scored.push((
-                    tier,
-                    u32::MAX - frec,
-                    0,
-                    label.to_lowercase(),
-                    Target::Channel(c.id.clone()),
-                    label,
-                ));
-            }
-        }
-        // Unjoined directory channels already known locally (e.g. from boot/directory).
-        for c in &self.fixtures.directory {
-            if c.is_archived || known_channels.contains(&c.id) {
-                continue;
-            }
-            let label = self.fixtures.conversation_label(c);
-            if !q.is_empty()
-                && let Some(tier) = match_tier(&label)
-            {
-                scored.push((
-                    tier,
-                    u32::MAX,
-                    2,
-                    label.to_lowercase(),
-                    Target::RemoteChannel(Box::new(c.clone())),
-                    label,
-                ));
-            }
-        }
-        for u in &self.fixtures.users {
-            if u.deleted || with_dm.contains(&u.id) {
-                continue;
-            }
-            let name = if u.id == self.fixtures.self_user {
-                format!("{} (you)", self.fixtures.name_of(u))
-            } else {
-                self.fixtures.name_of(u).to_owned()
-            };
-            let tier = match_tier(&name).or_else(|| match_tier(&u.name));
-            if let Some(tier) = tier {
-                scored.push((
-                    tier,
-                    u32::MAX,
-                    1,
-                    name.to_lowercase(),
-                    Target::User(u.id.clone()),
-                    name,
-                ));
-            }
-        }
-        // Merge remote Edge API channels & users when matching the current query.
-        if !q.is_empty() && self.remote_query == q {
-            let mut seen_remote_ch: HashSet<&ChannelId> = self
-                .fixtures
-                .directory
-                .iter()
-                .map(|c| &c.id)
-                .chain(known_channels.iter().copied())
-                .collect();
-            for c in &self.remote_channels {
-                if c.is_archived || !seen_remote_ch.insert(&c.id) {
-                    continue;
-                }
+    /// The remote Edge results for the current query that the snapshot does not hold.
+    fn remote_candidates(&self) -> Vec<Candidate> {
+        let mut seen = HashSet::new();
+        let channels = (self.remote_channels.iter().enumerate())
+            .filter(|(_, c)| {
+                !c.is_archived && self.fixtures.conversation(&c.id).is_none() && seen.insert(&c.id)
+            })
+            .map(|(ix, c)| {
                 let label = c
                     .name
                     .as_deref()
                     .map(|n| format!("# {n}"))
                     .unwrap_or_else(|| c.id.to_string());
-                let tier = match_tier(&label).unwrap_or(3);
-                scored.push((
-                    tier,
-                    u32::MAX,
-                    2,
-                    label.to_lowercase(),
-                    Target::RemoteChannel(Box::new(c.clone())),
-                    label,
-                ));
-            }
-            for u in &self.remote_users {
-                if u.deleted || with_dm.contains(&u.id) || known_users.contains(&u.id) {
-                    continue;
-                }
+                Candidate::new(Pick::RemoteChannel(ix), label, None, 2, true)
+            });
+        let with_dm = |u: &User| {
+            self.fixtures
+                .dms
+                .iter()
+                .any(|dm| dm.user.as_ref() == Some(&u.id))
+        };
+        let people = (self.remote_users.iter().enumerate())
+            .filter(|(_, u)| !u.deleted && !with_dm(u) && self.fixtures.user(&u.id).is_none())
+            .map(|(ix, u)| {
                 let name = self.fixtures.name_of(u).to_owned();
-                let tier = match_tier(&name)
-                    .or_else(|| match_tier(&u.name))
-                    .unwrap_or(3);
-                scored.push((
-                    tier,
-                    u32::MAX,
-                    3,
-                    name.to_lowercase(),
-                    Target::RemoteUser(Box::new(u.clone())),
-                    name,
-                ));
-            }
-        }
+                Candidate::new(Pick::RemoteUser(ix), name, Some(u.name.as_str()), 3, true)
+            });
+        channels.chain(people).collect()
+    }
 
-        scored.sort_by(|a, b| (a.0, a.1, a.2, &a.3).cmp(&(b.0, b.1, b.2, &b.3)));
-        scored.truncate(MAX_ROWS);
-        scored
-            .into_iter()
-            .map(|(_, _, _, _, target, label)| (target, label))
-            .collect()
+    /// What `pick` opens.
+    fn target(&self, pick: &Pick) -> Option<Target> {
+        Some(match pick {
+            Pick::Conversation(id) => Target::Channel(id.clone()),
+            Pick::Directory(ix) => {
+                Target::RemoteChannel(Box::new(self.fixtures.directory.get(*ix)?.clone()))
+            }
+            Pick::Person(id) => Target::User(id.clone()),
+            Pick::RemoteChannel(ix) => {
+                Target::RemoteChannel(Box::new(self.remote_channels.get(*ix)?.clone()))
+            }
+            Pick::RemoteUser(ix) => {
+                Target::RemoteUser(Box::new(self.remote_users.get(*ix)?.clone()))
+            }
+        })
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
-        if let Some((target, _)) = self.matches().into_iter().nth(self.selected) {
-            match target {
-                Target::Channel(channel) => cx.emit(SwitcherEvent::Open(channel)),
-                Target::RemoteChannel(channel) => {
-                    cx.emit(SwitcherEvent::OpenRemoteChannel(channel))
-                }
-                Target::User(user) => cx.emit(SwitcherEvent::OpenUser(user)),
-                Target::RemoteUser(user) => cx.emit(SwitcherEvent::OpenUser(user.id)),
-            }
+        let Some((target, _)) = self.matches().get(self.selected).cloned() else {
+            return;
+        };
+        match target {
+            Target::Channel(channel) => cx.emit(SwitcherEvent::Open(channel)),
+            Target::RemoteChannel(channel) => cx.emit(SwitcherEvent::OpenRemoteChannel(channel)),
+            Target::User(user) => cx.emit(SwitcherEvent::OpenUser(user)),
+            Target::RemoteUser(user) => cx.emit(SwitcherEvent::OpenUser(user.id)),
         }
     }
 
@@ -366,6 +377,68 @@ impl QuickSwitcher {
         }
         cx.stop_propagation();
         cx.notify();
+    }
+}
+
+/// Everything a query can match in `fixtures`: its conversations, the people without a DM
+/// and the unjoined channels it lists.
+fn candidates(fixtures: &Fixtures) -> Vec<Candidate> {
+    let with_dm: HashSet<&UserId> = (fixtures.dms.iter())
+        .filter_map(|dm| dm.user.as_ref())
+        .collect();
+    let conversations = fixtures.dms.iter().chain(&fixtures.channels);
+    let known: HashSet<&ChannelId> = conversations.clone().map(|c| &c.id).collect();
+    let mut all: Vec<Candidate> = conversations
+        .map(|c| {
+            let label = fixtures.conversation_label(c);
+            Candidate::new(Pick::Conversation(c.id.clone()), label, None, 0, false)
+        })
+        .collect();
+    all.extend(
+        (fixtures.directory.iter().enumerate())
+            .filter(|(_, c)| !c.is_archived && !known.contains(&c.id))
+            .map(|(ix, c)| {
+                let label = fixtures.conversation_label(c);
+                Candidate::new(Pick::Directory(ix), label, None, 2, false)
+            }),
+    );
+    all.extend(
+        (fixtures.users.iter())
+            .filter(|u| !u.deleted && !with_dm.contains(&u.id))
+            .map(|u| {
+                let name = if u.id == fixtures.self_user {
+                    format!("{} (you)", fixtures.name_of(u))
+                } else {
+                    fixtures.name_of(u).to_owned()
+                };
+                Candidate::new(
+                    Pick::Person(u.id.clone()),
+                    name,
+                    Some(u.name.as_str()),
+                    1,
+                    false,
+                )
+            }),
+    );
+    all
+}
+
+/// How well lowercased `key` matches `query`: exact, prefix, word prefix, substring; an empty
+/// query matches everything.
+fn match_tier(query: &str, key: &str) -> Option<u8> {
+    if query.is_empty() || key == query {
+        Some(0)
+    } else if key.starts_with(query) {
+        Some(1)
+    } else if key
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word.starts_with(query))
+    {
+        Some(2)
+    } else if key.contains(query) {
+        Some(3)
+    } else {
+        None
     }
 }
 
@@ -465,12 +538,7 @@ impl Render for QuickSwitcher {
                         (user_chip(&self.fixtures, &user.id, 20.), "Person")
                     }
                 };
-                let target_clone = match target {
-                    Target::Channel(c) => Target::Channel(c.clone()),
-                    Target::RemoteChannel(c) => Target::RemoteChannel(c.clone()),
-                    Target::User(u) => Target::User(u.clone()),
-                    Target::RemoteUser(u) => Target::RemoteUser(u.clone()),
-                };
+                let target_clone = target.clone();
                 h_flex()
                     .id(("switcher-row", ix))
                     .items_center()
@@ -588,41 +656,36 @@ mod tests {
         });
         let switcher = mounted.borrow_mut().take().unwrap();
 
-        // Empty query orders purely by frecency (recency + visit count).
+        let channel_ids = |s: &mut QuickSwitcher| -> Vec<String> {
+            (s.matches().iter())
+                .filter_map(|(t, _)| match t {
+                    Target::Channel(id) => Some(id.to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // An empty query orders by frecency (recency + visit count) once it arrives.
         switcher.update(cx, |s, cx| {
+            assert_eq!(
+                channel_ids(s)[0],
+                "C_EXACT",
+                "alphabetical without frecency"
+            );
             s.set_frecency(
                 vec![ChannelId::from("C_MID"), ChannelId::from("C_SUB")],
                 HashMap::from([(ChannelId::from("C_SUB"), 20)]),
                 cx,
             );
-        });
-        switcher.read_with(cx, |s, _| {
-            let ids: Vec<String> = s
-                .matches()
-                .into_iter()
-                .filter_map(|(t, _)| match t {
-                    Target::Channel(id) => Some(id.to_string()),
-                    _ => None,
-                })
-                .collect();
+            let ids = channel_ids(s);
             assert_eq!(ids[0], "C_SUB"); // 95 + 80 = 175 > 100
             assert_eq!(ids[1], "C_MID");
         });
 
         // Query "eng" ranks exact > prefix > word-prefix > substring.
         switcher.update(cx, |s, _| {
-            s.query = "eng".into();
-        });
-        switcher.read_with(cx, |s, _| {
-            let ids: Vec<String> = s
-                .matches()
-                .into_iter()
-                .filter_map(|(t, _)| match t {
-                    Target::Channel(id) => Some(id.to_string()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(ids, vec!["C_EXACT", "C_PRE", "C_SUB", "C_MID"]);
+            s.set_query("eng".into());
+            assert_eq!(channel_ids(s), ["C_EXACT", "C_PRE", "C_SUB", "C_MID"]);
         });
 
         // Merging remote results deduplicates known channels and ignores stale queries.
@@ -658,12 +721,24 @@ mod tests {
                 },
                 cx,
             );
-        });
-        switcher.read_with(cx, |s, _| {
-            let labels: Vec<String> = s.matches().into_iter().map(|(_, l)| l).collect();
+            let labels: Vec<String> = s.matches().iter().map(|(_, l)| l.clone()).collect();
             assert!(labels.iter().any(|l| l == "# eng-remote"));
             assert!(!labels.iter().any(|l| l == "# eng-stale"));
             assert_eq!(labels.iter().filter(|l| *l == "# eng").count(), 1);
+        });
+
+        // A new snapshot's conversations match at once.
+        switcher.update(cx, |s, cx| {
+            let mut next = s.fixtures.with_counts(HashMap::new());
+            next.channels.push(Conversation {
+                id: ChannelId::from("C_NEW"),
+                name: Some("eng-new".into()),
+                is_channel: true,
+                is_member: true,
+                ..Default::default()
+            });
+            s.set_fixtures(Arc::new(next), cx);
+            assert!(channel_ids(s).iter().any(|id| id == "C_NEW"));
         });
     }
 }
