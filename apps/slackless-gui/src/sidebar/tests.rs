@@ -763,4 +763,23 @@ fn custom_sections_list_only_joined_channels_and_dms(cx: &mut gpui::TestAppConte
     let rows = laid_out(cx);
     assert!(rows[..3].contains(&browsed.id));
     assert_eq!(count(&rows, &browsed.id), 1);
+
+    // A channel joined this session lists once under Channels, before and after the next
+    // snapshot lists it too.
+    let fresh = Conversation {
+        id: ChannelId::from("C_FRESH"),
+        name: Some("fresh".into()),
+        is_channel: true,
+        ..Default::default()
+    };
+    sidebar.update(cx, |s, cx| s.add_channel(fresh.clone(), cx));
+    assert_eq!(count(&laid_out(cx), &fresh.id), 1);
+    let mut next = crate::fixtures::load();
+    next.channels.push(fresh.clone());
+    sidebar.update(cx, |s, cx| s.set_fixtures(Arc::new(next), cx));
+    assert_eq!(
+        count(&laid_out(cx), &fresh.id),
+        1,
+        "the snapshot's copy and the session's join are one channel"
+    );
 }

@@ -366,9 +366,15 @@ impl Sidebar {
     }
 
     /// The joined channels the Home list shows: the snapshot's, then the ones joined from the
-    /// channel browser this session.
+    /// channel browser this session that the snapshot does not list yet (once a snapshot lists
+    /// a session join, its copy is the one shown).
     pub(super) fn home_channels(&self) -> impl Iterator<Item = &Conversation> {
-        self.fixtures.channels.iter().chain(&self.joined)
+        let listed = &self.fixtures.channels;
+        listed.iter().chain(
+            self.joined
+                .iter()
+                .filter(|joined| !listed.iter().any(|channel| channel.id == joined.id)),
+        )
     }
 
     /// The conversation `id` names among the ones the Home list shows (the channels of
