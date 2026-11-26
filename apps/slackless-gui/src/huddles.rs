@@ -29,8 +29,8 @@ use crate::fixtures::Fixtures;
 use crate::huddle_state;
 use crate::messages::list_stamp;
 
-/// Trail messages scanned per conversation in the live derivation.
-const SCAN_LIMIT: usize = 200;
+/// Newest stored huddle trails listed on the live Huddles page.
+const RECENT_LIMIT: usize = 200;
 
 /// One recent or live huddle: where it ran, who joined, duration, and thread replies.
 #[derive(Clone)]
@@ -785,43 +785,36 @@ impl Render for HuddlesView {
 
 /// Recent huddles from the stored `huddle_thread` trail messages, newest first.
 pub fn store_huddles(store: &Store, team: &TeamId) -> Vec<RecentHuddle> {
-    let Ok(conversations) = store.conversations(team) else {
+    let Ok(rows) =
+        store.recent_messages_by_subtype(team, &MessageSubtype::HuddleThread, RECENT_LIMIT)
+    else {
         return Vec::new();
     };
     let transcript_counts = store
         .huddle_transcript_counts_by_thread(team)
         .unwrap_or_default();
-    let mut huddles = Vec::new();
-    for conversation in &conversations {
-        let Ok(rows) = store.channel_history(team, &conversation.id, None, SCAN_LIMIT) else {
-            continue;
-        };
-        for row in rows {
-            let message = &row.message;
-            if row.deleted || message.subtype != Some(MessageSubtype::HuddleThread) {
-                continue;
-            }
-            let (live, participants, duration_secs) = match parse_huddle_room(message) {
+    rows.into_iter()
+        .map(|row| {
+            let message = row.message;
+            let (live, participants, duration_secs) = match parse_huddle_room(&message) {
                 Some(room) => (room.live, room.participants, room.duration_secs),
                 None => (false, Vec::new(), None),
             };
             let (transcript_call_id, transcript_lines) = transcript_counts
-                .get(&(conversation.id.clone(), message.ts.clone()))
+                .get(&(row.channel.clone(), message.ts.clone()))
                 .map_or((None, 0), |(cid, count)| (Some(cid.clone()), *count));
-            huddles.push(RecentHuddle {
-                channel: conversation.id.clone(),
-                ts: message.ts.clone(),
+            RecentHuddle {
+                channel: row.channel,
+                ts: message.ts,
                 participants,
                 live,
                 duration_secs,
                 reply_count: message.reply_count.unwrap_or(0),
                 transcript_call_id,
                 transcript_lines,
-            });
-        }
-    }
-    huddles.sort_by_key(|huddle| std::cmp::Reverse(huddle.ts.clone()));
-    huddles
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

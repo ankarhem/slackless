@@ -2523,6 +2523,53 @@ fn archive_read_apis_cover_channels_dms_users_resolve_digest_and_malformed_prefs
 }
 
 #[test]
+fn recent_messages_by_subtype_lists_one_workspaces_newest_undeleted_across_channels() {
+    let mut store = Store::open_in_memory().unwrap();
+    let huddle = |ts: &str| Message {
+        ts: Ts::from(ts),
+        subtype: Some(MessageSubtype::HuddleThread),
+        ..Default::default()
+    };
+    let c2 = ChannelId::from("C2");
+    for (channel, message) in [
+        (&general(), huddle("1700000001.000100")),
+        (&c2, huddle("1700000003.000100")),
+        (&general(), huddle("1700000005.000100")),
+        (&general(), msg("1700000006.000100", "U1", "not a huddle")),
+    ] {
+        store.upsert_message(&ws(), channel, &message).unwrap();
+    }
+    let gone = huddle("1700000007.000100");
+    store.upsert_message(&ws(), &general(), &gone).unwrap();
+    store
+        .record_deletion(&ws(), &general(), &gone.ts, None, Some(&gone))
+        .unwrap();
+    store
+        .upsert_message(
+            &TeamId::from("T2"),
+            &general(),
+            &huddle("1700000009.000100"),
+        )
+        .unwrap();
+
+    let newest = |limit| -> Vec<(ChannelId, Ts)> {
+        store
+            .recent_messages_by_subtype(&ws(), &MessageSubtype::HuddleThread, limit)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.channel, row.message.ts))
+            .collect()
+    };
+    let expected = [
+        (general(), Ts::from("1700000005.000100")),
+        (c2.clone(), Ts::from("1700000003.000100")),
+        (general(), Ts::from("1700000001.000100")),
+    ];
+    assert_eq!(newest(10), expected);
+    assert_eq!(newest(2), expected[..2]);
+}
+
+#[test]
 fn search_date_filters_enforce_exact_utc_midnight_boundaries_leap_days_and_rollover() {
     let mut store = Store::open_in_memory().unwrap();
     let ch = general();

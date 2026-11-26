@@ -469,6 +469,30 @@ impl Store {
             .map(Ts::from))
     }
 
+    /// Up to `limit` newest undeleted messages of `subtype` across all of `workspace`'s
+    /// conversations, newest first.
+    pub fn recent_messages_by_subtype(
+        &self,
+        workspace: &TeamId,
+        subtype: &MessageSubtype,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT channel_id, json, deleted FROM message_current
+             WHERE workspace_id = ?1 AND subtype = ?2 AND deleted = 0
+             ORDER BY ts_key DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                workspace.as_str(),
+                subtype.as_str(),
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ],
+            raw_row,
+        )?;
+        collect(rows)
+    }
+
     /// Activity digest grouped by channel for non-deleted messages at or after `cutoff_secs`
     /// (unix seconds), ordered by message count descending then latest timestamp descending.
     pub fn digest_since(
