@@ -105,15 +105,6 @@ fn spellcheck_language_timezone_and_schedule_helpers() {
     s.language = 99;
     assert_eq!(s.spellcheck_language(), None);
 
-    assert_eq!(s.timezone_offset_secs(), None);
-    s.timezone_auto = false;
-    s.timezone = 0;
-    assert_eq!(s.timezone_offset_secs(), Some(3_600));
-    s.timezone = 2;
-    assert_eq!(s.timezone_offset_secs(), Some(-18_000));
-    s.timezone = 99;
-    assert_eq!(s.timezone_offset_secs(), Some(0));
-
     s.schedule_enabled = false;
     assert!(s.notifications_allowed_now());
     assert_eq!(s.schedule_summary(), "Off");
@@ -235,6 +226,39 @@ fn control_metrics_switches_between_clean_and_compact() {
 }
 
 #[test]
+fn stored_timezone_migrates_legacy_indices_to_iana_zones() {
+    // (stored settings, zone the settings carry, zone the clock follows when the override is on)
+    for (json, stored) in [
+        (
+            r#"{"timezone_auto": false, "timezone": 0}"#,
+            "Europe/Stockholm",
+        ),
+        (
+            r#"{"timezone_auto": false, "timezone": 2}"#,
+            "America/New_York",
+        ),
+        (r#"{"timezone_auto": false, "timezone": 4}"#, "Asia/Tokyo"),
+        (r#"{"timezone_auto": false, "timezone": 600}"#, "UTC"),
+        (
+            r#"{"timezone_auto": false, "timezone": "Asia/Tokyo"}"#,
+            "Asia/Tokyo",
+        ),
+        (
+            r#"{"timezone_auto": false, "timezone": "Mars/Olympus"}"#,
+            "UTC",
+        ),
+        (r#"{"timezone_auto": false}"#, "Europe/Stockholm"),
+    ] {
+        let settings: Settings = serde_json::from_str(json).expect("settings deserialize");
+        assert_eq!(settings.timezone, stored, "{json}");
+        assert_eq!(settings.timezone(), Some(stored), "{json}");
+    }
+    let automatic: Settings = serde_json::from_str(r#"{"timezone": 2}"#).unwrap();
+    assert_eq!(automatic.timezone, "America/New_York");
+    assert_eq!(automatic.timezone(), None);
+}
+
+#[test]
 fn corrupted_out_of_bounds_settings_indices_never_panic() {
     let corrupted: Settings = serde_json::from_str(
         r#"{
@@ -261,7 +285,7 @@ fn corrupted_out_of_bounds_settings_indices_never_panic() {
         "Weekdays, 9:00 AM \u{2013} 6:00 PM"
     );
     assert_eq!(corrupted.spellcheck_language(), None);
-    assert_eq!(corrupted.timezone_offset_secs(), Some(0));
+    assert_eq!(corrupted.timezone(), Some("UTC"));
     assert_eq!(corrupted.mobile_handoff_secs(), 0);
     assert_eq!(corrupted.notify_level_wire(), "mentions_dms");
     assert_eq!(corrupted.mobile_notify_level_wire(), "mentions_dms");

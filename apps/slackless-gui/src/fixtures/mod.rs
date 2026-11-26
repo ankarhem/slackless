@@ -324,6 +324,32 @@ pub fn live(
     )
 }
 
+/// A live workspace on its first visit, before [`live`] has read it off the UI thread: the
+/// signed-in user and what their stored prefs set (one row; the color theme above all), so
+/// the switch paints at once, themed, and the snapshot then fills it in.
+pub fn placeholder(
+    session: &Session,
+    store: &Store,
+    counts: &HashMap<ChannelId, ConversationCounts>,
+) -> Fixtures {
+    let prefs = store
+        .prefs(&session.team_id)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    Fixtures::from_parts(
+        WorkspaceData {
+            self_user: session.user_id.clone(),
+            notify_levels: slackless_core::notify_levels(&prefs),
+            quick_reactions: quick_reactions(&prefs),
+            skin_tone: crate::emoji::skin_tone_from_prefs(&prefs),
+            palette: crate::theme::palette_from_prefs(&prefs),
+            ..Default::default()
+        },
+        counts.clone(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,7 +376,10 @@ mod tests {
             text: "cc <@U0BOB> and <@U0CARA|cara> :rocket:".into(),
             ..Default::default()
         };
-        assert_eq!(fixtures.plain_text(&sample_msg), "cc @bob and @cara 🚀");
+        assert_eq!(
+            crate::messages::plain_text(&sample_msg.text, &fixtures),
+            "cc @bob and @cara 🚀"
+        );
         let updated = fixtures.with_counts(HashMap::from([(
             ChannelId::from("C0GENERAL"),
             ConversationCounts {

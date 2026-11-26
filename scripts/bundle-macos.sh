@@ -63,7 +63,7 @@ VERSION="${SLACKLESS_VERSION:-$(awk -F'"' '/^version *=/{print $2; exit}' "$ROOT
 BUNDLE_VERSION="${VERSION//-/.}"
 APP="$TARGET_DIR/bundle/Slackless.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 
 cp "$BIN" "$APP/Contents/MacOS/slackless-gui"
 chmod +x "$APP/Contents/MacOS/slackless-gui"
@@ -71,6 +71,12 @@ if [[ -x "$CLI_BIN" ]]; then
   cp "$CLI_BIN" "$APP/Contents/MacOS/slackless"
   chmod +x "$APP/Contents/MacOS/slackless"
 fi
+
+# ONNX Runtime is not linked into the binaries; they load it on demand from Contents/Frameworks.
+# The pinned, checksum-verified download is cached, so only the first bundle hits the network.
+ORT_SRC="$("$ROOT/scripts/fetch-onnxruntime.sh")"
+ORT_DYLIB="$APP/Contents/Frameworks/libonnxruntime.dylib"
+cp "$ORT_SRC" "$ORT_DYLIB"
 
 ICON_PNG="$ROOT/apps/slackless-gui/icon.png"
 if [[ -f "$ICON_PNG" ]] && command -v sips >/dev/null && command -v iconutil >/dev/null; then
@@ -154,6 +160,8 @@ else
   SIGN_ID="${SLACKLESS_SIGN_IDENTITY:--}"
 fi
 if command -v codesign >/dev/null; then
+  # Nested code first, with the same identity, then the app that seals it.
+  codesign --force --sign "$SIGN_ID" "$ORT_DYLIB"
   codesign --force --deep --sign "$SIGN_ID" "$APP"
   if [[ -n "$SIGN_LABEL" ]]; then
     echo "Signed $APP with identity: $SIGN_LABEL ($SIGN_ID)"

@@ -2,9 +2,10 @@
 //!
 //! - [`TranscriptionProvider::SlackBuiltIn`]: default (0 MB disk, 0 extra RAM); archives Slack's
 //!   AWS Transcribe `SdkTranscriptFrame` captions when captions are enabled.
-//! - [`TranscriptionProvider::ParakeetV3`]: in-process Rust ONNX runtime (`transcribe-rs`) running
-//!   NVIDIA Parakeet TDT 0.6B v3 INT8 (~640 MB opt-in download; 25 European languages including
-//!   English & Swedish; zero external binaries; loaded only during active huddles -> 0 MB RAM idle).
+//! - [`TranscriptionProvider::ParakeetV3`]: in-process ONNX Runtime (`transcribe-rs`, runtime
+//!   library loaded on demand by [`crate::onnx_runtime`]) running NVIDIA Parakeet TDT 0.6B v3 INT8
+//!   (~640 MB opt-in download; 25 European languages including English & Swedish; loaded only
+//!   during active huddles -> 0 MB RAM idle).
 //! - [`TranscriptionProvider::WhisperTurbo`]: on-demand local `whisper-server` (or `whisper-cli`
 //!   fallback) running OpenAI Whisper Large v3 Turbo `q5_0` (~574 MB opt-in download; EN + SV
 //!   code-switching with `-l auto`; server stays hot during active huddles and exits on hangup).
@@ -24,7 +25,8 @@ use tokio::sync::mpsc as tokio_mpsc;
 use transcribe_rs::onnx::Quantization;
 use transcribe_rs::onnx::parakeet::{ParakeetModel, ParakeetParams, TimestampGranularity};
 
-use crate::{HuddleDataEvent, HuddleUpdate};
+use crate::audio::RateConverter;
+use crate::{HuddleDataEvent, HuddleUpdate, onnx_runtime};
 
 /// Multilingual Whisper prompt priming both English and Swedish (plus common tech/code-switching).
 const BILINGUAL_WHISPER_PROMPT: &str =
@@ -122,7 +124,7 @@ pub struct ModelDownloadProgress {
     pub total_bytes: Option<u64>,
 }
 
-fn data_root_dir() -> PathBuf {
+pub(crate) fn data_root_dir() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
         return PathBuf::from(xdg).join("slackless");
     }
@@ -191,14 +193,16 @@ pub fn detect_provider_setup(provider: TranscriptionProvider) -> ProviderSetupSt
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or_else(default_parakeet_model_dir);
             let ready = parakeet_files_present(&dir);
+            // Runs in-process; its only binary is the ONNX Runtime library loaded on demand.
+            let binary_path = onnx_runtime::locate().ok();
             ProviderSetupStatus {
                 provider,
                 model_ready: ready,
-                binary_ready: true, // In-process Rust ONNX runtime — zero external binaries!
+                binary_ready: binary_path.is_some(),
                 disk_bytes: dir_disk_bytes(&dir),
                 model_path: dir,
                 download_size_hint: "~640 MB",
-                binary_path: None,
+                binary_path,
             }
         }
         TranscriptionProvider::WhisperTurbo => {
@@ -356,6 +360,7 @@ async fn download_provider_model_async(
     provider: TranscriptionProvider,
     on_progress: impl Fn(ModelDownloadProgress) + Send + Sync + 'static,
 ) -> std::result::Result<PathBuf, String> {
+    crate::signaling::install_default_crypto_provider();
     let client = reqwest::Client::builder()
         .user_agent("slackless/1.0")
         .build()
@@ -1047,6 +1052,12 @@ impl Drop for LocalTranscriber {
     }
 }
 
+/// Load the Parakeet v3 INT8 model from `dir`, loading ONNX Runtime into the process first.
+fn load_parakeet(dir: &Path) -> std::result::Result<ParakeetModel, String> {
+    onnx_runtime::ensure_loaded()?;
+    ParakeetModel::load(dir, &Quantization::Int8).map_err(|err| err.to_string())
+}
+
 fn init_stt_backend(
     provider: TranscriptionProvider,
     setup: &ProviderSetupStatus,
@@ -1054,15 +1065,13 @@ fn init_stt_backend(
 ) -> Option<ActiveSttBackend> {
     match provider {
         TranscriptionProvider::SlackBuiltIn => None,
-        TranscriptionProvider::ParakeetV3 => {
-            match ParakeetModel::load(&setup.model_path, &Quantization::Int8) {
-                Ok(model) => Some(ActiveSttBackend::Parakeet(Box::new(model))),
-                Err(err) => {
-                    tracing::error!(%err, path = %setup.model_path.display(), "failed to load Parakeet v3 INT8 model");
-                    None
-                }
+        TranscriptionProvider::ParakeetV3 => match load_parakeet(&setup.model_path) {
+            Ok(model) => Some(ActiveSttBackend::Parakeet(Box::new(model))),
+            Err(err) => {
+                tracing::error!(%err, path = %setup.model_path.display(), "failed to load Parakeet v3 INT8 model");
+                None
             }
-        }
+        },
         TranscriptionProvider::WhisperTurbo => {
             if let Some(server_bin) = find_whisper_binary(&["whisper-server"])
                 && let Some(srv) =
@@ -1105,6 +1114,7 @@ fn spawn_whisper_server(
         *slot = Some(child);
     }
 
+    crate::signaling::install_default_crypto_provider();
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
@@ -1310,7 +1320,14 @@ fn decode_wav_bytes_to_16k_mono(bytes: &[u8]) -> std::result::Result<Vec<f32>, S
     let mut resampled = if sample_rate == TARGET_RATE as u32 {
         mono
     } else {
-        crate::audio::resample_linear(&mono, sample_rate, TARGET_RATE as u32)
+        // 100 ms blocks: a steep anti-aliasing filter, so nothing above 8 kHz folds into the
+        // speech band; the converter's delay is irrelevant for a file.
+        let mut converter =
+            RateConverter::new(sample_rate, TARGET_RATE as u32, sample_rate as usize / 10)
+                .map_err(|e| e.to_string())?;
+        let mut out = Vec::with_capacity(converter.output_capacity(mono.len()));
+        converter.process(&mono, &mut out);
+        out
     };
     if resampled.len() > MAX_OFFLINE_AUDIO_SAMPLES {
         resampled.truncate(MAX_OFFLINE_AUDIO_SAMPLES);
@@ -1504,6 +1521,10 @@ pub fn transcribe_media_file_timed(
     preferred: TranscriptionProvider,
 ) -> std::result::Result<TimedTranscription, String> {
     let Some(provider) = resolve_local_file_provider(preferred) else {
+        // A downloaded Parakeet model that only lacks its runtime is the more useful thing to report.
+        if detect_provider_setup(TranscriptionProvider::ParakeetV3).model_ready {
+            onnx_runtime::locate()?;
+        }
         return Err(
             "No local transcription model is downloaded yet. Download Parakeet v3 or Whisper Turbo in Preferences → Audio & Video."
                 .to_owned(),
@@ -1526,7 +1547,7 @@ pub fn transcribe_media_file_timed(
 
     match provider {
         TranscriptionProvider::ParakeetV3 => {
-            let mut model = ParakeetModel::load(&setup.model_path, &Quantization::Int8)
+            let mut model = load_parakeet(&setup.model_path)
                 .map_err(|e| format!("failed to load Parakeet v3 model: {e}"))?;
             let params = ParakeetParams {
                 language: None,

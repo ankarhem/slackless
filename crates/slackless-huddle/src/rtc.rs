@@ -324,11 +324,20 @@ impl Interceptor for VideoFeedbackRtcpInterceptor {
     fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
 }
 
-/// One inbound RTP Opus audio packet read from Chime's mixed remote audio track.
+/// One inbound RTP packet read from a remote Opus audio track.
 #[derive(Debug, Clone)]
 pub struct InboundAudioPacket {
+    pub ssrc: u32,
     pub seq: u16,
+    /// RTP timestamp (48 kHz samples).
+    pub timestamp: u32,
+    pub marker: bool,
+    /// Opus payload. Empty for a padding-only packet: Chime follows every 20 ms frame with a few
+    /// of them (transport-cc bandwidth probing) that reuse the frame's timestamp but take their
+    /// own sequence numbers, so they are neither media nor loss.
     pub payload: Bytes,
+    /// When the packet was read from the track.
+    pub arrival: Instant,
 }
 
 /// One inbound RTP video packet read from a remote Chime video/content track.
@@ -422,23 +431,24 @@ impl PeerConnectionEventHandler for ChimePeerHandler {
                     while let Some(evt) = track.poll().await {
                         match evt {
                             TrackRemoteEvent::OnRtpPacket(rtp) => {
-                                if rtp.payload.is_empty() {
-                                    continue;
+                                if !rtp.payload.is_empty() {
+                                    rx_pkts.fetch_add(1, Ordering::Relaxed);
+                                    rx_total.fetch_add(1, Ordering::Relaxed);
+                                    let len = rtp.payload.len() as u64;
+                                    rx_bytes.fetch_add(len, Ordering::Relaxed);
+                                    rx_total_bytes.fetch_add(len, Ordering::Relaxed);
                                 }
-                                rx_pkts.fetch_add(1, Ordering::Relaxed);
-                                rx_total.fetch_add(1, Ordering::Relaxed);
-                                let len = rtp.payload.len() as u64;
-                                rx_bytes.fetch_add(len, Ordering::Relaxed);
-                                rx_total_bytes.fetch_add(len, Ordering::Relaxed);
-                                if audio_tx
-                                    .send(InboundAudioPacket {
-                                        seq: rtp.header.sequence_number,
-                                        payload: rtp.payload,
-                                    })
-                                    .is_err()
-                                {
-                                    break;
-                                }
+                                // Keep polling when nobody listens (the `#content` peer, session
+                                // teardown): an unpolled track backs up the driver, which then
+                                // logs an error for every packet.
+                                let _ = audio_tx.send(InboundAudioPacket {
+                                    ssrc: rtp.header.ssrc,
+                                    seq: rtp.header.sequence_number,
+                                    timestamp: rtp.header.timestamp,
+                                    marker: rtp.header.marker,
+                                    payload: rtp.payload,
+                                    arrival: Instant::now(),
+                                });
                             }
                             TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnError => break,
                             _ => {}
@@ -546,20 +556,19 @@ impl PeerConnectionEventHandler for ChimePeerHandler {
                                 let len = rtp.payload.len() as u64;
                                 rx_bytes.fetch_add(len, Ordering::Relaxed);
                                 rx_total_bytes.fetch_add(len, Ordering::Relaxed);
-                                if video_tx
-                                    .send(InboundVideoPacket {
-                                        ssrc,
-                                        mid: mid.clone(),
-                                        track_id: track_id.clone(),
-                                        mime_type: mime_type.clone(),
-                                        seq: rtp.header.sequence_number,
-                                        payload: rtp.payload.to_vec(),
-                                        marker: rtp.header.marker,
-                                    })
-                                    .is_err()
-                                {
-                                    break;
+                                // As for audio: keep the track drained even without a consumer.
+                                if video_tx.is_closed() {
+                                    continue;
                                 }
+                                let _ = video_tx.send(InboundVideoPacket {
+                                    ssrc,
+                                    mid: mid.clone(),
+                                    track_id: track_id.clone(),
+                                    mime_type: mime_type.clone(),
+                                    seq: rtp.header.sequence_number,
+                                    payload: rtp.payload.to_vec(),
+                                    marker: rtp.header.marker,
+                                });
                             }
                             TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnError => break,
                             _ => {}
@@ -775,13 +784,14 @@ impl ChimeRtcPeer {
     }
 
     /// Create a `#content` sender PeerConnection (identical media engine & SRTP profile, audio on
-    /// mid 0 and H.264 content video on mid 1).
+    /// mid 0 and H.264 content video on mid 1). It only sends: whatever Chime sends back on its
+    /// tracks is read and discarded.
     pub async fn new_content_sender(
         turn: &SdkTurnCredentials,
-        inbound_opus_tx: mpsc::UnboundedSender<InboundAudioPacket>,
-        inbound_video_tx: mpsc::UnboundedSender<InboundVideoPacket>,
         state_tx: mpsc::UnboundedSender<RTCPeerConnectionState>,
     ) -> Result<Self> {
+        let (inbound_opus_tx, _) = mpsc::unbounded_channel();
+        let (inbound_video_tx, _) = mpsc::unbounded_channel();
         Self::new(turn, inbound_opus_tx, inbound_video_tx, state_tx).await
     }
 

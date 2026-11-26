@@ -3,8 +3,9 @@
 use std::process::ExitCode;
 
 use anyhow::Result;
+use slackless_core::Event;
 use slackless_core::rtm::{ConnectParams, ConnectionState, RtmClient, RtmConfig, RtmEvent};
-use slackless_core::types::{ChannelId, MessageEvent, SlackEvent};
+use slackless_core::types::{ChannelId, MessageEvent, SlackEvent, TeamId};
 
 use crate::archive::Archive;
 use crate::output;
@@ -54,11 +55,12 @@ pub async fn run_watch(
                     }
                     Some(RtmEvent::Event(slack_ev)) => {
                         let maybe_out = format_watch_event(&slack_ev, filter_ch.as_ref());
-                        if let Some(archive) = archive.as_mut() {
-                            let _ = slackless_core::apply_event(
-                                archive.store_mut(),
-                                &session.team_id,
-                                slack_ev,
+                        if let Some(archive) = archive.as_mut()
+                            && let Some(err) = mirror_event(archive, &session.team_id, slack_ev)
+                        {
+                            // stderr: `--json` consumers read only events on stdout.
+                            eprintln!(
+                                "slackless: could not mirror the event into the local archive ({err})"
                             );
                         }
                         if let Some((json_val, human_line)) = maybe_out {
@@ -77,6 +79,20 @@ pub async fn run_watch(
     }
     driver_task.abort();
     Ok(ExitCode::SUCCESS)
+}
+
+/// Mirrors one websocket event into the local archive and returns the store failure to report:
+/// the reducer folds a failed write into [`Event::Error`] rather than failing, so ignoring its
+/// answer loses the error silently.
+pub(crate) fn mirror_event(
+    archive: &mut Archive,
+    workspace: &TeamId,
+    ev: SlackEvent,
+) -> Option<String> {
+    match slackless_core::apply_event(archive.store_mut(), workspace, ev) {
+        Some(Event::Error(err)) => Some(err),
+        _ => None,
+    }
 }
 
 pub(crate) fn format_watch_event(

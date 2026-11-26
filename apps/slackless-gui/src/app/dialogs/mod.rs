@@ -1,6 +1,7 @@
 //! Modal dialogs, pickers, preferences application, and App overlays.
 
 mod channels;
+mod diff;
 pub(super) mod modal;
 pub(super) mod profile;
 pub(super) mod storage;
@@ -100,6 +101,7 @@ impl App {
             view.set_include_deleted(show_deleted_messages);
         });
         crate::zoom::set_strip_tracking_params(settings.strip_tracking_params);
+        crate::zoom::set_protocol_allowlist(&settings.protocol_allowlist);
         crate::composer::set_outgoing_guard_prefs(
             settings.strip_tracking_params,
             settings.warn_before_sending_secrets,
@@ -131,7 +133,7 @@ impl App {
         slackless_core::api::set_net_log_enabled(
             settings.net_log_enabled || settings.debug_logging,
         );
-        crate::messages::set_timezone_override(settings.timezone_offset_secs());
+        crate::messages::set_timezone_override(settings.timezone());
         crate::media::set_download_dir(
             (!settings.download_dir.is_empty())
                 .then(|| std::path::PathBuf::from(&settings.download_dir)),

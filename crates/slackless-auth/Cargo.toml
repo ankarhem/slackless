@@ -11,9 +11,21 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+url.workspace = true
 
 # Config-dir discovery for the on-disk session store.
 dirs = "7"
+
+# The sign-in window (feature `webview`): WebKit driven directly on macOS, `wry` in a `tao` window
+# everywhere else.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.5", optional = true }
+objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSApplication", "NSEvent", "NSGraphics", "NSGraphicsContext", "NSResponder", "NSRunningApplication", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSArray", "NSEnumerator", "NSGeometry", "NSHTTPCookie", "NSNotification", "NSString", "NSURL", "NSURLRequest", "objc2-core-foundation"] }
+objc2-web-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKFrameInfo", "WKHTTPCookieStore", "WKNavigation", "WKNavigationAction", "WKNavigationDelegate", "WKPreferences", "WKScriptMessage", "WKScriptMessageHandler", "WKUIDelegate", "WKUserContentController", "WKUserScript", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKWindowFeatures"] }
+block2 = { version = "0.6.2", optional = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
 wry = { version = "0.57.4", optional = true }
 tao = { version = "0.37.3", optional = true }
 
@@ -25,7 +37,15 @@ tempfile = "3"
 [features]
 # The embedded WebKit sign-in window (`embedded_sign_in`). Front-ends that open it enable this;
 # the core and its tests do not need a windowing stack.
-webview = ["dep:wry", "dep:tao"]
+webview = [
+    "dep:wry",
+    "dep:tao",
+    "dep:objc2",
+    "dep:objc2-app-kit",
+    "dep:objc2-foundation",
+    "dep:objc2-web-kit",
+    "dep:block2",
+]
 
 [lints]
 workspace = true

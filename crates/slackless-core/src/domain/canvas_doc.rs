@@ -1,6 +1,12 @@
 //! Pure, GPUI-free Slack Canvas document model, Quip/Canvas HTML & Markdown parsers,
 //! inline mention tokenizer, and media/embed classifiers (`F-COLLAB-125..150`).
 
+use std::rc::Rc;
+
+use html5ever::ParseOpts;
+use html5ever::tendril::TendrilSink;
+use markup5ever_rcdom::{Handle, NodeData, RcDom};
+
 use crate::api::CanvasEditOp;
 use crate::domain::mrkdwn::replace_shortcodes_with;
 
@@ -1050,226 +1056,904 @@ pub fn parse_canvas_html_with_ids(html: &str) -> (Vec<CanvasBlock>, Vec<Option<S
 
 /// Like [`parse_canvas_html_with_ids`], resolving `:shortcode:` emoji tokens and inline emoji
 /// `<img>` / `<control>` elements via `resolve_emoji`.
+///
+/// The markup goes through html5ever, so attribute names match exactly (`id` is never
+/// `data-id`), `>` inside quoted values or comments cannot truncate a tag, entities are decoded
+/// once and unclosed tags are closed the way a browser would.
 pub fn parse_canvas_html_with_ids_and_emoji(
     html: &str,
     resolve_emoji: &dyn Fn(&str) -> Option<String>,
 ) -> (Vec<CanvasBlock>, Vec<Option<String>>) {
-    let body = extract_tag_inner(html, "body").unwrap_or(html);
-    let mut blocks = Vec::new();
-    let mut ids = Vec::new();
-    let mut rest = body;
-    while let Some(open_pos) = rest.find('<') {
-        let before = clean_inline_html(&rest[..open_pos], resolve_emoji);
-        if !before.is_empty() {
-            blocks.push(CanvasBlock::Paragraph(before));
-            ids.push(None);
+    let dom = html5ever::parse_document(RcDom::default(), ParseOpts::default()).one(html);
+    let mut parser = HtmlParser::new(resolve_emoji);
+    parser.walk_children(&body_of(&dom.document));
+    parser.flush_text();
+    (parser.blocks, parser.ids)
+}
+
+/// `<body>` of a parsed document (the HTML5 tree builder always synthesizes `html > body`).
+fn body_of(document: &Handle) -> Handle {
+    let element = |parent: &Handle, name: &str| {
+        parent
+            .children
+            .borrow()
+            .iter()
+            .find(|node| is_element(node, name))
+            .cloned()
+    };
+    element(document, "html")
+        .and_then(|html| element(&html, "body"))
+        .unwrap_or_else(|| document.clone())
+}
+
+/// Tag name of an element node.
+fn tag(node: &Handle) -> Option<&str> {
+    match &node.data {
+        NodeData::Element { name, .. } => Some(&name.local),
+        _ => None,
+    }
+}
+
+fn is_element(node: &Handle, name: &str) -> bool {
+    tag(node) == Some(name)
+}
+
+/// Value of attribute `name` (the tokenizer lowercases names and decodes entities in values).
+fn attr(node: &Handle, name: &str) -> Option<String> {
+    let NodeData::Element { attrs, .. } = &node.data else {
+        return None;
+    };
+    attrs
+        .borrow()
+        .iter()
+        .find(|a| &*a.name.local == name)
+        .map(|a| a.value.to_string())
+}
+
+/// Whether an element carries attribute `name` (whatever its value).
+fn has_attr(node: &Handle, name: &str) -> bool {
+    match &node.data {
+        NodeData::Element { attrs, .. } => attrs.borrow().iter().any(|a| &*a.name.local == name),
+        _ => false,
+    }
+}
+
+/// Attribute `name` of `link` when present, else of its `node` container.
+fn attr_of(link: Option<&Handle>, node: &Handle, name: &str) -> Option<String> {
+    link.and_then(|link| attr(link, name))
+        .or_else(|| attr(node, name))
+}
+
+/// Lowercased attribute names and values: the haystack for Quip's class / `data-*` markers.
+fn marker_haystack(node: &Handle) -> String {
+    let NodeData::Element { attrs, .. } = &node.data else {
+        return String::new();
+    };
+    attrs
+        .borrow()
+        .iter()
+        .flat_map(|a| [&*a.name.local, " ", &*a.value, " "])
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Descendant nodes in document order.
+fn descendants(node: &Handle) -> impl Iterator<Item = Handle> {
+    let mut stack = node
+        .children
+        .borrow()
+        .iter()
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>();
+    std::iter::from_fn(move || {
+        let next = stack.pop()?;
+        stack.extend(next.children.borrow().iter().rev().cloned());
+        Some(next)
+    })
+}
+
+/// First element descendant (document order) with one of `names`.
+fn first_descendant(node: &Handle, names: &[&str]) -> Option<Handle> {
+    descendants(node).find(|n| names.iter().any(|name| is_element(n, name)))
+}
+
+/// Whether a `<p>` holds a block element: quirks-mode HTML (no doctype) lets a `<table>` nest
+/// inside an open `<p>`, which then has to be walked instead of flattened to text.
+fn has_block_child(node: &Handle) -> bool {
+    node.children.borrow().iter().any(|child| {
+        matches!(
+            tag(child),
+            Some(
+                "table"
+                    | "ul"
+                    | "ol"
+                    | "div"
+                    | "blockquote"
+                    | "pre"
+                    | "hr"
+                    | "p"
+                    | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+                    | "audio"
+                    | "video"
+                    | "section"
+            )
+        )
+    })
+}
+
+/// Tags whose boundaries break lines when inline text is collected.
+const BLOCK_BOUNDARY_TAGS: &[&str] = &[
+    "p",
+    "div",
+    "section",
+    "article",
+    "figure",
+    "figcaption",
+    "blockquote",
+    "pre",
+    "hr",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "ul",
+    "ol",
+    "li",
+    "dl",
+    "dt",
+    "dd",
+    "table",
+    "tr",
+    "td",
+    "th",
+];
+
+fn is_block_boundary(tag: &str) -> bool {
+    BLOCK_BOUNDARY_TAGS.contains(&tag)
+}
+
+/// Whether an `<li>` is a done checklist item (`data-checked="true"`, `class="checked"` or a
+/// checked `<input>`).
+fn list_item_checked(li: &Handle) -> bool {
+    let has_checked_class = |node: &Handle| {
+        attr(node, "class").is_some_and(|class| class.split_whitespace().any(|c| c == "checked"))
+    };
+    attr(li, "data-checked").is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        || has_attr(li, "checked")
+        || has_checked_class(li)
+        || descendants(li).any(|n| has_attr(&n, "checked") || has_checked_class(&n))
+}
+
+/// A comment node that is really a preserved mrkdwn token (`<!subteam^S01DES|@design>` is
+/// tokenized as a bogus comment), rendered back as text.
+fn comment_token(contents: &str) -> Option<String> {
+    is_preserved_slack_mention_token(&format!("!{contents}")).then(|| format!("<!{contents}>"))
+}
+
+/// DOM walker producing blocks from the `<body>`. Text nodes and inline elements accumulate in
+/// `text` until the next block boundary flushes them as a paragraph.
+struct HtmlParser<'a> {
+    resolve_emoji: &'a dyn Fn(&str) -> Option<String>,
+    blocks: Vec<CanvasBlock>,
+    ids: Vec<Option<String>>,
+    text: String,
+}
+
+impl<'a> HtmlParser<'a> {
+    fn new(resolve_emoji: &'a dyn Fn(&str) -> Option<String>) -> Self {
+        Self {
+            resolve_emoji,
+            blocks: Vec::new(),
+            ids: Vec::new(),
+            text: String::new(),
         }
-        rest = &rest[open_pos..];
-        let Some(gt) = rest.find('>') else {
-            break;
-        };
-        let raw_tag = &rest[1..gt];
-        rest = &rest[gt + 1..];
-        let trimmed = raw_tag.trim();
-        if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.starts_with('!') {
-            continue;
+    }
+
+    fn walk_children(&mut self, parent: &Handle) {
+        for child in &*parent.children.borrow() {
+            self.walk(child);
         }
-        let tag_name = trimmed
-            .split(|c: char| c.is_whitespace() || c == '/')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let section_id = extract_attr(trimmed, "id").filter(|s| !s.is_empty());
-        if tag_name == "hr" {
-            blocks.push(CanvasBlock::Divider);
-            ids.push(section_id);
-            continue;
-        }
-        if tag_name == "img" {
-            if let Some(emoji_glyph) = extract_emoji_from_img_tag(trimmed, resolve_emoji) {
-                blocks.push(CanvasBlock::Paragraph(emoji_glyph));
-                ids.push(section_id);
-                continue;
-            }
-            if let Some(src) = extract_attr(trimmed, "src")
-                && (src.starts_with("https://") || src.starts_with("http://"))
-            {
-                let alt = extract_attr(trimmed, "alt").unwrap_or_default();
-                let width = extract_attr(trimmed, "width")
-                    .and_then(|v| v.trim_end_matches("px").parse::<u32>().ok());
-                let height = extract_attr(trimmed, "height")
-                    .and_then(|v| v.trim_end_matches("px").parse::<u32>().ok());
-                blocks.push(CanvasBlock::Image {
-                    url: decode_entities(&src),
-                    alt: replace_shortcodes_with(&clean_text(&alt), resolve_emoji),
-                    width,
-                    height,
-                });
-                ids.push(section_id);
-            }
-            continue;
-        }
-        if matches!(tag_name.as_str(), "audio" | "video") {
-            let kind = if tag_name == "audio" {
-                CanvasMediaKind::Audio
-            } else {
-                CanvasMediaKind::Video
-            };
-            let inner = if trimmed.ends_with('/') {
-                ""
-            } else {
-                let close = format!("</{tag_name}>");
-                if let Some(end) = find_case_insensitive(rest, &close) {
-                    let slice = &rest[..end];
-                    rest = &rest[end + close.len()..];
-                    slice
-                } else {
-                    ""
+    }
+
+    fn walk(&mut self, node: &Handle) {
+        match &node.data {
+            NodeData::Text { contents } => self.text.push_str(&contents.borrow()),
+            NodeData::Comment { contents } => {
+                if let Some(token) = comment_token(contents) {
+                    self.text.push_str(&token);
                 }
-            };
-            if let Some(block) = parse_html_media_tag(kind, trimmed, inner, resolve_emoji) {
-                blocks.push(block);
-                ids.push(section_id);
             }
-            continue;
-        }
-        if tag_name == "control" {
-            if let Some(end) = find_case_insensitive(rest, "</control>") {
-                let inner = &rest[..end];
-                if let Some(card) = parse_control_profile_card(inner, resolve_emoji) {
-                    rest = &rest[end + "</control>".len()..];
-                    blocks.push(card);
-                    ids.push(section_id);
-                    continue;
-                }
-                if let Some(emoji) = extract_control_emoji(inner, resolve_emoji) {
-                    rest = &rest[end + "</control>".len()..];
-                    blocks.push(CanvasBlock::Paragraph(emoji));
-                    ids.push(section_id);
-                    continue;
-                }
-            }
-            continue;
-        }
-        if matches!(tag_name.as_str(), "div" | "section") {
-            let is_profile_card = has_profile_card_marker(trimmed);
-            let is_doc_embed = has_doc_embed_marker(trimmed);
-            let is_media_container = has_embedded_file_marker(trimmed);
-            if (is_profile_card || is_doc_embed || is_media_container)
-                && let Some((inner, next_rest)) = take_balanced_inner(rest, &tag_name)
-            {
-                let parsed = if is_profile_card {
-                    parse_html_profile_card(trimmed, inner, resolve_emoji)
-                } else if is_doc_embed {
-                    parse_html_doc_embed(trimmed, inner, resolve_emoji)
-                } else {
-                    parse_html_embedded_file_media(trimmed, inner, resolve_emoji)
-                        .or_else(|| parse_html_doc_embed(trimmed, inner, resolve_emoji))
-                };
-                if let Some(block) = parsed {
-                    rest = next_rest;
-                    blocks.push(block);
-                    ids.push(section_id);
-                    continue;
-                }
-            }
-            continue;
-        }
-        if matches!(tag_name.as_str(), "style" | "script" | "head") {
-            let close = format!("</{tag_name}>");
-            if let Some(end) = find_case_insensitive(rest, &close) {
-                rest = &rest[end + close.len()..];
-            }
-            continue;
-        }
-        if matches!(
-            tag_name.as_str(),
-            "h1" | "h2" | "h3" | "h4" | "p" | "pre" | "blockquote" | "ul" | "ol" | "table"
-        ) {
-            let close = format!("</{tag_name}>");
-            let Some(end) = find_case_insensitive(rest, &close) else {
-                continue;
-            };
-            let inner = &rest[..end];
-            rest = &rest[end + close.len()..];
-            let prev_len = blocks.len();
-            match tag_name.as_str() {
-                "h1" | "h2" | "h3" | "h4" => {
-                    let text = clean_inline_html(inner, resolve_emoji);
+            NodeData::Element { name, .. } => match &*name.local {
+                heading @ ("h1" | "h2" | "h3" | "h4" | "h5" | "h6") => {
+                    self.flush_text();
+                    let text = self.line_text(node, None);
                     if !text.is_empty() {
-                        let level = match tag_name.as_str() {
+                        let level = match heading {
                             "h1" => 1,
                             "h2" => 2,
                             _ => 3,
                         };
-                        blocks.push(CanvasBlock::Heading { level, text });
-                    }
-                }
-                "p" => {
-                    if let Some(embed_block) =
-                        parse_html_paragraph_embed(trimmed, inner, resolve_emoji)
-                    {
-                        blocks.push(embed_block);
-                    } else {
-                        let text = clean_inline_html(inner, resolve_emoji);
-                        if !text.is_empty() {
-                            blocks.push(CanvasBlock::Paragraph(text));
-                        }
+                        self.push(CanvasBlock::Heading { level, text }, node);
                     }
                 }
                 "pre" => {
-                    let code = decode_entities(&strip_tags(inner)).trim().to_owned();
-                    if !code.is_empty() {
-                        blocks.push(CanvasBlock::CodeBlock(code));
+                    self.flush_text();
+                    let code = self.raw_text(node);
+                    if !code.trim().is_empty() {
+                        self.push(CanvasBlock::CodeBlock(code.trim().to_owned()), node);
                     }
                 }
                 "blockquote" => {
-                    let text = clean_multiline_html(inner, resolve_emoji);
-                    if !text.is_empty() {
-                        blocks.push(CanvasBlock::Quote(text));
+                    self.flush_text();
+                    let lines = self.line_texts(node).join("\n");
+                    if !lines.is_empty() {
+                        self.push(CanvasBlock::Quote(lines), node);
                     }
                 }
-                "ul" | "ol" => {
-                    let section_style = extract_attr(trimmed, "data-section-style");
-                    let is_checklist = trimmed.contains("checklist")
-                        || section_style.as_deref() == Some("7")
-                        || inner.contains("data-checked")
-                        || inner.contains("type=\"checkbox\"");
-                    let is_numbered = !is_checklist
-                        && (tag_name == "ol" || section_style.as_deref() == Some("6"));
-                    let items = extract_list_items(inner, resolve_emoji);
-                    if !items.is_empty() {
-                        if is_checklist {
-                            blocks.push(CanvasBlock::Checklist(items));
-                        } else if is_numbered {
-                            blocks.push(CanvasBlock::NumberedList(
-                                items.into_iter().map(|(_, t)| t).collect(),
-                            ));
-                        } else {
-                            blocks.push(CanvasBlock::Bullets(
-                                items.into_iter().map(|(_, t)| t).collect(),
-                            ));
+                "ul" | "ol" => self.list(node),
+                "table" => self.table(node),
+                "hr" => {
+                    self.flush_text();
+                    self.push(CanvasBlock::Divider, node);
+                }
+                "img" => {
+                    if let Some(glyph) = self.emoji_from_img(node) {
+                        self.text.push_str(&glyph);
+                    } else {
+                        self.flush_text();
+                        if let Some(block) = self.image_block(node) {
+                            self.push(block, node);
                         }
                     }
                 }
-                "table" => {
-                    if let Some((header, rows)) = parse_html_table(inner, resolve_emoji) {
-                        blocks.push(CanvasBlock::Table { header, rows });
+                media @ ("audio" | "video") => {
+                    self.flush_text();
+                    let kind = if media == "video" {
+                        CanvasMediaKind::Video
+                    } else {
+                        CanvasMediaKind::Audio
+                    };
+                    if let Some(block) = self.media_tag(kind, node) {
+                        self.push(block, node);
                     }
                 }
-                _ => {}
-            }
-            if blocks.len() > prev_len {
-                ids.push(section_id);
-            }
+                "control" => {
+                    self.flush_text();
+                    if let Some(card) = self.control_profile_card(node) {
+                        self.push(card, node);
+                    } else {
+                        let mut text = std::mem::take(&mut self.text);
+                        self.collect_text(node, false, None, &mut text);
+                        self.text = text;
+                    }
+                }
+                "p" | "div" | "section" => self.container(node),
+                "head" | "script" | "style" | "title" | "template" | "noscript" => {}
+                // Inline or unknown wrappers are transparent; the separators keep adjacent
+                // blocks' words from gluing together.
+                _ => {
+                    self.text.push('\n');
+                    self.walk_children(node);
+                    self.text.push('\n');
+                }
+            },
+            NodeData::Document
+            | NodeData::Doctype { .. }
+            | NodeData::ProcessingInstruction { .. } => {}
         }
     }
-    let tail = clean_inline_html(rest, resolve_emoji);
-    if !tail.is_empty() {
-        blocks.push(CanvasBlock::Paragraph(tail));
-        ids.push(None);
+
+    fn push(&mut self, block: CanvasBlock, node: &Handle) {
+        self.blocks.push(block);
+        self.ids.push(attr(node, "id").filter(|id| !id.is_empty()));
     }
-    (blocks, ids)
+
+    /// Emits the accumulated inline text as a paragraph.
+    fn flush_text(&mut self) {
+        let text = std::mem::take(&mut self.text);
+        let text = self.resolve_line(&text);
+        if !text.is_empty() {
+            self.blocks.push(CanvasBlock::Paragraph(text));
+            self.ids.push(None);
+        }
+    }
+
+    /// `<p>`, `<div>` and `<section>`: a Quip unfurl/embed card when they carry its markers or
+    /// wrap nothing but a single embed; otherwise the paragraph text or, for containers, their
+    /// child blocks.
+    fn container(&mut self, node: &Handle) {
+        self.flush_text();
+        if let Some(block) = self.embedded_block(node) {
+            self.push(block, node);
+        } else if is_element(node, "p") && !has_block_child(node) {
+            let text = self.line_text(node, None);
+            if !text.is_empty() {
+                self.push(CanvasBlock::Paragraph(text), node);
+            }
+        } else {
+            self.walk_children(node);
+        }
+    }
+
+    fn embedded_block(&self, node: &Handle) -> Option<CanvasBlock> {
+        let markers = marker_haystack(node);
+        let has_marker = |names: &[&str]| names.iter().any(|name| markers.contains(*name));
+        let file_marker = has_marker(&["embedded-file", "media-embed", "data-slack-file-id"])
+            || descendants(node).any(|n| has_attr(&n, "data-slack-file-id"));
+        if (has_marker(&["user_unfurl", "user-unfurl", "profile-card", "profile_card"])
+            || attr(node, "data-user-id").is_some_and(|id| is_slack_user_id(&id)))
+            && let Some(card) = self.profile_card(node)
+        {
+            return Some(card);
+        }
+        if file_marker {
+            if let Some(media) = self.embedded_file_media(node) {
+                return Some(media);
+            }
+            if let Some(doc) = self.doc_embed(node) {
+                return Some(doc);
+            }
+        }
+        if has_marker(&[
+            "canvas_unfurl",
+            "canvas-unfurl",
+            "list_unfurl",
+            "list-unfurl",
+            "embedded-link",
+        ]) && let Some(doc) = self.doc_embed(node)
+        {
+            return Some(doc);
+        }
+        let sole = first_descendant(node, &["control", "a", "lnk", "img"])?;
+        if !self.line_text(node, Some(&sole)).is_empty() {
+            return None;
+        }
+        match tag(&sole) {
+            Some("control") => self.control_profile_card(&sole),
+            Some("img") => self.image_block(&sole),
+            _ => self.link_embed(&sole),
+        }
+    }
+
+    fn list(&mut self, list: &Handle) {
+        self.flush_text();
+        let style = attr(list, "data-section-style");
+        let checklist = marker_haystack(list).contains("checklist")
+            || style.as_deref() == Some("7")
+            || descendants(list).any(|n| {
+                has_attr(&n, "data-checked")
+                    || (is_element(&n, "input") && attr(&n, "type").as_deref() == Some("checkbox"))
+            });
+        let items: Vec<(bool, String)> = descendants(list)
+            .filter(|n| is_element(n, "li"))
+            .map(|li| (list_item_checked(&li), self.item_text(&li)))
+            .filter(|(_, text)| !text.is_empty())
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        let numbered = is_element(list, "ol") || style.as_deref() == Some("6");
+        let block = if checklist {
+            CanvasBlock::Checklist(items)
+        } else {
+            let texts = items.into_iter().map(|(_, text)| text).collect();
+            if numbered {
+                CanvasBlock::NumberedList(texts)
+            } else {
+                CanvasBlock::Bullets(texts)
+            }
+        };
+        self.push(block, list);
+    }
+
+    /// Rows are every `<tr>` descendant (so `thead`/`tbody` groupings do not matter) padded to
+    /// the widest row; the first row is the header.
+    fn table(&mut self, table: &Handle) {
+        self.flush_text();
+        let mut rows: Vec<Vec<String>> = descendants(table)
+            .filter(|n| is_element(n, "tr"))
+            .map(|tr| {
+                tr.children
+                    .borrow()
+                    .iter()
+                    .filter(|cell| matches!(tag(cell), Some("td" | "th")))
+                    .map(|cell| self.line_text(cell, None))
+                    .collect::<Vec<String>>()
+            })
+            .filter(|cells| !cells.is_empty())
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let width = rows.iter().map(Vec::len).max().unwrap_or(1);
+        for row in &mut rows {
+            row.resize(width, String::new());
+        }
+        let header = rows.remove(0);
+        self.push(CanvasBlock::Table { header, rows }, table);
+    }
+
+    /// Image block for an `<img>` with an `http(s)` source.
+    fn image_block(&self, img: &Handle) -> Option<CanvasBlock> {
+        let url = attr(img, "src")
+            .filter(|src| src.starts_with("https://") || src.starts_with("http://"))?;
+        let size =
+            |name: &str| attr(img, name).and_then(|v| v.trim_end_matches("px").parse::<u32>().ok());
+        Some(CanvasBlock::Image {
+            url,
+            alt: attr(img, "alt")
+                .map(|alt| self.resolve_line(&alt))
+                .unwrap_or_default(),
+            width: size("width"),
+            height: size("height"),
+        })
+    }
+
+    /// Glyph for an emoji `<img>`: `data-emoji`, `alt=":shortcode:"`, or an emoji-class image.
+    fn emoji_from_img(&self, img: &Handle) -> Option<String> {
+        if let Some(code) = attr(img, "data-emoji") {
+            let bare = code.trim_matches(':');
+            return Some(self.resolve(bare).unwrap_or_else(|| format!(":{bare}:")));
+        }
+        let alt = attr(img, "alt")?;
+        let trimmed = alt.trim();
+        if let Some(bare) = trimmed
+            .strip_prefix(':')
+            .and_then(|b| b.strip_suffix(':'))
+            .filter(|b| !b.is_empty())
+        {
+            return Some(self.resolve(bare).unwrap_or_else(|| trimmed.to_owned()));
+        }
+        if marker_haystack(img).contains("emoji") && !trimmed.is_empty() {
+            return self.resolve(trimmed.trim_matches(':'));
+        }
+        None
+    }
+
+    /// `<audio>` / `<video>` block: source from `src`, a nested `<source>` or a fallback link;
+    /// title from `title` / `data-title` / `aria-label`, else the inner text or file name.
+    fn media_tag(&self, kind: CanvasMediaKind, node: &Handle) -> Option<CanvasBlock> {
+        let source = first_descendant(node, &["source"]);
+        let link = first_descendant(node, &["a"]).or_else(|| first_descendant(node, &["lnk"]));
+        let url = attr(node, "src")
+            .or_else(|| source.as_ref().and_then(|s| attr(s, "src")))
+            .or_else(|| link.as_ref().and_then(|l| attr(l, "href")))
+            .filter(|src| !src.is_empty())?;
+        let title = attr(node, "title")
+            .or_else(|| attr(node, "data-title"))
+            .or_else(|| attr(node, "aria-label"))
+            .or_else(|| {
+                let text = self.line_text(node, None);
+                (!text.is_empty()).then_some(text)
+            })
+            .or_else(|| filename_from_url(&url))
+            .map(|title| self.resolve_line(&title))
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| format!("{} clip", kind.label()));
+        let mime = attr(node, "data-mime")
+            .or_else(|| attr(node, "type"))
+            .or_else(|| source.as_ref().and_then(|s| attr(s, "type")))
+            .or_else(|| classify_media_url(&url).map(|(_, mime)| mime.to_owned()));
+        Some(CanvasBlock::MediaEmbed {
+            kind,
+            title,
+            url,
+            file_id: attr(node, "data-slack-file-id")
+                .or_else(|| attr(node, "data-file-id"))
+                .map(|id| strip_slack_file_prefix(&id))
+                .filter(|id| !id.is_empty()),
+            duration: attr(node, "data-duration")
+                .or_else(|| attr(node, "duration"))
+                .filter(|d| !d.is_empty()),
+            mime,
+        })
+    }
+
+    /// Profile card for `<control><a href=".../team/U...">@U...</a></control>`.
+    fn control_profile_card(&self, control: &Handle) -> Option<CanvasBlock> {
+        let link =
+            first_descendant(control, &["a"]).or_else(|| first_descendant(control, &["lnk"]))?;
+        let body = self.line_text(&link, None);
+        let user_id = attr(&link, "data-user-id")
+            .filter(|id| is_slack_user_id(id))
+            .or_else(|| attr(&link, "href").and_then(|href| parse_slack_profile_url(&href)))
+            .or_else(|| {
+                let bare = body.trim().trim_start_matches('@');
+                is_slack_user_id(bare).then(|| bare.to_owned())
+            })?;
+        let name = body.trim();
+        let display_name =
+            (!name.is_empty() && name.trim_start_matches('@') != user_id).then(|| name.to_owned());
+        Some(CanvasBlock::ProfileCard {
+            user_id,
+            display_name,
+            title: attr(&link, "data-title").filter(|t| !t.is_empty()),
+            handle: attr(&link, "data-handle").filter(|h| !h.is_empty()),
+        })
+    }
+
+    /// Profile card for a `user_unfurl` container: id from `data-user-id`, the link or the text.
+    fn profile_card(&self, node: &Handle) -> Option<CanvasBlock> {
+        let link = first_descendant(node, &["a"]).or_else(|| first_descendant(node, &["lnk"]));
+        let link = link.as_ref();
+        let link_text = link.map(|l| self.line_text(l, None)).unwrap_or_default();
+        let inner_text = self.line_text(node, None);
+        let user_id = attr(node, "data-user-id")
+            .filter(|id| is_slack_user_id(id))
+            .or_else(|| attr_of(link, node, "data-user-id").filter(|id| is_slack_user_id(id)))
+            .or_else(|| attr_of(link, node, "href").and_then(|href| parse_slack_profile_url(&href)))
+            .or_else(|| {
+                inner_text.split_whitespace().find_map(|token| {
+                    let bare = token
+                        .trim_start_matches('@')
+                        .trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+                    is_slack_user_id(bare).then(|| bare.to_owned())
+                })
+            })?;
+        let title = attr(node, "data-title")
+            .or_else(|| attr(node, "data-role"))
+            .or_else(|| {
+                let span = first_descendant(node, &["span"])?;
+                let markers = marker_haystack(&span);
+                let text = self.line_text(&span, None);
+                ((markers.contains("title") || markers.contains("role")) && !text.is_empty())
+                    .then_some(text)
+            })
+            .filter(|title| !title.is_empty());
+        let display_name = attr(node, "data-display-name")
+            .or_else(|| attr(node, "data-name"))
+            .or_else(|| attr(node, "data-user-name"))
+            .or_else(|| {
+                (!link_text.is_empty() && link_text.trim_start_matches('@') != user_id)
+                    .then_some(link_text)
+            })
+            .or_else(|| {
+                (!inner_text.is_empty()
+                    && inner_text.trim_start_matches('@') != user_id
+                    && Some(inner_text.as_str()) != title.as_deref())
+                .then_some(inner_text)
+            });
+        Some(CanvasBlock::ProfileCard {
+            user_id,
+            display_name,
+            title,
+            handle: attr(node, "data-handle")
+                .or_else(|| attr(node, "data-username"))
+                .map(|handle| handle.trim_start_matches('@').to_owned())
+                .filter(|handle| !handle.is_empty()),
+        })
+    }
+
+    /// Canvas / List card for an `embedded-link` / `*_unfurl` container.
+    fn doc_embed(&self, node: &Handle) -> Option<CanvasBlock> {
+        let link = first_descendant(node, &["a"]).or_else(|| first_descendant(node, &["lnk"]));
+        let link = link.as_ref();
+        let link_text = link.map(|l| self.line_text(l, None)).unwrap_or_default();
+        let url = attr_of(link, node, "href")
+            .or_else(|| attr(node, "data-url"))
+            .unwrap_or_default();
+        let markers = marker_haystack(node);
+        let doc_kind = attr(node, "data-doc-kind");
+        let (kind, file_id) = match parse_slack_doc_url(&url) {
+            Some((kind, file_id)) => (kind, file_id),
+            None => {
+                let is_list = markers.contains("list_unfurl")
+                    || markers.contains("list-unfurl")
+                    || doc_kind
+                        .as_deref()
+                        .is_some_and(|k| k.eq_ignore_ascii_case("list"));
+                let is_canvas = markers.contains("canvas_unfurl")
+                    || markers.contains("canvas-unfurl")
+                    || doc_kind
+                        .as_deref()
+                        .is_some_and(|k| k.eq_ignore_ascii_case("canvas"));
+                let kind = if is_list {
+                    CanvasEmbedKind::List
+                } else if is_canvas {
+                    CanvasEmbedKind::Canvas
+                } else {
+                    return None;
+                };
+                let file_id = attr_of(link, node, "data-slack-file-id")
+                    .or_else(|| attr_of(link, node, "data-file-id"))
+                    .map(|id| strip_slack_file_prefix(&id))
+                    .filter(|id| is_slack_file_id(id))?;
+                (kind, file_id)
+            }
+        };
+        let inner_text = self.line_text(node, None);
+        let title = attr(node, "data-title")
+            .or_else(|| attr_of(link, node, "data-title"))
+            .or_else(|| (!link_text.is_empty() && link_text != url).then_some(link_text))
+            .or_else(|| (!inner_text.is_empty() && inner_text != url).then_some(inner_text))
+            .unwrap_or_else(|| format!("{} {file_id}", kind.label()));
+        let url = if url.is_empty() {
+            let segment = match kind {
+                CanvasEmbedKind::Canvas => "docs",
+                CanvasEmbedKind::List => "lists",
+            };
+            format!("https://slack.com/{segment}/T0/{file_id}")
+        } else {
+            url
+        };
+        Some(CanvasBlock::DocEmbed {
+            kind,
+            file_id,
+            title,
+            url,
+        })
+    }
+
+    /// Media clip for an `embedded-file` container: `<lnk>` or `<a>` carrying the file id, URL,
+    /// MIME type and duration.
+    fn embedded_file_media(&self, node: &Handle) -> Option<CanvasBlock> {
+        let link = first_descendant(node, &["lnk"]).or_else(|| first_descendant(node, &["a"]));
+        let link = link.as_ref();
+        let link_text = link.map(|l| self.line_text(l, None)).unwrap_or_default();
+        let inner_text = self.line_text(node, None);
+        let url = link
+            .and_then(|l| attr(l, "href"))
+            .or_else(|| link.and_then(|l| attr(l, "src")))
+            .or_else(|| attr(node, "href"))
+            .or_else(|| attr(node, "data-url"))
+            .unwrap_or_default();
+        let duration = attr_of(link, node, "data-duration").filter(|d| !d.is_empty());
+        let file_id = attr_of(link, node, "data-slack-file-id")
+            .or_else(|| attr_of(link, node, "data-file-id"))
+            .map(|id| strip_slack_file_prefix(&id))
+            .filter(|id| !id.is_empty());
+        let raw_title = attr_of(link, node, "data-title")
+            .or_else(|| attr_of(link, node, "title"))
+            .or_else(|| (!link_text.is_empty()).then_some(link_text))
+            .or_else(|| (!inner_text.is_empty()).then_some(inner_text))
+            .or_else(|| filename_from_url(&url))
+            .unwrap_or_default();
+        let (kind, mime) = attr_of(link, node, "data-mime")
+            .or_else(|| attr_of(link, node, "type"))
+            .or_else(|| attr_of(link, node, "data-filetype"))
+            .and_then(|mime| classify_media_mime(&mime))
+            .or_else(|| classify_media_url(&url).map(|(k, m)| (k, m.to_owned())))
+            .or_else(|| classify_media_url(&raw_title).map(|(k, m)| (k, m.to_owned())))?;
+        let title = if raw_title.is_empty() {
+            format!("{} clip", kind.label())
+        } else {
+            self.resolve_line(&raw_title)
+        };
+        Some(CanvasBlock::MediaEmbed {
+            kind,
+            title,
+            url,
+            file_id,
+            duration,
+            mime: Some(mime),
+        })
+    }
+
+    /// Embed for a paragraph holding nothing but one link: a canvas/list, a profile or a media
+    /// clip according to the href.
+    fn link_embed(&self, link: &Handle) -> Option<CanvasBlock> {
+        let href = attr(link, "href")?;
+        let label = self.line_text(link, None);
+        let bare_label = label.trim_start_matches('@');
+        if let Some((kind, file_id)) = parse_slack_doc_url(&href) {
+            let title = if label.is_empty() || label == href {
+                format!("{} {file_id}", kind.label())
+            } else {
+                label
+            };
+            return Some(CanvasBlock::DocEmbed {
+                kind,
+                file_id,
+                title,
+                url: href,
+            });
+        }
+        if let Some(user_id) = parse_slack_profile_url(&href) {
+            let display_name =
+                (!label.is_empty() && bare_label != user_id && label != href).then_some(label);
+            return Some(CanvasBlock::ProfileCard {
+                user_id,
+                display_name,
+                title: attr(link, "data-title").filter(|t| !t.is_empty()),
+                handle: attr(link, "data-handle").filter(|h| !h.is_empty()),
+            });
+        }
+        if let Some((kind, mime)) = classify_media_url(&href).or_else(|| classify_media_url(&label))
+        {
+            let title = if label.is_empty() {
+                filename_from_url(&href).unwrap_or_else(|| format!("{} clip", kind.label()))
+            } else {
+                label
+            };
+            return Some(CanvasBlock::MediaEmbed {
+                kind,
+                title,
+                url: href,
+                file_id: attr(link, "data-slack-file-id")
+                    .map(|id| strip_slack_file_prefix(&id))
+                    .filter(|id| !id.is_empty()),
+                duration: attr(link, "data-duration").filter(|d| !d.is_empty()),
+                mime: Some(mime.to_owned()),
+            });
+        }
+        None
+    }
+
+    /// Glyph for `<control><img alt="rocket" .../></control>`-style emoji.
+    fn emoji_from_control(&self, control: &Handle) -> Option<String> {
+        let img = first_descendant(control, &["img"])?;
+        if let Some(glyph) = self.emoji_from_img(&img) {
+            return Some(glyph);
+        }
+        let alt = attr(&img, "alt")?;
+        let bare = alt.trim().trim_matches(':');
+        if bare.is_empty() {
+            return None;
+        }
+        self.resolve(bare)
+            .or_else(|| (!bare.is_ascii()).then(|| bare.to_owned()))
+    }
+
+    /// Canonical mrkdwn mention token for `<control><a ...>@U... / #C...</a></control>`.
+    fn control_mention_token(&self, control: &Handle) -> Option<String> {
+        let anchor = first_descendant(control, &["a"])?;
+        let text = self.line_text(&anchor, None);
+        if let Some(uid) = text
+            .strip_prefix('@')
+            .map(str::trim)
+            .filter(|uid| is_slack_user_id(uid))
+        {
+            return Some(format!("<@{uid}>"));
+        }
+        if let Some(cid) = text
+            .strip_prefix('#')
+            .map(str::trim)
+            .filter(|cid| is_upper_alnum_id(cid, b"CG"))
+        {
+            return Some(format!("<#{cid}>"));
+        }
+        let href = attr(&anchor, "href")?;
+        let label = text.trim_start_matches(['@', '#']).trim();
+        if let Some(uid) = parse_slack_profile_url(&href) {
+            return Some(if label.is_empty() || label == uid {
+                format!("<@{uid}>")
+            } else {
+                format!("<@{uid}|{label}>")
+            });
+        }
+        let cid: String = href
+            .split("/archives/")
+            .nth(1)?
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect();
+        if is_upper_alnum_id(&cid, b"CG") {
+            return Some(if label.is_empty() || label == cid {
+                format!("<#{cid}>")
+            } else {
+                format!("<#{cid}|{label}>")
+            });
+        }
+        None
+    }
+
+    /// Appends the inline text of `node`'s subtree to `out`: tags vanish, `<br>` and block
+    /// boundaries become line breaks, emoji `<img>` / `<control>` become glyphs and mention
+    /// controls become mrkdwn tokens. The subtree rooted at `skip` is ignored. `raw` keeps the
+    /// parsed whitespace verbatim (`<pre>`).
+    fn collect_text(&self, node: &Handle, raw: bool, skip: Option<&Handle>, out: &mut String) {
+        if skip.is_some_and(|skip| Rc::ptr_eq(skip, node)) {
+            return;
+        }
+        match &node.data {
+            NodeData::Text { contents } => out.push_str(&contents.borrow()),
+            NodeData::Comment { contents } => {
+                if let Some(token) = comment_token(contents) {
+                    out.push_str(&token);
+                }
+            }
+            NodeData::Element { name, .. } => {
+                let tag_name = &*name.local;
+                if raw {
+                    if tag_name == "br" {
+                        out.push('\n');
+                    } else {
+                        self.collect_children(node, true, skip, out);
+                    }
+                    return;
+                }
+                match tag_name {
+                    "br" => out.push('\n'),
+                    "img" => {
+                        if let Some(glyph) = self.emoji_from_img(node) {
+                            out.push_str(&glyph);
+                        }
+                    }
+                    "control" => {
+                        if let Some(token) = self
+                            .emoji_from_control(node)
+                            .or_else(|| self.control_mention_token(node))
+                        {
+                            out.push_str(&token);
+                        } else {
+                            self.collect_children(node, false, skip, out);
+                        }
+                    }
+                    "head" | "script" | "style" | "title" | "template" | "noscript" => {}
+                    _ => {
+                        if is_block_boundary(tag_name) {
+                            out.push('\n');
+                        }
+                        self.collect_children(node, false, skip, out);
+                        if is_block_boundary(tag_name) {
+                            out.push('\n');
+                        }
+                    }
+                }
+            }
+            NodeData::Document
+            | NodeData::Doctype { .. }
+            | NodeData::ProcessingInstruction { .. } => {}
+        }
+    }
+
+    fn collect_children(&self, node: &Handle, raw: bool, skip: Option<&Handle>, out: &mut String) {
+        for child in &*node.children.borrow() {
+            self.collect_text(child, raw, skip, out);
+        }
+    }
+
+    /// Inline text collapsed onto one line, `:shortcode:` emoji resolved.
+    fn line_text(&self, node: &Handle, skip: Option<&Handle>) -> String {
+        let mut out = String::new();
+        self.collect_text(node, false, skip, &mut out);
+        self.resolve_line(&out)
+    }
+
+    /// Inline text split at `<br>` / block boundaries into non-empty lines, emoji resolved.
+    fn line_texts(&self, node: &Handle) -> Vec<String> {
+        let mut out = String::new();
+        self.collect_text(node, false, None, &mut out);
+        out.split('\n')
+            .map(|line| self.resolve_line(line))
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    /// Verbatim text of a `<pre>` (entities already decoded by the parser, `<br>` as newlines).
+    fn raw_text(&self, node: &Handle) -> String {
+        let mut out = String::new();
+        self.collect_text(node, true, None, &mut out);
+        out
+    }
+
+    /// Text of an `<li>` without its nested sub-lists (whose items are flattened into the list).
+    fn item_text(&self, li: &Handle) -> String {
+        let mut out = String::new();
+        for child in &*li.children.borrow() {
+            if !matches!(tag(child), Some("ul" | "ol")) {
+                self.collect_text(child, false, None, &mut out);
+            }
+        }
+        self.resolve_line(&out)
+    }
+
+    /// Collapses whitespace and resolves `:shortcode:` emoji.
+    fn resolve_line(&self, text: &str) -> String {
+        replace_shortcodes_with(&collapse_whitespace(text), self.resolve_emoji)
+    }
+
+    fn resolve(&self, code: &str) -> Option<String> {
+        (self.resolve_emoji)(code)
+    }
 }
 
 /// Lightweight Slack canvas markdown parser (headings, bullets, numbered lists, checklists,
@@ -1789,524 +2473,6 @@ fn parse_markdown_embed_line(line: &str) -> Option<CanvasBlock> {
     None
 }
 
-fn has_profile_card_marker(open_tag: &str) -> bool {
-    let lower = open_tag.to_ascii_lowercase();
-    lower.contains("user_unfurl")
-        || lower.contains("user-unfurl")
-        || lower.contains("profile-card")
-        || lower.contains("profile_card")
-        || extract_attr(open_tag, "data-user-id").is_some_and(|id| is_slack_user_id(&id))
-}
-
-fn has_doc_embed_marker(open_tag: &str) -> bool {
-    let lower = open_tag.to_ascii_lowercase();
-    lower.contains("canvas_unfurl")
-        || lower.contains("canvas-unfurl")
-        || lower.contains("list_unfurl")
-        || lower.contains("list-unfurl")
-        || lower.contains("embedded-link")
-}
-
-fn has_embedded_file_marker(open_tag: &str) -> bool {
-    let lower = open_tag.to_ascii_lowercase();
-    lower.contains("embedded-file")
-        || lower.contains("media-embed")
-        || lower.contains("data-slack-file-id")
-}
-
-fn take_balanced_inner<'a>(rest: &'a str, tag_name: &str) -> Option<(&'a str, &'a str)> {
-    let open_needle = format!("<{tag_name}");
-    let close_needle = format!("</{tag_name}>");
-    let lower = rest.to_ascii_lowercase();
-    let mut depth: usize = 1;
-    let mut cursor: usize = 0;
-
-    while cursor < lower.len() {
-        let next_open = lower[cursor..].find(&open_needle).map(|o| cursor + o);
-        let next_close = lower[cursor..].find(&close_needle).map(|c| cursor + c);
-
-        match (next_open, next_close) {
-            (_, None) => return None,
-            (Some(o), Some(c)) if o < c => {
-                let after = lower.as_bytes().get(o + open_needle.len()).copied();
-                let is_tag_boundary =
-                    after.is_some_and(|b| b.is_ascii_whitespace() || b == b'>' || b == b'/');
-                if is_tag_boundary {
-                    let gt_rel = lower[o..].find('>')?;
-                    let is_self_closing = lower[o..o + gt_rel].trim_end().ends_with('/');
-                    if !is_self_closing {
-                        depth += 1;
-                    }
-                    cursor = o + gt_rel + 1;
-                } else {
-                    cursor = o + open_needle.len();
-                }
-            }
-            (_, Some(c)) => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((&rest[..c], &rest[c + close_needle.len()..]));
-                }
-                cursor = c + close_needle.len();
-            }
-        }
-    }
-    None
-}
-
-fn find_first_tag<'a>(html: &'a str, tag_name: &str) -> Option<(&'a str, &'a str)> {
-    let open = format!("<{tag_name}");
-    let lower = html.to_ascii_lowercase();
-    let mut offset = 0;
-    while let Some(rel) = lower[offset..].find(&open) {
-        let pos = offset + rel;
-        let next_byte = lower.as_bytes().get(pos + open.len()).copied();
-        if !next_byte.is_some_and(|b| b.is_ascii_whitespace() || b == b'>' || b == b'/') {
-            offset = pos + open.len();
-            continue;
-        }
-        let after = &html[pos..];
-        let gt = after.find('>')?;
-        let raw = after[1..gt].trim();
-        let body = &after[gt + 1..];
-        if raw.ends_with('/') {
-            return Some((raw, ""));
-        }
-        let close = format!("</{tag_name}>");
-        let end = find_case_insensitive(body, &close).unwrap_or(body.len());
-        return Some((raw, &body[..end]));
-    }
-    None
-}
-
-fn parse_html_media_tag(
-    kind: CanvasMediaKind,
-    open_tag: &str,
-    inner: &str,
-    resolve_emoji: &dyn Fn(&str) -> Option<String>,
-) -> Option<CanvasBlock> {
-    let source_tag = find_first_tag(inner, "source").map(|(t, _)| t);
-    let link_tag = find_first_tag(inner, "a").or_else(|| find_first_tag(inner, "lnk"));
-
-    let raw_url = extract_attr(open_tag, "src")
-        .or_else(|| source_tag.and_then(|t| extract_attr(t, "src")))
-        .or_else(|| link_tag.and_then(|(t, _)| extract_attr(t, "href")))?;
-    let url = decode_entities(&raw_url);
-    if url.is_empty() {
-        return None;
-    }
-
-    let mime = extract_attr(open_tag, "data-mime")
-        .or_else(|| extract_attr(open_tag, "type"))
-        .or_else(|| source_tag.and_then(|t| extract_attr(t, "type")))
-        .or_else(|| classify_media_url(&url).map(|(_, m)| m.to_owned()));
-    let duration = extract_attr(open_tag, "data-duration")
-        .or_else(|| extract_attr(open_tag, "duration"))
-        .filter(|s| !s.is_empty());
-    let file_id = extract_attr(open_tag, "data-slack-file-id")
-        .or_else(|| extract_attr(open_tag, "data-file-id"))
-        .map(|s| strip_slack_file_prefix(&s))
-        .filter(|s| !s.is_empty());
-    let title = extract_attr(open_tag, "title")
-        .or_else(|| extract_attr(open_tag, "data-title"))
-        .or_else(|| extract_attr(open_tag, "aria-label"))
-        .or_else(|| {
-            let txt = clean_inline_html(inner, resolve_emoji);
-            (!txt.is_empty()).then_some(txt)
-        })
-        .or_else(|| filename_from_url(&url))
-        .map(|s| replace_shortcodes_with(&clean_text(&s), resolve_emoji))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("{} clip", kind.label()));
-
-    Some(CanvasBlock::MediaEmbed {
-        kind,
-        title,
-        url,
-        file_id,
-        duration,
-        mime,
-    })
-}
-
-fn parse_html_embedded_file_media(
-    open_tag: &str,
-    inner: &str,
-    resolve_emoji: &dyn Fn(&str) -> Option<String>,
-) -> Option<CanvasBlock> {
-    let link = find_first_tag(inner, "lnk").or_else(|| find_first_tag(inner, "a"));
-    let link_tag = link.map(|(t, _)| t).unwrap_or("");
-    let link_text = link
-        .map(|(_, body)| clean_inline_html(body, resolve_emoji))
-        .unwrap_or_default();
-
-    let file_id = extract_attr(link_tag, "data-slack-file-id")
-        .or_else(|| extract_attr(open_tag, "data-slack-file-id"))
-        .or_else(|| extract_attr(link_tag, "data-file-id"))
-        .or_else(|| extract_attr(open_tag, "data-file-id"))
-        .map(|s| strip_slack_file_prefix(&s))
-        .filter(|s| !s.is_empty());
-    let url = extract_attr(link_tag, "href")
-        .or_else(|| extract_attr(link_tag, "src"))
-        .or_else(|| extract_attr(open_tag, "href"))
-        .or_else(|| extract_attr(open_tag, "data-url"))
-        .map(|u| decode_entities(&u))
-        .unwrap_or_default();
-    let raw_mime = extract_attr(link_tag, "data-mime")
-        .or_else(|| extract_attr(open_tag, "data-mime"))
-        .or_else(|| extract_attr(link_tag, "type"))
-        .or_else(|| extract_attr(open_tag, "type"))
-        .or_else(|| extract_attr(link_tag, "data-filetype"))
-        .or_else(|| extract_attr(open_tag, "data-filetype"));
-    let duration = extract_attr(link_tag, "data-duration")
-        .or_else(|| extract_attr(open_tag, "data-duration"))
-        .filter(|s| !s.is_empty());
-
-    let raw_title = extract_attr(link_tag, "data-title")
-        .or_else(|| extract_attr(open_tag, "data-title"))
-        .or_else(|| extract_attr(link_tag, "title"))
-        .or_else(|| (!link_text.is_empty()).then_some(link_text))
-        .or_else(|| {
-            let txt = clean_inline_html(inner, resolve_emoji);
-            (!txt.is_empty()).then_some(txt)
-        })
-        .or_else(|| filename_from_url(&url))
-        .unwrap_or_default();
-
-    let (kind, mime) = raw_mime
-        .as_deref()
-        .and_then(classify_media_mime)
-        .or_else(|| classify_media_url(&url).map(|(k, m)| (k, m.to_owned())))
-        .or_else(|| classify_media_url(&raw_title).map(|(k, m)| (k, m.to_owned())))?;
-
-    let title = if raw_title.is_empty() {
-        format!("{} clip", kind.label())
-    } else {
-        replace_shortcodes_with(&clean_text(&raw_title), resolve_emoji)
-    };
-
-    Some(CanvasBlock::MediaEmbed {
-        kind,
-        title,
-        url,
-        file_id,
-        duration,
-        mime: Some(mime),
-    })
-}
-
-fn parse_control_profile_card(
-    control_inner: &str,
-    resolve_emoji: &dyn Fn(&str) -> Option<String>,
-) -> Option<CanvasBlock> {
-    let (link_tag, link_body) =
-        find_first_tag(control_inner, "a").or_else(|| find_first_tag(control_inner, "lnk"))?;
-    let body_text = clean_inline_html(link_body, resolve_emoji);
-    let href = extract_attr(link_tag, "href").map(|h| decode_entities(&h));
-
-    let user_id = extract_attr(link_tag, "data-user-id")
-        .filter(|s| is_slack_user_id(s))
-        .or_else(|| href.as_deref().and_then(parse_slack_profile_url))
-        .or_else(|| {
-            let bare = body_text.trim().trim_start_matches('@');
-            is_slack_user_id(bare).then(|| bare.to_owned())
-        })?;
-
-    let display_name = {
-        let trimmed = body_text.trim();
-        let bare = trimmed.trim_start_matches('@');
-        if trimmed.is_empty() || bare == user_id {
-            None
-        } else {
-            Some(trimmed.to_owned())
-        }
-    };
-    let title = extract_attr(link_tag, "data-title").filter(|s| !s.is_empty());
-    let handle = extract_attr(link_tag, "data-handle").filter(|s| !s.is_empty());
-
-    Some(CanvasBlock::ProfileCard {
-        user_id,
-        display_name,
-        title,
-        handle,
-    })
-}
-
-fn parse_html_profile_card(
-    open_tag: &str,
-    inner: &str,
-    resolve_emoji: &dyn Fn(&str) -> Option<String>,
-) -> Option<CanvasBlock> {
-    let link = find_first_tag(inner, "a").or_else(|| find_first_tag(inner, "lnk"));
-    let href = extract_attr(open_tag, "href")
-        .or_else(|| link.and_then(|(t, _)| extract_attr(t, "href")))
-        .map(|h| decode_entities(&h));
-    let inner_text = clean_inline_html(inner, resolve_emoji);
-
-    let user_id = extract_attr(open_tag, "data-user-id")
-        .filter(|s| is_slack_user_id(s))
-        .or_else(|| {
-            link.and_then(|(t, _)| extract_attr(t, "data-user-id"))
-                .filter(|s| is_slack_user_id(s))
-        })
-        .or_else(|| href.as_deref().and_then(parse_slack_profile_url))
-        .or_else(|| {
-            inner_text.split_whitespace().find_map(|tok| {
-                let bare = tok
-                    .trim_start_matches('@')
-                    .trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
-                is_slack_user_id(bare).then(|| bare.to_owned())
-            })
-        })?;
-
-    let title = extract_attr(open_tag, "data-title")
-        .or_else(|| extract_attr(open_tag, "data-role"))
-        .or_else(|| {
-            find_first_tag(inner, "span").and_then(|(t, body)| {
-                let lower = t.to_ascii_lowercase();
-                if lower.contains("title") || lower.contains("role") {
-                    let s = clean_inline_html(body, resolve_emoji);
-                    (!s.is_empty()).then_some(s)
-                } else {
-                    None
-                }
-            })
-        })
-        .filter(|s| !s.is_empty());
-
-    let handle = extract_attr(open_tag, "data-handle")
-        .or_else(|| extract_attr(open_tag, "data-username"))
-        .map(|h| h.trim_start_matches('@').to_owned())
-        .filter(|s| !s.is_empty());
-
-    let display_name = extract_attr(open_tag, "data-display-name")
-        .or_else(|| extract_attr(open_tag, "data-name"))
-        .or_else(|| extract_attr(open_tag, "data-user-name"))
-        .or_else(|| {
-            link.and_then(|(_, body)| {
-                let t = clean_inline_html(body, resolve_emoji);
-                let bare = t.trim_start_matches('@');
-                (!t.is_empty() && bare != user_id).then_some(t)
-            })
-        })
-        .or_else(|| {
-            let bare = inner_text.trim().trim_start_matches('@');
-            (!inner_text.is_empty()
-                && bare != user_id
-                && Some(inner_text.as_str()) != title.as_deref())
-            .then_some(inner_text)
-        });
-
-    Some(CanvasBlock::ProfileCard {
-        user_id,
-        display_name,
-        title,
-        handle,
-    })
-}
-
-fn parse_html_doc_embed(
-    open_tag: &str,
-    inner: &str,
-    resolve_emoji: &dyn Fn(&str) -> Option<String>,
-) -> Option<CanvasBlock> {
-    let link = find_first_tag(inner, "a").or_else(|| find_first_tag(inner, "lnk"));
-    let link_tag = link.map(|(t, _)| t).unwrap_or("");
-    let link_text = link
-        .map(|(_, body)| clean_inline_html(body, resolve_emoji))
-        .unwrap_or_default();
-
-    let url = extract_attr(link_tag, "href")
-        .or_else(|| extract_attr(open_tag, "href"))
-        .or_else(|| extract_attr(open_tag, "data-url"))
-        .map(|u| decode_entities(&u))
-        .unwrap_or_default();
-
-    let from_url = parse_slack_doc_url(&url);
-    let lower_tag = open_tag.to_ascii_lowercase();
-    let attr_file_id = extract_attr(link_tag, "data-slack-file-id")
-        .or_else(|| extract_attr(open_tag, "data-slack-file-id"))
-        .or_else(|| extract_attr(link_tag, "data-file-id"))
-        .or_else(|| extract_attr(open_tag, "data-file-id"))
-        .map(|s| strip_slack_file_prefix(&s))
-        .filter(|s| is_slack_file_id(s));
-
-    let (kind, file_id) = match from_url {
-        Some((k, fid)) => (k, fid),
-        None => {
-            let fid = attr_file_id?;
-            let is_list = lower_tag.contains("list_unfurl")
-                || lower_tag.contains("list-unfurl")
-                || extract_attr(open_tag, "data-doc-kind")
-                    .is_some_and(|k| k.eq_ignore_ascii_case("list"));
-            let is_canvas_marker = lower_tag.contains("canvas_unfurl")
-                || lower_tag.contains("canvas-unfurl")
-                || extract_attr(open_tag, "data-doc-kind")
-                    .is_some_and(|k| k.eq_ignore_ascii_case("canvas"));
-            if !is_list && !is_canvas_marker {
-                return None;
-            }
-            (
-                if is_list {
-                    CanvasEmbedKind::List
-                } else {
-                    CanvasEmbedKind::Canvas
-                },
-                fid,
-            )
-        }
-    };
-
-    let title = extract_attr(open_tag, "data-title")
-        .or_else(|| extract_attr(link_tag, "data-title"))
-        .or_else(|| (!link_text.is_empty() && link_text != url).then_some(link_text))
-        .or_else(|| {
-            let txt = clean_inline_html(inner, resolve_emoji);
-            (!txt.is_empty() && txt != url).then_some(txt)
-        })
-        .unwrap_or_else(|| format!("{} {file_id}", kind.label()));
-
-    let final_url = if url.is_empty() {
-        let seg = match kind {
-            CanvasEmbedKind::Canvas => "docs",
-            CanvasEmbedKind::List => "lists",
-        };
-        format!("https://slack.com/{seg}/T0/{file_id}")
-    } else {
-        url
-    };
-
-    Some(CanvasBlock::DocEmbed {
-        kind,
-        file_id,
-        title,
-        url: final_url,
-    })
-}
-
-fn parse_html_paragraph_embed(
-    open_tag: &str,
-    inner: &str,
-    resolve_emoji: &dyn Fn(&str) -> Option<String>,
-) -> Option<CanvasBlock> {
-    if has_profile_card_marker(open_tag)
-        && let Some(card) = parse_html_profile_card(open_tag, inner, resolve_emoji)
-    {
-        return Some(card);
-    }
-
-    if has_embedded_file_marker(open_tag)
-        || inner.to_ascii_lowercase().contains("data-slack-file-id")
-    {
-        if let Some(media) = parse_html_embedded_file_media(open_tag, inner, resolve_emoji) {
-            return Some(media);
-        }
-        if let Some(doc) = parse_html_doc_embed(open_tag, inner, resolve_emoji) {
-            return Some(doc);
-        }
-    }
-
-    if has_doc_embed_marker(open_tag)
-        && let Some(doc) = parse_html_doc_embed(open_tag, inner, resolve_emoji)
-    {
-        return Some(doc);
-    }
-
-    if let Some((control_inner, remaining_text)) = extract_sole_tag(inner, "control", resolve_emoji)
-        && remaining_text.is_empty()
-        && let Some(card) = parse_control_profile_card(control_inner, resolve_emoji)
-    {
-        return Some(card);
-    }
-
-    let sole_link = extract_sole_tag_with_attrs(inner, "a", resolve_emoji)
-        .or_else(|| extract_sole_tag_with_attrs(inner, "lnk", resolve_emoji));
-    if let Some((link_tag, link_body, remaining_text)) = sole_link
-        && remaining_text.is_empty()
-        && let Some(raw_href) = extract_attr(link_tag, "href")
-    {
-        let href = decode_entities(&raw_href);
-        let label = clean_inline_html(link_body, resolve_emoji);
-        if let Some((kind, file_id)) = parse_slack_doc_url(&href) {
-            let title = if !label.is_empty() && label != href {
-                label
-            } else {
-                format!("{} {file_id}", kind.label())
-            };
-            return Some(CanvasBlock::DocEmbed {
-                kind,
-                file_id,
-                title,
-                url: href,
-            });
-        }
-        if let Some(user_id) = parse_slack_profile_url(&href) {
-            let display_name = {
-                let bare = label.trim_start_matches('@');
-                (!label.is_empty() && bare != user_id && label != href).then_some(label)
-            };
-            return Some(CanvasBlock::ProfileCard {
-                user_id,
-                display_name,
-                title: extract_attr(link_tag, "data-title").filter(|s| !s.is_empty()),
-                handle: extract_attr(link_tag, "data-handle").filter(|s| !s.is_empty()),
-            });
-        }
-        if let Some((kind, mime)) = classify_media_url(&href).or_else(|| classify_media_url(&label))
-        {
-            let title = if !label.is_empty() {
-                label
-            } else {
-                filename_from_url(&href).unwrap_or_else(|| format!("{} clip", kind.label()))
-            };
-            let file_id = extract_attr(link_tag, "data-slack-file-id")
-                .map(|s| strip_slack_file_prefix(&s))
-                .filter(|s| !s.is_empty());
-            let duration = extract_attr(link_tag, "data-duration").filter(|s| !s.is_empty());
-            return Some(CanvasBlock::MediaEmbed {
-                kind,
-                title,
-                url: href,
-                file_id,
-                duration,
-                mime: Some(mime.to_owned()),
-            });
-        }
-    }
-
-    None
-}
-
-fn extract_sole_tag<'a>(
-    html: &'a str,
-    tag: &str,
-    resolve_emoji: &dyn Fn(&str) -> Option<String>,
-) -> Option<(&'a str, String)> {
-    let (_, inner, outside) = extract_sole_tag_with_attrs(html, tag, resolve_emoji)?;
-    Some((inner, outside))
-}
-
-fn extract_sole_tag_with_attrs<'a>(
-    html: &'a str,
-    tag: &str,
-    resolve_emoji: &dyn Fn(&str) -> Option<String>,
-) -> Option<(&'a str, &'a str, String)> {
-    let open = format!("<{tag}");
-    let pos = find_case_insensitive(html, &open)?;
-    let before = &html[..pos];
-    let after_start = &html[pos..];
-    let gt = after_start.find('>')?;
-    let raw_tag = after_start[1..gt].trim();
-    let after_open = &after_start[gt + 1..];
-    let close = format!("</{tag}>");
-    let end = find_case_insensitive(after_open, &close)?;
-    let inner = &after_open[..end];
-    let after = &after_open[end + close.len()..];
-    let mut outside = clean_inline_html(before, resolve_emoji);
-    outside.push_str(&clean_inline_html(after, resolve_emoji));
-    Some((raw_tag, inner, outside))
-}
-
 fn is_markdown_table_row(line: &str) -> bool {
     let trimmed = line.trim();
     !trimmed.is_empty() && trimmed.contains('|')
@@ -2321,321 +2487,6 @@ fn is_markdown_table_start(lines: &[&str], ix: usize) -> bool {
         return is_markdown_table_separator(lines[ix + 1].trim());
     }
     false
-}
-
-fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
-    haystack
-        .to_ascii_lowercase()
-        .find(&needle.to_ascii_lowercase())
-}
-
-fn extract_attr(tag: &str, attr: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let needle = format!("{attr}=");
-    let pos = lower.find(&needle)?;
-    let rest = tag[pos + needle.len()..].trim_start();
-    if let Some(quoted) = rest.strip_prefix('"') {
-        let end = quoted.find('"')?;
-        Some(quoted[..end].to_owned())
-    } else if let Some(quoted) = rest.strip_prefix('\'') {
-        let end = quoted.find('\'')?;
-        Some(quoted[..end].to_owned())
-    } else {
-        let end = rest
-            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
-            .unwrap_or(rest.len());
-        Some(rest[..end].to_owned())
-    }
-}
-
-fn extract_tag_inner<'a>(html: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}");
-    let start = find_case_insensitive(html, &open)?;
-    let after_open = &html[start..];
-    let gt = after_open.find('>')?;
-    let content = &after_open[gt + 1..];
-    let close = format!("</{tag}>");
-    let end = find_case_insensitive(content, &close)?;
-    Some(&content[..end])
-}
-
-fn extract_emoji_from_img_tag(
-    raw_tag: &str,
-    resolve_emoji: &dyn Fn(&str) -> Option<String>,
-) -> Option<String> {
-    if let Some(code) = extract_attr(raw_tag, "data-emoji") {
-        let bare = code.trim_matches(':');
-        return resolve_emoji(bare).or_else(|| Some(format!(":{bare}:")));
-    }
-    let alt = extract_attr(raw_tag, "alt")?;
-    let trimmed = alt.trim();
-    if trimmed.starts_with(':') && trimmed.ends_with(':') && trimmed.len() > 2 {
-        let bare = &trimmed[1..trimmed.len() - 1];
-        return resolve_emoji(bare).or_else(|| Some(trimmed.to_owned()));
-    }
-    let lower_tag = raw_tag.to_ascii_lowercase();
-    let looks_like_emoji = lower_tag.contains("emoji")
-        || extract_attr(raw_tag, "src")
-            .map(|s| s.to_ascii_lowercase().contains("emoji"))
-            .unwrap_or(false);
-    if looks_like_emoji && !trimmed.is_empty() {
-        let bare = trimmed.trim_matches(':');
-        if let Some(glyph) = resolve_emoji(bare) {
-            return Some(glyph);
-        }
-    }
-    None
-}
-
-fn expand_inline_emoji_tags(html: &str, resolve_emoji: &dyn Fn(&str) -> Option<String>) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while let Some(open_pos) = rest.find('<') {
-        out.push_str(&rest[..open_pos]);
-        rest = &rest[open_pos..];
-        let Some(gt) = rest.find('>') else {
-            out.push_str(rest);
-            return out;
-        };
-        let raw_tag = &rest[1..gt];
-        let trimmed = raw_tag.trim();
-        let tag_name = trimmed
-            .split(|c: char| c.is_whitespace() || c == '/')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if tag_name == "control" {
-            let after_open = &rest[gt + 1..];
-            if let Some(end) = find_case_insensitive(after_open, "</control>") {
-                let inner = &after_open[..end];
-                if let Some(emoji) = extract_control_emoji(inner, resolve_emoji) {
-                    out.push_str(&emoji);
-                    rest = &after_open[end + "</control>".len()..];
-                    continue;
-                }
-                if let Some(mention_token) = extract_control_inline_mention(inner) {
-                    out.push_str(&mention_token);
-                    rest = &after_open[end + "</control>".len()..];
-                    continue;
-                }
-            }
-        }
-        if tag_name == "img"
-            && let Some(emoji) = extract_emoji_from_img_tag(trimmed, resolve_emoji)
-        {
-            out.push_str(&emoji);
-            rest = &rest[gt + 1..];
-            continue;
-        }
-        out.push_str(&rest[..=gt]);
-        rest = &rest[gt + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn extract_control_emoji(
-    inner: &str,
-    resolve_emoji: &dyn Fn(&str) -> Option<String>,
-) -> Option<String> {
-    let img_pos = find_case_insensitive(inner, "<img")?;
-    let after_img = &inner[img_pos + 1..];
-    let gt = after_img.find('>')?;
-    let raw_img = &after_img[..gt];
-    if let Some(glyph) = extract_emoji_from_img_tag(raw_img, resolve_emoji) {
-        return Some(glyph);
-    }
-    let alt = extract_attr(raw_img, "alt")?;
-    let bare = alt.trim().trim_matches(':');
-    if bare.is_empty() {
-        return None;
-    }
-    resolve_emoji(bare).or_else(|| {
-        if !bare.is_ascii() {
-            Some(bare.to_owned())
-        } else {
-            None
-        }
-    })
-}
-
-fn clean_inline_html(inner: &str, resolve_emoji: &dyn Fn(&str) -> Option<String>) -> String {
-    let expanded = expand_inline_emoji_tags(inner, resolve_emoji);
-    replace_shortcodes_with(&clean_text(&strip_tags(&expanded)), resolve_emoji)
-}
-
-fn clean_multiline_html(inner: &str, resolve_emoji: &dyn Fn(&str) -> Option<String>) -> String {
-    let expanded = expand_inline_emoji_tags(inner, resolve_emoji);
-    let with_breaks = replace_line_break_tags(&expanded);
-    let stripped = strip_tags(&with_breaks);
-    let decoded = decode_entities(&stripped);
-    decoded
-        .lines()
-        .map(|l| {
-            let collapsed = l.split_whitespace().collect::<Vec<_>>().join(" ");
-            replace_shortcodes_with(&collapsed, resolve_emoji)
-        })
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn replace_line_break_tags(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while let Some(open_pos) = rest.find('<') {
-        out.push_str(&rest[..open_pos]);
-        rest = &rest[open_pos..];
-        let Some(gt) = rest.find('>') else {
-            out.push_str(rest);
-            return out;
-        };
-        let raw = rest[1..gt].trim().to_ascii_lowercase();
-        let name = raw
-            .split(|c: char| c.is_whitespace() || c == '/')
-            .next()
-            .unwrap_or("");
-        if name == "br" || raw.starts_with("/p") || raw.starts_with("/div") {
-            out.push('\n');
-        } else {
-            out.push_str(&rest[..=gt]);
-        }
-        rest = &rest[gt + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn extract_list_items(
-    inner: &str,
-    resolve_emoji: &dyn Fn(&str) -> Option<String>,
-) -> Vec<(bool, String)> {
-    let mut out = Vec::new();
-    let mut rest = inner;
-    while let Some(pos) = find_case_insensitive(rest, "<li") {
-        rest = &rest[pos..];
-        let Some(gt) = rest.find('>') else { break };
-        let open_tag = &rest[..gt];
-        rest = &rest[gt + 1..];
-        let end = find_case_insensitive(rest, "</li>").unwrap_or(rest.len());
-        let body = &rest[..end];
-        let checked = open_tag.contains("data-checked=\"true\"")
-            || open_tag.contains("class=\"checked\"")
-            || body.contains("checked");
-        let text = clean_inline_html(body, resolve_emoji);
-        if !text.is_empty() {
-            out.push((checked, text));
-        }
-        rest = if end + 5 <= rest.len() {
-            &rest[end + 5..]
-        } else {
-            ""
-        };
-    }
-    out
-}
-
-fn parse_html_table(
-    inner: &str,
-    resolve_emoji: &dyn Fn(&str) -> Option<String>,
-) -> Option<(Vec<String>, Vec<Vec<String>>)> {
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut rest = inner;
-    while let Some(pos) = find_case_insensitive(rest, "<tr") {
-        rest = &rest[pos..];
-        let Some(gt) = rest.find('>') else { break };
-        rest = &rest[gt + 1..];
-        let end = find_case_insensitive(rest, "</tr>").unwrap_or(rest.len());
-        let tr = &rest[..end];
-        let mut cells = Vec::new();
-        let mut cell_rest = tr;
-        while let Some(cpos) = cell_rest.find('<') {
-            cell_rest = &cell_rest[cpos..];
-            let Some(cgt) = cell_rest.find('>') else {
-                break;
-            };
-            let tag = cell_rest[1..cgt]
-                .split(|c: char| c.is_whitespace() || c == '/')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            cell_rest = &cell_rest[cgt + 1..];
-            if tag == "th" || tag == "td" {
-                let close = format!("</{tag}>");
-                let cend = find_case_insensitive(cell_rest, &close).unwrap_or(cell_rest.len());
-                cells.push(clean_inline_html(&cell_rest[..cend], resolve_emoji));
-                cell_rest = if cend + close.len() <= cell_rest.len() {
-                    &cell_rest[cend + close.len()..]
-                } else {
-                    ""
-                };
-            }
-        }
-        if !cells.is_empty() {
-            rows.push(cells);
-        }
-        rest = if end + 5 <= rest.len() {
-            &rest[end + 5..]
-        } else {
-            ""
-        };
-    }
-    if rows.is_empty() {
-        return None;
-    }
-    let col_count = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
-    for row in &mut rows {
-        row.resize(col_count, String::new());
-    }
-    let header = rows.remove(0);
-    Some((header, rows))
-}
-
-fn extract_control_inline_mention(inner: &str) -> Option<String> {
-    let a_pos = find_case_insensitive(inner, "<a")?;
-    let a_rest = &inner[a_pos..];
-    let gt = a_rest.find('>')?;
-    let raw_a = &a_rest[1..gt];
-    let after_a = &a_rest[gt + 1..];
-    let a_end = find_case_insensitive(after_a, "</a>")?;
-    let anchor_text = clean_text(&strip_tags(&after_a[..a_end]));
-
-    if let Some(uid) = anchor_text.strip_prefix('@')
-        && is_slack_user_id(uid.trim())
-    {
-        return Some(format!("<@{}>", uid.trim()));
-    }
-    if let Some(cid) = anchor_text.strip_prefix('#') {
-        let candidate = cid.trim();
-        if is_upper_alnum_id(candidate, b"CG") {
-            return Some(format!("<#{candidate}>"));
-        }
-    }
-    if let Some(href) = extract_attr(raw_a, "href") {
-        let decoded = decode_entities(&href);
-        if let Some(uid) = parse_slack_profile_url(&decoded) {
-            let label = anchor_text.trim_start_matches('@').trim();
-            if !label.is_empty() && label != uid {
-                return Some(format!("<@{uid}|{label}>"));
-            }
-            return Some(format!("<@{uid}>"));
-        }
-        if let Some(pos) = decoded.find("/archives/") {
-            let tail = &decoded[pos + "/archives/".len()..];
-            let cid: String = tail
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric())
-                .collect();
-            if is_upper_alnum_id(&cid, b"CG") {
-                let name = anchor_text.trim_start_matches('#').trim();
-                if !name.is_empty() && name != cid {
-                    return Some(format!("<#{cid}|{name}>"));
-                }
-                return Some(format!("<#{cid}>"));
-            }
-        }
-    }
-    None
 }
 
 fn is_preserved_slack_mention_token(inner: &str) -> bool {
@@ -2658,32 +2509,9 @@ fn is_preserved_slack_mention_token(inner: &str) -> bool {
     false
 }
 
-fn strip_tags(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(lt) = rest.find('<') {
-        out.push_str(&rest[..lt]);
-        let after = &rest[lt + 1..];
-        let Some(gt) = after.find('>') else {
-            break;
-        };
-        let inside = &after[..gt];
-        if is_preserved_slack_mention_token(inside) {
-            out.push('<');
-            out.push_str(inside);
-            out.push('>');
-        }
-        rest = &after[gt + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn clean_text(s: &str) -> String {
-    decode_entities(s)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Collapses runs of whitespace into single spaces.
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -2836,5 +2664,121 @@ mod tests {
         table.add_row();
         assert_eq!(table.header, vec!["A", "Column 2"]);
         assert_eq!(table.rows.len(), 2);
+    }
+
+    #[test]
+    fn html_parser_handles_markup_edge_cases() {
+        use CanvasBlock::{Bullets, Divider, Heading, NumberedList, Paragraph, Table};
+        let image = |alt: &str, width: Option<u32>| CanvasBlock::Image {
+            url: "https://files.slack.com/a.png".into(),
+            alt: alt.into(),
+            width,
+            height: None,
+        };
+        type Case = (&'static str, Vec<CanvasBlock>, Vec<Option<String>>);
+        let cases: &[Case] = &[
+            // Only an exact `id` attribute is a section id.
+            (
+                r#"<h1 data-id="x" aria-rowid="y" id="temp:C:h1">Title</h1><p gridid="z">Body</p>"#,
+                vec![
+                    Heading {
+                        level: 1,
+                        text: "Title".into(),
+                    },
+                    Paragraph("Body".into()),
+                ],
+                vec![Some("temp:C:h1".into()), None],
+            ),
+            // `>` inside a quoted attribute value neither truncates the tag nor leaks text.
+            (
+                r#"<img src="https://files.slack.com/a.png" alt="a > b" width="10"><p title="1 > 0">After</p>"#,
+                vec![image("a > b", Some(10)), Paragraph("After".into())],
+                vec![None, None],
+            ),
+            // Comments, including ones containing `>`, are dropped.
+            (
+                "<p>Before <!-- note: a > b --> <b>After</b></p><!-- top > level --><p>Next</p>",
+                vec![Paragraph("Before After".into()), Paragraph("Next".into())],
+                vec![None, None],
+            ),
+            // Uppercase tag/attribute names and unquoted attribute values.
+            (
+                r#"<H1 ID="temp:C:up">UP</H1><IMG SRC=https://files.slack.com/a.png ALT=diagram WIDTH=800><UL CLASS=checklist><LI DATA-CHECKED=true>A</LI></UL>"#,
+                vec![
+                    Heading {
+                        level: 1,
+                        text: "UP".into(),
+                    },
+                    image("diagram", Some(800)),
+                    CanvasBlock::Checklist(vec![(true, "A".into())]),
+                ],
+                vec![Some("temp:C:up".into()), None, None],
+            ),
+            // Entities are decoded exactly once, in text and in attribute values.
+            (
+                r#"<p>Fish &amp; chips &lt;3 &quot;q&quot; &#39;s&apos; &nbsp;tail &amp;lt;literal&amp;gt;</p><p class=embedded-link><a href="https://acme.slack.com/docs/T01/F01SPEC?a=1&amp;b=2">Spec</a></p>"#,
+                vec![
+                    Paragraph("Fish & chips <3 \"q\" 's' tail &lt;literal&gt;".into()),
+                    CanvasBlock::DocEmbed {
+                        kind: CanvasEmbedKind::Canvas,
+                        file_id: "F01SPEC".into(),
+                        title: "Spec".into(),
+                        url: "https://acme.slack.com/docs/T01/F01SPEC?a=1&b=2".into(),
+                    },
+                ],
+                vec![None, None],
+            ),
+            // Malformed / unclosed tags: auto-closed paragraphs, list items and table cells, a
+            // stray `<` in text.
+            (
+                "<ul><li>One<li>Two</ul><p>b < c<p>next<table><tr><th>A<th>B<tr><td>1<td>2</table>",
+                vec![
+                    Bullets(vec!["One".into(), "Two".into()]),
+                    Paragraph("b < c".into()),
+                    Paragraph("next".into()),
+                    Table {
+                        header: vec!["A".into(), "B".into()],
+                        rows: vec![vec!["1".into(), "2".into()]],
+                    },
+                ],
+                vec![None; 4],
+            ),
+            // Nested lists are flattened in document order; a list inside a cell joins as text.
+            (
+                "<ol><li>Step one<ol><li>Sub</ol></ol><table><thead><tr><th>Owner</th><th>Tasks</th></tr></thead><tbody><tr><td>Ana</td><td><ul><li>Ship<li>Test</ul></td></tr></tbody></table>",
+                vec![
+                    NumberedList(vec!["Step one".into(), "Sub".into()]),
+                    Table {
+                        header: vec!["Owner".into(), "Tasks".into()],
+                        rows: vec![vec!["Ana".into(), "Ship Test".into()]],
+                    },
+                ],
+                vec![None, None],
+            ),
+            // Body-level inline runs merge into one paragraph; `<br>` separates words.
+            (
+                "Hello <b>bold</b> world<hr id=\"s1\"><span>Line 1<br>Line 2</span>",
+                vec![
+                    Paragraph("Hello bold world".into()),
+                    Divider,
+                    Paragraph("Line 1 Line 2".into()),
+                ],
+                vec![None, Some("s1".into()), None],
+            ),
+            // Quip `<control>` mentions and mrkdwn tokens that look like tags survive as text.
+            (
+                r#"<p>Discuss in <control><a href="https://acme.slack.com/archives/C01ENG">#eng</a></control> with <!subteam^S01DES|@design> and <@U01ALICE> and @here.</p>"#,
+                vec![Paragraph(
+                    "Discuss in <#C01ENG|eng> with <!subteam^S01DES|@design> and <@U01ALICE> and @here."
+                        .into(),
+                )],
+                vec![None],
+            ),
+        ];
+        for (html, blocks, ids) in cases {
+            let (got_blocks, got_ids) = parse_canvas_html_with_ids(html);
+            assert_eq!(&got_blocks, blocks, "{html}");
+            assert_eq!(&got_ids, ids, "{html}");
+        }
     }
 }

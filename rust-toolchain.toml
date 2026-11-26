@@ -1,0 +1,6 @@
+# Single source of truth for the Rust toolchain: CI and the release workflow install exactly this
+# with `rustup toolchain install`. flake.lock pins the same nightly through fenix for the nix dev
+# shell (rust-nightly-complete-2026-11-18), so bump both together.
+[toolchain]
+channel = "nightly-2026-11-18"
+components = ["rustfmt", "clippy"]

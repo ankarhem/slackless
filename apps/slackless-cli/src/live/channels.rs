@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use slackless_core::api::{
     ApiError, ClientCounts, ConversationCounts, HistoryOpts, ListOpts, Page, SlackApi,
 };
+use slackless_core::types::time::now_epoch_secs;
 use slackless_core::types::{ChannelId, Message, TeamId, Ts};
 use slackless_core::{NotifyLevel, Synced, read_synced_spans, write_synced_spans};
 
@@ -314,6 +315,7 @@ async fn backfill_one_channel(
             break;
         }
         let mut waits = 0u32;
+        let fetched_at = now_epoch_secs();
         let page = loop {
             match api
                 .conversations_history(channel, &opts, cursor.clone())
@@ -333,7 +335,7 @@ async fn backfill_one_channel(
         if !page.items.is_empty() {
             archive
                 .store_mut()
-                .upsert_messages(workspace, channel, &page.items)
+                .upsert_history_page(workspace, channel, &page.items, fetched_at)
                 .with_context(|| format!("storing history page for {channel}"))
                 .map_err(BackfillStepError::Store)?;
             messages_stored += page.items.len();
@@ -355,6 +357,7 @@ async fn backfill_one_channel(
                 let mut got_any = false;
                 loop {
                     let mut reply_waits = 0u32;
+                    let reply_fetched_at = now_epoch_secs();
                     let reply_page = loop {
                         match api
                             .conversations_replies(
@@ -389,7 +392,12 @@ async fn backfill_one_channel(
                             reply_page.items.iter().filter(|m| m.ts != root_ts).count();
                         archive
                             .store_mut()
-                            .upsert_messages(workspace, channel, &reply_page.items)
+                            .upsert_replies_page(
+                                workspace,
+                                channel,
+                                &reply_page.items,
+                                reply_fetched_at,
+                            )
                             .with_context(|| {
                                 format!("storing thread replies for {channel} ({root_ts})")
                             })

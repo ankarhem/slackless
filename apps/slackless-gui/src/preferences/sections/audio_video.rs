@@ -300,6 +300,8 @@ impl Preferences {
         };
 
         let status_card = if provider.is_local() {
+            // Parakeet's only binary is the ONNX Runtime library; Whisper needs whisper-cpp.
+            let is_parakeet = provider == slackless_core::huddle::TranscriptionProvider::ParakeetV3;
             let dot_color = if downloading {
                 link_color
             } else if setup.is_ready() {
@@ -325,7 +327,7 @@ impl Preferences {
                     ),
                 )
             } else if !setup.model_ready {
-                let extra = if !setup.binary_ready {
+                let extra = if !setup.binary_ready && !is_parakeet {
                     " Also install brew install whisper-cpp for local Whisper."
                 } else {
                     " Runs natively in-process (no external tools required)."
@@ -339,6 +341,14 @@ impl Preferences {
                             setup.model_path.display()
                         )
                     }),
+                )
+            } else if is_parakeet {
+                (
+                    "ONNX Runtime missing".to_owned(),
+                    Some("Runtime missing"),
+                    slackless_core::huddle::onnx_runtime::locate()
+                        .err()
+                        .unwrap_or_default(),
                 )
             } else {
                 (

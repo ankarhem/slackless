@@ -46,6 +46,12 @@ pub(super) fn client_token() -> String {
     format!("web-{}", since_epoch.as_millis())
 }
 
+/// A fresh `client_msg_id` for `chat.postMessage`: the UUID Slack dedupes posts of one message
+/// by. Mint it once per message and reuse it for every retry of that message.
+pub fn new_client_msg_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 pub(super) fn page<W, T>(resp: ApiResponse<W>, items: impl FnOnce(W) -> Vec<T>) -> Page<T> {
     let next_cursor = resp.next_cursor().map(str::to_owned);
     Page {

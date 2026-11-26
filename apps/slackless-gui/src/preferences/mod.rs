@@ -31,11 +31,12 @@ pub(crate) use crate::ui::forms::{form_button_for, text_input_box_for};
 pub use prefs_globals::{
     active_quick_reactions, display_prefs, matches_highlight_keyword, set_display_prefs,
 };
+#[cfg(test)]
+pub(crate) use settings::AiSummarySettings;
 pub use settings::{
-    AiSummarySettings, AppearanceMode, HOURS, MEDIA_CACHE_AGE_OPTIONS, MEDIA_CACHE_SIZE_OPTIONS,
-    MESSAGE_VERBOSITY, MOBILE_HANDOFF, NOTIFY_LEVELS, SCHEDULE_DAYS, SOUND_FILES, Section,
-    Settings, StorageInfo, TRANSCRIPTION_PROVIDERS, format_accessible_message,
-    format_cross_workspace_summary,
+    AppearanceMode, HOURS, MEDIA_CACHE_AGE_OPTIONS, MEDIA_CACHE_SIZE_OPTIONS, MESSAGE_VERBOSITY,
+    MOBILE_HANDOFF, NOTIFY_LEVELS, SCHEDULE_DAYS, SOUND_FILES, Section, Settings, StorageInfo,
+    TRANSCRIPTION_PROVIDERS, format_accessible_message, format_cross_workspace_summary,
 };
 pub(crate) use slackless_core::types::time::format_bytes;
 pub use window::open_preferences_window;

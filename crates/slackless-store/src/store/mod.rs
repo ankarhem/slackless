@@ -251,34 +251,8 @@ impl Store {
         }
         let tx = self.conn.transaction()?;
         let ts = now_secs();
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO conversation
-                     (workspace_id, id, name, kind, is_archived, is_member, json, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT (workspace_id, id) DO UPDATE SET
-                     name = excluded.name, kind = excluded.kind, is_archived = excluded.is_archived,
-                     is_member = excluded.is_member, json = excluded.json,
-                     updated_at = excluded.updated_at",
-            )?;
-            for conv in conversations {
-                let kind = match conv.kind() {
-                    ConversationKind::PublicChannel => "public_channel",
-                    ConversationKind::PrivateChannel => "private_channel",
-                    ConversationKind::Im => "im",
-                    ConversationKind::Mpim => "mpim",
-                };
-                stmt.execute(params![
-                    workspace.as_str(),
-                    conv.id.as_str(),
-                    conv.name,
-                    kind,
-                    conv.is_archived,
-                    conv.is_member,
-                    serde_json::to_string(conv)?,
-                    ts,
-                ])?;
-            }
+        for conv in conversations {
+            upsert_conversation_in_tx(&tx, workspace, conv, ts)?;
         }
         tx.commit()?;
         Self::bump_message_revision();
@@ -331,15 +305,7 @@ impl Store {
 
     /// One stored conversation by id, as last written.
     pub fn conversation(&self, workspace: &TeamId, id: &ChannelId) -> Result<Option<Conversation>> {
-        let json: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT json FROM conversation WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace.as_str(), id.as_str()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(json.map(|j| serde_json::from_str(&j)).transpose()?)
+        load_conversation(&self.conn, workspace, id)
     }
 
     /// A `conversations.info` refresh of a stored conversation: overlays `fresh` without
@@ -347,14 +313,23 @@ impl Store {
     /// stored is inserted as-is.
     pub fn merge_conversation(&mut self, workspace: &TeamId, fresh: &Conversation) -> Result<()> {
         self.ensure_writable()?;
-        let merged = match self.conversation(workspace, &fresh.id)? {
+        // One IMMEDIATE transaction holds the write lock from before the read: the GUI and the
+        // CLI write the same file, and a merge based on a row another writer replaced in between
+        // would silently revert that write.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let merged = match load_conversation(&tx, workspace, &fresh.id)? {
             Some(mut stored) => {
                 stored.merge(fresh);
                 stored
             }
             None => fresh.clone(),
         };
-        self.upsert_conversation(workspace, &merged)
+        upsert_conversation_in_tx(&tx, workspace, &merged, now_secs())?;
+        tx.commit()?;
+        Self::bump_message_revision();
+        Ok(())
     }
 
     /// Every stored conversation of `workspace`, by name, as last upserted.
@@ -665,6 +640,57 @@ impl Store {
 }
 
 use self::messages::*;
+
+/// The stored JSON of one conversation, decoded.
+fn load_conversation(
+    conn: &Connection,
+    workspace: &TeamId,
+    id: &ChannelId,
+) -> Result<Option<Conversation>> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT json FROM conversation WHERE workspace_id = ?1 AND id = ?2",
+            params![workspace.as_str(), id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(json.map(|j| serde_json::from_str(&j)).transpose()?)
+}
+
+/// Inserts `conv` or replaces its row wholesale, stamped `updated_at = ts`.
+fn upsert_conversation_in_tx(
+    tx: &Transaction<'_>,
+    workspace: &TeamId,
+    conv: &Conversation,
+    ts: i64,
+) -> Result<()> {
+    let kind = match conv.kind() {
+        ConversationKind::PublicChannel => "public_channel",
+        ConversationKind::PrivateChannel => "private_channel",
+        ConversationKind::Im => "im",
+        ConversationKind::Mpim => "mpim",
+    };
+    let mut stmt = tx.prepare_cached(
+        "INSERT INTO conversation
+             (workspace_id, id, name, kind, is_archived, is_member, json, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT (workspace_id, id) DO UPDATE SET
+             name = excluded.name, kind = excluded.kind, is_archived = excluded.is_archived,
+             is_member = excluded.is_member, json = excluded.json,
+             updated_at = excluded.updated_at",
+    )?;
+    stmt.execute(params![
+        workspace.as_str(),
+        conv.id.as_str(),
+        conv.name,
+        kind,
+        conv.is_archived,
+        conv.is_member,
+        serde_json::to_string(conv)?,
+        ts,
+    ])?;
+    Ok(())
+}
 
 /// Builds `?, ?, ...` with `n` positional SQL placeholders.
 pub(super) fn placeholders(n: usize) -> String {

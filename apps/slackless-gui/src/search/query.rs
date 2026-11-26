@@ -2,6 +2,7 @@
 //! and client-side channel / people / DM matching.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -466,54 +467,31 @@ impl SearchView {
                         Some(emb) => emb,
                         None => load_or_get_onnx_embedder()? as Arc<dyn Embedder>,
                     };
-                    let mut embedded_total = 0usize;
-                    let mut skipped_total = 0usize;
-
-                    let mut run_index = |idx: &mut slackless_core::store::SemanticIndex| -> Result<(), String> {
-                        let mut seen = HashSet::new();
-                        for (ws, shared) in &mounted_targets {
-                            if !seen.insert(ws.clone()) {
-                                continue;
-                            }
-                            let store = shared.lock().unwrap_or_else(PoisonError::into_inner);
-                            let rep = index_store_documents_paced(
-                                &store,
-                                idx,
-                                embedder.as_ref(),
-                                Some(ws),
-                                IndexPacing::BACKGROUND,
-                                |_| {},
-                            )?;
-                            embedded_total += rep.embedded;
-                            skipped_total += rep.skipped_unchanged;
-                        }
-                        if !is_sample {
-                            let extra: Vec<_> = discover_local_archives()
-                                .into_iter()
-                                .filter(|(ws, _)| !seen.contains(ws))
-                                .collect();
-                            if !extra.is_empty() {
-                                let rep = index_disk_archives_paced(
-                                    &extra,
-                                    idx,
-                                    embedder.as_ref(),
-                                    IndexPacing::BACKGROUND,
-                                    |_| {},
-                                )?;
-                                embedded_total += rep.embedded;
-                                skipped_total += rep.skipped_unchanged;
-                            }
-                        }
-                        Ok(())
-                    };
-
-                    if let Some(shared_idx) = index_override {
-                        let mut guard = shared_idx.lock().unwrap_or_else(PoisonError::into_inner);
-                        run_index(&mut guard)?;
+                    let archives = if is_sample {
+                        Vec::new()
                     } else {
-                        let mut idx = open_default_semantic_index()?;
-                        run_index(&mut idx)?;
-                    }
+                        discover_local_archives()
+                    };
+                    let (embedded_total, skipped_total) = match index_override {
+                        Some(shared_idx) => {
+                            let mut idx = shared_idx.lock().unwrap_or_else(PoisonError::into_inner);
+                            index_semantic_workspaces(
+                                &mounted_targets,
+                                &archives,
+                                &mut idx,
+                                embedder.as_ref(),
+                            )?
+                        }
+                        None => {
+                            let mut idx = open_default_semantic_index()?;
+                            index_semantic_workspaces(
+                                &mounted_targets,
+                                &archives,
+                                &mut idx,
+                                embedder.as_ref(),
+                            )?
+                        }
+                    };
                     Ok(format!(
                         "Semantic index ready ({embedded_total} embedded, {skipped_total} unchanged)."
                     ))
@@ -690,6 +668,46 @@ impl SearchView {
             .take(RESULT_LIMIT)
             .collect()
     }
+}
+
+/// Index the `mounted` workspaces and every local archive file in `archives` into `index`,
+/// returning the `(embedded, unchanged)` document counts.
+///
+/// Archive files are read through private read-only connections opened for this run: indexing
+/// a large archive takes minutes, and a mounted workspace's store is the shared read handle the
+/// UI thread locks for channel history. Only mounted stores without a file (sample/fixture
+/// stores) are read through their shared handle.
+pub(super) fn index_semantic_workspaces(
+    mounted: &[(TeamId, SharedStore)],
+    archives: &[(TeamId, PathBuf)],
+    index: &mut slackless_core::store::SemanticIndex,
+    embedder: &dyn Embedder,
+) -> Result<(usize, usize), String> {
+    let mut embedded = 0usize;
+    let mut skipped = 0usize;
+    let mut seen = HashSet::new();
+    for (ws, shared) in mounted {
+        if archives.iter().any(|(archived, _)| archived == ws) || !seen.insert(ws) {
+            continue;
+        }
+        let store = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let report = index_store_documents_paced(
+            &store,
+            index,
+            embedder,
+            Some(ws),
+            IndexPacing::BACKGROUND,
+            |_| {},
+        )?;
+        embedded += report.embedded;
+        skipped += report.skipped_unchanged;
+    }
+    let report =
+        index_disk_archives_paced(archives, index, embedder, IndexPacing::BACKGROUND, |_| {})?;
+    Ok((
+        embedded + report.embedded,
+        skipped + report.skipped_unchanged,
+    ))
 }
 
 /// Fixture mode's archive: an in-memory store holding the first fixture workspace (users,

@@ -7,13 +7,13 @@
 use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{AuthError, Result};
+use crate::private_file::replace_private_file;
 
 /// Account identifier used for the local/BYO-key AI summary provider API key.
 pub const AI_SUMMARY_API_KEY_ACCOUNT: &str = "ai-summary-api-key";
@@ -153,48 +153,8 @@ impl SecretStore {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_vec_pretty(map)?;
-        let tmp = unique_tmp_path(&self.path);
-        write_private_file(&tmp, &json)?;
-        if let Err(err) = std::fs::rename(&tmp, &self.path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(err.into());
-        }
+        replace_private_file(&self.path, &json)?;
         Ok(())
-    }
-}
-
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn unique_tmp_path(target: &Path) -> PathBuf {
-    let stem = target
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("secrets");
-    let pid = std::process::id();
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    target.with_file_name(format!("{stem}.{pid}.{seq}.tmp"))
-}
-
-fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut f = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)?;
-        if let Err(err) = f.write_all(bytes).and_then(|()| f.sync_all()) {
-            let _ = std::fs::remove_file(path);
-            return Err(err);
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
     }
 }
 

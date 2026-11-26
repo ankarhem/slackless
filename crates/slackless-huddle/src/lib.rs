@@ -15,6 +15,7 @@ pub mod macos_audio_tap;
 #[cfg(target_os = "macos")]
 pub use macos as macos_media;
 pub mod metrics;
+pub mod onnx_runtime;
 pub mod pdf;
 pub mod peer_message;
 pub mod rtc;

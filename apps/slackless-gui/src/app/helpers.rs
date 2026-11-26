@@ -150,7 +150,7 @@ pub(super) fn broadcast_kind(content: &MessageContent) -> Option<BroadcastRange>
 }
 
 /// Drop a failed lazy tab load so its tab shows loading again while it is re-requested.
-pub(super) fn forget_failure<T>(loaded: &mut HashMap<ChannelId, Loaded<T>>, channel: &ChannelId) {
+pub(super) fn forget_failure<T>(loaded: &mut ChannelCache<Loaded<T>>, channel: &ChannelId) {
     if loaded.get(channel).is_some_and(Result::is_err) {
         loaded.remove(channel);
     }

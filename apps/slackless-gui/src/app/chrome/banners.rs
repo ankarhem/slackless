@@ -79,7 +79,8 @@ impl App {
         .detach();
     }
 
-    /// Download, verify SHA-256, atomically swap the running `.app`, and relaunch (`F-SHELL-163`).
+    /// Download, verify SHA-256 and the code signature, swap the `.app` in-process (rolling back on
+    /// failure), then relaunch once this app has quit (`F-SHELL-163`).
     pub(in crate::app) fn install_available_update(&mut self, cx: &mut Context<Self>) {
         use crate::updater::UpdateState;
         let Some(release) = (match &self.update_state {
@@ -94,7 +95,7 @@ impl App {
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
-                .spawn(async move { crate::updater::download_and_schedule_swap(&release) })
+                .spawn(async move { crate::updater::install_update(&release) })
                 .await;
             let _ = this.update(cx, |app, cx| match res {
                 Ok(()) => {

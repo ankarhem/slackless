@@ -12,5 +12,9 @@ thiserror.workspace = true
 rusqlite = { version = "0.43", features = ["bundled"] }
 flate2 = "1.1"
 
+[dev-dependencies]
+# `busy_handler` lets the `merge_conversation` test interleave a second writer deterministically.
+rusqlite = { version = "0.43", features = ["hooks"] }
+
 [lints]
 workspace = true

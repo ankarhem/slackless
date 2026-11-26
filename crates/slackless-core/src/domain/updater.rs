@@ -1,5 +1,6 @@
-//! Shared GitHub Releases update checker, version comparator, checksum parser, and install-path
-//! resolver used by both CLI (`slackless update`) and GUI (`Check for Updates`).
+//! Shared GitHub Releases update checker, version comparator, checksum parser, install-path
+//! resolver, code-signature verification and app-bundle swap used by both CLI (`slackless
+//! update`) and GUI (`Check for Updates`).
 
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -356,6 +357,7 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
 }
 
 fn build_updater_client(user_agent: &str, timeout: Duration) -> Result<reqwest::Client, String> {
+    crate::api::install_default_crypto_provider();
     let mut builder = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(timeout)
@@ -420,25 +422,11 @@ pub async fn fetch_latest_release_for_channel(
     }
 }
 
-/// Query GitHub Releases for `repo` (e.g. `"ankarhem/slackless"`) over HTTPS using `reqwest`
-/// (15s connect / 30s request timeout, `Accept: application/vnd.github+json`), returning
-/// `Ok(None)` for drafts/prereleases.
-pub async fn fetch_latest_release_for(
-    repo: &str,
-    user_agent: &str,
+/// Query GitHub Releases for the official Slackless repository on `channel` (`F-SHELL-164`).
+pub async fn fetch_latest_release_on(
+    channel: UpdateChannel,
 ) -> Result<Option<ReleaseInfo>, String> {
-    fetch_latest_release_for_channel(repo, UpdateChannel::Stable, user_agent).await
-}
-
-fn block_on_updater<F: std::future::Future>(fut: F) -> Result<F::Output, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        return Ok(tokio::task::block_in_place(|| handle.block_on(fut)));
-    }
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("failed to initialize updater async runtime: {e}"))?;
-    Ok(rt.block_on(fut))
+    fetch_latest_release_for_channel(RELEASES_REPO, channel, DEFAULT_USER_AGENT).await
 }
 
 /// Blocking wrapper around [`fetch_latest_release_for_channel`] for non-Tokio callers (e.g. GPUI
@@ -448,29 +436,8 @@ pub fn fetch_latest_release_for_channel_blocking(
     channel: UpdateChannel,
     user_agent: &str,
 ) -> Result<Option<ReleaseInfo>, String> {
-    block_on_updater(fetch_latest_release_for_channel(repo, channel, user_agent))?
-}
-
-/// Blocking wrapper around [`fetch_latest_release_for`] for non-Tokio callers (e.g. GPUI
-/// background executor threads), running `reqwest` on a lightweight temporary Tokio runtime.
-pub fn fetch_latest_release_for_blocking(
-    repo: &str,
-    user_agent: &str,
-) -> Result<Option<ReleaseInfo>, String> {
-    fetch_latest_release_for_channel_blocking(repo, UpdateChannel::Stable, user_agent)
-}
-
-/// Query GitHub Releases for the official Slackless repository on `channel` (`F-SHELL-164`).
-pub async fn fetch_latest_release_on(
-    channel: UpdateChannel,
-) -> Result<Option<ReleaseInfo>, String> {
-    fetch_latest_release_for_channel(RELEASES_REPO, channel, DEFAULT_USER_AGENT).await
-}
-
-/// Query GitHub Releases over HTTPS (using `reqwest` with workspace proxy support and timeouts)
-/// for the latest non-draft, non-prerelease official Slackless release.
-pub async fn fetch_latest_release() -> Result<Option<ReleaseInfo>, String> {
-    fetch_latest_release_on(UpdateChannel::Stable).await
+    crate::runtime::block_on(fetch_latest_release_for_channel(repo, channel, user_agent))
+        .map_err(|e| format!("failed to start async runtime: {e}"))?
 }
 
 /// Stream `url` directly to `dest` via `reqwest` (15s connect / 300s request timeout), returning
@@ -575,18 +542,18 @@ pub async fn download_and_verify_release(
 }
 
 /// Blocking wrapper around [`download_and_verify_release`] for non-Tokio callers (e.g. GPUI
-/// background executor threads), running `reqwest` + pure-Rust SHA-256 verification on a
-/// lightweight temporary Tokio runtime.
+/// background executor threads): pure-Rust SHA-256 verification on the shared async runtime.
 pub fn download_and_verify_release_blocking(
     release: &ReleaseInfo,
     staging_dir: &Path,
     user_agent: &str,
 ) -> Result<PathBuf, String> {
-    block_on_updater(download_and_verify_release(
+    crate::runtime::block_on(download_and_verify_release(
         release,
         staging_dir,
         user_agent,
-    ))?
+    ))
+    .map_err(|e| format!("failed to start async runtime: {e}"))?
 }
 
 /// Extract a `.tar.gz` archive into `dest_dir` via `tar -xzf`, returning clear stderr on failure.
@@ -614,6 +581,204 @@ pub fn extract_tar_gz(tarball: &Path, dest_dir: &Path) -> Result<(), String> {
             format!("failed to extract update archive: {stderr}")
         });
     }
+    Ok(())
+}
+
+/// What the installed app's designated requirement demands of an update bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignatureRequirement {
+    /// The installed bundle is signed with a certificate; the update must satisfy exactly this
+    /// designated requirement (`codesign -R=<requirement>`), i.e. come from the same identity.
+    Designated(String),
+    /// No certificate-based requirement is available (ad-hoc / `cdhash`-only installed bundle, or
+    /// nothing installed yet): the update's own signature must still verify intact, but its
+    /// identity is trusted to the SHA-256 checksum alone.
+    ChecksumOnly,
+}
+
+/// Extract the designated requirement from the output of `codesign -d -r-`, which prints
+/// `designated => <requirement>` (`# designated => ...` in verbose mode). Returns `None` when no
+/// designated requirement is present (unsigned or unreadable code).
+pub fn parse_designated_requirement(codesign_output: &str) -> Option<String> {
+    codesign_output.lines().find_map(|line| {
+        let line = line.trim();
+        let line = line.strip_prefix("# ").unwrap_or(line);
+        line.strip_prefix("designated => ")
+            .map(str::trim)
+            .filter(|req| !req.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+/// Decide how an update must be verified from the designated requirement of the installed
+/// (running) bundle. Requirements naming a certificate or an anchor (e.g.
+/// `identifier "dev.slackless.gui" and certificate leaf = H"…"`) are enforced as-is; ad-hoc
+/// `cdhash H"…"` or no requirement at all leaves no identity to pin to, so the checksum stays the
+/// only identity check.
+pub fn signature_requirement(designated: Option<&str>) -> SignatureRequirement {
+    match designated.map(str::trim) {
+        Some(req) if req.contains("certificate") || req.contains("anchor") => {
+            SignatureRequirement::Designated(req.to_owned())
+        }
+        _ => SignatureRequirement::ChecksumOnly,
+    }
+}
+
+/// The bundle whose designated requirement an update must match: the running app bundle when
+/// launched from one (GUI), else the installed `target_app` when there is one (CLI), else nothing.
+pub fn update_signature_reference(target_app: &Path) -> Option<PathBuf> {
+    current_app_bundle()
+        .filter(|running| running.is_dir())
+        .or_else(|| target_app.is_dir().then(|| target_app.to_path_buf()))
+}
+
+#[cfg(target_os = "macos")]
+const CODESIGN: &str = "/usr/bin/codesign";
+
+/// Read the designated requirement of `app` with `/usr/bin/codesign -d -r-`. `None` when `codesign`
+/// reports no designated requirement (unsigned, missing or malformed bundle).
+#[cfg(target_os = "macos")]
+pub fn designated_requirement_of(app: &Path) -> Option<String> {
+    let out = Command::new(CODESIGN)
+        .args(["-d", "-r-"])
+        .arg(app)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_designated_requirement(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Run `/usr/bin/codesign --verify --deep --strict` on `app`, optionally also requiring it to
+/// satisfy `requirement` (`-R=<text>`). Fails with `codesign`'s stderr when the bundle is unsigned,
+/// tampered with, or signed by a different identity than the requirement names.
+#[cfg(target_os = "macos")]
+fn codesign_verify(app: &Path, requirement: Option<&str>) -> Result<(), String> {
+    let mut cmd = Command::new(CODESIGN);
+    cmd.args(["--verify", "--deep", "--strict"]);
+    if let Some(requirement) = requirement {
+        cmd.arg(format!("-R={requirement}"));
+    }
+    let out = cmd
+        .arg(app)
+        .output()
+        .map_err(|e| format!("failed to run codesign on {}: {e}", app.display()))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+    Err(if stderr.is_empty() {
+        format!("codesign exited with {} for {}", out.status, app.display())
+    } else {
+        stderr
+    })
+}
+
+/// Verify the extracted update bundle `new_app` after extraction and before any swap, against
+/// `reference_app` (the running or installed `Slackless.app`, see
+/// [`update_signature_reference`]):
+///
+/// 1. `/usr/bin/codesign --verify --deep --strict <new_app>` must pass: the bundle is signed and
+///    intact (the SHA-256 checksum from the same release only proves it is what it claims to be).
+/// 2. When the reference bundle carries a certificate-based designated requirement, the same
+///    `-R=<requirement>` must pass for `new_app`; an update signed by anyone else is refused.
+/// 3. Without a certificate-based reference (ad-hoc / `cdhash`-only install, or no install yet),
+///    a warning is logged and the checksum remains the only identity check.
+#[cfg(target_os = "macos")]
+pub fn verify_update_signature(new_app: &Path, reference_app: Option<&Path>) -> Result<(), String> {
+    let designated = reference_app.and_then(designated_requirement_of);
+    verify_signature_requirement(new_app, signature_requirement(designated.as_deref()))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_signature_requirement(
+    new_app: &Path,
+    requirement: SignatureRequirement,
+) -> Result<(), String> {
+    codesign_verify(new_app, None)?;
+    match requirement {
+        SignatureRequirement::Designated(requirement) => {
+            codesign_verify(new_app, Some(&requirement))
+                .map_err(|e| format!("update is not signed like the installed app: {e}"))
+        }
+        SignatureRequirement::ChecksumOnly => {
+            // shortcut: identity check is checksum-only while the installed app is ad-hoc signed or
+            // missing, upgrade once every install carries a certificate-based designated requirement
+            tracing::warn!(
+                new_app = %new_app.display(),
+                "installed app has no certificate-based designated requirement; verifying the update by checksum only"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Replace `target_app` with `new_app`: move an existing `target_app` aside to
+/// `<target_app>.prev` (e.g. `Slackless.app.prev`, after dropping any stale backup), move the new
+/// bundle into place (copying with `ditto` when the two live on different volumes), then remove
+/// the backup. When the move fails the previous bundle is moved back and the error returned, so
+/// the installed app is never left missing. Renaming the bundle of a running app is fine on macOS.
+#[cfg(target_os = "macos")]
+pub fn swap_app_bundle(new_app: &Path, target_app: &Path) -> Result<(), String> {
+    let prev_app = target_app.with_extension("app.prev");
+    if prev_app.exists()
+        && let Err(e) = std::fs::remove_dir_all(&prev_app)
+    {
+        return Err(format!(
+            "cannot remove stale backup {}: {e}",
+            prev_app.display()
+        ));
+    }
+    let had_existing = target_app.exists();
+    if had_existing {
+        std::fs::rename(target_app, &prev_app)
+            .map_err(|e| format!("cannot move {} aside: {e}", target_app.display()))?;
+    }
+    if let Err(err) = move_dir_across_fs(new_app, target_app) {
+        if had_existing
+            && prev_app.exists()
+            && let Err(rb_err) = std::fs::rename(&prev_app, target_app)
+        {
+            return Err(format!(
+                "cannot install {} ({err}); restoring {} also failed ({rb_err})",
+                target_app.display(),
+                prev_app.display()
+            ));
+        }
+        return Err(err);
+    }
+    if prev_app.exists()
+        && let Err(e) = std::fs::remove_dir_all(&prev_app)
+    {
+        tracing::warn!(error = %e, backup = %prev_app.display(), "installed update but could not remove previous bundle");
+    }
+    Ok(())
+}
+
+/// Move directory `src` to `dst`, falling back to `/usr/bin/ditto` (which preserves metadata and
+/// resource forks) when the two are on different volumes and `rename` therefore fails.
+#[cfg(target_os = "macos")]
+fn move_dir_across_fs(src: &Path, dst: &Path) -> Result<(), String> {
+    if !src.exists() {
+        return Err(format!("source bundle does not exist: {}", src.display()));
+    }
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    let out = Command::new("/usr/bin/ditto")
+        .arg(src)
+        .arg(dst)
+        .output()
+        .map_err(|e| format!("failed to run ditto: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ditto exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let _ = std::fs::remove_dir_all(src);
     Ok(())
 }
 
@@ -798,6 +963,205 @@ pub fn dir_in_path(dir: &Path) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Per-test scratch directory under the temp dir, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "slackless-core-updater-{label}-{}-{}",
+                std::process::id(),
+                TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn parses_designated_requirements_and_classifies_them() {
+        // `codesign -d -r-` stdout for a certificate-signed Slackless.app.
+        let cert_based = "designated => identifier \"dev.slackless.gui\" and certificate leaf = H\"3f2e79ed498717dce5f8b5074fee9bc924ee3885\"\n";
+        let cert_requirement = "identifier \"dev.slackless.gui\" and certificate leaf = H\"3f2e79ed498717dce5f8b5074fee9bc924ee3885\"";
+        assert_eq!(
+            parse_designated_requirement(cert_based).as_deref(),
+            Some(cert_requirement)
+        );
+        assert_eq!(
+            signature_requirement(Some(cert_requirement)),
+            SignatureRequirement::Designated(cert_requirement.to_owned())
+        );
+
+        // Ad-hoc signed (universal binary): `cdhash`-only, nothing to pin the identity to.
+        let adhoc = "designated => cdhash H\"2309b035501b9492e21770fbb06dad25dffc6718\" or cdhash H\"6009d85589bbb3ff435b37c56c34d5c9ec54a021\" or cdhash H\"4e44e246e3242c993cea3ca9e816b20a42149afc\"\n";
+        assert!(
+            parse_designated_requirement(adhoc).is_some_and(|req| req.starts_with("cdhash H\""))
+        );
+        assert_eq!(
+            signature_requirement(parse_designated_requirement(adhoc).as_deref()),
+            SignatureRequirement::ChecksumOnly
+        );
+
+        // Verbose output prefixes the line with `# `; Apple's own anchor counts as identity too.
+        assert_eq!(
+            parse_designated_requirement("Executable=/bin/ls\n# designated => anchor apple\n")
+                .as_deref(),
+            Some("anchor apple")
+        );
+        assert_eq!(
+            signature_requirement(Some("anchor apple")),
+            SignatureRequirement::Designated("anchor apple".to_owned())
+        );
+
+        // Unsigned code prints no designated requirement at all.
+        assert_eq!(parse_designated_requirement(""), None);
+        assert_eq!(parse_designated_requirement("designated => \n"), None);
+        assert_eq!(
+            signature_requirement(None),
+            SignatureRequirement::ChecksumOnly
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn adhoc_signed_bundle(at: &Path) {
+        let macos = at.join("Contents/MacOS");
+        std::fs::create_dir_all(&macos).expect("create bundle");
+        std::fs::copy("/bin/sleep", macos.join("slackless-gui")).expect("copy a Mach-O");
+        std::fs::write(
+            at.join("Contents/Info.plist"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>CFBundleExecutable</key><string>slackless-gui</string><key>CFBundleIdentifier</key><string>dev.slackless.test</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>\n",
+        )
+        .expect("write Info.plist");
+        let out = Command::new(CODESIGN)
+            .args(["--force", "--sign", "-"])
+            .arg(at)
+            .output()
+            .expect("run codesign");
+        assert!(
+            out.status.success(),
+            "codesign failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verify_update_signature_checks_integrity_then_installed_identity() {
+        let dir = TempDir::new("signature");
+        let new_app = dir.path().join("stage/Slackless.app");
+        let installed = dir.path().join("Apps/Slackless.app");
+        adhoc_signed_bundle(&new_app);
+        adhoc_signed_bundle(&installed);
+
+        // The reference is the installed bundle when not running from one, nothing when there is
+        // no install yet.
+        assert_eq!(
+            update_signature_reference(&installed),
+            Some(installed.clone())
+        );
+        assert_eq!(
+            update_signature_reference(&dir.path().join("missing/Slackless.app")),
+            None
+        );
+
+        // An ad-hoc (cdhash-only) install pins no identity: the intact update passes, as does an
+        // update with no install to compare against.
+        assert!(
+            designated_requirement_of(&installed).is_some_and(|req| req.starts_with("cdhash H\""))
+        );
+        verify_update_signature(&new_app, Some(&installed))
+            .expect("ad-hoc install falls back to checksum-only");
+        verify_update_signature(&new_app, None).expect("no install yet");
+        assert_eq!(
+            designated_requirement_of(&dir.path().join("nope.app")),
+            None
+        );
+
+        // A certificate-based requirement is enforced: an update not signed by that identity is
+        // refused, while the bundle's own requirement passes.
+        let cert = "identifier \"dev.slackless.gui\" and certificate leaf = H\"3f2e79ed498717dce5f8b5074fee9bc924ee3885\"";
+        assert!(
+            verify_signature_requirement(
+                &new_app,
+                SignatureRequirement::Designated(cert.to_owned())
+            )
+            .is_err()
+        );
+        let own = designated_requirement_of(&new_app).expect("ad-hoc DR");
+        verify_signature_requirement(&new_app, SignatureRequirement::Designated(own))
+            .expect("bundle satisfies its own requirement");
+
+        // A tampered bundle fails the integrity check before any identity check, unsigned code
+        // fails it as well.
+        std::fs::write(new_app.join("Contents/Info.plist"), "broken").expect("tamper");
+        assert!(verify_update_signature(&new_app, Some(&installed)).is_err());
+        let unsigned = dir.path().join("unsigned/Slackless.app");
+        std::fs::create_dir_all(unsigned.join("Contents/MacOS")).expect("mkdir unsigned");
+        std::fs::copy("/bin/sleep", unsigned.join("Contents/MacOS/slackless-gui")).expect("copy");
+        assert!(verify_update_signature(&unsigned, None).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn swap_app_bundle_installs_upgrades_and_rolls_back() {
+        let dir = TempDir::new("swap");
+        let target = dir.path().join("Apps/Slackless.app");
+        let prev = target.with_extension("app.prev");
+        std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir Apps");
+        let staged = |version: &str| {
+            let app = dir.path().join(format!("stage-{version}/Slackless.app"));
+            std::fs::create_dir_all(app.join("Contents")).expect("mkdir stage");
+            std::fs::write(app.join("Contents/version"), version).expect("write version");
+            app
+        };
+        let installed =
+            || std::fs::read_to_string(target.join("Contents/version")).expect("version");
+
+        // Fresh install via swap_app_bundle.
+        swap_app_bundle(&staged("v1"), &target).expect("fresh install");
+        assert_eq!(installed(), "v1");
+        assert!(!prev.exists());
+
+        // A stale backup left by an interrupted update is dropped; the upgrade replaces v1 with v2.
+        std::fs::create_dir_all(&prev).expect("mkdir stale backup");
+        std::fs::write(prev.join("stale"), b"").expect("write stale");
+        swap_app_bundle(&staged("v2"), &target).expect("upgrade install");
+        assert_eq!(installed(), "v2");
+        assert!(!prev.exists());
+
+        // Failed swap (missing new_app) rolls back to v2 intact.
+        assert!(swap_app_bundle(&dir.path().join("stage-missing/Slackless.app"), &target).is_err());
+        assert_eq!(installed(), "v2");
+        assert!(!prev.exists());
+
+        // Plain directory move (rename) and a missing source.
+        let src = dir.path().join("move-src");
+        let dst = dir.path().join("move-dst");
+        std::fs::create_dir_all(&src).expect("mkdir move-src");
+        std::fs::write(src.join("marker"), b"ok").expect("write marker");
+        move_dir_across_fs(&src, &dst).expect("move dir");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("marker")).expect("marker"),
+            "ok"
+        );
+        assert!(!src.exists());
+        assert!(move_dir_across_fs(&src, &dir.path().join("move-dst-2")).is_err());
+    }
 
     #[test]
     fn parses_calver_four_tuple_and_semver_versions() {
@@ -904,6 +1268,9 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir");
         assert!(dir_is_writable(&dir));
         assert!(!dir_is_writable(&dir.join("nonexistent")));
+        let file = dir.join("file.txt");
+        std::fs::write(&file, b"hi").expect("write file");
+        assert!(!dir_is_writable(&file));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

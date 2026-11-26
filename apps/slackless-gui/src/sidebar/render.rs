@@ -7,7 +7,6 @@ use gpui_kit::gpui::{
     Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use slackless_core::types::Conversation;
 
 use super::helpers::{ListChild, count_pill, hidden_unreads};
 use super::{HomePage, NavItem, Sidebar, SidebarEvent, Unread};
@@ -23,16 +22,7 @@ impl Render for Sidebar {
         let sidebar_fg = cx.theme().sidebar_foreground;
         let focus = self.self_state.focused();
         let watermark = self.read_watermark();
-        let channels_cow: std::borrow::Cow<'_, [Conversation]> = if self.joined.is_empty() {
-            std::borrow::Cow::Borrowed(&self.fixtures.channels)
-        } else {
-            let mut v = Vec::with_capacity(self.fixtures.channels.len() + self.joined.len());
-            v.extend(self.fixtures.channels.iter().cloned());
-            v.extend(self.joined.iter().cloned());
-            std::borrow::Cow::Owned(v)
-        };
-        let channels: &[Conversation] = &channels_cow;
-        let channel_unread = self.total_unread(channels, watermark.as_ref());
+        let channel_unread = self.total_unread(self.home_channels(), watermark.as_ref());
         let dm_unread = self.total_unread(&self.fixtures.dms, watermark.as_ref());
         let mentions = channel_unread.mentions + dm_unread.mentions;
         let total = Unread {
@@ -199,7 +189,7 @@ impl Render for Sidebar {
                         .into_any_element(),
                 );
                 let mut unread_rows = Vec::new();
-                for (child, kind) in self.section_list(channels, watermark.as_ref(), cx) {
+                for (child, kind) in self.section_list(watermark.as_ref(), cx) {
                     if let ListChild::Unread(mentions) = kind {
                         unread_rows.push((children.len(), mentions));
                     }

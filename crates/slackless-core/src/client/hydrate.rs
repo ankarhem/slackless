@@ -453,6 +453,7 @@ pub(super) async fn prefetch_targets<B: Backend>(
         if fetched >= 3 {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
+        let fetched_at = now_secs();
         let items = match wait_out_rate_limits(|| {
             ctx.backend
                 .recent_history(channel.clone(), crate::backend::UNREADS_HISTORY_LIMIT)
@@ -473,7 +474,7 @@ pub(super) async fn prefetch_targets<B: Backend>(
         ctx.unfurls.resolve(items.iter());
         let (ws_put, target) = (ctx.workspace.clone(), channel.clone());
         with_store(&ctx.store, move |s| {
-            s.upsert_messages(&ws_put, &target, &items)
+            s.upsert_history_page(&ws_put, &target, &items, fetched_at)
         })
         .await?;
         ctx.events.emit(Event::StoreChanged { channel });

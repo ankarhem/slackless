@@ -139,12 +139,8 @@ impl ContentShareSession {
             .as_ref()
             .ok_or_else(|| HuddleError::Signaling("content JOIN_ACK missing TURN creds".into()))?;
 
-        let (dummy_opus_tx, _dummy_opus_rx) = mpsc::unbounded_channel();
-        let (dummy_video_tx, _dummy_video_rx) = mpsc::unbounded_channel();
         let (state_tx, mut state_rx) = mpsc::unbounded_channel();
-        let rtc = Arc::new(
-            ChimeRtcPeer::new_content_sender(turn, dummy_opus_tx, dummy_video_tx, state_tx).await?,
-        );
+        let rtc = Arc::new(ChimeRtcPeer::new_content_sender(turn, state_tx).await?);
 
         let offer_sdp = rtc.create_gathered_offer().await?;
         let sub_frame = build_content_subscribe_frame(&content_creds, &offer_sdp, false)?;

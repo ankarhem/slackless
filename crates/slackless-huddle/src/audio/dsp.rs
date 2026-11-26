@@ -1,7 +1,9 @@
+use rubato::{FftFixedInOut, Resampler as _};
 use sonora::config::{Config as SonoraConfig, EchoCanceller, GainController2, NoiseSuppression};
 use sonora::{AudioProcessing, StreamConfig as SonoraStreamConfig};
 
-use super::SAMPLE_RATE;
+use super::{FRAME_20MS, SAMPLE_RATE};
+use crate::{HuddleError, Result};
 
 /// Real-time generalized audio loudness normalizer (voice-activity-gated RMS leveler + soft-knee
 /// peak limiter).
@@ -21,8 +23,9 @@ pub struct LoudnessNormalizer {
 }
 
 impl LoudnessNormalizer {
-    /// Speech-tuned leveler for 20ms VoIP frames (`-18 dBFS` target, `-44 dBFS` silence gate,
-    /// fast ~80ms attack against shouting, gentle ~800ms release to lift quiet mics cleanly).
+    /// Speech-tuned leveler (`-18 dBFS` target, `-44 dBFS` silence gate, fast ~80ms attack
+    /// against shouting, gentle ~800ms release to lift quiet mics cleanly). The smoothing
+    /// constants are per 20 ms of audio.
     pub fn speech() -> Self {
         Self {
             target_rms: 0.125, // ~ -18 dBFS
@@ -35,13 +38,17 @@ impl LoudnessNormalizer {
         }
     }
 
-    /// Smoothly normalize a 20ms mono PCM frame in-place with soft-knee peak limiting.
+    /// Smoothly normalize one mono PCM frame in-place with soft-knee peak limiting. Frames of
+    /// any length level at the same speed (10 ms playout frames, 20 ms capture frames).
     pub fn process_frame(&mut self, samples: &mut [f32]) {
         if samples.is_empty() {
             return;
         }
         let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
         let rms = (sum_sq / samples.len() as f32).sqrt();
+        // Rescale a per-20 ms smoothing constant to this frame's length.
+        let frames_20ms = samples.len() as f32 / FRAME_20MS as f32;
+        let per_frame = |alpha: f32| 1.0 - (1.0 - alpha).powf(frames_20ms);
 
         let prev_gain = self.current_gain;
         if rms > self.gate_rms {
@@ -51,17 +58,17 @@ impl LoudnessNormalizer {
             } else {
                 self.release
             };
-            self.current_gain += (desired - self.current_gain) * alpha;
+            self.current_gain += (desired - self.current_gain) * per_frame(alpha);
         } else {
             // Gently drift back toward unity during extended silence so the next utterance starts
             // cleanly without an aggressive residual boost.
-            self.current_gain += (1.0 - self.current_gain) * 0.005;
+            self.current_gain += (1.0 - self.current_gain) * per_frame(0.005);
         }
 
         let next_gain = self.current_gain;
         let denom = samples.len().max(1) as f32;
         for (i, s) in samples.iter_mut().enumerate() {
-            // Interpolate gain across the 20ms frame to prevent zipper noise.
+            // Interpolate gain across the frame to prevent zipper noise.
             let g = prev_gain + (next_gain - prev_gain) * (i as f32 / denom);
             *s = soft_limit_sample(*s * g);
         }
@@ -134,35 +141,101 @@ pub(super) fn downmix_to_mono_f32(data: &[f32], channels: usize) -> Vec<f32> {
     out
 }
 
-pub(crate) fn resample_linear_into(
-    input: &[f32],
-    src_rate: u32,
-    dst_rate: u32,
-    out: &mut Vec<f32>,
-) {
-    out.clear();
-    if src_rate == dst_rate || input.is_empty() {
-        out.extend_from_slice(input);
-        return;
+/// Band-limited mono sample-rate converter: overlap-add FFT resampling, which low-pass filters
+/// every block in the frequency domain, so decimation cannot fold content above the target
+/// Nyquist into the speech band and interpolation adds no imaging.
+///
+/// [`Self::process`] never allocates: input is consumed in fixed `chunk_in`-frame blocks, each
+/// resampled into a scratch block of `chunk_out` frames. The filter is one block long, so a
+/// larger block means a steeper filter and more delay (`chunk_out / 2` frames).
+pub(crate) struct RateConverter {
+    resampler: FftFixedInOut<f32>,
+    chunk_in: usize,
+    chunk_out: usize,
+    block: Vec<f32>,
+    /// Leading input that does not complete a block yet; always shorter than `chunk_in`.
+    pending: Vec<f32>,
+}
+
+impl RateConverter {
+    /// Converter for one channel; `chunk_in` is the wanted input block length in frames (10 ms
+    /// keeps real-time latency low, 100 ms suits offline media).
+    pub(crate) fn new(src_rate: u32, dst_rate: u32, chunk_in: usize) -> Result<Self> {
+        let resampler = FftFixedInOut::new(src_rate as usize, dst_rate as usize, chunk_in, 1)
+            .map_err(|e| {
+                HuddleError::Audio(format!(
+                    "{src_rate} Hz to {dst_rate} Hz resampler unavailable: {e}"
+                ))
+            })?;
+        let chunk_in = resampler.input_frames_next();
+        let chunk_out = resampler.output_frames_max();
+        Ok(Self {
+            resampler,
+            chunk_in,
+            chunk_out,
+            block: vec![0.0; chunk_out],
+            pending: Vec::with_capacity(chunk_in),
+        })
     }
-    let ratio = src_rate as f64 / dst_rate as f64;
-    let out_len = ((input.len() as f64) / ratio).round().max(1.0) as usize;
-    out.reserve(out_len);
-    for i in 0..out_len {
-        let pos = i as f64 * ratio;
-        let idx = pos.floor() as usize;
-        let frac = (pos - idx as f64) as f32;
-        let s0 = input.get(idx).copied().unwrap_or(0.0);
-        let s1 = input.get(idx + 1).copied().unwrap_or(s0);
-        out.push(s0 + (s1 - s0) * frac);
+
+    /// Input frames per block: feeding exactly this many keeps the output rate on ratio.
+    pub(crate) fn chunk_in(&self) -> usize {
+        self.chunk_in
+    }
+
+    /// Output frames per block; also the converter's delay.
+    pub(crate) fn chunk_out(&self) -> usize {
+        self.chunk_out
+    }
+
+    /// Most frames [`Self::process`] appends for an input of `input_frames` frames.
+    pub(crate) fn output_capacity(&self, input_frames: usize) -> usize {
+        (input_frames / self.chunk_in + 1) * self.chunk_out
+    }
+
+    /// Append `input` resampled to the target rate to `out`. Allocates only if `out` is shorter
+    /// than [`Self::output_capacity`] for `input.len()`.
+    pub(crate) fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        let Self {
+            resampler,
+            chunk_in,
+            block,
+            pending,
+            ..
+        } = self;
+        let mut input = input;
+        if !pending.is_empty() {
+            let take = (*chunk_in - pending.len()).min(input.len());
+            pending.extend_from_slice(&input[..take]);
+            input = &input[take..];
+            if pending.len() == *chunk_in {
+                resample_block(resampler, pending, block, out);
+                pending.clear();
+            }
+        }
+        let mut blocks = input.chunks_exact(*chunk_in);
+        for block_in in blocks.by_ref() {
+            resample_block(resampler, block_in, block, out);
+        }
+        pending.extend_from_slice(blocks.remainder());
     }
 }
 
-/// Linear resampler used when a macOS device runs at 44.1 kHz instead of 48 kHz.
-pub fn resample_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
-    let mut out = Vec::new();
-    resample_linear_into(input, src_rate, dst_rate, &mut out);
-    out
+fn resample_block(
+    resampler: &mut FftFixedInOut<f32>,
+    input: &[f32],
+    block: &mut [f32],
+    out: &mut Vec<f32>,
+) {
+    // Both block lengths are fixed, so rubato's buffer validation cannot fail; should it ever,
+    // skipping the block keeps a real-time callback allocation- and panic-free.
+    if resampler
+        .process_into_buffer(&[input], &mut [&mut block[..]], None)
+        .is_err()
+    {
+        return;
+    }
+    out.extend_from_slice(block);
 }
 
 pub fn compute_rms_mono(samples: &[f32]) -> f32 {

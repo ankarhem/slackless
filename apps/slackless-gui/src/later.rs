@@ -1284,9 +1284,9 @@ mod tests {
         let base_utc =
             (slackless_core::types::time::days_from_civil(2026, 6, 15) * 86_400 + 2 * 3_600) as u64;
 
-        // In UTC+02:00 (Stockholm CEST), 02:00 UTC is 04:00 local on June 15.
+        // In Stockholm (CEST, UTC+02:00), 02:00 UTC is 04:00 local on June 15.
         // Tomorrow 09:00 local = June 16 07:00 UTC; NextWeek = June 22 07:00 UTC.
-        crate::messages::set_timezone_override(Some(2 * 3_600));
+        crate::messages::set_timezone_override(Some("Europe/Stockholm"));
         let expected_tomorrow_cest =
             (slackless_core::types::time::days_from_civil(2026, 6, 16) * 86_400 + 7 * 3_600) as u64;
         let expected_next_week_cest =
@@ -1294,9 +1294,9 @@ mod tests {
         assert_eq!(Remind::Tomorrow.at(base_utc), expected_tomorrow_cest);
         assert_eq!(Remind::NextWeek.at(base_utc), expected_next_week_cest);
 
-        // In UTC-07:00 (PDT), 02:00 UTC on June 15 is 19:00 local on June 14.
+        // In Los Angeles (PDT, UTC-07:00), 02:00 UTC on June 15 is 19:00 local on June 14.
         // Tomorrow 09:00 local = June 15 09:00 PDT = June 15 16:00 UTC.
-        crate::messages::set_timezone_override(Some(-7 * 3_600));
+        crate::messages::set_timezone_override(Some("America/Los_Angeles"));
         let expected_tomorrow_pdt = (slackless_core::types::time::days_from_civil(2026, 6, 15)
             * 86_400
             + 16 * 3_600) as u64;

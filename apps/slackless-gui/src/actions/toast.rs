@@ -103,7 +103,7 @@ pub fn copy_message_text(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let text = fixtures.plain_text(message);
+    let text = crate::messages::plain_text(&message.text, fixtures);
     cx.write_to_clipboard(ClipboardItem::new_string(text));
     notify("Copied", "Message text copied.", window, cx);
 }

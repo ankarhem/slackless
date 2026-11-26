@@ -834,17 +834,18 @@ impl App {
             Some(parked) => parked,
             None => {
                 let bg_counts = self.bg_counts.get(index).cloned().unwrap_or_default();
-                let (fixtures, channel, archive, chosen) =
-                    if let Some(mut snap) = self.bridge.snapshot(&bg_counts) {
+                // Live: the workspace paints at once from a placeholder while its snapshot is
+                // read off the UI thread, as the incoming state's pending reload.
+                let (fixtures, channel, archive, chosen, reload) =
+                    if let Some(mut snap) = self.bridge.placeholder(&bg_counts) {
                         if !self.live_teams.is_empty() {
                             snap.workspaces = self.live_teams.clone();
                         }
-                        let restored = self
-                            .bridge
-                            .last_conversation()
-                            .filter(|c| snap.conversation(c).is_some());
+                        // The conversation last open here opens at once; the snapshot confirms
+                        // it when it lands, else the first conversation opens instead.
+                        let restored = self.bridge.last_conversation();
                         let chosen = restored.is_some();
-                        let channel = restored.unwrap_or_else(|| first_conversation(&snap));
+                        let channel = restored.unwrap_or_default();
                         let archive = self.bridge.read_store_clone();
                         // Restore persisted drafts for this workspace on first visit.
                         if let Some(saved_drafts) = self.bridge.drafts() {
@@ -862,7 +863,7 @@ impl App {
                             self.drafts
                                 .update(cx, |view, cx| view.load_drafts(entries, cx));
                         }
-                        (Arc::new(snap), channel, archive, chosen)
+                        (Arc::new(snap), channel, archive, chosen, Some(Reload::Full))
                     } else {
                         let fixtures = Arc::new(fixtures::workspace(index));
                         let channel = first_conversation(&fixtures);
@@ -871,7 +872,7 @@ impl App {
                             .get(index)
                             .or_else(|| fixtures.workspaces.first())
                             .and_then(|t| fixture_archive_for(&fixtures, &t.id));
-                        (fixtures, channel, archive, false)
+                        (fixtures, channel, archive, false, None)
                     };
                 let views = build_workspace(&fixtures, index, archive, &channel, window, cx);
                 if let Some(prefs) = self.bridge.section_prefs() {
@@ -895,6 +896,7 @@ impl App {
                         counts: bg_counts,
                         chosen,
                         outbox: initial_outbox,
+                        reload,
                         ..Default::default()
                     },
                 }
@@ -909,6 +911,9 @@ impl App {
         };
         self.parked[self.workspace] = Some(outgoing);
         self.workspace = index;
+        // The outgoing workspace's read in flight is dropped (its reload stays pending in its
+        // parked state); the incoming one's pending reload resumes.
+        self.start_reload(window, cx);
         self.open_members = None;
         self.members_hover = (false, false);
         self.channel_people = None;
@@ -1012,7 +1017,7 @@ impl App {
                     let entries: Vec<Entry> = stored
                         .into_iter()
                         .filter_map(|row| {
-                            let text = fixtures.plain_text(&row.message);
+                            let text = crate::messages::plain_text(&row.message.text, &*fixtures);
                             if text.trim().is_empty() {
                                 return None;
                             }
@@ -1361,50 +1366,68 @@ impl App {
     }
 
     /// Re-derive the open Unreads view's cards: the view opened, the workspace reloaded, a
-    /// message landed, or everything was marked read.
+    /// message landed, or everything was marked read. Live mode reads the store off the UI
+    /// thread one read at a time ([`LiveRefresh`]): a burst of refreshes costs the read in
+    /// flight plus one more, and a read a newer refresh overtook never lands.
     pub(super) fn refresh_unreads(&mut self, cx: &mut Context<Self>) {
-        let order = self.sidebar.read(cx).unread_ids();
-        let groups = local_groups(&self.fixtures, &order);
-        let fixtures = self.fixtures.clone();
-        if let Some(store) = self.bridge.read_store_clone() {
-            // Live mode: keep already-loaded store groups on screen while refreshing off-thread
-            // (never flash empty `local_groups` placeholders).
-            self.unreads
-                .update(cx, |view, cx| view.begin_live_refresh(fixtures, cx));
-            let team = self.fixtures.workspaces[self.workspace].id.clone();
-            let targets = store_targets(&self.fixtures, &groups);
-            cx.spawn(async move |this, cx| {
-                let groups = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let Ok(store) = store.lock() else {
-                            return Vec::new();
-                        };
-                        store_groups(&store, &team, &targets)
-                    })
-                    .await;
-                this.update(cx, |app, cx| {
-                    // Only conversations Slack still counts unread take part: a mark may
-                    // have raced the store read.
-                    let keep = app.sidebar.read(cx).unread_ids();
-                    for group in &groups {
-                        if group.messages.is_empty()
-                            && keep.contains(&group.channel)
-                            && app.unreads_fetched.insert(group.channel.clone())
-                        {
-                            app.bridge
-                                .send(ChannelCommand::FetchLatestHistory(group.channel.clone()));
-                        }
-                    }
-                    app.unreads
-                        .update(cx, |view, cx| view.show_store(groups, &keep, cx));
-                })
-            })
-            .detach();
-        } else {
+        let Some(store) = self.bridge.read_store_clone() else {
+            let order = self.sidebar.read(cx).unread_ids();
+            let groups = local_groups(&self.fixtures, &order);
+            self.unreads_refresh.overtake();
+            let fixtures = self.fixtures.clone();
             self.unreads
                 .update(cx, |view, cx| view.show_local(fixtures, groups, cx));
-        }
+            return;
+        };
+        let team = self.fixtures.workspaces[self.workspace].id.clone();
+        let Some(generation) = self.unreads_refresh.request(&team) else {
+            return;
+        };
+        let order = self.sidebar.read(cx).unread_ids();
+        let targets = store_targets(&self.fixtures, &local_groups(&self.fixtures, &order));
+        // Keep already-loaded store groups on screen while refreshing off-thread (never flash
+        // empty `local_groups` placeholders).
+        let fixtures = self.fixtures.clone();
+        self.unreads
+            .update(cx, |view, cx| view.begin_live_refresh(fixtures, cx));
+        cx.spawn(async move |this, cx| {
+            let groups = cx
+                .background_executor()
+                .spawn(async move {
+                    let Ok(store) = store.lock() else {
+                        return Vec::new();
+                    };
+                    store_groups(&store, &team, &targets)
+                })
+                .await;
+            this.update(cx, |app, cx| {
+                let Some(again) = app.unreads_refresh.land(generation) else {
+                    return;
+                };
+                // The view closed while the store was read: its next opening reads again.
+                if app.page != MainPage::Unreads {
+                    return;
+                }
+                // Only conversations Slack still counts unread take part: a mark may have
+                // raced the store read.
+                let keep = app.sidebar.read(cx).unread_ids();
+                for group in &groups {
+                    if group.messages.is_empty()
+                        && keep.contains(&group.channel)
+                        && app.unreads_fetched.insert(group.channel.clone())
+                    {
+                        app.bridge
+                            .send(ChannelCommand::FetchLatestHistory(group.channel.clone()));
+                    }
+                }
+                app.unreads
+                    .update(cx, |view, cx| view.show_store(groups, &keep, cx));
+                if again {
+                    app.refresh_unreads(cx);
+                }
+            })
+        })
+        .detach();
     }
 
     /// The directory: the workspace's people and channels.

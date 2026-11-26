@@ -675,7 +675,12 @@ pub(crate) enum Commands {
     /// Summarize a channel, thread, transcript, or Catch-Up briefing using a local or BYO-key OpenAI-compatible LLM.
     Summarize(Box<SummarizeArgs>),
     /// Run a JSON-RPC 2.0 stdio Model Context Protocol (MCP) server for AI agents.
-    Mcp,
+    Mcp {
+        /// Offer only tools that leave Slack untouched: `send_message`, `reply_thread` and
+        /// `add_reaction` are not listed and calls to them are refused.
+        #[arg(long)]
+        read_only: bool,
+    },
     /// Account and session management.
     Auth {
         #[command(subcommand)]

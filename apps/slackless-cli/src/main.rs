@@ -304,7 +304,7 @@ async fn dispatch(
             update::run_update(ctx, args.check, args.force, args.restart, args.beta).await
         }
         Commands::Summarize(args) => cmd_summarize(ctx, workspace, &args).await,
-        Commands::Mcp => mcp::run_mcp(flag).await,
+        Commands::Mcp { read_only } => mcp::run_mcp(flag, read_only).await,
         Commands::Auth { command } => dispatch_auth(ctx, flag, *command),
     }
 }

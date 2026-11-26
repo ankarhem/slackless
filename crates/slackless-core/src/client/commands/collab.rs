@@ -338,6 +338,7 @@ impl<B: Backend> Core<B> {
                             MessageContent::plain(url.clone()),
                             None,
                             false,
+                            None,
                         )
                         .await
                     {
@@ -619,6 +620,7 @@ impl<B: Backend> Core<B> {
                             MessageContent::plain(url.clone()),
                             None,
                             false,
+                            None,
                         )
                         .await
                     {

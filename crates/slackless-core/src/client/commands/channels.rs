@@ -16,6 +16,7 @@ impl<B: Backend> Core<B> {
     pub(super) fn fetch_latest_history(&self, channel: ChannelId) {
         let ctx = self.ctx();
         self.spawn("conversations.history", async move {
+            let fetched_at = now_secs();
             let items = wait_out_rate_limits(|| {
                 ctx.backend
                     .recent_history(channel.clone(), crate::backend::UNREADS_HISTORY_LIMIT)
@@ -24,7 +25,10 @@ impl<B: Backend> Core<B> {
             ctx.unfurls.resolve(items.iter());
             let target = channel.clone();
             let ws = ctx.workspace.clone();
-            with_store(&ctx.store, move |s| s.upsert_messages(&ws, &target, &items)).await?;
+            with_store(&ctx.store, move |s| {
+                s.upsert_history_page(&ws, &target, &items, fetched_at)
+            })
+            .await?;
             ctx.events.emit(Event::StoreChanged { channel });
             Ok(())
         });

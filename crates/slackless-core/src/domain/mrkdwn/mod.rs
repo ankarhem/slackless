@@ -14,7 +14,8 @@ pub use parse::{
 pub use rich_text::{from_rich_text, mrkdwn_to_rich_text, rich_text_to_mrkdwn};
 pub use spans::{
     Directory, MrkdwnSpan, PlainDirectory, escape_mrkdwn, from_mrkdwn, mrkdwn_to_plain,
-    parse_mrkdwn_spans, parse_shortcode, replace_shortcodes_with, unescape_mrkdwn,
+    mrkdwn_to_plain_with, parse_mrkdwn_spans, parse_shortcode, replace_shortcodes_with,
+    unescape_mrkdwn,
 };
 
 #[cfg(test)]
@@ -121,6 +122,25 @@ mod tests {
             mrkdwn_to_plain(raw),
             "Hello world & @alice in #general @here Slack :wave::skin-tone-3: Nov 14"
         );
+    }
+
+    /// A directory names the references it knows; one it does not know (it echoes the id)
+    /// falls back to the label the text carries, else the id, as without a directory.
+    #[test]
+    fn plain_text_resolves_references_through_the_directory() {
+        let raw = "<@U1> <@U9|zoe> <@U8> <#C1> <#C9|design> <!subteam^S1> <!subteam^S9|@ops> \
+                   <!channel> <https://slack.com|Slack> <https://example.com> :rocket: *bold*";
+        assert_eq!(
+            mrkdwn_to_plain_with(raw, &TestDir),
+            "@alice @zoe @U8 #general #design @eng @ops @channel Slack https://example.com :rocket: bold"
+        );
+        // Without a directory every reference falls back to its label, else its id.
+        assert_eq!(
+            mrkdwn_to_plain(raw),
+            "@U1 @zoe @U8 #C1 #design @S1 @ops @channel Slack https://example.com :rocket: bold"
+        );
+        // An empty label is no label.
+        assert_eq!(mrkdwn_to_plain("<@U1|> <#C1|>"), "@U1 #C1");
     }
 
     #[test]

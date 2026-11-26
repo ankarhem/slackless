@@ -19,8 +19,9 @@ mod pagination;
 
 pub use assets::AssetClient;
 pub use client::{
-    MAX_RATE_LIMIT_RETRIES, NetLogEntry, SlackApi, clear_net_log, net_log_enabled,
-    net_log_export_json, net_log_snapshot, proxy_url, set_net_log_enabled, set_proxy_url,
+    MAX_RATE_LIMIT_RETRIES, NetLogEntry, SlackApi, clear_net_log, install_default_crypto_provider,
+    net_log_enabled, net_log_export_json, net_log_snapshot, proxy_url, set_net_log_enabled,
+    set_proxy_url,
 };
 pub use error::ApiError;
 pub use methods::{
@@ -40,8 +41,8 @@ pub use methods::{
     ThreadCounts, ThreadSubscription, ThreadsView, UploadFile, UploadSlot, UserBoot,
     ViewSubmitResponse, WorkflowStepSummary, WorkflowTriggerInfo, WorkflowTriggerTripResponse,
     canvas_comment_channel_id, extract_workflow_trigger_id, format_canvas_error, format_list_error,
-    list_comment_channel_id, parse_canvas_comment_threads, parse_canvas_meta_from_file,
-    parse_list_meta, parse_list_record_threads,
+    list_comment_channel_id, new_client_msg_id, parse_canvas_comment_threads,
+    parse_canvas_meta_from_file, parse_list_meta, parse_list_record_threads,
 };
 pub use pagination::{Page, paginate};
 

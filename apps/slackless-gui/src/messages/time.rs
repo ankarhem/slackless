@@ -1,15 +1,17 @@
-//! Local-time & civil-calendar formatting (zero chrono/time dependency; cached `localtime_r`).
+//! Local-time & civil-calendar formatting (jiff time zones; no chrono/time dependency).
 
-use std::cell::RefCell;
+#[cfg(not(test))]
+use std::sync::{PoisonError, RwLock};
 
+use jiff::{Timestamp, tz::TimeZone};
 use slackless_core::types::Ts;
 use slackless_core::types::time as core_time;
 
 use super::MONTHS;
 
 // ---------------------------------------------------------------------------
-// Local-time formatting: no chrono/time dependency, so the platform `localtime`
-// provides the UTC offset and the civil conversion is done by hand.
+// Local-time formatting: no chrono/time dependency, so the display zone (jiff) provides
+// the UTC offset and the civil conversion is done by hand.
 // ---------------------------------------------------------------------------
 
 /// Local wall-clock fields of a Unix timestamp, used for clock and date-divider labels.
@@ -327,86 +329,66 @@ pub(super) fn date_label_absolute(time: &CivilTime) -> String {
     format!("{} {}", MONTHS[(time.month - 1) as usize], time.day)
 }
 
-/// Manual timezone offset override in seconds (`i64::MIN` = follow OS timezone, `F-SHELL-100`).
+/// The zone timestamps render in (`F-SHELL-100`): the manual override, else the system zone,
+/// resolved once per settings change by [`set_timezone_override`]. A zone's offset at a timestamp
+/// is an in-memory lookup, so unlike `localtime_r` it needs no per-hour cache. Tests keep it
+/// thread-local so they do not override each other.
 #[cfg(not(test))]
-static TIMEZONE_OVERRIDE: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(i64::MIN);
+static DISPLAY_ZONE: RwLock<Option<TimeZone>> = RwLock::new(None);
 
 #[cfg(test)]
 thread_local! {
-    static TIMEZONE_OVERRIDE: std::cell::Cell<i64> = const { std::cell::Cell::new(i64::MIN) };
+    static DISPLAY_ZONE: std::cell::RefCell<Option<TimeZone>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-fn load_timezone_override() -> i64 {
-    #[cfg(not(test))]
-    {
-        TIMEZONE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    #[cfg(test)]
-    {
-        TIMEZONE_OVERRIDE.with(std::cell::Cell::get)
-    }
+/// The stored override, if any.
+#[cfg(not(test))]
+fn load_zone() -> Option<TimeZone> {
+    DISPLAY_ZONE
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
-/// Override the display clock timezone (`None` restores automatic system timezone).
-pub fn set_timezone_override(offset_secs: Option<i64>) {
-    let raw = offset_secs.unwrap_or(i64::MIN);
-    #[cfg(not(test))]
-    TIMEZONE_OVERRIDE.store(raw, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(test)]
-    TIMEZONE_OVERRIDE.with(|slot| slot.set(raw));
+#[cfg(test)]
+fn load_zone() -> Option<TimeZone> {
+    DISPLAY_ZONE.with(|slot| slot.borrow().clone())
 }
 
-/// Offset from UTC in seconds at `unix_secs`, honoring manual override or platform `localtime`.
-/// Cached per UTC hour in thread-local storage to avoid locking libc's global timezone mutex on
-/// every visible message row per frame.
-#[cfg(unix)]
-pub(crate) fn local_utc_offset(unix_secs: i64) -> i64 {
-    let manual = load_timezone_override();
-    if manual != i64::MIN {
-        return manual;
-    }
-    let hour_bucket = unix_secs.div_euclid(3600);
-    thread_local! {
-        static OFFSET_CACHE: RefCell<Vec<(i64, i64)>> = const { RefCell::new(Vec::new()) };
-    }
-    if let Some(cached) = OFFSET_CACHE.with(|cache| {
-        cache
-            .borrow()
-            .iter()
-            .find(|(h, _)| *h == hour_bucket)
-            .map(|(_, off)| *off)
-    }) {
-        return cached;
-    }
-    let time_val: libc::time_t = unix_secs as libc::time_t;
-    // SAFETY: `libc::tm` is a C POD struct zero-initialized before passing to `localtime_r`,
-    // and `time_val` outlives the call.
-    let offset = unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if !libc::localtime_r(&raw const time_val, &raw mut tm).is_null() {
-            tm.tm_gmtoff
-        } else {
-            0
-        }
-    };
-    OFFSET_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.len() >= 64 {
-            cache.remove(0);
-        }
-        cache.push((hour_bucket, offset));
+#[cfg(not(test))]
+fn store_zone(zone: TimeZone) {
+    *DISPLAY_ZONE.write().unwrap_or_else(PoisonError::into_inner) = Some(zone);
+}
+
+#[cfg(test)]
+fn store_zone(zone: TimeZone) {
+    DISPLAY_ZONE.with(|slot| *slot.borrow_mut() = Some(zone));
+}
+
+/// The display zone, resolving the system zone on first use.
+fn display_zone() -> TimeZone {
+    load_zone().unwrap_or_else(|| {
+        let zone = TimeZone::system();
+        store_zone(zone.clone());
+        zone
+    })
+}
+
+/// Override the display clock's time zone with the IANA zone `name` (`None` restores the
+/// automatic system zone; an unknown name shows UTC, as an out-of-range index used to).
+pub fn set_timezone_override(name: Option<&str>) {
+    store_zone(match name {
+        Some(name) => TimeZone::get(name).unwrap_or(TimeZone::UTC),
+        None => TimeZone::system(),
     });
-    offset
 }
 
-#[cfg(not(unix))]
-pub(crate) fn local_utc_offset(_unix_secs: i64) -> i64 {
-    let manual = load_timezone_override();
-    if manual != i64::MIN {
-        return manual;
-    }
-    0
+/// Offset from UTC in seconds at `unix_secs` in the display zone.
+pub(crate) fn local_utc_offset(unix_secs: i64) -> i64 {
+    i64::from(
+        Timestamp::from_second(unix_secs).map_or(0, |ts| display_zone().to_offset(ts).seconds()),
+    )
 }
 
 /// (year, month, day) from days since the Unix epoch (proleptic Gregorian).
@@ -704,22 +686,20 @@ mod time_tests {
         assert_eq!(date_label_absolute(&future_next_year), "Jan 2");
     }
 
+    /// Restores the automatic system zone when dropped.
+    struct RestoreZone;
+    impl Drop for RestoreZone {
+        fn drop(&mut self) {
+            set_timezone_override(None);
+        }
+    }
+
     #[test]
     fn timezone_override_affects_local_utc_offset_iso_date_and_format_clock() {
-        struct RestoreGuard(Option<i64>);
-        impl Drop for RestoreGuard {
-            fn drop(&mut self) {
-                set_timezone_override(self.0);
-            }
-        }
-        let prev = {
-            let raw = load_timezone_override();
-            (raw != i64::MIN).then_some(raw)
-        };
-        let _guard = RestoreGuard(prev);
+        let _guard = RestoreZone;
 
-        // UTC (0)
-        set_timezone_override(Some(0));
+        // UTC
+        set_timezone_override(Some("UTC"));
         assert_eq!(local_utc_offset(0), 0);
         assert_eq!(iso_date(0), "1970-01-01");
         let ts = Ts::from("1709812800.000000"); // 2024-03-07 12:00:00 UTC
@@ -727,15 +707,57 @@ mod time_tests {
         assert_eq!(format_clock_with(&ts, true), "12:00");
 
         // Tokyo (+09:00): 2024-03-07 12:00 UTC -> 21:00 JST, and 2024-03-07 20:00 UTC -> 2024-03-08
-        set_timezone_override(Some(9 * 3_600));
+        set_timezone_override(Some("Asia/Tokyo"));
         assert_eq!(local_utc_offset(0), 9 * 3_600);
         assert_eq!(format_clock(&ts), "9:00 PM");
         assert_eq!(format_clock_with(&ts, true), "21:00");
         assert_eq!(iso_date(1_709_841_600), "2024-03-08");
 
-        // PST (-08:00): 1970-01-01 00:00 UTC -> 1969-12-31
-        set_timezone_override(Some(-8 * 3_600));
+        // Los Angeles (PST, -08:00): 1970-01-01 00:00 UTC -> 1969-12-31
+        set_timezone_override(Some("America/Los_Angeles"));
         assert_eq!(iso_date(0), "1969-12-31");
         assert_eq!(format_clock_with(&Ts::from("0.000000"), true), "16:00");
+
+        // An unknown name shows UTC.
+        set_timezone_override(Some("Mars/Olympus"));
+        assert_eq!(local_utc_offset(0), 0);
+    }
+
+    #[test]
+    fn named_zone_override_follows_daylight_saving_transitions() {
+        let _guard = RestoreZone;
+        let at = |(y, m, d): (i64, u32, u32), h: i64, min: i64, s: i64| {
+            core_time::days_from_civil(y, m, d) * 86_400 + h * 3_600 + min * 60 + s
+        };
+        set_timezone_override(Some("America/New_York"));
+        // Clocks spring forward from 02:00 EST on 2024-03-10 and fall back from 02:00 EDT on
+        // 2024-11-03; a fixed -05:00 override (the old preference) would get summer wrong.
+        for (secs, offset, wall_clock, date) in [
+            (
+                at((2024, 1, 10), 21, 0, 0),
+                -18_000,
+                "4:00 PM",
+                "2024-01-10",
+            ),
+            (
+                at((2024, 3, 10), 6, 59, 59),
+                -18_000,
+                "1:59 AM",
+                "2024-03-10",
+            ),
+            (at((2024, 3, 10), 7, 0, 0), -14_400, "3:00 AM", "2024-03-10"),
+            (at((2024, 7, 8), 22, 0, 0), -14_400, "6:00 PM", "2024-07-08"),
+            (
+                at((2024, 11, 3), 5, 59, 59),
+                -14_400,
+                "1:59 AM",
+                "2024-11-03",
+            ),
+            (at((2024, 11, 3), 6, 0, 0), -18_000, "1:00 AM", "2024-11-03"),
+        ] {
+            assert_eq!(local_utc_offset(secs), offset, "at {secs}");
+            assert_eq!(clock(secs, None), wall_clock, "at {secs}");
+            assert_eq!(iso_date(secs), date, "at {secs}");
+        }
     }
 }

@@ -3,19 +3,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use opus::{Application, Bitrate, Channels, Decoder, Encoder};
+use cpal::traits::StreamTrait as _;
+use opus::{Application, Bitrate, Channels, Encoder};
 use tokio::sync::mpsc;
 
 use super::devices::{current_default_input_name, current_default_output_name};
 use super::dsp::{LoudnessNormalizer, build_sonora, compute_rms_mono};
+use super::playout::{AudioRxSnapshot, EpochClock, RemoteAudioMixer, service};
 use super::ring::SpscRing;
 use super::streams::{
     AudioIoBackend, CaptureRing, open_hw_duplex, open_input_stream, open_output_stream,
 };
-use super::{
-    AudioJitterBuffer, FRAME_10MS, FRAME_20MS, JitterStep, PlaybackBuffer, SAMPLE_RATE,
-    decode_opus_or_plc,
-};
+use super::{FRAME_10MS, FRAME_20MS, PlayoutRing, SAMPLE_RATE};
 use crate::backend::{AudioDeviceChangeKind, platform_backend};
 use crate::rtc::InboundAudioPacket;
 use crate::{HuddleAudioConfig, HuddleError, Result};
@@ -29,6 +28,8 @@ pub struct AudioSharedState {
     pub agc: Arc<AtomicBool>,
     pub local_rms_bits: Arc<AtomicU32>,
     pub running: Arc<AtomicBool>,
+    /// Remote audio receive/playout counters, refreshed about once a second by the playout thread.
+    pub rx_stats: Arc<Mutex<AudioRxSnapshot>>,
     /// Optional opt-in local multilingual Whisper transcriber tap (zero overhead when `None`).
     pub transcribe_tap: Arc<Mutex<Option<Arc<crate::transcribe::LocalTranscriber>>>>,
     /// Local participant user ID for tagging local microphone utterances.
@@ -46,6 +47,7 @@ impl AudioSharedState {
             agc: Arc::new(AtomicBool::new(cfg.agc)),
             local_rms_bits: Arc::new(AtomicU32::new(0)),
             running: Arc::new(AtomicBool::new(true)),
+            rx_stats: Arc::new(Mutex::new(AudioRxSnapshot::default())),
             transcribe_tap: Arc::new(Mutex::new(None)),
             self_user: Arc::new(Mutex::new(slackless_types::UserId::from("U0SELF"))),
             active_remote_speaker: Arc::new(Mutex::new(None)),
@@ -61,7 +63,7 @@ impl AudioSharedState {
     }
 }
 
-/// Live full-duplex audio engine (capture → sonora AEC3/NS/AGC → Opus TX; Opus RX → sonora ref → speaker).
+/// Live full-duplex audio engine (capture → sonora AEC3/NS/AGC → Opus TX; RTP RX → NetEq → speaker).
 ///
 /// Both `cpal::Stream`s live on the dedicated audio worker OS thread so `AudioEngine` stays `Send`
 /// on macOS CoreAudio (where `cpal::Stream` is `!Send`).
@@ -93,11 +95,11 @@ impl AudioEngine {
     ) -> std::result::Result<Self, (HuddleError, mpsc::UnboundedReceiver<InboundAudioPacket>)> {
         shared.running.store(true, Ordering::Release);
         let capture_ring = Arc::new(CaptureRing::new());
-        let playback_buf = Arc::new(PlaybackBuffer::new());
-        // Optional lock-free render tap used only when software `cpal + sonora` fallback is active
-        // (macOS CoreAudio `VoiceProcessingIO` taps its own render bus in hardware).
+        let playout = Arc::new(PlayoutRing::new());
+        // Far-end reference for the software echo canceller, filled by the `cpal` render callback
+        // with what it actually plays (macOS CoreAudio `VoiceProcessingIO` taps its own render
+        // bus in hardware and never touches this).
         let aec_render_tap = Arc::new(SpscRing::<f32>::new(FRAME_20MS * 8));
-        let needs_sw_aec_ref = Arc::new(AtomicBool::new(false));
 
         let in_name = cfg.input_device.clone();
         let out_name = cfg.output_device.clone();
@@ -109,9 +111,7 @@ impl AudioEngine {
 
         let worker_shared = shared.clone();
         let worker_capture = Arc::clone(&capture_ring);
-        let worker_playback = Arc::clone(&playback_buf);
-        let worker_aec_tap = Arc::clone(&aec_render_tap);
-        let worker_needs_aec = Arc::clone(&needs_sw_aec_ref);
+        let worker_playout = Arc::clone(&playout);
         let worker = match std::thread::Builder::new()
             .name("slackless-huddle-audio".to_owned())
             .spawn(move || {
@@ -123,17 +123,18 @@ impl AudioEngine {
                     !init_muted && init_ns,
                     !init_muted && init_agc,
                     &worker_capture,
-                    &worker_playback,
+                    &worker_playout,
                 ) {
-                    worker_needs_aec.store(false, Ordering::Release);
                     Ok(AudioIoBackend::Hardware(hw))
                 } else {
                     (|| -> Result<AudioIoBackend> {
                         let in_stream =
                             open_input_stream(in_name.as_deref(), Arc::clone(&worker_capture))?;
-                        let out_stream =
-                            open_output_stream(out_name.as_deref(), Arc::clone(&worker_playback))?;
-                        worker_needs_aec.store(true, Ordering::Release);
+                        let out_stream = open_output_stream(
+                            out_name.as_deref(),
+                            Arc::clone(&worker_playout),
+                            Arc::clone(&aec_render_tap),
+                        )?;
                         Ok(AudioIoBackend::Cpal {
                             in_stream,
                             out_stream,
@@ -148,8 +149,8 @@ impl AudioEngine {
                         run_audio_dsp_loop(AudioDspLoopArgs {
                             shared: worker_shared,
                             capture_ring: worker_capture,
-                            playback_buf: worker_playback,
-                            aec_render_tap: worker_aec_tap,
+                            playout: worker_playout,
+                            aec_render_tap,
                             outbound_opus_tx,
                             configured_in: in_name,
                             configured_out: out_name,
@@ -176,16 +177,12 @@ impl AudioEngine {
             return Err((err, inbound_opus_rx));
         }
 
-        // Dedicated inbound Opus jitter-buffer + decoder thread: completely decoupled from the
-        // microphone capture loop so remote speech is decoded within microseconds of UDP arrival!
-        // Hand `inbound_opus_rx` across a 1-slot channel only after the thread spawns so a spawn
-        // failure still returns `inbound_opus_rx` intact.
+        // Dedicated remote-audio playout thread (NetEq per stream, pulled by the output device),
+        // decoupled from the microphone capture loop. Hand `inbound_opus_rx` across a 1-slot
+        // channel only after the thread spawns so a spawn failure still returns it intact.
         let (rx_handoff_tx, rx_handoff_rx) =
             std::sync::mpsc::sync_channel::<mpsc::UnboundedReceiver<InboundAudioPacket>>(1);
         let rx_shared = shared.clone();
-        let rx_playback = Arc::clone(&playback_buf);
-        let rx_aec_tap = Arc::clone(&aec_render_tap);
-        let rx_needs_aec = Arc::clone(&needs_sw_aec_ref);
         let rx_worker = match std::thread::Builder::new()
             .name("slackless-huddle-audio-rx".to_owned())
             .spawn(move || {
@@ -196,13 +193,7 @@ impl AudioEngine {
                         return dummy_rx;
                     }
                 };
-                run_inbound_audio_rx_loop(
-                    rx_shared,
-                    &mut rx,
-                    rx_playback,
-                    rx_aec_tap,
-                    rx_needs_aec,
-                );
+                run_playout_loop(&rx_shared, &mut rx, &playout);
                 rx
             }) {
             Ok(h) => h,
@@ -250,76 +241,60 @@ impl Drop for AudioEngine {
     }
 }
 
-pub(super) fn run_inbound_audio_rx_loop(
-    shared: AudioSharedState,
+/// Remote-audio playout thread: feeds arriving packets to NetEq and keeps the playout ring topped
+/// up. The render callback wakes it after every device callback, so the device clock paces the
+/// 10 ms pulls; the park timeout only covers a device that stopped calling back.
+fn run_playout_loop(
+    shared: &AudioSharedState,
     inbound_opus_rx: &mut mpsc::UnboundedReceiver<InboundAudioPacket>,
-    playback_buf: Arc<PlaybackBuffer>,
-    aec_render_tap: Arc<SpscRing<f32>>,
-    needs_sw_aec_ref: Arc<AtomicBool>,
+    playout: &PlayoutRing,
 ) {
-    let Ok(mut decoder) = Decoder::new(SAMPLE_RATE, Channels::Mono) else {
-        return;
-    };
-    let mut jitter = AudioJitterBuffer::new();
-    let mut normalizer = LoudnessNormalizer::speech();
-    let mut decoded_pcm = vec![0.0f32; FRAME_20MS * 2];
+    playout.register_worker();
+    let epoch = Instant::now();
+    let mut mixer = RemoteAudioMixer::new(epoch, Arc::new(EpochClock(epoch)));
+    // The transcriber is fed 20 ms chunks, like the microphone side.
+    let mut tap_chunk = [0.0f32; FRAME_20MS];
+    let mut tap_filled = 0;
+    let mut frames_since_stats = 0;
 
     while shared.running.load(Ordering::Acquire) {
-        let mut received_any = false;
-        while let Ok(pkt) = inbound_opus_rx.try_recv() {
-            jitter.push(pkt.seq, pkt.payload, Instant::now());
-            received_any = true;
-        }
-
-        let now = Instant::now();
-        let mut decoded_any = false;
-        while let Some(step) = jitter.pop_ready(now) {
-            let decoded_res = match step {
-                JitterStep::Packet(pkt) => decoder.decode_float(&pkt, &mut decoded_pcm, false),
-                JitterStep::FecFromNext(next_pkt) => {
-                    decoder.decode_float(&next_pkt, &mut decoded_pcm[..FRAME_20MS], true)
-                }
-                JitterStep::Plc => decode_opus_or_plc(&mut decoder, &[], &mut decoded_pcm),
-            };
-            if let Ok(samples) = decoded_res {
-                let pcm = &mut decoded_pcm[..samples];
-                // Generalized per-stream speech loudness normalization: lifts quiet mics and tames
-                // hot mics to a consistent conversational level without boosting silence.
-                normalizer.process_frame(pcm);
-                playback_buf.push(pcm);
-                if let Ok(guard) = shared.transcribe_tap.lock()
-                    && let Some(tap) = guard.as_ref()
-                {
-                    let speaker = shared
-                        .active_remote_speaker
-                        .lock()
-                        .ok()
-                        .and_then(|s| s.clone())
-                        .unwrap_or_else(|| slackless_types::UserId::from("U0REMOTE"));
-                    tap.push(false, speaker, pcm);
-                }
-                if needs_sw_aec_ref.load(Ordering::Relaxed)
-                    && !shared.muted.load(Ordering::Relaxed)
-                    && shared.aec.load(Ordering::Relaxed)
-                {
-                    aec_render_tap.push_slice(pcm);
-                }
-                decoded_any = true;
+        frames_since_stats += service(inbound_opus_rx, &mut mixer, playout, |pcm| {
+            tap_chunk[tap_filled..tap_filled + FRAME_10MS].copy_from_slice(pcm);
+            tap_filled += FRAME_10MS;
+            if tap_filled < FRAME_20MS {
+                return;
+            }
+            tap_filled = 0;
+            if let Ok(guard) = shared.transcribe_tap.lock()
+                && let Some(tap) = guard.as_ref()
+            {
+                let speaker = shared
+                    .active_remote_speaker
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.clone())
+                    .unwrap_or_else(|| slackless_types::UserId::from("U0REMOTE"));
+                tap.push(false, speaker, &tap_chunk);
+            }
+        });
+        if frames_since_stats >= 100 {
+            frames_since_stats = 0;
+            let mut stats = mixer.stats();
+            stats.underruns = playout.underruns();
+            if let Ok(mut published) = shared.rx_stats.lock() {
+                *published = stats;
             }
         }
-
-        if !received_any && !decoded_any {
-            // Short 5ms poll sleep when idle: wakes immediately enough for 20ms RTP cadence
-            // while still checking `shared.running` cleanly on shutdown/device-swap.
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        playout.wait_for_demand(Duration::from_millis(20), || {
+            shared.running.load(Ordering::Acquire)
+        });
     }
 }
 
 struct AudioDspLoopArgs {
     shared: AudioSharedState,
     capture_ring: Arc<CaptureRing>,
-    playback_buf: Arc<PlaybackBuffer>,
+    playout: Arc<PlayoutRing>,
     aec_render_tap: Arc<SpscRing<f32>>,
     outbound_opus_tx: mpsc::UnboundedSender<Bytes>,
     configured_in: Option<String>,
@@ -331,7 +306,7 @@ fn run_audio_dsp_loop(args: AudioDspLoopArgs) {
     let AudioDspLoopArgs {
         shared,
         capture_ring,
-        playback_buf,
+        playout,
         aec_render_tap,
         outbound_opus_tx,
         configured_in,
@@ -423,7 +398,7 @@ fn run_audio_dsp_loop(args: AudioDspLoopArgs) {
                             !cur_muted && cur_ns,
                             !cur_muted && cur_agc,
                             &capture_ring,
-                            &playback_buf,
+                            &playout,
                         ) {
                             io = AudioIoBackend::Hardware(next_hw);
                         }
@@ -447,13 +422,23 @@ fn run_audio_dsp_loop(args: AudioDspLoopArgs) {
                     }
                     if configured_out.is_none() && (check_out || poll_due) {
                         let now_out = current_default_output_name();
-                        if now_out.is_some()
-                            && now_out != last_default_out
-                            && let Ok(next_stream) =
-                                open_output_stream(None, Arc::clone(&playback_buf))
-                        {
-                            *out_stream = next_stream;
-                            last_default_out = now_out;
+                        if now_out.is_some() && now_out != last_default_out {
+                            // Stop the old stream first: only one render callback at a time may
+                            // consume the playout ring and fill the echo reference.
+                            let _ = out_stream.pause();
+                            match open_output_stream(
+                                None,
+                                Arc::clone(&playout),
+                                Arc::clone(&aec_render_tap),
+                            ) {
+                                Ok(next_stream) => {
+                                    *out_stream = next_stream;
+                                    last_default_out = now_out;
+                                }
+                                Err(_) => {
+                                    let _ = out_stream.play();
+                                }
+                            }
                         }
                     }
                 }
@@ -482,9 +467,9 @@ fn run_audio_dsp_loop(args: AudioDspLoopArgs) {
             }
         }
 
-        // 1. Feed Sonora's AEC render reference only when running the software `cpal` fallback.
-        // (Hardware `VoiceProcessingIO` taps its own render bus internally, and inbound Opus
-        // decoding runs on the dedicated `slackless-huddle-audio-rx` thread without mic-loop lag.)
+        // 1. Feed Sonora's AEC render reference only when running the software `cpal` fallback:
+        // the samples its render callback actually played, so reference and echo stay aligned
+        // whatever the jitter buffer depth. (Hardware `VoiceProcessingIO` taps its own render bus.)
         if let AudioIoBackend::Cpal { apm, .. } = &mut io {
             if !cur_muted && cur_aec {
                 let tap_len = aec_render_tap.len();

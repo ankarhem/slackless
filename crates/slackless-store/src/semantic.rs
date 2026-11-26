@@ -4,7 +4,8 @@
 //! Stored strictly in its own SQLite file next to the workspace archive databases so the core
 //! archive schema (`schema.rs`) stays completely untouched and zero-conflict.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -113,6 +114,52 @@ pub struct SemanticHit {
     pub ts: String,
     /// Cosine similarity score in `[-1.0, 1.0]` (higher is more similar).
     pub score: f32,
+}
+
+/// A [`SemanticHit`] with its position in the scan, ordered best first: by score (descending),
+/// then `ts` (newest first), then `doc_id`, then scan order. A max-heap of them keeps the worst
+/// retained hit on top.
+struct RankedHit {
+    hit: SemanticHit,
+    scan_ix: usize,
+}
+
+impl RankedHit {
+    /// How a candidate (`score`, `ts`, `doc_id` at `scan_ix`) ranks against `self`:
+    /// [`Ordering::Less`] when the candidate comes first.
+    fn rank_candidate(&self, score: f32, ts: &str, doc_id: &str, scan_ix: usize) -> Ordering {
+        self.hit
+            .score
+            .total_cmp(&score)
+            .then_with(|| self.hit.ts.as_str().cmp(ts))
+            .then_with(|| doc_id.cmp(&self.hit.doc_id))
+            .then_with(|| scan_ix.cmp(&self.scan_ix))
+    }
+}
+
+impl Ord for RankedHit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.rank_candidate(self.hit.score, &self.hit.ts, &self.hit.doc_id, self.scan_ix)
+    }
+}
+
+impl PartialOrd for RankedHit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RankedHit {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RankedHit {}
+
+/// Borrow text column `ix` of `row` without copying it.
+fn column_str<'r>(row: &'r rusqlite::Row<'_>, ix: usize) -> rusqlite::Result<&'r str> {
+    Ok(row.get_ref(ix)?.as_str()?)
 }
 
 /// Summary statistics for `semantic_index.sqlite`.
@@ -548,7 +595,8 @@ impl SemanticIndex {
     /// Cosine-similarity nearest-neighbor search over stored embeddings.
     ///
     /// Optionally scopes to `workspaces` and/or `kinds`, filters by `min_score`, and returns the
-    /// top `limit` hits sorted descending by similarity score.
+    /// top `limit` hits sorted descending by similarity score (ties: newest `ts` first, then
+    /// `doc_id`, then scan order).
     pub fn search(
         &self,
         query_embedding: &[f32],
@@ -597,49 +645,57 @@ impl SemanticIndex {
         }
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(args), |r| {
-            let ws: String = r.get(0)?;
-            let kind_s: String = r.get(1)?;
-            let doc_id: String = r.get(2)?;
-            let channel_id: String = r.get(3)?;
-            let ts: String = r.get(4)?;
-            let blob = r
-                .get_ref(5)?
-                .as_blob()
-                .map(|b| b.to_vec())
-                .unwrap_or_default();
-            Ok((ws, kind_s, doc_id, channel_id, ts, blob))
-        })?;
-
-        let mut scored: Vec<SemanticHit> = Vec::new();
-        for row in rows {
-            let (ws, kind_s, doc_id, channel_id, ts, blob) = row?;
-            let Some(kind) = SemanticDocKind::from_tag(&kind_s) else {
+        let mut rows = stmt.query(params_from_iter(args))?;
+        // Rows are scored straight from their borrowed blobs; only the best `limit` hits are
+        // kept, and a row's strings are copied only once it ranks into them.
+        let mut best: BinaryHeap<RankedHit> = BinaryHeap::new();
+        let mut scan_ix = 0usize;
+        while let Some(row) = rows.next()? {
+            let row_ix = scan_ix;
+            scan_ix += 1;
+            let Ok(blob) = row.get_ref(5)?.as_blob() else {
                 continue;
             };
-            let Some(score) = cosine_against_blob(&query_unit, &blob) else {
+            let Some(score) = cosine_against_blob(&query_unit, blob) else {
                 continue;
             };
             if score >= min_score {
-                scored.push(SemanticHit {
-                    workspace: TeamId::from(ws),
-                    kind,
-                    doc_id,
-                    channel_id,
-                    ts,
-                    score,
-                });
+                let Some(kind) = SemanticDocKind::from_tag(column_str(row, 1)?) else {
+                    continue;
+                };
+                let doc_id = column_str(row, 2)?;
+                let ts = column_str(row, 4)?;
+                let full = best.len() >= limit;
+                if full
+                    && best
+                        .peek()
+                        .is_none_or(|worst| worst.rank_candidate(score, ts, doc_id, row_ix).is_ge())
+                {
+                    continue;
+                }
+                let ranked = RankedHit {
+                    hit: SemanticHit {
+                        workspace: TeamId::from(column_str(row, 0)?),
+                        kind,
+                        doc_id: doc_id.to_owned(),
+                        channel_id: column_str(row, 3)?.to_owned(),
+                        ts: ts.to_owned(),
+                        score,
+                    },
+                    scan_ix: row_ix,
+                };
+                if !full {
+                    best.push(ranked);
+                } else if let Some(mut worst) = best.peek_mut() {
+                    *worst = ranked;
+                }
             }
         }
-
-        scored.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| b.ts.cmp(&a.ts))
-                .then_with(|| a.doc_id.cmp(&b.doc_id))
-        });
-        scored.truncate(limit);
-        Ok(scored)
+        Ok(best
+            .into_sorted_vec()
+            .into_iter()
+            .map(|ranked| ranked.hit)
+            .collect())
     }
 
     /// Return aggregate document counts, model metadata, and SQLite byte size.
@@ -820,6 +876,56 @@ mod tests {
         assert!(idx.ensure_model("bge-small", 4).unwrap());
         assert_eq!(idx.stats().unwrap().total_docs, 0);
         assert_eq!(idx.model_id().unwrap().as_deref(), Some("bge-small"));
+    }
+
+    #[test]
+    fn search_keeps_the_best_limit_with_ts_doc_id_and_scan_order_tie_breaks() {
+        let mut idx = SemanticIndex::open_in_memory().unwrap();
+        idx.ensure_model("m", 2).unwrap();
+        let doc = |ws: &str, doc_id: &str, ts: &str, embedding: [f32; 2]| SemanticDocInput {
+            workspace: TeamId::from(ws),
+            kind: SemanticDocKind::Message,
+            doc_id: doc_id.into(),
+            channel_id: "C1".into(),
+            ts: ts.into(),
+            content_hash: "h".into(),
+            embedding: embedding.to_vec(),
+        };
+        // Every exact match ties on score; "b"/"c" also tie on ts, and the two "d"s tie on
+        // everything but their workspace, so scan order decides (T1's row is scanned first).
+        idx.upsert_batch(&[
+            doc("T1", "a", "1.0", [1.0, 0.0]),
+            doc("T1", "c", "3.0", [1.0, 0.0]),
+            doc("T1", "b", "3.0", [1.0, 0.0]),
+            doc("T2", "d", "2.0", [1.0, 0.0]),
+            doc("T1", "d", "2.0", [1.0, 0.0]),
+            doc("T1", "e", "9.0", [0.6, 0.8]),
+            doc("T1", "f", "9.0", [0.0, 1.0]),
+        ])
+        .unwrap();
+        let ranked = |limit: usize| -> Vec<(String, String)> {
+            idx.search(&[1.0, 0.0], None, None, limit, 0.1)
+                .unwrap()
+                .into_iter()
+                .map(|hit| (hit.workspace.as_str().to_owned(), hit.doc_id))
+                .collect()
+        };
+        let expected: Vec<(String, String)> = [
+            ("T1", "b"),
+            ("T1", "c"),
+            ("T1", "d"),
+            ("T2", "d"),
+            ("T1", "a"),
+            ("T1", "e"),
+        ]
+        .into_iter()
+        .map(|(ws, doc_id)| (ws.to_owned(), doc_id.to_owned()))
+        .collect();
+        assert_eq!(ranked(100), expected);
+        // Any limit keeps exactly the first `limit` hits of the full ranking, in order.
+        for limit in 1..=expected.len() {
+            assert_eq!(ranked(limit), expected[..limit], "limit {limit}");
+        }
     }
 
     #[test]

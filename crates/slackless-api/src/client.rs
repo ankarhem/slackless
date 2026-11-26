@@ -139,7 +139,18 @@ const UPLOAD_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
 
+/// Installs `rustls`'s `ring` `CryptoProvider` as the process-wide default (no-op if one is
+/// already installed).
+///
+/// reqwest is built without a crypto provider (`rustls-no-provider`, so no `aws-lc-sys`), and
+/// panics in `ClientBuilder::build()` unless a provider has been installed first. Every client
+/// this crate builds calls this; crates that build their own `reqwest::Client` must too.
+pub fn install_default_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 pub(crate) fn build_http_client(proxy: Option<&str>, timeout: Duration) -> Result<reqwest::Client> {
+    install_default_crypto_provider();
     let mut builder = reqwest::Client::builder()
         .user_agent(BROWSER_USER_AGENT)
         .connect_timeout(DEFAULT_CONNECT_TIMEOUT)

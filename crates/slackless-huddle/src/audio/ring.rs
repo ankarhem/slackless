@@ -6,7 +6,52 @@
 //! store after reading) and load `tail` (`Acquire`). Neither side ever blocks or allocates.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
+
+/// Lock-free wake-up from a real-time audio callback to the one worker thread serving its ring.
+#[derive(Default)]
+pub(crate) struct WorkerWake {
+    worker: OnceLock<std::thread::Thread>,
+    parked: AtomicBool,
+}
+
+impl WorkerWake {
+    /// Called once from the worker thread so real-time callbacks can unpark it.
+    pub(crate) fn register(&self) {
+        let _ = self.worker.set(std::thread::current());
+    }
+
+    /// Real-time side: wake the worker only if it is currently parked.
+    pub(crate) fn wake_if_parked(&self) {
+        if self.parked.swap(false, Ordering::AcqRel)
+            && let Some(t) = self.worker.get()
+        {
+            t.unpark();
+        }
+    }
+
+    /// Unconditional wake used on shutdown/hot-plug so the worker reacts immediately.
+    pub(crate) fn wake_now(&self) {
+        self.parked.store(false, Ordering::Release);
+        if let Some(t) = self.worker.get() {
+            t.unpark();
+        }
+    }
+
+    /// Worker side: park for up to `timeout` while `idle()` holds. `idle` is re-checked after
+    /// arming the flag, so a wake between the first check and the park is never lost.
+    pub(crate) fn park_while(&self, timeout: Duration, idle: impl Fn() -> bool) {
+        if idle() {
+            self.parked.store(true, Ordering::Release);
+            if idle() {
+                std::thread::park_timeout(timeout);
+            }
+            self.parked.store(false, Ordering::Release);
+        }
+    }
+}
 
 /// Fixed-capacity lock-free SPSC ring buffer of `Copy` samples.
 ///
@@ -122,17 +167,6 @@ impl<T: Copy + Default> SpscRing<T> {
         to_read
     }
 
-    /// Consumer: peek the oldest element without consuming it.
-    pub(crate) fn peek_front(&self) -> Option<T> {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
-        if tail.wrapping_sub(head) == 0 {
-            return None;
-        }
-        // SAFETY: Slot `head & mask` is initialized and published by producer.
-        Some(unsafe { *self.buf[head & self.mask].get() })
-    }
-
     /// Consumer: discard up to `count` oldest elements without copying; returns count skipped.
     pub(crate) fn skip(&self, count: usize) -> usize {
         let head = self.head.load(Ordering::Relaxed);
@@ -165,7 +199,6 @@ mod tests {
 
         assert_eq!(ring.push_slice(&[1, 2, 3, 4, 5, 6]), 6);
         assert_eq!(ring.len(), 6);
-        assert_eq!(ring.peek_front(), Some(1));
 
         let mut out = [0i16; 4];
         assert_eq!(ring.pop_slice(&mut out), 4);
@@ -177,7 +210,6 @@ mod tests {
         assert_eq!(ring.len(), 8);
 
         assert_eq!(ring.skip(3), 3); // drops 5, 6, 7
-        assert_eq!(ring.peek_front(), Some(8));
 
         let mut rest = [0i16; 8];
         assert_eq!(ring.pop_slice(&mut rest), 5);

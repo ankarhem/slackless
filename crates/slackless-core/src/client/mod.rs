@@ -27,6 +27,7 @@ use crate::backfill::{
 use crate::fetcher::Fetcher;
 use crate::rtm::ConnectionState;
 use crate::rtm::{ConnectParams, RtmClient, RtmConfig, RtmEvent};
+use crate::runtime::shared_runtime;
 use crate::store::{SearchQuery, Store, StoreError};
 use crate::types::event::MessageEvent;
 use crate::types::time::now_epoch_secs;
@@ -59,19 +60,6 @@ const SEARCH_LIMIT: usize = 200;
 
 /// The orchestrator entry point.
 pub struct Client;
-
-fn shared_runtime() -> std::io::Result<&'static tokio::runtime::Runtime> {
-    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    if let Some(rt) = RUNTIME.get() {
-        return Ok(rt);
-    }
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("slackless-tokio")
-        .enable_all()
-        .build()?;
-    Ok(RUNTIME.get_or_init(|| rt))
-}
 
 impl Client {
     /// Starts the core for one signed-in workspace on a shared multi-thread tokio runtime.
@@ -502,9 +490,14 @@ impl<B: Backend> Core<B> {
         huddle_media: HuddleMediaSender,
     ) -> Self {
         let ws_init = workspace.clone();
+        let init_events = events.clone();
         let (raw_offline, outbox_items, cached_bots, raw_synced) = with_store(&store, move |s| {
             let offline = s.list_offline(&ws_init).unwrap_or_default();
-            let _ = s.reset_outbox_sending_to_pending(&ws_init);
+            // Rows left `sending` by an unclean exit stay invisible to every flush until recovered.
+            if let Err(err) = s.reset_outbox_sending_to_pending(&ws_init) {
+                tracing::warn!(%err, "failed to recover outbox rows left in sending");
+                init_events.report("outbox recovery", err.into());
+            }
             let outbox = s.list_outbox(&ws_init).unwrap_or_default();
             let bots = s.bot_profiles(&ws_init).unwrap_or_default();
             let synced = s.local(&ws_init, BACKFILL_SYNCED_KEY).unwrap_or_default();

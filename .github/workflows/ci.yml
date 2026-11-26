@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Check dependencies (cargo-deny)
         uses: EmbarkStudios/cargo-deny-action@v2
@@ -35,12 +37,18 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-11-18
-          components: rustfmt, clippy
+          persist-credentials: false
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # With no arguments rustup installs the channel and components pinned in rust-toolchain.toml.
+          rustup set profile minimal
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+          rustc --version
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2

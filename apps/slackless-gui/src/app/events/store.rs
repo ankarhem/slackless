@@ -4,19 +4,106 @@ use super::super::*;
 
 impl App {
     /// Live mode: rebuild the workspace snapshot off the UI thread on the read-only WAL
-    /// connection, debouncing rapid event bursts (40ms) so boot hydration builds `Fixtures` once
-    /// instead of spawning concurrent duplicate SQLite reads and peaking heap memory.
+    /// connection, debounced with every other pending reload ([`App::schedule_reload`]) so
+    /// boot hydration builds `Fixtures` once instead of spawning concurrent duplicate SQLite
+    /// reads and peaking heap memory.
     pub(in crate::app) fn reload_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.schedule_reload(Reload::Full, window, cx);
+    }
+
+    /// Live mode: `users` changed in the store (a status or profile change, a stranger
+    /// resolved): re-read only them, off the UI thread, and patch them into the shown
+    /// snapshot, as one person's status must not rebuild the whole workspace.
+    pub(in crate::app) fn reload_users(
+        &mut self,
+        users: &[UserId],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.schedule_reload(Reload::Users(users.iter().cloned().collect()), window, cx);
+    }
+
+    /// Fold `reload` into the shown workspace's pending reload and restart its read. Every
+    /// request supersedes the read in flight, and pending work is cleared only when a read
+    /// lands, so no result lands over a newer store write and none is lost.
+    fn schedule_reload(&mut self, reload: Reload, window: &mut Window, cx: &mut Context<Self>) {
         if self.bridge.store().is_none() {
             return;
         }
+        self.ws.reload = Some(match self.ws.reload.take() {
+            Some(pending) => pending.merge(reload),
+            None => reload,
+        });
+        self.start_reload(window, cx);
+    }
+
+    /// (Re)start the debounced read of the shown workspace's pending reload, dropping the read
+    /// in flight (another workspace's, after a switch, whose own stays pending in its state).
+    pub(in crate::app) fn start_reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.reload_generation += 1;
+        self.reload_task = match self.ws.reload {
+            Some(Reload::Full) => self.reload_snapshot(window, cx),
+            Some(Reload::Users(_)) => self.reload_people(window, cx),
+            None => gpui::Task::ready(()),
+        };
+    }
+
+    /// The debounced people read of [`App::start_reload`]: the pending people's stored
+    /// records, patched into a copy of the shown snapshot, both off the UI thread. A patch
+    /// whose snapshot was replaced meanwhile (a transcript landed) is redone on the new one.
+    fn reload_people(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Task<()> {
         let generation = self.reload_generation;
         let workspace = self.workspace;
-        self.reload_task = cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(40))
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(RELOAD_DEBOUNCE).await;
+            let read = this
+                .update(cx, |app, _| {
+                    if app.reload_generation != generation || app.workspace != workspace {
+                        return None;
+                    }
+                    let Some(Reload::Users(users)) = &app.ws.reload else {
+                        return None;
+                    };
+                    let read = app.bridge.users(users.iter().cloned().collect())?;
+                    Some((app.fixtures.clone(), read))
+                })
+                .ok()
+                .flatten();
+            let Some((base, read)) = read else {
+                return;
+            };
+            let shown = base.clone();
+            let patched = cx
+                .background_executor()
+                .spawn(async move {
+                    let users = read.await;
+                    (!users.is_empty()).then(|| base.with_users(users))
+                })
                 .await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                if app.reload_generation != generation || app.workspace != workspace {
+                    return;
+                }
+                if !app.fixtures.shares_data(&shown) {
+                    app.start_reload(window, cx);
+                    return;
+                }
+                app.ws.reload = None;
+                if let Some(mut patched) = patched {
+                    // Counts may have moved while the people were read.
+                    patched.counts = app.fixtures.counts.clone();
+                    app.apply_snapshot(Arc::new(patched), window, cx);
+                }
+            });
+        })
+    }
+
+    /// The debounced full snapshot read of [`App::start_reload`].
+    fn reload_snapshot(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Task<()> {
+        let generation = self.reload_generation;
+        let workspace = self.workspace;
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(RELOAD_DEBOUNCE).await;
             let task = this
                 .update(cx, |app, _| {
                     if app.reload_generation != generation || app.workspace != workspace {
@@ -37,6 +124,7 @@ impl App {
                 if app.reload_generation != generation || app.workspace != workspace {
                     return;
                 }
+                app.ws.reload = None;
                 // Keep the full multi-workspace rail intact while updating this workspace's team info.
                 if let Some(own) = snapshot.workspaces.first().cloned()
                     && let Some(slot) = app.live_teams.get_mut(app.workspace)
@@ -46,6 +134,20 @@ impl App {
                 if !app.live_teams.is_empty() {
                     snapshot.workspaces = app.live_teams.clone();
                 }
+                // The store's cached bot profiles join the map every snapshot shares (a first
+                // visit's state starts it empty); profiles resolved this session stay.
+                let cached = mem::take(
+                    &mut *snapshot
+                        .bots
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner),
+                );
+                {
+                    let mut bots = app.ws.bots.write().unwrap_or_else(PoisonError::into_inner);
+                    for (id, profile) in cached {
+                        bots.entry(id).or_insert(profile);
+                    }
+                }
                 // Presence, usergroups, and app_commands are transient (never stored), so they ride along.
                 snapshot.presence = app.ws.presence.clone();
                 snapshot.bots = app.ws.bots.clone();
@@ -53,7 +155,7 @@ impl App {
                 snapshot.app_commands = app.ws.app_commands.clone();
                 app.apply_snapshot(Arc::new(snapshot), window, cx);
             });
-        });
+        })
     }
 
     /// Push `fixtures` to every mounted view (shared by both `apply_snapshot` and

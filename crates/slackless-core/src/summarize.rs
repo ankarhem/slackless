@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +15,7 @@ use url::Url;
 
 use crate::catchup::CatchUpBriefing;
 use crate::domain::mrkdwn::mrkdwn_to_plain;
+use crate::runtime::block_on;
 use crate::store::{Store, StoredMessage};
 use crate::types::time::civil_from_days;
 use crate::types::{ChannelId, FileId, TeamId, TranscriptCue, Ts, UserId};
@@ -900,6 +900,7 @@ struct ModelEntry {
 }
 
 fn build_http_client(timeout: Duration) -> Result<reqwest::Client, SummarizeError> {
+    crate::api::install_default_crypto_provider();
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(timeout)
@@ -1249,39 +1250,25 @@ pub async fn test_connection(
     })
 }
 
-fn shared_summarize_runtime() -> Result<&'static tokio::runtime::Runtime, SummarizeError> {
-    static RT: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
-    let res = RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("slackless-ai-http")
-            .enable_all()
-            .build()
-            .map_err(|e| format!("failed to start async HTTP runtime: {e}"))
-    });
-    match res {
-        Ok(rt) => Ok(rt),
-        Err(msg) => Err(SummarizeError::Transport(msg.clone())),
-    }
-}
-
 /// Blocking wrapper around [`summarize`] for callers outside a tokio runtime (e.g. GPUI
-/// background executor tasks).
+/// background executor tasks); safe to call from inside any runtime flavor too.
 pub fn summarize_blocking(
     config: &AiSummaryConfig,
     target: &SummaryTarget,
 ) -> Result<SummaryResult, SummarizeError> {
-    let rt = shared_summarize_runtime()?;
-    rt.block_on(summarize(config, target))
+    block_on(summarize(config, target)).map_err(|e| {
+        SummarizeError::Transport(format!("failed to start async HTTP runtime: {e}"))
+    })?
 }
 
 /// Blocking wrapper around [`test_connection`] for callers outside a tokio runtime (e.g. GPUI
-/// background executor tasks).
+/// background executor tasks); safe to call from inside any runtime flavor too.
 pub fn test_connection_blocking(
     config: &AiSummaryConfig,
 ) -> Result<ConnectionTestResult, SummarizeError> {
-    let rt = shared_summarize_runtime()?;
-    rt.block_on(test_connection(config))
+    block_on(test_connection(config)).map_err(|e| {
+        SummarizeError::Transport(format!("failed to start async HTTP runtime: {e}"))
+    })?
 }
 
 // --------------------------------------------------------------------------------------------

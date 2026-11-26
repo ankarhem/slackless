@@ -302,7 +302,9 @@ use crate::theme::{self, Palette, SlackTheme};
 use crate::threads::{ThreadPanel, ThreadPanelEvent};
 use crate::threads_cards::{local_cards, store_cards};
 use crate::threads_view::{ThreadsEvent, ThreadsView};
-use crate::unreads::{UnreadsEvent, UnreadsView, local_groups, store_groups, store_targets};
+use crate::unreads::{
+    LiveRefresh, UnreadsEvent, UnreadsView, local_groups, store_groups, store_targets,
+};
 
 actions!(
     slackless,
@@ -443,6 +445,63 @@ struct WorkspaceViews {
     switcher: Entity<QuickSwitcher>,
 }
 
+/// Channels a lazily loaded per-channel cache keeps (pins, bookmarks, files, member lists):
+/// past it the least recently loaded channel is dropped, fetched again when one of its
+/// surfaces next opens.
+const CHANNEL_CACHE_MAX: usize = 32;
+
+/// A per-channel cache bounded to the [`CHANNEL_CACHE_MAX`] most recently loaded channels.
+pub(super) struct ChannelCache<V> {
+    entries: HashMap<ChannelId, V>,
+    /// The cached channels, least recently loaded first.
+    lru: Vec<ChannelId>,
+}
+
+impl<V> Default for ChannelCache<V> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru: Vec::new(),
+        }
+    }
+}
+
+impl<V> ChannelCache<V> {
+    fn get(&self, channel: &ChannelId) -> Option<&V> {
+        self.entries.get(channel)
+    }
+
+    fn contains_key(&self, channel: &ChannelId) -> bool {
+        self.entries.contains_key(channel)
+    }
+
+    /// Keep `channel`'s freshly loaded `value` as the most recent entry, dropping the least
+    /// recently loaded channel past [`CHANNEL_CACHE_MAX`].
+    fn insert(&mut self, channel: ChannelId, value: V) {
+        self.lru.retain(|known| *known != channel);
+        self.lru.push(channel.clone());
+        self.entries.insert(channel, value);
+        while self.lru.len() > CHANNEL_CACHE_MAX {
+            let oldest = self.lru.remove(0);
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, channel: &ChannelId) {
+        self.lru.retain(|known| known != channel);
+        self.entries.remove(channel);
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
+        self.entries.values_mut()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// Per-workspace live state swapped atomically when switching workspaces.
 #[derive(Default)]
 pub(super) struct WorkspaceState {
@@ -478,24 +537,29 @@ pub(super) struct WorkspaceState {
     pub(super) member_counts: HashMap<ChannelId, u32>,
     /// Apps among a channel's members, counted apart from people as Slack's header does.
     pub(super) app_counts: HashMap<ChannelId, u32>,
-    /// Cached per-channel member lists from `Event::ConversationInfo` so returning to a Slack
-    /// Connect channel renders its amber banner on frame 0 without waiting on a refetch.
-    pub(super) members_cache: HashMap<ChannelId, Vec<UserId>>,
+    /// Cached member lists of the most recently opened channels from `Event::ConversationInfo`
+    /// so returning to a Slack Connect channel renders its amber banner on frame 0 without
+    /// waiting on a refetch.
+    pub(super) members_cache: ChannelCache<Vec<UserId>>,
     /// Live mode: channels whose stored history has no older page left; the transcript
     /// stops asking for them.
     pub(super) history_complete: HashSet<ChannelId>,
     /// The user opened a conversation themselves; until then live reloads open the one most
     /// recently read in Slack.
     pub(super) chosen: bool,
-    /// Live mode: per channel, its pinned messages (`pins.list`) or why they could not be
-    /// loaded; fetched each time a pins surface opens, never per channel.
-    pub(super) pins: HashMap<ChannelId, Loaded<Message>>,
-    /// Live mode: per channel, its bookmarks (`bookmarks.list`), fetched each time a
-    /// bookmarks surface opens.
-    pub(super) bookmarks: HashMap<ChannelId, Loaded<ChannelBookmark>>,
-    /// Live mode: per channel, its shared files (`files.list`), fetched each time Files &
-    /// links opens.
-    pub(super) files: HashMap<ChannelId, Loaded<File>>,
+    /// Live mode: what the next debounced reload re-reads from the store, cleared once its
+    /// read lands. It is parked with the workspace, so a reload a switch interrupted (a first
+    /// visit's snapshot among them) resumes when the workspace is shown again.
+    pub(super) reload: Option<Reload>,
+    /// Live mode: per recently loaded channel, its pinned messages (`pins.list`) or why they
+    /// could not be loaded; fetched each time a pins surface opens, never per channel.
+    pub(super) pins: ChannelCache<Loaded<Message>>,
+    /// Live mode: per recently loaded channel, its bookmarks (`bookmarks.list`), fetched each
+    /// time a bookmarks surface opens.
+    pub(super) bookmarks: ChannelCache<Loaded<ChannelBookmark>>,
+    /// Live mode: per recently loaded channel, its shared files (`files.list`), fetched each
+    /// time Files & links opens.
+    pub(super) files: ChannelCache<Loaded<File>>,
     /// Live mode: parsed read-only canvases keyed by file id (`files.info` -> `url_private`, `F-COLLAB-125`).
     pub(super) canvases: HashMap<String, Result<crate::canvas::CanvasDoc, String>>,
     /// Live mode: parsed `CanvasMeta` keyed by file id (`Event::CanvasMetaLoaded`).
@@ -528,6 +592,31 @@ struct Parked {
     views: WorkspaceViews,
     subscriptions: Vec<Subscription>,
     state: WorkspaceState,
+}
+
+/// How long a live reload waits for more events, so a burst (boot hydration) reads the store
+/// once.
+const RELOAD_DEBOUNCE: Duration = Duration::from_millis(40);
+
+/// What a live reload re-reads from the store.
+pub(super) enum Reload {
+    /// The whole workspace snapshot.
+    Full,
+    /// Only these people (a status or profile change), patched into the shown snapshot.
+    Users(HashSet<UserId>),
+}
+
+impl Reload {
+    /// This pending reload with `next` folded in; a full one already re-reads everyone.
+    fn merge(self, next: Reload) -> Reload {
+        match (self, next) {
+            (Reload::Users(mut users), Reload::Users(more)) => {
+                users.extend(more);
+                Reload::Users(users)
+            }
+            _ => Reload::Full,
+        }
+    }
 }
 
 /// Where an emoji pick goes.
@@ -723,6 +812,9 @@ pub struct App {
     /// Channels already asked for a single-page history fetch from `refresh_unreads`, so an
     /// empty unread channel is fetched at most once per session.
     unreads_fetched: HashSet<ChannelId>,
+    /// Live mode: the Unreads view's store reads - one in flight, the refreshes asked for
+    /// meanwhile folded into one more, an overtaken read dropped.
+    unreads_refresh: LiveRefresh,
     /// The Activity page (the rail's Activity destination): a full-width page right of the
     /// rail - the sidebar's list column hides while `page == MainPage::Activity`.
     activity: Entity<ActivityFeed>,
@@ -799,9 +891,10 @@ pub struct App {
     history_generation: u64,
     /// Live mode: the newest thread read started; an overtaken read is dropped.
     thread_generation: u64,
-    /// Live mode: the newest async `reload_live` snapshot started; coalesces event bursts.
+    /// Live mode: the newest debounced store reload started (a snapshot or a people patch);
+    /// coalesces event bursts.
     reload_generation: u64,
-    /// Debounced snapshot reload handle; replacing cancels pending reads during hydration bursts.
+    /// Debounced store reload handle; replacing cancels pending reads during hydration bursts.
     reload_task: gpui::Task<()>,
     /// Places navigated away from, newest last (Slack's back arrow, Cmd+[, mouse Back).
     back: Vec<NavPlace>,

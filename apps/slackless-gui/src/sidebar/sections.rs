@@ -23,16 +23,16 @@ use crate::sidebar_menu::{
 impl Sidebar {
     /// The sidebar's sections: the fixture-mode overlay once anything changed locally,
     /// else the snapshot's.
-    pub(super) fn section_set(&self) -> Vec<ChannelSection> {
+    pub(super) fn section_set(&self) -> &[ChannelSection] {
         self.local_sections
-            .clone()
-            .unwrap_or_else(|| self.fixtures.sections.clone())
+            .as_deref()
+            .unwrap_or(&self.fixtures.sections)
     }
 
     /// List a section created locally (fixture mode) after the stored ones.
     pub fn add_section(&mut self, name: String, cx: &mut Context<Self>) {
         let index = self.section_set().len() + 1;
-        let mut sections = self.section_set();
+        let mut sections = self.section_set().to_vec();
         sections.push(ChannelSection {
             id: format!("LLOCAL{index}"),
             name,
@@ -55,7 +55,7 @@ impl Sidebar {
     ) {
         let index = self.section_set().len() + 1;
         let id = format!("LLOCAL{index}");
-        let mut sections = self.section_set();
+        let mut sections = self.section_set().to_vec();
         sections.push(ChannelSection {
             id: id.clone(),
             name,
@@ -76,7 +76,7 @@ impl Sidebar {
     /// Fixture mode's rename of a section (live mode's goes through
     /// [`SidebarEvent::RenameSection`]).
     pub fn rename_section_local(&mut self, section: &str, name: &str, cx: &mut Context<Self>) {
-        let mut sections = self.section_set();
+        let mut sections = self.section_set().to_vec();
         if let Some(target) = sections.iter_mut().find(|known| known.id == section) {
             target.name = name.to_owned();
             self.local_sections = Some(sections);
@@ -86,7 +86,7 @@ impl Sidebar {
 
     /// Fixture mode's section delete; its conversations fall back to their default buckets.
     pub fn delete_section_local(&mut self, section: &str, cx: &mut Context<Self>) {
-        let mut sections = self.section_set();
+        let mut sections = self.section_set().to_vec();
         let before = sections.len();
         sections.retain(|known| known.id != section);
         if sections.len() != before {
@@ -108,7 +108,7 @@ impl Sidebar {
             return;
         }
         if self.fixtures.sample {
-            let mut sections = self.section_set();
+            let mut sections = self.section_set().to_vec();
             for section in sections.iter_mut() {
                 if section.kind == SectionKind::Standard {
                     section.channel_ids.retain(|id| *id != channel);
@@ -150,7 +150,7 @@ impl Sidebar {
             let currently_in_stars = stars.channel_ids.contains(&channel);
             let stars_id = stars.id.clone();
             if self.fixtures.sample {
-                let mut updated = sections;
+                let mut updated = sections.to_vec();
                 if let Some(target) = updated.iter_mut().find(|s| s.id == stars_id) {
                     if currently_in_stars {
                         target.channel_ids.retain(|id| *id != channel);
@@ -405,10 +405,13 @@ impl Sidebar {
     pub(super) fn section_menu_input(
         &self,
         key: SharedString,
-        section: Option<ChannelSection>,
+        section: Option<&str>,
         title: String,
         ids: &[ChannelId],
     ) -> SectionMenuInput {
+        let section = section
+            .and_then(|id| self.section_set().iter().find(|known| known.id == id))
+            .cloned();
         let watermark = self.read_watermark();
         let (mut unread, mut unmuted) = (Vec::new(), Vec::new());
         for id in ids {

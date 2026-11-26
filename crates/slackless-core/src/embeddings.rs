@@ -7,7 +7,6 @@
 //! zero network calls during unit/integration tests.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -20,6 +19,7 @@ use sha2::{Digest, Sha256};
 use slackless_store::l2_normalize;
 
 use crate::paths;
+use crate::runtime::block_on;
 
 /// Supported local ONNX sentence embedding models (quantized INT8 for compact disk & fast CPU).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -190,46 +190,14 @@ pub fn detect_embedding_model_setup(model: EmbeddingModel) -> EmbeddingModelStat
     }
 }
 
-/// Shared background Tokio runtime handle for blocking download calls (mirrors `transcribe.rs`).
-fn shared_http_runtime_handle() -> tokio::runtime::Handle {
-    static SHARED_HTTP_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    let rt = SHARED_HTTP_RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("slackless-embed-http")
-            .enable_all()
-            .build()
-            .expect("failed to initialize shared embedding HTTP runtime")
-    });
-    rt.handle().clone()
-}
-
-fn block_on_http<F>(fut: F) -> F::Output
-where
-    F: Future + Send,
-    F::Output: Send,
-{
-    if let Ok(handle) = tokio::runtime::Handle::try_current()
-        && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-    {
-        return tokio::task::block_in_place(|| handle.block_on(fut));
-    }
-    let handle = shared_http_runtime_handle();
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::scope(|s| s.spawn(|| handle.block_on(fut)).join())
-            .expect("embedding http helper thread panicked")
-    } else {
-        handle.block_on(fut)
-    }
-}
-
 /// Download the quantized ONNX model and `vocab.txt` for `model` atomically (`.part` -> rename).
 /// Blocking helper — call on a background executor/thread.
 pub fn download_embedding_model(
     model: EmbeddingModel,
     on_progress: impl Fn(EmbeddingDownloadProgress) + Send + Sync + 'static,
 ) -> std::result::Result<PathBuf, String> {
-    block_on_http(download_embedding_model_async(model, on_progress))
+    block_on(download_embedding_model_async(model, on_progress))
+        .map_err(|e| format!("failed to start async HTTP runtime: {e}"))?
 }
 
 /// Async version of [`download_embedding_model`] for CLI / Tokio callers.
@@ -248,6 +216,7 @@ async fn download_files_to_dir(
     files: Vec<(String, &'static str)>,
     on_progress: impl Fn(EmbeddingDownloadProgress) + Send + Sync + 'static,
 ) -> std::result::Result<(), String> {
+    crate::api::install_default_crypto_provider();
     let client = reqwest::Client::builder()
         .user_agent("slackless/1.0")
         .build()
@@ -648,6 +617,8 @@ impl OnnxEmbedder {
                 dir.display()
             )
         })?;
+        // ONNX Runtime is a shared library mapped on first use; `ort` must not run before it.
+        crate::huddle::onnx_runtime::ensure_loaded()?;
         let tokenizer = WordPieceTokenizer::from_file(&vocab_path)?;
         let threads = std::thread::available_parallelism()
             .map(|n| n.get().clamp(1, 4))

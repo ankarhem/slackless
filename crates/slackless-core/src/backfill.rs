@@ -16,6 +16,7 @@ use crate::api::{ApiError, Page};
 use crate::backend::Backend;
 use crate::client::{CoreError, Emitter, SharedStore, with_store};
 use crate::store::Store;
+use crate::types::time::now_epoch_secs;
 use crate::types::{ChannelId, Message, TeamId, Ts};
 use crate::unfurl::Unfurls;
 
@@ -549,6 +550,7 @@ impl<B: Backend> Backfill<B> {
                         .await;
                 }
             }
+            let fetched_at = now_epoch_secs();
             let page = self.fetch(channel, &latest, &cursor).await?;
             let next = page
                 .next_cursor
@@ -569,7 +571,8 @@ impl<B: Backend> Backfill<B> {
             } else {
                 Vec::new()
             };
-            self.store_page(channel, page.items).await?;
+            self.store_history_page(channel, page.items, fetched_at)
+                .await?;
             if !self.events.emit(Event::StoreChanged {
                 channel: channel.clone(),
             }) {
@@ -758,6 +761,7 @@ impl<B: Backend> Backfill<B> {
             if !std::mem::take(&mut first) {
                 tokio::time::sleep(self.page_delay).await;
             }
+            let fetched_at = now_epoch_secs();
             let page = wait_out_rate_limits(|| {
                 self.backend
                     .replies_page(channel.clone(), thread_ts.clone(), cursor.clone())
@@ -768,7 +772,8 @@ impl<B: Backend> Backfill<B> {
                 .filter(|next| Some(next) != cursor.as_ref());
             let replies_in_page = page.items.iter().filter(|m| m.ts != thread_ts).count() as u64;
             stored += replies_in_page;
-            self.store_page(&channel, page.items).await?;
+            self.store_replies_page(&channel, page.items, fetched_at)
+                .await?;
             if !self.events.emit(Event::StoreChanged {
                 channel: channel.clone(),
             }) {
@@ -781,14 +786,41 @@ impl<B: Backend> Backfill<B> {
         }
     }
 
-    async fn store_page(&self, channel: &ChannelId, items: Vec<Message>) -> Result<(), CoreError> {
+    /// Stores one `conversations.history` page requested at `fetched_at` (unix seconds) after
+    /// naming the channels its unfurls point at: live updates the page predates survive, and
+    /// messages it omits within its span are tombstoned ([`Store::upsert_history_page`]).
+    async fn store_history_page(
+        &self,
+        channel: &ChannelId,
+        items: Vec<Message>,
+        fetched_at: i64,
+    ) -> Result<(), CoreError> {
         self.unfurls.resolve(items.iter());
-        let (ws, channel) = (self.workspace.clone(), channel.clone());
-        with_store(&self.store, move |store| {
-            store.upsert_messages(&ws, &channel, &items)
+        let (ws, target) = (self.workspace.clone(), channel.clone());
+        let tombstoned = with_store(&self.store, move |store| {
+            store.upsert_history_page(&ws, &target, &items, fetched_at)
         })
         .await?;
+        if tombstoned > 0 {
+            tracing::debug!(%channel, tombstoned, "history page tombstoned messages deleted on Slack");
+        }
         Ok(())
+    }
+
+    /// Stores one `conversations.replies` page requested at `fetched_at` (unix seconds) after
+    /// naming the channels its unfurls point at ([`Store::upsert_replies_page`]).
+    async fn store_replies_page(
+        &self,
+        channel: &ChannelId,
+        items: Vec<Message>,
+        fetched_at: i64,
+    ) -> Result<(), CoreError> {
+        self.unfurls.resolve(items.iter());
+        let (ws, target) = (self.workspace.clone(), channel.clone());
+        with_store(&self.store, move |store| {
+            store.upsert_replies_page(&ws, &target, &items, fetched_at)
+        })
+        .await
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ChannelId, Synced>> {

@@ -176,9 +176,16 @@ impl MessagingBackend for SlackApi {
         content: MessageContent,
         thread_ts: Option<Ts>,
         broadcast: bool,
+        client_msg_id: Option<String>,
     ) -> api::Result<PostedMessage> {
-        self.chat_post_message(&channel, &content, thread_ts.as_ref(), broadcast)
-            .await
+        self.chat_post_message_with_client_msg_id(
+            &channel,
+            &content,
+            thread_ts.as_ref(),
+            broadcast,
+            client_msg_id.as_deref(),
+        )
+        .await
     }
     async fn update_message(
         &self,

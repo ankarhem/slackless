@@ -39,17 +39,17 @@ pub struct ChimeSignalClient {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
 }
 
-/// Installs `rustls`'s `ring` `CryptoProvider` as the process-wide default.
+/// Installs `rustls`'s `ring` `CryptoProvider` as the process-wide default (no-op if one is
+/// already installed).
 ///
-/// Safe to call repeatedly (subsequent calls are no-ops). Call once at binary startup so any
-/// crate that uses `rustls::ClientConfig::builder()` succeeds even when both `ring` and
-/// `aws-lc-rs` features are unified across the workspace.
+/// reqwest is built without a crypto provider (`rustls-no-provider`, so no `aws-lc-sys`), and
+/// panics in `ClientBuilder::build()` unless a provider has been installed first. Every
+/// `reqwest::Client` this crate builds calls this; the binaries call it at startup.
 pub fn install_default_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 fn tls_connector() -> Result<Connector> {
-    install_default_crypto_provider();
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };

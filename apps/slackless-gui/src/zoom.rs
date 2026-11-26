@@ -10,22 +10,22 @@
 //! dictation) and the native context menu of text fields from unscaled positions, so away from
 //! 100% they open offset from the caret.
 //!
+//! Every `cx.open_url` passes through the wrapper too, so it applies Preferences' link policy
+//! there: tracking parameters stripped, and a URL whose scheme is outside the protocol allowlist
+//! refused, whichever view (a bot button, a bookmark, a canvas) opens it.
+//!
 //! `Zoom::platform(&self) -> Rc<dyn Platform>` (`Application::with_platform`), the `Zoom`
-//! global, `set_level(usize, &mut App) -> bool`, `FACTORS`, `ACTUAL_SIZE`.
+//! global, `set_level(usize, &mut App) -> bool`, `FACTORS`, `ACTUAL_SIZE`;
+//! `set_strip_tracking_params(bool)`, `set_protocol_allowlist(&str)`,
+//! `open_trusted_url(&str, &App)`, `is_protocol_allowed`, `DEFAULT_PROTOCOL_ALLOWLIST`.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-static STRIP_TRACKING_PARAMS: AtomicBool = AtomicBool::new(true);
-
-/// Enable or disable automatic stripping of tracking query parameters on every `open_url` call.
-pub fn set_strip_tracking_params(enabled: bool) {
-    STRIP_TRACKING_PARAMS.store(enabled, Ordering::Relaxed);
-}
+use std::sync::{Arc, PoisonError, RwLock};
 
 use anyhow::Result;
 use futures::channel::oneshot;
@@ -34,6 +34,77 @@ use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, WindowHandle,
 };
 use smallvec::SmallVec;
+
+/// Preferences' default protocol allowlist (Advanced, `F-SHELL-193`).
+pub const DEFAULT_PROTOCOL_ALLOWLIST: &str = "https, http, mailto, slack";
+
+/// Whether `open_url` strips tracking query parameters (Preferences' privacy setting).
+static STRIP_TRACKING_PARAMS: AtomicBool = AtomicBool::new(true);
+
+/// The URL schemes `open_url` hands to the OS (Preferences' protocol allowlist).
+static PROTOCOL_ALLOWLIST: RwLock<Cow<'static, str>> =
+    RwLock::new(Cow::Borrowed(DEFAULT_PROTOCOL_ALLOWLIST));
+
+thread_local! {
+    /// Set for the one `open_url` call [`open_trusted_url`] makes.
+    static TRUSTED_OPEN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Enable or disable automatic stripping of tracking query parameters on every `open_url` call.
+pub fn set_strip_tracking_params(enabled: bool) {
+    STRIP_TRACKING_PARAMS.store(enabled, Ordering::Relaxed);
+}
+
+/// Limit every `open_url` call to the comma-separated schemes of `allowlist`: a link with any
+/// other scheme (`file:`, `smb:`, ...) is refused, not handed to the OS.
+pub fn set_protocol_allowlist(allowlist: &str) {
+    *PROTOCOL_ALLOWLIST
+        .write()
+        .unwrap_or_else(PoisonError::into_inner) = Cow::Owned(allowlist.to_owned());
+}
+
+/// Open `url` whatever its scheme: a link the user chose to open from the external-link prompt,
+/// or a URL the app built itself. Tracking parameters are still stripped.
+pub fn open_trusted_url(url: &str, cx: &App) {
+    TRUSTED_OPEN.set(true);
+    cx.open_url(url);
+    // `ZoomPlatform::open_url` took the flag; a platform without the wrapper (tests) did not.
+    TRUSTED_OPEN.set(false);
+}
+
+/// Whether `url`'s scheme is permitted by the comma-separated `allowlist` (`F-SHELL-193`).
+pub(crate) fn is_protocol_allowed(url: &str, allowlist: &str) -> bool {
+    let Some((scheme, _)) = url.split_once(':') else {
+        return false;
+    };
+    let scheme = scheme.trim().to_ascii_lowercase();
+    if scheme.is_empty() {
+        return false;
+    }
+    allowlist
+        .split([',', ' ', ';'])
+        .map(|s| s.trim().trim_end_matches(':').to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .any(|allowed| allowed == scheme)
+}
+
+/// What `open_url` hands the OS for `url`: nothing when its scheme is outside `allowlist` and
+/// the open is not `trusted`, else `url` with its tracking parameters stripped when `strip`.
+fn url_to_open<'a>(
+    url: &'a str,
+    allowlist: &str,
+    trusted: bool,
+    strip: bool,
+) -> Option<Cow<'a, str>> {
+    if !trusted && !is_protocol_allowed(url, allowlist) {
+        return None;
+    }
+    Some(if strip {
+        Cow::Owned(slackless_core::strip_tracking_params(url))
+    } else {
+        Cow::Borrowed(url)
+    })
+}
 
 /// Preferences' zoom levels (its `80%` to `150%` choices) as factors.
 pub const FACTORS: [f32; 6] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5];
@@ -252,11 +323,21 @@ impl Platform for ZoomPlatform {
         self.inner.button_layout()
     }
     fn open_url(&self, a0: &str) {
-        if STRIP_TRACKING_PARAMS.load(Ordering::Relaxed) {
-            let cleaned = slackless_core::strip_tracking_params(a0);
-            self.inner.open_url(&cleaned);
-        } else {
-            self.inner.open_url(a0);
+        let trusted = TRUSTED_OPEN.replace(false);
+        let to_open = url_to_open(
+            a0,
+            &PROTOCOL_ALLOWLIST
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+            trusted,
+            STRIP_TRACKING_PARAMS.load(Ordering::Relaxed),
+        );
+        match to_open {
+            Some(url) => self.inner.open_url(&url),
+            None => tracing::warn!(
+                scheme = a0.split_once(':').map_or("", |(scheme, _)| scheme),
+                "refused to open a link: its scheme is outside the protocol allowlist"
+            ),
         }
     }
     fn on_open_urls(&self, a0: Box<dyn FnMut(Vec<String>)>) {
@@ -804,7 +885,84 @@ impl PlatformWindow for ZoomWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{ACTUAL_SIZE, FACTORS, factor_for_level};
+    use super::{
+        ACTUAL_SIZE, DEFAULT_PROTOCOL_ALLOWLIST, FACTORS, factor_for_level, is_protocol_allowed,
+        url_to_open,
+    };
+
+    #[test]
+    fn is_protocol_allowed_parses_separators_colons_case_and_rejects_invalid() {
+        let list = "https:, http; mailto  slack: , zoommtg";
+        assert!(is_protocol_allowed("https://example.com", list));
+        assert!(is_protocol_allowed("HTTPS://EXAMPLE.COM/path", list));
+        assert!(is_protocol_allowed("http://example.com", list));
+        assert!(is_protocol_allowed("mailto:alice@example.com", list));
+        assert!(is_protocol_allowed("slack://channel?id=C1", list));
+        assert!(is_protocol_allowed("zoommtg://zoom.us/join", list));
+
+        // Disallowed schemes
+        assert!(!is_protocol_allowed("javascript:alert(1)", list));
+        assert!(!is_protocol_allowed("file:///etc/passwd", list));
+        assert!(!is_protocol_allowed("ftp://example.com", list));
+
+        // Missing colon, empty scheme, empty allowlist
+        assert!(!is_protocol_allowed("example.com/no-scheme", list));
+        assert!(!is_protocol_allowed(":no-scheme", list));
+        assert!(!is_protocol_allowed("   :leading-space", list));
+        assert!(!is_protocol_allowed("https://example.com", ""));
+        assert!(!is_protocol_allowed("https://example.com", " , ; "));
+    }
+
+    #[test]
+    fn open_url_refuses_schemes_outside_the_allowlist_unless_trusted() {
+        let default = DEFAULT_PROTOCOL_ALLOWLIST;
+        // A bot button, bookmark or canvas link to a local script or a network share.
+        assert_eq!(
+            url_to_open("file:///Users/me/Downloads/x.command", default, false, true),
+            None
+        );
+        assert_eq!(url_to_open("smb://host/share", default, false, true), None);
+        assert_eq!(
+            url_to_open("FILE:///tmp/x.command", default, false, false),
+            None
+        );
+        assert_eq!(url_to_open("x.command", default, false, true), None);
+
+        // Allowed schemes open, tracking parameters stripped only when enabled.
+        let tracked = "https://example.com/?utm_source=slack&id=1";
+        assert_eq!(
+            url_to_open(tracked, default, false, true).as_deref(),
+            Some("https://example.com/?id=1")
+        );
+        assert_eq!(
+            url_to_open(tracked, default, false, false).as_deref(),
+            Some(tracked)
+        );
+        assert_eq!(
+            url_to_open("mailto:alice@example.com", default, false, true).as_deref(),
+            Some("mailto:alice@example.com")
+        );
+
+        // The user's own allowlist decides.
+        assert_eq!(
+            url_to_open("smb://host/share", "https, smb", false, true).as_deref(),
+            Some("smb://host/share")
+        );
+        assert_eq!(
+            url_to_open("http://example.com", "https", false, true),
+            None
+        );
+
+        // A trusted open (the user chose Open link, or the app built the URL) gets past it.
+        assert_eq!(
+            url_to_open("smb://host/share", default, true, true).as_deref(),
+            Some("smb://host/share")
+        );
+        assert_eq!(
+            url_to_open("https://example.com/?fbclid=1", "", true, true).as_deref(),
+            Some("https://example.com/")
+        );
+    }
 
     #[test]
     fn factor_for_level_bounds_checks_corrupted_indices() {

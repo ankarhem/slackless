@@ -91,9 +91,9 @@ impl Sidebar {
         unread
     }
 
-    pub(super) fn total_unread(
+    pub(super) fn total_unread<'a>(
         &self,
-        conversations: &[Conversation],
+        conversations: impl IntoIterator<Item = &'a Conversation>,
         watermark: Option<&Ts>,
     ) -> Unread {
         let mut total = Unread::default();

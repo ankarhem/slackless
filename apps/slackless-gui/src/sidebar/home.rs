@@ -42,7 +42,7 @@ impl Sidebar {
         &self,
         key: SharedString,
         (title, leading): (&str, Option<AnyElement>),
-        conversations: &[Conversation],
+        conversations: &[&Conversation],
         watermark: Option<&Ts>,
         section: Option<&ChannelSection>,
         cx: &mut Context<Self>,
@@ -56,7 +56,7 @@ impl Sidebar {
         let filter = self.section_filter(&key);
         let mut hidden = HiddenConversations::default();
         let mut children = Vec::new();
-        for conversation in conversations.iter() {
+        for &conversation in conversations {
             let unread = self.unread_in(conversation, watermark);
             // A "Find a conversation…" query lists every match, collapsed or stale; otherwise
             // the rows leave out what Slack's rules hide, which the header's "More
@@ -131,7 +131,7 @@ impl Sidebar {
         key: SharedString,
         (title, leading): (&str, Option<AnyElement>),
         section: Option<&ChannelSection>,
-        conversations: &[Conversation],
+        conversations: &[&Conversation],
         hidden: &HiddenConversations,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -149,13 +149,13 @@ impl Sidebar {
         // The ⋮ and right-click menus read the sidebar once, as they open.
         let menu_input = {
             let key = key.clone();
-            let section = section.cloned();
+            let section = section.map(|section| section.id.clone());
             let title = title.to_owned();
             move |this: &gpui_kit::gpui::WeakEntity<Self>, cx: &gpui_kit::gpui::App| {
                 this.upgrade().map(|sidebar| {
                     sidebar.read(cx).section_menu_input(
                         key.clone(),
-                        section.clone(),
+                        section.as_deref(),
                         title.clone(),
                         &ids,
                     )
@@ -365,17 +365,44 @@ impl Sidebar {
         div().relative().child(header.context_menu(context_menu))
     }
 
+    /// The joined channels the Home list shows: the snapshot's, then the ones joined from the
+    /// channel browser this session.
+    pub(super) fn home_channels(&self) -> impl Iterator<Item = &Conversation> {
+        self.fixtures.channels.iter().chain(&self.joined)
+    }
+
+    /// The conversation `id` names among the ones the Home list shows (the channels of
+    /// [`Self::home_channels`] and the DMs). [`Fixtures::conversation`] also finds directory
+    /// and archived entries, so only a hit inside the snapshot's own channel or DM list counts;
+    /// a channel joined this session is looked up among the few joined ones.
+    pub(super) fn listed_conversation(&self, id: &ChannelId) -> Option<&Conversation> {
+        let holds = |list: &[Conversation], conversation: &Conversation| {
+            list.as_ptr_range()
+                .contains(&std::ptr::from_ref(conversation))
+        };
+        self.fixtures
+            .conversation(id)
+            .filter(|conversation| {
+                holds(&self.fixtures.channels, conversation)
+                    || holds(&self.fixtures.dms, conversation)
+            })
+            .or_else(|| {
+                self.joined
+                    .iter()
+                    .find(|conversation| conversation.id == *id)
+            })
+    }
+
     /// The sections under the nav rows. Live: the user's own sidebar sections in their order,
     /// the built-in Channels and Direct messages buckets holding every conversation no other
     /// section claims, as in Slack. Sample workspace: plain Channels and Direct messages.
     pub(super) fn section_list(
         &self,
-        channels: &[Conversation],
         watermark: Option<&Ts>,
         cx: &mut Context<Self>,
     ) -> Vec<(AnyElement, ListChild)> {
         self.rows.borrow_mut().clear();
-        let sections: Vec<ChannelSection> = self.section_set();
+        let sections = self.section_set();
         let home_keep = |c: &Conversation| -> bool {
             if c.id == self.selected {
                 return true;
@@ -393,7 +420,7 @@ impl Sidebar {
                 vip_users: self.vip_users.clone(),
                 ..Default::default()
             };
-            let vip_dms: Vec<Conversation> = self
+            let vip_dms: Vec<&Conversation> = self
                 .fixtures
                 .dms
                 .iter()
@@ -405,7 +432,6 @@ impl Sidebar {
                         vip_settings.is_vip(uid.as_str(), handle, display)
                     })
                 })
-                .cloned()
                 .collect();
             if !vip_dms.is_empty() {
                 list.extend(
@@ -429,11 +455,10 @@ impl Sidebar {
             }
         }
         if self.home_prefs.unreads_section {
-            let unread_all: Vec<Conversation> = channels
-                .iter()
+            let unread_all: Vec<&Conversation> = self
+                .home_channels()
                 .chain(&self.fixtures.dms)
                 .filter(|c| self.unread_in(c, watermark).count > 0)
-                .cloned()
                 .collect();
             if !unread_all.is_empty() {
                 list.extend(self.section(
@@ -448,11 +473,10 @@ impl Sidebar {
         }
         let has_server_stars = sections.iter().any(|s| s.kind == SectionKind::Stars);
         if !has_server_stars && !self.local_starred.is_empty() {
-            let starred_rows: Vec<Conversation> = channels
-                .iter()
+            let starred_rows: Vec<&Conversation> = self
+                .home_channels()
                 .chain(&self.fixtures.dms)
                 .filter(|c| self.local_starred.contains(&c.id) && home_keep(c))
-                .cloned()
                 .collect();
             if !starred_rows.is_empty() {
                 list.extend(
@@ -476,29 +500,19 @@ impl Sidebar {
             }
         }
         if sections.is_empty() {
-            let filtered_ch: Vec<Conversation> = channels
-                .iter()
+            let filtered_ch: Vec<&Conversation> = self
+                .home_channels()
                 .filter(|c| !self.local_starred.contains(&c.id) && home_keep(c))
-                .cloned()
                 .collect();
-            let filtered_dm: Vec<Conversation> = self
+            let filtered_dm: Vec<&Conversation> = self
                 .fixtures
                 .dms
                 .iter()
                 .filter(|c| !self.local_starred.contains(&c.id) && home_keep(c))
-                .cloned()
                 .collect();
             if self.home_prefs.separate_private {
-                let public: Vec<Conversation> = filtered_ch
-                    .iter()
-                    .filter(|c| !c.is_private)
-                    .cloned()
-                    .collect();
-                let private: Vec<Conversation> = filtered_ch
-                    .iter()
-                    .filter(|c| c.is_private)
-                    .cloned()
-                    .collect();
+                let (private, public): (Vec<&Conversation>, Vec<&Conversation>) =
+                    filtered_ch.into_iter().partition(|c| c.is_private);
                 list.extend(self.section(
                     "channels".into(),
                     ("Channels", None),
@@ -568,40 +582,30 @@ impl Sidebar {
                 claimed.entry(id).or_insert(section.id.as_str());
             }
         }
-        let member = |id: &ChannelId| {
-            channels
-                .iter()
-                .chain(&self.fixtures.dms)
-                .find(|conversation| conversation.id == *id)
-        };
-        for section in &sections {
-            let mut rows: Vec<Conversation> = match section.kind {
-                SectionKind::Channels => channels
-                    .iter()
+        for section in sections {
+            let mut rows: Vec<&Conversation> = match section.kind {
+                SectionKind::Channels => self
+                    .home_channels()
                     .filter(|c| !claimed.contains_key(&c.id) && !(connect && c.is_ext_shared))
-                    .cloned()
                     .collect(),
-                SectionKind::SlackConnect => channels
-                    .iter()
+                SectionKind::SlackConnect => self
+                    .home_channels()
                     .filter(|c| c.is_ext_shared && !claimed.contains_key(&c.id))
-                    .cloned()
                     .collect(),
                 SectionKind::DirectMessages => self
                     .fixtures
                     .dms
                     .iter()
                     .filter(|c| !claimed.contains_key(&c.id))
-                    .cloned()
                     .collect(),
                 _ => section
                     .channel_ids
                     .iter()
                     .filter(|id| claimed.get(id) == Some(&section.id.as_str()))
-                    .filter_map(member)
-                    .cloned()
+                    .filter_map(|id| self.listed_conversation(id))
                     .collect(),
             };
-            rows.retain(&home_keep);
+            rows.retain(|c| home_keep(c));
             if rows.is_empty() && !builtin(&section.kind) {
                 continue;
             }
@@ -1129,16 +1133,16 @@ impl Sidebar {
             }
             None => row,
         };
-        // Right-click: the row's own menu (details, copy, move, notify, leave).
-        let menu_conversation = conversation.clone();
-        let menu_section = section.cloned();
+        // Right-click: the row's own menu (details, copy, move, notify, leave), gathered from
+        // the sidebar as it opens.
+        let (menu_id, menu_section) = (id.clone(), section.map(|section| section.id.clone()));
         let this = cx.entity().downgrade();
         row.on_click(cx.listener(move |this, _, _, cx| this.select_row(id.clone(), cx)))
             .context_menu(move |menu, window, cx| {
-                let Some(input) = this.upgrade().map(|sidebar| {
+                let Some(input) = this.upgrade().and_then(|sidebar| {
                     sidebar
                         .read(cx)
-                        .channel_menu_input(&menu_conversation, menu_section.as_ref())
+                        .channel_menu_input(&menu_id, menu_section.as_deref())
                 }) else {
                     return menu;
                 };
@@ -1147,12 +1151,15 @@ impl Sidebar {
     }
 
     /// One row menu's whole input, gathered as the menu opens: the label, the workspace's
-    /// archive link, the custom sections to move into and the current notify level.
+    /// archive link, the custom sections to move into and the current notify level. `None`
+    /// once the row's conversation left the list.
     pub(super) fn channel_menu_input(
         &self,
-        conversation: &Conversation,
-        section: Option<&ChannelSection>,
-    ) -> ChannelMenuInput {
+        channel: &ChannelId,
+        section: Option<&str>,
+    ) -> Option<ChannelMenuInput> {
+        let conversation = self.listed_conversation(channel)?;
+        let section = section.and_then(|id| self.section_set().iter().find(|known| known.id == id));
         let link = match self.fixtures.workspaces.first() {
             Some(team) if !team.domain.is_empty() => {
                 format!(
@@ -1178,7 +1185,7 @@ impl Sidebar {
                 )
             })
             .collect();
-        ChannelMenuInput {
+        Some(ChannelMenuInput {
             channel: conversation.id.clone(),
             label: self.fixtures.conversation_label(conversation),
             link,
@@ -1194,7 +1201,7 @@ impl Sidebar {
             level: self
                 .notify_level(&conversation.id)
                 .unwrap_or(NotifyLevel::Everything),
-        }
+        })
     }
 
     /// Slack's floating "More unreads" chip for one edge of the list: it points at hidden

@@ -91,12 +91,12 @@ struct FakeState {
     posted_messages: Vec<(ChannelId, String)>,
     /// `chat.postMessage` thread replies: `(channel, thread_ts, text, broadcast)`.
     posted_thread_replies: Vec<(ChannelId, Ts, String, bool)>,
-    /// When true, `post_message` fails with a Slack error (for offline retry tests).
-    fail_post_message: bool,
     /// Optional explicit error override returned by `post_message`.
     post_message_error: Option<FakeSendError>,
     /// Optional gate blocking `post_message` to test concurrent `FlushOutbox` idempotency.
     post_message_gate: Option<Arc<tokio::sync::Notify>>,
+    /// `client_msg_id` of every `chat.postMessage` attempt, failed ones included, in order.
+    post_message_client_msg_ids: Vec<Option<String>>,
     /// `reactions.add` asks, in order.
     reaction_adds: Vec<(ChannelId, Ts, String)>,
     /// Optional explicit error override returned by `add_reaction`.
@@ -775,6 +775,7 @@ impl crate::backend::MessagingBackend for FakeBackend {
         content: MessageContent,
         thread_ts: Option<Ts>,
         broadcast: bool,
+        client_msg_id: Option<String>,
     ) -> api::Result<PostedMessage> {
         let gate = self.state.lock().unwrap().post_message_gate.clone();
         if let Some(gate) = gate {
@@ -782,11 +783,11 @@ impl crate::backend::MessagingBackend for FakeBackend {
         }
         {
             let mut state = self.state.lock().unwrap();
+            state
+                .post_message_client_msg_ids
+                .push(client_msg_id.clone());
             if let Some(ref err) = state.post_message_error {
                 return Err(err.to_api_error());
-            }
-            if state.fail_post_message {
-                return Err(ApiError::Slack("ratelimited".into()));
             }
             state
                 .posted_messages
@@ -813,7 +814,7 @@ impl crate::backend::MessagingBackend for FakeBackend {
             channel,
             ts,
             message: Some(message),
-            client_msg_id: None,
+            client_msg_id,
         })
     }
 
@@ -4263,7 +4264,7 @@ async fn offline_queue_buffers_and_flushes_on_reconnect() {
 #[tokio::test]
 async fn offline_queue_persists_across_restart_and_retries_or_discards() {
     let fake = FakeBackend::default();
-    fake.state.lock().unwrap().fail_post_message = true;
+    fake.state.lock().unwrap().post_message_error = Some(FakeSendError::Slack("not_in_channel"));
     let (store, events, mut rx) = fake_core_parts();
     let mut core = Core::new(
         fake.clone(),
@@ -4340,7 +4341,7 @@ async fn offline_queue_persists_across_restart_and_retries_or_discards() {
             .last_error
             .as_deref()
             .unwrap_or("")
-            .contains("ratelimited")
+            .contains("not_in_channel")
     );
     assert_eq!(
         store
@@ -4353,7 +4354,7 @@ async fn offline_queue_persists_across_restart_and_retries_or_discards() {
     );
 
     // Now backend recovers -> RetryOutboxItem succeeds and removes the SQLite row.
-    fake.state.lock().unwrap().fail_post_message = false;
+    fake.state.lock().unwrap().post_message_error = None;
     core2
         .handle(Command::Messaging(MessagingCommand::RetryOutboxItem(
             outbox_id,
@@ -5251,7 +5252,7 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
     assert_eq!(stored_conv.last_read, Some(Ts::from("99.0")));
 
     // 3. DiscardOutboxItem after a failed flush deletes the SQLite outbox row.
-    fake.state.lock().unwrap().fail_post_message = true;
+    fake.state.lock().unwrap().post_message_error = Some(FakeSendError::Slack("not_in_channel"));
     core.on_rtm(RtmEvent::State(ConnectionState::Disconnected {
         reason: "down2".into(),
     }))
@@ -5300,6 +5301,78 @@ async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn queued_mark_read_replay_never_moves_a_newer_stored_cursor_back() {
+    let fake = FakeBackend::default();
+    fake.state.lock().unwrap().mark_read_ok = true;
+    let (store, events, _rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+    // Another device read up to 200.0 while this one was offline, and that cursor reached the
+    // store before the mark queued here (150.0) is replayed.
+    store
+        .lock()
+        .unwrap()
+        .upsert_conversation(
+            &ws,
+            &Conversation {
+                id: c1(),
+                last_read: Some(Ts::from("200.0")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+    let stealth_mode = AtomicBool::new(false);
+    let stored_last_read = || {
+        store
+            .lock()
+            .unwrap()
+            .conversation(&ws, &c1())
+            .unwrap()
+            .and_then(|conv| conv.last_read)
+    };
+
+    Core::execute_queued_mutation(
+        &core.ctx(),
+        &stealth_mode,
+        QueuedMutation::MarkRead {
+            channel: c1(),
+            ts: Ts::from("150.0"),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        fake.state.lock().unwrap().mark_calls.is_empty(),
+        "a stale replay must not reach Slack"
+    );
+    assert_eq!(stored_last_read(), Some(Ts::from("200.0")));
+
+    // A queued mark ahead of the stored cursor still replays.
+    Core::execute_queued_mutation(
+        &core.ctx(),
+        &stealth_mode,
+        QueuedMutation::MarkRead {
+            channel: c1(),
+            ts: Ts::from("250.0"),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fake.state.lock().unwrap().mark_calls,
+        vec![(c1(), Ts::from("250.0"))]
+    );
+    assert_eq!(stored_last_read(), Some(Ts::from("250.0")));
 }
 
 #[tokio::test]
@@ -7762,6 +7835,7 @@ async fn outbox_concurrent_flush_is_idempotent_and_recovers_sending_rows_on_rest
         let mut s = store.lock().unwrap();
         let p1 = crate::outbox::OutboxPayload::Message {
             content: MessageContent::plain("first fifo"),
+            client_msg_id: None,
         }
         .encode();
         let item1 = s
@@ -7780,6 +7854,7 @@ async fn outbox_concurrent_flush_is_idempotent_and_recovers_sending_rows_on_rest
 
         let p2 = crate::outbox::OutboxPayload::Message {
             content: MessageContent::plain("second fifo"),
+            client_msg_id: None,
         }
         .encode();
         s.enqueue_outbox(
@@ -7884,7 +7959,8 @@ async fn outbox_retry_offline_resets_to_pending_and_discard_removes_row() {
     .await;
     let id = store.lock().unwrap().list_outbox(&ws).unwrap()[0].id;
 
-    // Explicit flush while still returning 503 -> marks item Failed.
+    // A permanent rejection during an explicit flush parks the item as Failed.
+    fake.state.lock().unwrap().post_message_error = Some(FakeSendError::Slack("not_in_channel"));
     core.handle(Command::Messaging(MessagingCommand::FlushOutbox))
         .await;
     wait_until("marked failed", || {
@@ -7922,6 +7998,7 @@ async fn outbox_retry_offline_resets_to_pending_and_discard_removes_row() {
         let mut s = store.lock().unwrap();
         let payload = crate::outbox::OutboxPayload::Message {
             content: MessageContent::plain("other workspace"),
+            client_msg_id: None,
         }
         .encode();
         s.enqueue_outbox(
@@ -7957,4 +8034,127 @@ async fn outbox_retry_offline_resets_to_pending_and_discard_removes_row() {
         .await;
     assert_eq!(next(&mut rx).await, Event::OutboxUpdated(Vec::new()));
     assert!(store.lock().unwrap().list_outbox(&ws).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn outbox_retry_reuses_the_client_msg_id_of_the_first_attempt() {
+    let fake = FakeBackend::default();
+    fake.state.lock().unwrap().post_message_error =
+        Some(FakeSendError::Status(503, "service unavailable"));
+    let (store, events, mut rx) = fake_core_parts();
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    // The first attempt fails transiently (Slack may still have accepted it), so the message
+    // waits in the outbox.
+    core.handle(Command::Messaging(MessagingCommand::SendMessage {
+        channel: c1(),
+        content: MessageContent::plain("posted once"),
+        thread_ts: None,
+        broadcast: false,
+    }))
+    .await;
+    match next(&mut rx).await {
+        Event::OutboxUpdated(items) => assert_eq!(items.len(), 1),
+        other => panic!("expected OutboxUpdated, got {other:?}"),
+    }
+
+    fake.state.lock().unwrap().post_message_error = None;
+    core.handle(Command::Messaging(MessagingCommand::FlushOutbox))
+        .await;
+    loop {
+        if let Event::OutboxUpdated(items) = next(&mut rx).await
+            && items.is_empty()
+        {
+            break;
+        }
+    }
+
+    let ids = fake
+        .state
+        .lock()
+        .unwrap()
+        .post_message_client_msg_ids
+        .clone();
+    assert_eq!(ids.len(), 2, "one failed attempt and one retry");
+    assert!(
+        ids[0].is_some(),
+        "the first attempt carries a client_msg_id"
+    );
+    assert_eq!(
+        ids[1], ids[0],
+        "the retry must reuse the first attempt's client_msg_id"
+    );
+}
+
+#[tokio::test]
+async fn outbox_flush_stops_at_a_transient_failure_and_keeps_the_item_pending() {
+    use crate::store::{NewOutboxItem, OutboxKind, OutboxStatus};
+
+    let fake = FakeBackend::default();
+    fake.state.lock().unwrap().post_message_error =
+        Some(FakeSendError::Status(503, "service unavailable"));
+    let (store, events, mut rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+    for text in ["first", "second"] {
+        let payload = crate::outbox::OutboxPayload::Message {
+            content: MessageContent::plain(text),
+            client_msg_id: None,
+        }
+        .encode();
+        store
+            .lock()
+            .unwrap()
+            .enqueue_outbox(
+                &ws,
+                &NewOutboxItem {
+                    channel_id: &c1(),
+                    thread_ts: None,
+                    kind: OutboxKind::Message,
+                    payload_json: &payload,
+                    last_error: None,
+                },
+            )
+            .unwrap();
+    }
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+    assert!(matches!(next(&mut rx).await, Event::OutboxUpdated(_)));
+
+    core.handle(Command::Messaging(MessagingCommand::FlushOutbox))
+        .await;
+    // The first item is claimed, then the transient failure returns it to `pending`.
+    for expected in [OutboxStatus::Sending, OutboxStatus::Pending] {
+        match next(&mut rx).await {
+            Event::OutboxUpdated(items) => assert_eq!(items[0].status, expected),
+            other => panic!("expected OutboxUpdated, got {other:?}"),
+        }
+    }
+    // A flush pass holds this lock until it ends: once acquired, the pass is over.
+    drop(core.outbox_flush_lock.lock().await);
+
+    let items = store.lock().unwrap().list_outbox(&ws).unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|i| i.status == OutboxStatus::Pending));
+    assert_eq!(items[0].attempts, 1);
+    assert_eq!(
+        items[1].attempts, 0,
+        "a later item must not overtake the one that failed"
+    );
+    assert_eq!(
+        fake.state.lock().unwrap().post_message_client_msg_ids.len(),
+        1
+    );
 }

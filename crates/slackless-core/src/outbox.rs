@@ -11,11 +11,18 @@ use crate::types::Ts;
 pub enum OutboxPayload {
     Message {
         content: MessageContent,
+        /// Minted before the first send attempt and reused by every retry, so Slack drops a
+        /// retry of a post it already accepted. `None` on rows queued before it was recorded.
+        #[serde(default)]
+        client_msg_id: Option<String>,
     },
     Reply {
         content: MessageContent,
         #[serde(default)]
         broadcast: bool,
+        /// As on [`OutboxPayload::Message`].
+        #[serde(default)]
+        client_msg_id: Option<String>,
     },
     ReactionAdd {
         ts: Ts,
@@ -51,7 +58,7 @@ impl OutboxPayload {
     /// The message body content when this entry is a channel message or thread reply.
     pub fn content(&self) -> Option<&MessageContent> {
         match self {
-            Self::Message { content } | Self::Reply { content, .. } => Some(content),
+            Self::Message { content, .. } | Self::Reply { content, .. } => Some(content),
             Self::ReactionAdd { .. } | Self::ReactionRemove { .. } => None,
         }
     }
@@ -59,7 +66,7 @@ impl OutboxPayload {
     /// Human-readable single-line preview for inline cards and top-bar menus.
     pub fn preview_text(&self) -> String {
         match self {
-            Self::Message { content } | Self::Reply { content, .. } => {
+            Self::Message { content, .. } | Self::Reply { content, .. } => {
                 let text = content.text.trim();
                 if text.is_empty() {
                     content
@@ -116,6 +123,7 @@ pub fn is_transient_send_error(err: &ApiError) -> bool {
                 | "fatal_error"
         ),
         ApiError::AuthExpired(_)
+        | ApiError::BodyTooLarge { .. }
         | ApiError::FileAuthRejected
         | ApiError::UntrustedUrl(_)
         | ApiError::Url(_)
@@ -182,10 +190,27 @@ mod tests {
         let long = "🎉".repeat(60);
         let p = OutboxPayload::Message {
             content: MessageContent::plain(long),
+            client_msg_id: Some("6a1f3c2e-8b1d-4c3e-9f0a-1b2c3d4e5f60".into()),
         };
         let encoded = p.encode();
         let decoded = OutboxPayload::decode(&encoded).expect("decode message");
         assert_eq!(decoded, p);
+
+        // Rows queued before `client_msg_id` was recorded still decode, without one.
+        let mut legacy: serde_json::Value = serde_json::from_str(&encoded).expect("json");
+        legacy
+            .as_object_mut()
+            .expect("payload object")
+            .remove("client_msg_id");
+        let legacy = OutboxPayload::decode(&legacy.to_string()).expect("decode legacy row");
+        assert!(matches!(
+            legacy,
+            OutboxPayload::Message {
+                client_msg_id: None,
+                ..
+            }
+        ));
+        assert_eq!(legacy.content(), p.content());
         assert_eq!(decoded.kind(), OutboxKind::Message);
         let summary = decoded.summary();
         assert!(summary.ends_with('…'));

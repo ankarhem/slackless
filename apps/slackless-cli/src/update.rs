@@ -1,10 +1,10 @@
 //! Self-update command (`slackless update`) backed by GitHub Releases.
 //!
 //! Delegates version comparison, GitHub release fetching (filtering out drafts and prereleases),
-//! pure-Rust HTTPS download & SHA-256 verification, archive extraction, macOS install-path
-//! resolution, and CLI symlink refresh to `slackless_core::domain::updater`. Safely stops a
-//! running `Slackless.app` before swapping on `--restart` and performs an atomic swap with
-//! `.app.prev` rollback.
+//! pure-Rust HTTPS download & SHA-256 verification, archive extraction, code-signature
+//! verification against the installed app, macOS install-path resolution, the `.app` swap with
+//! `.app.prev` rollback, and CLI symlink refresh to `slackless_core::domain::updater`. Safely
+//! stops a running `Slackless.app` before swapping on `--restart` and relaunches it afterwards.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -21,10 +21,16 @@ const QUIT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "macos")]
 const QUIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Executable name of the GUI inside `Slackless.app` (`CFBundleExecutable` in
+/// `scripts/bundle-macos.sh`). `pgrep -x` matches executable names, so the bundle's display name
+/// `Slackless` would never match the running app.
+#[cfg(target_os = "macos")]
+const APP_PROCESS_NAME: &str = "slackless-gui";
+
 #[cfg(target_os = "macos")]
 fn is_slackless_app_running() -> bool {
-    Command::new("pgrep")
-        .args(["-x", "Slackless"])
+    Command::new("/usr/bin/pgrep")
+        .args(["-x", APP_PROCESS_NAME])
         .status()
         .is_ok_and(|s| s.success())
 }
@@ -109,13 +115,18 @@ async fn install_in_stage(
         .arg(&new_app)
         .status();
 
+    // Refuse an update that is not signed like the installed app, before quitting anything.
+    let reference = updater::update_signature_reference(target_app);
+    updater::verify_update_signature(&new_app, reference.as_deref())
+        .map_err(|err| anyhow::anyhow!(err))?;
+
     // Stop a running Slackless.app and verify process exit BEFORE swapping the bundle on disk.
     if restart {
         quit_running_app_and_wait()?;
     }
 
     // Atomic swap with `.prev` rollback.
-    swap_app_bundle(&new_app, target_app)?;
+    updater::swap_app_bundle(&new_app, target_app).map_err(|err| anyhow::anyhow!(err))?;
 
     // Refresh CLI symlink to point at the newly installed bundle.
     let linked_cli = updater::install_cli_symlink(target_app);
@@ -141,58 +152,6 @@ async fn install_in_stage(
     }
 
     Ok((target_app.to_path_buf(), linked_cli))
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn swap_app_bundle(new_app: &Path, target_app: &Path) -> Result<()> {
-    let prev_app = target_app.with_extension("app.prev");
-    if prev_app.exists() {
-        std::fs::remove_dir_all(&prev_app)
-            .with_context(|| format!("removing stale backup {}", prev_app.display()))?;
-    }
-    let had_existing = target_app.exists();
-    if had_existing {
-        std::fs::rename(target_app, &prev_app)
-            .with_context(|| format!("moving existing {} aside", target_app.display()))?;
-    }
-    if let Err(err) = move_dir_across_fs(new_app, target_app) {
-        if had_existing
-            && prev_app.exists()
-            && let Err(rb_err) = std::fs::rename(&prev_app, target_app)
-        {
-            anyhow::bail!(
-                "installing to {} failed ({err:#}); rollback from {} also failed ({rb_err})",
-                target_app.display(),
-                prev_app.display()
-            );
-        }
-        return Err(err).with_context(|| format!("installing to {}", target_app.display()));
-    }
-    if prev_app.exists() {
-        std::fs::remove_dir_all(&prev_app)
-            .with_context(|| format!("cleaning up previous bundle {}", prev_app.display()))?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn move_dir_across_fs(src: &Path, dst: &Path) -> Result<()> {
-    if !src.exists() {
-        anyhow::bail!("source bundle does not exist: {}", src.display());
-    }
-    if std::fs::rename(src, dst).is_ok() {
-        return Ok(());
-    }
-    let out = Command::new("ditto")
-        .arg(src)
-        .arg(dst)
-        .output()
-        .context("copying Slackless.app with ditto")?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("ditto exited with {}: {}", out.status, stderr.trim());
-    }
-    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -331,39 +290,7 @@ pub async fn run_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    use slackless_core::domain::updater::{
-        dir_is_writable, find_sha256_entry, is_safe_asset_name, parse_version,
-    };
-
-    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(label: &str) -> Self {
-            let n = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "slackless-cli-update-test-{}-{}-{n}",
-                label,
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("create temp dir");
-            Self(dir)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use slackless_core::domain::updater::{find_sha256_entry, is_safe_asset_name, parse_version};
 
     #[test]
     fn delegates_version_and_checksum_validation_to_core_updater() {
@@ -411,57 +338,66 @@ mod tests {
         }
     }
 
+    /// Child half of [`quit_detection_matches_the_bundle_executable_name`]: with the env marker
+    /// set, announce on stdout and block until stdin closes; returns at once otherwise.
+    #[test]
+    fn pgrep_probe_child() {
+        if std::env::var_os("SLACKLESS_PGREP_PROBE").is_none() {
+            return;
+        }
+        println!("ready");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
-    fn dir_is_writable_and_bundle_swap_including_rollback() {
-        let dir = TempDir::new("swap");
-        assert!(dir_is_writable(dir.path()));
-        assert!(!dir_is_writable(&dir.path().join("does-not-exist")));
-        let plain_file = dir.path().join("file.txt");
-        std::fs::write(&plain_file, b"hi").unwrap();
-        assert!(!dir_is_writable(&plain_file));
+    fn quit_detection_matches_the_bundle_executable_name() {
+        use std::io::{BufRead, BufReader};
+        use std::process::Stdio;
 
-        // Fresh install via swap_app_bundle.
-        let stage1 = dir.path().join("stage1/Slackless.app");
-        let target = dir.path().join("Apps/Slackless.app");
-        std::fs::create_dir_all(stage1.join("Contents")).unwrap();
-        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        std::fs::write(stage1.join("Contents/version"), b"v1").unwrap();
+        // A real Slackless.app on this machine would make the "not running" checks meaningless.
+        if is_slackless_app_running() {
+            eprintln!("skipping: a {APP_PROCESS_NAME} process is already running");
+            return;
+        }
 
-        swap_app_bundle(&stage1, &target).expect("fresh install");
-        assert_eq!(
-            std::fs::read_to_string(target.join("Contents/version")).unwrap(),
-            "v1"
+        // Run this test binary again under the bundle's executable name (CFBundleExecutable in
+        // scripts/bundle-macos.sh; hard link where the volumes allow, else a copy): `pgrep -x`
+        // matches the executable name of a process, whatever APP_PROCESS_NAME claims.
+        let dir = std::env::temp_dir().join(format!("slackless-cli-pgrep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let exe = std::env::current_exe().expect("current exe");
+        let probe = dir.join("slackless-gui");
+        if std::fs::hard_link(&exe, &probe).is_err() {
+            std::fs::copy(&exe, &probe).expect("copy test binary");
+        }
+
+        let mut child = Command::new(&probe)
+            .args(["--exact", "update::tests::pgrep_probe_child", "--nocapture"])
+            .env("SLACKLESS_PGREP_PROBE", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn probe");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let ready = BufReader::new(stdout)
+            .lines()
+            .any(|line| line.is_ok_and(|line| line == "ready"));
+        assert!(ready, "probe must come up and announce itself");
+        assert!(
+            is_slackless_app_running(),
+            "pgrep must find a process named {APP_PROCESS_NAME}"
         );
-        assert!(!target.with_extension("app.prev").exists());
 
-        // Upgrade replaces v1 with v2 and removes .app.prev.
-        let stage2 = dir.path().join("stage2/Slackless.app");
-        std::fs::create_dir_all(stage2.join("Contents")).unwrap();
-        std::fs::write(stage2.join("Contents/version"), b"v2").unwrap();
-
-        swap_app_bundle(&stage2, &target).expect("upgrade install");
-        assert_eq!(
-            std::fs::read_to_string(target.join("Contents/version")).unwrap(),
-            "v2"
+        drop(child.stdin.take());
+        child.wait().expect("probe exits once stdin closes");
+        assert!(
+            !is_slackless_app_running(),
+            "pgrep must not find the exited probe"
         );
-        assert!(!target.with_extension("app.prev").exists());
 
-        // Failed swap (missing new_app) rolls back to v2 intact.
-        let missing_stage = dir.path().join("stage3/Missing.app");
-        assert!(swap_app_bundle(&missing_stage, &target).is_err());
-        assert_eq!(
-            std::fs::read_to_string(target.join("Contents/version")).unwrap(),
-            "v2"
-        );
-        assert!(!target.with_extension("app.prev").exists());
-
-        // Direct move_dir_across_fs test.
-        let src = dir.path().join("move-src");
-        let dst = dir.path().join("move-dst");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("marker"), b"ok").unwrap();
-        move_dir_across_fs(&src, &dst).expect("move dir");
-        assert_eq!(std::fs::read_to_string(dst.join("marker")).unwrap(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

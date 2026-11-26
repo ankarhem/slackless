@@ -355,4 +355,6 @@ pub use helpers::{list_to_csv, list_to_json};
 #[cfg(test)]
 pub(crate) use live::group_live_rows;
 pub use live::live_list_view;
-pub use share::{ListShareAccessRequest, ListShareTab};
+pub use share::ListShareAccessRequest;
+#[cfg(test)]
+pub(crate) use share::ListShareTab;

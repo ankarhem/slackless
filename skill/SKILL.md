@@ -807,27 +807,29 @@ Native Amazon Chime huddles from the terminal:
 #### mcp
 
 ```sh
-slackless mcp [--workspace TEAM_ID]
+slackless mcp [--workspace TEAM_ID] [--read-only]
 ```
 
-Runs a lightweight JSON-RPC 2.0 stdio MCP server supporting tools, resources, and prompts (`initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`, `prompts/list`, `prompts/get`). Pass `--workspace TEAM_ID` to set a default workspace when multiple archives exist.
+Runs a stdio MCP server (built on the official Rust SDK `rmcp`; protocol versions 2024-11-05 through 2025-06-18 are supported and any other requested version negotiates to 2025-03-26) supporting tools, resources, and prompts (`initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`, `prompts/list`, `prompts/get`). Pass `--workspace TEAM_ID` to set a default workspace when multiple archives exist.
+Pass `--read-only` to withhold the live write tools (`send_message`, `reply_thread`, `add_reaction`): they are left out of `tools/list` and `tools/call` rejects them with JSON-RPC `-32602`.
+Tool arguments are validated against each tool's `inputSchema` before the tool runs; malformed arguments come back as `isError: true` with `{"error":"invalid_args","message":...}`. A request for a known method whose params do not parse (for example a `tools/call` without `name`) is rejected with JSON-RPC `-32602`; unparsable lines are ignored, as in the other official MCP SDKs.
 
 ##### Exposed tools
 
-| Tool                  | Mode         | Summary                                                                                                                      |
-| --------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------- |
-| `list_workspaces`     | Offline      | Stored sessions and local SQLite archives with message counts and default workspace                                          |
-| `list_channels`       | Offline      | Channels and/or DMs for a workspace (`kind`: `all`/`channels`/`dms`, optional `filter`, `include_archived`, `limit`)         |
-| `search_messages`     | Offline      | Local FTS5 search over messages, file names, and audio/video transcripts (single or all-workspace, `recent` or `relevant`)   |
-| `read_channel`        | Offline/Live | Recent or windowed channel/DM messages (`limit`, `since`, `before`, `include_deleted`, `live`)                               |
-| `read_thread`         | Offline/Live | Thread root and replies (`channel`, `thread_ts`, optional `live`, `limit`)                                                   |
-| `get_transcript`      | Offline      | Fetch stored audio/video file transcript by `file_id` (with timed cues and duration when available)                          |
-| `list_transcripts`    | Offline      | List stored audio/video file transcripts and huddle transcript sessions (`kind`: `all`/`file`/`huddle`, excerpts, durations, cue counts) |
+| Tool                  | Mode         | Summary                                                                                                                                                                                                              |
+| --------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_workspaces`     | Offline      | Stored sessions and local SQLite archives with message counts and default workspace                                                                                                                                  |
+| `list_channels`       | Offline      | Channels and/or DMs for a workspace (`kind`: `all`/`channels`/`dms`, optional `filter`, `include_archived`, `limit`)                                                                                                 |
+| `search_messages`     | Offline      | Local FTS5 search over messages, file names, and audio/video transcripts (single or all-workspace, `recent` or `relevant`)                                                                                           |
+| `read_channel`        | Offline/Live | Recent or windowed channel/DM messages (`limit`, `since`, `before`, `include_deleted`, `live`)                                                                                                                       |
+| `read_thread`         | Offline/Live | Thread root and replies (`channel`, `thread_ts`, optional `live`, `limit`)                                                                                                                                           |
+| `get_transcript`      | Offline      | Fetch stored audio/video file transcript by `file_id` (with timed cues and duration when available)                                                                                                                  |
+| `list_transcripts`    | Offline      | List stored audio/video file transcripts and huddle transcript sessions (`kind`: `all`/`file`/`huddle`, excerpts, durations, cue counts)                                                                             |
 | `export_conversation` | Offline      | Export a channel (`include_threads`, `include_deleted`, `limit`), thread (`thread_ts`), file transcript (`file_id`), or huddle transcript (`huddle_id`) as Markdown (`md`) or JSON (`json`) returned as tool content |
-| `get_catchup_summary` | Offline      | Local SQLite activity digest over `since_hours` (default `24`): unread/recent channels, mentions, active threads, and new transcripts (single or all-workspace) |
-| `send_message`        | Live         | Post a message (`chat.postMessage`) with pre-send secret detection and local archive echo                                    |
-| `reply_thread`        | Live         | Reply in a thread (`chat.postMessage` + `thread_ts`, optional `reply_broadcast`)                                             |
-| `add_reaction`        | Live         | Add an emoji reaction (`reactions.add`)                                                                                      |
+| `get_catchup_summary` | Offline      | Local SQLite activity digest over `since_hours` (default `24`): unread/recent channels, mentions, active threads, and new transcripts (single or all-workspace)                                                      |
+| `send_message`        | Live         | Post a message (`chat.postMessage`) with pre-send secret detection and local archive echo                                                                                                                            |
+| `reply_thread`        | Live         | Reply in a thread (`chat.postMessage` + `thread_ts`, optional `reply_broadcast`)                                                                                                                                     |
+| `add_reaction`        | Live         | Add an emoji reaction (`reactions.add`)                                                                                                                                                                              |
 
 ##### Exposed resources & resource templates
 
@@ -845,13 +847,13 @@ All resource URIs strictly validate `{workspace}` (`[A-Za-z0-9_-]`) and reject p
 
 Each prompt returns ready-to-use MCP prompt messages pre-populated with bounded local SQLite context:
 
-| Prompt              | Arguments                                                                  | Purpose                                                                          |
-| ------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `catch_up`          | `workspace` (opt), `since_hours` (opt, default `24`)                       | Executive catch-up briefing across active/unread channels, mentions, threads, and transcripts |
-| `summarize_thread`  | `channel` (req), `thread_ts` (req), `workspace` (opt)                      | Summarize a thread's decisions, action items, and open questions                 |
-| `summarize_channel` | `channel` (req), `since` (opt), `limit` (opt), `workspace` (opt)           | Summarize recent discussions, themes, and blockers in a channel or DM       |
-| `find_decisions`    | `channel` (opt), `query` (opt), `since` (opt), `workspace` (opt)           | Extract concrete decisions, owners, rationale, and open questions                |
-| `search_transcripts`| `query` (req), `workspace` (opt)                                           | Search and synthesize audio/video clip and huddle transcripts for a topic        |
+| Prompt               | Arguments                                                        | Purpose                                                                                       |
+| -------------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `catch_up`           | `workspace` (opt), `since_hours` (opt, default `24`)             | Executive catch-up briefing across active/unread channels, mentions, threads, and transcripts |
+| `summarize_thread`   | `channel` (req), `thread_ts` (req), `workspace` (opt)            | Summarize a thread's decisions, action items, and open questions                              |
+| `summarize_channel`  | `channel` (req), `since` (opt), `limit` (opt), `workspace` (opt) | Summarize recent discussions, themes, and blockers in a channel or DM                         |
+| `find_decisions`     | `channel` (opt), `query` (opt), `since` (opt), `workspace` (opt) | Extract concrete decisions, owners, rationale, and open questions                             |
+| `search_transcripts` | `query` (req), `workspace` (opt)                                 | Search and synthesize audio/video clip and huddle transcripts for a topic                     |
 
 Example MCP client configuration (Claude Desktop, Cursor, Claude Code):
 

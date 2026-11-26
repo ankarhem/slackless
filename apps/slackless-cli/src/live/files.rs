@@ -1,5 +1,7 @@
 //! `files` listing, `download`, and `transcribe` commands.
 
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -89,7 +91,8 @@ pub(crate) fn select_download_url(file: &File) -> Option<&str> {
         .or(file.url_private.as_deref())
 }
 
-/// Sanitize a Slack file's display/file name into a single safe filename component.
+/// Sanitize a Slack file's display/file name into a single safe filename component: the
+/// uploader-chosen name never reaches outside the folder or becomes a dot-file (`.envrc`).
 pub(crate) fn sanitize_download_name(
     file_id: &str,
     name: Option<&str>,
@@ -98,21 +101,38 @@ pub(crate) fn sanitize_download_name(
     let fallback_name = name.or(title).unwrap_or(file_id);
     Path::new(fallback_name)
         .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
+        .map(|s| s.to_string_lossy().trim_start_matches('.').to_owned())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("{file_id}.bin"))
 }
 
-/// Compute `(safe_name, destination_path)` for `download`.
-pub(crate) fn resolve_download_dest(
-    file_id: &str,
-    file: &File,
-    out: Option<&Path>,
-) -> (String, PathBuf) {
-    let safe_name = sanitize_download_name(file_id, file.name.as_deref(), file.title.as_deref());
-    let dest = out
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(&safe_name));
-    (safe_name, dest)
+/// Writes `bytes` to a new file named `name` in `dir`, numbering the name like a browser
+/// (`report (1).pdf`) while it is taken, so a download never replaces or writes through an
+/// existing file or symlink. Returns the path written.
+pub(crate) fn create_numbered_file(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> std::io::Result<PathBuf> {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
+        _ => (name, String::new()),
+    };
+    let mut path = dir.join(name);
+    let mut n: u64 = 0;
+    loop {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                n += 1;
+                path = dir.join(format!("{stem} ({n}){ext}"));
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 /// `download <FILE_ID> [--out PATH]`
@@ -141,14 +161,24 @@ pub async fn run_download(
         Ok(b) => b,
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
-    let (safe_name, dest) = resolve_download_dest(file_id, &file, out);
-    if let Err(err) = std::fs::write(&dest, &bytes) {
-        return Ok(fail(
-            ctx,
-            "write_failed",
-            &format!("writing {}: {err}", dest.display()),
-        ));
-    }
+    let safe_name = sanitize_download_name(file_id, file.name.as_deref(), file.title.as_deref());
+    // `--out` names the exact destination; otherwise the uploader's name lands in the current
+    // directory without replacing anything already there.
+    let written = match out {
+        Some(path) => std::fs::write(path, &bytes).map(|()| path.to_path_buf()),
+        None => create_numbered_file(Path::new(""), &safe_name, &bytes),
+    };
+    let dest = match written {
+        Ok(dest) => dest,
+        Err(err) => {
+            let target = out.unwrap_or(Path::new(&safe_name));
+            return Ok(fail(
+                ctx,
+                "write_failed",
+                &format!("writing {}: {err}", target.display()),
+            ));
+        }
+    };
     output::emit(
         ctx.json,
         &serde_json::json!({

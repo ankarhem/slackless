@@ -19,6 +19,12 @@ emojis = "0.9"
 # The zoom platform wrapper (zoom.rs) names these types from GPUI's platform traits.
 raw-window-handle = "0.6"
 smallvec = "1"
+# Bare `http(s)://` autolinking in message text.
+linkify = "0.12"
+# Word-level diffs between message revisions (revision history dialog).
+similar = "2"
+# Named (IANA) time zones for the display clock's manual time zone preference.
+jiff = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 futures.workspace = true
 serde.workspace = true

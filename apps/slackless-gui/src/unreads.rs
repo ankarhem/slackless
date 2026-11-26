@@ -205,6 +205,54 @@ pub fn store_targets(
         .collect()
 }
 
+/// Single-flight bookkeeping for the view's live store reads ([`store_groups`]): one read in
+/// flight at a time, the refreshes asked for meanwhile folded into one more read after it, and
+/// a read a newer refresh overtook (another workspace's, or a derivation shown without the
+/// store since) dropped when it lands.
+#[derive(Default)]
+pub struct LiveRefresh {
+    /// The newest refresh started; a read of an older generation was overtaken.
+    generation: u64,
+    /// The workspace whose read is in flight.
+    in_flight: Option<TeamId>,
+    /// Refreshes were asked for while that read was in flight.
+    pending: bool,
+}
+
+impl LiveRefresh {
+    /// Ask for a store read of `team`'s unreads: the generation to start it under, or `None`
+    /// while that workspace's read is in flight (one more read follows it). A read in flight
+    /// for another workspace is overtaken.
+    pub fn request(&mut self, team: &TeamId) -> Option<u64> {
+        if self.in_flight.as_ref() == Some(team) {
+            self.pending = true;
+            return None;
+        }
+        self.generation += 1;
+        self.in_flight = Some(team.clone());
+        self.pending = false;
+        Some(self.generation)
+    }
+
+    /// The view was just derived without the store (the bundled workspace's groups): a read
+    /// still in flight must not land over it.
+    pub fn overtake(&mut self) {
+        self.generation += 1;
+        self.in_flight = None;
+        self.pending = false;
+    }
+
+    /// The read started under `generation` finished: `None` when a newer refresh overtook it
+    /// (its result is dropped), else whether refreshes asked for meanwhile need one more read.
+    pub fn land(&mut self, generation: u64) -> Option<bool> {
+        if generation != self.generation {
+            return None;
+        }
+        self.in_flight = None;
+        Some(std::mem::take(&mut self.pending))
+    }
+}
+
 /// What the All Unreads view asks the root for.
 pub enum UnreadsEvent {
     /// A card's conversation (its name, or the placeholder of a channel without rows) was
@@ -1366,6 +1414,48 @@ mod tests {
                 .all(|pair| pair[0].ts < pair[1].ts)
         );
         assert_eq!(unread.newest_ts, latest);
+    }
+
+    #[test]
+    fn live_refresh_coalesces_bursts_and_drops_overtaken_reads() {
+        let (ours, theirs) = (TeamId::from("T0OURS"), TeamId::from("T0THEIRS"));
+        let mut refresh = LiveRefresh::default();
+
+        // A burst while a read is in flight runs as one more read after it.
+        let first = refresh
+            .request(&ours)
+            .expect("an idle refresh reads at once");
+        assert_eq!(refresh.request(&ours), None);
+        assert_eq!(refresh.request(&ours), None);
+        assert_eq!(
+            refresh.land(first),
+            Some(true),
+            "it lands, one more read follows"
+        );
+        let follow_up = refresh.request(&ours).expect("the follow-up read starts");
+        assert_eq!(
+            refresh.land(follow_up),
+            Some(false),
+            "nothing left to follow"
+        );
+
+        // Another workspace's refresh overtakes the read in flight: its result never lands.
+        let overtaken = refresh.request(&ours).unwrap();
+        let current = refresh
+            .request(&theirs)
+            .expect("another workspace reads at once");
+        assert_eq!(
+            refresh.land(overtaken),
+            None,
+            "the overtaken result is dropped"
+        );
+        assert_eq!(refresh.land(current), Some(false));
+
+        // So does a derivation shown without the store meanwhile, leaving nothing in flight.
+        let overtaken = refresh.request(&ours).unwrap();
+        refresh.overtake();
+        assert_eq!(refresh.land(overtaken), None);
+        assert!(refresh.request(&ours).is_some());
     }
 
     #[test]

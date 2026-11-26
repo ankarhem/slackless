@@ -30,6 +30,9 @@ pub enum ApiError {
     /// A non-2xx HTTP status whose body was not a Slack JSON envelope.
     #[error("unexpected http status {status}: {body}")]
     Status { status: u16, body: String },
+    /// A response body was larger than the client buffers (announced or streamed).
+    #[error("response body exceeds the {limit}-byte limit")]
+    BodyTooLarge { limit: usize },
     /// A file URL answered with an HTML page (Slack's sign-in redirect) instead of the file.
     #[error("file download was not authorized (got an html page)")]
     FileAuthRejected,

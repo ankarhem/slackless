@@ -26,7 +26,6 @@ pub mod backfill;
 pub mod catchup;
 mod client;
 pub mod command;
-pub mod diff;
 pub mod domain;
 pub mod embeddings;
 pub mod event;
@@ -39,6 +38,7 @@ pub mod paths;
 pub mod privacy;
 mod reducer;
 pub mod rules;
+mod runtime;
 pub mod search;
 pub mod semantic_index;
 pub mod summarize;
@@ -67,7 +67,6 @@ pub use command::{
     ChannelCommand, CollabCommand, Command, HuddleCommand, HuddleControlCommand, MessagingCommand,
     WorkspaceCommand,
 };
-pub use diff::{DiffKind, DiffSegment, diff_words};
 pub use embeddings::{
     EMBEDDER_IDLE_TTL, Embedder, EmbeddingDownloadProgress, EmbeddingModel, EmbeddingModelStatus,
     HashProjectionEmbedder, IdleSlot, OnnxEmbedder, TokenizedInput, WordPieceTokenizer,

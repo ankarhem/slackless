@@ -173,6 +173,24 @@ pub fn parse_mrkdwn_spans(text: &str) -> Vec<MrkdwnSpan> {
 
 /// Convert raw Slack `mrkdwn` into clean, readable plain text (for CLI output, previews, and search).
 pub fn mrkdwn_to_plain(text: &str) -> String {
+    mrkdwn_to_plain_with(text, &PlainDirectory)
+}
+
+/// [`mrkdwn_to_plain`] with `@mentions`, `#channels` and `@usergroups` named through `names`.
+///
+/// A directory echoes a reference's id for one it does not know (as [`PlainDirectory`] does);
+/// such a reference shows the label the text carries instead, else its id. `:shortcode:` emoji
+/// stay literal (a front-end with a glyph table expands them afterwards).
+pub fn mrkdwn_to_plain_with(text: &str, names: &dyn Directory) -> String {
+    /// What a reference shows as: the name `resolved` through the directory, else the text's own
+    /// non-empty `label`, else `id`.
+    fn shown<'a>(resolved: &'a str, label: Option<&'a str>, id: &'a str) -> &'a str {
+        if resolved != id {
+            return resolved;
+        }
+        label.filter(|label| !label.is_empty()).unwrap_or(id)
+    }
+
     let mut out = String::with_capacity(text.len());
     for span in parse_mrkdwn_spans(text) {
         match span {
@@ -182,14 +200,19 @@ pub fn mrkdwn_to_plain(text: &str) -> String {
             }
             MrkdwnSpan::UserMention { id, label, .. } => {
                 out.push('@');
-                out.push_str(label.as_deref().unwrap_or(id.as_str()));
+                out.push_str(shown(&names.mention(&id), label.as_deref(), id.as_str()));
             }
             MrkdwnSpan::ChannelMention { id, name, .. } => {
                 out.push('#');
-                out.push_str(name.as_deref().unwrap_or(id.as_str()));
+                out.push_str(shown(
+                    &names.channel_name(&id),
+                    name.as_deref(),
+                    id.as_str(),
+                ));
             }
             MrkdwnSpan::UsergroupMention { id, handle, .. } => {
-                let shown = handle.as_deref().unwrap_or(id.as_str());
+                let known = names.usergroup_handle(&id);
+                let shown = shown(&known, handle.as_deref(), id.as_str());
                 if !shown.starts_with('@') {
                     out.push('@');
                 }

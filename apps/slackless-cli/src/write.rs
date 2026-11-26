@@ -436,6 +436,7 @@ pub async fn run_thread_live(
         limit: Some(limit.clamp(1, 999)),
         ..HistoryOpts::default()
     };
+    let fetched_at = now_epoch_secs();
     let page = match session
         .api
         .conversations_replies(&channel, &thread_ts, &opts, None)
@@ -446,9 +447,12 @@ pub async fn run_thread_live(
     };
 
     if let Some(archive) = archive.as_mut() {
-        let _ = archive
-            .store_mut()
-            .upsert_messages(&session.workspace, &channel, &page.items);
+        let _ = archive.store_mut().upsert_replies_page(
+            &session.workspace,
+            &channel,
+            &page.items,
+            fetched_at,
+        );
     }
 
     let user_names = archive

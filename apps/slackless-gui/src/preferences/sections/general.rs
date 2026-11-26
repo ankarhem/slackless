@@ -289,7 +289,20 @@ impl Preferences {
             |s| &mut s.timezone_auto,
             cx,
         );
-        let zone = self.select("tz", &ZONES, |s| &mut s.timezone, cx);
+        let zone_ix = ZONES
+            .iter()
+            .position(|zone| *zone == self.settings.timezone)
+            .unwrap_or(0);
+        let zone = self.select_indexed(
+            "tz",
+            300.,
+            &ZONE_LABELS,
+            zone_ix,
+            |this, ix| {
+                this.settings.timezone = ZONES[ix].to_owned();
+            },
+            cx,
+        );
         let spell = self.checkbox(
             "spellcheck",
             "Enable spellcheck on your messages",

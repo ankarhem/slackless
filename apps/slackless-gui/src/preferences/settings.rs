@@ -203,13 +203,25 @@ pub(super) const LANGUAGES: [&str; 7] = [
     "Espa\u{f1}ol",
     "\u{65E5}\u{672C}\u{8A9E}",
 ];
-pub(super) const ZONES: [&str; 5] = [
-    "(UTC+01:00) Stockholm",
-    "(UTC+00:00) London",
-    "(UTC-05:00) Eastern Time (US & Canada)",
-    "(UTC-08:00) Pacific Time (US & Canada)",
-    "(UTC+09:00) Tokyo",
+/// Manual time-zone choices ([`ZONE_LABELS`] in this order): the IANA zone names settings store.
+pub(super) const ZONES: [&str; 6] = [
+    "Europe/Stockholm",
+    "Europe/London",
+    "America/New_York",
+    "America/Los_Angeles",
+    "Asia/Tokyo",
+    "UTC",
 ];
+/// The menu labels of [`ZONES`]: daylight saving follows the zone, so no fixed offset is shown.
+pub(super) const ZONE_LABELS: [&str; 6] = [
+    "Stockholm (CET/CEST)",
+    "London (GMT/BST)",
+    "Eastern Time (US & Canada)",
+    "Pacific Time (US & Canada)",
+    "Tokyo (JST)",
+    "UTC",
+];
+const _: () = assert!(ZONES.len() == ZONE_LABELS.len());
 pub(super) const ZOOM: [&str; 6] = ["80%", "90%", "100%", "110%", "125%", "150%"];
 /// Screen-reader message verbosity choices (`0` = Standard, `1` = Concise, `2` = Verbose; `F-SHELL-105`).
 pub const MESSAGE_VERBOSITY: [&str; 3] = ["Standard", "Concise", "Verbose"];
@@ -401,7 +413,11 @@ pub struct Settings {
     // Language & region
     pub language: usize,
     pub timezone_auto: bool,
-    pub timezone: usize,
+    /// IANA name of the manual time zone (one of [`ZONES`]). Settings written before named zones
+    /// stored an index into five fixed-offset zones instead; `deserialize_timezone` maps those
+    /// and unknown names to the zone they stood for (UTC when there was none).
+    #[serde(deserialize_with = "deserialize_timezone")]
+    pub timezone: String,
     pub spellcheck: bool,
     // Accessibility
     pub zoom: usize,
@@ -505,6 +521,34 @@ pub struct Settings {
     pub media_cache_max_days: u32,
 }
 
+/// Settings written before named zones stored an index into five fixed-offset zones (the first
+/// five of [`ZONES`], in order); any other number or an unknown name stood for UTC, and still does.
+fn deserialize_timezone<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    struct Zone;
+    impl<'de> serde::de::Visitor<'de> for Zone {
+        type Value = String;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an IANA time zone name or a legacy zone index")
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, index: u64) -> Result<Self::Value, E> {
+            let legacy = usize::try_from(index).unwrap_or(usize::MAX);
+            Ok(if let Some(&zone) = ZONES.get(legacy) {
+                zone
+            } else {
+                "UTC"
+            }
+            .to_owned())
+        }
+
+        fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<Self::Value, E> {
+            Ok(if ZONES.contains(&name) { name } else { "UTC" }.to_owned())
+        }
+    }
+    d.deserialize_any(Zone)
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -576,7 +620,7 @@ impl Default for Settings {
             quick_reaction_emojis: crate::actions::DEFAULT_QUICK_REACTIONS.map(String::from),
             language: 0,
             timezone_auto: true,
-            timezone: 0,
+            timezone: ZONES[0].to_owned(),
             spellcheck: true,
             zoom: 2,
             animate_emoji: true,
@@ -591,7 +635,7 @@ impl Default for Settings {
             no_bg_mark_read: true,
             confirm_unsend: true,
             warn_external: true,
-            protocol_allowlist: "https, http, mailto, slack".to_owned(),
+            protocol_allowlist: crate::zoom::DEFAULT_PROTOCOL_ALLOWLIST.to_owned(),
             launch_at_login: false,
             show_menu_bar_icon: true,
             close_to_tray: false,
@@ -744,13 +788,9 @@ impl Settings {
         CODES.get(self.language).copied()
     }
 
-    /// Manual UTC offset in seconds when `timezone_auto` is off (`None` = system timezone).
-    pub fn timezone_offset_secs(&self) -> Option<i64> {
-        if self.timezone_auto {
-            return None;
-        }
-        const OFFSETS: [i64; 5] = [3_600, 0, -18_000, -28_800, 32_400];
-        Some(OFFSETS.get(self.timezone).copied().unwrap_or(0))
+    /// The manual time zone's IANA name; `None` follows the system zone.
+    pub fn timezone(&self) -> Option<&str> {
+        (!self.timezone_auto).then_some(self.timezone.as_str())
     }
 
     /// Slack's `push_idle_wait` value in seconds for [`Self::mobile_handoff`] (`F-CORE-155`).

@@ -11,7 +11,10 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 futures.workspace = true
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "multipart", "form"] }
+# `rustls-no-provider` keeps the rustls TLS stack (and the platform verifier) without pulling
+# aws-lc-sys; `install_default_crypto_provider` installs the `ring` provider reqwest then needs.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "multipart", "form"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 bytes = "1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }

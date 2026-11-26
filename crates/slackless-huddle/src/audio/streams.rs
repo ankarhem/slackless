@@ -1,5 +1,5 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait as _, StreamTrait as _};
@@ -7,9 +7,9 @@ use cpal::{SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
 use sonora::AudioProcessing;
 
 use super::devices::{select_input_device, select_output_device};
-use super::dsp::{downmix_to_mono_f32_into, resample_linear_into};
-use super::ring::SpscRing;
-use super::{FRAME_20MS, PlaybackBuffer, SAMPLE_RATE};
+use super::dsp::{RateConverter, downmix_to_mono_f32_into};
+use super::ring::{SpscRing, WorkerWake};
+use super::{FRAME_20MS, PlayoutRing, SAMPLE_RATE};
 use crate::backend::{HwAudioDuplexConfig, HwAudioDuplexHandle, platform_backend};
 use crate::{HuddleError, Result};
 
@@ -21,22 +21,20 @@ const RT_SCRATCH_SAMPLES: usize = 16_384;
 /// dedicated audio DSP worker thread (`wait_and_pop_frame`).
 pub(super) struct CaptureRing {
     ring: SpscRing<f32>,
-    worker: OnceLock<std::thread::Thread>,
-    parked: AtomicBool,
+    wake: WorkerWake,
 }
 
 impl CaptureRing {
     pub(super) fn new() -> Self {
         Self {
             ring: SpscRing::new(FRAME_20MS * 16),
-            worker: OnceLock::new(),
-            parked: AtomicBool::new(false),
+            wake: WorkerWake::default(),
         }
     }
 
     /// Called once from the DSP worker thread so RT producers can unpark it lock-free.
     pub(super) fn register_worker(&self) {
-        let _ = self.worker.set(std::thread::current());
+        self.wake.register();
     }
 
     /// Producer (real-time audio callback): push 48 kHz mono PCM lock-free and wake the DSP
@@ -44,25 +42,13 @@ impl CaptureRing {
     pub(super) fn push(&self, samples: &[f32]) {
         self.ring.push_slice(samples);
         if self.ring.len() >= FRAME_20MS {
-            self.wake_if_parked();
-        }
-    }
-
-    /// Lock-free wake for RT callbacks and CoreAudio device-change listeners.
-    pub(super) fn wake_if_parked(&self) {
-        if self.parked.swap(false, Ordering::AcqRel)
-            && let Some(t) = self.worker.get()
-        {
-            t.unpark();
+            self.wake.wake_if_parked();
         }
     }
 
     /// Unconditional wake used on shutdown/hot-plug so the worker wakes immediately.
     pub(super) fn wake_now(&self) {
-        self.parked.store(false, Ordering::Release);
-        if let Some(t) = self.worker.get() {
-            t.unpark();
-        }
+        self.wake.wake_now();
     }
 
     /// Consumer (DSP worker thread): wait up to `timeout` for a full 20 ms frame, trimming excess
@@ -73,13 +59,9 @@ impl CaptureRing {
         running: &AtomicBool,
         timeout: Duration,
     ) -> bool {
-        if self.ring.len() < FRAME_20MS && running.load(Ordering::Acquire) {
-            self.parked.store(true, Ordering::Release);
-            if self.ring.len() < FRAME_20MS && running.load(Ordering::Acquire) {
-                std::thread::park_timeout(timeout);
-            }
-            self.parked.store(false, Ordering::Release);
-        }
+        self.wake.park_while(timeout, || {
+            self.ring.len() < FRAME_20MS && running.load(Ordering::Acquire)
+        });
         let len = self.ring.len();
         if len > FRAME_20MS * 8 {
             self.ring.skip(len - FRAME_20MS * 4);
@@ -111,15 +93,15 @@ pub(super) fn open_hw_duplex(
     ns: bool,
     agc: bool,
     capture_ring: &Arc<CaptureRing>,
-    playback_buf: &Arc<PlaybackBuffer>,
+    playout: &Arc<PlayoutRing>,
 ) -> Option<Box<dyn HwAudioDuplexHandle>> {
     let cap_ring = Arc::clone(capture_ring);
-    let play_buf = Arc::clone(playback_buf);
+    let playout = Arc::clone(playout);
     let on_capture = Arc::new(move |samples: &[f32]| {
         cap_ring.push(samples);
     });
     let on_render = Arc::new(move |out: &mut [f32]| {
-        play_buf.pull_into(out);
+        playout.render(out);
     });
     let cfg = HwAudioDuplexConfig {
         sample_rate: SAMPLE_RATE,
@@ -137,18 +119,38 @@ pub(super) fn open_hw_duplex(
     }
 }
 
+/// Real-time device-rate <-> 48 kHz conversion with its output preallocated for one callback, so
+/// converting never allocates.
+struct StreamConverter {
+    conv: RateConverter,
+    out: Vec<f32>,
+}
+
+impl StreamConverter {
+    /// `None` when the rates match. Blocks of 10 ms keep the converter's 5 ms delay small.
+    fn new(src_rate: u32, dst_rate: u32) -> Result<Option<Self>> {
+        if src_rate == dst_rate {
+            return Ok(None);
+        }
+        let conv = RateConverter::new(src_rate, dst_rate, src_rate as usize / 100)?;
+        let out = Vec::with_capacity(conv.output_capacity(RT_SCRATCH_SAMPLES));
+        Ok(Some(Self { conv, out }))
+    }
+}
+
 #[inline]
 fn push_mono_to_capture_ring(
     mono: &[f32],
-    src_rate: u32,
-    resampled_scratch: &mut Vec<f32>,
+    converter: &mut Option<StreamConverter>,
     capture_ring: &CaptureRing,
 ) {
-    if src_rate == SAMPLE_RATE {
-        capture_ring.push(mono);
-    } else {
-        resample_linear_into(mono, src_rate, SAMPLE_RATE, resampled_scratch);
-        capture_ring.push(resampled_scratch);
+    match converter {
+        None => capture_ring.push(mono),
+        Some(c) => {
+            c.out.clear();
+            c.conv.process(mono, &mut c.out);
+            capture_ring.push(&c.out);
+        }
     }
 }
 
@@ -166,19 +168,14 @@ pub(super) fn open_input_stream(
     let config: StreamConfig = supported.into();
 
     let mut mono_scratch = Vec::with_capacity(RT_SCRATCH_SAMPLES);
-    let mut resampled_scratch = Vec::with_capacity(RT_SCRATCH_SAMPLES);
+    let mut converter = StreamConverter::new(src_rate, SAMPLE_RATE)?;
 
     let stream = match fmt {
         SampleFormat::F32 => device.build_input_stream(
             config,
             move |data: &[f32], _| {
                 downmix_to_mono_f32_into(data, channels, &mut mono_scratch);
-                push_mono_to_capture_ring(
-                    &mono_scratch,
-                    src_rate,
-                    &mut resampled_scratch,
-                    &capture_ring,
-                );
+                push_mono_to_capture_ring(&mono_scratch, &mut converter, &capture_ring);
             },
             |_| {},
             None,
@@ -192,12 +189,7 @@ pub(super) fn open_input_stream(
                     let sum: f32 = ch.iter().map(|&s| f32::from(s) / 32_768.0).sum();
                     mono_scratch.push(sum / ch_div);
                 }
-                push_mono_to_capture_ring(
-                    &mono_scratch,
-                    src_rate,
-                    &mut resampled_scratch,
-                    &capture_ring,
-                );
+                push_mono_to_capture_ring(&mono_scratch, &mut converter, &capture_ring);
             },
             |_| {},
             None,
@@ -214,12 +206,7 @@ pub(super) fn open_input_stream(
                         .sum();
                     mono_scratch.push(sum / ch_div);
                 }
-                push_mono_to_capture_ring(
-                    &mono_scratch,
-                    src_rate,
-                    &mut resampled_scratch,
-                    &capture_ring,
-                );
+                push_mono_to_capture_ring(&mono_scratch, &mut converter, &capture_ring);
             },
             |_| {},
             None,
@@ -234,12 +221,7 @@ pub(super) fn open_input_stream(
                     let sum: f32 = ch.iter().map(|&s| (f64::from(s) * inv) as f32).sum();
                     mono_scratch.push(sum / ch_div);
                 }
-                push_mono_to_capture_ring(
-                    &mono_scratch,
-                    src_rate,
-                    &mut resampled_scratch,
-                    &capture_ring,
-                );
+                push_mono_to_capture_ring(&mono_scratch, &mut converter, &capture_ring);
             },
             |_| {},
             None,
@@ -253,12 +235,7 @@ pub(super) fn open_input_stream(
                     let sum: f32 = ch.iter().map(|&s| s as f32).sum();
                     mono_scratch.push(sum / ch_div);
                 }
-                push_mono_to_capture_ring(
-                    &mono_scratch,
-                    src_rate,
-                    &mut resampled_scratch,
-                    &capture_ring,
-                );
+                push_mono_to_capture_ring(&mono_scratch, &mut converter, &capture_ring);
             },
             |_| {},
             None,
@@ -379,9 +356,12 @@ where
     Ok(stream)
 }
 
+/// Open the `cpal` speaker stream. `aec_reference` receives exactly the 48 kHz samples each
+/// callback renders, so the software echo canceller sees the far end as it is actually played.
 pub(super) fn open_output_stream(
     name: Option<&str>,
-    playback_buf: Arc<PlaybackBuffer>,
+    playout: Arc<PlayoutRing>,
+    aec_reference: Arc<SpscRing<f32>>,
 ) -> Result<Stream> {
     let device = select_output_device(name)?;
     let supported = device
@@ -391,30 +371,42 @@ pub(super) fn open_output_stream(
     let channels = (supported.channels() as usize).max(1);
 
     let mut src_scratch = vec![0.0f32; RT_SCRATCH_SAMPLES];
-    let mut resampled_scratch = Vec::with_capacity(RT_SCRATCH_SAMPLES);
+    // The converter emits fixed 48 kHz -> device-rate blocks while the device asks for a varying
+    // number of frames, so blocks are pulled on demand and the remainder kept for the next call.
+    let mut converter = StreamConverter::new(SAMPLE_RATE, dst_rate)?;
 
     let stream = build_output_stream_any_format(&device, supported, move |data: &mut [f32]| {
         let out_frames = data.len() / channels;
-        let needed_48k = ((out_frames as u64 * SAMPLE_RATE as u64).div_ceil(dst_rate.max(1) as u64)
-            as usize)
-            .min(src_scratch.len());
-        playback_buf.pull_into(&mut src_scratch[..needed_48k]);
-        let samples: &[f32] = if dst_rate == SAMPLE_RATE {
-            &src_scratch[..needed_48k]
-        } else {
-            resample_linear_into(
-                &src_scratch[..needed_48k],
-                SAMPLE_RATE,
-                dst_rate,
-                &mut resampled_scratch,
-            );
-            &resampled_scratch
+        let pull = |buf: &mut [f32]| {
+            playout.render(buf);
+            aec_reference.push_slice(buf);
+        };
+        let (samples, written) = match &mut converter {
+            None => {
+                let needed = out_frames.min(src_scratch.len());
+                pull(&mut src_scratch[..needed]);
+                (&src_scratch[..needed], needed)
+            }
+            Some(c) => {
+                let blocks = out_frames
+                    .saturating_sub(c.out.len())
+                    .div_ceil(c.conv.chunk_out())
+                    .min(RT_SCRATCH_SAMPLES / c.conv.chunk_in());
+                let pulled = blocks * c.conv.chunk_in();
+                pull(&mut src_scratch[..pulled]);
+                c.conv.process(&src_scratch[..pulled], &mut c.out);
+                let written = out_frames.min(c.out.len());
+                (&c.out[..], written)
+            }
         };
         for (i, frame) in data.chunks_mut(channels).enumerate() {
             let s = samples.get(i).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
             for ch in frame.iter_mut() {
                 *ch = s;
             }
+        }
+        if let Some(c) = &mut converter {
+            c.out.drain(..written);
         }
     })?;
 

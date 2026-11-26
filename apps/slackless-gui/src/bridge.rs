@@ -179,6 +179,17 @@ impl CoreBridge {
         }
     }
 
+    /// A live bridge over `store` with no core behind it (commands are dropped), for tests of
+    /// the store-backed paths.
+    #[cfg(test)]
+    pub(crate) fn with_store(session: Session, store: SharedStore) -> Self {
+        Self {
+            store: Some(store),
+            session: Some(session),
+            ..Self::offline()
+        }
+    }
+
     /// Starts the core live for `session`: opens its durable store and starts slackless-core on
     /// its dedicated tokio thread (guide section 13). Events flow into gpui through an async
     /// stream wakeup (zero polling latency, zero idle wakeups); views receive them via
@@ -377,6 +388,43 @@ impl CoreBridge {
         Some(async move {
             let store = store.lock().ok()?;
             Some(fixtures::live(&session, &store, &counts))
+        })
+    }
+
+    /// Live mode: what a first visit shows at once while [`CoreBridge::snapshot_async`] reads
+    /// the workspace off the UI thread ([`fixtures::placeholder`], one stored row). `None`
+    /// offline.
+    pub fn placeholder(&self, counts: &HashMap<ChannelId, ConversationCounts>) -> Option<Fixtures> {
+        let session = self.session.as_ref()?;
+        let store = self.read_store()?.lock().ok()?;
+        Some(fixtures::placeholder(session, &store, counts))
+    }
+
+    /// Live mode: a read of the stored records of `users` (a primary-key lookup each) to run
+    /// off the UI thread; people the store lacks are left out. `None` offline.
+    pub fn users(
+        &self,
+        users: Vec<UserId>,
+    ) -> Option<impl Future<Output = Vec<User>> + Send + 'static + use<>> {
+        let team = self.session.as_ref()?.team_id.clone();
+        let store = self.read_store()?.clone();
+        Some(async move {
+            let Ok(store) = store.lock() else {
+                return Vec::new();
+            };
+            users
+                .iter()
+                .filter_map(|id| {
+                    store.user(&team, id).unwrap_or_else(|e| {
+                        tracing::warn!(
+                            user = %id,
+                            error = %e,
+                            "could not read a person from the local store"
+                        );
+                        None
+                    })
+                })
+                .collect()
         })
     }
 
@@ -1029,16 +1077,7 @@ mod tests {
             xoxc_token: String::new(),
             d_cookie: String::new(),
         };
-        CoreBridge {
-            commands: None,
-            core_thread: None,
-            store: Some(store),
-            reader: None,
-            session: Some(session),
-            fetcher: None,
-            hub: None,
-            media_hub: None,
-        }
+        CoreBridge::with_store(session, store)
     }
 
     #[test]

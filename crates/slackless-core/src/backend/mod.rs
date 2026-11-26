@@ -90,13 +90,16 @@ pub trait MessagingBackend: Clone + Send + Sync + 'static {
         channel: ChannelId,
         limit: u32,
     ) -> impl Future<Output = api::Result<Vec<Message>>> + Send;
-    /// `broadcast` also posts a thread reply to the channel (`reply_broadcast`).
+    /// `broadcast` also posts a thread reply to the channel (`reply_broadcast`). A retry passes
+    /// the `client_msg_id` of the message's first attempt so Slack drops a duplicate post; `None`
+    /// mints a fresh one.
     fn post_message(
         &self,
         channel: ChannelId,
         content: MessageContent,
         thread_ts: Option<Ts>,
         broadcast: bool,
+        client_msg_id: Option<String>,
     ) -> impl Future<Output = api::Result<PostedMessage>> + Send;
     fn update_message(
         &self,

@@ -11,7 +11,7 @@ use sonora::config::{Config as SonoraConfig, GainController2, NoiseSuppression};
 use sonora::{AudioProcessing, StreamConfig as SonoraStreamConfig};
 
 use crate::audio::ring::SpscRing;
-use crate::audio::{FRAME_10MS, SAMPLE_RATE, resample_linear_into};
+use crate::audio::{FRAME_10MS, RateConverter, SAMPLE_RATE};
 use crate::{HuddleError, Result};
 
 use super::{LIVE_BARS, MAX_AUDIO_SAMPLES, RecordedClip, timestamp_slug};
@@ -71,6 +71,11 @@ impl AudioClipRecorder {
         let in_rate = supported.sample_rate();
         let in_channels = supported.channels() as usize;
         let config: cpal::StreamConfig = supported.into();
+        // 10 ms blocks, as in calls: the filter edge sits far above speech either way, and a
+        // stopped recording loses at most one block plus the 5 ms converter delay.
+        let mut converter = (in_rate != SAMPLE_RATE)
+            .then(|| RateConverter::new(in_rate, SAMPLE_RATE, in_rate as usize / 100))
+            .transpose()?;
 
         let samples = Arc::new(Mutex::new(Vec::<i16>::with_capacity(
             (SAMPLE_RATE as usize) * 15,
@@ -145,14 +150,22 @@ impl AudioClipRecorder {
                     .capture_config(apm_stream)
                     .build();
                 let mut apm_pending: Vec<f32> = Vec::with_capacity(FRAME_10MS * 4);
-                let mut resampled: Vec<f32> = Vec::with_capacity(FRAME_10MS * 4);
-                let mut processed_i16: Vec<i16> = Vec::with_capacity(FRAME_10MS * 4);
                 let mut raw_buf = [0.0f32; 2048];
+                let mut resampled = Vec::with_capacity(
+                    converter
+                        .as_ref()
+                        .map_or(FRAME_10MS * 4, |c| c.output_capacity(raw_buf.len())),
+                );
+                let mut processed_i16: Vec<i16> = Vec::with_capacity(FRAME_10MS * 4);
                 let mut bar_accum = 0.0f32;
                 let mut bar_chunks = 0usize;
 
                 let mut process_mono = |mono: &[f32]| {
-                    resample_linear_into(mono, in_rate, SAMPLE_RATE, &mut resampled);
+                    resampled.clear();
+                    match &mut converter {
+                        Some(conv) => conv.process(mono, &mut resampled),
+                        None => resampled.extend_from_slice(mono),
+                    }
                     apm_pending.extend_from_slice(&resampled);
                     processed_i16.clear();
                     let mut sum_sq = 0.0f32;

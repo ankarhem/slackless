@@ -237,31 +237,44 @@ pub fn index_store_documents_paced(
             .existing_hashes(&ws)
             .map_err(|e| format!("failed to read existing hashes for {ws}: {e}"))?;
         let mut live_keys: HashSet<(SemanticDocKind, String)> = HashSet::new();
-        let mut candidates: Vec<CandidateDoc> = Vec::new();
+        let mut to_embed: Vec<CandidateDoc> = Vec::new();
+        let mut total_ws = 0usize;
+        let mut skipped_ws = 0usize;
+        // Documents are checked against their stored hash as they are listed, so only changed
+        // ones (not the whole workspace) stay in memory until they are embedded.
+        let mut consider = |doc: CandidateDoc| {
+            total_ws += 1;
+            let key = (doc.kind, doc.doc_id.clone());
+            let unchanged = existing.get(&key).is_some_and(|(prev_hash, prev_dims)| {
+                *prev_hash == doc.content_hash && *prev_dims == dims
+            });
+            live_keys.insert(key);
+            if unchanged {
+                skipped_ws += 1;
+            } else {
+                to_embed.push(doc);
+            }
+        };
 
         // 1. Messages, snippets, and canvases from `message_current`.
-        let messages = store
-            .list_messages_for_indexing(&ws)
+        store
+            .for_each_message_for_indexing(&ws, |channel, msg, file_names, file_transcripts| {
+                let text = compose_message_index_text(&msg, &file_names, &file_transcripts);
+                if text.trim().is_empty() {
+                    return;
+                }
+                let hash = content_hash(&text);
+                consider(CandidateDoc {
+                    workspace: ws.clone(),
+                    kind: classify_message_doc_kind(&msg),
+                    doc_id: format!("{}:{}", channel.as_str(), msg.ts.as_str()),
+                    channel_id: channel.as_str().to_owned(),
+                    ts: msg.ts.as_str().to_owned(),
+                    text,
+                    content_hash: hash,
+                });
+            })
             .map_err(|e| format!("failed to list messages for {ws}: {e}"))?;
-        for (channel, msg, file_names, file_transcripts) in messages {
-            let text = compose_message_index_text(&msg, &file_names, &file_transcripts);
-            if text.trim().is_empty() {
-                continue;
-            }
-            let kind = classify_message_doc_kind(&msg);
-            let doc_id = format!("{}:{}", channel.as_str(), msg.ts.as_str());
-            let hash = content_hash(&text);
-            live_keys.insert((kind, doc_id.clone()));
-            candidates.push(CandidateDoc {
-                workspace: ws.clone(),
-                kind,
-                doc_id,
-                channel_id: channel.as_str().to_owned(),
-                ts: msg.ts.as_str().to_owned(),
-                text,
-                content_hash: hash,
-            });
-        }
 
         // 2. Standalone / persisted file transcripts (`file_transcript`).
         let file_trs = store
@@ -277,13 +290,11 @@ pub fn index_store_documents_paced(
             } else {
                 text.to_owned()
             };
-            let doc_id = entry.transcript.file_id.as_str().to_owned();
             let hash = content_hash(&truncated);
-            live_keys.insert((SemanticDocKind::FileTranscript, doc_id.clone()));
-            candidates.push(CandidateDoc {
+            consider(CandidateDoc {
                 workspace: ws.clone(),
                 kind: SemanticDocKind::FileTranscript,
-                doc_id,
+                doc_id: entry.transcript.file_id.as_str().to_owned(),
                 channel_id: entry
                     .channel
                     .map(|c| c.as_str().to_owned())
@@ -306,13 +317,11 @@ pub fn index_store_documents_paced(
             if text.is_empty() {
                 continue;
             }
-            let doc_id = seg.id.to_string();
             let hash = content_hash(text);
-            live_keys.insert((SemanticDocKind::HuddleTranscript, doc_id.clone()));
-            candidates.push(CandidateDoc {
+            consider(CandidateDoc {
                 workspace: ws.clone(),
                 kind: SemanticDocKind::HuddleTranscript,
-                doc_id,
+                doc_id: seg.id.to_string(),
                 channel_id: seg.channel.as_str().to_owned(),
                 ts: format!("{}.000000", seg.at_ms.div_euclid(1_000).max(0)),
                 text: text.to_owned(),
@@ -320,21 +329,7 @@ pub fn index_store_documents_paced(
             });
         }
 
-        let total_ws = candidates.len();
         report.total_seen += total_ws;
-
-        let mut to_embed: Vec<CandidateDoc> = Vec::new();
-        let mut skipped_ws = 0usize;
-        for doc in candidates {
-            if let Some((prev_hash, prev_dims)) = existing.get(&(doc.kind, doc.doc_id.clone()))
-                && *prev_hash == doc.content_hash
-                && *prev_dims == dims
-            {
-                skipped_ws += 1;
-                continue;
-            }
-            to_embed.push(doc);
-        }
         report.skipped_unchanged += skipped_ws;
 
         let mut embedded_ws = 0usize;

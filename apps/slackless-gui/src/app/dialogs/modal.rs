@@ -179,14 +179,17 @@ impl AppModalStack {
         cx.notify();
     }
 
+    #[cfg(test)]
     pub(in crate::app) fn depth(&self) -> usize {
         self.frames.len()
     }
 
+    #[cfg(test)]
     pub(in crate::app) fn top_view_id(&self) -> Option<&str> {
         self.frames.last().map(|f| f.view_id.as_str())
     }
 
+    #[cfg(test)]
     pub(in crate::app) fn top_kit(&self) -> Option<Entity<crate::blockkit::BlockKitState>> {
         self.frames.last().map(|f| f.kit.clone())
     }

@@ -21,7 +21,7 @@ use gpui_kit::gpui::{
 
 use super::settings::{
     DENSITY, ENTER_OPTIONS, LANGUAGES, MARK_READ, NAMES, OPEN_LINKS, SHOW, SKIN_TONES, SORTS,
-    SOUNDS, TAB_STYLES, ZONES, ZOOM,
+    SOUNDS, TAB_STYLES, ZONE_LABELS, ZONES, ZOOM,
 };
 use super::*;
 use crate::theme::{CUSTOM_ACCENTS, CUSTOM_SIDEBARS};
@@ -236,7 +236,29 @@ impl Preferences {
         choice: Choice,
         cx: &mut Context<Self>,
     ) -> Div {
-        let selected = (*choice(&mut self.settings)).min(options.len().saturating_sub(1));
+        let selected = *choice(&mut self.settings);
+        self.select_indexed(
+            id,
+            width,
+            options,
+            selected,
+            move |this, ix| *choice(&mut this.settings) = ix,
+            cx,
+        )
+    }
+
+    /// `select_w` for a choice stored as something other than the option index: `selected` is
+    /// the highlighted option and `pick` stores a picked one (the time zone's IANA name).
+    fn select_indexed(
+        &mut self,
+        id: &'static str,
+        width: f32,
+        options: &'static [&'static str],
+        selected: usize,
+        pick: impl Fn(&mut Self, usize) + Clone + 'static,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let selected = selected.min(options.len().saturating_sub(1));
         let open = self.open_select == Some(id);
         let m = self.metrics();
         let theme = cx.theme();
@@ -332,11 +354,14 @@ impl Preferences {
                                     .text_color(active_fg),
                             )
                         })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            *choice(&mut this.settings) = ix;
-                            this.open_select = None;
-                            this.changed(cx);
-                        }))
+                        .on_click({
+                            let pick = pick.clone();
+                            cx.listener(move |this, _, _, cx| {
+                                pick(this, ix);
+                                this.open_select = None;
+                                this.changed(cx);
+                            })
+                        })
                 }));
             div().absolute().top_full().left_0().mt_1().child(
                 deferred(

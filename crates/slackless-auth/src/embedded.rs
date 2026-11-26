@@ -10,10 +10,10 @@
 //! and nothing is decrypted — the webview hands back the cookie in clear.
 //!
 //! The capture-and-build step ([`capture_sessions`]) is pure and tested here. The window itself
-//! ([`embedded_sign_in`], feature `webview`) is a `tao` window hosting a `wry` WKWebView: an
-//! initialization script polls the page's `localConfig_v2` and posts it over wry's IPC channel
-//! once it holds an `xoxc-` token; the host then reads `d` from the webview cookie store and
-//! hands both to [`capture_sessions`].
+//! ([`embedded_sign_in`], feature `webview`) is a `WKWebView` in an `NSWindow` on macOS and a
+//! `wry` webview in a `tao` window elsewhere: an initialization script polls the page's
+//! `localConfig_v2` and posts it to the host once it holds an `xoxc-` token; the host then reads
+//! `d` from the webview cookie store and hands both to [`capture_sessions`].
 
 use std::fmt;
 
@@ -21,14 +21,19 @@ use serde_json::Value;
 #[cfg(any(test, feature = "webview"))]
 use slackless_types::endpoints::APP_CLIENT_URL;
 use slackless_types::endpoints::WEB_ORIGIN;
-#[cfg(any(test, feature = "webview"))]
 use slackless_types::net::is_trusted_slack_host;
 use slackless_types::{TeamId, UserId};
+use url::Url;
 
-#[cfg(feature = "webview")]
+#[cfg(all(feature = "webview", not(target_os = "macos")))]
 use crate::error::AuthError;
 use crate::error::Result;
 use crate::session::Session;
+
+#[cfg(all(feature = "webview", target_os = "macos"))]
+mod macos;
+#[cfg(all(feature = "webview", target_os = "macos"))]
+pub use macos::embedded_sign_in;
 
 /// What to open the embedded sign-in on.
 #[derive(Debug, Clone, Default)]
@@ -109,18 +114,31 @@ pub fn capture_sessions(capture: &WebviewCapture) -> Result<Vec<Session>> {
 }
 
 /// Resolves a team entry's workspace URL from its `url` field, falling back to `domain`.
+///
+/// The session's token and `d` cookie go to this URL on every API call, so an entry whose URL is
+/// not an `https` Slack URL ([`is_slack_https_url`]) is unroutable.
 fn team_workspace_url(team: &Value) -> Option<String> {
-    if let Some(url) = team
+    let url = match team
         .get("url")
         .and_then(Value::as_str)
         .filter(|u| !u.is_empty())
     {
-        return Some(url.to_owned());
-    }
-    team.get("domain")
-        .and_then(Value::as_str)
-        .filter(|d| !d.is_empty())
-        .map(domain_url)
+        Some(url) => url.to_owned(),
+        None => domain_url(
+            team.get("domain")
+                .and_then(Value::as_str)
+                .filter(|d| !d.is_empty())?,
+        ),
+    };
+    is_slack_https_url(&url).then_some(url)
+}
+
+/// Whether `raw` is an `https` URL on a Slack host: the only pages trusted to hand over a
+/// `localConfig_v2`, and the only workspace URLs a captured session's credentials may go to.
+fn is_slack_https_url(raw: &str) -> bool {
+    Url::parse(raw).is_ok_and(|url| {
+        url.scheme() == "https" && url.host_str().is_some_and(is_trusted_slack_host)
+    })
 }
 
 /// `acme` -> `https://acme.slack.com/`; Grid `acme.enterprise` -> `https://acme.enterprise.slack.com/`;
@@ -196,7 +214,7 @@ fn plist_string(plist: &str, key: &str) -> Option<String> {
 /// Runs its own event loop and returns when a session is captured or the window is closed
 /// ([`AuthError::SignInCancelled`]). Must be called on the main thread of a process that runs no
 /// other UI event loop (front-ends with one run this in a helper process).
-#[cfg(feature = "webview")]
+#[cfg(all(feature = "webview", not(target_os = "macos")))]
 pub fn embedded_sign_in(request: SignInRequest) -> Result<Vec<Session>> {
     use tao::dpi::LogicalSize;
     use tao::event::{Event, WindowEvent};
@@ -205,8 +223,10 @@ pub fn embedded_sign_in(request: SignInRequest) -> Result<Vec<Session>> {
     use tao::window::WindowBuilder;
     use wry::{NewWindowResponse, WebViewBuilder};
 
+    use slackless_types::net::redact_url;
+
     enum Signal {
-        /// The page's `localConfig_v2`, posted by [`CAPTURE_SCRIPT`].
+        /// A Slack page's `localConfig_v2`, posted by [`capture_script`].
         LocalConfig(String),
         /// A `window.open` (SSO popups): followed in the sign-in window itself.
         Navigate(String),
@@ -222,6 +242,7 @@ pub fn embedded_sign_in(request: SignInRequest) -> Result<Vec<Session>> {
     let ipc = event_loop.create_proxy();
     let popups = event_loop.create_proxy();
     let script = capture_script();
+    let reported_foreign_page = std::cell::Cell::new(false);
     let webview = WebViewBuilder::new()
         .with_url(request.url())
         .with_user_agent(user_agent())
@@ -229,7 +250,17 @@ pub fn embedded_sign_in(request: SignInRequest) -> Result<Vec<Session>> {
         // The launcher page opens `slack://` links: never hand the session to the desktop app.
         .with_navigation_handler(|url| !url.starts_with("slack:"))
         .with_ipc_handler(move |message| {
-            let _ = ipc.send_event(Signal::LocalConfig(message.into_body()));
+            // The capture script runs on every page the window visits (navigation stays open for
+            // SSO), so only a Slack page may hand over the config its session is built from.
+            let page = message.uri().to_string();
+            if is_slack_https_url(&page) {
+                let _ = ipc.send_event(Signal::LocalConfig(message.into_body()));
+            } else if !reported_foreign_page.replace(true) {
+                tracing::warn!(
+                    page = %redact_url(&page),
+                    "ignoring sign-in data posted by a non-Slack page"
+                );
+            }
         })
         .with_new_window_req_handler(move |url, _| {
             let _ = popups.send_event(Signal::Navigate(url));
@@ -336,6 +367,32 @@ mod tests {
         }"#;
         // T1 has no token, T2 has no token, T3 has no resolvable URL -> all skipped.
         assert!(capture_sessions(&capture(json)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn capture_only_routes_sessions_to_https_slack_urls() {
+        let json = r#"{
+            "teams": {
+                "T_OK": { "token": "xoxc-ok", "url": "https://acme.slack.com/" },
+                "T_EVIL": { "token": "xoxc-evil", "url": "https://evil.example/" },
+                "T_HTTP": { "token": "xoxc-http", "url": "http://acme.slack.com/" },
+                "T_LOOKALIKE": { "token": "xoxc-look", "url": "https://acme.slack.com.evil.example/" },
+                "T_USERINFO": { "token": "xoxc-user", "url": "https://acme.slack.com@evil.example/" },
+                "T_DOMAIN": { "token": "xoxc-domain", "domain": "evil.example/" }
+            }
+        }"#;
+        let sessions = capture_sessions(&capture(json)).unwrap();
+        let routed: Vec<(&str, &str)> = sessions
+            .iter()
+            .map(|s| (s.team_id.as_str(), s.workspace_url.as_str()))
+            .collect();
+        assert_eq!(routed, [("T_OK", "https://acme.slack.com/")]);
+
+        // The same check decides which pages may post their `localConfig_v2` to the host.
+        assert!(is_slack_https_url("https://app.slack.com/client/T1"));
+        assert!(!is_slack_https_url("https://evil.example/client/T1"));
+        assert!(!is_slack_https_url("http://app.slack.com/client/T1"));
+        assert!(!is_slack_https_url("about:blank"));
     }
 
     #[test]

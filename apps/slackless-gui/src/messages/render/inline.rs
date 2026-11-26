@@ -12,6 +12,8 @@ use gpui_kit::gpui::{
     StatefulInteractiveElement as _, StrikethroughStyle, Styled as _, StyledText, TextRun,
     UnderlineStyle, div, px, relative, rgb,
 };
+use linkify::{LinkFinder, LinkKind};
+use slackless_core::domain::mrkdwn::{Directory, mrkdwn_to_plain_with, unescape_mrkdwn};
 use slackless_core::types::{ChannelId, TextStyle, UserId};
 
 use super::super::{APP_ICON_SLOT, INLINE_EMOJI, LinkHandler, LinkTarget, route_link};
@@ -819,23 +821,6 @@ pub(in crate::messages) fn mrkdwn_line(
     Some(render_segments(segments, theme))
 }
 
-/// `text` with Slack's three mrkdwn HTML escapes undone (zero-copy when no `&` is present).
-pub(crate) fn unescape_cow(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains('&') {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    std::borrow::Cow::Owned(
-        text.replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&amp;", "&"),
-    )
-}
-
-/// `text` with Slack's three mrkdwn HTML escapes undone.
-pub(crate) fn unescape(text: &str) -> String {
-    unescape_cow(text).into_owned()
-}
-
 /// Plain mrkdwn text with Slack's HTML escapes undone; inline code gets its wash.
 /// Unless `theme.verbatim` is set (Block Kit `verbatim: true`, `F-COLLAB-758`) or inside inline
 /// code, bare `https://` / `http://` URLs are auto-linked.
@@ -845,33 +830,27 @@ pub(in crate::messages) fn push_mrkdwn_text(
     theme: &RunTheme,
     run: RunFlags,
 ) {
-    let unescaped = unescape(text);
+    let unescaped = unescape_mrkdwn(text);
     if run.code || theme.verbatim {
         let bg = run.code.then_some(theme.code_bg);
         builder.push_text(&unescaped, theme, run, None, bg);
         return;
     }
-    let mut rest = unescaped.as_str();
-    while let Some(pos) = rest.find("https://").or_else(|| rest.find("http://")) {
-        let (before, tail) = rest.split_at(pos);
-        if !before.is_empty() {
-            builder.push_text(before, theme, run, None, None);
+    // Slack auto-links `http(s)://` URLs only, so other linkify hits (`www.` hosts, `ftp://`,
+    // emails: the `<mailto:…>` form is explicit) stay plain text.
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Url]);
+    let mut plain_from = 0;
+    for link in finder.links(&unescaped) {
+        let url = link.as_str();
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            continue;
         }
-        let raw_end = tail
-            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\''))
-            .unwrap_or(tail.len());
-        let url = tail[..raw_end].trim_end_matches(['.', ',', ';', ':', ')', ']']);
-        if url.len() > "https://".len() {
-            builder.push_link(url.to_owned(), url.to_owned(), run, theme);
-            rest = &tail[url.len()..];
-        } else {
-            builder.push_text(&tail[..raw_end.max(1)], theme, run, None, None);
-            rest = &tail[raw_end.max(1)..];
-        }
+        builder.push_text(&unescaped[plain_from..link.start()], theme, run, None, None);
+        builder.push_link(url.to_owned(), url.to_owned(), run, theme);
+        plain_from = link.end();
     }
-    if !rest.is_empty() {
-        builder.push_text(rest, theme, run, None, None);
-    }
+    builder.push_text(&unescaped[plain_from..], theme, run, None, None);
 }
 
 /// Open or close the style `marker` stands for. A marker opens at a word start when a closing
@@ -968,7 +947,12 @@ pub(in crate::messages) fn angle_token(
         }
     } else if target.contains("://") || target.starts_with("mailto:") {
         let (label, run) = styled_label(label.unwrap_or(target), run);
-        builder.push_link(unescape(target), unescape(label), run, theme);
+        builder.push_link(
+            unescape_mrkdwn(target).into_owned(),
+            unescape_mrkdwn(label).into_owned(),
+            run,
+            theme,
+        );
     } else {
         return None;
     }
@@ -1017,6 +1001,14 @@ pub(crate) fn expand_shortcodes_in_text(text: &str) -> String {
         rest = &rest[next_colon..];
     }
     out
+}
+
+/// `text` as the plain text the clipboard, notifications and list previews show: `@mentions`,
+/// `#channels`, links and `<!date>` tokens resolved through `names` as the transcript shows
+/// them, formatting markers dropped, and known `:shortcode:` emoji as their glyphs (custom
+/// emoji stay `:name:`); line breaks kept.
+pub(crate) fn plain_text(text: &str, names: &dyn Directory) -> String {
+    expand_shortcodes_in_text(&mrkdwn_to_plain_with(text, names))
 }
 
 /// A `:shortcode:` at the start of `rest`: a glyph run, or a custom emoji image.

@@ -636,3 +636,105 @@ fn sidebar_custom_sections_starring_notify_and_nav_cycling(cx: &mut gpui::TestAp
         assert_eq!(s.active_nav(), NavItem::Todos);
     });
 }
+
+#[gpui::test]
+fn custom_sections_list_only_joined_channels_and_dms(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::init(cx);
+    });
+
+    let mut fx = crate::fixtures::load();
+    fx.messages.clear();
+    fx.counts.clear();
+    fx.notify_levels.clear();
+    let selected = fx.channels[0].id.clone();
+    let channel = fx.channels[1].id.clone();
+    let dm = fx.dms[0].id.clone();
+    // Ids a section can name that are not joined conversations: a channel the browser
+    // lists, an archived one, and one the snapshot does not know.
+    let browsed = Conversation {
+        id: ChannelId::from("C_BROWSED"),
+        name: Some("browsed".into()),
+        is_channel: true,
+        ..Default::default()
+    };
+    let archived = ChannelId::from("C_ARCHIVED");
+    fx.directory.push(browsed.clone());
+    fx.archived.push(Conversation {
+        id: archived.clone(),
+        name: Some("archived".into()),
+        is_channel: true,
+        ..Default::default()
+    });
+    let section = |id: &str, kind: SectionKind, channel_ids: Vec<ChannelId>| ChannelSection {
+        id: id.into(),
+        name: id.into(),
+        kind,
+        emoji: String::new(),
+        next_id: None,
+        channel_ids,
+    };
+    fx.sections = vec![
+        section(
+            "S_TEAM",
+            SectionKind::Standard,
+            vec![
+                channel.clone(),
+                dm.clone(),
+                browsed.id.clone(),
+                archived.clone(),
+                ChannelId::from("C_GONE"),
+            ],
+        ),
+        section("S_CHANNELS", SectionKind::Channels, Vec::new()),
+        section("S_DMS", SectionKind::DirectMessages, Vec::new()),
+    ];
+    let fx = Arc::new(fx);
+
+    let mounted = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = mounted.clone();
+    let (_root, cx) = cx.add_window_view(move |window, cx| {
+        let entity = Sidebar::new(fx.clone(), selected.clone(), window, cx);
+        *slot.borrow_mut() = Some(entity.clone());
+        gpui_kit::component::Root::new(entity, window, cx)
+    });
+    let sidebar = mounted.borrow_mut().take().unwrap();
+    let laid_out = |cx: &mut gpui::VisualTestContext| {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        sidebar.read_with(cx, |s, _| {
+            s.rows
+                .borrow()
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+    let count = |rows: &[ChannelId], id: &ChannelId| rows.iter().filter(|row| *row == id).count();
+
+    // The custom section, first in the list, holds the channel and the DM it names - once
+    // each, not again under Channels or Direct messages - and none of the other ids.
+    let rows = laid_out(cx);
+    assert!(rows[..2].contains(&channel) && rows[..2].contains(&dm));
+    assert_eq!(count(&rows, &channel), 1);
+    assert_eq!(count(&rows, &dm), 1);
+    assert_eq!(
+        count(&rows, &browsed.id),
+        0,
+        "a browser channel waits to be joined"
+    );
+    assert_eq!(
+        count(&rows, &archived),
+        0,
+        "an archived channel never lists"
+    );
+
+    // Joined from the browser, the channel lists in the section naming it, once.
+    sidebar.update(cx, |s, cx| s.add_channel(browsed.clone(), cx));
+    let rows = laid_out(cx);
+    assert!(rows[..3].contains(&browsed.id));
+    assert_eq!(count(&rows, &browsed.id), 1);
+}

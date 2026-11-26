@@ -100,24 +100,38 @@ if [[ -z "$TAG" || -z "$APP_URL" ]]; then
   exit 1
 fi
 
+if [[ -z "$SUMS_URL" ]]; then
+  echo "error: release ${TAG} has no SHA256SUMS.txt; refusing to install an unverified download" >&2
+  exit 1
+fi
+
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
+if ! curl -fsSL -o "${TMPDIR}/SHA256SUMS.txt" "$SUMS_URL"; then
+  echo "error: could not download SHA256SUMS.txt for ${TAG}; refusing to install an unverified download" >&2
+  exit 1
+fi
+
+# Like the in-app updater, never install a download without a matching SHA256SUMS.txt entry.
+verify_sha256() {
+  local asset="$1" expected actual
+  expected="$(awk -v f="$asset" '$2 == f { print $1; exit }' "${TMPDIR}/SHA256SUMS.txt")"
+  if [[ -z "$expected" ]]; then
+    echo "error: SHA256SUMS.txt has no entry for ${asset}; refusing to install an unverified download" >&2
+    exit 1
+  fi
+  actual="$(shasum -a 256 "${TMPDIR}/${asset}" | awk '{print $1}')"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "error: SHA-256 mismatch for ${asset} (expected ${expected}, got ${actual})" >&2
+    exit 1
+  fi
+  echo "Verified SHA-256 checksum of ${asset}."
+}
+
 echo "Downloading Slackless ${TAG}..."
 curl -fL --progress-bar -o "${TMPDIR}/${APP_ASSET}" "$APP_URL"
-
-if [[ -n "$SUMS_URL" ]]; then
-  curl -fsSL -o "${TMPDIR}/SHA256SUMS.txt" "$SUMS_URL"
-  EXPECTED="$(awk -v f="$APP_ASSET" '$2 == f { print $1; exit }' "${TMPDIR}/SHA256SUMS.txt")"
-  if [[ -n "$EXPECTED" ]]; then
-    ACTUAL="$(shasum -a 256 "${TMPDIR}/${APP_ASSET}" | awk '{print $1}')"
-    if [[ "$ACTUAL" != "$EXPECTED" ]]; then
-      echo "error: SHA-256 mismatch for ${APP_ASSET} (expected ${EXPECTED}, got ${ACTUAL})" >&2
-      exit 1
-    fi
-    echo "Verified SHA-256 checksum."
-  fi
-fi
+verify_sha256 "$APP_ASSET"
 
 mkdir -p "$INSTALL_DIR"
 STAGE_DIR="$(mktemp -d "${INSTALL_DIR}/.slackless-install.XXXXXX")"
@@ -172,16 +186,7 @@ if [[ "$INSTALL_CLI" -eq 1 ]]; then
   elif [[ -n "$CLI_URL" ]]; then
     echo "Downloading slackless CLI ${TAG}..."
     curl -fsSL -o "${TMPDIR}/${CLI_ASSET}" "$CLI_URL"
-    if [[ -f "${TMPDIR}/SHA256SUMS.txt" ]]; then
-      EXPECTED_CLI="$(awk -v f="$CLI_ASSET" '$2 == f { print $1; exit }' "${TMPDIR}/SHA256SUMS.txt")"
-      if [[ -n "$EXPECTED_CLI" ]]; then
-        ACTUAL_CLI="$(shasum -a 256 "${TMPDIR}/${CLI_ASSET}" | awk '{print $1}')"
-        if [[ "$ACTUAL_CLI" != "$EXPECTED_CLI" ]]; then
-          echo "error: SHA-256 mismatch for ${CLI_ASSET}" >&2
-          exit 1
-        fi
-      fi
-    fi
+    verify_sha256 "$CLI_ASSET"
     tar -xzf "${TMPDIR}/${CLI_ASSET}" -C "$TMPDIR"
     install -m 755 "${TMPDIR}/slackless" "$CLI_LINK"
     echo "Installed slackless CLI -> ${CLI_LINK}"

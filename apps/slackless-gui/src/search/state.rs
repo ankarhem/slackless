@@ -287,6 +287,7 @@ impl SearchView {
         cx.notify();
     }
 
+    #[cfg(test)]
     pub fn mode(&self) -> SearchMode {
         self.mode
     }

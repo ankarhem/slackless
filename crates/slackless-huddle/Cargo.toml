@@ -11,7 +11,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "multipart"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "multipart"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -25,13 +25,24 @@ rtc = { version = "0.21", default-features = false }
 webrtc = "0.21"
 cpal = "0.18"
 opus = "0.4"
+# WebRTC NetEq port (jitter buffer, concealment, time stretching). No default features: they pull
+# cpal 0.15, axum, tokio, clap and a second Opus implementation (ropus); we decode with libopus.
+neteq = { version = "1.0.2", default-features = false }
+# Band-limited (FFT) sample-rate conversion. Pinned to 0.16: its FFT path goes through realfft 3.x
+# onto the rustfft 6.4 transcribe-rs already links, unlike 1.x+ which adds four more crates.
+rubato = "0.16.2"
 sonora = "0.3"
 url = "2.5"
 openh264 = "0.9"
 rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 xcap = "0.9"
 transcribe-rs = { version = "0.3.12", features = ["onnx"] }
-ort = "=2.0.0-rc.12"
+# `load-dynamic`: ONNX Runtime is loaded on demand from a shared library (`onnx_runtime.rs`) instead
+# of being linked into every binary. transcribe-rs still enables ort's default features, which
+# `load-dynamic` makes inert (ort-sys skips its download and link step).
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24"] }
+# Same version ort loads the runtime with; used to vet the library before ort does.
+libloading = "0.9"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 nokhwa = { version = "0.10", features = ["input-native"] }

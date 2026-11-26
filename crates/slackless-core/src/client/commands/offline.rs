@@ -3,7 +3,8 @@
 
 use super::super::*;
 use super::messaging::{mark_read_and_store, post_message_and_store};
-use crate::outbox::{OutboxPayload, decode_outbox_payload};
+use crate::api::new_client_msg_id;
+use crate::outbox::{OutboxPayload, decode_outbox_payload, is_transient_send_error};
 use crate::store::{NewOutboxItem, OutboxItem};
 
 /// Serializable offline mutation stored in SQLite `offline_queue` until flushed on reconnect.
@@ -77,14 +78,18 @@ fn outbox_entry_from_command(command: &Command) -> Option<(ChannelId, Option<Ts>
             thread_ts,
             broadcast,
         } => {
+            // One id for every flush attempt of this entry (see `post_message_and_store`).
+            let client_msg_id = Some(new_client_msg_id());
             let payload = if thread_ts.is_some() {
                 OutboxPayload::Reply {
                     content: content.clone(),
                     broadcast: *broadcast,
+                    client_msg_id,
                 }
             } else {
                 OutboxPayload::Message {
                     content: content.clone(),
+                    client_msg_id,
                 }
             };
             Some((channel.clone(), thread_ts.clone(), payload))
@@ -100,6 +105,7 @@ fn outbox_entry_from_command(command: &Command) -> Option<(ChannelId, Option<Ts>
             OutboxPayload::Reply {
                 content: content.clone(),
                 broadcast: *broadcast,
+                client_msg_id: Some(new_client_msg_id()),
             },
         )),
         MessagingCommand::AddReaction { channel, ts, name } => Some((
@@ -163,16 +169,32 @@ async fn execute_outbox_item<B: Backend>(
         )));
     };
     match payload {
-        OutboxPayload::Message { content } => {
-            post_message_and_store(ctx, item.channel_id.clone(), content, None, false).await?;
+        OutboxPayload::Message {
+            content,
+            client_msg_id,
+        } => {
+            post_message_and_store(
+                ctx,
+                item.channel_id.clone(),
+                content,
+                None,
+                false,
+                client_msg_id,
+            )
+            .await?;
         }
-        OutboxPayload::Reply { content, broadcast } => {
+        OutboxPayload::Reply {
+            content,
+            broadcast,
+            client_msg_id,
+        } => {
             post_message_and_store(
                 ctx,
                 item.channel_id.clone(),
                 content,
                 item.thread_ts.clone(),
                 broadcast,
+                client_msg_id,
             )
             .await?;
         }
@@ -207,7 +229,8 @@ async fn execute_outbox_item<B: Backend>(
 }
 
 /// Claim, execute, and finalize one outbox item inside the serialized flush lock.
-/// Returns `false` if the caller should stop flushing further items (auth expired or cancelled).
+/// Returns `false` if the caller should stop flushing further items: auth expired, cancelled, or
+/// a transient failure that the items queued behind this one must not overtake.
 async fn deliver_claimed_outbox_item<B: Backend>(ctx: &TaskCtx<B>, item: OutboxItem) -> bool {
     let id = item.id;
     let ws = ctx.workspace.clone();
@@ -280,6 +303,27 @@ async fn deliver_claimed_outbox_item<B: Backend>(ctx: &TaskCtx<B>, item: OutboxI
             .await
             {
                 ctx.events.emit(Event::OutboxUpdated(all));
+            }
+            false
+        }
+        // Slack or the network may recover: back to `pending` for the next reconnect or flush
+        // (which reuses the message's `client_msg_id`), and stop this pass so later items cannot
+        // overtake it.
+        Err(CoreError::Api(ref err)) if is_transient_send_error(err) => {
+            tracing::info!(id, %err, "outbox send failed transiently; retrying on the next flush");
+            let ws = ctx.workspace.clone();
+            match with_store(&ctx.store, move |s| {
+                s.reset_outbox_item_pending(id)?;
+                s.list_outbox(&ws)
+            })
+            .await
+            {
+                Ok(all) => {
+                    ctx.events.emit(Event::OutboxUpdated(all));
+                }
+                Err(store_err) => {
+                    tracing::warn!(id, %store_err, "failed to return outbox item to pending");
+                }
             }
             false
         }
@@ -528,7 +572,8 @@ impl<B: Backend> Core<B> {
                 thread_ts,
                 broadcast,
             } => {
-                post_message_and_store(ctx, channel, content, thread_ts, broadcast).await?;
+                // Legacy rows only: sends now queue in the outbox, which keeps a `client_msg_id`.
+                post_message_and_store(ctx, channel, content, thread_ts, broadcast, None).await?;
             }
             QueuedMutation::AddReaction { channel, ts, name } => {
                 ctx.backend.add_reaction(channel, ts, name).await?;
@@ -540,6 +585,19 @@ impl<B: Backend> Core<B> {
                 // Never leak read receipts if Stealth Mode was enabled while queued.
                 if stealth_mode.load(Ordering::Relaxed) {
                     tracing::debug!(%channel, "suppressing queued MarkRead under Stealth Mode");
+                    return Ok(());
+                }
+                // A newer cursor already in the store (another device read further while this one
+                // was offline) wins: replaying this older mark would make the conversation unread
+                // again everywhere.
+                let ws = ctx.workspace.clone();
+                let target = channel.clone();
+                let stored = with_store(&ctx.store, move |s| s.conversation(&ws, &target)).await?;
+                if stored
+                    .and_then(|conv| conv.last_read)
+                    .is_some_and(|last_read| last_read > ts)
+                {
+                    tracing::debug!(%channel, %ts, "skipping stale queued MarkRead");
                     return Ok(());
                 }
                 mark_read_and_store(ctx, channel, ts).await?;

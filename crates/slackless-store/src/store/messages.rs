@@ -1,5 +1,7 @@
 //! Message upserts, deletions, history/thread queries, revisions, and zlib JSON storage.
 
+use std::cmp::Ordering;
+
 use super::*;
 
 /// Parameters shared by [`insert_revision`] and [`write_current`].
@@ -13,11 +15,14 @@ struct MessageWrite<'a> {
 }
 
 impl Store {
-    /// Records a message observed from history, replies, `chat.*` or the websocket.
+    /// Records a message observed from a live event: the websocket, a `chat.*` echo, or a
+    /// local rewrite of a stored message (reaction toggle, bot profile).
     ///
     /// For a `message_changed` event pass its inner `message`: the edit is keyed by `edited.ts`
-    /// and appended as a new revision. The current state follows the newest revision; once a
-    /// message is deleted, later (stale) observations are logged but never resurrect it.
+    /// and appended as a new revision. The current state follows the newest revision, and the
+    /// same revision key replaces the row (that is how a reaction or reply count changes);
+    /// once a message is deleted, later (stale) observations are logged but never resurrect it.
+    /// Pages fetched from `conversations.*` go through [`Self::upsert_history_page`] instead.
     pub fn upsert_message(
         &mut self,
         workspace: &TeamId,
@@ -27,8 +32,9 @@ impl Store {
         self.upsert_messages(workspace, channel, std::slice::from_ref(message))
     }
 
-    /// Records a batch of messages for `channel` in a single SQLite transaction (one WAL commit and
-    /// one revision bump for the whole page).
+    /// Records a batch of live observations for `channel` in a single SQLite transaction (one
+    /// WAL commit and one revision bump for the whole batch), with [`Self::upsert_message`]
+    /// semantics per message.
     pub fn upsert_messages(
         &mut self,
         workspace: &TeamId,
@@ -41,11 +47,83 @@ impl Store {
         }
         let tx = self.conn.transaction()?;
         for message in messages {
-            upsert_message_in_tx(&tx, workspace, channel, message)?;
+            upsert_message_in_tx(&tx, workspace, channel, message, SameRevision::Replace)?;
         }
         tx.commit()?;
         Self::bump_message_revision();
         Ok(())
+    }
+
+    /// Records a `conversations.history` page of `channel`, requested at `fetched_at` (unix
+    /// seconds, read before the request was sent), in a single SQLite transaction.
+    ///
+    /// The page is a snapshot that can predate live events already applied: when the stored
+    /// copy carries the same `edited.ts` but was updated at or after `fetched_at`, the page's
+    /// copy is skipped, so a reaction, reply count or pin change that arrived over the websocket
+    /// while the page was in flight survives. A newer `edited.ts` always wins, as for live writes.
+    ///
+    /// The page is also a complete view of the channel-level messages between its oldest and
+    /// newest `ts`, and `conversations.history` simply omits deleted messages: a stored, undeleted
+    /// top-level message in that span that the page omits was deleted while no `message_deleted`
+    /// reached this client, and is tombstoned with [`Self::record_deletion`] semantics (content
+    /// kept, nothing removed). Thread replies (never in such a page), ephemeral and hidden rows,
+    /// rows updated at or after `fetched_at`, and empty pages are never reconciled. Returns the
+    /// number of messages tombstoned.
+    pub fn upsert_history_page(
+        &mut self,
+        workspace: &TeamId,
+        channel: &ChannelId,
+        messages: &[Message],
+        fetched_at: i64,
+    ) -> Result<usize> {
+        self.upsert_page(workspace, channel, messages, fetched_at, true)
+    }
+
+    /// Records a `conversations.replies` page requested at `fetched_at` (unix seconds) with the
+    /// live-event protection of [`Self::upsert_history_page`] but without deletion
+    /// reconciliation: the page covers one thread, so absence from it says nothing about the rest
+    /// of the channel.
+    pub fn upsert_replies_page(
+        &mut self,
+        workspace: &TeamId,
+        channel: &ChannelId,
+        messages: &[Message],
+        fetched_at: i64,
+    ) -> Result<()> {
+        self.upsert_page(workspace, channel, messages, fetched_at, false)
+            .map(|_| ())
+    }
+
+    fn upsert_page(
+        &mut self,
+        workspace: &TeamId,
+        channel: &ChannelId,
+        messages: &[Message],
+        fetched_at: i64,
+        reconcile_deletions: bool,
+    ) -> Result<usize> {
+        self.ensure_writable()?;
+        if messages.is_empty() {
+            return Ok(0);
+        }
+        // IMMEDIATE: the page reads `message_current` before writing it while the GUI and the
+        // CLI share the file; holding the write lock from the start turns a concurrent live write
+        // into a short wait instead of a `SQLITE_BUSY_SNAPSHOT` failure that would drop the page.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let same = SameRevision::SkipIfUpdatedSince(fetched_at);
+        for message in messages {
+            upsert_message_in_tx(&tx, workspace, channel, message, same)?;
+        }
+        let tombstoned = if reconcile_deletions {
+            tombstone_absent_from_page(&tx, workspace, channel, messages, fetched_at)?
+        } else {
+            0
+        };
+        tx.commit()?;
+        Self::bump_message_revision();
+        Ok(tombstoned)
     }
 
     /// Forgets the current state of ephemeral messages ("Only visible to you", like Giphy's
@@ -79,40 +157,7 @@ impl Store {
     ) -> Result<()> {
         self.ensure_writable()?;
         let tx = self.conn.transaction()?;
-        archive_current_as_revision(&tx, workspace, channel, deleted_ts)?;
-        let mut prior = match previous {
-            Some(m) => m.clone(),
-            None => {
-                let mut stmt = tx.prepare_cached(
-                    "SELECT json FROM message_current
-                     WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3",
-                )?;
-                let stored: Option<String> = stmt
-                    .query_row(
-                        params![workspace.as_str(), channel.as_str(), deleted_ts.as_str()],
-                        |r| decode_json_value(r.get_ref(0)?),
-                    )
-                    .optional()?;
-                match stored {
-                    Some(json) => serde_json::from_str(&json)?,
-                    None => Message::default(),
-                }
-            }
-        };
-        prior.ts = deleted_ts.clone();
-        let edit_ts = event_ts.map_or_else(now_ts, |t| t.as_str().to_owned());
-        let json = serde_json::to_string(&prior)?;
-        let stored_json = encode_json_value(&json, is_ephemeral_message(&prior));
-        let write = MessageWrite {
-            workspace,
-            channel,
-            message: &prior,
-            edit_ts: &edit_ts,
-            deleted: true,
-            json: &stored_json,
-        };
-        insert_revision(&tx, &write)?;
-        write_current(&tx, &write, true)?;
+        record_deletion_in_tx(&tx, workspace, channel, deleted_ts, event_ts, previous)?;
         tx.commit()?;
         Self::bump_message_revision();
         Ok(())
@@ -321,6 +366,158 @@ impl Store {
     }
 }
 
+/// [`Store::record_deletion`] inside `tx`; the caller's transaction bumps the revision once.
+fn record_deletion_in_tx(
+    tx: &Transaction<'_>,
+    workspace: &TeamId,
+    channel: &ChannelId,
+    deleted_ts: &Ts,
+    event_ts: Option<&Ts>,
+    previous: Option<&Message>,
+) -> Result<()> {
+    archive_current_as_revision(tx, workspace, channel, deleted_ts)?;
+    let mut prior = match previous {
+        Some(m) => m.clone(),
+        None => {
+            let mut stmt = tx.prepare_cached(
+                "SELECT json FROM message_current
+                     WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3",
+            )?;
+            let stored: Option<String> = stmt
+                .query_row(
+                    params![workspace.as_str(), channel.as_str(), deleted_ts.as_str()],
+                    |r| decode_json_value(r.get_ref(0)?),
+                )
+                .optional()?;
+            match stored {
+                Some(json) => serde_json::from_str(&json)?,
+                None => Message::default(),
+            }
+        }
+    };
+    prior.ts = deleted_ts.clone();
+    let edit_ts = event_ts.map_or_else(now_ts, |t| t.as_str().to_owned());
+    let json = serde_json::to_string(&prior)?;
+    let stored_json = encode_json_value(&json, is_ephemeral_message(&prior));
+    let write = MessageWrite {
+        workspace,
+        channel,
+        message: &prior,
+        edit_ts: &edit_ts,
+        deleted: true,
+        json: &stored_json,
+    };
+    insert_revision(tx, &write)?;
+    write_current(tx, &write, true)?;
+    Ok(())
+}
+
+/// What a write does with the current row when the incoming message carries the same revision
+/// key (`edited.ts`) as the stored copy.
+#[derive(Clone, Copy)]
+enum SameRevision {
+    /// A live observation: the incoming copy replaces the row.
+    Replace,
+    /// A page requested at `fetched_at` (unix seconds): a row updated at or after that moment
+    /// was written by a live event the page predates, so the page's copy is skipped. Rows updated
+    /// within the request's own second are skipped too: `updated_at` has second resolution, and
+    /// keeping an equally fresh copy costs nothing while the next fetch still corrects it.
+    SkipIfUpdatedSince(i64),
+}
+
+impl SameRevision {
+    /// Whether the incoming copy (revision key `edit_ts`) replaces the stored, undeleted row
+    /// (revision key `current_edit`, last written at `updated_at`).
+    fn replaces(&self, edit_ts: &str, current_edit: &str, updated_at: i64) -> bool {
+        match Ts::from(edit_ts).cmp(&Ts::from(current_edit)) {
+            Ordering::Less => false,
+            Ordering::Greater => true,
+            Ordering::Equal => match self {
+                Self::Replace => true,
+                Self::SkipIfUpdatedSince(fetched_at) => updated_at < *fetched_at,
+            },
+        }
+    }
+}
+
+/// Tombstones the stored top-level messages inside the page's `[oldest, newest]` span that the
+/// page omits (see [`Store::upsert_history_page`]). Rows written at or after `fetched_at` are
+/// left alone, as are rows whose JSON no longer parses (nothing is tombstoned on a guess).
+/// Returns how many were tombstoned.
+fn tombstone_absent_from_page(
+    tx: &Transaction<'_>,
+    workspace: &TeamId,
+    channel: &ChannelId,
+    page: &[Message],
+    fetched_at: i64,
+) -> Result<usize> {
+    let mut keys = page.iter().map(|m| ts_key(&m.ts));
+    let Some(first) = keys.next() else {
+        return Ok(0);
+    };
+    let (oldest, newest) = keys.fold((first, first), |(lo, hi), key| (lo.min(key), hi.max(key)));
+    let in_page: HashSet<&str> = page.iter().map(|m| m.ts.as_str()).collect();
+    let absent: Vec<String> = {
+        let mut stmt = tx.prepare_cached(
+            "SELECT ts FROM message_current
+             WHERE workspace_id = ?1 AND channel_id = ?2 AND deleted = 0
+               AND ts_key BETWEEN ?3 AND ?4
+               AND (thread_ts IS NULL OR thread_ts = ts)
+               AND updated_at < ?5",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                workspace.as_str(),
+                channel.as_str(),
+                oldest,
+                newest,
+                fetched_at
+            ],
+            |r| r.get::<_, String>(0),
+        )?;
+        let mut out = Vec::new();
+        for ts in rows {
+            let ts = ts?;
+            if !in_page.contains(ts.as_str()) {
+                out.push(ts);
+            }
+        }
+        out
+    };
+    let mut tombstoned = 0;
+    for ts in absent {
+        let stored = stored_message_json(tx, workspace, channel, &ts)?;
+        let Ok(message) = serde_json::from_str::<Message>(&stored) else {
+            continue;
+        };
+        if message.hidden || is_ephemeral_message(&message) {
+            continue;
+        }
+        record_deletion_in_tx(tx, workspace, channel, &Ts::from(ts), None, Some(&message))?;
+        tombstoned += 1;
+    }
+    Ok(tombstoned)
+}
+
+/// The decoded `json` of one stored message (empty when the row is gone).
+fn stored_message_json(
+    tx: &Transaction<'_>,
+    workspace: &TeamId,
+    channel: &ChannelId,
+    ts: &str,
+) -> Result<String> {
+    let mut stmt = tx.prepare_cached(
+        "SELECT json FROM message_current
+         WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3",
+    )?;
+    Ok(stmt
+        .query_row(params![workspace.as_str(), channel.as_str(), ts], |r| {
+            decode_json_value(r.get_ref(0)?)
+        })
+        .optional()?
+        .unwrap_or_default())
+}
+
 /// Workspace-wide `recent_threads` query, shared with tests to assert `EXPLAIN QUERY PLAN`
 /// hits the V8 partial index `message_current_threads`.
 pub(super) const RECENT_THREADS_WORKSPACE_SQL: &str =
@@ -513,34 +710,37 @@ fn upsert_message_in_tx(
     workspace: &TeamId,
     channel: &ChannelId,
     message: &Message,
+    same: SameRevision,
 ) -> Result<()> {
     let edit_ts = message.edited.as_ref().map_or("", |e| e.ts.as_str());
     let json = serde_json::to_string(message)?;
     let ephemeral = is_ephemeral_message(message);
     let stored_json = encode_json_value(&json, ephemeral);
-    let current: Option<(String, bool)> = {
+    let current: Option<(String, bool, i64)> = {
         let mut stmt = tx.prepare_cached(
-            "SELECT edit_ts, deleted FROM message_current
+            "SELECT edit_ts, deleted, updated_at FROM message_current
              WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3",
         )?;
         stmt.query_row(
             params![workspace.as_str(), channel.as_str(), message.ts.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?
     };
     let newest = match &current {
         None => true,
-        Some((_, true)) => false,
-        Some((current_edit, false)) => Ts::from(edit_ts) >= Ts::from(current_edit.as_str()),
+        Some((_, true, _)) => false,
+        Some((current_edit, false, updated_at)) => {
+            same.replaces(edit_ts, current_edit, *updated_at)
+        }
     };
     // Avoid duplicating untouched originals in `message_revision` (cuts archive size ~65%):
     // whenever a message is edited, tombstoned, or re-observed with a different revision key,
     // archive the existing `message_current` row first and append the incoming revision.
     let needs_revision = match &current {
         None => false,
-        Some((_, true)) => true,
-        Some((current_edit, false)) => current_edit.as_str() != edit_ts,
+        Some((_, true, _)) => true,
+        Some((current_edit, false, _)) => current_edit.as_str() != edit_ts,
     };
     let write = MessageWrite {
         workspace,

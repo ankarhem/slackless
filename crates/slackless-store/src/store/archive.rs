@@ -292,37 +292,31 @@ impl Store {
         Ok(out)
     }
 
-    /// Stream every non-deleted current message in `workspace` (ordered oldest first) for
-    /// incremental sidecar indexing, including attached file names & transcripts.
-    pub fn list_messages_for_indexing(
+    /// Visit every non-deleted current message in `workspace` (oldest first) for incremental
+    /// sidecar indexing, with its attached file names & transcripts. Rows are decoded one at a
+    /// time, so a whole workspace is never held in memory at once.
+    pub fn for_each_message_for_indexing(
         &self,
         workspace: &TeamId,
-    ) -> Result<Vec<(ChannelId, Message, String, String)>> {
+        mut visit: impl FnMut(ChannelId, Message, String, String),
+    ) -> Result<()> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT channel_id, json, file_names, file_transcripts
              FROM message_current
              WHERE workspace_id = ?1 AND deleted = 0
              ORDER BY ts_key ASC",
         )?;
-        let rows = stmt.query_map(params![workspace.as_str()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                decode_json_value(row.get_ref(1)?)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (ch, json, file_names, file_transcripts) = row?;
-            let channel = ChannelId::from(ch);
+        let mut rows = stmt.query(params![workspace.as_str()])?;
+        while let Some(row) = rows.next()? {
+            let channel = ChannelId::from(row.get::<_, String>(0)?);
+            let json = decode_json_value(row.get_ref(1)?)?;
             let Ok(mut message) = serde_json::from_str::<Message>(&json) else {
                 continue;
             };
             message.channel.get_or_insert_with(|| channel.clone());
-            out.push((channel, message, file_names, file_transcripts));
+            visit(channel, message, row.get(2)?, row.get(3)?);
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Every stored `file_transcript` row in `workspace` (with optional carrying message channel

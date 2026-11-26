@@ -39,6 +39,7 @@ use gpui_kit::gpui::{
     StatefulInteractiveElement as _, Styled as _, Window, div, img, px,
 };
 use slackless_core::api::ActionContainer;
+use slackless_core::domain::mrkdwn::unescape_mrkdwn;
 use slackless_core::types::{
     Attachment, Block, BotId, ChannelId, ConversationKind, Message, TeamId, Ts, UserId,
 };
@@ -508,9 +509,9 @@ fn text_of(object: &Json) -> Option<&str> {
 /// Decode Slack HTML entities (`&amp;`, `&lt;`, `&gt;`) and substitute `:shortcode:` emoji
 /// unless Preferences -> Messages & media -> Emoji text mode is enabled.
 fn plain_label(text: &str, cx: &App) -> String {
-    let decoded = messages::unescape(text);
+    let decoded = unescape_mrkdwn(text);
     if crate::preferences::display_prefs(cx).emoji_text_mode {
-        decoded
+        decoded.into_owned()
     } else {
         emoji::replace_shortcodes(&decoded)
     }
@@ -967,6 +968,7 @@ pub fn collect_modal_state_errors(
 }
 
 /// Collect Slack `state.values` from modal `input` blocks and validate required / typed inputs.
+#[cfg(test)]
 pub fn collect_modal_state(
     ts: &Ts,
     raw_blocks: &[Json],

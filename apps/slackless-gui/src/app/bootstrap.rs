@@ -171,6 +171,10 @@ fn restore_initial_preferences(
             cx,
         );
     }
+    // `open_url`'s link policy holds from the first click, not from the first Preferences change.
+    let settings = preferences.read(cx).settings();
+    crate::zoom::set_strip_tracking_params(settings.strip_tracking_params);
+    crate::zoom::set_protocol_allowlist(&settings.protocol_allowlist);
     let factor = cx.global::<crate::zoom::Zoom>().factor();
     let zoom = (crate::zoom::FACTORS.iter())
         .position(|level| *level == factor)
@@ -1132,8 +1136,8 @@ fn wire_feature_view_subscriptions(
                         cx,
                     );
                 }
-                CatchUpEvent::WindowChanged(_)
-                | CatchUpEvent::ScopeChanged(_)
+                CatchUpEvent::WindowChanged
+                | CatchUpEvent::ScopeChanged
                 | CatchUpEvent::Refresh => {
                     this.refresh_catchup(cx);
                 }
@@ -1900,6 +1904,7 @@ impl App {
                 catchup,
                 catchup_generation: 0,
                 unreads_fetched: HashSet::new(),
+                unreads_refresh: LiveRefresh::default(),
                 activity,
                 files_page,
                 huddles,

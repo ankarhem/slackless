@@ -8,27 +8,38 @@ impl App {
         crate::huddle_video::huddle_browser_url(&self.fixtures, &self.channel, None)
     }
 
-    /// The header's huddle button: toggles the sample huddle dock in sample mode, or starts /
-    /// joins a native Chime audio huddle in live workspaces (with a confirmation warning on
-    /// channels with 150+ members, `F-COLLAB-055`).
+    /// The header's huddle button: [`Self::start_huddle_in`] the open conversation.
     pub(in crate::app) fn start_huddle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_huddle_in(self.channel.clone(), window, cx);
+    }
+
+    /// Toggle the sample huddle dock in sample mode, or start / join a native Chime audio
+    /// huddle in `channel` in live workspaces (with a confirmation warning on channels with
+    /// 150+ members, `F-COLLAB-055`).
+    pub(in crate::app) fn start_huddle_in(
+        &mut self,
+        channel: ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let is_fixture_huddle_channel = self.fixtures.sample
-            && huddle_state::fixture_huddle(&self.fixtures)
-                .is_some_and(|h| h.channel == self.channel);
+            && huddle_state::fixture_huddle(&self.fixtures).is_some_and(|h| h.channel == channel);
         if is_fixture_huddle_channel {
             let active_here = self
                 .huddle_session
                 .as_ref()
-                .is_some_and(|s| s.channel == self.channel);
+                .is_some_and(|s| s.channel == channel);
             if !active_here {
                 let settings = self.preferences.read(cx).settings().clone();
+                let huddle_link =
+                    crate::huddle_video::huddle_browser_url(&self.fixtures, &channel, None);
                 let snap = slackless_core::huddle::HuddleSessionSnapshot {
                     phase: slackless_core::huddle::HuddlePhase::Connected,
-                    channel: self.channel.clone(),
+                    channel,
                     call_id: "R0SAMPLE".to_owned(),
                     muted: settings.huddle_join_muted,
                     started_at_secs: crate::drafts::now_secs(),
-                    huddle_link: Some(self.huddle_link()),
+                    huddle_link: Some(huddle_link),
                     input_device: settings.huddle_input_device,
                     output_device: settings.huddle_output_device,
                     aec: settings.huddle_aec,
@@ -47,7 +58,7 @@ impl App {
         if self
             .huddle_session
             .as_ref()
-            .is_some_and(|s| s.channel == self.channel)
+            .is_some_and(|s| s.channel == channel)
         {
             self.pop_out_huddle(window, cx);
             return;
@@ -55,28 +66,27 @@ impl App {
         let member_count = self
             .ws
             .member_counts
-            .get(&self.channel)
+            .get(&channel)
             .copied()
             .or_else(|| {
                 self.fixtures
-                    .conversation(&self.channel)
+                    .conversation(&channel)
                     .and_then(|c| c.num_members)
             })
             .unwrap_or(0);
-        let is_channel = self.fixtures.conversation(&self.channel).is_some_and(|c| {
+        let is_channel = self.fixtures.conversation(&channel).is_some_and(|c| {
             matches!(
                 c.kind(),
                 ConversationKind::PublicChannel | ConversationKind::PrivateChannel
             )
         });
-        let target_channel = self.channel.clone();
         if is_channel && member_count >= 150 {
-            let label = self.label(&self.channel);
+            let label = self.label(&channel);
             let this = cx.weak_entity();
             window.open_dialog(cx, move |dialog, _, cx| {
                 let muted = cx.theme().muted_foreground;
                 let this = this.clone();
-                let ch = target_channel.clone();
+                let ch = channel.clone();
                 dialog
                     .title(format!("Start a huddle in {label}?"))
                     .w(px(440.))
@@ -117,8 +127,80 @@ impl App {
                     )
             });
         } else {
-            self.join_huddle_in(target_channel, window, cx);
+            self.join_huddle_in(channel, window, cx);
         }
+    }
+
+    /// A huddle link, in a message or from the OS (`slack://huddle?...`): asks before joining,
+    /// then joins as the huddle button does ([`Self::start_huddle_in`]), so the large-channel
+    /// warning and Preferences' Join muted apply.
+    pub(in crate::app) fn ask_to_join_huddle(
+        &mut self,
+        channel: ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Already in it: show it, as the huddle button does.
+        if self
+            .huddle_session
+            .as_ref()
+            .is_some_and(|s| s.channel == channel)
+        {
+            self.pop_out_huddle(window, cx);
+            return;
+        }
+        let label = self.label(&channel);
+        let mic = if self.preferences.read(cx).settings().huddle_join_muted {
+            "muted"
+        } else {
+            "on"
+        };
+        let this = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            let this = this.clone();
+            let ch = channel.clone();
+            dialog
+                .title(format!("Join huddle in {label}?"))
+                .w(px(440.))
+                .child(
+                    v_flex()
+                        .gap_4()
+                        .child(
+                            div()
+                                .text_color(muted)
+                                .child(format!("You'll join with your microphone {mic}.")),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    preferences::form_button(
+                                        Button::new("huddle-link-cancel").outline().label("Cancel"),
+                                        cx,
+                                    )
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                                )
+                                .child(
+                                    preferences::form_button(
+                                        Button::new("huddle-link-join")
+                                            .primary()
+                                            .label("Join huddle"),
+                                        cx,
+                                    )
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            let _ = this.update(cx, |app, cx| {
+                                                app.start_huddle_in(ch.clone(), window, cx);
+                                            });
+                                        },
+                                    ),
+                                ),
+                        ),
+                )
+        });
     }
 
     /// Join or start a native Chime audio huddle in `channel`.

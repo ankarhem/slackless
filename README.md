@@ -59,6 +59,8 @@ This builds release binaries and installs:
 - `~/Applications/Slackless.app` (with `slack://` deep-link handling and native notifications)
 - `~/.local/bin/slackless` (headless CLI)
 
+ONNX Runtime (semantic search, Parakeet transcription) is a shared library loaded on demand: the bundle script downloads a pinned, checksum-verified build into `Slackless.app/Contents/Frameworks/`. Unbundled binaries (`cargo run`, `just run`) find it after `scripts/fetch-onnxruntime.sh`, or through `ORT_DYLIB_PATH`; without it those features report themselves unavailable.
+
 For quick local runs, validation, or an offline demo with bundled sample data:
 
 ```sh

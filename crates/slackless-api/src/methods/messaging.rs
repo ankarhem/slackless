@@ -13,7 +13,28 @@ impl SlackApi {
         thread_ts: Option<&Ts>,
         reply_broadcast: bool,
     ) -> Result<PostedMessage> {
-        let client_msg_id = uuid::Uuid::new_v4().to_string();
+        self.chat_post_message_with_client_msg_id(
+            channel,
+            content,
+            thread_ts,
+            reply_broadcast,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::chat_post_message`] under a caller-minted `client_msg_id` ([`new_client_msg_id`]);
+    /// `None` mints a fresh one. Retrying a send under the id of its first attempt lets Slack drop
+    /// the duplicate when that attempt was accepted but its response never arrived.
+    pub async fn chat_post_message_with_client_msg_id(
+        &self,
+        channel: &ChannelId,
+        content: &MessageContent,
+        thread_ts: Option<&Ts>,
+        reply_broadcast: bool,
+        client_msg_id: Option<&str>,
+    ) -> Result<PostedMessage> {
+        let client_msg_id = client_msg_id.map_or_else(new_client_msg_id, str::to_owned);
         let mut params = vec![
             ("channel", channel.to_string()),
             ("type", "message".to_owned()),

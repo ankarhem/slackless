@@ -415,7 +415,12 @@ impl ThreadsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let initial = self.fixtures.plain_text(message);
+        // Seed with the raw mrkdwn / rich_text source, like the popout's inline edit: a plain-text
+        // seed strips formatting and flattens mentions to `@name` text, which is what gets sent.
+        let initial = crate::editor::from_rich_text(&message.blocks, &*self.fixtures)
+            .map(|doc| doc.to_mrkdwn())
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| message.text.clone());
         let input = cx.new(|cx| {
             let mut state = TextareaState::new(window, cx)
                 .placeholder("Edit message…")

@@ -12,6 +12,10 @@ slackless-store.workspace = true
 slackless-auth.workspace = true
 slackless-huddle.workspace = true
 dirs = "7"
+# Same html5ever/rcdom the GUI already links through gpui-kit: keep in lockstep or cargo adds a
+# second copy.
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
@@ -20,9 +24,9 @@ serde.workspace = true
 serde_json.workspace = true
 regex.workspace = true
 url.workspace = true
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 sha2 = "0.10"
-ort = "=2.0.0-rc.12"
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

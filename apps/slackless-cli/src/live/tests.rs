@@ -360,6 +360,35 @@ fn format_watch_event_handles_messages_reactions_threads_filters_and_ignored() {
 }
 
 #[test]
+fn mirror_event_reports_store_failures_instead_of_dropping_them() {
+    let ws = TeamId::from("T1");
+    let dir = TempDir::new("watch-mirror");
+    let db = dir.path().join("T1.sqlite");
+    let message = || {
+        SlackEvent::Message(MessageEvent::Message(Box::new(Message {
+            ts: Ts::from("1700000000.000100"),
+            channel: Some(ChannelId::from("C1")),
+            user: Some(UserId::from("U1")),
+            text: "hello".into(),
+            ..Message::default()
+        })))
+    };
+
+    // A writable archive mirrors the event and has nothing to report.
+    let mut archive = Archive::from_store(Store::open(&db).expect("open archive"));
+    assert_eq!(mirror_event(&mut archive, &ws, message()), None);
+    let mirrored = archive
+        .store()
+        .message(&ws, &ChannelId::from("C1"), &Ts::from("1700000000.000100"))
+        .expect("read back");
+    assert!(mirrored.is_some(), "the event lands in the archive");
+
+    // A store that cannot take the write hands its failure back for stderr instead of losing it.
+    let mut read_only = Archive::from_store(Store::open_read_only(&db).expect("open read-only"));
+    assert!(mirror_event(&mut read_only, &ws, message()).is_some());
+}
+
+#[test]
 fn summarize_unread_suppresses_muted_without_mentions_and_handles_caught_up() {
     let counts = ClientCounts {
         ims: vec![ConversationCounts {
@@ -510,13 +539,6 @@ fn status_normalization_download_sanitization_and_mark_thread_cursor() {
         select_download_url(&both_urls),
         Some("https://files.slack.com/download")
     );
-    let (safe, default_dest) = resolve_download_dest("F1", &both_urls, None);
-    assert_eq!(safe, "report.pdf");
-    assert_eq!(default_dest, PathBuf::from("report.pdf"));
-    let (safe2, custom_dest) =
-        resolve_download_dest("F1", &both_urls, Some(Path::new("/tmp/custom.pdf")));
-    assert_eq!(safe2, "report.pdf");
-    assert_eq!(custom_dest, PathBuf::from("/tmp/custom.pdf"));
 
     let private_only = File {
         id: FileId::from("F2"),
@@ -618,6 +640,36 @@ fn status_normalization_download_sanitization_and_mark_thread_cursor() {
         mark_thread_cursor("1700.001", Some("1700.002"), true),
         Ts::from("1700.002")
     );
+}
+
+#[test]
+fn default_download_never_replaces_existing_files_or_creates_dotfiles() {
+    let dir = TempDir::new("download-dest");
+    let path = |name: &str| dir.path().join(name);
+    std::fs::write(path("Makefile"), b"mine").expect("seed Makefile");
+    std::fs::write(path("target.txt"), b"secret").expect("seed symlink target");
+    std::os::unix::fs::symlink(path("target.txt"), path("notes.txt")).expect("seed symlink");
+
+    // A taken name gets the next free browser-style number; the original is left alone.
+    let first = create_numbered_file(dir.path(), "Makefile", b"upload").expect("save once");
+    let second = create_numbered_file(dir.path(), "Makefile", b"upload").expect("save twice");
+    assert_eq!(first, path("Makefile (1)"));
+    assert_eq!(second, path("Makefile (2)"));
+    assert_eq!(std::fs::read(path("Makefile")).expect("read"), b"mine");
+
+    // A symlink under the uploader's name is never written through.
+    let saved = create_numbered_file(dir.path(), "notes.txt", b"upload").expect("save notes");
+    assert_eq!(saved, path("notes (1).txt"));
+    assert_eq!(std::fs::read(&saved).expect("read saved"), b"upload");
+    assert_eq!(std::fs::read(path("target.txt")).expect("read"), b"secret");
+
+    // Uploader-chosen names never become dot-files.
+    assert_eq!(sanitize_download_name("F1", Some(".envrc"), None), "envrc");
+    assert_eq!(
+        sanitize_download_name("F1", Some("../.ssh/..config"), None),
+        "config"
+    );
+    assert_eq!(sanitize_download_name("F1", Some("..."), None), "F1.bin");
 }
 
 #[test]

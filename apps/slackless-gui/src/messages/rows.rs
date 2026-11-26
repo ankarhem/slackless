@@ -266,7 +266,7 @@ pub(super) fn transcript_row(
                     .binary_search_by(|m| m.ts.cmp(&root.ts))
                     .ok()
                     .and_then(|idx| messages.get(idx))
-                    .unwrap_or(root)
+                    .map_or(root, Rc::as_ref)
             });
         if let Some(root) = broadcast_root.filter(|_| !grouped) {
             // Slack's broadcast reference opens the thread.

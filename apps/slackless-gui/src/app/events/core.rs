@@ -11,9 +11,8 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         match event {
-            Event::Conversations(_) | Event::UsersChanged(_) | Event::SidebarChanged => {
-                self.reload_live(window, cx)
-            }
+            Event::Conversations(_) | Event::SidebarChanged => self.reload_live(window, cx),
+            Event::UsersChanged(users) => self.reload_users(users, window, cx),
             Event::Counts(counts) => self.on_counts_event(counts, window, cx),
             Event::ReadMarker { channel, ts } => {
                 self.apply_read_marker(channel, ts, cx);

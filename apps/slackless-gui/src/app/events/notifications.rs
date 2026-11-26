@@ -361,7 +361,7 @@ impl App {
                 .unwrap_or_default(),
         };
         let text = if self.preferences.read(cx).settings().show_preview {
-            self.fixtures.plain_text(message)
+            crate::messages::plain_text(&message.text, &*self.fixtures)
         } else {
             "New message".to_owned()
         };
@@ -512,6 +512,7 @@ impl App {
 
     /// Slack's desktop notification rules for a message just posted, layered with local smart
     /// notification rules (`BreakThroughMute` > `Suppress` > `PriorityHighlight`).
+    #[cfg(test)]
     pub(in crate::app) fn should_notify(
         &self,
         channel: &ChannelId,

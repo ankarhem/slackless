@@ -615,6 +615,97 @@ fn search_view_keyword_hybrid_semantic_modes_and_missing_model_prompt(cx: &mut T
     });
 }
 
+#[test]
+fn semantic_indexing_reads_archive_files_without_holding_the_shared_store() {
+    use slackless_core::embeddings::{Embedder, HashProjectionEmbedder};
+    use slackless_core::store::SemanticIndex;
+
+    use super::query::index_semantic_workspaces;
+
+    /// Records, for every document it embeds, whether the live archive's shared read handle
+    /// (the one the UI thread locks for channel history) was free.
+    struct LockProbe {
+        inner: HashProjectionEmbedder,
+        shared: SharedStore,
+        free: Mutex<Vec<bool>>,
+    }
+
+    impl Embedder for LockProbe {
+        fn dims(&self) -> usize {
+            self.inner.dims()
+        }
+
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+
+        fn embed_document(&self, text: &str) -> Result<Vec<f32>, String> {
+            let free = self.shared.try_lock().is_ok();
+            self.free.lock().unwrap().push(free);
+            self.inner.embed_document(text)
+        }
+    }
+
+    let message = |ts: &str, text: &str| Message {
+        ts: Ts::from(ts),
+        text: text.into(),
+        ..Default::default()
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "slackless-semantic-index-lock-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A live workspace: the core's writer, plus the shared read-only handle the UI reads from.
+    let live = TeamId::from("T_LIVE");
+    let path = dir.join("T_LIVE.sqlite");
+    let mut writer = Store::open(&path).unwrap();
+    writer
+        .upsert_messages(
+            &live,
+            &ChannelId::from("C1"),
+            &[message("1700000001.000000", "Kubernetes rollout plan")],
+        )
+        .unwrap();
+    let shared: SharedStore = Arc::new(Mutex::new(Store::open_read_only(&path).unwrap()));
+    // A sample workspace has no archive file, so only its shared handle can be indexed.
+    let sample = TeamId::from("T_SAMPLE");
+    let mut sample_store = Store::open_in_memory().unwrap();
+    sample_store
+        .upsert_messages(
+            &sample,
+            &ChannelId::from("C2"),
+            &[message("1700000002.000000", "Lunch menu")],
+        )
+        .unwrap();
+    let sample_store: SharedStore = Arc::new(Mutex::new(sample_store));
+
+    let probe = LockProbe {
+        inner: HashProjectionEmbedder::new(64),
+        shared: shared.clone(),
+        free: Mutex::new(Vec::new()),
+    };
+    let mut index = SemanticIndex::open_in_memory().unwrap();
+    let indexed = index_semantic_workspaces(
+        &[(live.clone(), shared), (sample.clone(), sample_store)],
+        &[(live.clone(), path)],
+        &mut index,
+        &probe,
+    );
+    let LockProbe { free, shared, .. } = probe;
+    drop((shared, writer));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(indexed, Ok((2, 0)));
+    assert_eq!(index.workspace_ids().unwrap(), vec![live, sample]);
+    assert_eq!(
+        free.into_inner().unwrap(),
+        [true, true],
+        "indexing must leave the shared store free while it embeds"
+    );
+}
+
 #[gpui::test]
 fn search_view_tracks_local_loading_and_rejects_duplicate_remote_pages(cx: &mut TestAppContext) {
     use super::state::{SearchScope, SearchWorkspaceSource};

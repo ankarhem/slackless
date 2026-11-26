@@ -508,7 +508,13 @@ fn initial_unread_scroll_fires_once_and_ignores_backfill_refreshes(cx: &mut Test
                     },
                 ];
                 let before_len = list.data.read(cx).messages.len();
-                expanded.extend(list.data.read(cx).messages.clone());
+                expanded.extend(
+                    list.data
+                        .read(cx)
+                        .messages
+                        .iter()
+                        .map(|m| Message::clone(m)),
+                );
                 list.set_history(channel, expanded, cx);
                 assert_eq!(list.data.read(cx).messages.len(), before_len + 2);
                 assert!(!list.scroller.read(cx).is_following_tail());
@@ -556,6 +562,130 @@ fn recent_channel_history_cache_avoids_blank_flash_on_switch(cx: &mut TestAppCon
                 assert_eq!(
                     list.message_by_ts(&c2, &m2.ts, cx).map(|m| m.text),
                     Some("channel 2 msg".to_owned())
+                );
+            });
+        });
+    });
+}
+
+#[gpui::test]
+fn history_refreshes_and_older_pages_keep_the_visible_order_and_share_messages(
+    cx: &mut TestAppContext,
+) {
+    with_transcript("C0ENG", cx, |harness, cx| {
+        cx.update(|_, cx| {
+            let list = harness.read(cx).list.clone();
+            let channel = ChannelId::from("C_LIVE_PAGES");
+            let message = |secs: u32, text: &str| Message {
+                ts: Ts::from(format!("17000000{secs:02}.000000")),
+                text: text.into(),
+                ..Default::default()
+            };
+            let hidden = |secs: u32| Message {
+                hidden: true,
+                ..message(secs, "metadata event")
+            };
+            let visible = |list: &MessageList, cx: &App| -> Vec<String> {
+                let data = list.data.read(cx);
+                data.messages.iter().map(|m| m.text.clone()).collect()
+            };
+            list.update(cx, |list, cx| {
+                let mut live = crate::fixtures::load();
+                live.sample = false;
+                list.set_fixtures(Arc::new(live), cx);
+                list.set_conversation(channel.clone(), cx);
+                list.set_history(
+                    channel.clone(),
+                    vec![
+                        message(20, "two"),
+                        hidden(30),
+                        message(40, "four"),
+                        message(50, "five"),
+                    ],
+                    cx,
+                );
+                assert_eq!(visible(list, cx), ["two", "four", "five"]);
+
+                // An out-of-order older page: loaded and repeated messages are skipped.
+                list.prepend_history(
+                    channel.clone(),
+                    vec![
+                        message(10, "one"),
+                        message(0, "zero"),
+                        message(20, "two again"),
+                        message(10, "one again"),
+                        hidden(5),
+                    ],
+                    cx,
+                );
+                assert_eq!(visible(list, cx), ["zero", "one", "two", "four", "five"]);
+
+                // A page overlapping the loaded window interleaves without reordering it.
+                list.prepend_history(
+                    channel.clone(),
+                    vec![message(60, "six"), message(35, "three and a half")],
+                    cx,
+                );
+                assert_eq!(
+                    visible(list, cx),
+                    [
+                        "zero",
+                        "one",
+                        "two",
+                        "three and a half",
+                        "four",
+                        "five",
+                        "six"
+                    ]
+                );
+
+                // A refreshed newest window replaces the loaded messages from its oldest one on
+                // and keeps the older pages; an unchanged message keeps its shared allocation.
+                let five = list.data.read(cx).messages[5].clone();
+                let window = || {
+                    vec![
+                        message(40, "four (edited)"),
+                        message(50, "five"),
+                        message(70, "seven"),
+                    ]
+                };
+                list.set_history(channel.clone(), window(), cx);
+                assert_eq!(
+                    visible(list, cx),
+                    [
+                        "zero",
+                        "one",
+                        "two",
+                        "three and a half",
+                        "four (edited)",
+                        "five",
+                        "seven"
+                    ]
+                );
+                assert!(Rc::ptr_eq(&list.data.read(cx).messages[5], &five));
+
+                // Re-reading the same window is a no-op, and the transcript holds the very
+                // messages the history cache holds rather than copies.
+                let shown = list.data.read(cx).messages.clone();
+                list.set_history(channel.clone(), window(), cx);
+                let data = list.data.read(cx);
+                assert_eq!(data.messages.len(), shown.len());
+                assert!(
+                    data.messages
+                        .iter()
+                        .zip(&shown)
+                        .all(|(a, b)| Rc::ptr_eq(a, b))
+                );
+                let cached: Vec<_> = list.messages[&channel]
+                    .iter()
+                    .filter(|m| !m.hidden)
+                    .collect();
+                assert_eq!(cached.len(), data.messages.len());
+                assert!(
+                    cached
+                        .iter()
+                        .zip(&data.messages)
+                        .all(|(a, b)| Rc::ptr_eq(a, b))
                 );
             });
         });
@@ -934,6 +1064,29 @@ fn push_mrkdwn_text_and_toggle_marker_enforce_verbatim_code_and_word_boundaries(
         b.links[1].1,
         LinkTarget::Url(SharedString::from("http://test.dev"))
     );
+
+    // linkify's boundary rules: balanced brackets stay in the URL, stray trailing punctuation
+    // does not, and only `http(s)://` URLs link (no `www.` hosts, emails or `file.rs`).
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "(https://example.com/a_(b))",
+            &["https://example.com/a_(b)"],
+        ),
+        ("https://example.com/q?x=1.", &["https://example.com/q?x=1"]),
+        ("https://", &[]),
+        ("www.example.com, alice@example.com and file.rs", &[]),
+    ];
+    for (text, urls) in cases {
+        let mut b = ParagraphBuilder::new();
+        push_mrkdwn_text(&mut b, text, &normal_theme, DEFAULT_FLAGS);
+        assert_eq!(b.text, *text);
+        let linked: Vec<&str> = b
+            .links
+            .iter()
+            .map(|(range, _)| &b.text[range.clone()])
+            .collect();
+        assert_eq!(linked, *urls, "{text}");
+    }
 
     // Verbatim mode and inline code skip auto-linking.
     let mut b_verb = ParagraphBuilder::new();

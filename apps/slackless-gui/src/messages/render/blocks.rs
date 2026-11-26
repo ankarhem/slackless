@@ -6,6 +6,7 @@ use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, Div, FontWeight, IntoElement, ParentElement as _, Styled as _, div, px,
 };
+use slackless_core::domain::mrkdwn::unescape_mrkdwn;
 use slackless_core::types::rich_text::{
     ListStyle, RichTextContainer, RichTextElement, RichTextList,
 };
@@ -15,7 +16,7 @@ use super::super::LinkTarget;
 use super::cards::render_huddle_thread_card;
 use super::inline::{
     ParagraphBuilder, RunFlags, RunTheme, flags, hex_color, jumbomoji_elements, mention_flags,
-    mrkdwn_fences, mrkdwn_lines, render_segments, unescape, unicode_glyph,
+    mrkdwn_fences, mrkdwn_lines, render_segments, unicode_glyph,
 };
 use super::{CivilTime, code_block, date_label_absolute, render_code};
 use crate::blockkit::{self, KitCx};
@@ -465,11 +466,11 @@ pub(crate) fn mrkdwn_with_verbatim(
     let mut column = v_flex().min_w_0();
     for (n, (fenced, piece)) in pieces.iter().enumerate() {
         column = if *fenced {
-            column.child(
-                div()
-                    .my_1()
-                    .child(code_block(unescape(piece), None, &theme)),
-            )
+            column.child(div().my_1().child(code_block(
+                unescape_mrkdwn(piece).into_owned(),
+                None,
+                &theme,
+            )))
         } else {
             mrkdwn_lines(
                 column,

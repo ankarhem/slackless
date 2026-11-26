@@ -56,8 +56,8 @@ pub(crate) use channels::{
 };
 #[cfg(test)]
 pub(crate) use files::{
-    clamp_files_limit, format_files_list, format_transcribe_result, infer_media_extension,
-    parse_transcribe_provider, resolve_download_dest, sanitize_download_name, select_download_url,
+    clamp_files_limit, create_numbered_file, format_files_list, format_transcribe_result,
+    infer_media_extension, parse_transcribe_provider, sanitize_download_name, select_download_url,
     select_transcribe_media_url,
 };
 #[cfg(test)]
@@ -78,4 +78,4 @@ pub(crate) use status::{
     compute_status_expiration, format_status_set, format_status_show, normalize_status_emoji,
 };
 #[cfg(test)]
-pub(crate) use watch::{format_watch_event, watch_reached_limit};
+pub(crate) use watch::{format_watch_event, mirror_event, watch_reached_limit};

@@ -1,10 +1,14 @@
 //! In-app auto-updater (`F-SHELL-163`) backed by GitHub Releases (`ankarhem/slackless`).
 //!
 //! Delegates pure-Rust release checks (`reqwest`), streaming download + SHA-256 verification
-//! (`sha2`), archive extraction, and CLI symlink installation to
-//! [`slackless_core::domain::updater`], while handling the macOS bundle swap & relaunch
-//! lifecycle for the running GUI app.
+//! (`sha2`), archive extraction, code-signature verification, the `.app` swap with rollback and
+//! CLI symlink installation to [`slackless_core::domain::updater`], while handling the relaunch
+//! of the running GUI app once it has quit.
 
+#[cfg(target_os = "macos")]
+use std::ffi::OsStr;
+#[cfg(target_os = "macos")]
+use std::path::Path;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::Command;
@@ -19,7 +23,12 @@ use slackless_core::domain::updater::{
 #[cfg(target_os = "macos")]
 use slackless_core::domain::updater::{
     download_and_verify_release_blocking, extract_tar_gz, resolve_target_app_bundle,
+    swap_app_bundle, update_signature_reference, verify_update_signature,
 };
+
+/// LaunchServices registration tool, run after a swap so Spotlight / `open` see the new bundle.
+#[cfg(target_os = "macos")]
+const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
 #[cfg(test)]
 pub use slackless_core::domain::updater::{
     find_sha256_entry, is_safe_asset_name, parse_release_highlights, parse_version,
@@ -168,17 +177,15 @@ pub fn check_for_update_on(channel: UpdateChannel) -> Result<Option<ReleaseInfo>
     Ok(Some(info))
 }
 
-/// Query GitHub Releases for the latest stable macOS arm64 release via pure-Rust `reqwest`.
-#[allow(dead_code)]
-pub fn check_for_update() -> Result<Option<ReleaseInfo>, String> {
-    check_for_update_on(UpdateChannel::Stable)
-}
-
 /// Download `release` via pure-Rust `reqwest`, verify its SHA-256 checksum in pure Rust (`sha2`),
-/// extract `Slackless.app`, and spawn a detached swap-and-relaunch helper that waits for this PID
-/// to exit. Caller should immediately quit the app (`cx.quit()`) upon `Ok(())`.
+/// extract `Slackless.app`, verify its code signature against the running app, swap it into place
+/// in-process (rolling back on failure), refresh the CLI symlink, register it with LaunchServices
+/// and spawn a detached helper that relaunches the new bundle once this process has exited.
+///
+/// Caller should quit the app (`cx.quit()`) upon `Ok(())`. On `Err` the swap was rolled back (or
+/// never attempted), so the app keeps running and can show the error.
 #[cfg(target_os = "macos")]
-pub fn download_and_schedule_swap(release: &ReleaseInfo) -> Result<(), String> {
+pub fn install_update(release: &ReleaseInfo) -> Result<(), String> {
     let target_app = resolve_target_app_bundle()
         .ok_or_else(|| "cannot determine Applications directory".to_owned())?;
     let parent = target_app
@@ -187,6 +194,7 @@ pub fn download_and_schedule_swap(release: &ReleaseInfo) -> Result<(), String> {
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("cannot write to {}: {e}", parent.display()))?;
 
+    // Stage next to the target so the swap is a same-volume rename.
     let stage_dir = parent.join(format!(".slackless-update-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage_dir);
     std::fs::create_dir_all(&stage_dir).map_err(|e| {
@@ -196,90 +204,94 @@ pub fn download_and_schedule_swap(release: &ReleaseInfo) -> Result<(), String> {
         )
     })?;
 
+    let swapped = stage_and_swap(release, &stage_dir, &target_app);
+    let _ = std::fs::remove_dir_all(&stage_dir);
+    swapped?;
+
+    // From here on the new bundle is installed whatever happens below.
+    if let Some(link) = slackless_core::domain::updater::install_cli_symlink(&target_app) {
+        tracing::debug!(link = %link.display(), "CLI symlink refreshed after update");
+    }
+    let _ = Command::new(LSREGISTER)
+        .args(["-f"])
+        .arg(&target_app)
+        .status();
+    schedule_relaunch(&target_app).map_err(|e| {
+        format!(
+            "Slackless was updated but will not relaunch automatically ({e}); quit and reopen Slackless"
+        )
+    })
+}
+
+/// Download, verify, extract, verify the signature and swap the new bundle into `target_app`.
+#[cfg(target_os = "macos")]
+fn stage_and_swap(
+    release: &ReleaseInfo,
+    stage_dir: &Path,
+    target_app: &Path,
+) -> Result<(), String> {
     let ua = format!("Slackless/{CURRENT_VERSION}");
-    let result = (|| -> Result<PathBuf, String> {
-        let archive = download_and_verify_release_blocking(release, &stage_dir, &ua)?;
-        extract_tar_gz(&archive, &stage_dir)?;
+    let archive = download_and_verify_release_blocking(release, stage_dir, &ua)?;
+    extract_tar_gz(&archive, stage_dir)?;
 
-        let new_app = stage_dir.join("Slackless.app");
-        if !new_app.join("Contents/MacOS/slackless-gui").is_file() {
-            return Err("update archive did not contain Slackless.app".to_owned());
-        }
-        let _ = Command::new("/usr/bin/xattr")
-            .args(["-dr", "com.apple.quarantine"])
-            .arg(&new_app)
-            .status();
-        Ok(new_app)
-    })();
+    let new_app = stage_dir.join("Slackless.app");
+    if !new_app.join("Contents/MacOS/slackless-gui").is_file() {
+        return Err("update archive did not contain Slackless.app".to_owned());
+    }
+    verify_update_signature(&new_app, update_signature_reference(target_app).as_deref())?;
+    let _ = Command::new("/usr/bin/xattr")
+        .args(["-dr", "com.apple.quarantine"])
+        .arg(&new_app)
+        .status();
 
-    let new_app = match result {
-        Ok(app) => app,
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&stage_dir);
-            return Err(err);
-        }
-    };
+    // Renaming the running app's bundle is fine on macOS; a failed move rolls back, leaving the
+    // running app in place.
+    swap_app_bundle(&new_app, target_app)
+}
 
-    // Spawn a detached shell script that waits for our PID to exit cleanly, atomically swaps the
-    // `.app` bundle (with rollback on error), registers LaunchServices, and relaunches Slackless.
-    let script = r#"
+/// Relaunch `app` with `open` once this process has exited (the relaunch has to happen after the
+/// quit, so it runs in a detached helper rather than in-process).
+#[cfg(target_os = "macos")]
+fn schedule_relaunch(app: &Path) -> Result<(), String> {
+    spawn_after_exit(
+        std::process::id(),
+        &[OsStr::new("/usr/bin/open"), app.as_os_str()],
+    )
+}
+
+/// Spawn a detached `/bin/sh` helper that waits for `pid` to exit and then runs `command`
+/// (an argument list, never interpolated into the script). Gives up without running anything if
+/// `pid` is still alive after five minutes.
+#[cfg(target_os = "macos")]
+fn spawn_after_exit(pid: u32, command: &[&OsStr]) -> Result<(), String> {
+    const SCRIPT: &str = r#"
 PID="$1"
-NEW_APP="$2"
-DEST="$3"
-STAGE="$4"
+shift
 i=0
-while kill -0 "$PID" 2>/dev/null && [ "$i" -lt 150 ]; do
+# shortcut: poll the PID every 100 ms for up to 5 minutes, upgrade to a kqueue watcher if a bound ever matters
+while kill -0 "$PID" 2>/dev/null && [ "$i" -lt 3000 ]; do
   sleep 0.1
   i=$((i + 1))
 done
-rm -rf "${DEST}.prev"
-if [ -d "$DEST" ]; then
-  mv "$DEST" "${DEST}.prev" 2>/dev/null || true
-fi
-if mv "$NEW_APP" "$DEST"; then
-  rm -rf "${DEST}.prev"
-else
-  if [ -d "${DEST}.prev" ]; then
-    mv "${DEST}.prev" "$DEST" 2>/dev/null || true
-  fi
-  rm -rf "$STAGE"
-  exit 1
-fi
-rm -rf "$STAGE"
-# Keep any installed `slackless` CLI symlink/binary synced to the updated bundle so the CLI always
-# matches the app version.
-CLI_BIN="${DEST}/Contents/MacOS/slackless"
-if [ -x "$CLI_BIN" ]; then
-  for CLI_LINK in /usr/local/bin/slackless "${HOME}/.local/bin/slackless"; do
-    if [ -L "$CLI_LINK" ] || [ -e "$CLI_LINK" ]; then
-      ln -sf "$CLI_BIN" "$CLI_LINK" 2>/dev/null || true
-    fi
-  done
-fi
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST" >/dev/null 2>&1 || true
-open "$DEST"
+kill -0 "$PID" 2>/dev/null && exit 0
+exec "$@"
 "#;
-
     Command::new("/bin/sh")
-        .args(["-c", script, "slackless-updater"])
-        .arg(std::process::id().to_string())
-        .arg(&new_app)
-        .arg(&target_app)
-        .arg(&stage_dir)
+        .arg("-c")
+        .arg(SCRIPT)
+        .arg("slackless-relaunch")
+        .arg(pid.to_string())
+        .args(command)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| {
-            let _ = std::fs::remove_dir_all(&stage_dir);
-            format!("failed to launch updater helper: {e}")
-        })?;
-
-    Ok(())
+        .map(|_| ())
+        .map_err(|e| format!("failed to launch relaunch helper: {e}"))
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn download_and_schedule_swap(_release: &ReleaseInfo) -> Result<(), String> {
+pub fn install_update(_release: &ReleaseInfo) -> Result<(), String> {
     Err("in-app updates are currently supported on macOS only".to_owned())
 }
 
@@ -323,6 +335,75 @@ mod tests {
             find_sha256_entry("notahash  Slackless.tar.gz\n", "Slackless.tar.gz"),
             None
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn relaunch_helper_runs_its_command_only_after_the_pid_exits() {
+        use std::io::{BufRead, BufReader};
+        use std::process::Stdio;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct TempDir(PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TempDir(
+            std::env::temp_dir().join(format!("slackless-gui-relaunch-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir_all(&dir.0).expect("create temp dir");
+
+        // The helper reports through a FIFO, so the test blocks on the result instead of polling.
+        let fifo = dir.0.join("result");
+        let status = Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        let (tx, rx) = mpsc::channel();
+        let reader_fifo = fifo.clone();
+        let reader = std::thread::spawn(move || {
+            let file = std::fs::File::open(&reader_fifo).expect("open fifo");
+            let mut line = String::new();
+            let _ = BufReader::new(file).read_line(&mut line);
+            let _ = tx.send(line);
+        });
+
+        // A child whose exit the test controls: `cat` ends once its stdin closes. The helper's
+        // command records whether that PID was still alive when the helper got to running it.
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let pid = child.id();
+        let script =
+            "if kill -0 \"$2\" 2>/dev/null; then echo alive > \"$1\"; else echo gone > \"$1\"; fi";
+        spawn_after_exit(
+            pid,
+            &[
+                OsStr::new("/bin/sh"),
+                OsStr::new("-c"),
+                OsStr::new(script),
+                OsStr::new("sh"),
+                fifo.as_os_str(),
+                OsStr::new(&pid.to_string()),
+            ],
+        )
+        .expect("spawn helper");
+        drop(child.stdin.take());
+        child.wait().expect("cat exits");
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("helper must run its command after the pid exits");
+        assert_eq!(result.trim(), "gone");
+        reader.join().expect("reader thread");
     }
 
     #[test]

@@ -178,15 +178,18 @@ enum DownloadDestination {
 
 impl DownloadDestination {
     fn write(&self, bytes: &[u8]) -> Result<(PathBuf, usize), String> {
-        let len = bytes.len();
-        match self {
+        let path = match self {
             DownloadDestination::DefaultFolder { dir, name } => {
-                save_download(dir.clone(), name, bytes).map(|p| (p, len))
+                save_download(dir.clone(), name, bytes)?
             }
-            DownloadDestination::ExplicitPath(dest) => std::fs::write(dest, bytes)
-                .map(|()| (dest.clone(), len))
-                .map_err(|e| e.to_string()),
-        }
+            DownloadDestination::ExplicitPath(dest) => {
+                std::fs::write(dest, bytes).map_err(|e| e.to_string())?;
+                dest.clone()
+            }
+        };
+        #[cfg(target_os = "macos")]
+        quarantine(&path);
+        Ok((path, bytes.len()))
     }
 
     fn success_notification(&self, path: &Path) -> (&'static str, String) {
@@ -342,6 +345,53 @@ pub fn download_as(url: String, name: String, window: &mut Window, cx: &mut App)
         .detach();
 }
 
+/// The extended attribute macOS keeps a file's download quarantine in.
+#[cfg(target_os = "macos")]
+const QUARANTINE_XATTR: &std::ffi::CStr = c"com.apple.quarantine";
+
+/// Mark the saved `path` as downloaded from the internet, as a browser does: Gatekeeper then
+/// checks an app or installer from Slack (or one unzipped from it) before it first runs. A
+/// failure is logged; the file stays saved.
+#[cfg(target_os = "macos")]
+fn quarantine(path: &Path) {
+    if let Err(err) = set_quarantine(path) {
+        tracing::warn!(path = %path.display(), error = %err, "could not quarantine a download");
+    }
+}
+
+/// Write `com.apple.quarantine` as `<flags>;<hex unix time>;<agent>;<event UUID>`, with no
+/// event UUID. The flags are the ones non-sandboxed downloaders write (Firefox, Chrome,
+/// AirDrop): `QTN_FLAG_DOWNLOAD` (`0x0001`) and `0x0080`. Sandboxed ones (Safari, Mail) also
+/// get `QTN_FLAG_SANDBOX` (`0x0002`), making `0083`.
+#[cfg(target_os = "macos")]
+fn set_quarantine(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let value = format!("0081;{now:x};Slackless;");
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: `path` and `QUARANTINE_XATTR` are NUL-terminated and `value` is readable for
+    // `value.len()` bytes; all three outlive the call, which only reads them.
+    let status = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            QUARANTINE_XATTR.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Writes `bytes` to `dir`/`name` (or ~/Downloads/`name`), numbering the name like a browser when it is taken.
 fn save_download(dir: Option<PathBuf>, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     let dir = match dir {
@@ -402,6 +452,66 @@ mod tests {
         let no_ext_2 = save_download(Some(dir.clone()), "README", b"hi2").unwrap();
         assert_eq!(no_ext_2, dir.join("README (1)"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn saved_downloads_are_quarantined_like_browser_downloads() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        let quarantine_of = |path: &Path| {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            let mut value = [0u8; 256];
+            // SAFETY: `path` and the name are NUL-terminated; `value` is writable for its length.
+            let len = unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    QUARANTINE_XATTR.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                )
+            };
+            let len = usize::try_from(len).expect("the saved file carries com.apple.quarantine");
+            String::from_utf8(value[..len].to_vec()).unwrap()
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "slackless-dl-quarantine-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let start = now();
+        let (in_folder, _) = DownloadDestination::DefaultFolder {
+            dir: Some(dir.clone()),
+            name: "Installer.zip".to_owned(),
+        }
+        .write(b"PK")
+        .unwrap();
+        let (saved_as, _) = DownloadDestination::ExplicitPath(dir.join("Chosen.zip"))
+            .write(b"PK")
+            .unwrap();
+        let end = now();
+
+        for path in [in_folder, saved_as] {
+            let value = quarantine_of(&path);
+            let fields: Vec<&str> = value.split(';').collect();
+            let flags = u32::from_str_radix(fields[0], 16).unwrap();
+            assert_ne!(flags & 0x0001, 0, "QTN_FLAG_DOWNLOAD in {value}");
+            let stamped = u64::from_str_radix(fields[1], 16).unwrap();
+            assert!((start..=end).contains(&stamped), "download time in {value}");
+            assert_eq!(fields[2], "Slackless", "{value}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -222,6 +222,36 @@ async fn post_message_sends_rich_text_blocks_and_client_msg_id() {
 }
 
 #[tokio::test]
+async fn post_message_sends_a_given_client_msg_id_instead_of_minting_one() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.postMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true, "channel": "C1", "ts": "1772325870.309319"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let first_attempt_id = "6a1f3c2e-8b1d-4c3e-9f0a-1b2c3d4e5f60";
+    let posted = api
+        .chat_post_message_with_client_msg_id(
+            &ChannelId::from("C1"),
+            &MessageContent::plain("retried"),
+            None,
+            false,
+            Some(first_attempt_id),
+        )
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let sent = form(&requests[0]);
+    assert_eq!(field(&sent, "client_msg_id"), Some(first_attempt_id));
+    assert_eq!(posted.client_msg_id.as_deref(), Some(first_attempt_id));
+}
+
+#[tokio::test]
 async fn paginate_follows_cursors_until_exhausted() {
     let (server, api) = setup().await;
     Mock::given(method("POST"))

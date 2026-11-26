@@ -1671,6 +1671,279 @@ fn same_edit_ts_upsert_updates_reactions_reply_count_and_pinned_without_duplicat
     assert_eq!(stored.message.pinned_to, vec![general()]);
 }
 
+/// Pins a stored message's `updated_at` (unix seconds) so page-vs-live ordering is exact.
+fn pin_updated_at(store: &Store, ts: &str, at: i64) {
+    store
+        .conn
+        .execute(
+            "UPDATE message_current SET updated_at = ?1
+             WHERE workspace_id = 'T1' AND channel_id = 'C1' AND ts = ?2",
+            params![at, ts],
+        )
+        .unwrap();
+}
+
+#[test]
+fn history_page_requested_before_a_live_write_does_not_clobber_it() {
+    let mut store = Store::open_in_memory().unwrap();
+    let m = msg("1700003000.000100", "U1", "status update");
+    store.upsert_message(&ws(), &general(), &m).unwrap();
+
+    // A live reaction lands while a history page is in flight; the page (same edit key, no
+    // reaction) is stored afterwards.
+    let mut live = m.clone();
+    live.reactions = vec![Reaction {
+        name: "eyes".into(),
+        count: 1,
+        users: vec![UserId::from("U2")],
+    }];
+    store.upsert_message(&ws(), &general(), &live).unwrap();
+    pin_updated_at(&store, "1700003000.000100", 1_700_000_000);
+
+    store
+        .upsert_history_page(
+            &ws(),
+            &general(),
+            std::slice::from_ref(&m),
+            1_700_000_000 - 1,
+        )
+        .unwrap();
+    let stored = store.message(&ws(), &general(), &m.ts).unwrap().unwrap();
+    assert_eq!(
+        stored.message.reactions.len(),
+        1,
+        "a page requested before the live write must not wipe the live row"
+    );
+    assert_eq!(
+        store.revisions(&ws(), &general(), &m.ts).unwrap().len(),
+        1,
+        "a skipped page copy leaves no revision churn"
+    );
+
+    // A page requested after the live write still replaces the row.
+    store
+        .upsert_history_page(
+            &ws(),
+            &general(),
+            std::slice::from_ref(&m),
+            1_700_000_000 + 1,
+        )
+        .unwrap();
+    let stored = store.message(&ws(), &general(), &m.ts).unwrap().unwrap();
+    assert!(stored.message.reactions.is_empty());
+
+    // A newer `edited.ts` on the page wins even when the row was written after the request.
+    let mut edited = m;
+    edited.text = "status update edited".into();
+    edited.edited = Some(Edited {
+        user: Some(UserId::from("U1")),
+        ts: Ts::from("1700003000.000500"),
+    });
+    store
+        .upsert_history_page(&ws(), &general(), std::slice::from_ref(&edited), 1)
+        .unwrap();
+    let stored = store
+        .message(&ws(), &general(), &edited.ts)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.message.text, "status update edited");
+}
+
+#[test]
+fn history_page_tombstones_top_level_messages_it_omits_except_replies_ephemeral_hidden_and_live_rows()
+ {
+    let mut store = Store::open_in_memory().unwrap();
+    let mut reply = msg("1700003102.000100", "U2", "thread reply");
+    reply.thread_ts = Some(Ts::from("1700003101.000100"));
+    let mut ephemeral = msg("1700003103.000100", "U2", "giphy preview");
+    ephemeral.is_ephemeral = true;
+    let mut hidden = msg("1700003104.000100", "U2", "metadata row");
+    hidden.hidden = true;
+    store
+        .upsert_messages(
+            &ws(),
+            &general(),
+            &[
+                msg("1700003101.000100", "U1", "thread root"),
+                reply,
+                ephemeral,
+                hidden,
+                msg(
+                    "1700003105.000100",
+                    "U2",
+                    "touched by a live event during the fetch",
+                ),
+                msg("1700003106.000100", "U1", "deleted on Slack while offline"),
+                msg("1700003110.000100", "U1", "older than the page"),
+            ],
+        )
+        .unwrap();
+    // Requested after every stored row was written, except the one a live event touched at the
+    // moment of the request.
+    let fetched_at = now_secs() + 1000;
+    pin_updated_at(&store, "1700003105.000100", fetched_at);
+
+    let page = [
+        msg("1700003101.000100", "U1", "thread root"),
+        msg("1700003107.000100", "U3", "new in the page"),
+    ];
+    assert_eq!(
+        store
+            .upsert_history_page(&ws(), &general(), &page, fetched_at)
+            .unwrap(),
+        1
+    );
+
+    let deleted_ts = Ts::from("1700003106.000100");
+    let deleted = store
+        .message(&ws(), &general(), &deleted_ts)
+        .unwrap()
+        .unwrap();
+    assert!(deleted.deleted);
+    assert_eq!(deleted.message.text, "deleted on Slack while offline");
+    let revs = store.revisions(&ws(), &general(), &deleted_ts).unwrap();
+    assert_eq!(revs.len(), 2);
+    assert!(!revs[0].deleted);
+    assert!(revs[1].deleted);
+    for ts in [
+        "1700003101.000100",
+        "1700003102.000100",
+        "1700003103.000100",
+        "1700003104.000100",
+        "1700003105.000100",
+        "1700003107.000100",
+        "1700003110.000100",
+    ] {
+        assert!(
+            !store
+                .message(&ws(), &general(), &Ts::from(ts))
+                .unwrap()
+                .unwrap()
+                .deleted,
+            "{ts} must stay undeleted"
+        );
+    }
+
+    // The same page again tombstones nothing, and an empty page does nothing.
+    assert_eq!(
+        store
+            .upsert_history_page(&ws(), &general(), &page, fetched_at)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .upsert_history_page(&ws(), &general(), &[], fetched_at + 2)
+            .unwrap(),
+        0
+    );
+
+    // A replies page (one thread) never reconciles the rest of the channel it overlaps...
+    let mut page_reply = msg("1700003108.000100", "U2", "new reply");
+    page_reply.thread_ts = Some(Ts::from("1700003101.000100"));
+    store
+        .upsert_replies_page(
+            &ws(),
+            &general(),
+            &[msg("1700003101.000100", "U1", "thread root"), page_reply],
+            fetched_at + 3,
+        )
+        .unwrap();
+    let spared = store
+        .message(&ws(), &general(), &Ts::from("1700003105.000100"))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !spared.deleted,
+        "absence from a replies page says nothing about other messages"
+    );
+
+    // ...while a later history page that still omits the row catches up with it: the
+    // timestamp guard only covers a page's own fetch window.
+    let later = [
+        msg("1700003101.000100", "U1", "thread root"),
+        msg("1700003107.000100", "U3", "new in the page"),
+        msg("1700003108.000100", "U2", "new reply"),
+    ];
+    assert_eq!(
+        store
+            .upsert_history_page(&ws(), &general(), &later, fetched_at + 4)
+            .unwrap(),
+        1
+    );
+    assert!(
+        store
+            .message(&ws(), &general(), &Ts::from("1700003105.000100"))
+            .unwrap()
+            .unwrap()
+            .deleted
+    );
+}
+
+#[test]
+fn merge_conversation_reads_and_writes_under_one_write_lock() {
+    let dir = MaintTempDir(
+        std::env::temp_dir().join(format!("slackless-store-merge-lock-{}", std::process::id())),
+    );
+    let path = dir.0.join("merge.sqlite");
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let mut store = Store::open(&path).unwrap();
+    let base = Conversation {
+        id: general(),
+        name: Some("general".into()),
+        is_channel: true,
+        topic: Some(TopicPurpose {
+            value: "Original topic".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    store.upsert_conversation(&ws(), &base).unwrap();
+
+    // A second writer (the CLI against the GUI) holds the write lock with an uncommitted rename
+    // and commits the moment `store` contends for the lock. The merge must read under that same
+    // lock, so the rename is its base instead of being silently reverted.
+    let mut other = Some(Connection::open(&path).unwrap());
+    other
+        .as_mut()
+        .unwrap()
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE conversation SET json = json_set(json, '$.name', 'renamed-elsewhere')
+             WHERE workspace_id = 'T1' AND id = 'C1';",
+        )
+        .unwrap();
+    store
+        .conn
+        .busy_handler(Some(Box::new(move |_attempts| {
+            if let Some(other) = other.take() {
+                other.execute_batch("COMMIT").unwrap();
+                return true;
+            }
+            false
+        })))
+        .unwrap();
+
+    let fresh = Conversation {
+        id: general(),
+        num_members: Some(42),
+        ..Default::default()
+    };
+    store.merge_conversation(&ws(), &fresh).unwrap();
+
+    let merged = store.conversation(&ws(), &general()).unwrap().unwrap();
+    assert_eq!(
+        merged.name.as_deref(),
+        Some("renamed-elsewhere"),
+        "the other writer's committed row must be the merge base"
+    );
+    assert_eq!(merged.num_members, Some(42));
+    assert_eq!(
+        merged.topic.as_ref().map(|t| t.value.as_str()),
+        Some("Original topic")
+    );
+}
+
 #[test]
 fn ts_key_handles_malformed_and_utf8_fractional_parts() {
     // Non-ASCII character straddling byte index 6 must not panic.

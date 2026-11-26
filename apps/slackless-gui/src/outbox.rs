@@ -409,9 +409,11 @@ mod tests {
             Some(_) => OutboxPayload::Reply {
                 content: MessageContent::plain(text),
                 broadcast: false,
+                client_msg_id: None,
             },
             None => OutboxPayload::Message {
                 content: MessageContent::plain(text),
+                client_msg_id: None,
             },
         };
         OutboxItem {

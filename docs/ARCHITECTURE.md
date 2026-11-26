@@ -103,9 +103,10 @@ windowing decoupled from headless media/networking crates:
   `DesktopDrawOverlay` (`OverlayDrawStroke`, `OverlayCursorState`, `OverlayPenEvent`) and
   `configure_floating_panel`, compiled with `-fobjc-arc` on macOS and stubbed as safe no-ops on
   non-macOS targets.
-- **Cross-platform utilities**: `app_data_dir` / `app_cache_dir` / `app_config_dir` /
-  `archive_store_path`, pure `DeepLink` / `parse_deep_link`, structured file logging, mouse
+- **Cross-platform utilities**: pure `DeepLink` / `parse_deep_link`, structured file logging, mouse
   navigation / screen-lock monitors, and POSIX `SIGTERM`/`SIGINT` self-pipe termination monitor.
+  (Application data / cache / config directories and `archive_store_path` live in
+  `slackless-core::paths`, so the headless crates never need this crate for them.)
 
 ### slackless-huddle
 
@@ -131,6 +132,7 @@ an `Event` receiver (store changed, connection state, …) over `futures::mpsc`.
 returns those handles; the GUI drains them via `cx.spawn`, the CLI via its own tokio loop.
 
 Shared front-end-agnostic Slack domain logic lives under **`slackless_core::domain`**:
+
 - `canvas`: canvas Markdown / Quill block conversion.
 - `huddles`: huddle state helpers and summary formatting.
 - `lists`: Slack Lists parsing and schema helpers.
@@ -161,6 +163,9 @@ and `slackless-store` directly on tokio.
 - Supply-chain security is checked via `cargo deny check` (`deny.toml`, zero ignored advisories).
 - Metal shaders compile at runtime (`runtime_shaders` default) — **no full Xcode needed**;
   disabling default features would require `xcrun metal`.
+- ONNX Runtime is not linked in (`ort` `load-dynamic`): `slackless_huddle::onnx_runtime` loads
+  `libonnxruntime.dylib` on first semantic or Parakeet use from `ORT_DYLIB_PATH`, then the bundle's
+  `Contents/Frameworks/`, then `~/.local/share/slackless/onnxruntime/` (`scripts/fetch-onnxruntime.sh`).
 - Common workflows live in `justfile`: `just validate`, `just test`, `just bench`, `just run`, `just install`.
 - Build with `CARGO_PROFILE_DEV_DEBUG=0` inside `nix develop` (or `direnv`, which sets
   `NIX_CC_WRAPPER_SUPPRESS_TARGET_WARNING=1`) for fast, low-disk dev builds.
@@ -168,7 +173,8 @@ and `slackless-store` directly on tokio.
 ## Workspace-level choices
 
 - Root `Cargo.toml` is a virtual manifest (`[workspace]`, members `crates/*` + `apps/*`).
-  Shared deps in `[workspace.dependencies]`; one pinned toolchain.
+  Shared deps in `[workspace.dependencies]`; one pinned toolchain: `rust-toolchain.toml` (installed
+  by CI and the release workflow), with `flake.lock` pinning the same nightly for the nix shell.
 - Error handling: `thiserror` in libraries, `anyhow` only in the two app binaries.
 - Async: `tokio` in libs/CLI; the GUI never blocks the smol executor — all awaiting Slack work
   crosses the channel bridge.

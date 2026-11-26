@@ -27,7 +27,9 @@ opt-level = 0
 
 [profile.release]
 lto = "thin"
-strip = "debuginfo"
+# Drop the symbol table too (~28 MB of __LINKEDIT on the GUI binary); release crashes are not
+# symbolicated locally.
+strip = "symbols"
 
 [workspace.dependencies]
 slackless-types = { path = "crates/slackless-types" }

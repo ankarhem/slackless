@@ -392,6 +392,25 @@ fn workspace_state_defaults_cleanly_for_atomic_swap() {
     assert!(b.pins.contains_key(&ChannelId::from("C1")));
 }
 
+#[test]
+fn channel_cache_drops_the_least_recently_loaded_channel() {
+    let channel = |ix: usize| ChannelId::from(format!("C{ix}"));
+    let mut cache = ChannelCache::default();
+    for ix in 0..CHANNEL_CACHE_MAX {
+        cache.insert(channel(ix), ix);
+    }
+    // Loading the oldest channel again makes it the most recent one.
+    cache.insert(channel(0), 0);
+    cache.insert(channel(CHANNEL_CACHE_MAX), CHANNEL_CACHE_MAX);
+
+    assert!(
+        !cache.contains_key(&channel(1)),
+        "the least recently loaded channel is dropped"
+    );
+    assert_eq!(cache.get(&channel(0)), Some(&0), "a reloaded channel stays");
+    assert!((2..=CHANNEL_CACHE_MAX).all(|ix| cache.contains_key(&channel(ix))));
+}
+
 #[gpui::test]
 fn mouse_back_and_forward_navigate_across_channels_and_pages(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| {
@@ -1176,6 +1195,59 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
 }
 
 #[gpui::test]
+fn huddle_links_ask_before_joining_then_join_like_the_huddle_button(cx: &mut gpui::TestAppContext) {
+    let (_root, app, cx) = mount_test_app(fixtures::load(), cx);
+    let design = ChannelId::from("C0DESIGN");
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.preferences.update(cx, |p, cx| {
+                let mut s = p.settings().clone();
+                s.huddle_join_muted = true;
+                p.load_settings(s, window, cx);
+            });
+            assert!(!window.has_active_dialog(cx));
+
+            // 1. A huddle link (from the OS or in a message) only asks: nothing joins yet.
+            assert!(app.handle_deep_link("slack://huddle?team=T0ACME&id=C0DESIGN", window, cx));
+            assert_eq!(app.channel, design);
+            assert!(
+                window.has_active_dialog(cx),
+                "a huddle link must ask before joining"
+            );
+            assert!(
+                app.huddle_session.is_none(),
+                "a huddle link must not join (microphone live) before the user confirms"
+            );
+
+            // 2. Join huddle joins as the huddle button does: Join muted applies.
+            window.close_dialog(cx);
+            app.start_huddle_in(design.clone(), window, cx);
+            let session = app.huddle_session.as_ref().expect("a confirmed link joins");
+            assert_eq!(session.channel, design);
+            assert!(session.muted, "Join muted applies to a linked huddle");
+            app.leave_huddle(cx);
+
+            // 3. In a large channel, confirming still brings the huddle button's member warning.
+            app.ws.member_counts.insert(design.clone(), 200);
+            assert!(app.handle_deep_link(
+                "https://app.slack.com/huddle/T0ACME/C0DESIGN",
+                window,
+                cx
+            ));
+            assert!(window.has_active_dialog(cx));
+            assert!(app.huddle_session.is_none());
+            window.close_dialog(cx);
+            app.start_huddle_in(design.clone(), window, cx);
+            assert!(
+                window.has_active_dialog(cx),
+                "the large-channel warning still applies to a linked huddle"
+            );
+            assert!(app.huddle_session.is_none());
+        });
+    });
+}
+
+#[gpui::test]
 fn qa_image_viewer_keyboard_zoom_step_and_zero_subscription_leak(cx: &mut gpui::TestAppContext) {
     use gpui_kit::base::Root;
     use std::cell::RefCell;
@@ -1496,6 +1568,19 @@ fn mount_test_app(
     gpui::Entity<App>,
     &mut gpui::VisualTestContext,
 ) {
+    mount_app(fx, vec![CoreBridge::offline()], cx)
+}
+
+/// [`mount_test_app`] over `bridges`, one per workspace.
+fn mount_app(
+    fx: Fixtures,
+    bridges: Vec<CoreBridge>,
+    cx: &mut gpui::TestAppContext,
+) -> (
+    gpui::Entity<gpui_kit::base::Root>,
+    gpui::Entity<App>,
+    &mut gpui::VisualTestContext,
+) {
     use gpui_kit::base::Root;
     use std::cell::RefCell;
 
@@ -1507,13 +1592,153 @@ fn mount_test_app(
     let mounted = Rc::new(RefCell::new(None));
     let slot = mounted.clone();
     let (root, cx) = cx.add_window_view(move |window, cx| {
-        let app = App::new(Arc::new(fx), CoreBridge::offline(), window, cx);
+        let app = App::new_multi(Arc::new(fx), bridges, window, cx);
         *slot.borrow_mut() = Some(app.clone());
         Root::new(app, window, cx)
     });
     let app = mounted.borrow_mut().take().unwrap();
     cx.run_until_parked();
     (root, app, cx)
+}
+
+/// A workspace signed in as `U0ME` over an in-memory store holding `channels` and `users`,
+/// and that store.
+fn memory_workspace(team: &str, channels: &[&str], users: &[User]) -> (CoreBridge, SharedStore) {
+    let team_id = slackless_core::types::TeamId::from(team);
+    let mut store = slackless_core::store::Store::open_in_memory().unwrap();
+    let record = Team {
+        id: team_id.clone(),
+        name: team.to_owned(),
+        ..Default::default()
+    };
+    store.upsert_team(&team_id, &record).unwrap();
+    for id in channels {
+        let channel = Conversation {
+            id: ChannelId::from(*id),
+            name: Some(id.to_lowercase()),
+            is_channel: true,
+            is_member: true,
+            ..Default::default()
+        };
+        store.upsert_conversation(&team_id, &channel).unwrap();
+    }
+    store.upsert_users(&team_id, users).unwrap();
+    let store: SharedStore = Arc::new(std::sync::Mutex::new(store));
+    let session = slackless_core::auth::Session {
+        team_id,
+        user_id: UserId::from("U0ME"),
+        workspace_url: format!("https://{}.slack.com", team.to_lowercase()),
+        xoxc_token: String::new(),
+        d_cookie: String::new(),
+    };
+    (CoreBridge::with_store(session, store.clone()), store)
+}
+
+#[gpui::test]
+fn users_changed_patches_people_without_rereading_the_workspace(cx: &mut gpui::TestAppContext) {
+    let person = |id: &str, status: &str| User {
+        id: UserId::from(id),
+        name: id.to_lowercase(),
+        profile: slackless_core::types::Profile {
+            status_text: Some(status.to_owned()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (bridge, store) = memory_workspace(
+        "T0ONE",
+        &["C0GENERAL"],
+        &[person("U0ME", ""), person("U0ALICE", "lunch")],
+    );
+    let fx = bridge.snapshot(&HashMap::new()).unwrap();
+    let (_root, app, cx) = mount_app(fx, vec![bridge], cx);
+    {
+        let team = slackless_core::types::TeamId::from("T0ONE");
+        let mut store = store.lock().unwrap();
+        // Alice's status moves and a stranger is resolved, while a channel lands unannounced:
+        // only a re-read of the whole workspace would show it.
+        let people = [person("U0ALICE", "in a meeting"), person("U0EXT", "")];
+        store.upsert_users(&team, &people).unwrap();
+        let channel = Conversation {
+            id: ChannelId::from("C0NEW"),
+            is_channel: true,
+            is_member: true,
+            ..Default::default()
+        };
+        store.upsert_conversation(&team, &channel).unwrap();
+    }
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            let changed = vec![UserId::from("U0ALICE"), UserId::from("U0EXT")];
+            app.on_core_event(&Event::UsersChanged(changed), window, cx);
+        })
+    });
+    // The debounced read lands.
+    cx.executor().advance_clock(RELOAD_DEBOUNCE);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let fixtures = &app.read(cx).fixtures;
+        let status = |id: &str| {
+            fixtures
+                .user(&UserId::from(id))
+                .and_then(|user| user.profile.status_text.as_deref())
+        };
+        assert_eq!(status("U0ALICE"), Some("in a meeting"));
+        assert_eq!(status("U0EXT"), Some(""), "a newly stored person is added");
+        assert_eq!(status("U0ME"), Some(""));
+        assert!(
+            fixtures
+                .conversation(&ChannelId::from("C0GENERAL"))
+                .is_some(),
+            "the rest of the snapshot is kept"
+        );
+        assert!(
+            fixtures.conversation(&ChannelId::from("C0NEW")).is_none(),
+            "a people change must not re-read the whole workspace"
+        );
+    });
+}
+
+#[gpui::test]
+fn first_workspace_visit_reads_its_snapshot_off_the_ui_thread_and_drops_a_stale_one(
+    cx: &mut gpui::TestAppContext,
+) {
+    let me = User {
+        id: UserId::from("U0ME"),
+        ..Default::default()
+    };
+    let (one, _) = memory_workspace("T0ONE", &["C0ONE"], std::slice::from_ref(&me));
+    let (two, _) = memory_workspace("T0TWO", &["C0TWO"], std::slice::from_ref(&me));
+    let mut fx = one.snapshot(&HashMap::new()).unwrap();
+    fx.workspaces = vec![one.team_summary().unwrap(), two.team_summary().unwrap()];
+    let (_root, app, cx) = mount_app(fx, vec![one, two], cx);
+    let switch = |cx: &mut gpui::VisualTestContext, index: usize| {
+        cx.update(|window, cx| app.update(cx, |app, cx| app.switch_workspace(index, window, cx)));
+    };
+    let shows = |cx: &mut gpui::VisualTestContext, id: &str| {
+        cx.update(|_, cx| {
+            app.read(cx)
+                .fixtures
+                .conversation(&ChannelId::from(id))
+                .is_some()
+        })
+    };
+
+    // The first visit paints at once: its snapshot is not read on the UI thread.
+    switch(cx, 1);
+    assert!(!shows(cx, "C0TWO"));
+    // Leaving before it lands drops it: the workspace switched back to keeps its own.
+    switch(cx, 0);
+    cx.executor().advance_clock(RELOAD_DEBOUNCE);
+    cx.run_until_parked();
+    assert!(shows(cx, "C0ONE"));
+    assert!(!shows(cx, "C0TWO"));
+    // Coming back resumes the read.
+    switch(cx, 1);
+    cx.executor().advance_clock(RELOAD_DEBOUNCE);
+    cx.run_until_parked();
+    assert!(shows(cx, "C0TWO"));
+    assert!(!shows(cx, "C0ONE"));
 }
 
 #[gpui::test]
@@ -3152,6 +3377,7 @@ fn app_outbox_events_inline_thread_sync_and_catchup_navigation(cx: &mut gpui::Te
                 kind: OutboxKind::Message,
                 payload_json: OutboxPayload::Message {
                     content: MessageContent::plain("Queued while on a flight"),
+                    client_msg_id: None,
                 }
                 .encode(),
                 status: OutboxStatus::Pending,
@@ -3169,6 +3395,7 @@ fn app_outbox_events_inline_thread_sync_and_catchup_navigation(cx: &mut gpui::Te
                 payload_json: OutboxPayload::Reply {
                     content: MessageContent::plain("Failed thread reply"),
                     broadcast: false,
+                    client_msg_id: None,
                 }
                 .encode(),
                 status: OutboxStatus::Failed,

@@ -103,6 +103,7 @@ fn ensure_cached_slack_audio(filename: &str) -> Option<PathBuf> {
     let tmp = dir.join(format!(".{filename}.{}.{seq}.tmp", std::process::id()));
 
     let bytes = crate::transcribe::block_on_http(async move {
+        crate::signaling::install_default_crypto_provider();
         let client = reqwest::Client::builder()
             .user_agent("slackless/1.0")
             .timeout(Duration::from_secs(8))

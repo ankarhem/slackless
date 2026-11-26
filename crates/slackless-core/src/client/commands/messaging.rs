@@ -3,7 +3,7 @@
 
 use super::super::*;
 use super::offline::enqueue_outbox_with_ctx;
-use crate::api::{ActionContainer, ActivityEntry, MessageContent, SavedMark};
+use crate::api::{ActionContainer, ActivityEntry, MessageContent, SavedMark, new_client_msg_id};
 use crate::outbox::{OutboxPayload, is_transient_send_error};
 use crate::reducer::update_conversation_last_read;
 
@@ -26,6 +26,9 @@ impl<B: Backend> Core<B> {
         broadcast: bool,
     ) {
         let ctx = self.ctx();
+        // Minted before the first attempt so it and any outbox retry share one id: Slack then
+        // drops a retry of a post it accepted before the connection failed.
+        let client_msg_id = new_client_msg_id();
         self.spawn("chat.postMessage", async move {
             let outcome = post_message_and_store(
                 &ctx,
@@ -33,15 +36,24 @@ impl<B: Backend> Core<B> {
                 content.clone(),
                 thread_ts.clone(),
                 broadcast,
+                Some(client_msg_id.clone()),
             )
             .await;
             match outcome {
                 Ok(()) => Ok(()),
                 Err(CoreError::Api(ref err)) if is_transient_send_error(err) => {
+                    let client_msg_id = Some(client_msg_id);
                     let payload = if thread_ts.is_some() {
-                        OutboxPayload::Reply { content, broadcast }
+                        OutboxPayload::Reply {
+                            content,
+                            broadcast,
+                            client_msg_id,
+                        }
                     } else {
-                        OutboxPayload::Message { content }
+                        OutboxPayload::Message {
+                            content,
+                            client_msg_id,
+                        }
                     };
                     enqueue_outbox_with_ctx(
                         &ctx,
@@ -590,17 +602,25 @@ impl<B: Backend> Core<B> {
 }
 
 /// Post a message to Slack, store the echoed message locally, resolve unfurls, and emit
-/// [`Event::StoreChanged`]. Shared by online [`Core::send_message`] and offline queue flushing.
+/// [`Event::StoreChanged`]. Shared by online [`Core::send_message`] and offline queue flushing;
+/// a retry passes the `client_msg_id` of the message's first attempt (`None` mints one).
 pub(super) async fn post_message_and_store<B: Backend>(
     ctx: &TaskCtx<B>,
     channel: ChannelId,
     content: MessageContent,
     thread_ts: Option<Ts>,
     broadcast: bool,
+    client_msg_id: Option<String>,
 ) -> Result<(), CoreError> {
     let posted = ctx
         .backend
-        .post_message(channel.clone(), content, thread_ts, broadcast)
+        .post_message(
+            channel.clone(),
+            content,
+            thread_ts,
+            broadcast,
+            client_msg_id,
+        )
         .await?;
     if let Some(message) = posted.message {
         ctx.unfurls.resolve(std::slice::from_ref(&message));

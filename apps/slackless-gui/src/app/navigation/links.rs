@@ -80,7 +80,7 @@ impl App {
     ) {
         let settings = self.preferences.read(cx).settings();
         let browser_choice = settings.open_links;
-        let blocked_scheme = !is_protocol_allowed(url, &settings.protocol_allowlist);
+        let blocked_scheme = !crate::zoom::is_protocol_allowed(url, &settings.protocol_allowlist);
         let warn = blocked_scheme || (settings.warn_external && is_suspicious_url(url));
         if !warn {
             launch_external_url(url, browser_choice, cx);
@@ -274,7 +274,7 @@ impl App {
                     return false;
                 }
                 self.select(ch.clone(), cx);
-                self.join_huddle_in(ch, window, cx);
+                self.ask_to_join_huddle(ch, window, cx);
                 true
             }
             DeepLink::AppHome {
@@ -596,6 +596,8 @@ impl App {
 
 /// Open `url` in the browser selected in Preferences -> Advanced (`0 = Default`, `1 = Safari`,
 /// `2 = Firefox`). Falls back to the system default handler on non-macOS or launch errors.
+/// [`App::open_external_url`] already applied the protocol allowlist (its scheme is allowed, or
+/// the user chose Open link), so this goes past `open_url`'s own check.
 fn launch_external_url(url: &str, browser_choice: usize, cx: &mut gpui::App) {
     #[cfg(target_os = "macos")]
     {
@@ -617,23 +619,7 @@ fn launch_external_url(url: &str, browser_choice: usize, cx: &mut gpui::App) {
     }
     #[cfg(not(target_os = "macos"))]
     let _ = browser_choice;
-    cx.open_url(url);
-}
-
-/// Whether `url`'s scheme is permitted by the comma-separated `allowlist` (`F-SHELL-193`).
-pub(in crate::app) fn is_protocol_allowed(url: &str, allowlist: &str) -> bool {
-    let Some((scheme, _)) = url.split_once(':') else {
-        return false;
-    };
-    let scheme = scheme.trim().to_ascii_lowercase();
-    if scheme.is_empty() {
-        return false;
-    }
-    allowlist
-        .split([',', ' ', ';'])
-        .map(|s| s.trim().trim_end_matches(':').to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .any(|allowed| allowed == scheme)
+    crate::zoom::open_trusted_url(url, cx);
 }
 
 /// Whether `url` is a Slack Workflow Builder link trigger (`https://slack.com/shortcuts/Ft...`,
@@ -689,30 +675,7 @@ return "FREE"
 
 #[cfg(test)]
 mod tests {
-    use super::{is_protocol_allowed, is_workflow_trigger_url};
-
-    #[test]
-    fn is_protocol_allowed_parses_separators_colons_case_and_rejects_invalid() {
-        let list = "https:, http; mailto  slack: , zoommtg";
-        assert!(is_protocol_allowed("https://example.com", list));
-        assert!(is_protocol_allowed("HTTPS://EXAMPLE.COM/path", list));
-        assert!(is_protocol_allowed("http://example.com", list));
-        assert!(is_protocol_allowed("mailto:alice@example.com", list));
-        assert!(is_protocol_allowed("slack://channel?id=C1", list));
-        assert!(is_protocol_allowed("zoommtg://zoom.us/join", list));
-
-        // Disallowed schemes
-        assert!(!is_protocol_allowed("javascript:alert(1)", list));
-        assert!(!is_protocol_allowed("file:///etc/passwd", list));
-        assert!(!is_protocol_allowed("ftp://example.com", list));
-
-        // Missing colon, empty scheme, empty allowlist
-        assert!(!is_protocol_allowed("example.com/no-scheme", list));
-        assert!(!is_protocol_allowed(":no-scheme", list));
-        assert!(!is_protocol_allowed("   :leading-space", list));
-        assert!(!is_protocol_allowed("https://example.com", ""));
-        assert!(!is_protocol_allowed("https://example.com", " , ; "));
-    }
+    use super::is_workflow_trigger_url;
 
     #[test]
     fn is_workflow_trigger_url_matches_slack_shortcuts_ft_only() {

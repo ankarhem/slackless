@@ -1,6 +1,7 @@
 //! Downloads viewer, file deletion, storage maintenance, revisions, and transcript export.
 
 use super::super::*;
+use super::diff::{DiffKind, diff_words};
 
 pub(in crate::app) struct HuddleTranscriptOpen {
     pub(in crate::app) call_id: String,
@@ -59,7 +60,7 @@ impl App {
                             cx,
                         )
                         .on_click(move |_, _, cx| {
-                            cx.open_url(&Self::file_url(&path));
+                            crate::zoom::open_trusted_url(&Self::file_url(&path), cx);
                         }),
                     )
                 })
@@ -671,7 +672,7 @@ impl App {
                     } else {
                         format!("Edited · {}", rev.edit_ts)
                     };
-                    let text = fixtures.plain_text(&rev.message);
+                    let text = crate::messages::plain_text(&rev.message.text, &*fixtures);
                     (stamp, rev.deleted, text)
                 })
                 .collect()
@@ -684,7 +685,7 @@ impl App {
                     vec![(
                         format!("Original · {}", m.ts),
                         false,
-                        fixtures.plain_text(m),
+                        crate::messages::plain_text(&m.text, &*fixtures),
                     )]
                 })
                 .unwrap_or_default()
@@ -729,10 +730,10 @@ impl App {
                 for (ix, (stamp, deleted, text)) in revisions.iter().enumerate() {
                     let copy_text = text.clone();
                     let content_el: AnyElement = if ix > 0 && revisions[ix - 1].2 != *text {
-                        let segments = slackless_core::diff_words(&revisions[ix - 1].2, text);
+                        let segments = diff_words(&revisions[ix - 1].2, text);
                         let mut combined = String::new();
                         let mut runs = Vec::with_capacity(segments.len() * 2);
-                        let mut prev_kind: Option<slackless_core::DiffKind> = None;
+                        let mut prev_kind: Option<DiffKind> = None;
                         for seg in segments {
                             let len = seg.text.len();
                             if len == 0 {
@@ -740,13 +741,8 @@ impl App {
                             }
                             if matches!(
                                 (prev_kind, seg.kind),
-                                (
-                                    Some(slackless_core::DiffKind::Removed),
-                                    slackless_core::DiffKind::Added
-                                ) | (
-                                    Some(slackless_core::DiffKind::Added),
-                                    slackless_core::DiffKind::Removed
-                                )
+                                (Some(DiffKind::Removed), DiffKind::Added)
+                                    | (Some(DiffKind::Added), DiffKind::Removed)
                             ) {
                                 combined.push(' ');
                                 runs.push(gpui::TextRun {
@@ -763,8 +759,8 @@ impl App {
                             }
                             combined.push_str(&seg.text);
                             let (color, background_color, strikethrough) = match seg.kind {
-                                slackless_core::DiffKind::Equal => (foreground, None, None),
-                                slackless_core::DiffKind::Removed => (
+                                DiffKind::Equal => (foreground, None, None),
+                                DiffKind::Removed => (
                                     danger,
                                     Some(danger.opacity(0.14)),
                                     Some(gpui::StrikethroughStyle {
@@ -772,9 +768,7 @@ impl App {
                                         color: Some(danger),
                                     }),
                                 ),
-                                slackless_core::DiffKind::Added => {
-                                    (success, Some(success.opacity(0.14)), None)
-                                }
+                                DiffKind::Added => (success, Some(success.opacity(0.14)), None),
                             };
                             runs.push(gpui::TextRun {
                                 len,

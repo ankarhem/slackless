@@ -60,9 +60,9 @@ use render::{
     CivilTime, card_stamp, date_label, day_index, format_clock, format_clock_with, message_body,
 };
 pub(crate) use render::{
-    clock, day_and_time, day_label, expand_shortcodes_in_text, file_day, hex_color, iso_date,
-    list_stamp, local_offset_now, mrkdwn, mrkdwn_preview, mrkdwn_with_verbatim, now_secs,
-    render_block, selectable_code, selectable_text, short_date, unescape,
+    clock, day_and_time, day_label, file_day, hex_color, iso_date, list_stamp, local_offset_now,
+    mrkdwn, mrkdwn_preview, mrkdwn_with_verbatim, now_secs, plain_text, render_block,
+    selectable_code, selectable_text, short_date,
 };
 use rows::transcript_row;
 #[cfg(test)]
@@ -266,8 +266,9 @@ pub enum MessageListEvent {
 struct MessageData {
     fixtures: Arc<Fixtures>,
     channel: ChannelId,
-    /// Oldest first, hidden events filtered out.
-    messages: Vec<Message>,
+    /// Oldest first, hidden events filtered out. Each message is shared with the history cache
+    /// in [`MessageList`], not copied.
+    messages: Vec<Rc<Message>>,
     /// The conversation's read cursor; the first message past it gets the new-messages divider.
     last_read: Option<Ts>,
     /// Precomputed index of the first unread message from someone else (O(1) lookup per row).
@@ -302,7 +303,7 @@ impl MessageData {
 
 /// Collect remote non-avatar attachment/thumbnail URLs from `messages` so switching channels can
 /// evict decoded channel media from GPUI's texture atlas without touching avatars or emoji.
-fn collect_channel_media_urls(messages: &[Message]) -> Vec<String> {
+fn collect_channel_media_urls(messages: &[Rc<Message>]) -> Vec<String> {
     let mut urls = Vec::new();
     for m in messages {
         for f in &m.files {
@@ -346,7 +347,9 @@ pub struct MessageList {
     fixtures: Arc<Fixtures>,
     channel: ChannelId,
     /// Per-conversation history, oldest first (fixture history or bounded recent-channel LRU).
-    messages: HashMap<ChannelId, Vec<Message>>,
+    /// The open conversation's visible messages are the same allocations the row snapshot
+    /// shows.
+    messages: HashMap<ChannelId, Vec<Rc<Message>>>,
     /// Most-recently-used order for live cached channels (newest at the back).
     history_lru: Vec<ChannelId>,
     /// Projection of the current conversation that the row renderer reads.
@@ -381,7 +384,16 @@ impl MessageList {
         cx: &mut gpui_kit::gpui::App,
     ) -> Entity<MessageList> {
         cx.new(|cx| {
-            let messages = fixtures.messages.clone();
+            let messages: HashMap<ChannelId, Vec<Rc<Message>>> = fixtures
+                .messages
+                .iter()
+                .map(|(channel, history)| {
+                    (
+                        channel.clone(),
+                        history.iter().cloned().map(Rc::new).collect(),
+                    )
+                })
+                .collect();
             let history = history_of(&messages, &channel);
             let count = history.len();
             let kit = cx.new(|_| BlockKitState::default());
@@ -548,12 +560,12 @@ impl MessageList {
         if *channel == self.channel
             && let Some(m) = self.data.read(cx).messages.iter().find(|m| &m.ts == ts)
         {
-            return Some(m.clone());
+            return Some(Message::clone(m));
         }
         self.messages
             .get(channel)
             .and_then(|history| history.iter().find(|m| &m.ts == ts))
-            .cloned()
+            .map(|m| Message::clone(m))
     }
 
     pub fn set_conversation(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
@@ -607,6 +619,7 @@ impl MessageList {
     /// to the visible conversation also advance the virtual list by one row, tail-anchored.
     pub fn append(&mut self, channel: ChannelId, message: Message, cx: &mut Context<Self>) {
         let visible = channel == self.channel && !message.hidden;
+        let message = Rc::new(message);
         if visible {
             self.data.update(cx, |data, _| {
                 data.messages.push(message.clone());
@@ -626,6 +639,8 @@ impl MessageList {
     /// unchanged history is a no-op; one that only grew keeps the scroll position. Pages
     /// older than the refreshed window (loaded by [`MessageList::prepend_history`]) survive
     /// the refresh, so scrolling back does not reload what the reader already paged in.
+    /// Refreshed messages that did not change keep the allocation the transcript shows, so
+    /// the transcript is diffed by pointer instead of being copied and compared whole.
     pub fn set_history(
         &mut self,
         channel: ChannelId,
@@ -635,20 +650,18 @@ impl MessageList {
         // A refresh may overtake an in-flight older-page read; forget the request so the top
         // of the list re-asks.
         self.requested_older = None;
-        let merged = match (
-            self.messages.remove(&channel),
-            history.first().map(|message| message.ts.clone()),
-        ) {
-            (Some(mut stored), Some(oldest)) => {
+        let merged = match self.messages.remove(&channel) {
+            Some(mut stored) if !history.is_empty() => {
+                let oldest = &history[0].ts;
                 let pages = stored
                     .iter()
-                    .take_while(|message| message.ts < oldest)
+                    .take_while(|message| message.ts < *oldest)
                     .count();
-                stored.truncate(pages);
-                stored.extend(history);
+                let refreshed = stored.split_off(pages);
+                stored.extend(reuse_unchanged(refreshed, history));
                 stored
             }
-            _ => history,
+            _ => history.into_iter().map(Rc::new).collect(),
         };
         let visible = channel == self.channel;
         self.messages.insert(channel.clone(), merged);
@@ -659,7 +672,7 @@ impl MessageList {
         let history = history_of(&self.messages, &self.channel);
         let (unchanged, prefix, tail_added, preserves_window) = {
             let shown = &self.data.read(cx).messages;
-            if *shown == history {
+            if same_messages(shown, &history) {
                 (true, 0, 0, true)
             } else if let Some(first_shown) = shown.first() {
                 let prefix = history.iter().take_while(|m| m.ts < first_shown.ts).count();
@@ -707,13 +720,7 @@ impl MessageList {
         let Some(history) = self.messages.get_mut(&channel) else {
             return;
         };
-        for message in older {
-            let at = history.partition_point(|shown| shown.ts < message.ts);
-            if history.get(at).is_some_and(|shown| shown.ts == message.ts) {
-                continue;
-            }
-            history.insert(at, message);
-        }
+        merge_older(history, older);
         if channel != self.channel {
             return;
         }
@@ -745,7 +752,7 @@ impl MessageList {
             .messages
             .get_mut(channel)
             .and_then(|history| history.iter_mut().find(|message| &message.ts == ts));
-        if message.is_some_and(|message| actions::add_reaction(message, &me, name)) {
+        if message.is_some_and(|message| actions::add_reaction(Rc::make_mut(message), &me, name)) {
             cx.emit(MessageListEvent::Changed {
                 channel: channel.clone(),
                 change: MessageChange::React {
@@ -823,11 +830,23 @@ impl MessageList {
         });
     }
 
+    /// The open conversation's message `ts`.
+    fn current(&self, ts: &Ts) -> Option<&Message> {
+        self.messages
+            .get(&self.channel)?
+            .iter()
+            .find(|message| &message.ts == ts)
+            .map(Rc::as_ref)
+    }
+
+    /// The open conversation's message `ts`, to change in place: the transcript keeps showing
+    /// its shared copy until the next refresh.
     fn current_mut(&mut self, ts: &Ts) -> Option<&mut Message> {
         self.messages
             .get_mut(&self.channel)?
             .iter_mut()
             .find(|message| &message.ts == ts)
+            .map(Rc::make_mut)
     }
 
     pub fn run_action(
@@ -864,7 +883,7 @@ impl MessageList {
             }
             MessageAction::ReplyInThread => {
                 let thread_ts = self
-                    .current_mut(ts)
+                    .current(ts)
                     .and_then(|message| message.thread_ts.clone())
                     .unwrap_or_else(|| ts.clone());
                 cx.emit(MessageListEvent::OpenThread { channel, thread_ts });
@@ -945,7 +964,12 @@ impl MessageList {
             MessageAction::Edit => self.begin_edit(ts, window, cx),
             MessageAction::Delete => {
                 let data = self.data.read(cx);
-                let Some(message) = data.messages.iter().find(|m| &m.ts == ts).cloned() else {
+                let Some(message) = data
+                    .messages
+                    .iter()
+                    .find(|m| &m.ts == ts)
+                    .map(|m| Message::clone(m))
+                else {
                     return;
                 };
                 let fixtures = data.fixtures.clone();
@@ -1005,7 +1029,7 @@ impl MessageList {
             MessageAction::JoinHuddle => cx.emit(MessageListEvent::JoinHuddle(channel)),
             MessageAction::BlockAction { action, attachment } => {
                 let live = !self.fixtures.sample;
-                if let Some(message) = self.current_mut(ts).cloned()
+                if let Some(message) = self.current(ts).cloned()
                     && let Some(change) = actions::dispatch_block_action(
                         live, &message, &channel, action, attachment, window, cx,
                     )
@@ -1034,7 +1058,12 @@ impl MessageList {
     fn open_image(&mut self, ts: &Ts, origin: &ImageOrigin, cx: &mut Context<Self>) {
         let found = {
             let data = self.data.read(cx);
-            image_viewer::collect_viewer_images(&data.fixtures, &data.messages, ts, origin)
+            image_viewer::collect_viewer_images(
+                &data.fixtures,
+                data.messages.iter().map(Rc::as_ref),
+                ts,
+                origin,
+            )
         };
         if let Some((images, index)) = found {
             cx.emit(MessageListEvent::OpenImage {
@@ -1442,7 +1471,7 @@ impl MessageList {
     /// Edit `ts` in place: the row body becomes the shared WYSIWYG edit composer, focused at
     /// the end and scrolled into view.
     fn begin_edit(&mut self, ts: &Ts, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(message) = self.current_mut(ts).cloned() else {
+        let Some(message) = self.current(ts).cloned() else {
             return;
         };
         let composer = self.data.read(cx).edit_composer.clone();
@@ -1516,8 +1545,12 @@ impl MessageList {
     }
 }
 
-/// History snapshot for a conversation: oldest first, metadata-only events dropped.
-fn history_of(messages: &HashMap<ChannelId, Vec<Message>>, channel: &ChannelId) -> Vec<Message> {
+/// History snapshot for a conversation: oldest first, metadata-only events dropped. The
+/// snapshot shares its messages with the history cache rather than copying them.
+fn history_of(
+    messages: &HashMap<ChannelId, Vec<Rc<Message>>>,
+    channel: &ChannelId,
+) -> Vec<Rc<Message>> {
     messages
         .get(channel)
         .map(|history| {
@@ -1528,6 +1561,64 @@ fn history_of(messages: &HashMap<ChannelId, Vec<Message>>, channel: &ChannelId) 
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Whether two snapshots show the same messages; shared (pointer-equal) messages are not
+/// compared field by field.
+fn same_messages(shown: &[Rc<Message>], history: &[Rc<Message>]) -> bool {
+    shown.len() == history.len()
+        && shown
+            .iter()
+            .zip(history)
+            .all(|(a, b)| Rc::ptr_eq(a, b) || a == b)
+}
+
+/// `fresh`, a re-read window of history (oldest first), as shared messages: a message equal to
+/// its counterpart in `previous` (the same window as stored before) keeps that allocation, so
+/// the transcript already showing it sees it unchanged.
+fn reuse_unchanged(
+    previous: Vec<Rc<Message>>,
+    fresh: Vec<Message>,
+) -> impl Iterator<Item = Rc<Message>> {
+    let mut previous = previous.into_iter().peekable();
+    fresh.into_iter().map(move |message| {
+        while previous.next_if(|old| old.ts < message.ts).is_some() {}
+        previous
+            .next_if(|old| old.ts == message.ts && **old == message)
+            .unwrap_or_else(|| Rc::new(message))
+    })
+}
+
+/// Merge `older` (a page of history in any order) into `history` (oldest first), skipping
+/// messages whose `ts` is already present, so a repeated or out-of-order page can neither
+/// duplicate nor reorder the list. A page that fits before one loaded message (an older page
+/// landing in front, the usual case) goes in with a single splice.
+fn merge_older(history: &mut Vec<Rc<Message>>, mut older: Vec<Message>) {
+    older.sort_by(|a, b| a.ts.cmp(&b.ts));
+    older.dedup_by(|later, earlier| later.ts == earlier.ts);
+    older.retain(|message| {
+        history
+            .binary_search_by(|shown| shown.ts.cmp(&message.ts))
+            .is_err()
+    });
+    let (Some(first), Some(last)) = (older.first(), older.last()) else {
+        return;
+    };
+    let at = history.partition_point(|shown| shown.ts < first.ts);
+    if history.get(at).is_none_or(|next| last.ts < next.ts) {
+        history.splice(at..at, older.into_iter().map(Rc::new));
+        return;
+    }
+    let mut older = older.into_iter().map(Rc::new).peekable();
+    let mut merged = Vec::with_capacity(history.len() + older.len());
+    for shown in history.drain(..) {
+        while let Some(message) = older.next_if(|message| message.ts < shown.ts) {
+            merged.push(message);
+        }
+        merged.push(shown);
+    }
+    merged.extend(older);
+    *history = merged;
 }
 
 impl Render for MessageList {

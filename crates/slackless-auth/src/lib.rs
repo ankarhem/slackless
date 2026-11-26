@@ -10,7 +10,7 @@
 //! * [`validate`] — checks a session with `auth.test`, mapping `invalid_auth`/`token_revoked` to
 //!   [`AuthError::NeedsReauth`].
 //! * `embedded_sign_in` (feature `webview`) / [`capture_sessions`] — the first-party WebKit
-//!   sign-in: slackless acquires its own session from a `wry` webview window it owns, turning the
+//!   sign-in: slackless acquires its own session from a webview window it owns, turning the
 //!   webview's own `localConfig_v2` + `d` cookie into [`Session`]s.
 //!
 //! ## Secret storage
@@ -32,6 +32,7 @@ pub use slackless_types as types;
 
 mod embedded;
 mod error;
+mod private_file;
 mod secrets;
 mod session;
 mod store;

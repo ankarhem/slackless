@@ -35,8 +35,8 @@ pub enum CatchUpEvent {
         call_id: String,
         channel: Option<ChannelId>,
     },
-    WindowChanged(CatchUpWindow),
-    ScopeChanged(bool),
+    WindowChanged,
+    ScopeChanged,
     Refresh,
     MarkCaughtUp,
     Summarize,
@@ -109,7 +109,7 @@ impl CatchUpView {
     pub fn select_window(&mut self, window: CatchUpWindow, cx: &mut Context<Self>) {
         if self.window != window {
             self.window = window;
-            cx.emit(CatchUpEvent::WindowChanged(window));
+            cx.emit(CatchUpEvent::WindowChanged);
             cx.notify();
         }
     }
@@ -117,7 +117,7 @@ impl CatchUpView {
     pub fn select_scope(&mut self, all_workspaces: bool, cx: &mut Context<Self>) {
         if self.all_workspaces != all_workspaces {
             self.all_workspaces = all_workspaces;
-            cx.emit(CatchUpEvent::ScopeChanged(all_workspaces));
+            cx.emit(CatchUpEvent::ScopeChanged);
             cx.notify();
         }
     }
@@ -1119,13 +1119,13 @@ mod tests {
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
         let events_sub = events.clone();
         cx.update(|cx| {
-            let _sub = cx.subscribe(&view, move |_, event, _| match event {
-                CatchUpEvent::WindowChanged(w) => {
-                    events_sub
-                        .borrow_mut()
-                        .push(format!("window:{}", w.label()));
+            let _sub = cx.subscribe(&view, move |view, event, cx| match event {
+                CatchUpEvent::WindowChanged => {
+                    let label = view.read(cx).window.label();
+                    events_sub.borrow_mut().push(format!("window:{label}"));
                 }
-                CatchUpEvent::ScopeChanged(all) => {
+                CatchUpEvent::ScopeChanged => {
+                    let all = view.read(cx).all_workspaces;
                     events_sub.borrow_mut().push(format!("scope:{all}"));
                 }
                 _ => {}

@@ -56,7 +56,7 @@ pub(super) enum ConvBucket {
 }
 
 /// Immutable (copy-on-write via `Arc`) workspace data shared across count refreshes.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct WorkspaceData {
     pub workspaces: Vec<Team>,
     /// Every organization the snapshot knows: the signed-in workspace's own team first, then
@@ -138,6 +138,15 @@ pub struct WorkspaceData {
     pub(super) team_index: OnceLock<HashMap<TeamId, usize>>,
 }
 
+/// Each person's position in `users` (the first, should an id repeat).
+fn index_users(users: &[User]) -> HashMap<UserId, usize> {
+    let mut map = HashMap::with_capacity(users.len());
+    for (ix, u) in users.iter().enumerate() {
+        map.entry(u.id.clone()).or_insert(ix);
+    }
+    map
+}
+
 /// Snapshot of a workspace rendered by views: `Arc`-shared [`WorkspaceData`] paired with the
 /// latest per-conversation read/unread `counts`.
 pub struct Fixtures {
@@ -206,6 +215,7 @@ impl Fixtures {
     }
 
     /// Return a new [`Fixtures`] snapshot with `file_id`'s transcript inserted or updated.
+    #[cfg(test)]
     pub fn with_file_transcript(&self, file_id: FileId, text: String) -> Self {
         self.with_file_transcript_cues(file_id, text, Vec::new())
     }
@@ -231,6 +241,37 @@ impl Fixtures {
             data: Arc::new(data),
             counts: self.counts.clone(),
         }
+    }
+
+    /// A copy of this snapshot with `users` (fresh store records) in place of the people of
+    /// the same ids and the others added: a status or profile change reaches the views without
+    /// re-reading the rest of the workspace. The people index is carried over and extended,
+    /// not rebuilt.
+    pub fn with_users(&self, users: Vec<User>) -> Self {
+        let mut data = (*self.data).clone();
+        let mut index = data
+            .user_index
+            .take()
+            .unwrap_or_else(|| index_users(&data.users));
+        for user in users {
+            if let Some(slot) = index.get(&user.id).and_then(|&ix| data.users.get_mut(ix)) {
+                *slot = user;
+            } else {
+                index.insert(user.id.clone(), data.users.len());
+                data.users.push(user);
+            }
+        }
+        data.user_index = OnceLock::from(index);
+        Self {
+            data: Arc::new(data),
+            counts: self.counts.clone(),
+        }
+    }
+
+    /// Whether `other` holds this snapshot's workspace data: it is this snapshot or one of its
+    /// [`Fixtures::with_counts`] copies.
+    pub fn shares_data(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.data, &other.data)
     }
 
     /// Effective read cursor for `id`: prefers live `counts[id].last_read`, falling back to
@@ -283,13 +324,9 @@ impl Fixtures {
     }
 
     fn user_map(&self) -> &HashMap<UserId, usize> {
-        self.data.user_index.get_or_init(|| {
-            let mut map = HashMap::with_capacity(self.users.len());
-            for (ix, u) in self.users.iter().enumerate() {
-                map.entry(u.id.clone()).or_insert(ix);
-            }
-            map
-        })
+        self.data
+            .user_index
+            .get_or_init(|| index_users(&self.users))
     }
 
     fn team_map(&self) -> &HashMap<TeamId, usize> {
@@ -396,54 +433,16 @@ impl Fixtures {
         }
     }
 
-    /// A message's text as plain text (Slack's "Copy message"): user mentions resolved to
-    /// `@name` in a single O(len) pass, standard `:emoji:` shown as their glyph, line breaks kept.
-    pub fn plain_text(&self, message: &Message) -> String {
-        let raw = message.text.as_str();
-        if !raw.contains("<@") {
-            return crate::messages::expand_shortcodes_in_text(raw);
-        }
-        let mut out = String::with_capacity(raw.len());
-        let mut rest = raw;
-        while let Some(start) = rest.find("<@") {
-            out.push_str(&rest[..start]);
-            rest = &rest[start + 2..];
-            if let Some(end) = rest.find('>') {
-                let inner = &rest[..end];
-                let (id_str, label) = inner
-                    .split_once('|')
-                    .map_or((inner, None), |(id, lbl)| (id, Some(lbl)));
-                let uid = UserId::from(id_str);
-                if let Some(user) = self.user(&uid) {
-                    out.push('@');
-                    out.push_str(user.display_name());
-                } else if let Some(lbl) = label.filter(|l| !l.is_empty()) {
-                    out.push('@');
-                    out.push_str(lbl);
-                } else {
-                    out.push_str("<@");
-                    out.push_str(inner);
-                    out.push('>');
-                }
-                rest = &rest[end + 1..];
-            } else {
-                out.push_str("<@");
-                break;
-            }
-        }
-        out.push_str(rest);
-        crate::messages::expand_shortcodes_in_text(&out)
-    }
-
-    /// One-line plain preview of a message: [`Self::plain_text`] on one line, file-only
-    /// messages described by their first file.
+    /// One-line plain preview of a message: its text as plain text (see
+    /// [`crate::messages::plain_text`]) on one line, file-only messages described by their first
+    /// file.
     pub fn preview(&self, message: &Message) -> String {
         if message.text.trim().is_empty()
             && let Some(file) = message.files.first()
         {
             return format!("Shared a file: {}", file.name.as_deref().unwrap_or("file"));
         }
-        self.plain_text(message).replace('\n', " ")
+        crate::messages::plain_text(&message.text, self).replace('\n', " ")
     }
 
     /// The signed-in workspace's own team ID, if present.

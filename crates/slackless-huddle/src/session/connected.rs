@@ -265,6 +265,7 @@ pub(super) async fn run_connected_loop(
 
     let mut exit_reason: Option<LoopExit> = None;
     let mut last_levels_rms_bucket: u8 = 0;
+    let mut last_audio_rx = crate::audio::AudioRxSnapshot::default();
     let mut last_levels_speakers: Vec<(UserId, f32)> = Vec::new();
     let mut last_levels_muted: Vec<UserId> = Vec::new();
 
@@ -393,6 +394,11 @@ pub(super) async fn run_connected_loop(
             _ = perf_tick.tick() => {
                 let (dt, cpu_tenths, rss_mb) = res_sampler.sample();
                 let perf_snap = state.perf.sample(dt, cpu_tenths, rss_mb);
+                // Remote audio over this window: a healthy call conceals ~0% and sits near its
+                // target delay; padding packets are skipped, never concealed.
+                let audio_now = state.shared.rx_stats.lock().map(|s| *s).unwrap_or(last_audio_rx);
+                let audio = audio_now.since(&last_audio_rx);
+                last_audio_rx = audio_now;
                 tracing::info!(
                     cpu_pct = format_args!("{}.{}", perf_snap.cpu_tenths_pct / 10, perf_snap.cpu_tenths_pct % 10),
                     rss_mb = perf_snap.rss_mb,
@@ -408,6 +414,17 @@ pub(super) async fn run_connected_loop(
                     rx_kbps = perf_snap.rx_kbps,
                     rx_seq_gaps = perf_snap.rx_seq_gaps,
                     rx_loss_pct = format_args!("{:.1}", perf_snap.rx_loss_pct),
+                    audio_rx_pkts = audio.packets,
+                    audio_rx_padding = audio.padding,
+                    audio_rx_errors = audio.errors,
+                    audio_conceal_pct = format_args!("{:.1}", audio.pct_of_played(audio.audible_concealed_samples())),
+                    audio_silence_pct = format_args!("{:.1}", audio.pct_of_played(audio.silent_concealed_samples)),
+                    audio_accel_pct = format_args!("{:.2}", audio.pct_of_played(audio.accelerated_samples)),
+                    audio_decel_pct = format_args!("{:.2}", audio.pct_of_played(audio.decelerated_samples)),
+                    audio_delay_ms = audio.current_delay_ms,
+                    audio_target_ms = audio.target_delay_ms,
+                    audio_underruns = audio.underruns,
+                    audio_streams = audio.streams,
                     degraded = perf_snap.is_degraded(),
                     "huddle perf"
                 );
