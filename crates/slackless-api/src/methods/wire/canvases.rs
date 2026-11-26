@@ -2,39 +2,16 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::de::{or_default, value_as_lenient_bool};
 use crate::types::{ChannelId, File, Message, MessageSubtype, Ts, UserId};
 
 /// Access level for `canvases.access.set`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CanvasAccessLevel {
-    Read,
-    Write,
-    Owner,
-}
-
-impl CanvasAccessLevel {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Read => "read",
-            Self::Write => "write",
-            Self::Owner => "owner",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "read" => Some(Self::Read),
-            "write" => Some(Self::Write),
-            "owner" => Some(Self::Owner),
-            _ => None,
-        }
-    }
-}
+pub use super::{
+    AccessLevel as CanvasAccessLevel, comment_channel_id as canvas_comment_channel_id,
+};
 
 /// Parsed metadata for a Slack Canvas (`files.info` canvas fields + derived comment channel).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,15 +64,6 @@ pub struct CanvasCommentThread {
     pub reply_count: usize,
     pub replies: Vec<CanvasCommentReply>,
     pub resolved: bool,
-}
-
-/// Derives a canvas's comment file-channel id by replacing a leading `'F'` with `'C'`.
-pub fn canvas_comment_channel_id(file_id: &str) -> ChannelId {
-    if let Some(rest) = file_id.strip_prefix('F') {
-        ChannelId::from(format!("C{rest}"))
-    } else {
-        ChannelId::from(file_id)
-    }
 }
 
 fn lookup_canvas_field<'a>(
@@ -204,13 +172,10 @@ pub fn parse_canvas_meta_from_file(file: &File, raw: Option<&Value>) -> CanvasMe
     }
 }
 
-/// Translates known Slack server-enforced Canvas error codes into clear user-facing messages.
+/// Translates known Slack server-enforced Canvas error codes into clear user-facing messages;
+/// anything else is passed through as written.
 pub fn format_canvas_error(err: &str) -> String {
-    let normalized = err
-        .trim()
-        .strip_prefix("slack api error:")
-        .map(str::trim)
-        .unwrap_or_else(|| err.trim());
+    let normalized = err.trim();
 
     match normalized {
         "free_teams_cannot_create_standalone_canvases" => {

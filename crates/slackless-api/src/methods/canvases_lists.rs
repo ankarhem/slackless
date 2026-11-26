@@ -25,16 +25,19 @@ fn should_fallback_list_method(err: &ApiError) -> bool {
     )
 }
 
-fn canvases_access_params(
-    canvas_id: &str,
-    access_level: Option<CanvasAccessLevel>,
+/// Form params for `canvases.access.*` / `slackLists.access.*`: exactly one of `channel_ids`
+/// or `user_ids` (Slack's XOR), under the endpoint's id key (`canvas_id` / `list_id`).
+fn access_params(
+    id_key: &'static str,
+    id: &str,
+    access_level: Option<AccessLevel>,
     channel_ids: &[ChannelId],
     user_ids: &[UserId],
 ) -> Result<crate::client::Params> {
     if channel_ids.is_empty() == user_ids.is_empty() {
         return Err(ApiError::Slack("invalid_parameters".to_owned()));
     }
-    let mut params = vec![("canvas_id", canvas_id.to_owned())];
+    let mut params = vec![(id_key, id.to_owned())];
     if let Some(level) = access_level {
         params.push(("access_level", level.as_str().to_owned()));
     }
@@ -58,29 +61,6 @@ fn take_list_records(mut data: Value) -> Vec<Value> {
         Some(Value::Array(records)) => records,
         _ => Vec::new(),
     }
-}
-
-fn lists_access_params(
-    list_id: &str,
-    access_level: Option<ListAccessLevel>,
-    channel_ids: &[ChannelId],
-    user_ids: &[UserId],
-) -> Result<crate::client::Params> {
-    if channel_ids.is_empty() == user_ids.is_empty() {
-        return Err(ApiError::Slack("invalid_parameters".to_owned()));
-    }
-    let mut params = vec![("list_id", list_id.to_owned())];
-    if let Some(level) = access_level {
-        params.push(("access_level", level.as_str().to_owned()));
-    }
-    if !channel_ids.is_empty() {
-        let ids: Vec<&str> = channel_ids.iter().map(ChannelId::as_str).collect();
-        params.push(("channel_ids", serde_json::to_string(&ids)?));
-    } else {
-        let ids: Vec<&str> = user_ids.iter().map(UserId::as_str).collect();
-        params.push(("user_ids", serde_json::to_string(&ids)?));
-    }
-    Ok(params)
 }
 
 impl SlackApi {
@@ -149,9 +129,7 @@ impl SlackApi {
             }
             if meta.permalink.is_none() {
                 let fallback_meta = parse_list_meta(list_obj);
-                if meta.permalink.is_none() {
-                    meta.permalink = fallback_meta.permalink;
-                }
+                meta.permalink = fallback_meta.permalink;
                 if meta.access.is_none() {
                     meta.access = fallback_meta.access;
                 }
@@ -428,7 +406,13 @@ impl SlackApi {
         channel_ids: &[ChannelId],
         user_ids: &[UserId],
     ) -> Result<()> {
-        let params = canvases_access_params(canvas_id, Some(access_level), channel_ids, user_ids)?;
+        let params = access_params(
+            "canvas_id",
+            canvas_id,
+            Some(access_level),
+            channel_ids,
+            user_ids,
+        )?;
         self.call_ok(method::CANVASES_ACCESS_SET, params).await
     }
 
@@ -439,7 +423,7 @@ impl SlackApi {
         channel_ids: &[ChannelId],
         user_ids: &[UserId],
     ) -> Result<()> {
-        let params = canvases_access_params(canvas_id, None, channel_ids, user_ids)?;
+        let params = access_params("canvas_id", canvas_id, None, channel_ids, user_ids)?;
         self.call_ok(method::CANVASES_ACCESS_DELETE, params).await
     }
 
@@ -706,7 +690,13 @@ impl SlackApi {
         channel_ids: &[ChannelId],
         user_ids: &[UserId],
     ) -> Result<()> {
-        let params = lists_access_params(list_id, Some(access_level), channel_ids, user_ids)?;
+        let params = access_params(
+            "list_id",
+            list_id,
+            Some(access_level),
+            channel_ids,
+            user_ids,
+        )?;
         self.call_ok(method::SLACK_LISTS_ACCESS_SET, params).await
     }
 
@@ -718,7 +708,7 @@ impl SlackApi {
         channel_ids: &[ChannelId],
         user_ids: &[UserId],
     ) -> Result<ListAccessDeleteResult> {
-        let params = lists_access_params(list_id, None, channel_ids, user_ids)?;
+        let params = access_params("list_id", list_id, None, channel_ids, user_ids)?;
         Ok(self
             .call(method::SLACK_LISTS_ACCESS_DELETE, params)
             .await?

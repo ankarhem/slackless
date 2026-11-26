@@ -716,7 +716,7 @@ fn canvas_access_level_meta_errors_and_comments_parsers() {
     assert!(!blank_meta.editable);
     assert!(blank_meta.canvas_printing_enabled);
 
-    // format_canvas_error: every documented error code + prefixed + unknown passthrough
+    // format_canvas_error: every documented error code + unknown passthrough
     for code in [
         "free_teams_cannot_create_standalone_canvases",
         "free_team_canvas_tab_already_exists",
@@ -731,10 +731,6 @@ fn canvas_access_level_meta_errors_and_comments_parsers() {
     ] {
         let translated = format_canvas_error(code);
         assert_ne!(translated, code, "expected friendly message for {code}");
-        assert_eq!(
-            format_canvas_error(&format!("slack api error: {code}")),
-            translated
-        );
     }
     assert_eq!(
         format_canvas_error("some_custom_unmapped_error"),

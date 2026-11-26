@@ -3071,7 +3071,6 @@ async fn slack_lists_access_meta_threads_and_team_connections() {
             .await
             .unwrap();
         assert_eq!(del.failed_to_update_user_ids, vec![UserId::from("U02")]);
-        assert!(del.has_failures());
         assert!(format_list_error("list_not_found").contains("not found"));
     }
 

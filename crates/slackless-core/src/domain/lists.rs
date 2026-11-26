@@ -112,7 +112,7 @@ pub fn list_general_access_summary(
 pub fn format_list_api_error(err: &ApiError) -> String {
     match err {
         ApiError::Slack(code) | ApiError::AuthExpired(code) => format_list_error(code),
-        other => format_list_error(&other.to_string()),
+        other => other.to_string(),
     }
 }
 

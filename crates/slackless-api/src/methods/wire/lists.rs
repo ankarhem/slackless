@@ -2,39 +2,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::de::value_as_lenient_bool;
 use crate::types::{ChannelId, Message, Ts, UserId};
 
 /// Access level for `slackLists.access.set` (`F-COLLAB-243..245`, `F-COLLAB-274..278`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ListAccessLevel {
-    Read,
-    Write,
-    Owner,
-}
-
-impl ListAccessLevel {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Read => "read",
-            Self::Write => "write",
-            Self::Owner => "owner",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "read" | "view" => Some(Self::Read),
-            "write" | "edit" => Some(Self::Write),
-            "owner" => Some(Self::Owner),
-            _ => None,
-        }
-    }
-}
+pub use super::{AccessLevel as ListAccessLevel, comment_channel_id as list_comment_channel_id};
 
 /// Partial-failure report returned by `slackLists.access.delete` (`api-canvases-lists.md`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -43,12 +18,6 @@ pub struct ListAccessDeleteResult {
     pub failed_to_update_channel_ids: Vec<ChannelId>,
     #[serde(default)]
     pub failed_to_update_user_ids: Vec<UserId>,
-}
-
-impl ListAccessDeleteResult {
-    pub fn has_failures(&self) -> bool {
-        !self.failed_to_update_channel_ids.is_empty() || !self.failed_to_update_user_ids.is_empty()
-    }
 }
 
 /// Parsed access, sharing, and limit metadata from `files.info` for a Slack List.
@@ -68,15 +37,6 @@ pub struct ListMeta {
     pub archived_row_count: Option<u32>,
     pub over_row_maximum: bool,
     pub comment_channel_id: ChannelId,
-}
-
-/// Derive a list's file comment channel id by replacing a leading `'F'` with `'C'`.
-pub fn list_comment_channel_id(file_id: &str) -> ChannelId {
-    if let Some(rest) = file_id.strip_prefix('F') {
-        ChannelId::from(format!("C{rest}"))
-    } else {
-        ChannelId::from(file_id)
-    }
 }
 
 /// Parse [`ListMeta`] from a `files.info` `file` object (or `slackLists.items.list` `list` object).
@@ -162,13 +122,7 @@ pub fn parse_list_meta(file_obj: &Value) -> ListMeta {
 /// Translate Slack server-enforced List errors into clear user-facing guidance
 /// (`F-COLLAB-246`, `F-COLLAB-254`, `F-COLLAB-274..279`).
 pub fn format_list_error(err: &str) -> String {
-    let normalized = err
-        .trim()
-        .strip_prefix("slack api error:")
-        .map(str::trim)
-        .unwrap_or_else(|| err.trim());
-
-    match normalized {
+    match err.trim() {
         "restricted_action" | "permission_denied" | "access_denied" => {
             "You do not have permission to perform this action on this list (owner or edit access may be required).".to_owned()
         }

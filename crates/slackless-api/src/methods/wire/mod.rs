@@ -24,8 +24,47 @@ pub use lists::*;
 pub use messaging::*;
 pub use users_search::*;
 
+use serde::{Deserialize, Serialize};
+
 use crate::pagination::Page;
-use crate::types::ApiResponse;
+use crate::types::{ApiResponse, ChannelId};
+
+/// Access level granted by `canvases.access.set` and `slackLists.access.set`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessLevel {
+    Read,
+    Write,
+    Owner,
+}
+
+impl AccessLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Owner => "owner",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "read" | "view" => Some(Self::Read),
+            "write" | "edit" => Some(Self::Write),
+            "owner" => Some(Self::Owner),
+            _ => None,
+        }
+    }
+}
+
+/// A canvas's or List's file comment channel: its file id with the leading `'F'` a `'C'`.
+pub fn comment_channel_id(file_id: &str) -> ChannelId {
+    if let Some(rest) = file_id.strip_prefix('F') {
+        ChannelId::from(format!("C{rest}"))
+    } else {
+        ChannelId::from(file_id)
+    }
+}
 
 /// `_x_reason` the web client tags message sends with.
 pub(super) const REASON_MESSAGE_SEND: &str = "webapp_message_send";

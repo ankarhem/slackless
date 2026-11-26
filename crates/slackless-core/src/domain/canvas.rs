@@ -149,7 +149,7 @@ pub fn general_access_summary(
 pub fn format_canvas_api_error(err: &ApiError) -> String {
     match err {
         ApiError::Slack(code) | ApiError::AuthExpired(code) => format_canvas_error(code),
-        other => format_canvas_error(&other.to_string()),
+        other => other.to_string(),
     }
 }
 
