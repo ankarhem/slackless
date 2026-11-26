@@ -31,7 +31,9 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
             config.muted = muted;
             state.shared.muted.store(muted, Ordering::Relaxed);
             snap.muted = muted;
-            let _ = signal.send_frame(&build_audio_control_frame(muted)).await;
+            if let Err(err) = signal.send_frame(&build_audio_control_frame(muted)).await {
+                tracing::warn!(%err, muted, "failed to send AUDIO_CONTROL mute state");
+            }
             let _ = state
                 .updates
                 .send(HuddleUpdate::State(Box::new(snap.clone())));
@@ -125,8 +127,9 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
                                 true,
                                 &state.remote_sources,
                             )
+                            && let Err(err) = signal.send_frame(&f).await
                         {
-                            let _ = signal.send_frame(&f).await;
+                            tracing::warn!(%err, "failed to send camera-on SUBSCRIBE");
                         }
                     }
                     Err(err) => {
@@ -149,8 +152,9 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
                         false,
                         &state.remote_sources,
                     )
+                    && let Err(err) = signal.send_frame(&f).await
                 {
-                    let _ = signal.send_frame(&f).await;
+                    tracing::warn!(%err, "failed to send camera-off SUBSCRIBE");
                 }
             }
             let _ = state
@@ -212,13 +216,10 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
                 snap.share_source_id = None;
                 state.media.set_camera_compact(false);
                 let cap_bytes = build_capabilities_message(&state.creds.attendee_id, false);
-                let _ = signal
-                    .send_frame(&build_data_message_frame(
-                        SLACK_DATA_CHANNEL_TOPIC,
-                        cap_bytes,
-                        30_000,
-                    ))
-                    .await;
+                let frame = build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, cap_bytes, 30_000);
+                if let Err(err) = signal.send_frame(&frame).await {
+                    tracing::warn!(%err, "failed to withdraw screen share capabilities");
+                }
                 let _ = state
                     .updates
                     .send(HuddleUpdate::VideoTileClosed(VideoTileKey::LocalScreen));
@@ -235,7 +236,9 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
             let bytes =
                 build_reacji_message(&state.creds.attendee_id, &emoji, kind, emoji_url.clone());
             let frame = build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, bytes, 4000);
-            let _ = signal.send_frame(&frame).await;
+            if let Err(err) = signal.send_frame(&frame).await {
+                tracing::warn!(%err, %emoji, "failed to send reaction");
+            }
             let _ = state
                 .updates
                 .send(HuddleUpdate::DataEvent(HuddleDataEvent::Reaction {
@@ -258,7 +261,9 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
                 now_ms() as i64,
             );
             let frame = build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, bytes, 30_000);
-            let _ = signal.send_frame(&frame).await;
+            if let Err(err) = signal.send_frame(&frame).await {
+                tracing::warn!(%err, raised, "failed to send hand raise");
+            }
             let _ = state
                 .updates
                 .send(HuddleUpdate::DataEvent(HuddleDataEvent::HandRaise {
@@ -280,7 +285,9 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
                 now_ms() as i64,
             );
             let frame = build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, bytes, 30_000);
-            let _ = signal.send_frame(&frame).await;
+            if let Err(err) = signal.send_frame(&frame).await {
+                tracing::warn!(%err, ?emoji, "failed to send sticky emoji");
+            }
             let _ = state
                 .updates
                 .send(HuddleUpdate::DataEvent(HuddleDataEvent::StickyEmoji {
@@ -294,7 +301,9 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
         Some(HuddleControl::SendDraw(draw_msg)) => {
             let bytes = build_draw_message(&state.creds.attendee_id, &draw_msg);
             let frame = build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, bytes, 5000);
-            let _ = signal.send_frame(&frame).await;
+            if let Err(err) = signal.send_frame(&frame).await {
+                tracing::warn!(%err, "failed to send draw message");
+            }
             let _ = state
                 .updates
                 .send(HuddleUpdate::DataEvent(HuddleDataEvent::Draw {
@@ -308,7 +317,9 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
             snap.jukebox_song = song_key.clone();
             let bytes = build_jukebox_message(&state.creds.attendee_id, song_key.as_deref());
             let frame = build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, bytes, 15_000);
-            let _ = signal.send_frame(&frame).await;
+            if let Err(err) = signal.send_frame(&frame).await {
+                tracing::warn!(%err, ?song_key, "failed to send jukebox message");
+            }
             let _ = state
                 .updates
                 .send(HuddleUpdate::State(Box::new(snap.clone())));
@@ -316,7 +327,9 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
         Some(HuddleControl::MutePeer(peer_id)) => {
             let bytes = build_mute_request_message(&state.creds.attendee_id, &peer_id);
             let frame = build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, bytes, 5000);
-            let _ = signal.send_frame(&frame).await;
+            if let Err(err) = signal.send_frame(&frame).await {
+                tracing::warn!(%err, %peer_id, "failed to send mute request");
+            }
         }
         Some(HuddleControl::SetTopic(topic)) => {
             snap.topic = (!topic.trim().is_empty()).then(|| topic.clone());
@@ -359,7 +372,9 @@ pub(super) async fn handle_control<R: RtcController, S: SignalSink, M: MediaDevi
                     .collect();
                 if !removed_mids.is_empty() {
                     let upd = build_remote_video_update_frame(Vec::new(), removed_mids);
-                    let _ = signal.send_frame(&upd).await;
+                    if let Err(err) = signal.send_frame(&upd).await {
+                        tracing::warn!(%err, "failed to send audio-only REMOTE_VIDEO_UPDATE");
+                    }
                 }
                 state.remote_sources.clear();
                 if let Ok(mut rt) = state.vdec_routing.lock() {

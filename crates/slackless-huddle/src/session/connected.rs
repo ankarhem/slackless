@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slackless_types::UserId;
 use tokio::sync::mpsc;
@@ -70,22 +70,41 @@ pub(super) async fn announce_screen_share_capabilities<S: SignalSink>(
     src_id: &str,
 ) {
     let cap_bytes = build_capabilities_message(attendee_id, true);
-    let _ = signal
+    if let Err(err) = signal
         .send_frame(&build_data_message_frame(
             SLACK_DATA_CHANNEL_TOPIC,
             cap_bytes,
             300_000,
         ))
-        .await;
+        .await
+    {
+        tracing::warn!(%err, "failed to announce screen share draw capabilities");
+    }
     let det_bytes =
         build_content_share_details_message(attendee_id, content_share_source_type(src_id));
-    let _ = signal
+    if let Err(err) = signal
         .send_frame(&build_data_message_frame(
             SLACK_DATA_CHANNEL_TOPIC,
             det_bytes,
             300_000,
         ))
-        .await;
+        .await
+    {
+        tracing::warn!(%err, "failed to announce screen share source details");
+    }
+}
+
+/// Log a recurring per-packet outbound track write failure at most once per 5 s.
+#[derive(Default)]
+struct WriteWarn(Option<Instant>);
+
+impl WriteWarn {
+    fn log(&mut self, err: &HuddleError, track: &'static str) {
+        if self.0.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+            self.0 = Some(Instant::now());
+            tracing::warn!(%err, track, "outbound track write failed");
+        }
+    }
 }
 
 impl<M: MediaDevices> SessionRuntime<'_, M> {
@@ -252,10 +271,14 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
     let video_tx_task = {
         let video_sender = peer.video_sender();
         tokio::spawn(async move {
+            let mut write_warn = WriteWarn::default();
             while let Some(h264_frame) = outbound_h264_rx.recv().await {
-                let _ = video_sender
+                if let Err(err) = video_sender
                     .write_h264_frame(h264_frame, Duration::from_millis(42))
-                    .await;
+                    .await
+                {
+                    write_warn.log(&err, "camera video");
+                }
             }
         })
     };
@@ -265,6 +288,7 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
     let mut last_audio_rx = crate::audio::AudioRxSnapshot::default();
     let mut last_levels_speakers: Vec<(UserId, f32)> = Vec::new();
     let mut last_levels_muted: Vec<UserId> = Vec::new();
+    let mut opus_write_warn = WriteWarn::default();
 
     while exit_reason.is_none() {
         let connect_timeout = async {
@@ -279,7 +303,9 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
                 exit_reason = Some(classify_handshake_err(HuddleError::UdpBlocked, is_reconnect));
             }
             Some(opus_pkt) = outbound_opus_rx.recv() => {
-                let _ = peer.write_opus_frame(opus_pkt).await;
+                if let Err(err) = peer.write_opus_frame(opus_pkt).await {
+                    opus_write_warn.log(&err, "opus");
+                }
             }
             Some(fb) = cam_fb_rx.recv() => {
                 match fb {
@@ -369,7 +395,9 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
             }
             _ = metric_tick.tick() => {
                 let stats = peer.take_metrics_snapshot(state.shared.local_rms());
-                let _ = signal.send_frame(&build_client_metric_frame(stats)).await;
+                if let Err(err) = signal.send_frame(&build_client_metric_frame(stats)).await {
+                    tracing::warn!(%err, "failed to send CLIENT_METRIC");
+                }
                 let tx_pkts = peer.total_packets_sent();
                 let rx_pkts = peer.total_packets_received();
                 let tx_bytes = peer.total_bytes_sent();
