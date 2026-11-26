@@ -1,7 +1,9 @@
 use super::*;
 use gpui_kit::gpui;
 use slackless_core::types::rich_text::{Block, RichTextContainer, RichTextElement};
-use slackless_core::types::{SectionKind, UserId};
+use slackless_core::types::{File, SectionKind, UserId};
+
+use super::dms::dm_preview_text;
 
 #[test]
 fn nav_prefs_shows_respects_toggles() {
@@ -65,6 +67,30 @@ fn drop_target_and_dm_acceptance_follow_section_kinds() {
     );
     assert!(accepts_dms(Some(&custom_section), &custom_key));
     assert!(!accepts_dms(None, &channels_key));
+}
+
+/// The DM list previews the raw mrkdwn, never a plain-text preview parsed again: a link typed
+/// literally arrives escaped, and re-parsing its unescaped form would open the first address
+/// under the second's label.
+#[test]
+fn dm_preview_is_the_raw_mrkdwn_with_the_file_fallback() {
+    let fixtures = crate::fixtures::load();
+    let typed = Message {
+        text: "&lt;https://evil.example|https://bank.example&gt;".into(),
+        ..Default::default()
+    };
+    assert_eq!(dm_preview_text(&fixtures, &typed), typed.text);
+    let shared = Message {
+        files: vec![File {
+            name: Some("plan.pdf".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        dm_preview_text(&fixtures, &shared),
+        "Shared a file: plan.pdf"
+    );
 }
 
 #[gpui::test]

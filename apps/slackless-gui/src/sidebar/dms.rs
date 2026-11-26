@@ -12,6 +12,7 @@ use slackless_core::types::{Conversation, Message, Ts};
 
 use super::{Sidebar, SidebarEvent, count_pill};
 use crate::avatars::conversation_avatar;
+use crate::fixtures::Fixtures;
 use crate::messages::list_stamp;
 
 impl Sidebar {
@@ -185,9 +186,9 @@ impl Sidebar {
                 Some(user) if *user == self.fixtures.self_user => "You: ",
                 _ => "",
             };
-            // Formatting, links and emoji render as in the transcript, as Slack's list does.
+            // Formatting, links and emoji render as in the transcript.
             crate::messages::mrkdwn_preview(
-                &format!("{author}{}", self.fixtures.preview(message)),
+                &format!("{author}{}", dm_preview_text(&self.fixtures, message)),
                 &self.fixtures,
                 dim,
                 format!("dm-preview-{}", dm.id),
@@ -244,5 +245,16 @@ impl Sidebar {
                 ))
             })
             .on_click(cx.listener(move |this, _, _, cx| this.select_row(id.clone(), cx)))
+    }
+}
+
+/// What the DM list previews of `message`: its raw mrkdwn, as the transcript renders it (a
+/// link typed literally arrives escaped; parsing its unescaped plain text again would draw a
+/// live link to the first address labelled with the second), or the file line of a bare share.
+pub(super) fn dm_preview_text(fixtures: &Fixtures, message: &Message) -> String {
+    if message.text.trim().is_empty() {
+        fixtures.preview(message)
+    } else {
+        message.text.clone()
     }
 }
