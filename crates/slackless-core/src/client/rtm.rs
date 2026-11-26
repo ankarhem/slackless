@@ -65,7 +65,7 @@ impl<B: Backend> Core<B> {
                         if let Some(user) = &ev.user {
                             self.events.emit(Event::DndPaused {
                                 user: user.clone(),
-                                paused: ev.dnd_status.paused(now_secs()),
+                                paused: ev.dnd_status.paused(now_epoch_secs()),
                             });
                         }
                     }
@@ -361,7 +361,7 @@ impl<B: Backend> Core<B> {
             let status = ctx.backend.dnd_info(peer.clone()).await?;
             ctx.events.emit(Event::DndPaused {
                 user: peer,
-                paused: status.paused(now_secs()),
+                paused: status.paused(now_epoch_secs()),
             });
             Ok(())
         });

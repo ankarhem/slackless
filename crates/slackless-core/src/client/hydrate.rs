@@ -453,7 +453,7 @@ pub(super) async fn prefetch_targets<B: Backend>(
         if fetched >= 3 {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
-        let fetched_at = now_secs();
+        let fetched_at = now_epoch_secs();
         let items = match wait_out_rate_limits(|| {
             ctx.backend
                 .recent_history(channel.clone(), crate::backend::UNREADS_HISTORY_LIMIT)

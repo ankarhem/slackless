@@ -24,7 +24,7 @@ impl Store {
             workspace.as_str(),
             bot_id.as_str(),
             json,
-            now_secs()
+            now_epoch_secs()
         ])?;
         Ok(())
     }

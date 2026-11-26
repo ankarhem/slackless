@@ -9,7 +9,7 @@ impl Store {
         let mut stmt = self.conn.prepare_cached(
             "INSERT INTO offline_queue (workspace_id, payload, created_at) VALUES (?1, ?2, ?3)",
         )?;
-        stmt.execute(params![workspace.as_str(), payload, now_secs()])?;
+        stmt.execute(params![workspace.as_str(), payload, now_epoch_secs()])?;
         Ok(self.conn.last_insert_rowid())
     }
 

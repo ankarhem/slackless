@@ -16,7 +16,7 @@ impl<B: Backend> Core<B> {
     pub(super) fn fetch_latest_history(&self, channel: ChannelId) {
         let ctx = self.ctx();
         self.spawn("conversations.history", async move {
-            let fetched_at = now_secs();
+            let fetched_at = now_epoch_secs();
             let items = wait_out_rate_limits(|| {
                 ctx.backend
                     .recent_history(channel.clone(), crate::backend::UNREADS_HISTORY_LIMIT)

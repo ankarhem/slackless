@@ -8,10 +8,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use slackless_store::{
     DEFAULT_RRF_K, Has, SearchFilters, SearchMode, SearchQuery, SearchSort, SemanticDocInput,
-    SemanticDocKind, SemanticHit, SemanticIndex, SemanticIndexStats, Store,
+    SemanticDocKind, SemanticHit, SemanticIndex, SemanticIndexStats, Store, UserSummary,
     extract_inline_file_body, extract_inline_file_transcript, fuse_rrf,
 };
-use slackless_types::{ChannelId, File, FileId, Message, TeamId, Ts};
+use slackless_types::{ChannelId, File, FileId, Message, TeamId, Ts, UserId};
 
 use crate::client::read_store;
 use crate::domain::mrkdwn::mrkdwn_to_plain;
@@ -950,7 +950,7 @@ fn fuse_transcript_hits(
 struct HydrateMeta {
     workspace_name: Option<String>,
     channels: HashMap<String, String>,
-    users: HashMap<String, (String, Option<String>, Option<String>)>,
+    users: HashMap<UserId, UserSummary>,
 }
 
 fn load_hydrate_meta(store: &Store, ws: &TeamId, fallback_name: Option<&str>) -> HydrateMeta {
@@ -969,12 +969,7 @@ fn load_hydrate_meta(store: &Store, ws: &TeamId, fallback_name: Option<&str>) ->
     let channels = store.channel_names(ws).unwrap_or_default();
     let mut users = HashMap::new();
     if let Ok(list) = store.list_users(ws, None, true) {
-        for u in list {
-            users.insert(
-                u.id.as_str().to_owned(),
-                (u.name, u.display_name, u.real_name),
-            );
-        }
+        users.extend(list.into_iter().map(|u| (u.id.clone(), u)));
     }
     HydrateMeta {
         workspace_name,
@@ -1065,12 +1060,8 @@ fn hydrate_one_hit(
                 .message
                 .user
                 .as_ref()
-                .and_then(|u| meta.users.get(u.as_str()))
-                .and_then(|(n, d, r)| {
-                    d.clone()
-                        .or_else(|| r.clone())
-                        .or_else(|| (!n.is_empty()).then(|| n.clone()))
-                })
+                .and_then(|u| meta.users.get(u))
+                .map(UserSummary::label)
                 .or_else(|| stored.message.bot_profile.as_ref().map(|b| b.name.clone()));
             let kind = match sem.kind {
                 SemanticDocKind::Canvas => SearchHitKind::Canvas,
@@ -1203,15 +1194,17 @@ fn message_matches_filters(
     }
 
     let user_id = message.user.as_ref().map(|u| u.as_str());
-    let user_tuple = user_id.and_then(|id| meta.users.get(id));
+    let user = message.user.as_ref().and_then(|id| meta.users.get(id));
     let matches_user = |cand: &str| {
         user_id.is_some_and(|id| id.eq_ignore_ascii_case(cand))
-            || user_tuple.is_some_and(|(name, disp, real)| {
-                name.eq_ignore_ascii_case(cand)
-                    || disp
+            || user.is_some_and(|user| {
+                user.name.eq_ignore_ascii_case(cand)
+                    || user
+                        .display_name
                         .as_deref()
                         .is_some_and(|d| d.eq_ignore_ascii_case(cand))
-                    || real
+                    || user
+                        .real_name
                         .as_deref()
                         .is_some_and(|r| r.eq_ignore_ascii_case(cand))
             })

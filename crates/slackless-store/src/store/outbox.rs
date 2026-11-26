@@ -138,7 +138,7 @@ impl Store {
         item: &NewOutboxItem<'_>,
     ) -> Result<OutboxItem> {
         self.ensure_writable()?;
-        let now = now_secs();
+        let now = now_epoch_secs();
         let thread_ts = item.thread_ts.filter(|ts| !ts.as_str().is_empty());
         let mut stmt = self.conn.prepare_cached(
             "INSERT INTO outbox
@@ -247,7 +247,7 @@ impl Store {
              SET status = 'sending', attempts = attempts + 1, updated_at = ?2
              WHERE id = ?1 AND status != 'sending'",
         )?;
-        let changed = stmt.execute(params![id, now_secs()])?;
+        let changed = stmt.execute(params![id, now_epoch_secs()])?;
         if changed > 0 {
             self.bump_message_revision();
             Ok(true)
@@ -264,7 +264,7 @@ impl Store {
              SET status = 'failed', last_error = ?2, updated_at = ?3
              WHERE id = ?1",
         )?;
-        let changed = stmt.execute(params![id, error, now_secs()])?;
+        let changed = stmt.execute(params![id, error, now_epoch_secs()])?;
         if changed > 0 {
             self.bump_message_revision();
             Ok(true)
@@ -281,7 +281,7 @@ impl Store {
              SET status = 'pending', last_error = NULL, updated_at = ?2
              WHERE id = ?1",
         )?;
-        let changed = stmt.execute(params![id, now_secs()])?;
+        let changed = stmt.execute(params![id, now_epoch_secs()])?;
         if changed > 0 {
             self.bump_message_revision();
             Ok(true)
@@ -299,7 +299,7 @@ impl Store {
              SET status = 'pending', updated_at = ?2
              WHERE workspace_id = ?1 AND status = 'sending'",
         )?;
-        let changed = stmt.execute(params![workspace.as_str(), now_secs()])?;
+        let changed = stmt.execute(params![workspace.as_str(), now_epoch_secs()])?;
         if changed > 0 {
             self.bump_message_revision();
         }

@@ -17,7 +17,7 @@ use crate::catchup::CatchUpBriefing;
 use crate::domain::mrkdwn::mrkdwn_to_plain;
 use crate::runtime::block_on;
 use crate::store::{Store, StoredMessage};
-use crate::types::time::civil_from_days;
+use crate::types::time::format_utc;
 use crate::types::{ChannelId, FileId, TeamId, TranscriptCue, Ts, UserId};
 
 /// Default request timeout in seconds for chat completions.
@@ -1275,27 +1275,6 @@ pub fn test_connection_blocking(
 // Local SQLite store target loaders (shared by CLI & GUI)
 // --------------------------------------------------------------------------------------------
 
-fn user_display_map(store: &Store, workspace: &TeamId) -> HashMap<UserId, String> {
-    store
-        .users(workspace)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|u| {
-            let name = u
-                .profile
-                .display_name
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .or_else(|| u.profile.real_name.as_deref().filter(|s| !s.is_empty()))
-                .or(u.real_name.as_deref().filter(|s| !s.is_empty()))
-                .or_else(|| (!u.name.is_empty()).then_some(u.name.as_str()))
-                .unwrap_or(u.id.as_str())
-                .to_owned();
-            (u.id, name)
-        })
-        .collect()
-}
-
 fn channel_label_and_topic(
     store: &Store,
     workspace: &TeamId,
@@ -1324,14 +1303,7 @@ fn channel_label_and_topic(
 
 fn format_ts_utc(ts: &Ts) -> Option<String> {
     let secs = ts.as_str().split('.').next()?.parse::<i64>().ok()?;
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let hour = rem / 3_600;
-    let minute = (rem % 3_600) / 60;
-    Some(format!(
-        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}Z"
-    ))
+    Some(format_utc(secs))
 }
 
 fn stored_to_summary_message(
@@ -1388,7 +1360,7 @@ pub fn load_thread_target(
     let rows = store
         .thread_replies(workspace, channel, thread_ts)
         .map_err(|e| SummarizeError::EmptyInput(format!("reading thread: {e}")))?;
-    let users = user_display_map(store, workspace);
+    let users = store.user_labels(workspace).unwrap_or_default();
     let (channel_label, _) = channel_label_and_topic(store, workspace, channel, &users);
     let messages: Vec<SummaryMessage> = rows
         .iter()
@@ -1418,7 +1390,7 @@ pub fn load_channel_target(
     let rows = store
         .channel_history(workspace, channel, None, limit)
         .map_err(|e| SummarizeError::EmptyInput(format!("reading channel: {e}")))?;
-    let users = user_display_map(store, workspace);
+    let users = store.user_labels(workspace).unwrap_or_default();
     let (channel_label, topic) = channel_label_and_topic(store, workspace, channel, &users);
     let messages: Vec<SummaryMessage> = rows
         .iter()
@@ -1566,7 +1538,7 @@ mod tests {
     fn thread_prompt_truncates_utf8_safely_and_preserves_root_and_latest() {
         let mut messages = vec![SummaryMessage {
             author: "Alice".to_owned(),
-            timestamp: Some("2026-11-26 09:00Z".to_owned()),
+            timestamp: Some("2026-11-26 09:00:00Z".to_owned()),
             text: "Root proposal: ship v2 on Friday 🚀".to_owned(),
             is_thread_root: true,
         }];

@@ -242,7 +242,7 @@ impl Store {
                 source,
                 effective_text,
                 cues_json,
-                now_secs(),
+                now_epoch_secs(),
             ])?;
         }
         let updated = refresh_messages_for_file(&tx, workspace, file_id)?;

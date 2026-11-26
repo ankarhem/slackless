@@ -37,6 +37,19 @@ pub struct UserSummary {
     pub deleted: bool,
 }
 
+impl UserSummary {
+    /// What a reader recognises best: display name, then real name, then handle, then the id.
+    pub fn label(&self) -> String {
+        pick_user_display(
+            self.display_name.as_deref(),
+            self.real_name.as_deref(),
+            Some(self.name.as_str()),
+        )
+        .unwrap_or(self.id.as_str())
+        .to_owned()
+    }
+}
+
 /// One conversation's activity summary in a time-windowed offline digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DigestChannel {
@@ -198,10 +211,25 @@ impl Store {
         )?;
         let row = stmt
             .query_row(params![workspace.as_str(), user.as_str()], |row| {
-                Ok(pick_user_display(row.get(0)?, row.get(1)?, row.get(2)?))
+                let display: Option<String> = row.get(0)?;
+                let real: Option<String> = row.get(1)?;
+                let name: Option<String> = row.get(2)?;
+                Ok(
+                    pick_user_display(display.as_deref(), real.as_deref(), name.as_deref())
+                        .map(ToOwned::to_owned),
+                )
             })
             .optional()?;
         Ok(row.flatten())
+    }
+
+    /// Every stored user's [`UserSummary::label`] by id, deleted users included.
+    pub fn user_labels(&self, workspace: &TeamId) -> Result<HashMap<UserId, String>> {
+        Ok(self
+            .list_users(workspace, None, true)?
+            .into_iter()
+            .map(|user| (user.id.clone(), user.label()))
+            .collect())
     }
 
     /// List archived workspace users, optionally filtered by a case-insensitive substring on
@@ -581,10 +609,13 @@ impl Store {
                     r#"SELECT id, display_name, real_name, name FROM "user"
                        WHERE workspace_id = ?1 AND id"#,
                     |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            pick_user_display(row.get(1)?, row.get(2)?, row.get(3)?),
-                        ))
+                        let display: Option<String> = row.get(1)?;
+                        let real: Option<String> = row.get(2)?;
+                        let name: Option<String> = row.get(3)?;
+                        let label =
+                            pick_user_display(display.as_deref(), real.as_deref(), name.as_deref())
+                                .map(ToOwned::to_owned);
+                        Ok((row.get::<_, String>(0)?, label))
                     },
                     |(id, display)| {
                         if let Some(name) = display {
@@ -639,11 +670,11 @@ impl Store {
     }
 }
 
-fn pick_user_display(
-    display: Option<String>,
-    real: Option<String>,
-    name: Option<String>,
-) -> Option<String> {
+fn pick_user_display<'a>(
+    display: Option<&'a str>,
+    real: Option<&'a str>,
+    name: Option<&'a str>,
+) -> Option<&'a str> {
     display
         .filter(|v| !v.is_empty())
         .or_else(|| real.filter(|v| !v.is_empty()))

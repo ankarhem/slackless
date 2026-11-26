@@ -63,6 +63,18 @@ pub fn now_epoch_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Formats unix epoch seconds as `YYYY-MM-DD HH:MM:SSZ` (UTC).
+pub fn format_utc(secs: i64) -> String {
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let rem = secs.rem_euclid(86_400);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}Z",
+        rem / 3_600,
+        (rem % 3_600) / 60,
+        rem % 60
+    )
+}
+
 /// Formats a media duration in milliseconds as `M:SS` (e.g. `0:05`, `12:34`).
 pub fn format_duration(ms: u64) -> String {
     let total_secs = ms / 1000;
@@ -175,6 +187,8 @@ mod tests {
         let ms = now_epoch_ms();
         assert!(secs > 1_700_000_000);
         assert!(ms >= (secs as u64) * 1000);
+        assert_eq!(format_utc(0), "1970-01-01 00:00:00Z");
+        assert_eq!(format_utc(1_700_000_000), "2023-11-14 22:13:20Z");
     }
 
     #[test]

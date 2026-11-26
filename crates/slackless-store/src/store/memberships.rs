@@ -85,7 +85,7 @@ impl Store {
         self.ensure_writable()?;
         let mut flipped = Vec::new();
         let tx = self.conn.transaction()?;
-        let now = now_secs();
+        let now = now_epoch_secs();
         if members.len() <= SQL_IN_CHUNK {
             if !members.is_empty() {
                 let in_list = placeholders(members.len());

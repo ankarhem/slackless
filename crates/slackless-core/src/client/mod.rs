@@ -703,10 +703,5 @@ pub(super) fn spawn_tracked<F>(
     });
 }
 
-/// Unix seconds now; 0 if the clock is somehow before the epoch.
-fn now_secs() -> i64 {
-    now_epoch_secs()
-}
-
 #[cfg(test)]
 pub(crate) mod tests;

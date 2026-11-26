@@ -47,6 +47,7 @@ use rusqlite::{
 };
 
 use crate::query::{Has, SearchQuery};
+use crate::types::time::now_epoch_secs;
 use crate::types::{
     BotId, BotProfile, ChannelId, ChannelSection, Conversation, ConversationKind, Message,
     MessageSubtype, Team, TeamId, Ts, User, UserId,
@@ -275,7 +276,7 @@ impl Store {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
-        let ts = now_secs();
+        let ts = now_epoch_secs();
         for conv in conversations {
             upsert_conversation_in_tx(&tx, workspace, conv, ts)?;
         }
@@ -295,7 +296,7 @@ impl Store {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
-        let ts = now_secs();
+        let ts = now_epoch_secs();
         {
             let mut stmt = tx.prepare_cached(
                 r#"INSERT INTO "user"
@@ -351,7 +352,7 @@ impl Store {
             }
             None => fresh.clone(),
         };
-        upsert_conversation_in_tx(&tx, workspace, &merged, now_secs())?;
+        upsert_conversation_in_tx(&tx, workspace, &merged, now_epoch_secs())?;
         tx.commit()?;
         self.bump_message_revision();
         Ok(())
@@ -424,7 +425,7 @@ impl Store {
                 workspace.as_str(),
                 team.id.as_str(),
                 serde_json::to_string(team)?,
-                now_secs(),
+                now_epoch_secs(),
             ],
         )?;
         Ok(())
@@ -505,7 +506,7 @@ impl Store {
     ) -> Result<()> {
         self.ensure_writable()?;
         let tx = self.conn.transaction()?;
-        let ts = now_secs();
+        let ts = now_epoch_secs();
         {
             let mut del =
                 tx.prepare_cached("DELETE FROM channel_section WHERE workspace_id = ?1")?;
@@ -597,7 +598,7 @@ impl Store {
             params![
                 workspace.as_str(),
                 serde_json::to_string(prefs)?,
-                now_secs()
+                now_epoch_secs()
             ],
         )?;
         Ok(())

@@ -616,7 +616,7 @@ fn insert_revision(tx: &Transaction<'_>, w: &MessageWrite<'_>) -> Result<()> {
         w.deleted,
         w.json,
         w.message.ts.secs(),
-        now_secs(),
+        now_epoch_secs(),
     ])?;
     Ok(())
 }
@@ -679,7 +679,7 @@ fn write_current(tx: &Transaction<'_>, w: &MessageWrite<'_>, existed: bool) -> R
                 w.message.reply_count,
                 w.json,
                 w.message.ts.secs(),
-                now_secs(),
+                now_epoch_secs(),
             ],
             |r| r.get(0),
         )?
@@ -864,12 +864,6 @@ pub(super) fn parse_ts_key(ts: &Ts) -> Option<i64> {
 /// Unparseable timestamps sort at epoch `0`.
 pub(super) fn ts_key(ts: &Ts) -> i64 {
     parse_ts_key(ts).unwrap_or(0)
-}
-
-pub(super) fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
 }
 
 pub(super) fn now_ts() -> String {

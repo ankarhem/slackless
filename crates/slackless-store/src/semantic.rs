@@ -7,11 +7,12 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use slackless_types::TeamId;
+use slackless_types::time::now_epoch_secs;
 
 use crate::Result;
 
@@ -523,7 +524,7 @@ impl SemanticIndex {
         if docs.is_empty() {
             return Ok(0);
         }
-        let now = now_secs();
+        let now = now_epoch_secs();
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
@@ -743,12 +744,6 @@ impl SemanticIndex {
             .saturating_mul(u64::try_from(page_size.max(0)).unwrap_or(0));
         Ok(stats)
     }
-}
-
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
 }
 
 #[cfg(test)]

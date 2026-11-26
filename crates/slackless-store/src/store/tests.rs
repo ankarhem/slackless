@@ -1828,7 +1828,7 @@ fn history_page_tombstones_top_level_messages_it_omits_except_replies_ephemeral_
         .unwrap();
     // Requested after every stored row was written, except the one a live event touched at the
     // moment of the request.
-    let fetched_at = now_secs() + 1000;
+    let fetched_at = now_epoch_secs() + 1000;
     pin_updated_at(&store, "1700003105.000100", fetched_at);
 
     let page = [
@@ -2469,6 +2469,12 @@ fn archive_read_apis_cover_channels_dms_users_resolve_digest_and_malformed_prefs
     assert_eq!(
         store.user_display(&ws1, &UserId::from("U99")).unwrap(),
         None
+    );
+    // The batch labels follow the same rule.
+    let labels = store.user_labels(&ws1).unwrap();
+    assert_eq!(
+        ["U1", "U2", "U3"].map(|id| labels.get(&UserId::from(id)).map(String::as_str)),
+        [Some("Alice Display"), Some("Bob Real"), Some("carol")]
     );
 
     let active_users: Vec<String> = store
