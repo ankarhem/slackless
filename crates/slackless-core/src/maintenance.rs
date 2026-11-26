@@ -66,13 +66,21 @@ impl PruneReport {
 }
 
 /// Every media cache directory slackless writes: the temp playback cache
-/// (`$TMPDIR/slackless-media`), legacy audio cache (`$TMPDIR/slackless-audio`), and the persistent
-/// public avatar/emoji cache (`<cache_dir>/media`).
+/// (`$TMPDIR/slackless-media`), legacy audio cache (`$TMPDIR/slackless-audio`), the persistent
+/// public avatar/emoji cache (`<cache_dir>/media`), and slackless-huddle's cache of Slack's
+/// huddle sounds (`<cache_dir>/sounds`, or `$TMPDIR/slackless-sounds` without a cache dir).
 pub fn default_media_cache_dirs() -> Vec<PathBuf> {
     let tmp = std::env::temp_dir();
-    let mut dirs = vec![tmp.join("slackless-media"), tmp.join("slackless-audio")];
+    let mut dirs = vec![
+        tmp.join("slackless-media"),
+        tmp.join("slackless-audio"),
+        tmp.join("slackless-sounds"),
+    ];
     if let Some(disk) = crate::fetcher::disk_cache_dir() {
         dirs.push(disk);
+    }
+    if let Some(cache) = crate::paths::app_cache_dir() {
+        dirs.push(cache.join("sounds"));
     }
     dirs
 }
@@ -414,6 +422,18 @@ mod tests {
         assert_eq!(total.removed_files, 0);
         assert_eq!(total.remaining_files, 2);
         assert_eq!(total.remaining_bytes, 96);
+    }
+
+    #[test]
+    fn media_cache_dirs_cover_the_huddle_sound_cache() {
+        // slackless-huddle caches Slack's lifecycle sounds under `<cache>/sounds`, or under
+        // `$TMPDIR/slackless-sounds` without a cache dir: Clear cache, Prune and the size
+        // count must reach both.
+        let dirs = default_media_cache_dirs();
+        assert!(dirs.contains(&std::env::temp_dir().join("slackless-sounds")));
+        if let Some(cache) = crate::paths::app_cache_dir() {
+            assert!(dirs.contains(&cache.join("sounds")), "{dirs:?}");
+        }
     }
 
     #[test]
