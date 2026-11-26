@@ -1,10 +1,11 @@
-//! Block Kit datepicker, datetimepicker, timepicker, and calendar math helpers.
+//! Block Kit datepicker, datetimepicker and timepicker elements (calendar math via jiff).
+
+use jiff::ToSpan as _;
+use jiff::civil::Date;
 
 use super::super::*;
 use super::selects::{DropdownSpec, dropdown};
 use super::{action_base, dispatch_action, maybe_confirm};
-
-pub(in crate::blockkit) use slackless_core::types::time::weekday_sunday0;
 
 /// Slack `datetimepicker` element (`F-COLLAB-746`): displays the chosen date & time (formatted
 /// from unix epoch `initial_date_time`) with quick preset picks dispatching `selected_date_time`.
@@ -90,76 +91,10 @@ pub(in crate::blockkit) fn timepicker_slots() -> Vec<(String, String)> {
         .collect()
 }
 
-pub(in crate::blockkit) fn parse_iso_ymd(s: &str) -> Option<(i32, u32, u32)> {
-    let mut parts = s.split('-');
-    let ys = parts.next()?;
-    let ms = parts.next()?;
-    let ds = parts.next()?;
-    if parts.next().is_some()
-        || ys.len() != 4
-        || ms.len() != 2
-        || ds.len() != 2
-        || !ys.bytes().all(|b| b.is_ascii_digit())
-        || !ms.bytes().all(|b| b.is_ascii_digit())
-        || !ds.bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let y = ys.parse::<i32>().ok()?;
-    let m = ms.parse::<u32>().ok()?;
-    let d = ds.parse::<u32>().ok()?;
-    if (1..=12).contains(&m) && (1..=days_in_month(y, m)).contains(&d) {
-        Some((y, m, d))
-    } else {
-        None
-    }
-}
-
-/// Step `(year, month)` by `delta_months` (handling Dec -> Jan and Jan -> Dec rollovers).
-pub(in crate::blockkit) fn step_month(year: i32, month: u32, delta_months: i32) -> (i32, u32) {
-    let total = year * 12 + (month as i32 - 1) + delta_months;
-    let next_year = total.div_euclid(12);
-    let next_month = (total.rem_euclid(12) + 1) as u32;
-    (next_year, next_month)
-}
-
-/// Shift `(year, month, day)` by `delta_months`, clamping `day` to the target month's length
-/// (e.g. Jan 31 + 1 month -> Feb 28 / Feb 29 on leap years; Mar 31 + 1 month -> Apr 30).
-#[cfg_attr(not(test), allow(dead_code))]
-pub(in crate::blockkit) fn shift_date_by_months(
-    year: i32,
-    month: u32,
-    day: u32,
-    delta_months: i32,
-) -> (i32, u32, u32) {
-    let (ny, nm) = step_month(year, month, delta_months);
-    let clamped_day = day.min(days_in_month(ny, nm)).max(1);
-    (ny, nm, clamped_day)
-}
-
-pub(in crate::blockkit) fn days_in_month(year: i32, month: u32) -> u32 {
-    slackless_core::types::time::days_in_month(i64::from(year), month).unwrap_or(30)
-}
-
-pub(in crate::blockkit) fn month_name(month: u32) -> &'static str {
-    const NAMES: [&str; 12] = [
-        "January",
-        "February",
-        "March",
-        "April",
-        "May",
-        "June",
-        "July",
-        "August",
-        "September",
-        "October",
-        "November",
-        "December",
-    ];
-    NAMES
-        .get((month.saturating_sub(1)) as usize)
-        .copied()
-        .unwrap_or("")
+/// `YYYY-MM-DD` (Slack's date format) as the first of that month; `None` for any other shape.
+fn parse_month(iso: &str) -> Option<Date> {
+    let date = Date::strptime("%Y-%m-%d", iso).ok()?;
+    Some(date.first_of_month())
 }
 
 /// Interactive monthly calendar grid date picker (`F-COLLAB-745`).
@@ -173,19 +108,15 @@ pub(in crate::blockkit) fn datepicker(
     let selected =
         choice(kcx, &key, cx).or_else(|| element["initial_date"].as_str().map(str::to_owned));
     let today_iso = messages::iso_date(messages::now_secs());
-    let (today_y, today_m, _) = parse_iso_ymd(&today_iso).unwrap_or((2026, 1, 1));
-    let default_ym = selected
-        .as_deref()
-        .and_then(parse_iso_ymd)
-        .map(|(y, m, _)| (y, m))
-        .unwrap_or((today_y, today_m));
+    let today = parse_month(&today_iso).unwrap_or_default();
+    let default_month = selected.as_deref().and_then(parse_month).unwrap_or(today);
     let is_open = kcx
         .kit
         .is_some_and(|kit| kit.read(cx).open_calendars.contains(&key));
-    let (view_y, view_m) = kcx
+    let view_month = kcx
         .kit
         .and_then(|kit| kit.read(cx).calendar_months.get(&key).copied())
-        .unwrap_or(default_ym);
+        .unwrap_or(default_month);
     let label = selected
         .clone()
         .or_else(|| text_of(&element["placeholder"]).map(str::to_owned))
@@ -218,7 +149,7 @@ pub(in crate::blockkit) fn datepicker(
                     state
                         .calendar_months
                         .entry(key_toggle.clone())
-                        .or_insert(default_ym);
+                        .or_insert(default_month);
                     cx.notify();
                 });
             }
@@ -228,10 +159,11 @@ pub(in crate::blockkit) fn datepicker(
         return trigger.into_any_element();
     }
 
-    let first_dow = weekday_sunday0(view_y, view_m, 1) as usize;
-    let total_days = days_in_month(view_y, view_m) as usize;
-    let (prev_y, prev_m) = step_month(view_y, view_m, -1);
-    let (next_y, next_m) = step_month(view_y, view_m, 1);
+    let first_dow = usize::try_from(view_month.weekday().to_sunday_zero_offset()).unwrap_or(0);
+    let total_days = usize::try_from(view_month.days_in_month()).unwrap_or(30);
+    let prev_month = view_month.checked_add(-1.month()).unwrap_or(view_month);
+    let next_month = view_month.checked_add(1.month()).unwrap_or(view_month);
+    let (view_y, view_m) = (view_month.year(), view_month.month());
     let base = action_base(element, block);
     let mut cells: Vec<Option<u32>> = vec![None; first_dow];
     cells.extend((1..=total_days as u32).map(Some));
@@ -263,9 +195,7 @@ pub(in crate::blockkit) fn datepicker(
                         .on_click(move |_, _, cx| {
                             if let Some(kit) = &kit_prev {
                                 kit.update(cx, |state, cx| {
-                                    state
-                                        .calendar_months
-                                        .insert(key_prev.clone(), (prev_y, prev_m));
+                                    state.calendar_months.insert(key_prev.clone(), prev_month);
                                     cx.notify();
                                 });
                             }
@@ -276,7 +206,7 @@ pub(in crate::blockkit) fn datepicker(
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(fg)
-                        .child(format!("{} {view_y}", month_name(view_m))),
+                        .child(view_month.strftime("%B %Y").to_string()),
                 )
                 .child(
                     Button::new(SharedString::from(format!("bk-cal-next-{key}")))
@@ -286,9 +216,7 @@ pub(in crate::blockkit) fn datepicker(
                         .on_click(move |_, _, cx| {
                             if let Some(kit) = &kit_next {
                                 kit.update(cx, |state, cx| {
-                                    state
-                                        .calendar_months
-                                        .insert(key_next.clone(), (next_y, next_m));
+                                    state.calendar_months.insert(key_next.clone(), next_month);
                                     cx.notify();
                                 });
                             }

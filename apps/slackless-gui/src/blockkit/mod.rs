@@ -72,8 +72,8 @@ pub struct BlockKitState {
     dismissed_unfurls: HashSet<String>,
     /// Datepicker keys whose monthly calendar grid is currently expanded (`F-COLLAB-745`).
     open_calendars: HashSet<String>,
-    /// Currently browsed `(year, month)` per datepicker key (1-based month).
-    calendar_months: HashMap<String, (i32, u32)>,
+    /// Currently browsed month (its first day) per datepicker key.
+    calendar_months: HashMap<String, jiff::civil::Date>,
     /// Live option suggestions fetched via `blocks.suggestions` for `external_select` (`F-COLLAB-786`).
     suggestions: HashMap<String, Vec<(String, String)>>,
     /// Query inputs for `external_select` / `multi_external_select` elements.

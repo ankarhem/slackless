@@ -346,54 +346,7 @@ fn parses_hex_colors_and_rich_option_descriptions() {
 }
 
 #[test]
-fn calendar_math_handles_iso_parsing_leap_years_and_weekdays() {
-    assert_eq!(parse_iso_ymd("2026-11-25"), Some((2026, 11, 25)));
-    assert_eq!(parse_iso_ymd("2024-02-29"), Some((2024, 2, 29)));
-    assert_eq!(parse_iso_ymd("2026-00-10"), None);
-    assert_eq!(parse_iso_ymd("2026-13-10"), None);
-    assert_eq!(parse_iso_ymd("2026-01-00"), None);
-    assert_eq!(parse_iso_ymd("2026-01-32"), None);
-    assert_eq!(parse_iso_ymd("bad"), None);
-
-    assert_eq!(days_in_month(2024, 2), 29);
-    assert_eq!(days_in_month(2023, 2), 28);
-    assert_eq!(days_in_month(1900, 2), 28);
-    assert_eq!(days_in_month(2000, 2), 29);
-    assert_eq!(days_in_month(2026, 4), 30);
-    assert_eq!(days_in_month(2026, 12), 31);
-
-    // 1970-01-01 was Thursday (4); 2000-01-01 was Saturday (6); 2024-02-29 was Thursday (4); 2026-11-25 is Wednesday (3).
-    assert_eq!(weekday_sunday0(1970, 1, 1), 4);
-    assert_eq!(weekday_sunday0(2000, 1, 1), 6);
-    assert_eq!(weekday_sunday0(2024, 2, 29), 4);
-    assert_eq!(weekday_sunday0(2026, 11, 25), 3);
-}
-
-#[test]
-fn datepicker_and_timepicker_handle_rollovers_leap_years_day_clamping_and_slots() {
-    // Reject impossible calendar dates (non-leap Feb 29, Feb 30, Apr 31, trailing segments)
-    assert_eq!(parse_iso_ymd("2025-02-29"), None);
-    assert_eq!(parse_iso_ymd("1900-02-29"), None);
-    assert_eq!(parse_iso_ymd("2000-02-29"), Some((2000, 2, 29)));
-    assert_eq!(parse_iso_ymd("2026-04-31"), None);
-    assert_eq!(parse_iso_ymd("2026-01-01-extra"), None);
-
-    // Month rollovers: Dec -> Jan and Jan -> Dec
-    assert_eq!(step_month(2025, 12, 1), (2026, 1));
-    assert_eq!(step_month(2026, 1, -1), (2025, 12));
-    assert_eq!(step_month(2024, 1, 1), (2024, 2));
-    assert_eq!(step_month(2024, 3, -1), (2024, 2));
-    assert_eq!(step_month(2024, 11, 14), (2026, 1));
-    assert_eq!(step_month(2024, 2, -14), (2022, 12));
-
-    // Clamping day 31 when moving to Feb (leap vs non-leap) and Apr
-    assert_eq!(shift_date_by_months(2024, 1, 31, 1), (2024, 2, 29));
-    assert_eq!(shift_date_by_months(2025, 1, 31, 1), (2025, 2, 28));
-    assert_eq!(shift_date_by_months(2025, 3, 31, 1), (2025, 4, 30));
-    assert_eq!(shift_date_by_months(2024, 5, 31, -1), (2024, 4, 30));
-    assert_eq!(shift_date_by_months(2025, 12, 31, 1), (2026, 1, 31));
-    assert_eq!(shift_date_by_months(2026, 1, 31, -1), (2025, 12, 31));
-
+fn timepicker_slots_cover_the_day_in_15_minute_steps() {
     // Timepicker 15-minute slots cover full 24-hour day (96 slots: 00:00..23:45)
     let slots = timepicker_slots();
     assert_eq!(slots.len(), 96);

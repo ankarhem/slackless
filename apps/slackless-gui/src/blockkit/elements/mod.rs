@@ -13,10 +13,6 @@ pub(super) use inputs::{
 };
 pub(super) use pickers::{PickerSpec, datepicker, datetimepicker, picker, timepicker_slots};
 #[cfg(test)]
-pub(super) use pickers::{
-    days_in_month, parse_iso_ymd, shift_date_by_months, step_month, weekday_sunday0,
-};
-#[cfg(test)]
 pub(super) use selects::rich_options;
 pub(super) use selects::{checkboxes, external_select, filtered_conversations, radios, select};
 
