@@ -1586,3 +1586,39 @@ fn backfill_stuck_cursor_guard_status_spacing_and_huddle_helpers() {
     assert_eq!(format_ms_utc(0), "1970-01-01 00:00:00");
     assert_eq!(format_ms_utc(1_709_208_000_000), "2024-02-29 12:00:00");
 }
+
+#[test]
+fn format_archive_backfill_output_aggregates_channels_and_threads() {
+    let ws = TeamId::from("T1");
+    let channels = vec![
+        ArchiveBackfillChannelSummary {
+            channel: "C1".into(),
+            label: "#general".into(),
+            pages: 2,
+            messages: 50,
+            threads: 3,
+            replies: 11,
+            reached_end: true,
+        },
+        ArchiveBackfillChannelSummary {
+            channel: "C2".into(),
+            label: "#ops".into(),
+            pages: 1,
+            messages: 10,
+            threads: 0,
+            replies: 0,
+            reached_end: false,
+        },
+    ];
+    let (json, human) = format_archive_backfill_output(&ws, true, &channels);
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["channels_count"], 2);
+    assert_eq!(json["completed_channels"], 1);
+    assert_eq!(json["messages"], 60);
+    assert_eq!(json["threads"], 3);
+    assert_eq!(json["replies"], 11);
+    assert!(human.contains(
+        "backfilled #general: 50 messages across 2 page(s), 11 replies across 3 thread(s)"
+    ));
+    assert!(human.contains("total (T1): 1/2 channels complete, 60 messages, 11 thread replies"));
+}

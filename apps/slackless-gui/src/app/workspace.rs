@@ -187,6 +187,19 @@ pub(super) fn subscribe_workspace(
                     this.select(channel.clone(), cx);
                     this.messages.update(cx, |list, cx| list.reveal(ts, cx));
                 }
+                SearchEvent::OpenInWorkspace {
+                    workspace,
+                    channel,
+                    ts,
+                } => {
+                    this.open_message_in_workspace(
+                        workspace,
+                        channel.clone(),
+                        ts.clone(),
+                        window,
+                        cx,
+                    );
+                }
                 SearchEvent::OpenChannel(channel) => {
                     this.select(channel.clone(), cx);
                 }
@@ -207,6 +220,37 @@ pub(super) fn subscribe_workspace(
                         window,
                         cx,
                     );
+                }
+                SearchEvent::OpenTranscriptInWorkspace {
+                    workspace,
+                    call_id,
+                    channel,
+                    highlight_segment_id,
+                    highlight_query,
+                } => {
+                    if let Some(idx) = this.workspace_index_for(workspace) {
+                        if idx != this.workspace {
+                            this.switch_workspace(idx, window, cx);
+                        }
+                        this.open_huddle_transcript(
+                            call_id.clone(),
+                            channel.clone(),
+                            *highlight_segment_id,
+                            highlight_query.clone(),
+                            window,
+                            cx,
+                        );
+                    } else {
+                        notify(
+                            "Workspace not loaded",
+                            format!(
+                                "Sign in to workspace {} to open its huddle transcript.",
+                                workspace
+                            ),
+                            window,
+                            cx,
+                        );
+                    }
                 }
                 SearchEvent::RemoteMessages { query, sort, page } => {
                     this.bridge.send(CollabCommand::SearchRemoteMessages {
@@ -346,6 +390,19 @@ pub(super) fn subscribe_workspace(
                 }
                 ThreadPanelEvent::AddToList { channel, ts } => {
                     this.open_add_to_list_dialog(channel.clone(), ts.clone(), window, cx)
+                }
+                ThreadPanelEvent::Export {
+                    channel,
+                    thread_ts,
+                    markdown,
+                } => {
+                    this.export_thread_transcript(
+                        channel.clone(),
+                        thread_ts.clone(),
+                        *markdown,
+                        window,
+                        cx,
+                    );
                 }
                 ThreadPanelEvent::SendToChannel {
                     channel,

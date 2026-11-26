@@ -8,11 +8,12 @@ use gpui_kit::gpui::{
     AnyElement, Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
     Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
+use slackless_core::search::{SearchHitKind, UnifiedSearchHit};
 use slackless_core::store::SearchSort;
 use slackless_core::types::{ChannelId, Conversation, File, Message, Ts, User};
 
 use super::query::transcript_match_excerpt;
-use super::state::{SearchEvent, SearchSource, SearchTab, SearchView};
+use super::state::{SearchEvent, SearchScope, SearchSource, SearchTab, SearchView};
 use crate::messages::{list_stamp, message_row};
 
 impl SearchView {
@@ -27,11 +28,18 @@ impl SearchView {
             theme.secondary,
         );
         let summary = match (self.tab, self.source) {
-            (SearchTab::Messages, SearchSource::Local) => match self.local_results.len() {
-                0 => "Local · instant".to_owned(),
-                1 => "1 local hit".to_owned(),
-                n => format!("{n} local hits"),
-            },
+            (SearchTab::Messages, SearchSource::Local) => {
+                let scope_note = if self.scope == SearchScope::AllWorkspaces {
+                    " · all workspaces"
+                } else {
+                    ""
+                };
+                match self.local_results.len() {
+                    0 => format!("Local · instant{scope_note}"),
+                    1 => format!("1 local hit{scope_note}"),
+                    n => format!("{n} local hits{scope_note}"),
+                }
+            }
             (SearchTab::Messages, SearchSource::Remote) => {
                 if self.remote_messages_loading && self.remote_messages.is_empty() {
                     "Searching Slack…".to_owned()
@@ -41,11 +49,18 @@ impl SearchView {
                     format!("{} on Slack", self.remote_messages.len())
                 }
             }
-            (SearchTab::Transcripts, _) => match self.transcript_results.len() {
-                0 => "Huddle transcripts · instant".to_owned(),
-                1 => "1 transcript hit".to_owned(),
-                n => format!("{n} transcript hits"),
-            },
+            (SearchTab::Transcripts, _) => {
+                let scope_note = if self.scope == SearchScope::AllWorkspaces {
+                    " · all workspaces"
+                } else {
+                    ""
+                };
+                match self.transcript_results.len() {
+                    0 => format!("Huddle transcripts · instant{scope_note}"),
+                    1 => format!("1 transcript hit{scope_note}"),
+                    n => format!("{n} transcript hits{scope_note}"),
+                }
+            }
             (SearchTab::Files, _) => {
                 if self.remote_files_loading && self.remote_files.is_empty() {
                     "Searching Slack files…".to_owned()
@@ -212,6 +227,45 @@ impl SearchView {
                             ),
                     )
                     .child(div().flex_1())
+                    .when(
+                        (self.tab == SearchTab::Messages && self.source == SearchSource::Local)
+                            || self.tab == SearchTab::Transcripts,
+                        |bar| {
+                            bar.child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .p(px(2.))
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(border)
+                                    .child(
+                                        pill(
+                                            "search-scope-current",
+                                            "This workspace",
+                                            self.scope == SearchScope::CurrentWorkspace,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.set_scope(SearchScope::CurrentWorkspace, cx);
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        pill(
+                                            "search-scope-all",
+                                            "All workspaces",
+                                            self.scope == SearchScope::AllWorkspaces,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.set_scope(SearchScope::AllWorkspaces, cx);
+                                            }),
+                                        ),
+                                    ),
+                            )
+                        },
+                    )
                     .when(
                         self.tab == SearchTab::Messages && !self.fixtures.sample,
                         |bar| {
@@ -592,6 +646,212 @@ impl SearchView {
             })
     }
 
+    fn local_message_hit_row(
+        &self,
+        ix: usize,
+        hit: &UnifiedSearchHit,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let (muted, border, hover, fg, link_color, pill_bg) = (
+            theme.muted_foreground,
+            theme.border,
+            theme.accent,
+            theme.foreground,
+            theme.link,
+            theme.secondary.opacity(0.65),
+        );
+        let is_foreign = hit.workspace != self.workspace;
+        let show_ws_badge = self.scope == SearchScope::AllWorkspaces || is_foreign;
+        let ws_label = hit
+            .workspace_name
+            .clone()
+            .unwrap_or_else(|| hit.workspace.to_string());
+        let ch_label = if !is_foreign {
+            self.fixtures
+                .conversation(&hit.channel)
+                .map(|c| self.fixtures.conversation_label(c))
+                .or_else(|| hit.channel_name.clone())
+                .unwrap_or_else(|| hit.channel.to_string())
+        } else {
+            hit.channel_name
+                .clone()
+                .unwrap_or_else(|| hit.channel.to_string())
+        };
+        let kind_badge = (hit.kind != SearchHitKind::Message).then(|| hit.kind.label());
+
+        let open_workspace = hit.workspace.clone();
+        let open_channel = hit.channel.clone();
+        let ts = hit.message.ts.clone();
+
+        let body_el: AnyElement = if !is_foreign {
+            message_row(&self.fixtures, &hit.message, None, cx).into_any_element()
+        } else {
+            let author = hit
+                .user_name
+                .clone()
+                .or_else(|| hit.message.user.as_ref().map(|u| u.to_string()))
+                .or_else(|| hit.message.bot_id.as_ref().map(|b| b.to_string()))
+                .unwrap_or_else(|| "Unknown".to_owned());
+            let plain = slackless_core::domain::mrkdwn::mrkdwn_to_plain(&hit.message.text);
+            let files: Vec<String> = hit
+                .message
+                .files
+                .iter()
+                .filter_map(|f| f.name.clone().or_else(|| f.title.clone()))
+                .collect();
+            v_flex()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg)
+                        .child(author),
+                )
+                .when(!plain.trim().is_empty(), |col| {
+                    col.child(
+                        div()
+                            .text_sm()
+                            .line_height(px(20.))
+                            .text_color(fg)
+                            .child(plain),
+                    )
+                })
+                .when(!files.is_empty(), |col| {
+                    col.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(format!("Files: {}", files.join(", "))),
+                    )
+                })
+                .into_any_element()
+        };
+
+        let transcript_match = hit
+            .transcript_excerpt
+            .as_ref()
+            .map(|excerpt| {
+                let name = hit
+                    .transcript_file_id
+                    .as_ref()
+                    .and_then(|fid| {
+                        hit.message
+                            .files
+                            .iter()
+                            .find(|f| f.id == *fid)
+                            .and_then(|f| f.name.as_deref().or(f.title.as_deref()))
+                    })
+                    .or_else(|| hit.transcript_file_id.as_ref().map(|fid| fid.as_str()))
+                    .unwrap_or("clip")
+                    .to_owned();
+                (name, excerpt.clone())
+            })
+            .or_else(|| {
+                hit.message.files.iter().find_map(|file| {
+                    let transcript = self
+                        .fixtures
+                        .file_transcript(&file.id)
+                        .map(str::to_owned)
+                        .or_else(|| slackless_core::domain::webvtt::inline_clip_transcript(file))?;
+                    let excerpt = transcript_match_excerpt(&transcript, &self.query)?;
+                    let filename = file
+                        .name
+                        .as_deref()
+                        .or(file.title.as_deref())
+                        .unwrap_or(file.id.as_str())
+                        .to_owned();
+                    Some((filename, excerpt))
+                })
+            });
+
+        v_flex()
+            .id(("search-hit", ix))
+            .gap_1()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(border)
+            .cursor_pointer()
+            .hover(|el| el.bg(hover))
+            .child(
+                h_flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .when(show_ws_badge, |row| {
+                        row.child(
+                            div()
+                                .px_1p5()
+                                .py(px(1.))
+                                .rounded(px(4.))
+                                .bg(link_color.opacity(0.14))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(link_color)
+                                .child(ws_label),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("{ch_label} · {}", list_stamp(&hit.message.ts))),
+                    )
+                    .when_some(kind_badge, |row, kind| {
+                        row.child(
+                            div()
+                                .px_1p5()
+                                .py(px(1.))
+                                .rounded(px(4.))
+                                .bg(pill_bg)
+                                .text_xs()
+                                .text_color(muted)
+                                .child(kind),
+                        )
+                    }),
+            )
+            .child(body_el)
+            .when_some(transcript_match, |col, (filename, excerpt)| {
+                col.child(
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .when(!is_foreign, |row| row.pl(px(44.)))
+                        .text_xs()
+                        .text_color(muted)
+                        .child(
+                            Icon::new(IconName::Captions)
+                                .size(px(12.))
+                                .text_color(muted)
+                                .flex_none(),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .child(format!("Transcript ({filename}): {excerpt}")),
+                        ),
+                )
+            })
+            .on_click(cx.listener(move |_, _, _, cx| {
+                if is_foreign {
+                    cx.emit(SearchEvent::OpenInWorkspace {
+                        workspace: open_workspace.clone(),
+                        channel: open_channel.clone(),
+                        ts: ts.clone(),
+                    });
+                } else {
+                    cx.emit(SearchEvent::Open {
+                        channel: open_channel.clone(),
+                        ts: ts.clone(),
+                    });
+                }
+            }))
+    }
+
     fn render_local_messages(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.local_results.is_empty() {
             return self.empty_state(cx).into_any_element();
@@ -602,7 +862,7 @@ impl SearchView {
             .local_results
             .iter()
             .enumerate()
-            .map(|(ix, hit)| self.message_hit_row(ix, &hit.channel, None, &hit.message, cx))
+            .map(|(ix, hit)| self.local_message_hit_row(ix, hit, cx))
             .collect();
         let query_for_cta = self.query.clone();
         v_flex()
@@ -707,20 +967,40 @@ impl SearchView {
             .transcript_results
             .iter()
             .enumerate()
-            .map(|(ix, seg)| {
-                let ch_label = self
-                    .fixtures
-                    .conversation(&seg.channel)
-                    .map(|c| self.fixtures.conversation_label(c))
-                    .unwrap_or_else(|| seg.channel.to_string());
-                let speaker = seg
-                    .speaker_id
-                    .as_ref()
-                    .map(|u| self.fixtures.user_name(u).to_owned())
-                    .unwrap_or_else(|| "Speaker".to_owned());
-                let avatar = match &seg.speaker_id {
-                    Some(uid) => crate::avatars::user_chip(&self.fixtures, uid, 28.),
-                    None => div()
+            .map(|(ix, hit)| {
+                let seg = &hit.segment;
+                let is_foreign = hit.workspace != self.workspace;
+                let show_ws_badge = self.scope == SearchScope::AllWorkspaces || is_foreign;
+                let ws_label = hit
+                    .workspace_name
+                    .clone()
+                    .unwrap_or_else(|| hit.workspace.to_string());
+                let ch_label = if !is_foreign {
+                    self.fixtures
+                        .conversation(&seg.channel)
+                        .map(|c| self.fixtures.conversation_label(c))
+                        .or_else(|| hit.channel_name.clone())
+                        .unwrap_or_else(|| seg.channel.to_string())
+                } else {
+                    hit.channel_name
+                        .clone()
+                        .unwrap_or_else(|| seg.channel.to_string())
+                };
+                let speaker = if !is_foreign {
+                    seg.speaker_id
+                        .as_ref()
+                        .map(|u| self.fixtures.user_name(u).to_owned())
+                        .or_else(|| hit.speaker_name.clone())
+                        .unwrap_or_else(|| "Speaker".to_owned())
+                } else {
+                    hit.speaker_name
+                        .clone()
+                        .or_else(|| seg.speaker_id.as_ref().map(|u| u.to_string()))
+                        .unwrap_or_else(|| "Speaker".to_owned())
+                };
+                let avatar = match (&seg.speaker_id, is_foreign) {
+                    (Some(uid), false) => crate::avatars::user_chip(&self.fixtures, uid, 28.),
+                    _ => div()
                         .size(px(28.))
                         .rounded_md()
                         .bg(pill_bg)
@@ -736,6 +1016,7 @@ impl SearchView {
                 let ts = Ts::from(format!("{}.000000", seg.at_ms.div_euclid(1_000)));
                 let stamp = list_stamp(&ts);
                 let lang_badge = seg.lang.as_deref().map(|l| l.to_ascii_uppercase());
+                let workspace_id = hit.workspace.clone();
                 let call_id = seg.call_id.clone();
                 let channel = seg.channel.clone();
                 let seg_id = seg.id;
@@ -763,6 +1044,19 @@ impl SearchView {
                                     .items_center()
                                     .flex_wrap()
                                     .gap_1p5()
+                                    .when(show_ws_badge, |row| {
+                                        row.child(
+                                            div()
+                                                .px_1p5()
+                                                .py(px(1.))
+                                                .rounded(px(4.))
+                                                .bg(link_color.opacity(0.14))
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(link_color)
+                                                .child(ws_label),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .text_xs()
@@ -801,12 +1095,22 @@ impl SearchView {
                             ),
                     )
                     .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(SearchEvent::OpenTranscript {
-                            call_id: call_id.clone(),
-                            channel: channel.clone(),
-                            highlight_segment_id: Some(seg_id),
-                            highlight_query: hl_query.clone(),
-                        });
+                        if is_foreign {
+                            cx.emit(SearchEvent::OpenTranscriptInWorkspace {
+                                workspace: workspace_id.clone(),
+                                call_id: call_id.clone(),
+                                channel: channel.clone(),
+                                highlight_segment_id: Some(seg_id),
+                                highlight_query: hl_query.clone(),
+                            });
+                        } else {
+                            cx.emit(SearchEvent::OpenTranscript {
+                                call_id: call_id.clone(),
+                                channel: channel.clone(),
+                                highlight_segment_id: Some(seg_id),
+                                highlight_query: hl_query.clone(),
+                            });
+                        }
                     }))
             })
             .collect();

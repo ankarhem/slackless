@@ -284,7 +284,7 @@ use crate::new_message::{NewMessageEvent, NewMessageView};
 use crate::pins;
 use crate::preferences::{self, AppearanceMode, Preferences, PreferencesEvent, Section};
 use crate::profile::{ProfileEvent, ProfilePanel};
-use crate::search::{SearchEvent, SearchView, fixture_archive};
+use crate::search::{SearchEvent, SearchView, SearchWorkspaceSource, fixture_archive};
 use crate::search_menu::{SEARCH_PLACEHOLDER, SearchMenu, SearchMenuEvent, Snapshot};
 use crate::shortcuts::shortcuts_view;
 use crate::sidebar::{NavItem, Sidebar, SidebarEvent, WorkspaceBadge};
@@ -505,6 +505,8 @@ pub(super) struct WorkspaceState {
     pub(super) app_homes: HashMap<ChannelId, Result<slackless_core::api::AppHomeResponse, String>>,
     /// Deduplicates `subscriptions.thread.mark` calls: last cursor sent per `(channel, thread_ts)`.
     pub(super) marked_threads: HashMap<(ChannelId, Ts), Ts>,
+    /// Live archive backfill progress snapshot for this workspace (`Event::BackfillProgress`).
+    pub(super) backfill_progress: Option<slackless_core::WorkspaceBackfillProgress>,
 }
 
 /// A workspace that is not shown: its fixtures, open conversation, views, subscriptions,

@@ -787,28 +787,34 @@ impl App {
             _ => "Slack AWS",
         });
 
-        let markdown_export = {
-            let mut md = format!("# Huddle Transcript \u{2014} {ch_label} (`{call_id}`)\n\n");
-            for seg in &segments {
-                let speaker = seg
-                    .speaker_id
-                    .as_ref()
-                    .map(|u| fixtures.user_name(u).to_owned())
-                    .unwrap_or_else(|| "Speaker".to_owned());
-                let ts = Ts::from(format!("{}.000000", seg.at_ms.div_euclid(1_000)));
-                let clock = crate::messages::list_stamp(&ts);
-                let lang_tag = seg
-                    .lang
-                    .as_deref()
-                    .map(|l| format!(" `[{l}]`"))
-                    .unwrap_or_default();
-                md.push_str(&format!(
-                    "- **{speaker}** ({clock}){lang_tag}: {}\n",
-                    seg.text
-                ));
+        let export_doc = {
+            let ws = self
+                .bridge
+                .team_id()
+                .cloned()
+                .or_else(|| self.fixtures.workspaces.first().map(|t| t.id.clone()))
+                .unwrap_or_default();
+            let ws_name = self
+                .fixtures
+                .workspaces
+                .iter()
+                .find(|t| t.id == ws)
+                .map(|t| t.name.clone())
+                .filter(|n| !n.trim().is_empty());
+            let mut users = HashMap::new();
+            for u in &self.fixtures.users {
+                users.insert(u.id.clone(), self.fixtures.name_of(u).to_owned());
             }
-            md
+            slackless_core::export::build_huddle_transcript_doc(
+                &ws, ws_name, &call_id, &channel, &ch_label, &segments, &users,
+            )
         };
+        let markdown_export =
+            slackless_core::export::render_huddle_transcript_markdown(&export_doc);
+        let json_export =
+            slackless_core::export::render_huddle_transcript_json(&export_doc).unwrap_or_default();
+        let suggested_stem =
+            slackless_core::export::sanitize_export_filename(&call_id, "huddle-transcript");
 
         // Parse search query terms (excluding filter tokens like `in:#ch` / `from:@user`) so we
         // can highlight matched words inside the transcript with Swedish åäö diacritic folding.
@@ -840,6 +846,7 @@ impl App {
         let jump_channel = channel.clone();
         let this = cx.weak_entity();
         let speaker_count = unique_speakers.len();
+        let save_dir = self.default_export_dir(cx);
         window.open_dialog(cx, move |dialog, _, cx| {
             let theme = cx.theme();
             let (border, muted, fg, accent, warn, card_bg, pill_bg, font_family) = (
@@ -853,6 +860,13 @@ impl App {
                 theme.font_family.clone(),
             );
             let copy_md = markdown_export.clone();
+            let save_md = markdown_export.clone();
+            let save_json = json_export.clone();
+            let stem_md = suggested_stem.clone();
+            let stem_json = suggested_stem.clone();
+            let dir_md = save_dir.clone();
+            let dir_json = save_dir.clone();
+            let seg_count = segments.len();
             let del_store = store_for_del.clone();
             let del_team = team_for_del.clone();
             let del_id = del_call_id.clone();
@@ -975,7 +989,7 @@ impl App {
                                 Button::new("transcript-copy-md")
                                     .outline()
                                     .icon(IconName::Copy)
-                                    .label("Copy Markdown")
+                                    .label("Copy MD")
                                     .disabled(segments.is_empty()),
                                 cx,
                             )
@@ -987,6 +1001,90 @@ impl App {
                                     window,
                                     cx,
                                 );
+                            }),
+                        )
+                        .child(
+                            preferences::form_button(
+                                Button::new("transcript-export-md")
+                                    .outline()
+                                    .icon(IconName::Download)
+                                    .label("Save MD\u{2026}")
+                                    .disabled(segments.is_empty()),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                let suggested = format!("{stem_md}.md");
+                                let content = save_md.clone();
+                                let rx = cx.prompt_for_new_path(&dir_md, Some(&suggested));
+                                window
+                                    .spawn(cx, async move |cx| {
+                                        let Ok(Ok(Some(path))) = rx.await else {
+                                            return;
+                                        };
+                                        let res = cx
+                                            .background_executor()
+                                            .spawn(async move {
+                                                std::fs::write(&path, content).map(|()| path)
+                                            })
+                                            .await;
+                                        let _ = cx.update(|window, cx| match res {
+                                            Ok(path) => notify(
+                                                "Transcript exported",
+                                                format!(
+                                                    "Saved {seg_count} lines to {}",
+                                                    path.display()
+                                                ),
+                                                window,
+                                                cx,
+                                            ),
+                                            Err(err) => {
+                                                notify("Export failed", err.to_string(), window, cx)
+                                            }
+                                        });
+                                    })
+                                    .detach();
+                            }),
+                        )
+                        .child(
+                            preferences::form_button(
+                                Button::new("transcript-export-json")
+                                    .outline()
+                                    .icon(IconName::FileCode)
+                                    .label("Save JSON\u{2026}")
+                                    .disabled(segments.is_empty()),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                let suggested = format!("{stem_json}.json");
+                                let content = save_json.clone();
+                                let rx = cx.prompt_for_new_path(&dir_json, Some(&suggested));
+                                window
+                                    .spawn(cx, async move |cx| {
+                                        let Ok(Ok(Some(path))) = rx.await else {
+                                            return;
+                                        };
+                                        let res = cx
+                                            .background_executor()
+                                            .spawn(async move {
+                                                std::fs::write(&path, content).map(|()| path)
+                                            })
+                                            .await;
+                                        let _ = cx.update(|window, cx| match res {
+                                            Ok(path) => notify(
+                                                "Transcript exported",
+                                                format!(
+                                                    "Saved {seg_count} lines to {}",
+                                                    path.display()
+                                                ),
+                                                window,
+                                                cx,
+                                            ),
+                                            Err(err) => {
+                                                notify("Export failed", err.to_string(), window, cx)
+                                            }
+                                        });
+                                    })
+                                    .detach();
                             }),
                         )
                         .when(!segments.is_empty(), |row| {
@@ -1199,6 +1297,491 @@ impl App {
         });
     }
 
+    /// Default folder for save/export dialogs (configured download folder, else `~/Downloads`).
+    pub(in crate::app) fn default_export_dir(&self, cx: &gpui::App) -> std::path::PathBuf {
+        let custom = self.preferences.read(cx).settings().download_dir.clone();
+        if !custom.is_empty() {
+            std::path::PathBuf::from(custom)
+        } else {
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join("Downloads"))
+                .unwrap_or_else(std::env::temp_dir)
+        }
+    }
+
+    /// Start an explicit background backfill (history + thread replies) for one channel.
+    pub(in crate::app) fn start_channel_backfill(
+        &mut self,
+        channel: ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let label = self.label(&channel);
+        if self.fixtures.sample || self.bridge.store().is_none() {
+            notify(
+                "Live workspace required",
+                format!("Sign in to backfill full Slack history for {label}."),
+                window,
+                cx,
+            );
+            return;
+        }
+        self.bridge.send(WorkspaceCommand::BackfillChannel {
+            channel,
+            include_threads: true,
+        });
+        notify(
+            "Backfill started",
+            format!("Syncing history and threads for {label} into local SQLite."),
+            window,
+            cx,
+        );
+    }
+
+    /// Start background archive backfill across all member channels in the active workspace.
+    pub(in crate::app) fn start_workspace_backfill(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.fixtures.sample || self.bridge.store().is_none() {
+            notify(
+                "Live workspace required",
+                "Sign in to backfill workspace history into local SQLite.",
+                window,
+                cx,
+            );
+            return;
+        }
+        self.bridge.send(WorkspaceCommand::BackfillWorkspace {
+            include_threads: true,
+        });
+        notify(
+            "Workspace backfill started",
+            "Walking channel history and threads in the background.",
+            window,
+            cx,
+        );
+    }
+
+    /// Pause any running background archive backfill cleanly between pages.
+    pub(in crate::app) fn pause_backfill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fixtures.sample || self.bridge.store().is_none() {
+            return;
+        }
+        self.bridge.send(WorkspaceCommand::PauseBackfill);
+        notify(
+            "Backfill paused",
+            "Archive sync paused; click Resume to continue where it left off.",
+            window,
+            cx,
+        );
+    }
+
+    /// Resume a paused background archive backfill.
+    pub(in crate::app) fn resume_backfill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fixtures.sample || self.bridge.store().is_none() {
+            return;
+        }
+        self.bridge.send(WorkspaceCommand::ResumeBackfill);
+        notify(
+            "Backfill resumed",
+            "Continuing background archive sync into local SQLite.",
+            window,
+            cx,
+        );
+    }
+
+    /// Open the Archive & Storage modal dialog showing local SQLite metrics, live workspace &
+    /// per-channel backfill progress, Start / Pause / Resume controls, and maintenance actions.
+    pub(in crate::app) fn open_storage_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_storage_stats(cx);
+        if !self.fixtures.sample && self.bridge.store().is_some() {
+            self.bridge.send(WorkspaceCommand::QueryBackfillProgress);
+        }
+        let this = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            let (border, muted, fg, accent, success, danger, card_bg, pill_bg) = (
+                theme.border,
+                theme.muted_foreground,
+                theme.foreground,
+                theme.link,
+                theme.success,
+                theme.danger,
+                theme.secondary.opacity(0.32),
+                theme.secondary.opacity(0.65),
+            );
+            let snapshot = this.upgrade().map(|app| {
+                let a = app.read(cx);
+                let stats = a.preferences.read(cx).storage_stats_snapshot();
+                let progress = a.ws.backfill_progress.clone();
+                let active_channel = a.channel.clone();
+                let active_label = a.label(&active_channel);
+                let sample = a.fixtures.sample;
+                (stats, progress, active_channel, active_label, sample)
+            });
+            let (stats, progress, active_channel, active_label, sample) = match snapshot {
+                Some(s) => s,
+                None => {
+                    return dialog.title("Archive & Storage").w(px(620.)).child(div());
+                }
+            };
+
+            let status = progress
+                .as_ref()
+                .map(|p| p.status)
+                .unwrap_or(slackless_core::BackfillStatus::Idle);
+            let status_color = match status {
+                slackless_core::BackfillStatus::Running => accent,
+                slackless_core::BackfillStatus::Complete => success,
+                slackless_core::BackfillStatus::Error => danger,
+                slackless_core::BackfillStatus::Paused | slackless_core::BackfillStatus::Idle => {
+                    muted
+                }
+            };
+            let (completed, total, msgs, replies, pages) = progress
+                .as_ref()
+                .map(|p| {
+                    (
+                        p.completed_channels,
+                        p.total_channels,
+                        p.messages_stored,
+                        p.replies_stored,
+                        p.pages_fetched,
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0, 0));
+            let pct = if total > 0 {
+                ((completed as f32) / (total as f32)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+
+            let this_ws = this.clone();
+            let this_ch = this.clone();
+            let this_pause = this.clone();
+            let this_resume = this.clone();
+            let this_compact = this.clone();
+            let this_prune = this.clone();
+            let this_reset = this.clone();
+            let active_ch_for_btn = active_channel.clone();
+
+            let stats_card = v_flex()
+                .gap_1p5()
+                .p_3()
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(card_bg)
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg)
+                        .child("Local SQLite archive"),
+                )
+                .child(match stats {
+                    Some(st) => div().text_xs().text_color(muted).child(format!(
+                        "{} SQLite · {} media cache · {} messages ({} revisions) · {} conversations · {} users",
+                        slackless_core::types::time::format_bytes(st.db_bytes),
+                        slackless_core::types::time::format_bytes(st.media_cache_bytes),
+                        st.messages,
+                        st.revisions,
+                        st.conversations,
+                        st.users,
+                    )),
+                    None => div().text_xs().text_color(muted).child(
+                        "Connect a live workspace to inspect SQLite database metrics and backfill Slack history.",
+                    ),
+                });
+
+            let mut controls = h_flex().items_center().flex_wrap().gap_2();
+            match status {
+                slackless_core::BackfillStatus::Running => {
+                    controls = controls.child(
+                        preferences::form_button(
+                            Button::new("storage-bf-pause")
+                                .outline()
+                                .label("Pause backfill"),
+                            cx,
+                        )
+                        .on_click(move |_, window, cx| {
+                            let _ = this_pause.update(cx, |app, cx| app.pause_backfill(window, cx));
+                        }),
+                    );
+                }
+                slackless_core::BackfillStatus::Paused => {
+                    controls = controls.child(
+                        preferences::form_button(
+                            Button::new("storage-bf-resume")
+                                .primary()
+                                .label("Resume backfill"),
+                            cx,
+                        )
+                        .on_click(move |_, window, cx| {
+                            let _ =
+                                this_resume.update(cx, |app, cx| app.resume_backfill(window, cx));
+                        }),
+                    );
+                }
+                _ => {
+                    controls = controls.child(
+                        preferences::form_button(
+                            Button::new("storage-bf-workspace")
+                                .primary()
+                                .disabled(sample)
+                                .label("Backfill workspace history"),
+                            cx,
+                        )
+                        .on_click(move |_, window, cx| {
+                            let _ = this_ws
+                                .update(cx, |app, cx| app.start_workspace_backfill(window, cx));
+                        }),
+                    );
+                }
+            }
+            controls = controls.child(
+                preferences::form_button(
+                    Button::new("storage-bf-current")
+                        .outline()
+                        .disabled(sample)
+                        .label(format!("Backfill {active_label}")),
+                    cx,
+                )
+                .on_click(move |_, window, cx| {
+                    let _ = this_ch.update(cx, |app, cx| {
+                        app.start_channel_backfill(active_ch_for_btn.clone(), window, cx);
+                    });
+                }),
+            );
+
+            let backfill_card = v_flex()
+                .gap_2()
+                .p_3()
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(card_bg)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg)
+                                .child("Background history backfill"),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py(px(1.))
+                                .rounded(px(4.))
+                                .bg(status_color.opacity(0.16))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(status_color)
+                                .child(status.label()),
+                        ),
+                )
+                .child(
+                    div().text_xs().text_color(muted).child(format!(
+                        "{completed}/{total} channels complete · {msgs} messages · {replies} thread replies · {pages} pages"
+                    )),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(6.))
+                        .rounded_full()
+                        .bg(pill_bg)
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative(pct))
+                                .bg(if status == slackless_core::BackfillStatus::Complete {
+                                    success
+                                } else {
+                                    accent
+                                }),
+                        ),
+                )
+                .child(controls);
+
+            let channel_rows: Vec<_> = progress
+                .as_ref()
+                .map(|p| {
+                    p.channels
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, ch)| {
+                            let ch_id = ch.channel.clone();
+                            let ch_name = ch
+                                .channel_name
+                                .clone()
+                                .unwrap_or_else(|| ch.channel.to_string());
+                            let ch_status_color = match ch.status {
+                                slackless_core::BackfillStatus::Running => accent,
+                                slackless_core::BackfillStatus::Complete => success,
+                                slackless_core::BackfillStatus::Error => danger,
+                                _ => muted,
+                            };
+                            let detail = if let Some(err) = &ch.last_error {
+                                format!("Error: {err}")
+                            } else {
+                                format!(
+                                    "{} msgs · {} replies",
+                                    ch.messages_stored, ch.replies_stored
+                                )
+                            };
+                            let this_row = this.clone();
+                            h_flex()
+                                .id(("storage-bf-ch", ix))
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .px_2p5()
+                                .py_1p5()
+                                .border_b_1()
+                                .border_color(border.opacity(0.6))
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(fg)
+                                                .child(ch_name),
+                                        )
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .child(detail),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .flex_none()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(
+                                            div()
+                                                .px_1p5()
+                                                .py(px(1.))
+                                                .rounded(px(4.))
+                                                .bg(ch_status_color.opacity(0.14))
+                                                .text_xs()
+                                                .text_color(ch_status_color)
+                                                .child(ch.status.label()),
+                                        )
+                                        .child(
+                                            Button::new(("storage-bf-row-go", ix))
+                                                .ghost()
+                                                .with_size(Size::XSmall)
+                                                .icon(IconName::RotateCcw)
+                                                .tooltip("Backfill this channel")
+                                                .disabled(sample)
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = this_row.update(cx, |app, cx| {
+                                                        app.start_channel_backfill(
+                                                            ch_id.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    });
+                                                }),
+                                        ),
+                                )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            let maintenance = h_flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .pt_2()
+                .border_t_1()
+                .border_color(border)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            preferences::form_button(
+                                Button::new("storage-dlg-compact")
+                                    .outline()
+                                    .label("Compact SQLite"),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                let _ = this_compact
+                                    .update(cx, |app, cx| app.compact_storage(window, cx));
+                            }),
+                        )
+                        .child(
+                            preferences::form_button(
+                                Button::new("storage-dlg-prune")
+                                    .outline()
+                                    .label("Prune media cache"),
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                let _ = this_prune
+                                    .update(cx, |app, cx| app.prune_media_cache(window, cx));
+                            }),
+                        ),
+                )
+                .child(
+                    preferences::form_button(
+                        Button::new("storage-dlg-reset")
+                            .danger()
+                            .label("Clear local cache"),
+                        cx,
+                    )
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        let _ = this_reset
+                            .update(cx, |app, cx| app.confirm_reset_cache(window, cx));
+                    }),
+                );
+
+            dialog.title("Archive & Storage").w(px(620.)).child(
+                v_flex()
+                    .gap_3()
+                    .child(stats_card)
+                    .child(backfill_card)
+                    .when(!channel_rows.is_empty(), |col| {
+                        col.child(
+                            v_flex()
+                                .id("storage-bf-channel-list")
+                                .max_h(px(240.))
+                                .overflow_y_scroll()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(border)
+                                .children(channel_rows),
+                        )
+                    })
+                    .child(maintenance),
+            )
+        });
+    }
+
     /// Export the active conversation's locally archived messages as Markdown or pretty JSON
     /// using a native save dialog.
     pub(in crate::app) fn export_conversation_transcript(
@@ -1207,121 +1790,72 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let channel = self.channel.clone();
+        self.export_channel_transcript(self.channel.clone(), markdown, window, cx);
+    }
+
+    /// Export any channel's locally archived messages using `slackless_core::export` (with
+    /// fixture-mode fallback so sample workspaces export identically).
+    pub(in crate::app) fn export_channel_transcript(
+        &self,
+        channel: ChannelId,
+        markdown: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let label = self.label(&channel);
-        let safe_name: String = label
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        let safe_name = safe_name.trim_matches('-');
-        let stem = if safe_name.is_empty() {
-            channel.as_str()
+        let fmt = if markdown {
+            slackless_core::export::ExportFormat::Markdown
         } else {
-            safe_name
+            slackless_core::export::ExportFormat::Json
         };
-        let ext = if markdown { "md" } else { "json" };
-        let suggested = format!("{stem}-transcript.{ext}");
-        let start_dir = {
-            let custom = self.preferences.read(cx).settings().download_dir.clone();
-            if !custom.is_empty() {
-                std::path::PathBuf::from(custom)
-            } else {
-                std::env::var_os("HOME")
-                    .map(|h| std::path::PathBuf::from(h).join("Downloads"))
-                    .unwrap_or_else(std::env::temp_dir)
-            }
-        };
+        let stem = slackless_core::export::sanitize_export_filename(&label, channel.as_str());
+        let suggested = format!("{stem}-export.{}", fmt.extension());
+        let start_dir = self.default_export_dir(cx);
         let fixtures = self.fixtures.clone();
-        let store = self.bridge.store().cloned();
+        let store = self.bridge.read_store_clone();
         let team = self.bridge.team_id().cloned();
+        let include_deleted = self.preferences.read(cx).settings().show_deleted_messages;
         let rx = cx.prompt_for_new_path(&start_dir, Some(&suggested));
         cx.spawn_in(window, async move |_, cx| {
             let Ok(Ok(Some(path))) = rx.await else {
                 return;
             };
-            let result = cx
+            let result: std::io::Result<(usize, std::path::PathBuf)> = cx
                 .background_executor()
                 .spawn(async move {
-                    let messages: Vec<slackless_core::types::Message> =
-                        if let (Some(store), Some(team)) = (store, team) {
-                            store
-                                .lock()
-                                .ok()
-                                .and_then(|s| s.channel_history(&team, &channel, None, 10_000).ok())
-                                .map(|rows| rows.into_iter().map(|r| r.message).collect())
-                                .unwrap_or_default()
-                        } else {
-                            fixtures.messages.get(&channel).cloned().unwrap_or_default()
-                        };
-                    let count = messages.len();
-                    let body = if markdown {
-                        let mut md = format!("# {label}\n\n");
-                        for msg in &messages {
-                            let author = msg
-                                .user
-                                .as_ref()
-                                .map(|u| fixtures.user_name(u).to_owned())
-                                .or_else(|| msg.bot_profile.as_ref().map(|b| b.name.clone()))
-                                .unwrap_or_else(|| "unknown".to_owned());
-                            md.push_str(&format!("**{author}** (`{}`)\n\n", msg.ts));
-                            let text = fixtures.plain_text(msg);
-                            if !text.is_empty() {
-                                md.push_str(&text);
-                                md.push_str("\n\n");
-                            }
-                            if !msg.files.is_empty() {
-                                let names: Vec<&str> = msg
-                                    .files
-                                    .iter()
-                                    .filter_map(|f| f.name.as_deref().or(f.title.as_deref()))
-                                    .collect();
-                                if !names.is_empty() {
-                                    md.push_str(&format!("_Files:_ {}\n\n", names.join(", ")));
-                                }
-                            }
-                            md.push_str("---\n\n");
-                        }
-                        md
+                    let opts = slackless_core::export::ExportOptions {
+                        format: fmt,
+                        limit: 10_000,
+                        include_deleted,
+                        include_threads: true,
+                        include_transcripts: true,
+                    };
+                    let (count, body) = if let (Some(store), Some(team)) = (store, team) {
+                        let artifact = store
+                            .lock()
+                            .map_err(|_| std::io::Error::other("local store unavailable"))?
+                            .export_channel_via_core(&team, &channel, &opts)
+                            .map_err(std::io::Error::other)?;
+                        (artifact.item_count, artifact.content)
                     } else {
-                        let rows: Vec<_> = messages
-                            .iter()
-                            .map(|msg| {
-                                let author = msg
-                                    .user
-                                    .as_ref()
-                                    .map(|u| fixtures.user_name(u).to_owned())
-                                    .or_else(|| msg.bot_profile.as_ref().map(|b| b.name.clone()));
-                                crate::blockkit::serde_json::json!({
-                                    "ts": msg.ts.as_str(),
-                                    "user": msg.user.as_ref().map(|u| u.as_str()),
-                                    "author": author,
-                                    "text": fixtures.plain_text(msg),
-                                    "thread_ts": msg.thread_ts.as_ref().map(|t| t.as_str()),
-                                })
-                            })
-                            .collect();
-                        crate::blockkit::serde_json::to_string_pretty(
-                            &crate::blockkit::serde_json::json!({
-                                "channel": channel.as_str(),
-                                "label": label,
-                                "count": count,
-                                "messages": rows,
-                            }),
-                        )
-                        .unwrap_or_default()
+                        let doc = build_fixture_channel_export(&fixtures, &channel, &label);
+                        let content = match fmt {
+                            slackless_core::export::ExportFormat::Markdown => {
+                                slackless_core::export::render_messages_markdown(&doc)
+                            }
+                            slackless_core::export::ExportFormat::Json => {
+                                slackless_core::export::render_messages_json(&doc)
+                                    .map_err(std::io::Error::other)?
+                            }
+                        };
+                        (doc.count, content)
                     };
                     std::fs::write(&path, body).map(|()| (count, path))
                 })
                 .await;
             let _ = cx.update(|window, cx| match result {
                 Ok((count, path)) => notify(
-                    "Transcript exported",
+                    "Channel exported",
                     format!("Saved {count} messages to {}", path.display()),
                     window,
                     cx,
@@ -1330,6 +1864,234 @@ impl App {
             });
         })
         .detach();
+    }
+
+    /// Export a single thread (root + replies) as Markdown or JSON using `slackless_core::export`.
+    pub(in crate::app) fn export_thread_transcript(
+        &self,
+        channel: ChannelId,
+        thread_ts: Ts,
+        markdown: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let label = self.label(&channel);
+        let fmt = if markdown {
+            slackless_core::export::ExportFormat::Markdown
+        } else {
+            slackless_core::export::ExportFormat::Json
+        };
+        let stem = slackless_core::export::sanitize_export_filename(&label, channel.as_str());
+        let ts_slug =
+            slackless_core::export::sanitize_export_filename(thread_ts.as_str(), "thread");
+        let suggested = format!("{stem}-thread-{ts_slug}.{}", fmt.extension());
+        let start_dir = self.default_export_dir(cx);
+        let fixtures = self.fixtures.clone();
+        let store = self.bridge.read_store_clone();
+        let team = self.bridge.team_id().cloned();
+        let include_deleted = self.preferences.read(cx).settings().show_deleted_messages;
+        let rx = cx.prompt_for_new_path(&start_dir, Some(&suggested));
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(path))) = rx.await else {
+                return;
+            };
+            let result: std::io::Result<(usize, std::path::PathBuf)> = cx
+                .background_executor()
+                .spawn(async move {
+                    let opts = slackless_core::export::ExportOptions {
+                        format: fmt,
+                        limit: 10_000,
+                        include_deleted,
+                        include_threads: false,
+                        include_transcripts: true,
+                    };
+                    let (count, body) = if let (Some(store), Some(team)) = (store, team) {
+                        let guard = store
+                            .lock()
+                            .map_err(|_| std::io::Error::other("local store unavailable"))?;
+                        let artifact = slackless_core::export::export_thread(
+                            &guard, &team, &channel, &thread_ts, &opts,
+                        )
+                        .map_err(std::io::Error::other)?;
+                        (artifact.item_count, artifact.content)
+                    } else {
+                        let doc =
+                            build_fixture_thread_export(&fixtures, &channel, &label, &thread_ts);
+                        let content = match fmt {
+                            slackless_core::export::ExportFormat::Markdown => {
+                                slackless_core::export::render_messages_markdown(&doc)
+                            }
+                            slackless_core::export::ExportFormat::Json => {
+                                slackless_core::export::render_messages_json(&doc)
+                                    .map_err(std::io::Error::other)?
+                            }
+                        };
+                        (doc.count, content)
+                    };
+                    std::fs::write(&path, body).map(|()| (count, path))
+                })
+                .await;
+            let _ = cx.update(|window, cx| match result {
+                Ok((count, path)) => notify(
+                    "Thread exported",
+                    format!("Saved {count} messages to {}", path.display()),
+                    window,
+                    cx,
+                ),
+                Err(err) => notify("Export failed", err.to_string(), window, cx),
+            });
+        })
+        .detach();
+    }
+}
+
+trait StoreExportExt {
+    fn export_channel_via_core(
+        &self,
+        team: &slackless_core::types::TeamId,
+        channel: &ChannelId,
+        opts: &slackless_core::export::ExportOptions,
+    ) -> slackless_core::store::Result<slackless_core::export::ExportArtifact>;
+}
+
+impl StoreExportExt for slackless_core::store::Store {
+    fn export_channel_via_core(
+        &self,
+        team: &slackless_core::types::TeamId,
+        channel: &ChannelId,
+        opts: &slackless_core::export::ExportOptions,
+    ) -> slackless_core::store::Result<slackless_core::export::ExportArtifact> {
+        slackless_core::export::export_channel(self, team, channel, opts)
+    }
+}
+
+fn build_fixture_channel_export(
+    fixtures: &Fixtures,
+    channel: &ChannelId,
+    label: &str,
+) -> slackless_core::export::ExportedMessagesDoc {
+    let ws = fixtures
+        .workspaces
+        .first()
+        .map(|t| t.id.as_str().to_owned())
+        .unwrap_or_default();
+    let ws_name = fixtures
+        .workspaces
+        .first()
+        .map(|t| t.name.clone())
+        .filter(|n| !n.trim().is_empty());
+    let mut users = HashMap::new();
+    for u in &fixtures.users {
+        users.insert(u.id.clone(), fixtures.name_of(u).to_owned());
+    }
+    let transcripts = &fixtures.file_transcripts;
+    let messages: Vec<slackless_core::export::ExportedMessage> = fixtures
+        .messages
+        .get(channel)
+        .into_iter()
+        .flatten()
+        .map(|msg| {
+            let stored = slackless_core::store::StoredMessage {
+                channel: channel.clone(),
+                message: msg.clone(),
+                deleted: false,
+            };
+            let mut row =
+                slackless_core::export::build_exported_message(&stored, &users, transcripts, true);
+            if let Some(replies) = fixtures.threads.get(&(channel.clone(), msg.ts.clone())) {
+                for r in replies {
+                    if r.ts == msg.ts {
+                        continue;
+                    }
+                    let rs = slackless_core::store::StoredMessage {
+                        channel: channel.clone(),
+                        message: r.clone(),
+                        deleted: false,
+                    };
+                    row.replies
+                        .push(slackless_core::export::build_exported_message(
+                            &rs,
+                            &users,
+                            transcripts,
+                            true,
+                        ));
+                }
+            }
+            row
+        })
+        .collect();
+    slackless_core::export::ExportedMessagesDoc {
+        kind: "channel".to_owned(),
+        workspace: ws,
+        workspace_name: ws_name,
+        channel: slackless_core::export::ExportedChannelMeta {
+            id: channel.as_str().to_owned(),
+            label: label.to_owned(),
+        },
+        thread_ts: None,
+        count: messages.len(),
+        messages,
+    }
+}
+
+fn build_fixture_thread_export(
+    fixtures: &Fixtures,
+    channel: &ChannelId,
+    label: &str,
+    thread_ts: &Ts,
+) -> slackless_core::export::ExportedMessagesDoc {
+    let ws = fixtures
+        .workspaces
+        .first()
+        .map(|t| t.id.as_str().to_owned())
+        .unwrap_or_default();
+    let ws_name = fixtures
+        .workspaces
+        .first()
+        .map(|t| t.name.clone())
+        .filter(|n| !n.trim().is_empty());
+    let mut users = HashMap::new();
+    for u in &fixtures.users {
+        users.insert(u.id.clone(), fixtures.name_of(u).to_owned());
+    }
+    let transcripts = HashMap::new();
+    let mut raw: Vec<Message> = Vec::new();
+    if let Some(root) = fixtures
+        .messages
+        .get(channel)
+        .and_then(|list| list.iter().find(|m| m.ts == *thread_ts))
+    {
+        raw.push(root.clone());
+    }
+    if let Some(replies) = fixtures.threads.get(&(channel.clone(), thread_ts.clone())) {
+        for r in replies {
+            if !raw.iter().any(|m| m.ts == r.ts) {
+                raw.push(r.clone());
+            }
+        }
+    }
+    let messages: Vec<slackless_core::export::ExportedMessage> = raw
+        .into_iter()
+        .map(|msg| {
+            let stored = slackless_core::store::StoredMessage {
+                channel: channel.clone(),
+                message: msg,
+                deleted: false,
+            };
+            slackless_core::export::build_exported_message(&stored, &users, &transcripts, true)
+        })
+        .collect();
+    slackless_core::export::ExportedMessagesDoc {
+        kind: "thread".to_owned(),
+        workspace: ws,
+        workspace_name: ws_name,
+        channel: slackless_core::export::ExportedChannelMeta {
+            id: channel.as_str().to_owned(),
+            label: label.to_owned(),
+        },
+        thread_ts: Some(thread_ts.as_str().to_owned()),
+        count: messages.len(),
+        messages,
     }
 }
 

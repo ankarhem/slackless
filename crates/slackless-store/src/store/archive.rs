@@ -270,6 +270,49 @@ impl Store {
         Ok(u64::try_from(count.max(0)).unwrap_or(0))
     }
 
+    /// Distinct workspace IDs present anywhere in this database (`team`, `conversation`,
+    /// `message_current`, `file_transcript`, `huddle_transcript`), sorted.
+    pub fn list_workspaces(&self) -> Result<Vec<TeamId>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT workspace_id FROM team
+             UNION SELECT workspace_id FROM conversation
+             UNION SELECT workspace_id FROM message_current
+             UNION SELECT workspace_id FROM file_transcript
+             UNION SELECT workspace_id FROM huddle_transcript
+             ORDER BY workspace_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let id = row?;
+            if !id.is_empty() {
+                out.push(TeamId::from(id));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Per-channel stored message counts for `workspace` (including tombstones), in one query.
+    pub fn channel_message_counts(&self, workspace: &TeamId) -> Result<HashMap<ChannelId, u64>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT channel_id, COUNT(*) FROM message_current
+             WHERE workspace_id = ?1
+             GROUP BY channel_id",
+        )?;
+        let rows = stmt.query_map(params![workspace.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (ch, count) = row?;
+            out.insert(
+                ChannelId::from(ch),
+                u64::try_from(count.max(0)).unwrap_or(0),
+            );
+        }
+        Ok(out)
+    }
+
     /// Newest stored non-deleted message `ts` in `channel`, if any.
     pub fn latest_ts(&self, workspace: &TeamId, channel: &ChannelId) -> Result<Option<Ts>> {
         let mut stmt = self.conn.prepare_cached(

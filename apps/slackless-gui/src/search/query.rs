@@ -1,15 +1,20 @@
 //! Local FTS5 search execution, remote Slack query formatting, fixture archive seeding,
 //! and client-side channel / people / DM matching.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use gpui_kit::gpui::Context;
 use slackless_core::SharedStore;
 use slackless_core::api::SearchSort as ApiSearchSort;
+use slackless_core::search::{
+    WorkspaceSearchTarget, discover_local_archives, search_across_stores, search_disk_archives,
+    search_huddle_transcripts_across_stores,
+};
 use slackless_core::store::{SearchFilters, SearchQuery, SearchSort, Store};
 use slackless_core::types::{Conversation, ConversationKind, User};
 
-use super::state::{RESULT_LIMIT, SearchEvent, SearchSource, SearchTab, SearchView};
+use super::state::{RESULT_LIMIT, SearchEvent, SearchScope, SearchSource, SearchTab, SearchView};
 use crate::fixtures::Fixtures;
 
 impl SearchView {
@@ -88,33 +93,89 @@ impl SearchView {
         parsed.filters.threads_only |= self.filters.threads_only;
         parsed.filters.include_deleted |= self.filters.include_deleted || self.include_deleted;
         let workspace = self.workspace.clone();
+        let workspace_name = self
+            .fixtures
+            .workspaces
+            .iter()
+            .find(|t| t.id == workspace)
+            .map(|t| t.name.clone())
+            .filter(|n| !n.trim().is_empty());
+        let scope = self.scope;
+        let is_sample = self.fixtures.sample;
+        let targets: Vec<WorkspaceSearchTarget> = match scope {
+            SearchScope::CurrentWorkspace => vec![WorkspaceSearchTarget {
+                workspace: workspace.clone(),
+                workspace_name,
+                store: archive,
+            }],
+            SearchScope::AllWorkspaces => {
+                if self.workspace_sources.is_empty() {
+                    vec![WorkspaceSearchTarget {
+                        workspace: workspace.clone(),
+                        workspace_name,
+                        store: archive,
+                    }]
+                } else {
+                    self.workspace_sources
+                        .iter()
+                        .map(|src| WorkspaceSearchTarget {
+                            workspace: src.team_id.clone(),
+                            workspace_name: (!src.name.trim().is_empty()).then(|| src.name.clone()),
+                            store: src.store.clone(),
+                        })
+                        .collect()
+                }
+            }
+        };
         let sort = self.sort;
         let query = self.query.clone();
         cx.spawn(async move |this, cx| {
             let (found, transcripts) = cx
                 .background_executor()
                 .spawn(async move {
-                    match archive.lock() {
-                        Ok(store) => {
-                            let msgs = store
-                                .search_sorted(&workspace, &parsed, sort, RESULT_LIMIT)
-                                .map_err(|e| e.to_string());
-                            let trs = store
-                                .search_huddle_transcripts(
-                                    &workspace,
-                                    &query,
-                                    None,
-                                    None,
-                                    RESULT_LIMIT,
-                                )
-                                .unwrap_or_default();
-                            (msgs, trs)
+                    let mut msgs_res = search_across_stores(&targets, &parsed, sort, RESULT_LIMIT)
+                        .map(|r| r.hits)
+                        .map_err(|e| e.to_string());
+                    // In live cross-workspace search, also pick up any additional stored `.sqlite`
+                    // archives on disk that are not currently mounted as active/parked bridges.
+                    if scope == SearchScope::AllWorkspaces
+                        && !is_sample
+                        && let Ok(ref mut hits) = msgs_res
+                    {
+                        let mounted: HashSet<_> =
+                            targets.iter().map(|t| t.workspace.clone()).collect();
+                        let extra: Vec<_> = discover_local_archives()
+                            .into_iter()
+                            .filter(|(ws, _)| !mounted.contains(ws))
+                            .collect();
+                        if !extra.is_empty()
+                            && let Ok(disk_res) =
+                                search_disk_archives(&extra, &parsed, sort, RESULT_LIMIT)
+                        {
+                            hits.extend(disk_res.hits);
+                            match sort {
+                                SearchSort::Recent => {
+                                    hits.sort_by(|a, b| b.message.ts.cmp(&a.message.ts));
+                                }
+                                SearchSort::Relevant => {
+                                    hits.sort_by(|a, b| {
+                                        let ra = a.rank.unwrap_or(f64::INFINITY);
+                                        let rb = b.rank.unwrap_or(f64::INFINITY);
+                                        ra.total_cmp(&rb)
+                                            .then_with(|| b.message.ts.cmp(&a.message.ts))
+                                    });
+                                }
+                            }
+                            hits.truncate(RESULT_LIMIT);
                         }
-                        Err(_) => (
-                            Err("the local archive is unavailable".to_owned()),
-                            Vec::new(),
-                        ),
                     }
+                    let trs = search_huddle_transcripts_across_stores(
+                        &targets,
+                        &query,
+                        None,
+                        RESULT_LIMIT,
+                    );
+                    (msgs_res, trs)
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {

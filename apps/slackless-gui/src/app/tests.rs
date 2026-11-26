@@ -2157,3 +2157,86 @@ fn wave1_and_wave2_gui_secret_guard_link_scrubber_stealth_and_stt_provider(
     });
     drop(root);
 }
+
+#[gpui::test]
+fn cross_workspace_search_jump_storage_backfill_progress_and_export_engine(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui_kit::base::Root;
+    use slackless_core::{BackfillStatus, ChannelBackfillProgress, WorkspaceBackfillProgress};
+    use std::cell::RefCell;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let fx = Arc::new(fixtures::workspace(0));
+        let app = App::new(fx, CoreBridge::offline(), window, cx);
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            assert_eq!(app.workspace, 0);
+            assert!(
+                app.fixtures.workspaces.len() >= 2,
+                "fixture mode should provide at least two workspaces for cross-workspace jump test"
+            );
+
+            // 1. Cross-workspace search jump switches workspace and selects the target channel.
+            let target_ws_id = app.fixtures.workspaces[1].id.clone();
+            let ws1_fx = fixtures::workspace(1);
+            let target_ch = ws1_fx.channels[0].id.clone();
+            let target_ts = ws1_fx
+                .messages
+                .get(&target_ch)
+                .and_then(|msgs| msgs.first())
+                .map(|m| m.ts.clone())
+                .unwrap_or_else(|| Ts::from("1700000001.000000"));
+
+            app.open_message_in_workspace(&target_ws_id, target_ch.clone(), target_ts, window, cx);
+            assert_eq!(app.workspace, 1);
+            assert_eq!(app.channel, target_ch);
+
+            // 2. Event::BackfillProgress updates workspace state, preferences, and storage dialog opens cleanly.
+            let progress = WorkspaceBackfillProgress {
+                workspace: target_ws_id.clone(),
+                status: BackfillStatus::Running,
+                paused: false,
+                active_channel: Some(target_ch.clone()),
+                total_channels: 2,
+                completed_channels: 1,
+                pages_fetched: 3,
+                messages_stored: 120,
+                threads_fetched: 2,
+                replies_stored: 8,
+                channels: vec![ChannelBackfillProgress {
+                    channel: target_ch.clone(),
+                    channel_name: Some("#general".into()),
+                    status: BackfillStatus::Running,
+                    pages_fetched: 3,
+                    messages_stored: 120,
+                    threads_fetched: 2,
+                    replies_stored: 8,
+                    oldest_ts: None,
+                    newest_ts: None,
+                    complete: false,
+                    last_error: None,
+                }],
+            };
+            app.on_core_event(&Event::BackfillProgress(progress.clone()), window, cx);
+            assert_eq!(app.ws.backfill_progress.as_ref(), Some(&progress));
+
+            app.open_storage_dialog(window, cx);
+            window.close_dialog(cx);
+        });
+    });
+    drop(root);
+}

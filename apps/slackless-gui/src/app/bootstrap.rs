@@ -635,6 +635,12 @@ fn wire_feature_view_subscriptions(
                 }
                 PreferencesEvent::CheckForUpdates => this.check_for_updates(true, cx),
                 PreferencesEvent::InstallUpdate => this.install_available_update(cx),
+                PreferencesEvent::OpenStorageDialog => this.open_storage_dialog(window, cx),
+                PreferencesEvent::StartWorkspaceBackfill => {
+                    this.start_workspace_backfill(window, cx);
+                }
+                PreferencesEvent::PauseBackfill => this.pause_backfill(window, cx),
+                PreferencesEvent::ResumeBackfill => this.resume_backfill(window, cx),
             },
         ),
         cx.subscribe_in(

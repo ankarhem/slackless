@@ -13,4 +13,4 @@ mod state;
 mod tests;
 
 pub use query::fixture_archive;
-pub use state::{SearchEvent, SearchView};
+pub use state::{SearchEvent, SearchView, SearchWorkspaceSource};
