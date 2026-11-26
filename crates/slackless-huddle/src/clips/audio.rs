@@ -5,13 +5,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use sonora::config::{Config as SonoraConfig, GainController2, NoiseSuppression};
 use sonora::{AudioProcessing, StreamConfig as SonoraStreamConfig};
 
 use crate::audio::ring::SpscRing;
-use crate::audio::{FRAME_10MS, RateConverter, SAMPLE_RATE};
+use crate::audio::{FRAME_10MS, RateConverter, SAMPLE_RATE, build_input_stream_any_format};
 use crate::{HuddleError, Result};
 
 use super::{LIVE_BARS, MAX_AUDIO_SAMPLES, RecordedClip, timestamp_slug};
@@ -32,19 +31,12 @@ pub struct AudioClipRecorder {
 
 /// Push downmixed mono samples into `ring` using a fixed stack buffer (zero heap allocations
 /// and zero locks in the real-time `cpal` callback).
-fn push_downmixed_rt<T: Copy>(
-    data: &[T],
-    channels: usize,
-    ring: &SpscRing<f32>,
-    to_f32: impl Fn(T) -> f32,
-) {
-    let ch = channels.max(1);
-    let div = ch as f32;
+fn push_downmixed_rt(data: &[f32], channels: usize, ring: &SpscRing<f32>) {
+    let div = channels as f32;
     let mut stack = [0.0f32; 512];
     let mut n = 0usize;
-    for frame in data.chunks(ch) {
-        let sum: f32 = frame.iter().map(|&s| to_f32(s)).sum();
-        stack[n] = sum / div;
+    for frame in data.chunks(channels) {
+        stack[n] = frame.iter().sum::<f32>() / div;
         n += 1;
         if n == stack.len() {
             let _ = ring.push_slice(&stack);
@@ -66,10 +58,8 @@ impl AudioClipRecorder {
         let supported = device
             .default_input_config()
             .map_err(|e| HuddleError::Audio(e.to_string()))?;
-        let sample_format = supported.sample_format();
         let in_rate = supported.sample_rate();
-        let in_channels = supported.channels() as usize;
-        let config: cpal::StreamConfig = supported.into();
+        let in_channels = usize::from(supported.channels()).max(1);
         // 10 ms blocks, as in calls: the filter edge sits far above speech either way, and a
         // stopped recording loses at most one block plus the 5 ms converter delay.
         let mut converter = (in_rate != SAMPLE_RATE)
@@ -86,47 +76,9 @@ impl AudioClipRecorder {
         let ring = Arc::new(SpscRing::<f32>::new(65_536));
 
         let ring_cb = Arc::clone(&ring);
-        let err_fn = |err| {
-            tracing::warn!(%err, "audio clip stream error");
-        };
-
-        let stream = match sample_format {
-            SampleFormat::F32 => device
-                .build_input_stream(
-                    config,
-                    move |data: &[f32], _| push_downmixed_rt(data, in_channels, &ring_cb, |s| s),
-                    err_fn,
-                    None,
-                )
-                .map_err(|e| HuddleError::Audio(e.to_string()))?,
-            SampleFormat::I16 => device
-                .build_input_stream(
-                    config,
-                    move |data: &[i16], _| {
-                        push_downmixed_rt(data, in_channels, &ring_cb, |s| s as f32 / 32768.0)
-                    },
-                    err_fn,
-                    None,
-                )
-                .map_err(|e| HuddleError::Audio(e.to_string()))?,
-            SampleFormat::U16 => device
-                .build_input_stream(
-                    config,
-                    move |data: &[u16], _| {
-                        push_downmixed_rt(data, in_channels, &ring_cb, |s| {
-                            (s as f32 - 32768.0) / 32768.0
-                        })
-                    },
-                    err_fn,
-                    None,
-                )
-                .map_err(|e| HuddleError::Audio(e.to_string()))?,
-            other => {
-                return Err(HuddleError::Audio(format!(
-                    "unsupported input sample format: {other:?}"
-                )));
-            }
-        };
+        let stream = build_input_stream_any_format(&device, supported, move |data| {
+            push_downmixed_rt(data, in_channels, &ring_cb);
+        })?;
 
         let samples_worker = Arc::clone(&samples);
         let bars_worker = Arc::clone(&bars);

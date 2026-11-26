@@ -29,3 +29,4 @@ pub use dsp::{LoudnessNormalizer, compute_rms_mono, normalized_gain_for_rms};
 pub(crate) use engine::{AudioEngine, AudioSharedState};
 pub use playout::AudioRxSnapshot;
 pub(crate) use playout::PlayoutRing;
+pub(crate) use streams::build_input_stream_any_format;

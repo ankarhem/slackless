@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use cpal::SampleFormat;
+use cpal::Sample as _;
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use tokio::sync::mpsc;
 use webrtc::peer_connection::RTCPeerConnectionState;
@@ -216,95 +216,34 @@ impl ContentShareSession {
                     let Ok(supported) = dev.default_input_config() else {
                         return;
                     };
-                    let fmt = supported.sample_format();
-                    let ch = (supported.channels() as usize).max(1);
-                    let cfg: cpal::StreamConfig = supported.into();
-                    let stream = match fmt {
-                        SampleFormat::F32 => dev
-                            .build_input_stream(
-                                cfg,
-                                move |data: &[f32], _| {
-                                    // Stack-buffered lock-free conversion: zero heap allocs or locks in RT callback.
-                                    let mut buf = [0i16; 1024];
-                                    let mut n = 0usize;
-                                    for frame in data.chunks(ch) {
-                                        let l = (frame[0].clamp(-1.0, 1.0) * 32_767.0) as i16;
-                                        let r = (frame
-                                            .get(1)
-                                            .copied()
-                                            .unwrap_or(frame[0])
-                                            .clamp(-1.0, 1.0)
-                                            * 32_767.0)
-                                            as i16;
-                                        buf[n] = l;
-                                        buf[n + 1] = r;
-                                        n += 2;
-                                        if n == buf.len() {
-                                            loopback_pcm_tx.push_slice(&buf[..n]);
-                                            n = 0;
-                                        }
-                                    }
-                                    if n > 0 {
-                                        loopback_pcm_tx.push_slice(&buf[..n]);
-                                    }
-                                },
-                                |_| {},
-                                None,
-                            )
-                            .ok(),
-                        SampleFormat::I16 => dev
-                            .build_input_stream(
-                                cfg,
-                                move |data: &[i16], _| {
-                                    let mut buf = [0i16; 1024];
-                                    let mut n = 0usize;
-                                    for frame in data.chunks(ch) {
-                                        buf[n] = frame[0];
-                                        buf[n + 1] = *frame.get(1).unwrap_or(&frame[0]);
-                                        n += 2;
-                                        if n == buf.len() {
-                                            loopback_pcm_tx.push_slice(&buf[..n]);
-                                            n = 0;
-                                        }
-                                    }
-                                    if n > 0 {
-                                        loopback_pcm_tx.push_slice(&buf[..n]);
-                                    }
-                                },
-                                |_| {},
-                                None,
-                            )
-                            .ok(),
-                        SampleFormat::U16 => dev
-                            .build_input_stream(
-                                cfg,
-                                move |data: &[u16], _| {
-                                    let mut buf = [0i16; 1024];
-                                    let mut n = 0usize;
-                                    for frame in data.chunks(ch) {
-                                        let l = (i32::from(frame[0]) - 32_768) as i16;
-                                        let r = (i32::from(*frame.get(1).unwrap_or(&frame[0]))
-                                            - 32_768)
-                                            as i16;
-                                        buf[n] = l;
-                                        buf[n + 1] = r;
-                                        n += 2;
-                                        if n == buf.len() {
-                                            loopback_pcm_tx.push_slice(&buf[..n]);
-                                            n = 0;
-                                        }
-                                    }
-                                    if n > 0 {
-                                        loopback_pcm_tx.push_slice(&buf[..n]);
-                                    }
-                                },
-                                |_| {},
-                                None,
-                            )
-                            .ok(),
-                        _ => None,
+                    let ch = usize::from(supported.channels()).max(1);
+                    let stream =
+                        crate::audio::build_input_stream_any_format(&dev, supported, move |data| {
+                            // Stack-buffered stereo i16: zero heap allocs or locks in the RT callback.
+                            let mut buf = [0i16; 1024];
+                            let mut n = 0usize;
+                            for frame in data.chunks(ch) {
+                                let l = frame[0];
+                                let r = frame.get(1).copied().unwrap_or(l);
+                                buf[n] = i16::from_sample(l.clamp(-1.0, 1.0));
+                                buf[n + 1] = i16::from_sample(r.clamp(-1.0, 1.0));
+                                n += 2;
+                                if n == buf.len() {
+                                    loopback_pcm_tx.push_slice(&buf);
+                                    n = 0;
+                                }
+                            }
+                            if n > 0 {
+                                loopback_pcm_tx.push_slice(&buf[..n]);
+                            }
+                        });
+                    let stream = match stream {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            tracing::warn!(%err, "screen-share loopback capture unavailable");
+                            return;
+                        }
                     };
-                    let Some(stream) = stream else { return };
                     let _ = stream.play();
                     while loopback_capture_running.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(50));

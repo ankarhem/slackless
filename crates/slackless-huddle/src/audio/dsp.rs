@@ -247,11 +247,7 @@ pub fn compute_rms_mono(samples: &[f32]) -> f32 {
 }
 
 /// Zero-allocation interleaved RMS computation safe for real-time audio callbacks.
-pub(super) fn compute_rms_interleaved_map<T: Copy>(
-    samples: &[T],
-    channels: usize,
-    to_f32: impl Fn(T) -> f32,
-) -> f32 {
+pub(super) fn compute_rms_interleaved(samples: &[f32], channels: usize) -> f32 {
     let ch = channels.max(1);
     if samples.len() < ch {
         return 0.0;
@@ -260,11 +256,7 @@ pub(super) fn compute_rms_interleaved_map<T: Copy>(
     let mut sum_sq = 0.0f32;
     let mut frames = 0usize;
     for frame in samples.chunks_exact(ch) {
-        let mut mono = 0.0f32;
-        for &s in frame {
-            mono += to_f32(s);
-        }
-        mono *= inv_ch;
+        let mono = frame.iter().sum::<f32>() * inv_ch;
         sum_sq += mono * mono;
         frames += 1;
     }

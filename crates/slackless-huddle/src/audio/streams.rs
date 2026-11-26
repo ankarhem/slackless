@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait as _, StreamTrait as _};
-use cpal::{SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
+use cpal::{
+    FromSample, Sample as _, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig,
+};
 use sonora::AudioProcessing;
 
 use super::devices::{select_input_device, select_output_device};
@@ -163,90 +165,15 @@ pub(super) fn open_input_stream(
         .default_input_config()
         .map_err(|e| HuddleError::Audio(e.to_string()))?;
     let src_rate = supported.sample_rate();
-    let channels = (supported.channels() as usize).max(1);
-    let fmt = supported.sample_format();
-    let config: StreamConfig = supported.into();
+    let channels = usize::from(supported.channels()).max(1);
 
     let mut mono_scratch = Vec::with_capacity(RT_SCRATCH_SAMPLES);
     let mut converter = StreamConverter::new(src_rate, SAMPLE_RATE)?;
 
-    let stream = match fmt {
-        SampleFormat::F32 => device.build_input_stream(
-            config,
-            move |data: &[f32], _| {
-                downmix_to_mono_f32_into(data, channels, &mut mono_scratch);
-                push_mono_to_capture_ring(&mono_scratch, &mut converter, &capture_ring);
-            },
-            |_| {},
-            None,
-        ),
-        SampleFormat::I16 => device.build_input_stream(
-            config,
-            move |data: &[i16], _| {
-                mono_scratch.clear();
-                let ch_div = channels as f32;
-                for ch in data.chunks(channels) {
-                    let sum: f32 = ch.iter().map(|&s| f32::from(s) / 32_768.0).sum();
-                    mono_scratch.push(sum / ch_div);
-                }
-                push_mono_to_capture_ring(&mono_scratch, &mut converter, &capture_ring);
-            },
-            |_| {},
-            None,
-        ),
-        SampleFormat::U16 => device.build_input_stream(
-            config,
-            move |data: &[u16], _| {
-                mono_scratch.clear();
-                let ch_div = channels as f32;
-                for ch in data.chunks(channels) {
-                    let sum: f32 = ch
-                        .iter()
-                        .map(|&s| (f32::from(s) - 32_768.0) / 32_768.0)
-                        .sum();
-                    mono_scratch.push(sum / ch_div);
-                }
-                push_mono_to_capture_ring(&mono_scratch, &mut converter, &capture_ring);
-            },
-            |_| {},
-            None,
-        ),
-        SampleFormat::I32 => device.build_input_stream(
-            config,
-            move |data: &[i32], _| {
-                mono_scratch.clear();
-                let ch_div = channels as f32;
-                let inv = 1.0 / (i32::MAX as f64);
-                for ch in data.chunks(channels) {
-                    let sum: f32 = ch.iter().map(|&s| (f64::from(s) * inv) as f32).sum();
-                    mono_scratch.push(sum / ch_div);
-                }
-                push_mono_to_capture_ring(&mono_scratch, &mut converter, &capture_ring);
-            },
-            |_| {},
-            None,
-        ),
-        SampleFormat::F64 => device.build_input_stream(
-            config,
-            move |data: &[f64], _| {
-                mono_scratch.clear();
-                let ch_div = channels as f32;
-                for ch in data.chunks(channels) {
-                    let sum: f32 = ch.iter().map(|&s| s as f32).sum();
-                    mono_scratch.push(sum / ch_div);
-                }
-                push_mono_to_capture_ring(&mono_scratch, &mut converter, &capture_ring);
-            },
-            |_| {},
-            None,
-        ),
-        other => {
-            return Err(HuddleError::Audio(format!(
-                "unsupported input sample format {other:?}"
-            )));
-        }
-    }
-    .map_err(|e| HuddleError::Audio(e.to_string()))?;
+    let stream = build_input_stream_any_format(&device, supported, move |data| {
+        downmix_to_mono_f32_into(data, channels, &mut mono_scratch);
+        push_mono_to_capture_ring(&mono_scratch, &mut converter, &capture_ring);
+    })?;
 
     stream
         .play()
@@ -254,9 +181,82 @@ pub(super) fn open_input_stream(
     Ok(stream)
 }
 
-/// Build a `cpal` output stream supporting `F32`, `I16`, `U16`, `I32`, and `F64` host formats
-/// while feeding the caller an interleaved `&mut [f32]` buffer of whole frames with zero
-/// per-callback allocations.
+/// Samples per format-conversion chunk: [`RT_SCRATCH_SAMPLES`] rounded down to whole frames.
+fn conversion_chunk(supported: &SupportedStreamConfig) -> usize {
+    let channels = usize::from(supported.channels()).max(1);
+    (RT_SCRATCH_SAMPLES / channels).max(1) * channels
+}
+
+fn stream_error(err: cpal::Error) {
+    tracing::warn!(%err, "audio stream error");
+}
+
+/// Build a `cpal` input stream for any `F32`, `I16`, `U16`, `I32` or `F64` host format, handing
+/// `on_data` the interleaved samples as `f32` in whole frames. Other formats are converted through
+/// a preallocated scratch buffer, so the real-time callback never allocates.
+pub(crate) fn build_input_stream_any_format<F>(
+    device: &cpal::Device,
+    supported: SupportedStreamConfig,
+    mut on_data: F,
+) -> Result<Stream>
+where
+    F: FnMut(&[f32]) + Send + 'static,
+{
+    let chunk = conversion_chunk(&supported);
+    let fmt = supported.sample_format();
+    let config: StreamConfig = supported.into();
+    match fmt {
+        SampleFormat::F32 => device
+            .build_input_stream(
+                config,
+                move |data: &[f32], _| on_data(data),
+                stream_error,
+                None,
+            )
+            .map_err(|e| HuddleError::Audio(e.to_string())),
+        SampleFormat::I16 => build_input::<i16, _>(device, config, chunk, on_data),
+        SampleFormat::U16 => build_input::<u16, _>(device, config, chunk, on_data),
+        SampleFormat::I32 => build_input::<i32, _>(device, config, chunk, on_data),
+        SampleFormat::F64 => build_input::<f64, _>(device, config, chunk, on_data),
+        other => Err(HuddleError::Audio(format!(
+            "unsupported input sample format {other:?}"
+        ))),
+    }
+}
+
+fn build_input<T, F>(
+    device: &cpal::Device,
+    config: StreamConfig,
+    chunk: usize,
+    mut on_data: F,
+) -> Result<Stream>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+    F: FnMut(&[f32]) + Send + 'static,
+{
+    let mut scratch = vec![0.0f32; chunk];
+    device
+        .build_input_stream(
+            config,
+            move |data: &[T], _| {
+                for src in data.chunks(chunk) {
+                    let buf = &mut scratch[..src.len()];
+                    for (dst, &s) in buf.iter_mut().zip(src) {
+                        *dst = f32::from_sample(s);
+                    }
+                    on_data(buf);
+                }
+            },
+            stream_error,
+            None,
+        )
+        .map_err(|e| HuddleError::Audio(e.to_string()))
+}
+
+/// Build a `cpal` output stream for any `F32`, `I16`, `U16`, `I32` or `F64` host format while
+/// feeding the caller an interleaved `&mut [f32]` buffer of whole frames with zero per-callback
+/// allocations.
 pub(super) fn build_output_stream_any_format<F>(
     device: &cpal::Device,
     supported: SupportedStreamConfig,
@@ -265,95 +265,55 @@ pub(super) fn build_output_stream_any_format<F>(
 where
     F: FnMut(&mut [f32]) + Send + 'static,
 {
+    let chunk = conversion_chunk(&supported);
     let fmt = supported.sample_format();
-    let channels = (supported.channels() as usize).max(1);
-    let chunk_elems = ((RT_SCRATCH_SAMPLES / channels).max(1)) * channels;
     let config: StreamConfig = supported.into();
-
-    let stream = match fmt {
-        SampleFormat::F32 => device.build_output_stream(
-            config,
-            move |data: &mut [f32], _| fill_f32(data),
-            |_| {},
-            None,
-        ),
-        SampleFormat::I16 => {
-            let mut scratch = vec![0.0f32; chunk_elems];
-            device.build_output_stream(
+    match fmt {
+        SampleFormat::F32 => device
+            .build_output_stream(
                 config,
-                move |data: &mut [i16], _| {
-                    for chunk in data.chunks_mut(chunk_elems) {
-                        let buf = &mut scratch[..chunk.len()];
-                        fill_f32(buf);
-                        for (dst, &src) in chunk.iter_mut().zip(buf.iter()) {
-                            *dst = (src.clamp(-1.0, 1.0) * 32_767.0) as i16;
-                        }
-                    }
-                },
-                |_| {},
+                move |data: &mut [f32], _| fill_f32(data),
+                stream_error,
                 None,
             )
-        }
-        SampleFormat::U16 => {
-            let mut scratch = vec![0.0f32; chunk_elems];
-            device.build_output_stream(
-                config,
-                move |data: &mut [u16], _| {
-                    for chunk in data.chunks_mut(chunk_elems) {
-                        let buf = &mut scratch[..chunk.len()];
-                        fill_f32(buf);
-                        for (dst, &src) in chunk.iter_mut().zip(buf.iter()) {
-                            *dst = ((src.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65_535.0) as u16;
-                        }
-                    }
-                },
-                |_| {},
-                None,
-            )
-        }
-        SampleFormat::I32 => {
-            let mut scratch = vec![0.0f32; chunk_elems];
-            device.build_output_stream(
-                config,
-                move |data: &mut [i32], _| {
-                    for chunk in data.chunks_mut(chunk_elems) {
-                        let buf = &mut scratch[..chunk.len()];
-                        fill_f32(buf);
-                        for (dst, &src) in chunk.iter_mut().zip(buf.iter()) {
-                            *dst = (f64::from(src.clamp(-1.0, 1.0)) * f64::from(i32::MAX)) as i32;
-                        }
-                    }
-                },
-                |_| {},
-                None,
-            )
-        }
-        SampleFormat::F64 => {
-            let mut scratch = vec![0.0f32; chunk_elems];
-            device.build_output_stream(
-                config,
-                move |data: &mut [f64], _| {
-                    for chunk in data.chunks_mut(chunk_elems) {
-                        let buf = &mut scratch[..chunk.len()];
-                        fill_f32(buf);
-                        for (dst, &src) in chunk.iter_mut().zip(buf.iter()) {
-                            *dst = f64::from(src.clamp(-1.0, 1.0));
-                        }
-                    }
-                },
-                |_| {},
-                None,
-            )
-        }
-        other => {
-            return Err(HuddleError::Audio(format!(
-                "unsupported output sample format {other:?}"
-            )));
-        }
+            .map_err(|e| HuddleError::Audio(e.to_string())),
+        SampleFormat::I16 => build_output::<i16, _>(device, config, chunk, fill_f32),
+        SampleFormat::U16 => build_output::<u16, _>(device, config, chunk, fill_f32),
+        SampleFormat::I32 => build_output::<i32, _>(device, config, chunk, fill_f32),
+        SampleFormat::F64 => build_output::<f64, _>(device, config, chunk, fill_f32),
+        other => Err(HuddleError::Audio(format!(
+            "unsupported output sample format {other:?}"
+        ))),
     }
-    .map_err(|e| HuddleError::Audio(e.to_string()))?;
+}
 
-    Ok(stream)
+fn build_output<T, F>(
+    device: &cpal::Device,
+    config: StreamConfig,
+    chunk: usize,
+    mut fill_f32: F,
+) -> Result<Stream>
+where
+    T: SizedSample + FromSample<f32>,
+    F: FnMut(&mut [f32]) + Send + 'static,
+{
+    let mut scratch = vec![0.0f32; chunk];
+    device
+        .build_output_stream(
+            config,
+            move |data: &mut [T], _| {
+                for dst in data.chunks_mut(chunk) {
+                    let buf = &mut scratch[..dst.len()];
+                    fill_f32(buf);
+                    for (d, &s) in dst.iter_mut().zip(buf.iter()) {
+                        *d = T::from_sample(s.clamp(-1.0, 1.0));
+                    }
+                }
+            },
+            stream_error,
+            None,
+        )
+        .map_err(|e| HuddleError::Audio(e.to_string()))
 }
 
 /// Open the `cpal` speaker stream. `aec_reference` receives exactly the 48 kHz samples each

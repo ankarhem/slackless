@@ -2,11 +2,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use cpal::Stream;
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
-use cpal::{SampleFormat, Stream, StreamConfig};
 
-use super::dsp::compute_rms_interleaved_map;
-use super::streams::build_output_stream_any_format;
+use super::dsp::compute_rms_interleaved;
+use super::streams::{build_input_stream_any_format, build_output_stream_any_format};
 use crate::{HuddleError, Result};
 
 /// One enumerated audio device (mic or speaker).
@@ -191,70 +191,11 @@ impl MicLevelProbe {
                     let supported = device
                         .default_input_config()
                         .map_err(|e| HuddleError::Audio(e.to_string()))?;
-                    let channels = (supported.channels() as usize).max(1);
-                    let fmt = supported.sample_format();
-                    let config: StreamConfig = supported.into();
-
-                    let stream = match fmt {
-                        SampleFormat::F32 => device.build_input_stream(
-                            config,
-                            move |data: &[f32], _| {
-                                let rms = compute_rms_interleaved_map(data, channels, |s| s);
-                                rms_cb.store(rms.to_bits(), Ordering::Relaxed);
-                            },
-                            |_| {},
-                            None,
-                        ),
-                        SampleFormat::I16 => device.build_input_stream(
-                            config,
-                            move |data: &[i16], _| {
-                                let rms = compute_rms_interleaved_map(data, channels, |s| {
-                                    f32::from(s) / 32_768.0
-                                });
-                                rms_cb.store(rms.to_bits(), Ordering::Relaxed);
-                            },
-                            |_| {},
-                            None,
-                        ),
-                        SampleFormat::U16 => device.build_input_stream(
-                            config,
-                            move |data: &[u16], _| {
-                                let rms = compute_rms_interleaved_map(data, channels, |s| {
-                                    (f32::from(s) - 32_768.0) / 32_768.0
-                                });
-                                rms_cb.store(rms.to_bits(), Ordering::Relaxed);
-                            },
-                            |_| {},
-                            None,
-                        ),
-                        SampleFormat::I32 => device.build_input_stream(
-                            config,
-                            move |data: &[i32], _| {
-                                let inv = 1.0 / f64::from(i32::MAX);
-                                let rms = compute_rms_interleaved_map(data, channels, |s| {
-                                    (f64::from(s) * inv) as f32
-                                });
-                                rms_cb.store(rms.to_bits(), Ordering::Relaxed);
-                            },
-                            |_| {},
-                            None,
-                        ),
-                        SampleFormat::F64 => device.build_input_stream(
-                            config,
-                            move |data: &[f64], _| {
-                                let rms = compute_rms_interleaved_map(data, channels, |s| s as f32);
-                                rms_cb.store(rms.to_bits(), Ordering::Relaxed);
-                            },
-                            |_| {},
-                            None,
-                        ),
-                        other => {
-                            return Err(HuddleError::Audio(format!(
-                                "unsupported mic probe sample format {other:?}"
-                            )));
-                        }
-                    }
-                    .map_err(|e| HuddleError::Audio(e.to_string()))?;
+                    let channels = usize::from(supported.channels()).max(1);
+                    let stream = build_input_stream_any_format(&device, supported, move |data| {
+                        let rms = compute_rms_interleaved(data, channels);
+                        rms_cb.store(rms.to_bits(), Ordering::Relaxed);
+                    })?;
                     stream
                         .play()
                         .map_err(|e| HuddleError::Audio(e.to_string()))?;
