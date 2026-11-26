@@ -120,8 +120,9 @@ pub struct ThreadsView {
     remote: bool,
     /// True on the very first live open before `subscriptions.thread.getView` has answered.
     loading: bool,
-    /// The card the shared reply composer is docked to (defaults to card 0 when present).
-    active: Option<usize>,
+    /// The card the shared reply composer is docked to, by identity so that a re-sort or a
+    /// refreshed list cannot move it onto another thread (defaults to card 0 when present).
+    active: Option<(ChannelId, Ts)>,
     /// Cards whose "Show N more replies" link has been expanded in-place.
     expanded: HashSet<(ChannelId, Ts)>,
     /// Saved-for-later message timestamps synced from `LaterView`.
@@ -132,6 +133,11 @@ pub struct ThreadsView {
     filter: ThreadsFilter,
     composer: Entity<Composer>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A card's identity, what the docked reply composer keeps across sorts and refreshes.
+fn card_key(card: &ThreadCard) -> (ChannelId, Ts) {
+    (card.channel.clone(), card.thread_ts.clone())
 }
 
 impl EventEmitter<ThreadsEvent> for ThreadsView {}
@@ -197,12 +203,27 @@ impl ThreadsView {
 
     fn sync_also_send(&self, cx: &mut Context<Self>) {
         let target = self
-            .active
-            .and_then(|ix| self.cards.get(ix))
+            .active_card()
             .filter(|card| card.list_item.is_none())
             .and_then(|card| AlsoSendTarget::for_channel(&self.fixtures, &card.channel));
         self.composer
             .update(cx, |composer, cx| composer.set_also_send(target, cx));
+    }
+
+    /// The card the reply composer is docked to, if it is still listed.
+    fn active_card(&self) -> Option<&ThreadCard> {
+        let (channel, thread_ts) = self.active.as_ref()?;
+        self.cards
+            .iter()
+            .find(|card| &card.channel == channel && &card.thread_ts == thread_ts)
+    }
+
+    /// Un-dock the reply composer when its card left the list (the draft stays in the composer)
+    /// rather than hand the reply to whichever card took its place.
+    fn retain_active(&mut self) {
+        if self.active.is_some() && self.active_card().is_none() {
+            self.active = None;
+        }
     }
 
     /// Show `cards` (the fixture derivation) and drop any earlier remote list; call when the
@@ -212,7 +233,7 @@ impl ThreadsView {
         self.loading = false;
         self.cards = cards;
         self.expanded.clear();
-        self.active = (!self.cards.is_empty()).then_some(0);
+        self.active = self.cards.first().map(card_key);
         self.sync_also_send(cx);
         cx.notify();
     }
@@ -262,6 +283,7 @@ impl ThreadsView {
         let Some(card) = list_item_thread_card(meta, messages) else {
             return false;
         };
+        let first_card = self.cards.is_empty();
         if let Some(existing) = self.cards.iter_mut().find(|c| {
             c.list_item.as_ref().is_some_and(|m| {
                 card.list_item
@@ -274,10 +296,11 @@ impl ThreadsView {
             self.cards.push(card);
         }
         sort_cards(&mut self.cards);
-        self.active = self
-            .active
-            .filter(|&ix| ix < self.cards.len())
-            .or_else(|| (!self.cards.is_empty()).then_some(0));
+        if first_card {
+            self.active = self.cards.first().map(card_key);
+        } else {
+            self.retain_active();
+        }
         self.sync_also_send(cx);
         cx.notify();
         true
@@ -375,10 +398,7 @@ impl ThreadsView {
             .position(|c| c.channel == *channel && c.root.ts == *ts)
         {
             self.cards.remove(card_ix);
-            self.active = self
-                .active
-                .filter(|&ix| ix < self.cards.len())
-                .or_else(|| (!self.cards.is_empty()).then_some(0));
+            self.retain_active();
             changed = true;
         } else {
             for card in &mut self.cards {
@@ -507,7 +527,7 @@ impl ThreadsView {
         }
         self.loading = false;
         self.cards = cards;
-        self.active = (!self.cards.is_empty()).then_some(0);
+        self.active = self.cards.first().map(card_key);
         self.sync_also_send(cx);
         cx.notify();
     }
@@ -518,6 +538,7 @@ impl ThreadsView {
     pub fn set_remote(&mut self, view: SlackThreads, cx: &mut Context<Self>) {
         self.remote = true;
         self.loading = false;
+        let first_show = self.cards.is_empty();
         let preserved_list_cards: Vec<ThreadCard> = self
             .cards
             .iter()
@@ -539,10 +560,11 @@ impl ThreadsView {
         }
         sort_cards(&mut next);
         self.cards = next;
-        self.active = self
-            .active
-            .filter(|&ix| ix < self.cards.len())
-            .or_else(|| (!self.cards.is_empty()).then_some(0));
+        if first_show {
+            self.active = self.cards.first().map(card_key);
+        } else {
+            self.retain_active();
+        }
         self.sync_also_send(cx);
         cx.notify();
     }
@@ -604,26 +626,28 @@ impl ThreadsView {
 
     /// The thread the reply composer is docked to, where a slash command typed there runs.
     pub fn active_thread(&self) -> Option<(ChannelId, Ts)> {
-        let card = self.cards.get(self.active?)?;
-        Some((card.channel.clone(), card.thread_ts.clone()))
+        self.active_card()
+            .map(|card| (card.channel.clone(), card.thread_ts.clone()))
     }
 
     fn reply(&mut self, content: MessageContent, cx: &mut Context<Self>) {
-        let Some(ix) = self.active else {
+        let Some((channel, thread_ts)) = self.active.clone() else {
             return;
         };
-        let Some(card) = self.cards.get_mut(ix) else {
+        let Some(card) = self
+            .cards
+            .iter_mut()
+            .find(|card| card.channel == channel && card.thread_ts == thread_ts)
+        else {
             return;
         };
         let broadcast = self
             .composer
             .update(cx, |composer, cx| composer.take_also_send(cx));
         // The local echo shows the same blocks the reply posts with.
-        let mut message = self.fixtures.local_message(
-            &card.channel,
-            content.text.clone(),
-            Some(card.thread_ts.clone()),
-        );
+        let mut message =
+            self.fixtures
+                .local_message(&channel, content.text.clone(), Some(thread_ts.clone()));
         message.blocks = content.blocks.clone();
         message.attachments = content.attachments.clone();
         card.replies.push(message);
@@ -631,8 +655,8 @@ impl ThreadsView {
         card.unread = 0;
         card.last_read = None;
         cx.emit(ThreadsEvent::Reply {
-            channel: card.channel.clone(),
-            thread_ts: card.thread_ts.clone(),
+            channel,
+            thread_ts,
             content,
             broadcast,
         });
@@ -646,7 +670,7 @@ impl ThreadsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.active = ix;
+        self.active = ix.and_then(|ix| self.cards.get(ix)).map(card_key);
         self.sync_also_send(cx);
         if ix.is_some() {
             self.composer
@@ -851,7 +875,9 @@ impl Render for ThreadsView {
                     fixtures: &self.fixtures,
                     ix: *ix,
                     card,
-                    active: self.active == Some(*ix),
+                    active: self.active.as_ref().is_some_and(|(channel, thread_ts)| {
+                        *channel == card.channel && *thread_ts == card.thread_ts
+                    }),
                     expanded,
                     saved_set: &self.saved,
                     editing: editing.as_ref(),
@@ -1357,5 +1383,89 @@ mod tests {
             view.update(cx, |v, cx| v.set_filter(ThreadsFilter::Messages, cx));
             assert_eq!(view.read(cx).filter, ThreadsFilter::Messages);
         });
+    }
+
+    /// The docked reply composer follows its thread, not its position: a refresh that re-sorts
+    /// the cards (another reply makes the thread unread, which sorts first) must not send the
+    /// draft to whichever thread took the card's place.
+    #[gpui::test]
+    fn reply_stays_on_its_thread_when_the_cards_are_resorted(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let fixtures = Arc::new(crate::fixtures::load());
+        let view_cell = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let cell = view_cell.clone();
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = ThreadsView::new(fixtures.clone(), window, cx);
+            *cell.borrow_mut() = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let view = view_cell.borrow_mut().take().unwrap();
+        let replies: Arc<std::sync::Mutex<Vec<(ChannelId, Ts)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sent = replies.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, event: &ThreadsEvent, _| {
+                if let ThreadsEvent::Reply {
+                    channel, thread_ts, ..
+                } = event
+                {
+                    sent.lock()
+                        .unwrap()
+                        .push((channel.clone(), thread_ts.clone()));
+                }
+            })
+            .detach();
+        });
+
+        let eng = ChannelId::from("C0ENG");
+        let a_ts = Ts::from("1760000001.000100");
+        let subscription = |channel: &str, ts: &str, unread: Vec<Message>| ThreadSubscription {
+            root: Message {
+                channel: Some(ChannelId::from(channel)),
+                ts: Ts::from(ts),
+                text: "root".into(),
+                ..Default::default()
+            },
+            latest_replies: vec![],
+            unread_replies: unread,
+        };
+        let threads = |unread: Vec<Message>| SlackThreads {
+            threads: vec![
+                subscription("C0ENG", "1760000001.000100", unread),
+                subscription("C0GENERAL", "1760000002.000100", vec![]),
+            ],
+            has_more: false,
+            total_unread_replies: 0,
+        };
+
+        cx.update(|window, cx| {
+            // The later thread sorts first, so thread A sits at index 1; the composer docks on it.
+            view.update(cx, |v, cx| v.set_remote(threads(vec![]), cx));
+            view.update(cx, |v, cx| v.activate_thread(&eng, &a_ts, window, cx));
+            assert_eq!(
+                view.read(cx).active_thread(),
+                Some((eng.clone(), a_ts.clone()))
+            );
+
+            // A new reply makes A unread, so A moves to the front and B takes its index.
+            let new_reply = Message {
+                ts: Ts::from("1760000001.000300"),
+                text: "new".into(),
+                ..Default::default()
+            };
+            view.update(cx, |v, cx| v.set_remote(threads(vec![new_reply]), cx));
+            let cards = &view.read(cx).cards;
+            assert_eq!(
+                (cards[0].channel.as_str(), cards[1].channel.as_str()),
+                ("C0ENG", "C0GENERAL"),
+                "A moved to the front"
+            );
+
+            view.update(cx, |v, cx| v.reply(MessageContent::plain("draft"), cx));
+        });
+        assert_eq!(*replies.lock().unwrap(), vec![(eng, a_ts)]);
     }
 }
