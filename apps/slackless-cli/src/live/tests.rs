@@ -1176,9 +1176,13 @@ fn status_and_huddle_formatters_and_credential_builder_cover_all_branches() {
             "user": "U1", "text": "hej", "is_partial": false, "at_ms": 7, "lang": "sv"
         }}})
     );
+    // Video tiles keep the snake_case JSON the CLI emits, for both unit and per-user variants.
     assert_eq!(
-        video_tile_json(&VideoTileKey::RemoteScreen(UserId::from("U2"))),
-        serde_json::json!({"remote_screen": "U2"})
+        serde_json::json!([
+            VideoTileKey::LocalCamera,
+            VideoTileKey::RemoteScreen(UserId::from("U2"))
+        ]),
+        serde_json::json!(["local_camera", {"remote_screen": "U2"}])
     );
 }
 

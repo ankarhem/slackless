@@ -116,7 +116,8 @@ impl PartialEq for VideoFrame {
 }
 
 /// Identifies which tile a [`VideoFrame`] belongs to in the Huddle window.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VideoTileKey {
     LocalCamera,
     LocalScreen,
