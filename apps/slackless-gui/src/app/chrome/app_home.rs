@@ -8,16 +8,18 @@ impl App {
     /// another channel while the huddle bar is open), using its newest `huddle_thread` trail
     /// message (falling back to the newest message in sample mode).
     pub(in crate::app) fn toggle_huddle_thread(&mut self, cx: &mut Context<Self>) {
-        let huddle_channel = self
-            .huddle_session
-            .as_ref()
-            .map(|s| s.channel.clone())
+        // The dock's session: the core's snapshot with the room's meta merged in, which is
+        // where a thread started after joining arrives.
+        let session = self.huddle_state.as_ref().map(|state| {
+            let session = state.read(cx).session();
+            (session.channel.clone(), session.thread_root_ts.clone())
+        });
+        let huddle_channel = (session.as_ref())
+            .map(|(channel, _)| channel.clone())
             .or_else(|| huddle_state::fixture_huddle(&self.fixtures).map(|h| h.channel))
             .unwrap_or_else(|| self.channel.clone());
-        let huddle_ts = self
-            .huddle_session
-            .as_ref()
-            .and_then(|s| s.thread_root_ts.clone())
+        let huddle_ts = session
+            .and_then(|(_, thread_root_ts)| thread_root_ts)
             .or_else(|| {
                 if huddle_channel == self.channel {
                     self.messages

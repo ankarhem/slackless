@@ -174,6 +174,32 @@ fn wired_huddle_lifecycle_commands_events_media_and_teardown(cx: &mut gpui::Test
         assert_eq!(state.read(cx).session().call_id, "R0WIRED");
     });
 
+    // 2b. A huddle thread started after joining (the room's thread root) is the one the main
+    // window's huddle-thread toggle opens.
+    let root_ts = Ts::from("1700000500.000100");
+    cx.update(|_, cx| {
+        core.emit(
+            Event::Huddle(HuddleEvent::Updated {
+                channel: eng.clone(),
+                participants: vec![UserId::from("U0ME"), UserId::from("U0ALICE")],
+                ended: false,
+                topic: None,
+                background_id: None,
+                thread_root_ts: Some(root_ts.clone()),
+            }),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| app.toggle_huddle_thread(cx));
+        assert_eq!(
+            app.read(cx).thread.read(cx).open_thread(),
+            Some((eng.clone(), root_ts.clone())),
+            "the toggle must open the thread the room announced after joining"
+        );
+    });
+
     // 3. Emit high-frequency `HuddleMediaEvent`s through real `HuddleMediaHub` (AudioLevels,
     // VideoFrame, VideoTileClosed) and verify `HuddleState` + `HuddleVideoStore` stay in sync.
     let tile = VideoTileKey::RemoteCamera(UserId::from("U0ALICE"));
