@@ -99,15 +99,16 @@ struct ActiveInlineVideo {
     loading: bool,
     player: Option<NativeVideoPlayer>,
     last_frame: Option<Arc<VideoSurface>>,
-    last_rendered_epoch: u64,
+    last_painted_epoch: u64,
     inline_in_viewport: bool,
+    confirmed_inline_visible: bool,
     pip_engaged: bool,
 }
 
 #[derive(Default)]
 struct InlineVideoManager {
     next_generation: u64,
-    frame_epoch: u64,
+    paint_epoch: u64,
     active: Option<ActiveInlineVideo>,
     /// One-shot `(file_id, handoff)` stashed when expanding from inline playback into
     /// [`crate::image_viewer::ImageViewer`] so the viewer resumes at the exact timestamp and speed.
@@ -255,48 +256,51 @@ pub fn inline_video_snapshot(file_id: &str, cx: &App) -> Option<InlineVideoSnaps
     snapshot_from_active(active)
 }
 
-/// Advance the per-frame visibility epoch at the start of `App::render` so unmounted inline video
-/// cards are detected immediately on channel/page navigation or virtualized list scroll.
-pub fn inline_video_begin_frame(cx: &mut App) {
+/// Begin one window prepaint pass (called from the root `App` canvas `prepaint`, which runs
+/// before every child element's `prepaint`). Returns the epoch to pass into
+/// [`inline_video_finish_paint`] during `paint`.
+pub fn inline_video_begin_paint(cx: &mut App) -> u64 {
     if cx.has_global::<InlineVideoManager>() {
         let mgr = cx.global_mut::<InlineVideoManager>();
-        mgr.frame_epoch = mgr.frame_epoch.wrapping_add(1);
+        mgr.paint_epoch = mgr.paint_epoch.wrapping_add(1);
+        mgr.paint_epoch
+    } else {
+        0
     }
 }
 
-/// Record that the inline video card for `file_id` rendered in the current frame.
-pub fn mark_inline_video_rendered(file_id: &str, cx: &mut App) {
+/// Record from an active inline `VideoFrame`'s `prepaint` pass that its card is mounted in the
+/// current frame and whether its painted bounds intersect the visible viewport.
+pub fn report_inline_video_painted(file_id: &str, in_viewport: bool, cx: &mut App) {
     if cx.has_global::<InlineVideoManager>() {
         let mgr = cx.global_mut::<InlineVideoManager>();
-        let epoch = mgr.frame_epoch;
+        let epoch = mgr.paint_epoch;
         if let Some(active) = mgr.active.as_mut().filter(|a| a.file_id == file_id) {
-            active.last_rendered_epoch = epoch;
+            active.last_painted_epoch = epoch;
+            active.inline_in_viewport = in_viewport;
         }
     }
 }
 
-/// Update whether the rendered inline video card's painted bounds intersect the visible viewport.
-/// Triggers a window refresh only on visibility transitions so scrolling past a mounted card opens
-/// or dismisses the floating mini-player immediately.
-pub fn update_inline_video_viewport_visibility(
-    file_id: &str,
-    in_viewport: bool,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let changed = if cx.has_global::<InlineVideoManager>() {
-        cx.global_mut::<InlineVideoManager>()
-            .active
-            .as_mut()
-            .filter(|a| a.file_id == file_id)
-            .is_some_and(|active| {
-                let prev = active.inline_in_viewport;
-                active.inline_in_viewport = in_viewport;
-                prev != in_viewport
-            })
-    } else {
-        false
-    };
+/// Finish one window paint pass (called from the root `App` canvas `paint`, after all children's
+/// `prepaint` callbacks have run). Compares whether the active inline video card was actually
+/// mounted & in-viewport during `epoch` against `confirmed_inline_visible`, refreshing the window
+/// only on transitions so the floating PiP dock appears/disappears immediately without false
+/// triggers when the inline card is visible.
+pub fn inline_video_finish_paint(epoch: u64, window: &mut Window, cx: &mut App) {
+    if epoch == 0 || !cx.has_global::<InlineVideoManager>() {
+        return;
+    }
+    let changed = cx
+        .global_mut::<InlineVideoManager>()
+        .active
+        .as_mut()
+        .is_some_and(|active| {
+            let actually_visible = active.last_painted_epoch == epoch && active.inline_in_viewport;
+            let prev = active.confirmed_inline_visible;
+            active.confirmed_inline_visible = actually_visible;
+            prev != actually_visible
+        });
     if changed {
         window.refresh();
     }
@@ -305,23 +309,22 @@ pub fn update_inline_video_viewport_visibility(
 /// Evaluate whether the floating mini-player / picture-in-picture dock should be shown for the
 /// active inline video right now.
 ///
-/// Engages when the active inline video is playing (or loading) and its inline card is scrolled out
-/// of view or navigated away from; stays engaged while the user pauses inside the dock so they can
-/// resume, expand, jump to the message, or close it; automatically hides when the inline card
-/// scrolls back into view or when [`crate::image_viewer::ImageViewer`] opens.
+/// Engages when the active inline video is playing (or loading) and its inline card was not
+/// visible in the latest completed paint pass (scrolled out of view or navigated away from); stays
+/// engaged while the user pauses inside the dock so they can resume, expand, jump to the message,
+/// or close it; automatically hides when the inline card returns into view or when
+/// [`crate::image_viewer::ImageViewer`] opens.
 pub fn active_pip_video(image_viewer_open: bool, cx: &mut App) -> Option<PipVideoSnapshot> {
     if !cx.has_global::<InlineVideoManager>() {
         return None;
     }
     let mgr = cx.global_mut::<InlineVideoManager>();
-    let epoch = mgr.frame_epoch;
     let active = mgr.active.as_mut()?;
     if image_viewer_open {
         active.pip_engaged = false;
         return None;
     }
-    let inline_visible = active.last_rendered_epoch == epoch && active.inline_in_viewport;
-    if inline_visible {
+    if active.confirmed_inline_visible {
         active.pip_engaged = false;
         return None;
     }
@@ -427,7 +430,7 @@ pub fn play_inline_video_with_meta(
     };
     let mgr = cx.default_global::<InlineVideoManager>();
     let generation = mgr.next_gen();
-    let epoch = mgr.frame_epoch;
+    let epoch = mgr.paint_epoch;
     mgr.pending_handoff = None;
     mgr.active = Some(ActiveInlineVideo {
         generation,
@@ -437,8 +440,9 @@ pub fn play_inline_video_with_meta(
         loading: true,
         player: None,
         last_frame: None,
-        last_rendered_epoch: epoch,
+        last_painted_epoch: epoch,
         inline_in_viewport: true,
+        confirmed_inline_visible: true,
         pip_engaged: false,
     });
     window.refresh();
@@ -1046,7 +1050,7 @@ pub(crate) fn seed_inline_video_for_test(
 ) {
     let mgr = cx.default_global::<InlineVideoManager>();
     let generation = mgr.next_gen();
-    let epoch = mgr.frame_epoch;
+    let epoch = mgr.paint_epoch;
     mgr.active = Some(ActiveInlineVideo {
         generation,
         tick_gen: 0,
@@ -1055,12 +1059,13 @@ pub(crate) fn seed_inline_video_for_test(
         loading,
         player: None,
         last_frame: None,
-        last_rendered_epoch: if in_viewport {
+        last_painted_epoch: if in_viewport {
             epoch
         } else {
             epoch.wrapping_sub(1)
         },
         inline_in_viewport: in_viewport,
+        confirmed_inline_visible: in_viewport,
         pip_engaged: false,
     });
 }
@@ -1111,8 +1116,9 @@ mod tests {
             loading: true,
             player: None,
             last_frame: None,
-            last_rendered_epoch: 0,
+            last_painted_epoch: 0,
             inline_in_viewport: true,
+            confirmed_inline_visible: true,
             pip_engaged: false,
         });
         assert_eq!(mgr.active.as_ref().unwrap().file_id, "F_VID_1");
@@ -1128,8 +1134,9 @@ mod tests {
             loading: false,
             player: None,
             last_frame: None,
-            last_rendered_epoch: 0,
+            last_painted_epoch: 0,
             inline_in_viewport: true,
+            confirmed_inline_visible: true,
             pip_engaged: false,
         });
         assert_eq!(mgr.stop_matching("F_VID_1"), None);
@@ -1227,8 +1234,9 @@ mod tests {
             loading: false,
             player: Some(player),
             last_frame: None,
-            last_rendered_epoch: 0,
+            last_painted_epoch: 0,
             inline_in_viewport: true,
+            confirmed_inline_visible: true,
             pip_engaged: false,
         });
 
@@ -1244,31 +1252,106 @@ mod tests {
     }
 
     #[gpui::test]
-    fn pip_dock_engages_when_scrolled_or_navigated_away_and_clears_when_visible(
+    fn pip_dock_stays_hidden_across_multiple_draws_while_visible_and_engages_when_scrolled_away(
         cx: &mut gpui::TestAppContext,
     ) {
-        cx.update(|cx| {
-            inline_video_begin_frame(cx);
+        use gpui::{Context, IntoElement, Render};
+
+        struct PipLifecycleHost {
+            mount_card: bool,
+            card_in_viewport: bool,
+        }
+        impl Render for PipLifecycleHost {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let mount = self.mount_card;
+                let in_vp = self.card_in_viewport;
+                let pip = active_pip_video(false, cx);
+                div()
+                    .size_full()
+                    .child(
+                        canvas(
+                            |_, _, cx| inline_video_begin_paint(cx),
+                            |_, epoch, window, cx| inline_video_finish_paint(epoch, window, cx),
+                        )
+                        .absolute()
+                        .size_0(),
+                    )
+                    .when(mount, |root| {
+                        root.child(
+                            div().size(px(200.)).child(
+                                canvas(
+                                    move |_, _, cx| {
+                                        report_inline_video_painted("F_PIP", in_vp, cx);
+                                    },
+                                    |_, (), _, _| {},
+                                )
+                                .size_full(),
+                            ),
+                        )
+                    })
+                    .when(pip.is_some(), |root| root.child(div().id("pip-present")))
+            }
+        }
+
+        let (host, cx) = cx.add_window_view(|_, cx| {
             seed_inline_video_for_test(test_meta("F_PIP"), true, true, cx);
-            // Visible inline -> no PiP dock.
-            assert!(active_pip_video(false, cx).is_none());
+            PipLifecycleHost {
+                mount_card: true,
+                card_in_viewport: true,
+            }
+        });
 
-            // Advance frame without rendering the inline card (simulates navigating away / virtualized scroll out).
-            inline_video_begin_frame(cx);
-            let pip = active_pip_video(false, cx).expect("PiP must engage when inline card leaves");
+        // Across 3 consecutive real window draws with the inline card mounted & in-viewport,
+        // PiP must NEVER pop up.
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                assert!(
+                    active_pip_video(false, cx).is_none(),
+                    "PiP dock must stay hidden while inline video card is visible"
+                );
+            });
+        }
+
+        // Scrolling the card outside viewport engages PiP immediately after paint.
+        host.update(cx, |h, cx| {
+            h.card_in_viewport = false;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let pip = active_pip_video(false, cx)
+                .expect("PiP must engage when inline card scrolls out of viewport");
             assert_eq!(pip.meta.file_id, "F_PIP");
-
             // Opening ImageViewer suppresses PiP.
             assert!(active_pip_video(true, cx).is_none());
+        });
 
-            // Re-engage when viewer closes and card is still absent.
-            let pip2 = active_pip_video(false, cx).expect("PiP re-engages while loading/playing");
-            assert_eq!(pip2.meta.file_id, "F_PIP");
+        // Unmounting the card completely (virtualized scroll / channel switch) keeps PiP engaged.
+        host.update(cx, |h, cx| {
+            h.mount_card = false;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert!(
+                active_pip_video(false, cx).is_some(),
+                "PiP must remain engaged when inline card is unmounted"
+            );
+        });
 
-            // Returning to the message marks the card rendered -> PiP clears.
-            inline_video_begin_frame(cx);
-            mark_inline_video_rendered("F_PIP", cx);
-            assert!(active_pip_video(false, cx).is_none());
+        // Returning to the message with the card visible dismisses PiP cleanly.
+        host.update(cx, |h, cx| {
+            h.mount_card = true;
+            h.card_in_viewport = true;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert!(
+                active_pip_video(false, cx).is_none(),
+                "PiP must dismiss when inline card returns into view"
+            );
         });
     }
 }

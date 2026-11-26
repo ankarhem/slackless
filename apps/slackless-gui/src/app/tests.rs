@@ -1374,8 +1374,12 @@ fn qa_image_viewer_keyboard_zoom_step_and_zero_subscription_leak(cx: &mut gpui::
             crate::media::active_pip_video(false, cx).is_some(),
             "floating mini-player dock should be active when inline video is off-screen"
         );
-        crate::media::stop_active_inline_video(window, cx);
-        assert!(crate::media::active_pip_video(false, cx).is_none());
+        // Switching workspaces cleanly stops any active inline video / PiP from the outgoing workspace.
+        app.update(cx, |app, cx| app.switch_workspace(1, window, cx));
+        assert!(
+            crate::media::active_pip_video(false, cx).is_none(),
+            "switching workspaces must stop outgoing inline video / PiP"
+        );
     });
 }
 

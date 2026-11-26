@@ -14,7 +14,6 @@
 //! modes (the reference screenshot is a light workspace under the same dark viewer), like
 //! the avatar identity chips [`crate::theme`] keeps constant.
 
-use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -510,6 +509,9 @@ pub struct ImageViewer {
     pdf_load_task: Option<Task<()>>,
     show_transcript: bool,
     transcript_copied: bool,
+    /// Pending single-click mouse-down `(cue_index, position)` persisted across 30fps video
+    /// re-renders so clicking a transcript cue row seeks reliably while drag-selection stays intact.
+    cue_mouse_down: Option<(usize, Point<Pixels>)>,
 }
 
 impl Drop for ImageViewer {
@@ -582,6 +584,7 @@ impl ImageViewer {
                 pdf_load_task: None,
                 show_transcript: false,
                 transcript_copied: false,
+                cue_mouse_down: None,
             }
         });
         viewer.update(cx, |v, cx| v.sync_current_media(window, cx));
@@ -782,6 +785,7 @@ impl ImageViewer {
         }
         self.show_transcript = !self.show_transcript;
         self.transcript_copied = false;
+        self.cue_mouse_down = None;
         if self.show_transcript {
             self.ensure_transcript_loaded(window, cx);
         }
@@ -832,6 +836,30 @@ impl ImageViewer {
         self.video_load_task = None;
         self.video_tick_task = None;
         self.video_playback = None;
+        self.cue_mouse_down = None;
+    }
+
+    /// Record a transcript cue mouse-down on the entity so it survives 30fps video re-renders.
+    fn record_cue_mouse_down(&mut self, cue_idx: usize, click_count: usize, pos: Point<Pixels>) {
+        if click_count == 1 {
+            self.cue_mouse_down = Some((cue_idx, pos));
+        } else {
+            self.cue_mouse_down = None;
+        }
+    }
+
+    /// Resolve a transcript cue mouse-up: returns `true` when the press-and-release stayed within
+    /// the click threshold on the same cue row (not a text drag-selection).
+    fn take_cue_click(&mut self, cue_idx: usize, pos: Point<Pixels>) -> bool {
+        let Some((down_idx, origin)) = self.cue_mouse_down.take() else {
+            return false;
+        };
+        if down_idx != cue_idx {
+            return false;
+        }
+        let dx: f32 = (pos.x - origin.x).into();
+        let dy: f32 = (pos.y - origin.y).into();
+        dx.abs() < 4.0 && dy.abs() < 4.0
     }
 
     /// Sync video or PDF playback to `self.current()`: stops any previous video/PDF, and starts
@@ -1560,8 +1588,6 @@ impl Render for ImageViewer {
                         let is_active = active_cue_idx == Some(idx);
                         let start_secs = cue.start_secs;
                         let stamp_label = TranscriptCue::format_timestamp(start_secs);
-                        let down_pos: Rc<Cell<Option<Point<Pixels>>>> = Rc::new(Cell::new(None));
-                        let down_pos_up = Rc::clone(&down_pos);
                         let text_el = crate::messages::selectable_text(
                             &format!("viewer-transcript-{}-{idx}", video.file_id),
                             0,
@@ -1589,22 +1615,17 @@ impl Render for ImageViewer {
                             })
                             .when(is_active, |row| row.bg(chrome.button_hover))
                             .hover(move |row| row.bg(chrome.button))
-                            .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _, _| {
-                                if ev.click_count == 1 {
-                                    down_pos.set(Some(ev.position));
-                                } else {
-                                    down_pos.set(None);
-                                }
-                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |viewer, ev: &MouseDownEvent, _, _| {
+                                    viewer.record_cue_mouse_down(idx, ev.click_count, ev.position);
+                                }),
+                            )
                             .on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(move |viewer, ev: &MouseUpEvent, window, cx| {
-                                    if let Some(origin) = down_pos_up.take() {
-                                        let dx: f32 = (ev.position.x - origin.x).into();
-                                        let dy: f32 = (ev.position.y - origin.y).into();
-                                        if dx.abs() < 4.0 && dy.abs() < 4.0 {
-                                            viewer.seek_video(start_secs, window, cx);
-                                        }
+                                    if viewer.take_cue_click(idx, ev.position) {
+                                        viewer.seek_video(start_secs, window, cx);
                                     }
                                 }),
                             )
@@ -2642,6 +2663,28 @@ mod tests {
             );
             assert_eq!(resolved_cues, cues);
             let _ = window.draw(cx);
+            // Verify cue row click tracking persists across 30fps playback re-renders while
+            // rejecting drag selections and mismatched cue indices.
+            iv.update(cx, |v, cx| {
+                v.record_cue_mouse_down(1, 1, gpui::point(px(40.), px(60.)));
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+            assert!(
+                iv.update(cx, |v, _| v
+                    .take_cue_click(1, gpui::point(px(41.), px(61.)))),
+                "cue click must survive a re-render between mouse-down and mouse-up"
+            );
+            iv.update(cx, |v, cx| {
+                v.record_cue_mouse_down(1, 1, gpui::point(px(40.), px(60.)));
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+            assert!(
+                !iv.update(cx, |v, _| v
+                    .take_cue_click(1, gpui::point(px(75.), px(60.)))),
+                "text drag-selection must NOT trigger a cue click seek"
+            );
             iv.update(cx, |v, cx| v.evict_assets(window, cx));
         });
         cx.run_until_parked();

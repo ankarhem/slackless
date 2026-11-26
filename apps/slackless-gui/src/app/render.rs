@@ -1602,7 +1602,6 @@ impl App {
 
 impl Render for App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        crate::media::inline_video_begin_frame(cx);
         // Owned color copies: `cx.theme()` borrows `cx`, so nothing may outlive the
         // statement that reads it across the `cx.listener` calls in the helpers below.
         let background = cx.theme().background;
@@ -1727,8 +1726,9 @@ impl Render for App {
             .child({
                 let nav_app = cx.weak_entity();
                 canvas(
-                    |_, _, _| {},
-                    move |_, _, window, _| {
+                    |_, _, cx| crate::media::inline_video_begin_paint(cx),
+                    move |_, paint_epoch, window, cx| {
+                        crate::media::inline_video_finish_paint(paint_epoch, window, cx);
                         let nav_app = nav_app.clone();
                         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
                             if phase != DispatchPhase::Capture {

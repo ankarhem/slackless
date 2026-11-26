@@ -684,6 +684,10 @@ impl App {
         if index == self.workspace || index >= self.parked.len() {
             return;
         }
+        // Stop any active inline video / PiP dock or full-screen viewer from the outgoing
+        // workspace before swapping bridges, auth cookies, and fixtures.
+        crate::media::stop_active_inline_video(window, cx);
+        self.close_image_viewer(window, cx);
         self.save_draft(cx);
         self.bridge
             .send(ChannelCommand::CloseConversation(self.channel.clone()));

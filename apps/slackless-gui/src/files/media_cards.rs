@@ -710,9 +710,6 @@ impl RenderOnce for VideoFrame {
             .as_ref()
             .and_then(|src| loaded_image_dims(src, window, cx));
         let snap = crate::media::inline_video_snapshot(&id_str, cx);
-        if snap.is_some() {
-            crate::media::mark_inline_video_rendered(&id_str, cx);
-        }
         let theme = cx.theme();
         let (w, h) = resolve_video_preview_size(
             video_dimensions(&file),
@@ -998,9 +995,7 @@ impl RenderOnce for VideoFrame {
                         && bounds.top() < vp.height - px(12.)
                         && bounds.right() > px(0.)
                         && bounds.left() < vp.width;
-                    crate::media::update_inline_video_viewport_visibility(
-                        &id_vis, visible, window, cx,
-                    );
+                    crate::media::report_inline_video_painted(&id_vis, visible, cx);
                 },
                 |_, (), _, _| {},
             )
