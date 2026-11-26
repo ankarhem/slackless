@@ -79,6 +79,11 @@ pub struct BlockKitState {
     suggestion_queries: HashMap<String, Entity<TextareaState>>,
     /// Keys currently waiting on an in-flight `blocks.suggestions` request.
     suggestions_loading: HashSet<String>,
+    /// Monotonic per-control sequence number for `blocks.suggestions` requests so stale
+    /// out-of-order responses never overwrite newer queries.
+    suggestion_seq: HashMap<String, u64>,
+    /// Most recent in-flight query string per `external_select` control key for deduping.
+    suggestion_last_query: HashMap<String, String>,
     /// Inline validation errors keyed by `block_id` (`views.submit` `response_action: "errors"`
     /// and local required/typed field checks, `F-COLLAB-612`).
     block_errors: HashMap<String, String>,
@@ -89,15 +94,50 @@ pub struct BlockKitState {
 }
 
 impl BlockKitState {
-    /// Store dynamically loaded `blocks.suggestions` options for `key`.
-    pub fn set_suggestions(&mut self, key: String, options: Vec<(String, String)>) {
-        self.suggestions_loading.remove(&key);
-        self.suggestions.insert(key, options);
+    /// Start a sequenced `blocks.suggestions` request for `base_key` with `query`.
+    /// Returns `None` if an identical query is already in flight for `base_key`, avoiding
+    /// duplicate rapid clicks while still allowing a newer query to supersede a slow request.
+    pub fn begin_suggestion_request(&mut self, base_key: &str, query: &str) -> Option<String> {
+        if self.suggestions_loading.contains(base_key)
+            && self
+                .suggestion_last_query
+                .get(base_key)
+                .is_some_and(|prev| prev == query)
+        {
+            return None;
+        }
+        let next = self
+            .suggestion_seq
+            .get(base_key)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(1);
+        self.suggestion_seq.insert(base_key.to_owned(), next);
+        self.suggestion_last_query
+            .insert(base_key.to_owned(), query.to_owned());
+        self.suggestions_loading.insert(base_key.to_owned());
+        Some(format!("{base_key}#seq={next}"))
     }
 
-    /// Mark an `external_select` key as currently loading suggestions.
-    pub fn mark_suggestions_loading(&mut self, key: String) {
-        self.suggestions_loading.insert(key);
+    /// Store dynamically loaded `blocks.suggestions` options for `key`.
+    /// When `key` carries a `#seq=N` suffix from [`Self::begin_suggestion_request`], stale
+    /// out-of-order responses whose sequence number does not match the latest request are dropped.
+    pub fn set_suggestions(&mut self, key: String, options: Vec<(String, String)>) {
+        let (base_key, seq) = match key.rsplit_once("#seq=") {
+            Some((base, raw_seq)) => match raw_seq.parse::<u64>() {
+                Ok(n) => (base.to_owned(), Some(n)),
+                Err(_) => (key, None),
+            },
+            None => (key, None),
+        };
+        if let Some(seq) = seq
+            && self.suggestion_seq.get(&base_key).copied() != Some(seq)
+        {
+            return;
+        }
+        self.suggestions_loading.remove(&base_key);
+        self.suggestion_last_query.remove(&base_key);
+        self.suggestions.insert(base_key, options);
     }
 
     /// Replace all inline `block_id -> error` validation messages (e.g. from `views.submit`).
@@ -940,4 +980,50 @@ pub fn collect_modal_state(
             .and_then(|k| map.remove(k))
             .unwrap_or_else(|| "Missing or invalid field.".to_owned())
     })
+}
+
+#[cfg(test)]
+mod suggestion_race_tests {
+    use super::*;
+
+    #[test]
+    fn external_select_suggestions_dedupe_and_drop_stale_responses() {
+        let mut state = BlockKitState::default();
+        let key = "modal:V1/b1/act1";
+
+        let req1 = state
+            .begin_suggestion_request(key, "alp")
+            .expect("first request starts");
+        assert!(req1.starts_with(key));
+        // Duplicate rapid click with same query while in flight is suppressed.
+        assert!(state.begin_suggestion_request(key, "alp").is_none());
+
+        // User edits query before req1 completes -> supersedes with req2.
+        let req2 = state
+            .begin_suggestion_request(key, "alpha")
+            .expect("new query supersedes in-flight request");
+        assert_ne!(req1, req2);
+
+        // Latest response lands first.
+        state.set_suggestions(req2, vec![("Alpha".into(), "a".into())]);
+        assert!(!state.suggestions_loading.contains(key));
+        assert_eq!(
+            state.suggestions.get(key),
+            Some(&vec![("Alpha".into(), "a".into())])
+        );
+
+        // Stale out-of-order req1 arrives later and must be ignored.
+        state.set_suggestions(req1, vec![("Stale".into(), "s".into())]);
+        assert_eq!(
+            state.suggestions.get(key),
+            Some(&vec![("Alpha".into(), "a".into())])
+        );
+
+        // Unsequenced keys remain backwards-compatible.
+        state.set_suggestions(key.to_owned(), vec![("Direct".into(), "d".into())]);
+        assert_eq!(
+            state.suggestions.get(key),
+            Some(&vec![("Direct".into(), "d".into())])
+        );
+    }
 }

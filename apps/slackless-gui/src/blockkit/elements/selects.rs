@@ -44,16 +44,17 @@ pub(in crate::blockkit) fn external_select(
         }
     }
 
-    let (loaded, is_loading, query_input) = match kcx.kit {
+    let (loaded, is_loading, last_query, query_input) = match kcx.kit {
         Some(kit) => {
             let state = kit.read(cx);
             (
                 state.suggestions.get(&key).cloned(),
                 state.suggestions_loading.contains(&key),
+                state.suggestion_last_query.get(&key).cloned(),
                 state.suggestion_queries.get(&key).cloned(),
             )
         }
-        None => (None, false, None),
+        None => (None, false, None, None),
     };
     if let Some(live) = loaded {
         for (text, val) in live {
@@ -76,7 +77,17 @@ pub(in crate::blockkit) fn external_select(
     };
 
     let has_query = query_input.is_some();
-    let fetch_label = if is_loading {
+    let current_query = query_input
+        .as_ref()
+        .map(|q| q.read(cx).value().trim().to_owned())
+        .unwrap_or_default();
+    // Only disable the button while the exact same query is still in flight; editing the query
+    // lets the user supersede a slow request, and stale out-of-order responses are dropped.
+    let same_query_in_flight = is_loading
+        && last_query
+            .as_deref()
+            .is_none_or(|prev| prev == current_query);
+    let fetch_label = if same_query_in_flight {
         "Loading\u{2026}"
     } else if has_query {
         "Search"
@@ -92,7 +103,7 @@ pub(in crate::blockkit) fn external_select(
         .with_size(Size::Small)
         .icon(IconName::Search)
         .label(fetch_label)
-        .disabled(is_loading)
+        .disabled(same_query_in_flight)
         .on_click(move |_, window, cx| {
             let value = query_for_btn
                 .as_ref()
@@ -107,15 +118,23 @@ pub(in crate::blockkit) fn external_select(
                 );
                 return;
             }
-            if let Some(kit) = &kit_for_fetch {
-                kit.update(cx, |state, cx| {
-                    state.mark_suggestions_loading(key_for_btn.clone());
-                    cx.notify();
-                });
-            }
+            let request_key = if let Some(kit) = &kit_for_fetch {
+                let Some(seq_key) = kit.update(cx, |state, cx| {
+                    let req = state.begin_suggestion_request(&key_for_btn, &value);
+                    if req.is_some() {
+                        cx.notify();
+                    }
+                    req
+                }) else {
+                    return;
+                };
+                seq_key
+            } else {
+                key_for_btn.clone()
+            };
             on_suggest(
                 SuggestRequest {
-                    key: key_for_btn.clone(),
+                    key: request_key,
                     action_id: action_for_btn.clone(),
                     block_id: block_for_btn.clone(),
                     value,

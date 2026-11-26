@@ -464,6 +464,10 @@ impl App {
     /// Build the list of all mounted workspace archives (active + parked live workspaces, or all
     /// fixture workspaces in sample mode) and hand them to `SearchView` for "All workspaces" FTS5.
     pub(in crate::app) fn sync_search_workspace_sources(&self, cx: &mut Context<Self>) {
+        self.sync_search_workspace_sources_inner(true, cx);
+    }
+
+    fn sync_search_workspace_sources_inner(&self, refresh: bool, cx: &mut Context<Self>) {
         let mut sources: Vec<SearchWorkspaceSource> = Vec::new();
         if !self.fixtures.sample {
             let count = self.live_teams.len().max(1);
@@ -513,7 +517,11 @@ impl App {
             }
         }
         self.results.update(cx, |results, cx| {
-            results.set_workspace_sources(sources, cx);
+            if refresh {
+                results.set_workspace_sources(sources, cx);
+            } else {
+                results.set_workspace_sources_quiet(sources);
+            }
         });
     }
 
@@ -550,7 +558,7 @@ impl App {
     /// pill's Enter and the dropdown's rows both land here; the dropdown's filter chips
     /// (and only its non-empty query) narrow the run and join its history.
     pub(super) fn run_message_search(&mut self, query: String, cx: &mut Context<Self>) {
-        self.sync_search_workspace_sources(cx);
+        self.sync_search_workspace_sources_inner(false, cx);
         let filters = self
             .search_menu
             .read(cx)
@@ -793,10 +801,15 @@ impl App {
         if index == self.workspace || index >= self.parked.len() {
             return;
         }
-        // Stop any active inline video / PiP dock or full-screen viewer from the outgoing
-        // workspace before swapping bridges, auth cookies, and fixtures.
+        // Stop any active inline video / PiP dock, full-screen viewer, PDF render cache, or
+        // open app modal / workflow details dialog from the outgoing workspace before swapping
+        // bridges, auth cookies, and fixtures.
         crate::media::stop_active_inline_video(window, cx);
         self.close_image_viewer(window, cx);
+        crate::media::clear_pdf_cache(window, cx);
+        self.modal_stack
+            .update(cx, |stack, cx| stack.dismiss_all(window, cx));
+        self.workflow_details = None;
         self.save_draft(cx);
         self.bridge
             .send(ChannelCommand::CloseConversation(self.channel.clone()));

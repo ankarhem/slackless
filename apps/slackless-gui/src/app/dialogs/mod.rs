@@ -674,7 +674,8 @@ impl App {
     /// like the row's context menu. A pick routes through the transcript's handler and the
     /// menu dismisses itself (its [`DismissEvent`] closes the overlay).
     pub(super) fn open_remind_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.remind_menu.is_some()
+        if self.image_viewer.is_some()
+            || self.remind_menu.is_some()
             || self.picker.is_some()
             || !window
                 .focused(cx)
