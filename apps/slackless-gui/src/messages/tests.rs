@@ -477,6 +477,36 @@ fn one_key_reply_and_pin_emit_the_transcript_events(cx: &mut TestAppContext) {
     });
 }
 
+/// Dismissing an "Only visible to you" message drops its row from the virtual list with it,
+/// as a delete does, and reports nothing to the store.
+#[gpui::test]
+fn dismissing_an_ephemeral_message_drops_its_row_from_the_virtual_list(cx: &mut TestAppContext) {
+    with_transcript("C0ENG", cx, |harness, cx| {
+        cx.update(|window, cx| {
+            let list = harness.read(cx).list.clone();
+            list.update(cx, |list, cx| {
+                let before = list.data.read(cx).messages.len();
+                assert_eq!(list.scroller.read(cx).item_count(), before);
+                let ts = list.data.read(cx).messages[0].ts.clone();
+                list.run_action(&ts, MessageAction::DismissEphemeral, window, cx);
+                assert_eq!(list.data.read(cx).messages.len(), before - 1);
+                assert_eq!(
+                    list.scroller.read(cx).item_count(),
+                    before - 1,
+                    "the dismissed message's row left the list with it"
+                );
+            });
+        });
+        assert!(
+            !harness.update(cx, |harness, _| harness
+                .events
+                .borrow()
+                .contains(&"changed")),
+            "dismissing is local: nothing is reported to the store"
+        );
+    });
+}
+
 #[gpui::test]
 fn initial_unread_scroll_fires_once_and_ignores_backfill_refreshes(cx: &mut TestAppContext) {
     with_transcript("D0ALICE", cx, |harness, cx| {

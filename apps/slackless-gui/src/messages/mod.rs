@@ -1004,15 +1004,25 @@ impl MessageList {
                 });
             }
             MessageAction::DismissEphemeral => {
-                let target = ts.clone();
+                let row = self
+                    .data
+                    .read(cx)
+                    .messages
+                    .iter()
+                    .position(|message| &message.ts == ts);
                 if let Some(history) = self.messages.get_mut(&self.channel) {
-                    history.retain(|m| m.ts != target);
+                    history.retain(|m| &m.ts != ts);
                 }
                 self.data.update(cx, |data, cx| {
-                    data.messages.retain(|m| m.ts != target);
+                    data.messages.retain(|m| &m.ts != ts);
                     data.recompute_first_unread();
                     cx.notify();
                 });
+                if let Some(row) = row {
+                    self.scroller.update(cx, |scroller, cx| {
+                        scroller.splice(row..row + 1, 0, cx);
+                    });
+                }
                 cx.notify();
             }
             MessageAction::OpenProfile(user) => cx.emit(MessageListEvent::OpenProfile(user)),
@@ -1646,7 +1656,7 @@ impl Render for MessageList {
                 if store.messages.is_empty() {
                     return div();
                 }
-                let message = &store.messages[ix.min(store.messages.len() - 1)];
+                let message = &store.messages[ix];
                 let has_inputs = message.blocks.iter().any(
                     |block| matches!(block, Block::Unknown { r#type, .. } if r#type == "input"),
                 );
@@ -1656,7 +1666,6 @@ impl Render for MessageList {
                 blockkit::prepare_inputs(&kit, &message, window, cx);
             }
             let store = data.read(cx);
-            let ix = ix.min(store.messages.len() - 1);
             transcript_row(store, ix, &this, &now, cx)
         })
         .jump_button(true)
