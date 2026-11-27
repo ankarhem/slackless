@@ -9,7 +9,7 @@ impl PopoutWindow {
         channel: &ChannelId,
         people: &[slackless_core::types::UserId],
         pal: &HuddlePalette,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> Option<gpui_kit::gpui::Div> {
         match self.huddle_popover {
             Some(HuddlePopover::Camera) => {
@@ -39,7 +39,7 @@ impl PopoutWindow {
         &self,
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
         pal: &HuddlePalette,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         use gpui_kit::component::Icon;
         use slackless_core::huddle::list_audio_devices;
@@ -223,7 +223,7 @@ impl PopoutWindow {
         video_now: bool,
         blur_now: bool,
         pal: &HuddlePalette,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         use gpui_kit::component::Icon;
 
@@ -409,7 +409,7 @@ impl PopoutWindow {
         &self,
         active_source: Option<&str>,
         pal: &HuddlePalette,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
         use gpui_kit::component::Icon;
         use gpui_kit::gpui::{Corners, ObjectFit};
@@ -987,7 +987,7 @@ impl PopoutWindow {
         &self,
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
         pal: &HuddlePalette,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         use slackless_core::huddle::{HuddleDataEvent, HuddleReactionKind};
 
@@ -1211,7 +1211,7 @@ impl PopoutWindow {
         &self,
         active_bg: Option<&str>,
         pal: &HuddlePalette,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         const THEMES: [(&str, &str, u32); 7] = [
             ("default", "Match theme", 0xCBEAD7),
@@ -1291,7 +1291,7 @@ impl PopoutWindow {
         channel: &ChannelId,
         people: &[slackless_core::types::UserId],
         pal: &HuddlePalette,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         let candidates: Vec<_> = self
             .fixtures

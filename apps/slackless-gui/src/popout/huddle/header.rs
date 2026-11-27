@@ -8,7 +8,7 @@ impl PopoutWindow {
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
         people_count: usize,
         pal: &HuddlePalette,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
         use gpui_kit::component::Icon;
 
@@ -131,7 +131,7 @@ impl PopoutWindow {
         &self,
         active_key: &str,
         pal: &HuddlePalette,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::AnyElement {
         use gpui_kit::component::Icon;
 
@@ -298,7 +298,7 @@ impl PopoutWindow {
         &self,
         topic: Option<&str>,
         pal: &HuddlePalette,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         let hover = pal.drawer_hover;
         if let Some(input) = &self.huddle_topic_editing {

@@ -87,29 +87,6 @@ pub fn is_hand(emoji: Option<&str>) -> bool {
     matches!(emoji, Some("raised_hand" | "\u{270B}"))
 }
 
-/// Snapshot consumed by `PopoutKind::Huddle` and `HuddleFloatingPanel` so secondary windows stay
-/// in lock-step with [`HuddleState`]; shared, so a popped-out window's render reuses the copy its
-/// observer took on the last change. The collections are shared with [`HuddleState`] (copied on
-/// write there), so a copy of this is shallow whatever their size. Live video frames live in a
-/// separate [`HuddleVideoStore`] entity so high-frequency video updates never repaint the main
-/// window.
-#[derive(Clone)]
-pub struct HuddleViewState {
-    pub session: HuddleSessionSnapshot,
-    pub participants: Rc<Vec<UserId>>,
-    pub levels: Rc<HuddleAudioLevels>,
-    pub elapsed_secs: u64,
-    pub raised_hands: Rc<HashSet<UserId>>,
-    pub sticky_emojis: Rc<HashMap<UserId, String>>,
-    pub reactions: Rc<Vec<ReactionEntry>>,
-    pub active_effect: Option<ActiveEffect>,
-    pub draw_strokes: Rc<Vec<DrawStrokeEntry>>,
-    pub draw_cursors: Rc<HashMap<UserId, DrawCursorEntry>>,
-    pub draw_mode: bool,
-    pub draw_hue: i32,
-    pub captions: Rc<Vec<CaptionLine>>,
-}
-
 /// App-level actions emitted by [`HuddleState`] (floating panel lifecycle, desktop pen draw
 /// packets, and control requests from secondary windows).
 pub enum HuddleStateEvent {
@@ -350,6 +327,34 @@ impl HuddleState {
 
     pub fn draw_hue(&self) -> i32 {
         self.draw_hue
+    }
+
+    pub fn raised_hands(&self) -> &HashSet<UserId> {
+        &self.raised_hands
+    }
+
+    pub fn sticky_emojis(&self) -> &HashMap<UserId, String> {
+        &self.sticky_emojis
+    }
+
+    pub fn reactions(&self) -> &[ReactionEntry] {
+        &self.reactions
+    }
+
+    pub fn active_effect(&self) -> Option<&ActiveEffect> {
+        self.active_effect.as_ref()
+    }
+
+    pub fn draw_strokes(&self) -> &[DrawStrokeEntry] {
+        &self.draw_strokes
+    }
+
+    pub fn draw_cursors(&self) -> &HashMap<UserId, DrawCursorEntry> {
+        &self.draw_cursors
+    }
+
+    pub fn captions(&self) -> &[CaptionLine] {
+        &self.captions
     }
 
     fn local_draw_item_id(&self) -> String {
@@ -1136,24 +1141,6 @@ impl HuddleState {
             cx.notify();
         }
     }
-
-    pub fn view_state(&self) -> Rc<HuddleViewState> {
-        Rc::new(HuddleViewState {
-            session: self.session.clone(),
-            participants: self.participants.clone(),
-            levels: self.levels.clone(),
-            elapsed_secs: self.elapsed_secs,
-            raised_hands: self.raised_hands.clone(),
-            sticky_emojis: self.sticky_emojis.clone(),
-            reactions: self.reactions.clone(),
-            active_effect: self.active_effect.clone(),
-            draw_strokes: self.draw_strokes.clone(),
-            draw_cursors: self.draw_cursors.clone(),
-            draw_mode: self.draw_mode,
-            draw_hue: self.draw_hue,
-            captions: self.captions.clone(),
-        })
-    }
 }
 
 #[cfg(test)]
@@ -1242,14 +1229,8 @@ mod tests {
                         cx,
                     );
                 }
-                assert_eq!(s.view_state().reactions.len(), 24);
-                assert_eq!(
-                    s.view_state()
-                        .active_effect
-                        .as_ref()
-                        .map(|e| e.emoji.as_str()),
-                    Some("e29")
-                );
+                assert_eq!(s.reactions().len(), 24);
+                assert_eq!(s.active_effect().map(|e| e.emoji.as_str()), Some("e29"));
 
                 // 2. Regression: StickyEmoji("raised_hand") followed by StickyEmoji("coffee")
                 // MUST clear `raised_hands` so peer's hand isn't stuck raised!
@@ -1260,9 +1241,9 @@ mod tests {
                     },
                     cx,
                 );
-                assert!(s.view_state().raised_hands.contains(&peer));
+                assert!(s.raised_hands().contains(&peer));
                 assert_eq!(
-                    s.view_state().sticky_emojis.get(&peer).map(String::as_str),
+                    s.sticky_emojis().get(&peer).map(String::as_str),
                     Some("raised_hand")
                 );
 
@@ -1274,11 +1255,11 @@ mod tests {
                     cx,
                 );
                 assert!(
-                    !s.view_state().raised_hands.contains(&peer),
+                    !s.raised_hands().contains(&peer),
                     "switching sticky emoji away from raised_hand must clear raised_hands"
                 );
                 assert_eq!(
-                    s.view_state().sticky_emojis.get(&peer).map(String::as_str),
+                    s.sticky_emojis().get(&peer).map(String::as_str),
                     Some("coffee")
                 );
 
@@ -1299,8 +1280,8 @@ mod tests {
                     cx,
                 );
                 assert!(!s.session().hand_raised);
-                assert!(!s.view_state().raised_hands.contains(&me));
-                assert!(!s.view_state().sticky_emojis.contains_key(&me));
+                assert!(!s.raised_hands().contains(&me));
+                assert!(!s.sticky_emojis().contains_key(&me));
 
                 // 4. Captions: partial from same speaker updates in-place; finalizes; caps at 4.
                 s.apply_data_event(
@@ -1323,9 +1304,9 @@ mod tests {
                     },
                     cx,
                 );
-                assert_eq!(s.view_state().captions.len(), 1);
-                assert_eq!(s.view_state().captions[0].text, "Hello world");
-                assert_eq!(s.view_state().captions[0].lang.as_deref(), Some("en"));
+                assert_eq!(s.captions().len(), 1);
+                assert_eq!(s.captions()[0].text, "Hello world");
+                assert_eq!(s.captions()[0].lang.as_deref(), Some("en"));
                 for i in 0..6 {
                     s.apply_data_event(
                         &HuddleDataEvent::Caption {
@@ -1338,7 +1319,7 @@ mod tests {
                         cx,
                     );
                 }
-                assert_eq!(s.view_state().captions.len(), 4);
+                assert_eq!(s.captions().len(), 4);
 
                 // 5. Topic, Jukebox, MutedByPeer, room meta.
                 s.apply_data_event(
@@ -1501,12 +1482,11 @@ mod tests {
                     cx,
                 );
 
-                let vs = s.view_state();
-                assert_eq!(vs.draw_strokes.len(), 1);
-                assert_eq!(vs.draw_strokes[0].hue, 140);
-                assert!(vs.draw_strokes[0].ended);
-                assert_eq!(vs.draw_strokes[0].segments, vec![seg2]);
-                assert!(vs.draw_cursors.contains_key(&peer));
+                assert_eq!(s.draw_strokes().len(), 1);
+                assert_eq!(s.draw_strokes()[0].hue, 140);
+                assert!(s.draw_strokes()[0].ended);
+                assert_eq!(s.draw_strokes()[0].segments, vec![seg2]);
+                assert!(s.draw_cursors().contains_key(&peer));
 
                 // Local draw mode + hue + commit stroke.
                 s.toggle_draw_mode(cx);
@@ -1514,7 +1494,7 @@ mod tests {
                 s.set_draw_hue(30, cx);
                 assert_eq!(s.draw_hue(), 30);
                 s.commit_local_draw_stroke("local-1".into(), 30, vec![seg1], cx);
-                assert_eq!(s.view_state().draw_strokes.len(), 2);
+                assert_eq!(s.draw_strokes().len(), 2);
 
                 // Session sharing transitions emit OpenFloatingPanel then CloseFloatingPanel and
                 // disable draw_mode when sharing stops.

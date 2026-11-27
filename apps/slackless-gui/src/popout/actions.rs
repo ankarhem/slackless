@@ -5,7 +5,7 @@ use std::cell::Cell;
 
 use gpui_kit::component::input::TextareaState;
 use gpui_kit::gpui::{
-    AppContext as _, ClipboardItem, Context, Focusable as _, Pixels, Point, Window,
+    App, AppContext as _, ClipboardItem, Context, Focusable as _, Pixels, Point, Window,
 };
 use slackless_core::api::MessageContent;
 use slackless_core::types::{ChannelId, Message, Ts};
@@ -507,7 +507,7 @@ impl PopoutWindow {
     /// [`Self::send_guarded`] once the text holds no secret: ask before a broadcast goes out, as
     /// the main window does; canceling puts the text back in the composer.
     fn guard_broadcast(&mut self, outgoing: Outgoing, window: &mut Window, cx: &mut Context<Self>) {
-        let guard = self.send_target().and_then(|(channel, _)| {
+        let guard = self.send_target(cx).and_then(|(channel, _)| {
             crate::app::broadcast_guard(&outgoing.content, &self.fixtures, &channel, None)
         });
         let Some(guard) = guard else {
@@ -559,11 +559,9 @@ impl PopoutWindow {
         cx: &mut Context<Self>,
     ) {
         if matches!(&self.kind, PopoutKind::Huddle { .. }) {
-            let Some(state) = &self.huddle_state else {
+            let Some((channel, thread_ts)) = self.huddle_thread_target(cx) else {
                 return;
             };
-            let channel = state.session.channel.clone();
-            let thread_ts = self.resolve_huddle_thread_root(&state.session);
             let broadcast = broadcast
                 || (self.composer.as_ref())
                     .is_some_and(|c| c.update(cx, |composer, cx| composer.take_also_send(cx)));
@@ -644,7 +642,7 @@ impl PopoutWindow {
 
     /// Upload `outgoing`'s files with its text (if any).
     fn upload(&mut self, outgoing: Outgoing, cx: &mut Context<Self>) {
-        let Some((channel, thread_ts)) = self.send_target() else {
+        let Some((channel, thread_ts)) = self.send_target(cx) else {
             return;
         };
         let Outgoing { content, files, .. } = outgoing;
@@ -661,17 +659,13 @@ impl PopoutWindow {
     }
 
     /// Where the composer sends: its conversation, its thread, or the huddle's thread.
-    fn send_target(&self) -> Option<(ChannelId, Option<Ts>)> {
+    fn send_target(&self, cx: &App) -> Option<(ChannelId, Option<Ts>)> {
         match &self.kind {
             PopoutKind::Conversation { channel, .. } => Some((channel.clone(), None)),
             PopoutKind::Thread {
                 channel, thread_ts, ..
             } => Some((channel.clone(), Some(thread_ts.clone()))),
-            PopoutKind::Huddle { .. } => {
-                let state = self.huddle_state.as_ref()?;
-                let thread_ts = self.resolve_huddle_thread_root(&state.session);
-                Some((state.session.channel.clone(), thread_ts))
-            }
+            PopoutKind::Huddle { .. } => self.huddle_thread_target(cx),
             PopoutKind::Activity { .. }
             | PopoutKind::Later { .. }
             | PopoutKind::Canvas { .. }

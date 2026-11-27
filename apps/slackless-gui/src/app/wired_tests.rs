@@ -234,7 +234,7 @@ fn wired_huddle_lifecycle_commands_events_media_and_teardown(cx: &mut gpui::Test
     cx.update(|window, cx| {
         let _ = window.draw(cx);
         let state = app.read(cx).huddle_state.as_ref().unwrap().read(cx);
-        assert_eq!(state.view_state().levels.active_speakers.len(), 1);
+        assert_eq!(state.levels().active_speakers.len(), 1);
         assert!(
             state.video_store().read(cx).frames().contains_key(&tile),
             "VideoFrame via HuddleMediaHub must land in HuddleVideoStore"

@@ -12,9 +12,9 @@ struct ParticipantTileLayout {
 impl PopoutWindow {
     pub(super) fn render_huddle_stage(
         &self,
-        state: &crate::huddle_state::HuddleViewState,
+        state: &crate::huddle_state::HuddleState,
         pal: &HuddlePalette,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> Option<gpui_kit::gpui::Div> {
         use slackless_core::huddle::{HuddleDrawMessage, VideoTileKey};
 
@@ -32,8 +32,8 @@ impl PopoutWindow {
             }
             screens.sort_by(|a, b| a.0.cmp(&b.0));
             if let Some(v) = frames.get(&VideoTileKey::LocalScreen) {
-                let local_item = if !state.session.attendee_id.is_empty() {
-                    state.session.attendee_id.clone()
+                let local_item = if !state.session().attendee_id.is_empty() {
+                    state.session().attendee_id.clone()
                 } else {
                     self.fixtures.self_user.to_string()
                 };
@@ -73,8 +73,8 @@ impl PopoutWindow {
         let white = pal.scrim_fg;
         let emerald = pal.success;
         let primary = pal.primary;
-        let draw_mode = state.draw_mode;
-        let draw_hue = state.draw_hue;
+        let draw_mode = state.draw_mode();
+        let draw_hue = state.draw_hue();
         let draw_btn = {
             let item = primary_item_id.clone();
             h_flex()
@@ -359,20 +359,20 @@ impl PopoutWindow {
         pane_ix: usize,
         item_id: String,
         frame: crate::huddle_state::DisplayVideoFrame,
-        state: &crate::huddle_state::HuddleViewState,
-        cx: &mut Context<Self>,
+        state: &crate::huddle_state::HuddleState,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
         use gpui_kit::gpui::{Corners, ObjectFit};
         use slackless_core::huddle::HuddleDrawMessage;
 
         let filter_id = item_id.clone();
         let strokes: Vec<_> = state
-            .draw_strokes
+            .draw_strokes()
             .iter()
             .filter(|s| s.item_id.is_empty() || s.item_id == filter_id || pane_ix == 0)
             .cloned()
             .collect();
-        let active_hue = state.draw_hue;
+        let active_hue = state.draw_hue();
         let local_live_segments = if pane_ix == 0
             && self.huddle_drawing_active
             && !self.huddle_draw_local_segments.is_empty()
@@ -382,7 +382,7 @@ impl PopoutWindow {
             None
         };
         let cursors: Vec<_> = state
-            .draw_cursors
+            .draw_cursors()
             .iter()
             .filter(|(_, c)| c.item_id.is_empty() || c.item_id == filter_id || pane_ix == 0)
             .map(|(uid, c)| {
@@ -555,7 +555,7 @@ impl PopoutWindow {
             .overflow_hidden()
             .child(stage_canvas);
 
-        if state.draw_mode && pane_ix == 0 {
+        if state.draw_mode() && pane_ix == 0 {
             pane = pane
                 .cursor_crosshair()
                 .on_mouse_down(
@@ -743,7 +743,7 @@ impl PopoutWindow {
 
     pub(super) fn render_huddle_tiles(
         &self,
-        state: &crate::huddle_state::HuddleViewState,
+        state: &crate::huddle_state::HuddleState,
         people: &[slackless_core::types::UserId],
         pal: &HuddlePalette,
         cx: &Context<Self>,
@@ -782,7 +782,7 @@ impl PopoutWindow {
 
     pub(super) fn render_huddle_filmstrip(
         &self,
-        state: &crate::huddle_state::HuddleViewState,
+        state: &crate::huddle_state::HuddleState,
         people: &[slackless_core::types::UserId],
         pal: &HuddlePalette,
         cx: &Context<Self>,
@@ -814,7 +814,7 @@ impl PopoutWindow {
 
     fn render_huddle_participant_tile(
         &self,
-        state: &crate::huddle_state::HuddleViewState,
+        state: &crate::huddle_state::HuddleState,
         uid: &slackless_core::types::UserId,
         pal: &HuddlePalette,
         layout: ParticipantTileLayout,
@@ -830,20 +830,20 @@ impl PopoutWindow {
             avatar_px,
             full_bleed_avatar,
         } = layout;
-        let snap = &state.session;
+        let snap = state.session();
         let is_self = *uid == self.fixtures.self_user;
         let speaking =
-            crate::huddle_video::is_user_speaking(is_self, snap.muted, &state.levels, uid);
+            crate::huddle_video::is_user_speaking(is_self, snap.muted, state.levels(), uid);
         let is_muted = if is_self {
             snap.muted
         } else {
-            state.levels.muted_peers.contains(uid)
+            state.levels().muted_peers.contains(uid)
         };
         let badge_glyph = state
-            .sticky_emojis
+            .sticky_emojis()
             .get(uid)
             .map(|s| sticky_emoji_glyph(s).to_owned())
-            .or_else(|| state.raised_hands.contains(uid).then(|| "✋".to_owned()));
+            .or_else(|| state.raised_hands().contains(uid).then(|| "✋".to_owned()));
         let video_frame = self
             .huddle_video
             .as_ref()
@@ -1001,14 +1001,14 @@ impl PopoutWindow {
 
     pub(super) fn render_huddle_floating_reactions(
         &self,
-        state: &crate::huddle_state::HuddleViewState,
+        state: &crate::huddle_state::HuddleState,
         pal: &HuddlePalette,
     ) -> Option<gpui_kit::gpui::Div> {
-        if state.reactions.is_empty() {
+        if state.reactions().is_empty() {
             return None;
         }
         let mut stacked: Vec<(String, usize, Vec<String>)> = Vec::new();
-        for entry in state.reactions.iter() {
+        for entry in state.reactions().iter() {
             let who = self.fixtures.user_name(&entry.user).to_owned();
             if let Some(slot) = stacked.iter_mut().find(|(em, _, _)| *em == entry.emoji) {
                 slot.1 += 1;
@@ -1053,15 +1053,15 @@ impl PopoutWindow {
 
     pub(super) fn render_huddle_floating_captions(
         &self,
-        state: &crate::huddle_state::HuddleViewState,
+        state: &crate::huddle_state::HuddleState,
         pal: &HuddlePalette,
     ) -> Option<gpui_kit::gpui::Div> {
-        let show_captions = state.session.captions_enabled || !state.captions.is_empty();
+        let show_captions = state.session().captions_enabled || !state.captions().is_empty();
         if !show_captions {
             return None;
         }
         let latest_lang = state
-            .captions
+            .captions()
             .iter()
             .rev()
             .find_map(|line| line.lang.as_deref())
@@ -1117,7 +1117,7 @@ impl PopoutWindow {
             .shadow_xl()
             .child(header);
 
-        if state.captions.is_empty() {
+        if state.captions().is_empty() {
             cap_box = cap_box.child(
                 div()
                     .w_full()
@@ -1133,7 +1133,7 @@ impl PopoutWindow {
                 uid: &'a slackless_core::types::UserId,
                 lines: Vec<(usize, &'a str, bool)>,
             }
-            let total = state.captions.len();
+            let total = state.captions().len();
             let mut groups: Vec<CaptionTurn<'_>> = Vec::new();
             for (
                 idx,
@@ -1143,7 +1143,7 @@ impl PopoutWindow {
                     partial: is_partial,
                     ..
                 },
-            ) in state.captions.iter().enumerate()
+            ) in state.captions().iter().enumerate()
             {
                 if let Some(prev) = groups.last_mut()
                     && prev.uid == uid

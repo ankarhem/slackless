@@ -8,7 +8,7 @@ impl PopoutWindow {
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
         status_color: Hsla,
         pal: &HuddlePalette,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         use gpui_kit::component::Icon;
         use slackless_core::huddle::{list_audio_devices, list_cameras, list_screen_sources};
@@ -433,7 +433,7 @@ impl PopoutWindow {
                     Some(HuddleDrawer::Thread)
                 };
                 this.refresh_huddle_thread_async(cx);
-                this.maybe_fetch_huddle_thread();
+                this.maybe_fetch_huddle_thread(cx);
                 cx.notify();
             }));
 

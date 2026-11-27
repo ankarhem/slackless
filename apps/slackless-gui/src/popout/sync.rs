@@ -1,7 +1,7 @@
 //! Store reload, revision watching, fixture seeding, and huddle thread synchronization for
 //! popped-out secondary windows.
 
-use gpui_kit::gpui::Context;
+use gpui_kit::gpui::{App, Context};
 use slackless_core::MessagingCommand;
 use slackless_core::types::Message;
 
@@ -33,13 +33,10 @@ impl PopoutWindow {
                 }
                 return;
             }
-            PopoutKind::Huddle { source, .. } => {
-                if let Some(state_entity) = source.upgrade() {
-                    self.huddle_state = Some(state_entity.read(cx).view_state());
-                }
+            PopoutKind::Huddle { .. } => {
                 if self.huddle_drawer == Some(HuddleDrawer::Thread) {
                     self.refresh_huddle_thread_async(cx);
-                    self.maybe_fetch_huddle_thread();
+                    self.maybe_fetch_huddle_thread(cx);
                     cx.notify();
                 }
                 return;
@@ -106,14 +103,11 @@ impl PopoutWindow {
         cx.notify();
     }
 
-    pub(super) fn maybe_fetch_huddle_thread(&mut self) {
+    pub(super) fn maybe_fetch_huddle_thread(&mut self, cx: &App) {
         if self.huddle_drawer != Some(HuddleDrawer::Thread) {
             return;
         }
-        let Some(state) = &self.huddle_state else {
-            return;
-        };
-        let Some(root_ts) = self.resolve_huddle_thread_root(&state.session) else {
+        let Some((channel, Some(root_ts))) = self.huddle_thread_target(cx) else {
             return;
         };
         if self.huddle_thread_fetched.as_ref() == Some(&root_ts) {
@@ -122,7 +116,7 @@ impl PopoutWindow {
         self.huddle_thread_fetched = Some(root_ts.clone());
         (self.send)(
             MessagingCommand::OpenThread {
-                channel: state.session.channel.clone(),
+                channel,
                 thread_ts: root_ts,
             }
             .into(),

@@ -1002,7 +1002,7 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
 
             // 4b. Phase 2–4: video frames (camera & screen share) arrive on HuddleMediaEvent and
             // DATA_MESSAGE events (reactions, hand raise, topic, captions) arrive on Event::Huddle
-            // -> HuddleState -> HuddleViewState. The store converts frames, off the UI thread,
+            // -> HuddleState. The store converts frames, off the UI thread,
             // only while a huddle pop-out window shows video.
             let popout = app
                 .huddle_state
@@ -1162,25 +1162,25 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
     cx.run_until_parked();
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
-            let vs = app.huddle_state.as_ref().unwrap().read(cx).view_state();
-            let video_store = app.huddle_state.as_ref().unwrap().read(cx).video_store();
+            let state = app.huddle_state.as_ref().unwrap().read(cx);
+            let video_store = state.video_store();
             assert_eq!(video_store.read(cx).frames().len(), 2);
-            assert!(vs.raised_hands.contains(&inviter));
+            assert!(state.raised_hands().contains(&inviter));
             assert_eq!(
-                vs.sticky_emojis.get(&inviter).map(String::as_str),
+                state.sticky_emojis().get(&inviter).map(String::as_str),
                 Some("coffee")
             );
-            assert_eq!(vs.reactions.len(), 1);
-            assert!(vs.active_effect.is_some());
-            assert_eq!(vs.draw_strokes.len(), 1);
-            assert_eq!(vs.draw_strokes[0].hue, 135);
-            assert!(vs.draw_cursors.contains_key(&inviter));
-            assert_eq!(vs.session.jukebox_song.as_deref(), Some("lofi"));
-            assert_eq!(vs.session.topic.as_deref(), Some("Release readiness"));
+            assert_eq!(state.reactions().len(), 1);
+            assert!(state.active_effect().is_some());
+            assert_eq!(state.draw_strokes().len(), 1);
+            assert_eq!(state.draw_strokes()[0].hue, 135);
+            assert!(state.draw_cursors().contains_key(&inviter));
+            assert_eq!(state.session().jukebox_song.as_deref(), Some("lofi"));
+            assert_eq!(state.session().topic.as_deref(), Some("Release readiness"));
             // Partial caption updated in-place by final caption -> 1 row!
-            assert_eq!(vs.captions.len(), 1);
-            assert_eq!(vs.captions[0].text, "Shipping full parity today!");
-            assert!(!vs.captions[0].partial);
+            assert_eq!(state.captions().len(), 1);
+            assert_eq!(state.captions()[0].text, "Shipping full parity today!");
+            assert!(!state.captions()[0].partial);
             app.on_huddle_media_event(
                 &HuddleMediaEvent::VideoTileClosed(
                     slackless_core::huddle::VideoTileKey::LocalCamera,

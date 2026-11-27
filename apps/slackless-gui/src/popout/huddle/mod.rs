@@ -173,11 +173,21 @@ fn send_huddle_draw(msg: slackless_core::huddle::HuddleDrawMessage) -> Command {
 }
 
 impl PopoutWindow {
-    fn huddle_state_entity(&self) -> Option<Entity<crate::huddle_state::HuddleState>> {
+    pub(super) fn huddle_state_entity(&self) -> Option<Entity<crate::huddle_state::HuddleState>> {
         match &self.kind {
             PopoutKind::Huddle { source, .. } => source.upgrade(),
             _ => None,
         }
+    }
+
+    /// The huddle's channel and thread root (explicit, else the cached store lookup, see
+    /// [`Self::resolve_huddle_thread_root`]); `None` once the huddle has ended.
+    pub(super) fn huddle_thread_target(&self, cx: &App) -> Option<(ChannelId, Option<Ts>)> {
+        let session = self.huddle_state_entity()?.read(cx).session();
+        Some((
+            session.channel.clone(),
+            self.resolve_huddle_thread_root(session),
+        ))
     }
 
     fn close_huddle_popovers(&mut self) {
@@ -257,18 +267,14 @@ impl PopoutWindow {
         &self,
         on_jump: JumpHandler,
         on_open_canvas: CanvasOpenHandler,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
         use gpui_kit::component::Icon;
         use slackless_core::huddle::{HuddlePhase, VideoTileKey};
 
-        let bg_id = self
-            .huddle_state
-            .as_ref()
-            .and_then(|s| s.session.background_id.as_deref());
-        let pal = HuddlePalette::for_theme(bg_id, cx);
-
-        let Some(state) = self.huddle_state.clone() else {
+        // The huddle has ended once its `HuddleState` is gone: say so over the theme backdrop.
+        let Some(state) = self.huddle_state_entity() else {
+            let pal = HuddlePalette::for_theme(None, cx);
             return v_flex()
                 .id("popout-huddle-ended")
                 .size_full()
@@ -320,20 +326,21 @@ impl PopoutWindow {
                         ),
                 );
         };
+        let state = state.read(cx);
+        let session = state.session();
+        let pal = HuddlePalette::for_theme(session.background_id.as_deref(), cx);
 
-        let snap = state.session.clone();
-        let channel = snap.channel.clone();
-        let mut people = state.participants.as_ref().clone();
+        let mut people = state.participants().to_vec();
         if !people.contains(&self.fixtures.self_user) {
             people.push(self.fixtures.self_user.clone());
         }
-        let (status_color, status_text) = match snap.phase {
+        let (status_color, status_text) = match session.phase {
             HuddlePhase::Joining | HuddlePhase::Connecting => {
                 (pal.warning, "Connecting…".to_owned())
             }
             HuddlePhase::Connected => (
                 pal.success,
-                crate::huddle_state::format_elapsed(state.elapsed_secs),
+                crate::huddle_state::format_elapsed(state.elapsed_secs()),
             ),
             HuddlePhase::Reconnecting => (pal.warning, "Reconnecting…".to_owned()),
             HuddlePhase::Leaving => (pal.chrome_muted, "Leaving…".to_owned()),
@@ -341,7 +348,7 @@ impl PopoutWindow {
             HuddlePhase::Idle => (pal.chrome_muted, "Ended".to_owned()),
         };
 
-        let header = self.render_huddle_titlebar(&snap, people.len(), &pal, cx);
+        let header = self.render_huddle_titlebar(session, people.len(), &pal, cx);
 
         let has_screen_share =
             self.huddle_video
@@ -396,16 +403,16 @@ impl PopoutWindow {
                         .text_color(pal.tile_pill_fg)
                         .child(status_text),
                 )
-                .child(self.render_huddle_topic_bar(snap.topic.as_deref(), &pal, cx)),
+                .child(self.render_huddle_topic_bar(session.topic.as_deref(), &pal, cx)),
         );
 
         // Top-right floating Lounge Music player pill + song-selector dropdown (matches Official
         // Slack's solo/lounge music banner that lets you switch between all 10 Slack tracks or stop).
-        if let Some(active_song_key) = snap.jukebox_song.clone() {
+        if let Some(active_song_key) = session.jukebox_song.clone() {
             stage = stage.child(self.render_huddle_music_pill(&active_song_key, &pal, cx));
         }
 
-        if snap.audio_only {
+        if session.audio_only {
             let send_resume = self.send.clone();
             stage = stage.child(
                 h_flex()
@@ -456,7 +463,7 @@ impl PopoutWindow {
             );
         }
 
-        if let Some(err) = snap.error.clone() {
+        if let Some(err) = session.error.clone() {
             stage = stage.child(
                 h_flex()
                     .mt(px(36.))
@@ -481,14 +488,14 @@ impl PopoutWindow {
         }
 
         if has_screen_share {
-            if let Some(screen_stage) = self.render_huddle_stage(&state, &pal, cx) {
+            if let Some(screen_stage) = self.render_huddle_stage(state, &pal, cx) {
                 stage = stage.child(screen_stage);
             }
-            stage = stage.child(self.render_huddle_filmstrip(&state, &people, &pal, cx));
+            stage = stage.child(self.render_huddle_filmstrip(state, &people, &pal, cx));
         } else {
-            let has_bottom_overlay = state.session.captions_enabled
-                || !state.captions.is_empty()
-                || !state.reactions.is_empty();
+            let has_bottom_overlay = session.captions_enabled
+                || !state.captions().is_empty()
+                || !state.reactions().is_empty();
             stage = stage.child(
                 v_flex()
                     .flex_1()
@@ -497,7 +504,7 @@ impl PopoutWindow {
                     .when(has_bottom_overlay, |el| el.pb(px(48.)))
                     .items_center()
                     .justify_center()
-                    .child(self.render_huddle_tiles(&state, &people, &pal, cx)),
+                    .child(self.render_huddle_tiles(state, &people, &pal, cx)),
             );
         }
 
@@ -506,7 +513,7 @@ impl PopoutWindow {
             user: uid,
             emoji: effect_name,
             ..
-        }) = &state.active_effect
+        }) = state.active_effect()
         {
             let who = self.fixtures.user_name(uid).to_owned();
             let (glyph, label) = effect_label(effect_name);
@@ -539,21 +546,22 @@ impl PopoutWindow {
         }
 
         // Floating stacking reactions (bottom-left above dock)
-        if let Some(reactions_el) = self.render_huddle_floating_reactions(&state, &pal) {
+        if let Some(reactions_el) = self.render_huddle_floating_reactions(state, &pal) {
             stage = stage.child(reactions_el);
         }
 
         // Floating live captions subtitle overlay (bottom-center above dock)
-        if let Some(captions_el) = self.render_huddle_floating_captions(&state, &pal) {
+        if let Some(captions_el) = self.render_huddle_floating_captions(state, &pal) {
             stage = stage.child(captions_el);
         }
 
-        let active_popover = self.render_huddle_active_popover(&snap, &channel, &people, &pal, cx);
+        let active_popover =
+            self.render_huddle_active_popover(session, &session.channel, &people, &pal, cx);
 
         let body: gpui_kit::gpui::AnyElement = if let Some(drawer) = self.huddle_drawer {
             let drawer_el = self.render_huddle_drawer(
                 drawer,
-                &state,
+                state,
                 &pal,
                 on_jump.clone(),
                 on_open_canvas.clone(),
@@ -612,7 +620,7 @@ impl PopoutWindow {
             )
             .child(header)
             .child(body)
-            .child(self.render_huddle_controls(&snap, status_color, &pal, cx))
+            .child(self.render_huddle_controls(session, status_color, &pal, cx))
             .when_some(active_popover, |root, popover| {
                 // Full-window transparent click-away backdrop so clicking anywhere outside any
                 // huddle dropdown (audio, video, reactions, theme, invite, more) dismisses it.
@@ -649,7 +657,7 @@ impl PopoutWindow {
             })
             .when(self.huddle_popover == Some(HuddlePopover::Share), |root| {
                 root.child(self.render_huddle_share_modal(
-                    snap.share_source_id.as_deref(),
+                    session.share_source_id.as_deref(),
                     &pal,
                     cx,
                 ))

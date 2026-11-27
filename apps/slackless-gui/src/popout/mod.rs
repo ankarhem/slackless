@@ -26,7 +26,7 @@ use crate::activity::ActivityFeed;
 use crate::composer::{self, Composer, ComposerEvent};
 use crate::emoji::{EmojiPicker, EmojiPickerEvent};
 use crate::fixtures::Fixtures;
-use crate::huddle_state::{HuddlePopoutGuard, HuddleState, HuddleVideoStore, HuddleViewState};
+use crate::huddle_state::{HuddlePopoutGuard, HuddleState, HuddleVideoStore};
 use crate::image_viewer::ImageViewer;
 use crate::later::{LaterItem, LaterView};
 use crate::messages::{LinkHandler, LinkTarget, MessageList};
@@ -148,6 +148,12 @@ fn store_changes(cx: &mut App) -> Entity<StoreChanges> {
 
 static CASCADE_STEP: AtomicUsize = AtomicUsize::new(0);
 
+/// The huddle's channel and explicit thread root, read from its [`HuddleState`].
+fn huddle_session_of(state: &Entity<HuddleState>, cx: &App) -> (ChannelId, Option<Ts>) {
+    let session = state.read(cx).session();
+    (session.channel.clone(), session.thread_root_ts.clone())
+}
+
 fn popout_window_options(
     title: &str,
     is_huddle: bool,
@@ -247,7 +253,9 @@ pub struct PopoutWindow {
     activity_rows: Vec<PopoutActivityRow>,
     later_items: Vec<LaterItem>,
     files_items: Vec<(String, String, Option<String>)>,
-    huddle_state: Option<Rc<HuddleViewState>>,
+    /// The huddle's channel and explicit thread root as its [`HuddleState`] observer last saw
+    /// them: a change to either resets or re-queries the thread caches below.
+    huddle_session_key: Option<(ChannelId, Option<Ts>)>,
     huddle_video: Option<WeakEntity<HuddleVideoStore>>,
     _huddle_popout_guard: Option<HuddlePopoutGuard>,
     reload_gen: u64,
@@ -405,7 +413,7 @@ impl PopoutWindow {
         let mut activity_rows = Vec::new();
         let mut later_items = Vec::new();
         let mut files_items = Vec::new();
-        let mut huddle_state = None;
+        let mut huddle_session_key = None;
         let mut huddle_video = None;
         let mut huddle_popout_guard = None;
         match &kind {
@@ -445,33 +453,29 @@ impl PopoutWindow {
             }
             PopoutKind::Huddle { source, .. } => {
                 if let Some(state_entity) = source.upgrade() {
-                    let st = state_entity.read(cx).view_state();
+                    let (channel, root) = huddle_session_of(&state_entity, cx);
                     let video_store = state_entity.read(cx).video_store();
-                    let target =
-                        composer::AlsoSendTarget::for_channel(&fixtures, &st.session.channel);
+                    let target = composer::AlsoSendTarget::for_channel(&fixtures, &channel);
                     if let Some(composer) = &composer {
                         composer.update(cx, |c, cx| c.set_also_send(target, cx));
                     }
-                    huddle_state = Some(st);
+                    huddle_session_key = Some((channel, root));
                     huddle_popout_guard = Some(video_store.read(cx).register_popout());
                     huddle_video = Some(video_store.downgrade());
                     subscriptions.push(cx.observe(&video_store, |_this, _vs, cx| {
                         cx.notify();
                     }));
                     subscriptions.push(cx.observe(&state_entity, |this, state_entity, cx| {
-                        let st = state_entity.read(cx).view_state();
-                        let (channel_changed, root_changed) =
-                            this.huddle_state.as_ref().map_or((true, true), |prev| {
-                                (
-                                    prev.session.channel != st.session.channel,
-                                    prev.session.thread_root_ts != st.session.thread_root_ts,
-                                )
+                        let (channel, root) = huddle_session_of(&state_entity, cx);
+                        let (channel_changed, root_changed) = this
+                            .huddle_session_key
+                            .as_ref()
+                            .map_or((true, true), |(prev_channel, prev_root)| {
+                                (*prev_channel != channel, *prev_root != root)
                             });
                         if channel_changed {
-                            let target = composer::AlsoSendTarget::for_channel(
-                                &this.fixtures,
-                                &st.session.channel,
-                            );
+                            let target =
+                                composer::AlsoSendTarget::for_channel(&this.fixtures, &channel);
                             if let Some(composer) = &this.composer {
                                 composer.update(cx, |c, cx| c.set_also_send(target, cx));
                             }
@@ -480,7 +484,7 @@ impl PopoutWindow {
                             this.huddle_thread_store_msgs.clear();
                             this.huddle_thread_local.clear();
                         }
-                        this.huddle_state = Some(st);
+                        this.huddle_session_key = Some((channel, root));
                         // Audio levels alone notify ~8x/s: only a new channel or thread root
                         // changes the query (new replies arrive as its channel's store changes).
                         if (channel_changed || root_changed)
@@ -488,7 +492,7 @@ impl PopoutWindow {
                         {
                             this.refresh_huddle_thread_async(cx);
                         }
-                        this.maybe_fetch_huddle_thread();
+                        this.maybe_fetch_huddle_thread(cx);
                         cx.notify();
                     }));
                 }
@@ -501,7 +505,7 @@ impl PopoutWindow {
             subscriptions.push(cx.subscribe(
                 &hub,
                 move |this: &mut Self, _, change: &StoreChange, cx| {
-                    if change.team == team && this.shows(&change.channel) {
+                    if change.team == team && this.shows(&change.channel, cx) {
                         this.reload_from_store(cx);
                     }
                 },
@@ -524,7 +528,7 @@ impl PopoutWindow {
             activity_rows,
             later_items,
             files_items,
-            huddle_state,
+            huddle_session_key,
             huddle_video,
             _huddle_popout_guard: huddle_popout_guard,
             reload_gen: 0,
@@ -570,14 +574,15 @@ impl PopoutWindow {
 
     /// Whether this window shows `channel`'s stored messages: its conversation or thread, or
     /// the huddle's thread while that drawer is open.
-    fn shows(&self, channel: &ChannelId) -> bool {
+    fn shows(&self, channel: &ChannelId, cx: &App) -> bool {
         match &self.kind {
             PopoutKind::Conversation { channel: own, .. }
             | PopoutKind::Thread { channel: own, .. } => own == channel,
             PopoutKind::Huddle { .. } => {
                 self.huddle_drawer == Some(HuddleDrawer::Thread)
-                    && (self.huddle_state.as_ref())
-                        .is_some_and(|state| state.session.channel == *channel)
+                    && self
+                        .huddle_state_entity()
+                        .is_some_and(|state| state.read(cx).session().channel == *channel)
             }
             PopoutKind::Activity { .. }
             | PopoutKind::Later { .. }

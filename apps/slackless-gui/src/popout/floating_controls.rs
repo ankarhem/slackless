@@ -105,13 +105,13 @@ impl Render for HuddleFloatingPanel {
             window.remove_window();
             return div().id("huddle-floating-panel-empty");
         };
-        let state = dock.read(cx).view_state();
-        let snap = &state.session;
-        let muted = snap.muted;
-        let video_on = snap.video;
-        let sharing = snap.sharing;
-        let pen_on = state.draw_mode;
-        let pen_hue = state.draw_hue;
+        let state = dock.read(cx);
+        let session = state.session();
+        let muted = session.muted;
+        let video_on = session.video;
+        let sharing = session.sharing;
+        let pen_on = state.draw_mode();
+        let pen_hue = state.draw_hue();
 
         let pal = crate::theme::floating_huddle_palette(cx.theme());
         let bar_bg = pal.bar_bg;

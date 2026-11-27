@@ -6,18 +6,18 @@ impl PopoutWindow {
     pub(super) fn render_huddle_drawer(
         &self,
         drawer: HuddleDrawer,
-        state: &crate::huddle_state::HuddleViewState,
+        state: &crate::huddle_state::HuddleState,
         pal: &HuddlePalette,
         on_jump: JumpHandler,
         on_open_canvas: CanvasOpenHandler,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         let content: gpui_kit::gpui::AnyElement = match drawer {
             HuddleDrawer::Thread => self
-                .render_huddle_thread_drawer(&state.session, pal, on_jump, cx)
+                .render_huddle_thread_drawer(state.session(), pal, on_jump, cx)
                 .into_any_element(),
             HuddleDrawer::Notes => self
-                .render_huddle_notes_drawer(&state.session, pal, on_open_canvas, cx)
+                .render_huddle_notes_drawer(state.session(), pal, on_open_canvas, cx)
                 .into_any_element(),
             HuddleDrawer::Diagnostics => self
                 .render_huddle_diagnostics_drawer(state, pal, cx)
@@ -53,19 +53,23 @@ impl PopoutWindow {
     /// replies, updating `huddle_thread_root_cache` / `huddle_thread_store_msgs` and pruning
     /// echoed optimistic local replies on completion.
     pub(in crate::popout) fn refresh_huddle_thread_async(&mut self, cx: &mut Context<Self>) {
-        let Some(state) = self.huddle_state.as_ref() else {
+        let Some(state) = self.huddle_state_entity() else {
             return;
         };
         let (Some(store), Some(team)) = (self.store.clone(), self.team.clone()) else {
             return;
         };
-        let channel = state.session.channel.clone();
-        let explicit_root = state
-            .session
-            .thread_root_ts
-            .as_ref()
-            .filter(|ts| !ts.as_str().trim().is_empty())
-            .cloned();
+        let (channel, explicit_root) = {
+            let session = state.read(cx).session();
+            (
+                session.channel.clone(),
+                session
+                    .thread_root_ts
+                    .as_ref()
+                    .filter(|ts| !ts.as_str().trim().is_empty())
+                    .cloned(),
+            )
+        };
         self.reload_gen = self.reload_gen.wrapping_add(1);
         let generation = self.reload_gen;
         cx.spawn(async move |this, cx| {
@@ -118,7 +122,7 @@ impl PopoutWindow {
                 win.huddle_thread_root_cache = root;
                 win.huddle_thread_store_msgs = store_msgs;
                 win.prune_echoed_huddle_locals_from_cache();
-                win.maybe_fetch_huddle_thread();
+                win.maybe_fetch_huddle_thread(cx);
                 if changed {
                     cx.notify();
                 }
@@ -236,7 +240,7 @@ impl PopoutWindow {
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
         pal: &HuddlePalette,
         on_jump: JumpHandler,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         use gpui_kit::component::Icon;
 
@@ -432,7 +436,7 @@ impl PopoutWindow {
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
         pal: &HuddlePalette,
         on_open_canvas: CanvasOpenHandler,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         use gpui_kit::component::Icon;
 
@@ -583,16 +587,16 @@ impl PopoutWindow {
     /// Troubleshooting, Network Stats HUD & Self-Test drawer (`F-COLLAB-074`, `075`, `076`).
     fn render_huddle_diagnostics_drawer(
         &self,
-        state: &crate::huddle_state::HuddleViewState,
+        state: &crate::huddle_state::HuddleState,
         pal: &HuddlePalette,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
         use gpui_kit::component::Icon;
         use slackless_core::huddle::{HuddleChime, HuddlePhase};
         #[cfg(not(test))]
         use slackless_core::huddle::{play_huddle_chime, play_speaker_test_tone};
 
-        let snap = &state.session;
+        let snap = state.session();
         let (phase_color, phase_label) = match snap.phase {
             HuddlePhase::Connected => (pal.success, "Connected (UDP TURN Relay)"),
             HuddlePhase::Joining | HuddlePhase::Connecting => (pal.warning, "Connecting…"),
@@ -626,7 +630,7 @@ impl PopoutWindow {
             });
         let tx_kb = snap.bytes_sent as f64 / 1024.0;
         let rx_kb = snap.bytes_received as f64 / 1024.0;
-        let rms_pct = (state.levels.local_rms.clamp(0.0, 1.0) * 100.0) as u32;
+        let rms_pct = (state.levels().local_rms.clamp(0.0, 1.0) * 100.0) as u32;
         let audio_only = snap.audio_only;
         let send_ao = self.send.clone();
         let test_out = snap.output_device.clone();
