@@ -134,6 +134,7 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
                                     id: Some("Q0DEMO1".to_owned()),
                                     workspace: ws,
                                     channel: ch.clone(),
+                                    thread_ts: None,
                                     label: label.clone(),
                                     text: "Påminnelse: synka nya checkout-releasen innan lunch!"
                                         .to_owned(),
@@ -146,6 +147,7 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
                                     id: Some("Q0DEMO2".to_owned()),
                                     workspace: ws,
                                     channel: ch,
+                                    thread_ts: None,
                                     label,
                                     text: "Good morning team — metrics look green after yesterday's deploy."
                                         .to_owned(),

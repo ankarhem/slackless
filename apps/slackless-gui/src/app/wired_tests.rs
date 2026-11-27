@@ -2362,6 +2362,7 @@ fn wired_activity_toggle_read_workspace_isolation_and_drafts_cancel_routing(
                 id: Some("Q0SCHED1".into()),
                 workspace: 0,
                 channel: ChannelId::from("C0ONE"),
+                thread_ts: None,
                 label: "#one".into(),
                 text: "scheduled in ws0".into(),
                 at: 1_900_000_000,
@@ -2796,6 +2797,403 @@ fn wired_huddle_leave_race_and_multi_workspace_isolation(cx: &mut gpui::TestAppC
         has_save_cmd(&c2),
         "WS 1 must receive SetSaveHuddleTranscripts"
     );
+
+    drop(root);
+}
+
+#[gpui::test]
+fn wired_live_builtin_slash_commands_and_thread_command_response(cx: &mut gpui::TestAppContext) {
+    let people = [user("U0ME", "me"), user("U0ALICE", "alice")];
+    let (bridge, core) = cx.update(|cx| {
+        make_wired_workspace(
+            "T0SLSH",
+            "Slash Co",
+            &[("C0ENG", "engineering")],
+            &people,
+            cx,
+        )
+    });
+    let fx = bridge.snapshot(&HashMap::new()).expect("snapshot");
+    let (root, app, cx) = mount_wired(fx, vec![bridge], cx);
+    let _ = core.drain_commands();
+
+    let eng = ChannelId::from("C0ENG");
+    let live_builtins = [
+        ("/topic Release freeze", "/topic", "Release freeze"),
+        ("/leave", "/leave", ""),
+        ("/mute", "/mute", ""),
+        ("/invite @alice", "/invite", "@alice"),
+        ("/remind me check logs", "/remind", "me check logs"),
+        ("/msg @alice hi", "/msg", "@alice hi"),
+        ("/collapse", "/collapse", ""),
+        ("/giphy cats", "/giphy", "cats"),
+    ];
+    for (draft, expected_cmd, expected_args) in live_builtins {
+        let inv = crate::slash::parse(draft).expect("valid slash command");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.run_slash(&inv, None, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let cmds = core.drain_commands();
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Command::Messaging(MessagingCommand::RunCommand {
+                    channel,
+                    command,
+                    args,
+                    thread_ts: None,
+                    app_id: None,
+                }) if *channel == eng && command == expected_cmd && args == expected_args
+            )),
+            "built-in slash command `{draft}` must dispatch MessagingCommand::RunCommand in live mode, got: {cmds:?}"
+        );
+    }
+
+    // A CommandResponse carrying `thread_ts: Some(root_ts)` must route into ThreadPanel,
+    // never appending to the top-level channel transcript.
+    let root_ts = Ts::from("1700000100.000100");
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.open_thread(eng.clone(), root_ts.clone(), cx);
+        });
+    });
+    cx.run_until_parked();
+    let before_channel_newest = cx.update(|_, cx| app.read(cx).messages.read(cx).newest_ts());
+    cx.update(|_, cx| {
+        core.emit(
+            Event::CommandResponse {
+                channel: eng.clone(),
+                command: "/giphy".into(),
+                response_type: Some("ephemeral".into()),
+                text: "thread-only gif response".into(),
+                thread_ts: Some(root_ts.clone()),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    let after_channel_newest = cx.update(|_, cx| app.read(cx).messages.read(cx).newest_ts());
+    assert_eq!(
+        before_channel_newest, after_channel_newest,
+        "thread CommandResponse must not append to the main channel transcript"
+    );
+
+    drop(root);
+}
+
+#[gpui::test]
+fn wired_unreads_mark_unread_cursor_explicit_pin_and_monotonic_threads(
+    cx: &mut gpui::TestAppContext,
+) {
+    let people = [user("U0ME", "me"), user("U0ALICE", "alice")];
+    let (bridge, core) = cx.update(|cx| {
+        make_wired_workspace(
+            "T0UNR",
+            "Unread Co",
+            &[("C0ENG", "engineering"), ("C0RND", "random")],
+            &people,
+            cx,
+        )
+    });
+    let fx = bridge.snapshot(&HashMap::new()).expect("snapshot");
+    let (root, app, cx) = mount_wired(fx, vec![bridge], cx);
+    let _ = core.drain_commands();
+
+    let eng = ChannelId::from("C0ENG");
+    let rnd = ChannelId::from("C0RND");
+    let msg_ts = Ts::from("1700000200.000500");
+
+    // 1. All Unreads "Mark unread" on `msg_ts` must send a cursor strictly before `msg_ts`.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.handle_message_action(
+                messaging::MessageTarget {
+                    surface: messaging::MessageSurface::Unreads,
+                    channel: rnd.clone(),
+                    thread_ts: None,
+                },
+                Message {
+                    ts: msg_ts.clone(),
+                    user: Some(UserId::from("U0ALICE")),
+                    text: "sole unread".into(),
+                    ..Default::default()
+                },
+                actions::MessageAction::MarkUnread,
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    let cmds = core.drain_commands();
+    let expected_cursor = crate::threads_cards::ts_just_before(&msg_ts);
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Messaging(MessagingCommand::MarkRead { channel, ts })
+                if *channel == rnd && *ts == expected_cursor
+        )),
+        "Unreads MarkUnread must send cursor strictly before ts ({expected_cursor}), got: {cmds:?}"
+    );
+
+    // 2. Explicitly marking the open channel unread must NOT be undone by a subsequent Counts event.
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.apply_local_mark_unread(&eng, expected_cursor.clone(), cx);
+        });
+    });
+    let _ = core.drain_commands();
+    cx.update(|_, cx| {
+        core.emit(
+            Event::Counts(Box::new(slackless_core::api::ClientCounts {
+                channels: vec![slackless_core::api::ConversationCounts {
+                    id: eng.clone(),
+                    last_read: Some(expected_cursor.clone()),
+                    latest: Some(msg_ts.clone()),
+                    has_unreads: true,
+                    mention_count: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    let cmds = core.drain_commands();
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            Command::Messaging(MessagingCommand::MarkRead { channel, .. }) if *channel == eng
+        )),
+        "Counts event must not auto-mark an explicitly unread open channel back to read: {cmds:?}"
+    );
+
+    // 3. `mark_thread_read` must ignore backward/stale timestamps monotonically.
+    let t_root = Ts::from("1700000100.000000");
+    let newer = Ts::from("1700000300.000200");
+    let older = Ts::from("1700000300.000100");
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.mark_thread_read(eng.clone(), t_root.clone(), newer.clone(), false, cx);
+            app.mark_thread_read(eng.clone(), t_root.clone(), older.clone(), false, cx);
+        });
+    });
+    cx.run_until_parked();
+    let thread_marks: Vec<Ts> = core
+        .drain_commands()
+        .into_iter()
+        .filter_map(|c| match c {
+            Command::Messaging(MessagingCommand::MarkThreadRead { ts, .. }) => Some(ts),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        thread_marks,
+        vec![newer],
+        "stale older timestamp must not regress thread read cursor"
+    );
+
+    drop(root);
+}
+
+#[gpui::test]
+fn wired_cloud_draft_hydration_scheduled_send_now_and_broadcast_escape(
+    cx: &mut gpui::TestAppContext,
+) {
+    let people = [
+        user("U0ME", "me"),
+        user("U0A", "alice"),
+        user("U0B", "bob"),
+        user("U0C", "carol"),
+        user("U0D", "dave"),
+        user("U0E", "eve"),
+        user("U0F", "frank"),
+    ];
+    let (bridge, core) = cx.update(|cx| {
+        make_wired_workspace(
+            "T0DRFT",
+            "Drafts Co",
+            &[("C0ENG", "engineering"), ("C0RND", "random")],
+            &people,
+            cx,
+        )
+    });
+    let mut fx = bridge.snapshot(&HashMap::new()).expect("snapshot");
+    if let Some(ch) = fx
+        .channels
+        .iter_mut()
+        .find(|c| c.id == ChannelId::from("C0ENG"))
+    {
+        ch.num_members = Some(10);
+    }
+    let (root, app, cx) = mount_wired(fx, vec![bridge], cx);
+    let _ = core.drain_commands();
+
+    let eng = ChannelId::from("C0ENG");
+    let rnd = ChannelId::from("C0RND");
+
+    // 1. CloudDraft arriving for the currently open channel must hydrate the empty composer so
+    //    switching channels preserves the draft instead of syncing "" to Slack.
+    cx.update(|_, cx| {
+        core.emit(
+            Event::CloudDrafts(vec![slackless_core::api::CloudDraft {
+                id: "Dr0PHONE".into(),
+                channel: eng.clone(),
+                text: "draft typed on phone".into(),
+                last_updated_ts: None,
+                updated_secs: Some(1_700_000_500),
+            }]),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(
+            app.read(cx).composer.read(cx).text(),
+            "draft typed on phone",
+            "empty open composer must load arriving cloud draft"
+        );
+        app.update(cx, |app, cx| app.select(rnd.clone(), cx));
+    });
+    cx.run_until_parked();
+    let cmds = core.drain_commands();
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            Command::Messaging(MessagingCommand::SyncDraft { channel, text })
+                if *channel == eng && text.is_empty()
+        )),
+        "leaving channel after CloudDrafts must not erase the draft on Slack: {cmds:?}"
+    );
+    cx.update(|_, cx| {
+        assert_eq!(
+            app.read(cx).drafts.read(cx).draft(0, &eng).as_deref(),
+            Some("draft typed on phone")
+        );
+    });
+
+    // 2. Scheduled "Send now" for a thread reply preserves `thread_ts` and emits `ReplyThread`.
+    let root_ts = Ts::from("1700000900.000100");
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.deliver(
+                Entry {
+                    id: Some("Q0THREAD1".into()),
+                    workspace: 0,
+                    channel: eng.clone(),
+                    thread_ts: Some(root_ts.clone()),
+                    label: "#engineering".into(),
+                    text: "scheduled thread reply".into(),
+                    at: 1_900_000_000,
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    let cmds = core.drain_commands();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Messaging(MessagingCommand::DeleteScheduledMessage {
+                scheduled_message_id,
+                ..
+            }) if scheduled_message_id == "Q0THREAD1"
+        )),
+        "delivering unguarded scheduled reply must delete scheduled copy: {cmds:?}"
+    );
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Messaging(MessagingCommand::ReplyThread {
+                channel,
+                thread_ts,
+                ..
+            }) if *channel == eng && *thread_ts == root_ts
+        )),
+        "delivering scheduled thread reply must preserve thread_ts via ReplyThread: {cmds:?}"
+    );
+
+    // 3. Scheduled "Send now" containing `<!channel>` cancelled via dialog close (Escape/backdrop)
+    //    must NOT delete the scheduled message on Slack and must restore it to DraftsView.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.ws.member_counts.insert(eng.clone(), 10);
+            app.deliver(
+                Entry {
+                    id: Some("Q0GUARD1".into()),
+                    workspace: 0,
+                    channel: eng.clone(),
+                    thread_ts: None,
+                    label: "#engineering".into(),
+                    text: "<!channel> deploy starting".into(),
+                    at: 1_900_000_100,
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let cmds = core.drain_commands();
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            Command::Messaging(
+                MessagingCommand::DeleteScheduledMessage { .. }
+                    | MessagingCommand::SendMessage { .. }
+            )
+        )),
+        "dismissing broadcast guard on scheduled Send now must neither delete nor send: {cmds:?}"
+    );
+    // Verify the scheduled message was restored back into DraftsView.
+    cx.update(|_, cx| {
+        assert_eq!(
+            app.read(cx).drafts.read(cx).scheduled_count(),
+            1,
+            "cancelling broadcast guard on scheduled Send now must restore the scheduled entry"
+        );
+    });
+
+    // 4. Dismissing `<!channel>` dialog via Escape for MainComposer restores draft text.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.select(eng.clone(), cx);
+            app.ws.member_counts.insert(eng.clone(), 10);
+            let content = composer::content_of("<!channel> urgent alert", &app.fixtures);
+            app.send(content, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let cmds = core.drain_commands();
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, Command::Messaging(MessagingCommand::SendMessage { .. }))),
+        "dismissed broadcast confirmation must not send: {cmds:?}"
+    );
+    cx.update(|_, cx| {
+        assert_eq!(
+            app.read(cx).composer.read(cx).text(),
+            "<!channel> urgent alert",
+            "dismissing broadcast confirmation via Escape/close must restore MainComposer text"
+        );
+    });
 
     drop(root);
 }

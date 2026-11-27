@@ -653,6 +653,9 @@ impl App {
             cx.background_executor().spawn(write).detach();
         }
         self.save_draft(cx);
+        // Leaving a channel the user explicitly marked unread releases the in-view auto-mark
+        // suppression so returning to it later marks it read again (while leaving it unread now).
+        self.ws.explicit_unread.remove(&self.channel);
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_selected(channel.clone(), cx));
         self.bridge
@@ -895,6 +898,7 @@ impl App {
                                     id: None,
                                     workspace: index,
                                     channel: d.channel,
+                                    thread_ts: None,
                                     label: d.label,
                                     text: d.text,
                                     at: d.at,
@@ -1107,6 +1111,7 @@ impl App {
                                 id: None,
                                 workspace,
                                 channel: row.channel,
+                                thread_ts: None,
                                 label,
                                 text,
                                 at,

@@ -106,13 +106,15 @@ pub fn when_label_with_offset(at: u64, now: u64, offset_secs: i64) -> String {
 }
 
 /// One draft, scheduled or sent message.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     /// Slack's `scheduled_message_id` for a live scheduled message (`None` for local entries).
     pub id: Option<String>,
     /// Index into the workspace list the conversation belongs to.
     pub workspace: usize,
     pub channel: ChannelId,
+    /// Optional parent thread timestamp when scheduling a thread reply.
+    pub thread_ts: Option<slackless_core::types::Ts>,
     /// Conversation label at the time of writing (`# name` / peer names).
     pub label: String,
     pub text: String,
@@ -201,6 +203,11 @@ impl DraftsView {
             }
         }
         cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scheduled_count(&self) -> usize {
+        self.scheduled.len()
     }
 
     pub fn schedule(&mut self, entry: Entry, cx: &mut Context<Self>) {
@@ -636,6 +643,7 @@ mod tests {
             id: None,
             workspace: ws,
             channel: ch.clone(),
+            thread_ts: None,
             label: format!("# {}", ch.as_str()),
             text: text.into(),
             at,

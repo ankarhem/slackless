@@ -640,6 +640,29 @@ impl ThreadPanel {
         cx.notify();
     }
 
+    /// Append an ephemeral or slash-command response message directly to `(channel, thread_ts)`
+    /// (both the live open panel and its cache) without polluting the main channel transcript.
+    pub fn append_ephemeral(
+        &mut self,
+        channel: &ChannelId,
+        thread_ts: &Ts,
+        message: Message,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key = (channel.clone(), thread_ts.clone());
+        if self.thread.as_ref() == Some(&key) {
+            self.replies.push(message);
+            self.sync_cache();
+            cx.notify();
+            return true;
+        }
+        if let Some((_, cached_replies)) = self.cache.get_mut(&key) {
+            cached_replies.push(message);
+            return true;
+        }
+        false
+    }
+
     /// Undo a synthetic optimistic reply and put `text` back in the reply composer when a send
     /// guard (secret warning or `@channel` confirmation) was cancelled.
     pub fn rollback_pending_reply(

@@ -1753,6 +1753,7 @@ impl App {
                         id: None,
                         workspace: 0,
                         channel: d.channel,
+                        thread_ts: None,
                         label: d.label,
                         text: d.text,
                         at: d.at,

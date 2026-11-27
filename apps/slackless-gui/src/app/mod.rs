@@ -407,6 +407,10 @@ pub(super) struct WorkspaceState {
     /// reopening the summary dialog shows the previous generation until the user clicks Regenerate.
     pub(in crate::app) summary_cache:
         DocCache<dialogs::summary::SummaryCacheKey, slackless_core::summarize::SummaryResult>,
+    /// Conversations the user explicitly marked unread while viewing them; `maybe_mark_open_read`
+    /// respects this pin until the user leaves the channel, sends a message, or explicitly marks
+    /// it read again (`Esc` / "Mark as Read").
+    pub(super) explicit_unread: HashSet<ChannelId>,
     /// Deduplicates `subscriptions.thread.mark` calls: last cursor sent per `(channel, thread_ts)`.
     pub(super) marked_threads: HashMap<(ChannelId, Ts), Ts>,
     /// Live archive backfill progress snapshot for this workspace (`Event::BackfillProgress`).

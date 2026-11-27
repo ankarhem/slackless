@@ -343,6 +343,23 @@ impl UnreadsView {
         })
     }
 
+    /// Compute the `conversations.mark` cursor strictly before `ts` inside `channel`'s unread
+    /// group (so `ts` itself remains unread, matching `MessageList::mark_unread`).
+    pub fn cursor_before(&self, channel: &ChannelId, ts: &Ts) -> Ts {
+        self.groups
+            .iter()
+            .find(|group| group.channel == *channel)
+            .and_then(|group| {
+                group
+                    .messages
+                    .iter()
+                    .take_while(|message| &message.ts < ts)
+                    .last()
+                    .map(|message| message.ts.clone())
+            })
+            .unwrap_or_else(|| crate::threads_cards::ts_just_before(ts))
+    }
+
     /// Replace the set of saved message timestamps shown with Slack's saved banner/tint.
     pub fn replace_saved(&mut self, saved: HashSet<Ts>, cx: &mut Context<Self>) {
         if self.saved != saved {

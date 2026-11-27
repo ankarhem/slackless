@@ -343,6 +343,7 @@ impl App {
                     .insert(channel.clone(), target_ts.clone());
             }
         }
+        self.ws.explicit_unread.remove(channel);
         self.bridge.send(MessagingCommand::MarkRead {
             channel: channel.clone(),
             ts: target_ts,
@@ -355,7 +356,7 @@ impl App {
     /// Mark the open conversation read if the transcript is visible and the user's preferences
     /// allow auto-marking read (`mark_read != 2`, and window focused when `no_bg_mark_read` is on).
     pub(super) fn maybe_mark_open_read(&mut self, cx: &mut Context<Self>) {
-        if !self.transcript_visible(cx) {
+        if !self.transcript_visible(cx) || self.ws.explicit_unread.contains(&self.channel) {
             return;
         }
         let (mark_read, no_bg_mark_read) = {
@@ -388,6 +389,7 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         self.ws.marked_read.remove(channel);
+        self.ws.explicit_unread.insert(channel.clone());
         if !self.fixtures.sample {
             let entry =
                 self.ws
@@ -428,7 +430,7 @@ impl App {
             .ws
             .marked_threads
             .get(&key)
-            .is_some_and(|prev| *prev == ts);
+            .is_some_and(|prev| *prev >= ts);
         if !already_marked {
             self.ws.marked_threads.insert(key, ts.clone());
             self.bridge.send(MessagingCommand::MarkThreadRead {
@@ -465,6 +467,7 @@ impl App {
         let mentions = self.sidebar.read(cx).thread_mentions();
         self.sidebar
             .update(cx, |s, cx| s.set_thread_counts(true, mentions, cx));
+        self.sync_badge(cx);
     }
 
     /// Auto-mark every currently unread card in `ThreadsView` read on Slack when the view opens,
@@ -475,7 +478,12 @@ impl App {
             .update(cx, |threads, cx| threads.clear_all_unreads(false, cx));
         for (channel, thread_ts, ts) in targets {
             let key = (channel.clone(), thread_ts.clone());
-            if self.ws.marked_threads.get(&key) != Some(&ts) {
+            if !self
+                .ws
+                .marked_threads
+                .get(&key)
+                .is_some_and(|prev| *prev >= ts)
+            {
                 self.ws.marked_threads.insert(key, ts.clone());
                 self.bridge.send(MessagingCommand::MarkThreadRead {
                     channel,
@@ -486,6 +494,7 @@ impl App {
         }
         self.sidebar
             .update(cx, |s, cx| s.set_thread_counts(false, 0, cx));
+        self.sync_badge(cx);
     }
 
     /// Explicitly mark all unread threads read (`Esc` in Threads view or "Mark all read" button).
@@ -495,7 +504,12 @@ impl App {
             .update(cx, |threads, cx| threads.clear_all_unreads(true, cx));
         for (channel, thread_ts, ts) in targets {
             let key = (channel.clone(), thread_ts.clone());
-            if self.ws.marked_threads.get(&key) != Some(&ts) {
+            if !self
+                .ws
+                .marked_threads
+                .get(&key)
+                .is_some_and(|prev| *prev >= ts)
+            {
                 self.ws.marked_threads.insert(key, ts.clone());
                 self.bridge.send(MessagingCommand::MarkThreadRead {
                     channel,
@@ -506,6 +520,7 @@ impl App {
         }
         self.sidebar
             .update(cx, |s, cx| s.set_thread_counts(false, 0, cx));
+        self.sync_badge(cx);
     }
 
     /// Clear the sidebar's Threads unread indicator when `ThreadsView` has the remote list and
@@ -515,6 +530,7 @@ impl App {
         if threads.is_remote() && !threads.has_unreads() {
             self.sidebar
                 .update(cx, |s, cx| s.set_thread_counts(false, 0, cx));
+            self.sync_badge(cx);
         }
     }
 
@@ -597,6 +613,7 @@ impl App {
             id: None,
             workspace: self.workspace,
             channel: self.channel.clone(),
+            thread_ts: None,
             label: self.label(&self.channel),
             text,
             at: now_secs(),
@@ -678,13 +695,14 @@ impl App {
                 channel: channel.clone(),
                 post_at,
                 content,
-                thread_ts,
+                thread_ts: thread_ts.clone(),
             });
         }
         let entry = Entry {
             id: None,
             workspace: self.workspace,
             channel: channel.clone(),
+            thread_ts,
             label: self.label(&channel),
             text,
             at: post_at,
@@ -705,53 +723,38 @@ impl App {
         }
     }
 
-    /// Deliver a scheduled message now, through the send pipeline in its own workspace (the
-    /// scheduled copy is deleted on Slack first, as "Send now" means).
-    pub(super) fn deliver(
-        &mut self,
-        mut entry: Entry,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Deliver a scheduled message now, through the send pipeline in its own workspace.
+    /// Deleting the scheduled copy on Slack is deferred until `dispatch` so canceling a secret
+    /// or `@channel` guard keeps the scheduled message intact.
+    pub(super) fn deliver(&mut self, entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
         if entry.workspace != self.workspace {
             self.switch_workspace(entry.workspace, window, cx);
         }
-        if let Some(id) = entry.id.take()
-            && let Some(bridge) = self.workspace_bridge(entry.workspace)
-        {
-            bridge.send(MessagingCommand::DeleteScheduledMessage {
-                channel: entry.channel.clone(),
-                scheduled_message_id: id,
-            });
-        }
+        let label = entry.label.clone();
         // A scheduled message is kept as its draft text; it posts as the draft would have.
         let msg = OutgoingMessage {
             channel: entry.channel.clone(),
-            thread_ts: None,
+            thread_ts: entry.thread_ts.clone(),
             broadcast: false,
             content: composer::content_of(&entry.text, &self.fixtures),
             files: None,
-            origin: OutgoingOrigin::External,
+            origin: OutgoingOrigin::Scheduled(Box::new(entry)),
         };
         if self.submit(msg, window, cx) {
-            notify(
-                "Message sent",
-                format!("Delivered to {}", entry.label),
-                window,
-                cx,
-            );
+            notify("Message sent", format!("Delivered to {label}"), window, cx);
         }
     }
 }
 
 /// Where an [`OutgoingMessage`] originated, so cancelling a send guard restores the right
 /// composer (and rolls back any optimistic thread echo) without clobbering unrelated state.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) enum OutgoingOrigin {
     #[default]
     MainComposer,
     ThreadPanel,
     ThreadsView,
+    Scheduled(Box<Entry>),
     External,
 }
 
@@ -969,7 +972,8 @@ pub(crate) fn confirm_broadcast(
             theme.border,
             theme.secondary.opacity(0.4),
         );
-        let (on_send, on_cancel) = (on_send.clone(), on_cancel.clone());
+        let (on_send, on_cancel, on_cancel_close) =
+            (on_send.clone(), on_cancel.clone(), on_cancel.clone());
         let count_badge = if guard.is_large_enterprise {
             format!(
                 "{} members \u{b7} Large Enterprise channel",
@@ -988,30 +992,18 @@ pub(crate) fn confirm_broadcast(
         } else {
             "Channel broadcast".to_owned()
         };
-        dialog.title(guard.title.clone()).w(px(480.)).child(
-            v_flex()
-                .gap_3()
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_1()
-                                .px_2()
-                                .py_0p5()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(border)
-                                .bg(card_bg)
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(Icon::new(IconName::Users).size(px(12.)).text_color(muted))
-                                .child(count_badge),
-                        )
-                        .when(guard.is_restricted, |row| {
-                            row.child(
+        dialog
+            .title(guard.title.clone())
+            .w(px(480.))
+            .on_close(move |_, window, cx| on_cancel_close(window, cx))
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
                                 h_flex()
                                     .items_center()
                                     .gap_1()
@@ -1019,73 +1011,91 @@ pub(crate) fn confirm_broadcast(
                                     .py_0p5()
                                     .rounded_sm()
                                     .border_1()
-                                    .border_color(warning.opacity(0.45))
-                                    .bg(warning.opacity(0.14))
+                                    .border_color(border)
+                                    .bg(card_bg)
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(warning)
                                     .child(
-                                        Icon::new(IconName::TriangleAlert)
-                                            .size(px(12.))
-                                            .text_color(warning),
+                                        Icon::new(IconName::Users).size(px(12.)).text_color(muted),
                                     )
-                                    .child("Restricted mention"),
+                                    .child(count_badge),
                             )
-                        }),
-                )
-                .child(div().text_sm().text_color(muted).child(guard.body.clone()))
-                .when_some(guard.restriction_note.clone(), |col, note| {
-                    col.child(
-                        h_flex()
-                            .items_start()
-                            .gap_2()
-                            .p_2p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(warning.opacity(0.4))
-                            .bg(warning.opacity(0.1))
-                            .text_xs()
-                            .child(
-                                Icon::new(IconName::TriangleAlert)
-                                    .size(px(14.))
-                                    .text_color(warning),
-                            )
-                            .child(div().flex_1().min_w_0().child(note)),
+                            .when(guard.is_restricted, |row| {
+                                row.child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(warning.opacity(0.45))
+                                        .bg(warning.opacity(0.14))
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(warning)
+                                        .child(
+                                            Icon::new(IconName::TriangleAlert)
+                                                .size(px(12.))
+                                                .text_color(warning),
+                                        )
+                                        .child("Restricted mention"),
+                                )
+                            }),
                     )
-                })
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .justify_end()
-                        .pt_1()
-                        .child(
-                            preferences::form_button(
-                                Button::new("broadcast-cancel").outline().label("Cancel"),
-                                cx,
-                            )
-                            .debug_selector(|| "broadcast-cancel".into())
-                            .on_click(move |_, window, cx| {
-                                window.close_dialog(cx);
-                                on_cancel(window, cx);
-                            }),
+                    .child(div().text_sm().text_color(muted).child(guard.body.clone()))
+                    .when_some(guard.restriction_note.clone(), |col, note| {
+                        col.child(
+                            h_flex()
+                                .items_start()
+                                .gap_2()
+                                .p_2p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(warning.opacity(0.4))
+                                .bg(warning.opacity(0.1))
+                                .text_xs()
+                                .child(
+                                    Icon::new(IconName::TriangleAlert)
+                                        .size(px(14.))
+                                        .text_color(warning),
+                                )
+                                .child(div().flex_1().min_w_0().child(note)),
                         )
-                        .child(
-                            preferences::form_button(
-                                if guard.is_restricted {
-                                    Button::new("broadcast-send").danger().label("Send anyway")
-                                } else {
-                                    Button::new("broadcast-send").primary().label("Send")
-                                },
-                                cx,
+                    })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .pt_1()
+                            .child(
+                                preferences::form_button(
+                                    Button::new("broadcast-cancel").outline().label("Cancel"),
+                                    cx,
+                                )
+                                .debug_selector(|| "broadcast-cancel".into())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    on_cancel(window, cx);
+                                }),
                             )
-                            .debug_selector(|| "broadcast-send".into())
-                            .on_click(move |_, window, cx| {
-                                window.close_dialog(cx);
-                                on_send(window, cx);
-                            }),
-                        ),
-                ),
-        )
+                            .child(
+                                preferences::form_button(
+                                    if guard.is_restricted {
+                                        Button::new("broadcast-send").danger().label("Send anyway")
+                                    } else {
+                                        Button::new("broadcast-send").primary().label("Send")
+                                    },
+                                    cx,
+                                )
+                                .debug_selector(|| "broadcast-send".into())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    on_send(window, cx);
+                                }),
+                            ),
+                    ),
+            )
     });
 }
 
@@ -1196,12 +1206,15 @@ impl App {
                 return;
             }
         }
-        let remote = !invocation.force_builtin
-            && (invocation.app_id.is_some()
-                || invocation.app_name.is_some()
-                || invocation
-                    .command
-                    .is_none_or(|command| command.kind == SlashKind::Giphy));
+        let is_local_builtin = invocation.command.is_some_and(|command| {
+            matches!(
+                command.kind,
+                SlashKind::Shrug | SlashKind::Away | SlashKind::Status | SlashKind::Dnd
+            )
+        });
+        let remote = (!invocation.force_builtin
+            && (invocation.app_id.is_some() || invocation.app_name.is_some()))
+            || !is_local_builtin;
         if remote && !self.fixtures.sample {
             let (channel, thread_ts) = match thread {
                 Some((channel, thread_ts)) => (channel, Some(thread_ts)),
@@ -1212,7 +1225,11 @@ impl App {
                 command: format!("/{}", invocation.name),
                 args: invocation.args.clone(),
                 thread_ts,
-                app_id: invocation.app_id.clone(),
+                app_id: if invocation.force_builtin {
+                    None
+                } else {
+                    invocation.app_id.clone()
+                },
             });
             return;
         }
@@ -1654,8 +1671,17 @@ impl App {
             broadcast,
             content,
             files: _,
-            origin: _,
+            origin,
         } = msg;
+        if let OutgoingOrigin::Scheduled(entry) = origin
+            && let Some(id) = entry.id
+            && let Some(bridge) = self.workspace_bridge(entry.workspace)
+        {
+            bridge.send(MessagingCommand::DeleteScheduledMessage {
+                channel: entry.channel,
+                scheduled_message_id: id,
+            });
+        }
         let Some(thread_ts) = thread_ts else {
             self.send_to_conversation(channel, content, cx);
             return;
@@ -1694,6 +1720,10 @@ impl App {
                         view.rollback_pending_reply(&msg.channel, thread_ts, &msg.content.text, cx);
                     });
                 }
+            }
+            OutgoingOrigin::Scheduled(entry) => {
+                self.drafts
+                    .update(cx, |drafts, cx| drafts.schedule(*entry, cx));
             }
             OutgoingOrigin::External => {}
         }
@@ -1747,10 +1777,12 @@ impl App {
         } else {
             content.text.clone()
         };
+        self.ws.explicit_unread.remove(&channel);
         let entry = Entry {
             id: None,
             workspace: self.workspace,
             channel: channel.clone(),
+            thread_ts: None,
             label: self.label(&channel),
             text: sent_text,
             at: now_secs(),
@@ -2016,8 +2048,9 @@ impl App {
             }
             MessageAction::MarkUnread => match surface {
                 MessageSurface::Unreads => {
-                    self.post_change(&channel, &MessageChange::MarkUnread { ts: ts.clone() });
-                    self.apply_local_mark_unread(&channel, ts, cx);
+                    let cursor = self.unreads.read(cx).cursor_before(&channel, &ts);
+                    self.post_change(&channel, &MessageChange::MarkUnread { ts: cursor.clone() });
+                    self.apply_local_mark_unread(&channel, cursor, cx);
                 }
                 MessageSurface::Threads => {
                     let cursor = self.threads.read(cx).cursor_before(

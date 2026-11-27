@@ -61,8 +61,14 @@ impl App {
                 msg.user = None;
                 msg.username = Some(command.clone());
                 msg.is_ephemeral = is_ephemeral;
-                self.messages
-                    .update(cx, |list, cx| list.append(channel.clone(), msg, cx));
+                if let Some(root_ts) = thread_ts {
+                    self.thread.update(cx, |panel, cx| {
+                        panel.append_ephemeral(channel, root_ts, msg, cx);
+                    });
+                } else {
+                    self.messages
+                        .update(cx, |list, cx| list.append(channel.clone(), msg, cx));
+                }
             }
             Event::Typing {
                 channel,
@@ -297,6 +303,7 @@ impl App {
                         id: Some(m.id.clone()),
                         workspace,
                         channel: m.channel_id.clone(),
+                        thread_ts: None,
                         label: self.label(&m.channel_id),
                         text: m.text.clone(),
                         at: m.post_at,
@@ -694,10 +701,20 @@ impl App {
                 .draft(self.workspace, &draft.channel)
                 .is_some();
             if !has_local {
+                if draft.channel == self.channel {
+                    let current = self.composer.read(cx).text();
+                    if !current.is_empty() {
+                        // Do not clobber text the user is actively typing in the open composer.
+                        continue;
+                    }
+                    self.composer
+                        .update(cx, |composer, cx| composer.load_draft(&draft.text, cx));
+                }
                 let entry = Entry {
                     id: Some(draft.id.clone()),
                     workspace: self.workspace,
                     channel: draft.channel.clone(),
+                    thread_ts: None,
                     label: self.label(&draft.channel),
                     text: draft.text.clone(),
                     at: draft.updated_secs.unwrap_or_else(now_secs),
