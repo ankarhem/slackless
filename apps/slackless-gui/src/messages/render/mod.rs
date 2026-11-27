@@ -12,7 +12,7 @@ pub(super) use super::code_block::CodeModel;
 pub(crate) use super::code_block::{selectable_code, selectable_text};
 pub(super) use super::selectable::SelectableParagraph;
 pub(crate) use super::time::format_clock_with;
-pub(super) use super::time::{CivilTime, card_stamp, date_label, day_index, format_clock};
+pub(super) use super::time::{CivilTime, card_stamp, date_label, day_index};
 pub(crate) use super::time::{
     clock, day_and_time, day_label, file_day, iso_date, list_stamp, local_offset_now, now_secs,
     short_date,

@@ -212,6 +212,9 @@ pub struct ThreadPanel {
     /// True when the live workspace RTM connection is offline (skips optimistic local echo so
     /// the inline outbox card does not duplicate the reply).
     offline: bool,
+    /// Synthetic `(channel, thread_ts, optimistic_ts)` replies pushed locally by `reply()`, so
+    /// `rollback_pending_reply` only removes an optimistic echo that was actually inserted.
+    pending_optimistic: Vec<(ChannelId, Ts, Ts)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -319,6 +322,7 @@ impl ThreadPanel {
                 reveal: None,
                 outbox: Vec::new(),
                 offline: false,
+                pending_optimistic: Vec::new(),
                 _subscriptions: subscriptions,
             }
         })
@@ -411,9 +415,7 @@ impl ThreadPanel {
     /// Mirror the open thread's current `root` / `replies` back into `self.cache` so closing and
     /// immediately reopening the thread never flashes stale pre-edit / pre-delete / pre-react state.
     fn sync_cache(&mut self) {
-        if let Some(key) = self.thread.clone()
-            && self.cache.contains_key(&key)
-        {
+        if let Some(key) = self.thread.clone() {
             self.cache_put(key, self.root.clone(), self.replies.clone());
         }
     }
@@ -434,7 +436,7 @@ impl ThreadPanel {
             .and_then(|history| history.iter().find(|m| m.ts == thread_ts))
             .cloned();
         if let Some((cached_root, cached_replies)) = cached {
-            self.root = cached_root.or(seed_root).or(fixture_root);
+            self.root = seed_root.or(cached_root).or(fixture_root);
             self.replies = cached_replies;
             self.loading = false;
         } else {
@@ -474,6 +476,11 @@ impl ThreadPanel {
     #[cfg(test)]
     pub fn reply_count_for_test(&self) -> usize {
         self.replies.len()
+    }
+
+    #[cfg(test)]
+    pub fn reply_for_test(&mut self, content: MessageContent, cx: &mut Context<Self>) {
+        self.reply(content, cx);
     }
 
     /// Replace the open thread's messages (live mode: re-read from the store after it
@@ -573,11 +580,11 @@ impl ThreadPanel {
     /// Up in the empty reply box: edit the signed-in user's latest reply in this thread.
     fn edit_last_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let me = &self.fixtures.self_user;
-        let latest = self
-            .replies
-            .iter()
-            .rev()
-            .find(|reply| reply.user.as_ref() == Some(me));
+        let latest = self.replies.iter().rev().find(|reply| {
+            reply.user.as_ref() == Some(me)
+                && !reply.is_ephemeral
+                && !crate::messages::is_deleted_ghost(reply)
+        });
         if let Some(ts) = latest.map(|reply| reply.ts.clone()) {
             self.begin_edit(ts, window, cx);
         }
@@ -624,7 +631,10 @@ impl ThreadPanel {
             );
             message.blocks = content.blocks.clone();
             message.attachments = content.attachments.clone();
+            let optimistic_ts = message.ts.clone();
             self.replies.push(message);
+            self.pending_optimistic
+                .push((channel.clone(), thread_ts.clone(), optimistic_ts));
             self.sync_cache();
         }
         self.reply_hint = false;
@@ -673,23 +683,24 @@ impl ThreadPanel {
         cx: &mut Context<Self>,
     ) {
         let key = (channel.clone(), thread_ts.clone());
-        let me = self.fixtures.self_user.clone();
+        let optimistic_ts = self
+            .pending_optimistic
+            .iter()
+            .rposition(|(c, t, _)| c == channel && t == thread_ts)
+            .map(|ix| self.pending_optimistic.remove(ix).2);
         if self.thread.as_ref() == Some(&key) {
-            if let Some(pos) = self
-                .replies
-                .iter()
-                .rposition(|m| m.user.as_ref() == Some(&me) && m.text == text)
+            if let Some(opt_ts) = optimistic_ts
+                && let Some(pos) = self.replies.iter().rposition(|m| m.ts == opt_ts)
             {
                 self.replies.remove(pos);
+                self.sync_cache();
             }
-            self.sync_cache();
             self.composer
                 .update(cx, |composer, cx| composer.load_draft(text, cx));
             cx.notify();
-        } else if let Some((_, cached_replies)) = self.cache.get_mut(&key)
-            && let Some(pos) = cached_replies
-                .iter()
-                .rposition(|m| m.user.as_ref() == Some(&me) && m.text == text)
+        } else if let Some(opt_ts) = optimistic_ts
+            && let Some((_, cached_replies)) = self.cache.get_mut(&key)
+            && let Some(pos) = cached_replies.iter().rposition(|m| m.ts == opt_ts)
         {
             cached_replies.remove(pos);
         }
@@ -831,6 +842,7 @@ impl ThreadPanel {
                     },
                     cx,
                 );
+                cx.notify();
             }
             MessageAction::Delete => {
                 let Some(message) = self.message_at_mut(ts).map(|message| message.clone()) else {
@@ -1765,5 +1777,145 @@ mod tests {
         assert!(evs.contains(&"edit"));
         assert!(evs.contains(&"delete"));
         assert!(evs.contains(&"close"));
+    }
+
+    #[gpui::test]
+    fn thread_panel_offline_rollback_cache_sync_fresh_root_and_edit_last_reply(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let mut live_fx = crate::fixtures::load();
+        live_fx.sample = false;
+        let fixtures = Arc::new(live_fx);
+        let ch = fixtures.channels[0].id.clone();
+        let me = fixtures.self_user.clone();
+
+        let panel_slot: Rc<RefCell<Option<Entity<ThreadPanel>>>> = Rc::new(RefCell::new(None));
+        struct Host {
+            panel: Entity<ThreadPanel>,
+        }
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.panel.clone()
+            }
+        }
+        let slot = panel_slot.clone();
+        let fx = fixtures.clone();
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                let panel = ThreadPanel::new(fx, window, cx);
+                *slot.borrow_mut() = Some(panel.clone());
+                Host { panel }
+            });
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let panel = panel_slot.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+
+        let root_ts = Ts::from("1700001000.000100");
+        let r1_ts = Ts::from("1700001010.000100");
+        let ghost_ts = Ts::from("1700001020.000100");
+        let eph_ts = Ts::from("1700001030.000100");
+
+        let root_msg = Message {
+            ts: root_ts.clone(),
+            user: Some(me.clone()),
+            text: "root v1".into(),
+            ..Default::default()
+        };
+        let earlier_reply = Message {
+            ts: r1_ts.clone(),
+            thread_ts: Some(root_ts.clone()),
+            user: Some(me.clone()),
+            text: "same text".into(),
+            ..Default::default()
+        };
+        let mut ghost_reply = Message {
+            ts: ghost_ts.clone(),
+            thread_ts: Some(root_ts.clone()),
+            user: Some(me.clone()),
+            text: "deleted reply".into(),
+            ..Default::default()
+        };
+        ghost_reply.extra.insert(
+            crate::bridge::DELETED_EXTRA_KEY.to_owned(),
+            serde_json::Value::Bool(true),
+        );
+        let eph_reply = Message {
+            ts: eph_ts.clone(),
+            thread_ts: Some(root_ts.clone()),
+            user: Some(me.clone()),
+            text: "ephemeral reply".into(),
+            is_ephemeral: true,
+            ..Default::default()
+        };
+
+        cx.update(|window, cx| {
+            panel.update(cx, |p, cx| {
+                p.open(ch.clone(), root_ts.clone(), Some(root_msg.clone()), cx);
+                p.set_thread(
+                    ch.clone(),
+                    root_ts.clone(),
+                    vec![
+                        root_msg.clone(),
+                        earlier_reply.clone(),
+                        ghost_reply.clone(),
+                        eph_reply.clone(),
+                    ],
+                    cx,
+                );
+
+                // 1. Offline reply does not push an optimistic echo; rolling it back must NOT
+                //    delete an earlier already-sent reply that happened to share the same text.
+                p.set_offline(true, cx);
+                p.reply(MessageContent::plain("same text"), cx);
+                assert_eq!(p.replies.len(), 3);
+                p.rollback_pending_reply(&ch, &root_ts, "same text", cx);
+                assert_eq!(
+                    p.replies.len(),
+                    3,
+                    "offline rollback must not delete an already-sent reply"
+                );
+                assert_eq!(p.composer.read(cx).text(), "same text");
+
+                // 2. Online reply DOES push an optimistic echo; rolling it back removes ONLY
+                //    that optimistic reply and keeps the earlier reply intact.
+                p.set_offline(false, cx);
+                p.reply(MessageContent::plain("same text"), cx);
+                assert_eq!(p.replies.len(), 4);
+                p.rollback_pending_reply(&ch, &root_ts, "same text", cx);
+                assert_eq!(p.replies.len(), 3);
+                assert_eq!(p.replies[0].ts, r1_ts);
+
+                // 3. edit_last_reply skips deleted ghost & ephemeral own replies.
+                p.edit_last_reply(window, cx);
+                assert_eq!(p.editing, Some(r1_ts.clone()));
+
+                // 4. Reopening a cached thread with a newer seed_root prefers seed_root over stale cache.
+                let mut root_v2 = root_msg.clone();
+                root_v2.text = "root v2 edited".into();
+                p.open(ch.clone(), root_ts.clone(), Some(root_v2), cx);
+                assert_eq!(
+                    p.root.as_ref().map(|m| m.text.as_str()),
+                    Some("root v2 edited")
+                );
+
+                // 5. sync_cache caches mutations even on a previously uncached thread.
+                let uncached_ts = Ts::from("1700002000.000100");
+                let uncached_root = Message {
+                    ts: uncached_ts.clone(),
+                    user: Some(me.clone()),
+                    text: "uncached root".into(),
+                    ..Default::default()
+                };
+                p.open(ch.clone(), uncached_ts.clone(), Some(uncached_root), cx);
+                assert!(!p.cache.contains_key(&(ch.clone(), uncached_ts.clone())));
+                p.reply(MessageContent::plain("cached via sync_cache"), cx);
+                assert!(p.cache.contains_key(&(ch.clone(), uncached_ts.clone())));
+                p.open(ch.clone(), uncached_ts.clone(), None, cx);
+                assert_eq!(p.replies.len(), 1);
+                assert_eq!(p.replies[0].text, "cached via sync_cache");
+            });
+        });
     }
 }

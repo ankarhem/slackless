@@ -58,8 +58,7 @@ mod shell;
 mod time;
 pub(crate) use render::is_deleted_ghost;
 use render::{
-    BodyCache, CivilTime, card_stamp, date_label, day_index, format_clock, message_body,
-    message_body_cached,
+    BodyCache, CivilTime, card_stamp, date_label, day_index, message_body, message_body_cached,
 };
 pub(crate) use render::{
     Preview, clock, day_and_time, day_label, file_day, format_clock_with, hex_color, iso_date,
@@ -1024,6 +1023,7 @@ impl MessageList {
                         pinned,
                     },
                 });
+                self.refresh(cx);
             }
             MessageAction::DismissEphemeral => {
                 let row = self
@@ -1081,7 +1081,7 @@ impl MessageList {
             .messages
             .iter()
             .rev()
-            .find(|m| !m.is_ephemeral && m.user.as_ref() == Some(me))
+            .find(|m| !m.is_ephemeral && !is_deleted_ghost(m) && m.user.as_ref() == Some(me))
             .map(|m| m.ts.clone())
     }
 
@@ -1121,7 +1121,11 @@ impl MessageList {
             .messages
             .iter()
             .rev()
-            .find(|message| message.user.as_ref() == Some(&me))
+            .find(|message| {
+                message.user.as_ref() == Some(&me)
+                    && !message.is_ephemeral
+                    && !is_deleted_ghost(message)
+            })
             .map(|message| message.ts.clone());
         if let Some(ts) = newest {
             self.begin_edit(&ts, window, cx);
@@ -1327,16 +1331,17 @@ impl MessageList {
     pub fn finish_jump(&mut self, cx: &mut Context<Self>) {
         if let Some(ts) = self.pending_highlight.take() {
             self.pending_jump = None;
-            if let Some(ix) = self
-                .data
-                .read(cx)
-                .messages
-                .iter()
-                .position(|message| message.ts >= ts)
-            {
+            let landed = {
+                let messages = &self.data.read(cx).messages;
+                messages
+                    .iter()
+                    .position(|message| message.ts >= ts)
+                    .map(|ix| (ix, messages[ix].ts.clone()))
+            };
+            if let Some((ix, landed_ts)) = landed {
                 self.scroller
                     .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
-                self.flash_highlight(ts, cx);
+                self.flash_highlight(landed_ts, cx);
                 return;
             }
         }
@@ -1350,12 +1355,16 @@ impl MessageList {
     /// window starts after it.
     pub fn reveal(&mut self, ts: &Ts, cx: &mut Context<Self>) {
         let since = ts.secs().unwrap_or(0);
-        let target = {
+        let (target, newest) = {
             let messages = &self.data.read(cx).messages;
-            messages
+            let target = messages
                 .iter()
                 .position(|message| &message.ts >= ts)
-                .map(|ix| (ix, messages[ix].ts.clone()))
+                .map(|ix| (ix, messages[ix].ts.clone()));
+            let newest = messages
+                .last()
+                .map(|message| (messages.len() - 1, message.ts.clone()));
+            (target, newest)
         };
         match target {
             Some((ix, landed))
@@ -1364,6 +1373,15 @@ impl MessageList {
                 self.scroller
                     .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
                 self.flash_highlight(landed, cx);
+            }
+            None if newest.is_some() => {
+                // `ts` is newer than every loaded message; stay at the newest row rather than
+                // requesting older history and snapping to row 0.
+                if let Some((ix, newest_ts)) = newest {
+                    self.scroller
+                        .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
+                    self.flash_highlight(newest_ts, cx);
+                }
             }
             _ => {
                 self.pending_jump = Some(since);

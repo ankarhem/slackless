@@ -2438,23 +2438,12 @@ fn wired_thread_rollback_cache_sync_and_search_workspace_reset(cx: &mut gpui::Te
         text: "thread root".into(),
         ..Default::default()
     };
-    let my_reply = Message {
-        ts: Ts::from("1700000101.000100"),
-        thread_ts: Some(root_ts.clone()),
-        user: Some(UserId::from("U0ME")),
-        text: "ghp_secret_draft".into(),
-        ..Default::default()
-    };
     cx.update(|_, cx| {
         let panel = app.read(cx).thread.clone();
         panel.update(cx, |panel, cx| {
             panel.open(ch.clone(), root_ts.clone(), Some(root_msg.clone()), cx);
-            panel.set_thread(
-                ch.clone(),
-                root_ts.clone(),
-                vec![root_msg.clone(), my_reply.clone()],
-                cx,
-            );
+            panel.set_thread(ch.clone(), root_ts.clone(), vec![root_msg.clone()], cx);
+            panel.reply_for_test(MessageContent::plain("ghp_secret_draft"), cx);
             panel.rollback_pending_reply(&ch, &root_ts, "ghp_secret_draft", cx);
             // Re-opening from cache must not resurrect the rolled-back reply.
             panel.open(ch.clone(), root_ts.clone(), Some(root_msg.clone()), cx);

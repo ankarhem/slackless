@@ -1587,3 +1587,205 @@ fn benchmark_highlight_mrkdwn_and_time_1000_messages() {
     );
     assert!(total_tokens > 0 && total_chars > 0);
 }
+
+#[test]
+fn same_group_guards_membership_anonymous_bots_and_distinct_broadcasts() {
+    use slackless_core::types::BotId;
+
+    let mut base = Message {
+        ts: Ts::from("1700000100.000100"),
+        user: Some(UserId::from("U1")),
+        text: "first".into(),
+        ..Default::default()
+    };
+    let followup = Message {
+        ts: Ts::from("1700000110.000100"),
+        user: Some(UserId::from("U1")),
+        text: "second".into(),
+        ..Default::default()
+    };
+    assert!(same_group(&base, &followup));
+
+    // Membership notice followed by a regular message from the same user must not group.
+    base.subtype = Some(MessageSubtype::ChannelJoin);
+    assert!(!same_group(&base, &followup));
+
+    // Anonymous messages with neither user, bot_id, nor username must never group.
+    let anon1 = Message {
+        ts: Ts::from("1700000100.000100"),
+        ..Default::default()
+    };
+    let anon2 = Message {
+        ts: Ts::from("1700000105.000100"),
+        ..Default::default()
+    };
+    assert!(!same_group(&anon1, &anon2));
+
+    // Two distinct bot_ids without user/username must not group; same bot_id does.
+    let bot_a = Message {
+        ts: Ts::from("1700000100.000100"),
+        bot_id: Some(BotId::from("B1")),
+        ..Default::default()
+    };
+    let bot_b = Message {
+        ts: Ts::from("1700000105.000100"),
+        bot_id: Some(BotId::from("B2")),
+        ..Default::default()
+    };
+    let bot_a2 = Message {
+        ts: Ts::from("1700000108.000100"),
+        bot_id: Some(BotId::from("B1")),
+        ..Default::default()
+    };
+    assert!(!same_group(&bot_a, &bot_b));
+    assert!(same_group(&bot_a, &bot_a2));
+
+    // Two thread broadcasts from different threads must not group; same thread does.
+    let bc1 = Message {
+        ts: Ts::from("1700000100.000100"),
+        user: Some(UserId::from("U1")),
+        thread_ts: Some(Ts::from("1700000010.000100")),
+        subtype: Some(MessageSubtype::ThreadBroadcast),
+        ..Default::default()
+    };
+    let bc_other = Message {
+        ts: Ts::from("1700000105.000100"),
+        user: Some(UserId::from("U1")),
+        thread_ts: Some(Ts::from("1700000020.000100")),
+        subtype: Some(MessageSubtype::ThreadBroadcast),
+        ..Default::default()
+    };
+    let bc_same = Message {
+        ts: Ts::from("1700000108.000100"),
+        user: Some(UserId::from("U1")),
+        thread_ts: Some(Ts::from("1700000010.000100")),
+        subtype: Some(MessageSubtype::ThreadBroadcast),
+        ..Default::default()
+    };
+    assert!(!same_group(&bc1, &bc_other));
+    assert!(same_group(&bc1, &bc_same));
+}
+
+#[gpui::test]
+fn message_list_pin_refresh_edit_last_own_skips_ghost_and_jump_reveal_guards(
+    cx: &mut TestAppContext,
+) {
+    use std::rc::Rc;
+
+    cx.update(gpui_kit::init);
+    let fixtures = Arc::new(crate::fixtures::load());
+    let ch = fixtures.channels[0].id.clone();
+    let me = fixtures.self_user.clone();
+
+    let real_ts = Ts::from("1700000100.000100");
+    let ghost_ts = Ts::from("1700000200.000100");
+    let eph_ts = Ts::from("1700000300.000100");
+    let newest_ts = Ts::from("1700000400.000100");
+
+    let real_own = Message {
+        ts: real_ts.clone(),
+        user: Some(me.clone()),
+        text: "editable message".into(),
+        ..Default::default()
+    };
+    let mut ghost_own = Message {
+        ts: ghost_ts.clone(),
+        user: Some(me.clone()),
+        text: "deleted".into(),
+        ..Default::default()
+    };
+    ghost_own.extra.insert(
+        crate::bridge::DELETED_EXTRA_KEY.to_owned(),
+        serde_json::Value::Bool(true),
+    );
+    let eph_own = Message {
+        ts: eph_ts.clone(),
+        user: Some(me.clone()),
+        text: "ephemeral".into(),
+        is_ephemeral: true,
+        ..Default::default()
+    };
+    let other_newest = Message {
+        ts: newest_ts.clone(),
+        user: Some(UserId::from("U0OTHER")),
+        text: "newest".into(),
+        ..Default::default()
+    };
+
+    let need_history_count = Rc::new(RefCell::new(0usize));
+    let list_slot: Rc<RefCell<Option<Entity<MessageList>>>> = Rc::new(RefCell::new(None));
+
+    struct Host {
+        list: Entity<MessageList>,
+        _sub: Subscription,
+    }
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.list.clone()
+        }
+    }
+
+    let nhc = need_history_count.clone();
+    let slot = list_slot.clone();
+    let fx = fixtures.clone();
+    let ch_init = ch.clone();
+    let (_root, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| {
+            let list = MessageList::new(fx, ch_init, window, cx);
+            *slot.borrow_mut() = Some(list.clone());
+            let sub = cx.subscribe(&list, move |_, _, ev: &MessageListEvent, _| {
+                if matches!(ev, MessageListEvent::NeedHistorySince { .. }) {
+                    *nhc.borrow_mut() += 1;
+                }
+            });
+            Host { list, _sub: sub }
+        });
+        gpui_kit::base::Root::new(view, window, cx)
+    });
+    let list = list_slot.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        list.update(cx, |l, cx| {
+            l.set_history(
+                ch.clone(),
+                vec![
+                    real_own.clone(),
+                    ghost_own.clone(),
+                    eph_own.clone(),
+                    other_newest.clone(),
+                ],
+                cx,
+            );
+
+            // 1. TogglePin refreshes data.messages immediately.
+            l.run_action(&real_ts, MessageAction::TogglePin, window, cx);
+            let pinned_in_data = l
+                .data
+                .read(cx)
+                .messages
+                .iter()
+                .find(|m| m.ts == real_ts)
+                .is_some_and(|m| m.pinned_to.contains(&ch));
+            assert!(
+                pinned_in_data,
+                "TogglePin must refresh MessageData snapshot immediately"
+            );
+
+            // 2. edit_last_own & latest_own_ts skip ephemeral and deleted ghost own messages.
+            assert_eq!(l.latest_own_ts(cx), Some(real_ts.clone()));
+            l.edit_last_own(window, cx);
+            assert_eq!(l.data.read(cx).editing, Some(real_ts.clone()));
+
+            // 3. reveal() with a ts NEWER than the loaded tail stays at newest and does not emit NeedHistorySince.
+            l.reveal(&Ts::from("1700009999.000100"), cx);
+            assert_eq!(*need_history_count.borrow(), 0);
+            assert_eq!(l.data.read(cx).highlighted, Some(newest_ts.clone()));
+
+            // 4. finish_jump() when the target ts was deleted highlights the landed message ts.
+            l.pending_highlight = Some(Ts::from("1700000150.000100"));
+            l.finish_jump(cx);
+            assert_eq!(l.data.read(cx).highlighted, Some(ghost_ts.clone()));
+        });
+    });
+}

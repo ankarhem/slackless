@@ -28,7 +28,7 @@ pub(super) fn transcript_row(
     let date_break = previous.is_none_or(|prev| day_index(&prev.ts) != day_index(&message.ts));
     // Like Slack, your own messages never count as new: `first_unread_ix` is precomputed once
     // when messages or `last_read` change so row rendering is O(1).
-    let new_break = !date_break && store.first_unread_ix == Some(ix);
+    let new_break = store.first_unread_ix == Some(ix);
     let grouped =
         !date_break && !new_break && previous.is_some_and(|prev| same_group(prev, message));
     let editing = store.editing.as_ref() == Some(&message.ts);
@@ -61,7 +61,8 @@ pub(super) fn transcript_row(
             Some(this.downgrade()),
             cx,
         ));
-    } else if new_break {
+    }
+    if new_break {
         row = row.child(new_messages_divider(cx));
     }
     if is_membership(message) {
@@ -593,21 +594,33 @@ pub(crate) fn reply_bar(
 }
 
 /// Two consecutive messages group into one card when they share an author, land on the same
-/// day within [`GROUP_WINDOW_SECS`], and carry the same thread-ness.
+/// day within [`GROUP_WINDOW_SECS`], and carry the same thread-ness (and thread root when
+/// broadcast).
 pub(crate) fn same_group(prev: &Message, message: &Message) -> bool {
-    if is_deleted_ghost(prev) || is_deleted_ghost(message) {
+    if is_deleted_ghost(prev)
+        || is_deleted_ghost(message)
+        || is_membership(prev)
+        || is_membership(message)
+    {
         return false;
     }
     let same_author = match (&prev.user, &message.user) {
         (Some(a), Some(b)) => a == b,
-        (None, None) => prev.username == message.username,
+        (None, None) => {
+            (prev.bot_id.is_some() || prev.username.is_some())
+                && prev.bot_id == message.bot_id
+                && prev.username == message.username
+        }
         _ => false,
     };
     let close = match (prev.ts.secs(), message.ts.secs()) {
         (Some(prev_secs), Some(secs)) => secs.saturating_sub(prev_secs) <= GROUP_WINDOW_SECS,
         _ => false,
     };
-    same_author && close && prev.is_thread_reply() == message.is_thread_reply()
+    same_author
+        && close
+        && prev.is_thread_reply() == message.is_thread_reply()
+        && (!prev.is_thread_reply() || prev.thread_ts == message.thread_ts)
 }
 
 fn author_key(message: &Message) -> String {
@@ -749,7 +762,7 @@ pub fn message_row_linked(
             .when(compact, |el| el.text_size(px(10.)))
             .when(!compact, |el| el.text_xs())
             .text_color(cx.theme().muted_foreground)
-            .child(format_clock(&message.ts))
+            .child(format_clock_with(&message.ts, prefs.clock_24h))
             .into_any_element(),
         None => avatar_gutter(
             AvatarGutterSpec {
@@ -1203,7 +1216,10 @@ fn membership_line(
                 .child(channel_span)
                 .child("."),
         })
-        .child(div().text_xs().child(format_clock(&message.ts)))
+        .child(div().text_xs().child(format_clock_with(
+            &message.ts,
+            crate::preferences::display_prefs(cx).clock_24h,
+        )))
 }
 
 /// One muted, hover-underlined clickable span of a join/leave line.

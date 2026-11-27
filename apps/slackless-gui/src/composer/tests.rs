@@ -1293,3 +1293,125 @@ fn composer_schedule_gif_staging_also_send_and_emoji_insertion(cx: &mut TestAppC
 
     drop(root);
 }
+
+#[gpui::test]
+fn outgoing_transforms_emoticons_preserve_underline_fences_header_tracking_and_edit_slash(
+    cx: &mut TestAppContext,
+) {
+    use super::{Menu, apply_outgoing_transforms, convert_emoticons, set_outgoing_guard_prefs};
+    use slackless_core::types::rich_text::{
+        LinkElement, RichTextHeader, RichTextSection, TextElement,
+    };
+    use slackless_core::types::{
+        Block, RichTextBlock, RichTextContainer, RichTextElement, TextStyle,
+    };
+
+    // 1. HTML-escaped `<3` (`&lt;3`), raw `<3`, triple-backtick fences with single backticks
+    //    inside, and multi-backtick inline spans.
+    assert_eq!(convert_emoticons("I <3 Rust"), "I :heart: Rust");
+    assert_eq!(convert_emoticons("I &lt;3 Rust"), "I :heart: Rust");
+    assert_eq!(
+        convert_emoticons("```\n` :) `\n``` and :)"),
+        "```\n` :) `\n``` and :slightly_smiling_face:"
+    );
+    assert_eq!(
+        convert_emoticons("`` ` :) `` and &lt;3"),
+        "`` ` :) `` and :heart:"
+    );
+
+    // 2. apply_outgoing_transforms preserves rich-text underline while converting emoticons
+    //    and strips tracking query params inside RichTextContainer::Header links.
+    let fixtures = crate::fixtures::load();
+    cx.update(|cx| {
+        let settings = crate::preferences::Settings {
+            convert_emoticons: true,
+            ..Default::default()
+        };
+        crate::preferences::set_display_prefs(&settings, cx);
+        set_outgoing_guard_prefs(true, true, cx);
+
+        let underline = Some(TextStyle {
+            underline: true,
+            ..Default::default()
+        });
+        let mut content = MessageContent {
+            text: "Hello :) https://example.com/p?utm_source=slack&keep=1".to_owned(),
+            blocks: vec![Block::RichText(RichTextBlock {
+                block_id: None,
+                elements: vec![
+                    RichTextContainer::Section(RichTextSection {
+                        elements: vec![RichTextElement::Text(TextElement {
+                            text: "Hello :)".to_owned(),
+                            style: underline,
+                        })],
+                    }),
+                    RichTextContainer::Header(RichTextHeader {
+                        level: Some(1),
+                        elements: vec![RichTextElement::Link(LinkElement {
+                            url: "https://example.com/p?utm_source=slack&keep=1".to_owned(),
+                            text: Some("doc".to_owned()),
+                            style: None,
+                        })],
+                    }),
+                ],
+            })],
+            attachments: Vec::new(),
+        };
+
+        apply_outgoing_transforms(&mut content, &fixtures, cx);
+
+        assert_eq!(
+            content.text,
+            "Hello :slightly_smiling_face: https://example.com/p?keep=1"
+        );
+        let [Block::RichText(rich)] = content.blocks.as_slice() else {
+            panic!("expected one RichText block");
+        };
+        let RichTextContainer::Section(sec) = &rich.elements[0] else {
+            panic!("expected section");
+        };
+        assert_eq!(sec.elements.len(), 2);
+        match &sec.elements[0] {
+            RichTextElement::Text(t) => {
+                assert_eq!(t.text, "Hello ");
+                assert_eq!(
+                    t.style, underline,
+                    "underline style must survive emoticon conversion"
+                );
+            }
+            other => panic!("expected Text element, got {other:?}"),
+        }
+        match &sec.elements[1] {
+            RichTextElement::Emoji(e) => {
+                assert_eq!(e.name, "slightly_smiling_face");
+                assert_eq!(e.style, underline);
+            }
+            other => panic!("expected Emoji element, got {other:?}"),
+        }
+        let RichTextContainer::Header(hdr) = &rich.elements[1] else {
+            panic!("expected header");
+        };
+        let [RichTextElement::Link(link)] = hdr.elements.as_slice() else {
+            panic!("expected link inside header");
+        };
+        assert_eq!(link.url, "https://example.com/p?keep=1");
+    });
+
+    // 3. Edit-mode slash suppression: `/topic` opens slash menu when allow_slash=true,
+    //    is suppressed when allow_slash=false, while `@` mentions inside `/topic @...` still work.
+    let mut editor = crate::editor::Editor::default();
+    editor.replace_all("/topic");
+    assert!(
+        Menu::at_caret(&editor, &fixtures).is_some(),
+        "normal composer opens slash menu"
+    );
+    assert!(
+        Menu::at_caret_with_slash(&editor, &fixtures, false).is_none(),
+        "edit composer suppresses slash menu"
+    );
+    editor.replace_all("/topic @he");
+    assert!(
+        Menu::at_caret_with_slash(&editor, &fixtures, false).is_some(),
+        "edit composer still completes @mentions inside messages starting with `/`"
+    );
+}

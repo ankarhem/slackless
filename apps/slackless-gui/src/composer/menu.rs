@@ -50,12 +50,27 @@ pub(super) struct Menu {
 impl Menu {
     /// The menu for what is being typed at the caret, when anything matches it.
     pub fn at_caret(editor: &Editor, fixtures: &Fixtures) -> Option<Menu> {
+        Self::at_caret_with_slash(editor, fixtures, true)
+    }
+
+    /// Like [`Self::at_caret`], with slash-command completion suppressed when `allow_slash` is
+    /// `false` (e.g. inline message editing, where Enter should save rather than run `/commands`).
+    pub fn at_caret_with_slash(
+        editor: &Editor,
+        fixtures: &Fixtures,
+        allow_slash: bool,
+    ) -> Option<Menu> {
         let selection = editor.selection();
         if !selection.is_empty() {
             return None;
         }
         let doc = editor.doc();
-        let (range, entries) = match slash::typing(doc.text()) {
+        let slash_match = if allow_slash {
+            slash::typing(doc.text())
+        } else {
+            None
+        };
+        let (range, entries) = match slash_match {
             Some(name) => (0..doc.text().len(), slash_commands(fixtures, name)),
             None => {
                 let found = trigger(doc, selection.start)?;

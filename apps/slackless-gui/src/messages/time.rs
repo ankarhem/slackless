@@ -69,6 +69,7 @@ pub(super) fn format_clock_civil(time: &CivilTime, clock_24h: bool) -> String {
     }
 }
 
+#[cfg(test)]
 pub(super) fn format_clock(ts: &Ts) -> String {
     format_clock_with(ts, false)
 }

@@ -223,52 +223,74 @@ pub(crate) fn set_outgoing_guard_prefs(
     });
 }
 
+const EMOTICON_MAP: [(&str, &str); 13] = [
+    (":-)", "slightly_smiling_face"),
+    (":)", "slightly_smiling_face"),
+    (":-D", "smiley"),
+    (":D", "smiley"),
+    (":-(", "disappointed"),
+    (":(", "disappointed"),
+    (";-)", "wink"),
+    (";)", "wink"),
+    (":-P", "stuck_out_tongue"),
+    (":P", "stuck_out_tongue"),
+    ("&lt;3", "heart"),
+    ("<3", "heart"),
+    (":/", "confused"),
+];
+
+fn match_emoticon(rest: &str) -> Option<(&'static str, &'static str)> {
+    EMOTICON_MAP.iter().copied().find(|(pat, _)| {
+        rest.strip_prefix(*pat).is_some_and(|after| {
+            after
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace() || matches!(c, '.' | ',' | '!' | '?'))
+        })
+    })
+}
+
+fn is_emoticon_left_boundary(prev: Option<char>) -> bool {
+    prev.is_none_or(|c| c.is_whitespace() || c == '(')
+}
+
 /// Convert common typed emoticons outside inline/fenced code spans into Slack `:shortcode:`
 /// emoji when Preferences > Appearance > Convert emoticons is enabled (`F-SHELL-091`).
 pub(crate) fn convert_emoticons(text: &str) -> String {
-    const MAP: [(&str, &str); 12] = [
-        (":-)", ":slightly_smiling_face:"),
-        (":)", ":slightly_smiling_face:"),
-        (":-D", ":smiley:"),
-        (":D", ":smiley:"),
-        (":-(", ":disappointed:"),
-        (":(", ":disappointed:"),
-        (";-)", ":wink:"),
-        (";)", ":wink:"),
-        (":-P", ":stuck_out_tongue:"),
-        (":P", ":stuck_out_tongue:"),
-        ("<3", ":heart:"),
-        (":/", ":confused:"),
-    ];
     let mut out = String::with_capacity(text.len());
-    let mut in_code = false;
+    let mut in_fence = false;
+    let mut inline_ticks: usize = 0;
     let mut rest = text;
     while !rest.is_empty() {
-        if let Some(after) = rest.strip_prefix('`') {
-            in_code = !in_code;
-            out.push('`');
-            rest = after;
+        if rest.starts_with('`') {
+            let ticks = rest.bytes().take_while(|&b| b == b'`').count();
+            out.push_str(&rest[..ticks]);
+            rest = &rest[ticks..];
+            if in_fence {
+                if ticks >= 3 {
+                    in_fence = false;
+                }
+            } else if inline_ticks > 0 {
+                if ticks == inline_ticks {
+                    inline_ticks = 0;
+                }
+            } else if ticks >= 3 {
+                in_fence = true;
+            } else {
+                inline_ticks = ticks;
+            }
             continue;
         }
-        if !in_code {
-            let at_boundary = out
-                .chars()
-                .last()
-                .is_none_or(|c| c.is_whitespace() || c == '(');
-            if at_boundary
-                && let Some((pat, rep)) = MAP.iter().find(|(pat, _)| {
-                    rest.strip_prefix(*pat).is_some_and(|after| {
-                        after
-                            .chars()
-                            .next()
-                            .is_none_or(|c| c.is_whitespace() || matches!(c, '.' | ',' | '!' | '?'))
-                    })
-                })
-            {
-                out.push_str(rep);
-                rest = &rest[pat.len()..];
-                continue;
-            }
+        if !in_fence
+            && inline_ticks == 0
+            && is_emoticon_left_boundary(out.chars().last())
+            && let Some((pat, name)) = match_emoticon(rest)
+        {
+            out.push(':');
+            out.push_str(name);
+            out.push(':');
+            rest = &rest[pat.len()..];
+            continue;
         }
         let Some(ch) = rest.chars().next() else {
             break;
@@ -277,6 +299,93 @@ pub(crate) fn convert_emoticons(text: &str) -> String {
         rest = &rest[ch.len_utf8()..];
     }
     out
+}
+
+fn convert_emoticons_in_elements(elements: &mut Vec<slackless_core::types::RichTextElement>) {
+    use slackless_core::types::RichTextElement;
+    use slackless_core::types::rich_text::{EmojiElement, TextElement};
+
+    let mut out = Vec::with_capacity(elements.len());
+    let mut prev_char: Option<char> = None;
+    for el in std::mem::take(elements) {
+        match el {
+            RichTextElement::Text(text_el) if !text_el.style.is_some_and(|s| s.code) => {
+                let style = text_el.style;
+                let mut rest = text_el.text.as_str();
+                let mut buf = String::new();
+                while !rest.is_empty() {
+                    let left = buf.chars().last().or(prev_char);
+                    if is_emoticon_left_boundary(left)
+                        && let Some((pat, name)) = match_emoticon(rest)
+                    {
+                        if !buf.is_empty() {
+                            out.push(RichTextElement::Text(TextElement {
+                                text: std::mem::take(&mut buf),
+                                style,
+                            }));
+                        }
+                        out.push(RichTextElement::Emoji(EmojiElement {
+                            name: name.to_owned(),
+                            unicode: None,
+                            skin_tone: None,
+                            style,
+                        }));
+                        prev_char = Some(':');
+                        rest = &rest[pat.len()..];
+                        continue;
+                    }
+                    let Some(ch) = rest.chars().next() else {
+                        break;
+                    };
+                    buf.push(ch);
+                    prev_char = Some(ch);
+                    rest = &rest[ch.len_utf8()..];
+                }
+                if !buf.is_empty() {
+                    out.push(RichTextElement::Text(TextElement { text: buf, style }));
+                }
+            }
+            RichTextElement::Text(text_el) => {
+                prev_char = text_el.text.chars().last().or(prev_char);
+                out.push(RichTextElement::Text(text_el));
+            }
+            other => {
+                prev_char = Some('x');
+                out.push(other);
+            }
+        }
+    }
+    *elements = out;
+}
+
+fn convert_emoticons_in_blocks(blocks: &mut [slackless_core::types::Block]) {
+    for block in blocks {
+        if let slackless_core::types::Block::RichText(rich) = block {
+            for container in &mut rich.elements {
+                match container {
+                    slackless_core::types::RichTextContainer::Section(s) => {
+                        convert_emoticons_in_elements(&mut s.elements);
+                    }
+                    slackless_core::types::RichTextContainer::Quote(q) => {
+                        convert_emoticons_in_elements(&mut q.elements);
+                    }
+                    slackless_core::types::RichTextContainer::Header(h) => {
+                        convert_emoticons_in_elements(&mut h.elements);
+                    }
+                    slackless_core::types::RichTextContainer::List(list) => {
+                        for item in &mut list.elements {
+                            if let slackless_core::types::RichTextContainer::Section(s) = item {
+                                convert_emoticons_in_elements(&mut s.elements);
+                            }
+                        }
+                    }
+                    slackless_core::types::RichTextContainer::Preformatted(_)
+                    | slackless_core::types::RichTextContainer::Divider(_)
+                    | slackless_core::types::RichTextContainer::Unknown { .. } => {}
+                }
+            }
+        }
+    }
 }
 
 /// Strip tracking parameters (`utm_*`, `fbclid`, `gclid`, etc.) from outgoing text and
@@ -295,6 +404,7 @@ pub(crate) fn strip_tracking_params_in_content(content: &mut MessageContent) {
                     slackless_core::types::RichTextContainer::Section(s) => &mut s.elements,
                     slackless_core::types::RichTextContainer::Quote(q) => &mut q.elements,
                     slackless_core::types::RichTextContainer::Preformatted(p) => &mut p.elements,
+                    slackless_core::types::RichTextContainer::Header(h) => &mut h.elements,
                     slackless_core::types::RichTextContainer::List(list) => {
                         for item in &mut list.elements {
                             if let slackless_core::types::RichTextContainer::Section(s) = item {
@@ -307,8 +417,7 @@ pub(crate) fn strip_tracking_params_in_content(content: &mut MessageContent) {
                         }
                         continue;
                     }
-                    slackless_core::types::RichTextContainer::Header(_)
-                    | slackless_core::types::RichTextContainer::Divider(_)
+                    slackless_core::types::RichTextContainer::Divider(_)
                     | slackless_core::types::RichTextContainer::Unknown { .. } => continue,
                 };
                 for el in elements {
@@ -325,15 +434,14 @@ pub(crate) fn strip_tracking_params_in_content(content: &mut MessageContent) {
 /// respecting active display & privacy preferences.
 pub(crate) fn apply_outgoing_transforms(
     content: &mut MessageContent,
-    fixtures: &Fixtures,
+    _fixtures: &Fixtures,
     cx: &App,
 ) {
     if crate::preferences::display_prefs(cx).convert_emoticons {
         let converted = convert_emoticons(&content.text);
         if converted != content.text {
-            let attachments = std::mem::take(&mut content.attachments);
-            *content = content_of(&converted, fixtures);
-            content.attachments = attachments;
+            content.text = converted;
+            convert_emoticons_in_blocks(&mut content.blocks);
         }
     }
     if outgoing_guard_prefs(cx).strip_tracking_params {

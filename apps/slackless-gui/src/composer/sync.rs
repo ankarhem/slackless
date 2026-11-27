@@ -300,7 +300,7 @@ impl Composer {
 
     /// The draft or the caret changed: reopen or close the completion menu.
     pub(super) fn changed(&mut self, cx: &mut Context<Self>) {
-        self.menu = match Menu::at_caret(&self.editor, &self.fixtures) {
+        self.menu = match Menu::at_caret_with_slash(&self.editor, &self.fixtures, !self.edit_mode) {
             Some(menu) if self.dismissed == Some(menu.range.start) => None,
             menu => {
                 self.dismissed = None;
