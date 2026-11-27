@@ -768,6 +768,7 @@ pub(super) fn push_undo_and_set(
             if s.undo_stack.last().map(String::as_str) != Some(current.as_str()) {
                 s.undo_stack.push(current);
             }
+            s.undo_stack.push(next.clone());
             s.redo_stack.clear();
         },
         window,

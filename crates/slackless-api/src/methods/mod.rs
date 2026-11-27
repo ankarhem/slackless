@@ -327,17 +327,34 @@ impl SlackApi {
     /// A channel's managers: the users holding Slack's channel-manager role on it, from
     /// `admin.roles.entity.listAssignments` (what Slack's channel details read). Read-only.
     pub async fn channel_managers(&self, channel: &ChannelId) -> Result<Vec<UserId>> {
-        let params = vec![("entity_id", channel.to_string())];
-        let resp = self
-            .call::<RoleAssignmentsWire>(method::ADMIN_ROLES_ENTITY_LIST_ASSIGNMENTS, params)
-            .await?;
-        Ok(resp
-            .data
-            .role_assignments
-            .into_iter()
-            .filter(|assignment| assignment.role_id == CHANNEL_MANAGER_ROLE)
-            .flat_map(|assignment| assignment.users)
-            .collect())
+        let mut managers = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let mut params = vec![
+                ("entity_id", channel.to_string()),
+                ("limit", "200".to_owned()),
+            ];
+            if let Some(ref c) = cursor {
+                params.push(("cursor", c.clone()));
+            }
+            let resp = self
+                .call::<RoleAssignmentsWire>(method::ADMIN_ROLES_ENTITY_LIST_ASSIGNMENTS, params)
+                .await?;
+            let next = resp.next_cursor().map(str::to_owned);
+            managers.extend(
+                resp.data
+                    .role_assignments
+                    .into_iter()
+                    .filter(|assignment| assignment.role_id == CHANNEL_MANAGER_ROLE)
+                    .flat_map(|assignment| assignment.users),
+            );
+            match next {
+                Some(c) if !c.is_empty() && seen.insert(c.clone()) => cursor = Some(c),
+                _ => break,
+            }
+        }
+        Ok(managers)
     }
 
     /// One page of `client.dms`: the DMs-tab list (IMs and MPIMs) with per-DM `is_open`,

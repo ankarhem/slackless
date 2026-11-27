@@ -51,6 +51,14 @@ pub(super) trait SignalSession: SignalSink + Sized {
     fn send_leave_and_close<'a>(self, drain_timeout: Duration) -> BoxFuture<'a, ()>
     where
         Self: 'a;
+
+    /// Close the signaling transport without sending a Chime `LEAVE` frame (used on reconnect).
+    fn close<'a>(self) -> BoxFuture<'a, ()>
+    where
+        Self: 'a,
+    {
+        Box::pin(async {})
+    }
 }
 
 impl SignalSink for ChimeSignalClient {
@@ -93,6 +101,13 @@ impl SignalSession for ChimeSignalClient {
         Self: 'a,
     {
         Box::pin(ChimeSignalClient::send_leave_and_close(self, drain_timeout))
+    }
+
+    fn close<'a>(self) -> BoxFuture<'a, ()>
+    where
+        Self: 'a,
+    {
+        Box::pin(ChimeSignalClient::close(self))
     }
 }
 

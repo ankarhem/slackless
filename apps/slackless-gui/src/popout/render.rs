@@ -440,6 +440,7 @@ impl PopoutWindow {
         &self,
         doc: &crate::canvas::CanvasDoc,
         file_id: &Option<String>,
+        channel: &Option<ChannelId>,
         open_browser_url: &Option<String>,
         on_jump: &JumpHandler,
         cx: &App,
@@ -569,7 +570,7 @@ impl PopoutWindow {
             );
         let on_upload_file: crate::canvas::CanvasUploadFileFn = {
             let send = self.send.clone();
-            let upload_channel = self.fixtures.messages.keys().next().cloned();
+            let upload_channel = channel.clone();
             let is_live = file_id.is_some();
             Rc::new(move |on_done, window: &mut Window, cx: &mut App| {
                 let rx = cx.prompt_for_paths(gpui_kit::gpui::PathPromptOptions {
@@ -593,12 +594,21 @@ impl PopoutWindow {
                             .and_then(|n| n.to_str())
                             .unwrap_or("attachment")
                             .to_owned();
-                        // A picked file can be gigabytes: read it off the UI thread.
+                        // Check Slack's 1 GiB cap before reading so a huge file cannot OOM.
                         let bytes = if is_live {
                             let read_path = path.clone();
                             match cx
                                 .background_executor()
-                                .spawn(async move { std::fs::read(&read_path) })
+                                .spawn(async move {
+                                    let meta = std::fs::metadata(&read_path)?;
+                                    if meta.len() > crate::composer::MAX_UPLOAD_BYTES {
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            "File exceeds Slack's 1 GB upload limit.",
+                                        ));
+                                    }
+                                    std::fs::read(&read_path)
+                                })
                                 .await
                             {
                                 Ok(bytes) => Some(bytes).filter(|b| !b.is_empty()),

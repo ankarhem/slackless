@@ -411,15 +411,25 @@ impl LaterView {
             .filter(|item| item.workspace == workspace && item.fired)
             .map(|item| (item.channel.clone(), item.ts.clone()))
             .collect();
+        let moved_to_todos: HashSet<(ChannelId, Ts)> = self
+            .items
+            .iter()
+            .filter(|item| item.workspace == workspace && item.is_todo && !item.is_personal_todo())
+            .map(|item| (item.channel.clone(), item.ts.clone()))
+            .collect();
         for item in &mut incoming {
             item.workspace = workspace;
-            if already_fired.contains(&(item.channel.clone(), item.ts.clone()))
-                || item.due.is_some_and(|due| due <= now)
-            {
+            let key = (item.channel.clone(), item.ts.clone());
+            if already_fired.contains(&key) || item.due.is_some_and(|due| due <= now) {
                 item.fired = true;
             }
+            if moved_to_todos.contains(&key) {
+                item.is_todo = true;
+            }
         }
-        self.items.retain(|item| item.workspace != workspace);
+        // Keep other workspaces' items and this workspace's local personal to-dos (`TODO`).
+        self.items
+            .retain(|item| item.workspace != workspace || item.is_personal_todo());
         self.items.extend(incoming);
         cx.emit(LaterEvent::Changed);
         cx.notify();

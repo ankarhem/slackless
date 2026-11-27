@@ -478,10 +478,14 @@ impl PopoutWindow {
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(pal.danger_fg)
             .child("Leave")
-            .on_click(move |_, window, _| {
-                (send_leave)(HuddleCommand::Leave.into());
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if let Some(state) = this.huddle_state_entity() {
+                    state.update(cx, |s, cx| s.request_leave(cx));
+                } else {
+                    (send_leave)(HuddleCommand::Leave.into());
+                }
                 window.remove_window();
-            });
+            }));
 
         h_flex()
             .flex_none()

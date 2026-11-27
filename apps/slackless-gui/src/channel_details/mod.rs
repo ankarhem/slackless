@@ -288,6 +288,7 @@ impl ChannelDetails {
         if self.members.is_empty() {
             self.rows.clear();
             self.orgs.clear();
+            self.filter_choices = Arc::new(Vec::new());
             return;
         }
         let fixtures = Arc::clone(&self.fixtures);

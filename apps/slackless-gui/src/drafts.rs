@@ -383,43 +383,70 @@ impl Render for DraftsView {
                     _ => when_label(entry.at, now),
                 };
                 let (workspace, channel) = (entry.workspace, entry.channel.clone());
+                let entry_id = entry.id.clone();
+                let entry_at = entry.at;
                 let actions = match tab {
-                    DraftsTab::Drafts => h_flex().child(
-                        Button::new(("draft-delete", ix))
-                            .ghost()
-                            .with_size(Size::Small)
-                            .icon(IconName::Trash)
-                            .tooltip("Delete draft")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.drafts.remove(ix);
-                                cx.emit(DraftsEvent::Deleted);
-                                cx.notify();
-                            })),
-                    ),
-                    DraftsTab::Scheduled => h_flex()
-                        .gap_1()
-                        .child(
-                            Button::new(("scheduled-send", ix))
+                    DraftsTab::Drafts => {
+                        let del_ch = channel.clone();
+                        h_flex().child(
+                            Button::new(("draft-delete", ix))
                                 .ghost()
                                 .with_size(Size::Small)
-                                .label("Send now")
+                                .icon(IconName::Trash)
+                                .tooltip("Delete draft")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    let entry = this.scheduled.remove(ix);
-                                    cx.emit(DraftsEvent::SendNow(entry));
-                                    cx.notify();
+                                    if let Some(pos) = this.drafts.iter().position(|e| {
+                                        e.workspace == workspace && e.channel == del_ch
+                                    }) {
+                                        this.drafts.remove(pos);
+                                        cx.emit(DraftsEvent::Deleted);
+                                        cx.notify();
+                                    }
                                 })),
                         )
-                        .child(
-                            Button::new(("scheduled-cancel", ix))
-                                .ghost()
-                                .with_size(Size::Small)
-                                .label("Cancel")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let entry = this.scheduled.remove(ix);
-                                    cx.emit(DraftsEvent::CancelScheduled(entry));
-                                    cx.notify();
-                                })),
-                        ),
+                    }
+                    DraftsTab::Scheduled => {
+                        let (send_id, send_ch) = (entry_id.clone(), channel.clone());
+                        let (cancel_id, cancel_ch) = (entry_id, channel.clone());
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new(("scheduled-send", ix))
+                                    .ghost()
+                                    .with_size(Size::Small)
+                                    .label("Send now")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(pos) = this.scheduled.iter().position(|e| {
+                                            e.workspace == workspace
+                                                && e.channel == send_ch
+                                                && e.at == entry_at
+                                                && e.id == send_id
+                                        }) {
+                                            let entry = this.scheduled.remove(pos);
+                                            cx.emit(DraftsEvent::SendNow(entry));
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new(("scheduled-cancel", ix))
+                                    .ghost()
+                                    .with_size(Size::Small)
+                                    .label("Cancel")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(pos) = this.scheduled.iter().position(|e| {
+                                            e.workspace == workspace
+                                                && e.channel == cancel_ch
+                                                && e.at == entry_at
+                                                && e.id == cancel_id
+                                        }) {
+                                            let entry = this.scheduled.remove(pos);
+                                            cx.emit(DraftsEvent::CancelScheduled(entry));
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                    }
                     DraftsTab::Sent => h_flex(),
                 };
                 h_flex()

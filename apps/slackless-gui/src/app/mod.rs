@@ -424,6 +424,42 @@ pub(super) enum Arrival {
 }
 
 impl WorkspaceState {
+    /// Fold a `client.counts` snapshot into `self.counts` while honoring `self.marked_read` so an
+    /// in-flight snapshot that predates a local `conversations.mark` cannot resurrect unreads.
+    /// Returns the channel ids that became unread under this snapshot.
+    pub(super) fn fold_counts(
+        &mut self,
+        counts: &slackless_core::api::ClientCounts,
+    ) -> Vec<ChannelId> {
+        let mut next_counts: HashMap<ChannelId, ConversationCounts> =
+            [&counts.channels, &counts.ims, &counts.mpims]
+                .into_iter()
+                .flatten()
+                .map(|entry| (entry.id.clone(), entry.clone()))
+                .collect();
+        let mut newly_unread: Vec<ChannelId> = Vec::new();
+        for (id, entry) in &mut next_counts {
+            if let Some(marked) = self.marked_read.get(id).cloned() {
+                let server_has_newer = entry.latest.as_ref().is_some_and(|latest| *latest > marked);
+                if !server_has_newer {
+                    entry.clear_unreads();
+                    if entry.last_read.as_ref().is_none_or(|r| marked > *r) {
+                        entry.last_read = Some(marked);
+                    }
+                } else {
+                    self.marked_read.remove(id);
+                    if entry.is_unread() {
+                        newly_unread.push(id.clone());
+                    }
+                }
+            } else if entry.is_unread() {
+                newly_unread.push(id.clone());
+            }
+        }
+        self.counts = next_counts;
+        newly_unread
+    }
+
     /// Fold Slack's read marker (`*_marked`, from here or another device) for `channel` at `ts`
     /// into the counts. A DM left unread (`dm`) keeps a mention, as Slack badges it. Returns
     /// whether the conversation is read now.
@@ -634,6 +670,9 @@ pub struct App {
     rail: Vec<usize>,
     /// Slot of the shown workspace.
     workspace: usize,
+    /// Monotonic counter bumped on every workspace switch so in-flight per-workspace async reads
+    /// cannot land on a different workspace (or even after an A -> B -> A round-trip).
+    workspace_epoch: u64,
     /// Active workspace's per-workspace live state (swapped with its slot's on a switch).
     ws: WorkspaceState,
     channel: ChannelId,
@@ -665,10 +704,20 @@ pub struct App {
     _huddle_state_sub: Option<Subscription>,
     /// Persistent sidebar mini-dock mounted at the bottom of the sidebar while in a huddle.
     huddle_dock: Option<Entity<HuddleDock>>,
+    /// Tracked Pop-out Huddle Window so repeated pop-out actions focus the single window instead
+    /// of spawning duplicates that leak sprite-atlas textures.
+    huddle_popout: Option<gpui::AnyWindowHandle>,
     huddle_floating_panel: Option<gpui::AnyWindowHandle>,
+    /// `(workspace_slot, call_id)` of a huddle the user just clicked Leave on; suppresses
+    /// trailing queued `Connected`/`Leaving` snapshots from resurrecting the dock or double-chiming.
+    huddle_leaving_call: Option<(usize, String)>,
     _huddle_dock_sub: Option<Subscription>,
     /// Floating incoming DM huddle ring banner (`huddle_invite`).
     huddle_invite: Option<Entity<HuddleInviteBanner>>,
+    /// Slot of the workspace that owns the current `huddle_invite` banner.
+    huddle_invite_owner: Option<usize>,
+    huddle_invite_ring_task: Option<gpui::Task<()>>,
+    huddle_invite_expire_task: Option<gpui::Task<()>>,
     _huddle_invite_sub: Option<Subscription>,
     /// Official Slack 60-second solo-huddle idle music timer (`huddles_play_music_timeout` = 60s).
     huddle_alone_music_task: Option<gpui::Task<()>>,

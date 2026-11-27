@@ -83,7 +83,12 @@ fn channel_people_recent_authors_then_members() {
     let members = ["U0ONE", "U0THREE"].map(UserId::from).to_vec();
     let mut fixtures = fixtures;
     fixtures.self_user = UserId::from("U0SELF");
-    fixtures.users = vec![person("U0ONE"), person("U0TWO"), person("U0THREE"), bot];
+    fixtures.replace_users(vec![
+        person("U0ONE"),
+        person("U0TWO"),
+        person("U0THREE"),
+        bot,
+    ]);
     let people = channel_people(&fixtures, &members, &history);
     assert_eq!(
         people.iter().map(UserId::as_str).collect::<Vec<_>>(),
@@ -564,7 +569,7 @@ fn app_home_huddle_threads_and_list_csv_work_end_to_end(cx: &mut gpui::TestAppCo
         ..Default::default()
     };
     bot.profile.title = Some("Release orchestrator".into());
-    fx.users.push(bot);
+    fx.users_mut().push(bot);
     let bot_dm = ChannelId::from("D0APPBOT");
     fx.dms.push(Conversation {
         id: bot_dm.clone(),
@@ -943,8 +948,7 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
     let general = ChannelId::from("C0GENERAL");
     let design = ChannelId::from("C0DESIGN");
     let inviter = fixtures
-        .users
-        .iter()
+        .people()
         .find(|u| u.id != fixtures.self_user)
         .expect("other user in fixtures")
         .id
@@ -991,6 +995,7 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
 
             // 4. Live speaking / RMS audio levels arrive on the dedicated HuddleMediaEvent lane.
             app.on_huddle_media_event(
+                0,
                 &HuddleMediaEvent::AudioLevels(slackless_core::huddle::HuddleAudioLevels {
                     local_rms: 0.25,
                     active_speakers: vec![(inviter.clone(), 0.72)],
@@ -1014,6 +1019,7 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
                 .register_popout();
             let frame = slackless_core::huddle::VideoFrame::from_bgra(4, 4, vec![180u8; 4 * 4 * 4]);
             app.on_huddle_media_event(
+                0,
                 &HuddleMediaEvent::VideoFrame {
                     tile: slackless_core::huddle::VideoTileKey::LocalCamera,
                     frame: frame.clone(),
@@ -1022,6 +1028,7 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
                 cx,
             );
             app.on_huddle_media_event(
+                0,
                 &HuddleMediaEvent::VideoFrame {
                     tile: slackless_core::huddle::VideoTileKey::RemoteScreen(inviter.clone()),
                     frame,
@@ -1182,6 +1189,7 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
             assert_eq!(state.captions()[0].text, "Shipping full parity today!");
             assert!(!state.captions()[0].partial);
             app.on_huddle_media_event(
+                0,
                 &HuddleMediaEvent::VideoTileClosed(
                     slackless_core::huddle::VideoTileKey::LocalCamera,
                 ),
@@ -1758,7 +1766,10 @@ fn first_workspace_visit_reads_its_snapshot_off_the_ui_thread_and_drops_a_stale_
     let (one, _) = memory_workspace("T0ONE", &["C0ONE"], std::slice::from_ref(&me));
     let (two, _) = memory_workspace("T0TWO", &["C0TWO"], std::slice::from_ref(&me));
     let mut fx = one.snapshot(&HashMap::new()).unwrap();
-    fx.workspaces = vec![one.team_summary().unwrap(), two.team_summary().unwrap()];
+    fx.set_rail_workspaces(vec![
+        one.team_summary().unwrap(),
+        two.team_summary().unwrap(),
+    ]);
     let (_root, app, cx) = mount_app(fx, vec![one, two], cx);
     let switch = |cx: &mut gpui::VisualTestContext, index: usize| {
         cx.update(|window, cx| app.update(cx, |app, cx| app.switch_workspace(index, window, cx)));
@@ -1794,8 +1805,7 @@ fn should_notify_and_system_notification_dedup_cover_all_rules(cx: &mut gpui::Te
     let mut fx = fixtures::load();
     let me = fx.self_user.clone();
     let peer = fx
-        .users
-        .iter()
+        .people()
         .find(|u| u.id != me && !u.is_bot)
         .expect("peer user")
         .id
@@ -1980,8 +1990,7 @@ fn message_posted_typing_cleanup_thread_reply_rules_and_multi_workspace_sync_bad
     fx.messages.clear();
     fx.counts.clear();
     let peer = fx
-        .users
-        .iter()
+        .people()
         .find(|u| u.id != fx.self_user && !u.is_bot)
         .unwrap()
         .id
@@ -2231,10 +2240,9 @@ fn deep_links_permalinks_workspace_switch_focus_leave_and_hover_card_lifecycle(
     cx: &mut gpui::TestAppContext,
 ) {
     let fx = fixtures::load();
-    let team_id = fx.workspaces[0].id.clone();
+    let team_id = fx.rail_workspaces()[0].id.clone();
     let peer = fx
-        .users
-        .iter()
+        .people()
         .find(|u| u.id != fx.self_user && !u.is_bot)
         .unwrap()
         .id
@@ -2799,12 +2807,12 @@ fn cross_workspace_search_jump_storage_backfill_progress_and_export_engine(
         app.update(cx, |app, cx| {
             assert_eq!(app.workspace, 0);
             assert!(
-                app.fixtures.workspaces.len() >= 2,
+                app.fixtures.rail_workspaces().len() >= 2,
                 "fixture mode should provide at least two workspaces for cross-workspace jump test"
             );
 
             // 1. Cross-workspace search jump switches workspace and selects the target channel.
-            let target_ws_id = app.fixtures.workspaces[1].id.clone();
+            let target_ws_id = app.fixtures.rail_workspaces()[1].id.clone();
             let ws1_fx = fixtures::workspace(1);
             let target_ch = ws1_fx.channels[0].id.clone();
             let target_ts = ws1_fx
@@ -2852,7 +2860,7 @@ fn cross_workspace_search_jump_storage_backfill_progress_and_export_engine(
 
             // 3. Searching from workspace index 1 works in both CurrentWorkspace and AllWorkspaces
             //    scopes, and jumping back to workspace 0 switches workspaces accurately.
-            let ws0_id = app.fixtures.workspaces[0].id.clone();
+            let ws0_id = app.fixtures.rail_workspaces()[0].id.clone();
             let ws0_fx = fixtures::workspace(0);
             let ws0_ch = ws0_fx.channels[0].id.clone();
             let ws0_ts = ws0_fx
@@ -2882,7 +2890,7 @@ fn cross_workspace_search_jump_storage_backfill_progress_and_export_engine(
             let mut fx1_export = fixtures::workspace(1);
             let fid = slackless_core::types::FileId::from("F_CLIP_WS1");
             fx1_export
-                .file_transcripts
+                .file_transcripts_mut()
                 .insert(fid.clone(), "Spoken note in ws1 thread".into());
             let export_ch = fx1_export.channels[0].id.clone();
             let root_ts = Ts::from("1700999000.000100");
@@ -2902,18 +2910,18 @@ fn cross_workspace_search_jump_storage_backfill_progress_and_export_engine(
                 });
             let ch_doc = super::dialogs::storage::build_fixture_channel_export(
                 &fx1_export,
-                &fx1_export.workspaces[1],
+                &fx1_export.rail_workspaces()[1],
                 &export_ch,
                 "#ch",
             );
             assert_eq!(ch_doc.workspace, target_ws_id.as_str());
             assert_eq!(
                 ch_doc.workspace_name.as_deref(),
-                Some(fx1_export.workspaces[1].name.as_str())
+                Some(fx1_export.rail_workspaces()[1].name.as_str())
             );
             let th_doc = super::dialogs::storage::build_fixture_thread_export(
                 &fx1_export,
-                &fx1_export.workspaces[1],
+                &fx1_export.rail_workspaces()[1],
                 &export_ch,
                 "#ch",
                 &root_ts,
@@ -2936,7 +2944,7 @@ fn cross_workspace_search_jump_storage_backfill_progress_and_export_engine(
     // and switching to AllWorkspaces returns hits attributed to their respective workspaces.
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
-            let ws1_id = app.fixtures.workspaces[1].id.clone();
+            let ws1_id = app.fixtures.rail_workspaces()[1].id.clone();
             app.switch_workspace(1, window, cx);
             let ws1_word = app
                 .fixtures
@@ -2957,7 +2965,7 @@ fn cross_workspace_search_jump_storage_backfill_progress_and_export_engine(
     cx.run_until_parked();
     cx.update(|_, cx| {
         app.read_with(cx, |app, cx| {
-            let ws1_id = &app.fixtures.workspaces[1].id;
+            let ws1_id = &app.fixtures.rail_workspaces()[1].id;
             let hits = app.results.read(cx).local_hits_for_test();
             assert!(
                 !hits.is_empty(),
@@ -2988,7 +2996,7 @@ fn cross_workspace_search_jump_storage_backfill_progress_and_export_engine(
     cx.run_until_parked();
     cx.update(|_, cx| {
         app.read_with(cx, |app, cx| {
-            let ws0_id = &app.fixtures.workspaces[0].id;
+            let ws0_id = &app.fixtures.rail_workspaces()[0].id;
             let hits = app.results.read(cx).local_hits_for_test();
             assert!(
                 hits.iter().any(|h| h.workspace == *ws0_id),
@@ -3435,7 +3443,7 @@ fn app_outbox_events_inline_thread_sync_and_catchup_navigation(cx: &mut gpui::Te
     // 1. OutboxUpdated populates channel + thread outbox state and renders cleanly.
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
-            let ws_id = app.fixtures.workspaces[0].id.clone();
+            let ws_id = app.fixtures.rail_workspaces()[0].id.clone();
             let ch = app.channel.clone();
             let item_ch = OutboxItem {
                 id: 101,
@@ -3497,7 +3505,7 @@ fn app_outbox_events_inline_thread_sync_and_catchup_navigation(cx: &mut gpui::Te
         app.update(cx, |app, cx| {
             assert_eq!(app.catchup.read(cx).window(), CatchUpWindow::Last7d);
             assert!(app.catchup.read(cx).all_workspaces());
-            let ws1_id = app.fixtures.workspaces[1].id.clone();
+            let ws1_id = app.fixtures.rail_workspaces()[1].id.clone();
             let ws1_ch = fixtures::workspace(1).channels[0].id.clone();
             app.open_catchup_channel(&ws1_id, ws1_ch.clone(), None, window, cx);
             assert_eq!(app.workspace, 1);
@@ -3517,8 +3525,7 @@ fn smart_notification_rules_and_daily_catchup_reminder_in_app(cx: &mut gpui::Tes
     let mut fx = fixtures::load();
     let me = fx.self_user.clone();
     let peer = fx
-        .users
-        .iter()
+        .people()
         .find(|u| u.id != me)
         .expect("peer user")
         .id
@@ -3667,9 +3674,9 @@ fn deep_link_hardening_multi_workspace_threads_files_and_unsigned_workspace(
     cx: &mut gpui::TestAppContext,
 ) {
     let mut fx = fixtures::load();
-    let ws0_id = fx.workspaces[0].id.clone();
-    let ws1_id = fx.workspaces[1].id.clone();
-    let ws1_domain = fx.workspaces[1].domain.clone();
+    let ws0_id = fx.rail_workspaces()[0].id.clone();
+    let ws1_id = fx.rail_workspaces()[1].id.clone();
+    let ws1_domain = fx.rail_workspaces()[1].domain.clone();
     let ws1_fx = fixtures::workspace(1);
     let ws1_ch = ws1_fx.channels[0].id.clone();
 

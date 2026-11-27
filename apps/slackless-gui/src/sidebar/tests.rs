@@ -553,7 +553,7 @@ fn sidebar_custom_sections_starring_notify_and_nav_cycling(cx: &mut gpui::TestAp
         },
     );
     // The rail lists Side Project first; the shown workspace is still Acme.
-    fx.workspaces.rotate_left(1);
+    fx.rail_workspaces_mut().rotate_left(1);
     let fx = Arc::new(fx);
 
     let mounted = std::rc::Rc::new(std::cell::RefCell::new(None));

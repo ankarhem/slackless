@@ -271,21 +271,29 @@ unsafe extern "C" fn on_audio_tap_pcm_cb(ctx: *mut c_void, samples: *const i16, 
 pub struct MacSystemAudioTap {
     handle: NonNull<SlacklessAudioTap>,
     ctx: NonNull<TapRingCtx>,
+    sample_rate: u32,
 }
 
 // SAFETY: `slackless_audio_tap_stop` stops and destroys the IOProc synchronously before freeing `ctx`.
 unsafe impl Send for MacSystemAudioTap {}
 
 impl MacSystemAudioTap {
+    pub(crate) fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
     pub(crate) fn start(ring: Arc<SpscRing<i16>>) -> Result<Self> {
         let ctx = NonNull::from(Box::leak(Box::new(TapRingCtx { ring })));
+        let mut sample_rate: u32 = 48_000;
         let mut err_buf = [0 as c_char; 256];
         // SAFETY: `ctx` stays valid until `Drop` frees it after `slackless_audio_tap_stop`, the
-        // callback has the signature the IOProc invokes, and `err_buf` is writable for its length.
+        // callback has the signature the IOProc invokes, `sample_rate` is a valid out-pointer, and
+        // `err_buf` is writable for its length.
         let handle = unsafe {
             slackless_audio_tap_start(
                 ctx.as_ptr().cast(),
                 on_audio_tap_pcm_cb,
+                &mut sample_rate,
                 err_buf.as_mut_ptr(),
                 err_buf.len(),
             )
@@ -301,8 +309,15 @@ impl MacSystemAudioTap {
                 .to_owned();
             return Err(HuddleError::Audio(msg));
         };
-        tracing::info!("macOS CoreAudio Process Tap started (ARC native)");
-        Ok(Self { handle, ctx })
+        tracing::info!(
+            sample_rate,
+            "macOS CoreAudio Process Tap started (ARC native)"
+        );
+        Ok(Self {
+            handle,
+            ctx,
+            sample_rate,
+        })
     }
 }
 

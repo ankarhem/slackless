@@ -1015,6 +1015,104 @@ async fn channel_managers_reads_the_manager_role_on_the_channel() {
 }
 
 #[tokio::test]
+async fn scheduled_messages_drafts_and_channel_managers_paginate_and_break_cycles() {
+    let (server, api) = setup().await;
+
+    // 1. chat.scheduledMessages.list follows next_cursor across pages and breaks on repeated cursor.
+    Mock::given(method("POST"))
+        .and(path("/api/chat.scheduledMessages.list"))
+        .and(body_string_contains("cursor=page2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "scheduled_messages": [
+                {"id": "Q2", "channel_id": "C1", "post_at": 1700000200, "text": "second"}
+            ],
+            "response_metadata": {"next_cursor": "page2"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.scheduledMessages.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "scheduled_messages": [
+                {"id": "Q1", "channel_id": "C1", "post_at": 1700000100, "text": "first"}
+            ],
+            "response_metadata": {"next_cursor": "page2"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let sched = api.chat_scheduled_messages_list(None).await.unwrap();
+    assert_eq!(sched.len(), 2);
+    assert_eq!(sched[0].id, "Q1");
+    assert_eq!(sched[1].id, "Q2");
+
+    // 2. drafts.list merges drafts across pages.
+    Mock::given(method("POST"))
+        .and(path("/api/drafts.list"))
+        .and(body_string_contains("cursor=dpage2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "drafts": [{
+                "id": "Dr2",
+                "destinations": [{"channel_id": "C2"}],
+                "blocks": [{"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [{"type": "text", "text": "draft two"}]}]}],
+                "date_created": 2,
+                "last_updated_ts": "2.000000"
+            }],
+            "next_cursor": ""
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/drafts.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "drafts": [{
+                "id": "Dr1",
+                "destinations": [{"channel_id": "C1"}],
+                "blocks": [{"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [{"type": "text", "text": "draft one"}]}]}],
+                "date_created": 1,
+                "last_updated_ts": "1.000000"
+            }],
+            "next_cursor": "dpage2"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let drafts = api.drafts_list().await.unwrap();
+    assert_eq!(drafts.len(), 2);
+
+    // 3. admin.roles.entity.listAssignments follows next_cursor across pages.
+    Mock::given(method("POST"))
+        .and(path("/api/admin.roles.entity.listAssignments"))
+        .and(body_string_contains("cursor=mpage2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "role_assignments": [{"role_id": "Rl0A", "users": ["U3"]}],
+            "response_metadata": {"next_cursor": ""}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/admin.roles.entity.listAssignments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "role_assignments": [{"role_id": "Rl0A", "users": ["U1"]}],
+            "response_metadata": {"next_cursor": "mpage2"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let managers = api.channel_managers(&ChannelId::from("C1")).await.unwrap();
+    assert_eq!(managers, [UserId::from("U1"), UserId::from("U3")]);
+}
+
+#[tokio::test]
 async fn thread_subscription_adds_and_removes_with_the_read_cursor() {
     let (server, api) = setup().await;
     for endpoint in ["subscriptions.thread.add", "subscriptions.thread.remove"] {

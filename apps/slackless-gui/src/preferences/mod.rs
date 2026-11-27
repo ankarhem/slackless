@@ -327,6 +327,8 @@ pub struct Preferences {
     /// Whether an AI API key is currently stored in the OS Keychain (`None` until probed off-thread).
     pub(super) ai_api_key_stored: Option<bool>,
     pub(super) ai_key_status_note: Option<String>,
+    /// Monotonic generation guarding async Keychain probe/save/clear tasks against out-of-order writes.
+    pub(super) ai_key_gen: u64,
     pub(super) ai_test_running: bool,
     pub(super) ai_test_status: Option<(bool, String)>,
     /// Result of the most recent "Verify integrity" run, keyed by workspace `TeamId`.
@@ -692,6 +694,7 @@ impl Preferences {
                 ai_api_key_input,
                 ai_api_key_stored: None,
                 ai_key_status_note: None,
+                ai_key_gen: 0,
                 ai_test_running: false,
                 ai_test_status: None,
                 integrity_reports: std::collections::HashMap::new(),
@@ -1071,10 +1074,12 @@ impl Preferences {
     }
 
     /// Check off-thread whether an AI summary API key is stored in the OS Keychain.
-    pub fn refresh_ai_api_key_status(&self, cx: &mut Context<Self>) {
+    pub fn refresh_ai_api_key_status(&mut self, cx: &mut Context<Self>) {
+        self.ai_key_gen = self.ai_key_gen.wrapping_add(1);
+        let key_gen = self.ai_key_gen;
         #[cfg(test)]
         {
-            let _ = cx;
+            let _ = (cx, key_gen);
         }
         #[cfg(not(test))]
         {
@@ -1088,6 +1093,9 @@ impl Preferences {
                     })
                     .await;
                 let _ = this.update(cx, |prefs, cx| {
+                    if prefs.ai_key_gen != key_gen {
+                        return;
+                    }
                     prefs.ai_api_key_stored = Some(has_key);
                     cx.notify();
                 });

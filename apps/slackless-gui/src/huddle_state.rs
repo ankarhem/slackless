@@ -44,8 +44,7 @@ pub fn fixture_huddle(fixtures: &Fixtures) -> Option<FixtureHuddle> {
     }
     let channel = fixtures.channels.first()?.id.clone();
     let participants = fixtures
-        .users
-        .iter()
+        .people()
         .map(|user| user.id.clone())
         .filter(|id| *id != fixtures.self_user)
         .take(3)
@@ -93,6 +92,7 @@ pub enum HuddleStateEvent {
     ToggleMute,
     ToggleCamera,
     ToggleScreenShare,
+    Leave,
     OpenFloatingPanel,
     CloseFloatingPanel,
     SendDraw(HuddleDrawMessage),
@@ -381,6 +381,12 @@ impl HuddleState {
                 hue: self.draw_hue,
             };
             cx.emit(HuddleStateEvent::SendDraw(msg));
+            // Guarantee the above-overlay floating control bar is visible whenever interactive
+            // desktop pen mode turns on, so the user always has a clickable toggle above the
+            // click-capturing overlay in addition to Escape.
+            if self.session.sharing {
+                cx.emit(HuddleStateEvent::OpenFloatingPanel);
+            }
         }
         self.sync_desktop_pen_mode(cx);
         self.sync_desktop_draw_overlay(cx);
@@ -420,6 +426,12 @@ impl HuddleState {
         cx.emit(HuddleStateEvent::ToggleScreenShare);
     }
 
+    /// Ask the main window to cleanly leave the active huddle (works in both live and sample mode
+    /// and tears down failed docks).
+    pub fn request_leave(&mut self, cx: &mut Context<Self>) {
+        cx.emit(HuddleStateEvent::Leave);
+    }
+
     /// Ask the main window to open Preferences directly on the Audio & video section.
     pub fn open_audio_settings(&mut self, cx: &mut Context<Self>) {
         cx.emit(HuddleStateEvent::OpenAudioSettings);
@@ -452,6 +464,16 @@ impl HuddleState {
 
     #[cfg(target_os = "macos")]
     fn handle_desktop_pen_event(&mut self, event: OverlayPenEvent, cx: &mut Context<Self>) {
+        if matches!(event, OverlayPenEvent::Escape) {
+            if self.desktop_draw_down {
+                self.finish_desktop_draw_stroke(cx);
+            }
+            self.desktop_pen_active = false;
+            self.desktop_pen_task = None;
+            self.desktop_pen_source = None;
+            self.set_draw_mode(false, cx);
+            return;
+        }
         if !self.draw_mode || !self.session.sharing {
             return;
         }
@@ -543,6 +565,7 @@ impl HuddleState {
                     }));
                 }
             }
+            OverlayPenEvent::Escape => {}
         }
     }
 
@@ -741,12 +764,17 @@ impl HuddleState {
             Rc::make_mut(&mut self.raised_hands).remove(&self.fixtures.self_user);
         }
         let was_sharing = self.session.sharing;
+        let was_video = self.session.video;
         let share_changed = self.session.sharing != session.sharing
             || self.session.share_source_id != session.share_source_id;
         self.session = session;
+        if was_video && !self.session.video {
+            self.close_video_tile(&VideoTileKey::LocalCamera, cx);
+        }
         if share_changed {
             if !self.session.sharing {
                 self.draw_mode = false;
+                self.close_video_tile(&VideoTileKey::LocalScreen, cx);
             }
             self.sync_desktop_pen_mode(cx);
             self.sync_desktop_draw_overlay(cx);
@@ -1193,6 +1221,7 @@ mod tests {
                     HuddleStateEvent::CloseFloatingPanel => "close_floating",
                     HuddleStateEvent::SendDraw(_) => "send_draw",
                     HuddleStateEvent::OpenAudioSettings => "audio_settings",
+                    HuddleStateEvent::Leave => "leave",
                 };
                 ev_log.borrow_mut().push(tag.to_owned());
             })

@@ -698,15 +698,17 @@ pub fn swap_app_bundle(new_app: &Path, target_app: &Path) -> Result<(), String> 
             .map_err(|e| format!("cannot move {} aside: {e}", target_app.display()))?;
     }
     if let Err(err) = move_dir_across_fs(new_app, target_app) {
-        if had_existing
-            && prev_app.exists()
-            && let Err(rb_err) = std::fs::rename(&prev_app, target_app)
-        {
-            return Err(format!(
-                "cannot install {} ({err}); restoring {} also failed ({rb_err})",
-                target_app.display(),
-                prev_app.display()
-            ));
+        if had_existing && prev_app.exists() {
+            if target_app.exists() {
+                let _ = std::fs::remove_dir_all(target_app);
+            }
+            if let Err(rb_err) = std::fs::rename(&prev_app, target_app) {
+                return Err(format!(
+                    "cannot install {} ({err}); restoring {} also failed ({rb_err})",
+                    target_app.display(),
+                    prev_app.display()
+                ));
+            }
         }
         return Err(err);
     }
@@ -734,6 +736,8 @@ fn move_dir_across_fs(src: &Path, dst: &Path) -> Result<(), String> {
         .output()
         .map_err(|e| format!("failed to run ditto: {e}"))?;
     if !out.status.success() {
+        // Remove any partially copied directory so callers can cleanly roll back.
+        let _ = std::fs::remove_dir_all(dst);
         return Err(format!(
             "ditto exited with {}: {}",
             out.status,

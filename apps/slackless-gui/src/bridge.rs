@@ -523,13 +523,18 @@ impl CoreBridge {
         Some(bridge)
     }
 
-    /// Return a blocking closure that sends [`Command::Shutdown`] and joins this workspace's core
-    /// thread so any active huddle flushes its Chime `LEAVE` before process exit.
-    pub fn shutdown_task(&self) -> Option<Box<dyn FnOnce() + Send>> {
-        let commands = self.commands.clone()?;
+    /// Immediately enqueue [`Command::Shutdown`] on this workspace's core without blocking, so
+    /// multi-workspace app quit can signal every core before joining any thread.
+    pub fn send_shutdown(&self) {
+        if let Some(commands) = &self.commands {
+            let _ = commands.unbounded_send(Command::Shutdown);
+        }
+    }
+
+    /// Return a blocking closure that joins this workspace's core thread after [`Self::send_shutdown`].
+    pub fn join_shutdown_task(&self) -> Option<Box<dyn FnOnce() + Send>> {
         let thread_slot = self.core_thread.clone()?;
         Some(Box::new(move || {
-            let _ = commands.unbounded_send(Command::Shutdown);
             if let Some(handle) = thread_slot.lock().ok().and_then(|mut g| g.take()) {
                 let _ = handle.join();
             }

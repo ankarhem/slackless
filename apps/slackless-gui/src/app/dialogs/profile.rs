@@ -184,6 +184,8 @@ impl App {
         });
 
         let this = cx.entity().downgrade();
+        let origin_ws = self.workspace;
+        let origin_epoch = self.workspace_epoch;
         window.open_dialog(cx, move |dialog, window, cx| {
             let theme = cx.theme();
             let (muted, border, card_bg) = (
@@ -392,22 +394,33 @@ impl App {
                                                 }
                                             };
                                             let _ = cx.update(|window, cx| {
-                                                let _ = this_u.update(cx, |app, _| {
-                                                    if !app.fixtures.sample {
-                                                        app.bridge.send(
-                                                            WorkspaceCommand::SetUserPhoto {
-                                                                filename: filename.clone(),
-                                                                bytes,
-                                                            },
-                                                        );
-                                                    }
-                                                });
-                                                notify(
-                                                    "Profile photo",
-                                                    format!("Uploading {filename}\u{2026}"),
-                                                    window,
-                                                    cx,
-                                                );
+                                                let sent = this_u
+                                                    .update(cx, |app, _| {
+                                                        if app.workspace_epoch != origin_epoch {
+                                                            return false;
+                                                        }
+                                                        if !app.fixtures.sample
+                                                            && let Some(bridge) =
+                                                                app.workspace_bridge(origin_ws)
+                                                        {
+                                                            bridge.send(
+                                                                WorkspaceCommand::SetUserPhoto {
+                                                                    filename: filename.clone(),
+                                                                    bytes,
+                                                                },
+                                                            );
+                                                        }
+                                                        true
+                                                    })
+                                                    .unwrap_or(false);
+                                                if sent {
+                                                    notify(
+                                                        "Profile photo",
+                                                        format!("Uploading {filename}\u{2026}"),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }
                                             });
                                         })
                                         .detach();

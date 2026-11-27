@@ -257,8 +257,7 @@ pub(crate) fn sort_cards(cards: &mut [ThreadCard]) {
 /// can be inspected and filtered in the Threads view (`F-COLLAB-250`, `F-COLLAB-251`).
 fn fixture_list_item_card(fixtures: &Fixtures) -> Option<ThreadCard> {
     let peer = fixtures
-        .users
-        .iter()
+        .people()
         .find(|u| u.id != fixtures.self_user)
         .map(|u| u.id.clone())?;
     let meta = ListItemThreadMeta {

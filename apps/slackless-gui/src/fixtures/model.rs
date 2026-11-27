@@ -58,13 +58,17 @@ pub(super) enum ConvBucket {
 /// Immutable (copy-on-write via `Arc`) workspace data shared across count refreshes.
 #[derive(Clone, Default)]
 pub struct WorkspaceData {
-    pub workspaces: Vec<Team>,
+    /// Every workspace in the switcher rail's display order (read via [`Fixtures::rail_workspaces`],
+    /// never as the shown workspace's own team — use [`Fixtures::own_team`] for that).
+    pub(super) workspaces: Vec<Team>,
     /// Every organization the snapshot knows: the signed-in workspace's own team first, then
     /// the connected teams of Slack Connect channels (live: stored `team.info` records).
     pub teams: Vec<Team>,
     /// The signed-in user; author of locally composed messages.
     pub self_user: UserId,
-    pub users: Vec<User>,
+    /// Snapshot users before live `fresh_people` overlays (read via [`Fixtures::people`] /
+    /// [`Fixtures::user`] so status, profile, and deactivation updates are never missed).
+    pub(super) users: Vec<User>,
     /// Active `@handle` user groups (`usergroups.list`).
     pub usergroups: Vec<Usergroup>,
     /// Workspace slash commands from `client.appCommands` (merged into `/` autocomplete).
@@ -101,10 +105,12 @@ pub struct WorkspaceData {
     pub skin_tone: u8,
     /// Decoded image thumbnails per file (live mode: downloaded `thumb_*` bytes).
     pub thumbnails: HashMap<FileId, Arc<Image>>,
-    /// Locally persisted audio/video transcripts keyed by `FileId`.
-    pub file_transcripts: HashMap<FileId, String>,
-    /// Timed transcript cues keyed by `FileId` (populated from local transcription or WebVTT).
-    pub file_transcript_cues: HashMap<FileId, Vec<slackless_core::types::TranscriptCue>>,
+    /// Locally persisted audio/video transcripts keyed by `FileId` (read via
+    /// [`Fixtures::file_transcript`] / [`Fixtures::all_file_transcripts`] so transcripts landed
+    /// since the snapshot are never missed).
+    pub(super) file_transcripts: HashMap<FileId, String>,
+    /// Timed transcript cues keyed by `FileId` (read via [`Fixtures::file_transcript_cues`]).
+    pub(super) file_transcript_cues: HashMap<FileId, Vec<slackless_core::types::TranscriptCue>>,
     /// Profile data the typed `Profile` does not model (pronouns, custom fields).
     pub profile_extras: HashMap<UserId, ProfileExtras>,
     /// The workspace's custom emoji by name.
@@ -296,6 +302,66 @@ impl Fixtures {
         Arc::ptr_eq(&self.data, &other.data)
             && Arc::ptr_eq(&self.fresh_people, &other.fresh_people)
             && Arc::ptr_eq(&self.transcripts, &other.transcripts)
+    }
+
+    /// Every non-empty file transcript, merging freshly landed updates over the snapshot's map.
+    pub fn all_file_transcripts(&self) -> HashMap<FileId, String> {
+        let mut out: HashMap<FileId, String> = self
+            .data
+            .file_transcripts
+            .iter()
+            .filter(|(_, text)| !text.is_empty())
+            .map(|(id, text)| (id.clone(), text.clone()))
+            .collect();
+        for (id, landed) in self.transcripts.iter() {
+            if landed.text.is_empty() {
+                out.remove(id);
+            } else {
+                out.insert(id.clone(), landed.text.clone());
+            }
+        }
+        out
+    }
+
+    /// Workspaces in the switcher rail's display order. Do **not** use `.first()` to identify
+    /// the shown workspace — use [`Self::own_team`] / [`Self::own_team_id`] instead.
+    pub fn rail_workspaces(&self) -> &[Team] {
+        &self.data.workspaces
+    }
+
+    /// Replace the switcher rail's workspace list in display order.
+    pub fn set_rail_workspaces(&mut self, teams: Vec<Team>) {
+        self.workspaces = teams;
+    }
+
+    /// Look up any workspace/team record by ID across `teams` and the switcher rail.
+    pub fn workspace_by_id(&self, id: &TeamId) -> Option<&Team> {
+        self.team_map()
+            .get(id)
+            .and_then(|&ix| self.teams.get(ix))
+            .or_else(|| self.data.workspaces.iter().find(|t| t.id == *id))
+    }
+
+    /// Replace the snapshot's user list cleanly, clearing any stale `fresh_people` overlay.
+    pub fn replace_users(&mut self, users: Vec<User>) {
+        self.fresh_people = Arc::default();
+        self.users = users;
+    }
+
+    #[cfg(test)]
+    pub fn rail_workspaces_mut(&mut self) -> &mut Vec<Team> {
+        &mut self.workspaces
+    }
+
+    #[cfg(test)]
+    pub fn users_mut(&mut self) -> &mut Vec<User> {
+        self.fresh_people = Arc::default();
+        &mut self.users
+    }
+
+    #[cfg(test)]
+    pub fn file_transcripts_mut(&mut self) -> &mut HashMap<FileId, String> {
+        &mut self.file_transcripts
     }
 
     /// Everyone in `users`, each by their freshest record.

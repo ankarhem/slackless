@@ -86,19 +86,26 @@ impl ChimeSignalClient {
             .insert("Origin", HeaderValue::from_static("https://app.slack.com"));
 
         let tls = tls_connector()?;
-        let (ws, _resp) = connect_async_tls_with_config(req, None, false, Some(tls))
-            .await
-            .map_err(|e| HuddleError::Signaling(e.to_string()))?;
+        let (ws, _resp) = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_async_tls_with_config(req, None, false, Some(tls)),
+        )
+        .await
+        .map_err(|_| HuddleError::Signaling("timed out connecting to Chime signaling".to_owned()))?
+        .map_err(|e| HuddleError::Signaling(e.to_string()))?;
         Ok(Self { ws })
     }
 
     /// Encode and send a single `[0x05][SdkSignalFrame]` binary websocket message.
     pub async fn send_frame(&mut self, frame: &SdkSignalFrame) -> Result<()> {
         let payload = encode_wire_frame(frame);
-        self.ws
-            .send(WsMessage::Binary(payload.into()))
-            .await
-            .map_err(|e| HuddleError::Signaling(e.to_string()))
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.ws.send(WsMessage::Binary(payload.into())),
+        )
+        .await
+        .map_err(|_| HuddleError::Signaling("timed out sending signaling frame".to_owned()))?
+        .map_err(|e| HuddleError::Signaling(e.to_string()))
     }
 
     /// Receive the next decoded `SdkSignalFrame`, skipping websocket ping/pong control frames.
@@ -111,10 +118,13 @@ impl ChimeSignalClient {
                         return Ok(Some(frame));
                     }
                 }
-                WsMessage::Ping(data) => {
-                    let _ = self.ws.send(WsMessage::Pong(data)).await;
-                }
-                WsMessage::Pong(_) | WsMessage::Text(_) | WsMessage::Frame(_) => {}
+                // `tungstenite` automatically queues WebSocket Pong replies on incoming Ping;
+                // never await `ws.send(Pong)` here so `next_frame` stays cancel-safe inside
+                // `tokio::select!`.
+                WsMessage::Ping(_)
+                | WsMessage::Pong(_)
+                | WsMessage::Text(_)
+                | WsMessage::Frame(_) => {}
                 WsMessage::Close(_) => return Ok(None),
             }
         }
@@ -208,14 +218,14 @@ impl ChimeSignalClient {
     /// Send a Chime `LEAVE` frame, drain up to `drain_timeout` for server acknowledgement, and
     /// close the websocket cleanly.
     pub async fn send_leave_and_close(mut self, drain_timeout: Duration) {
-        let _ = self.send_frame(&build_leave_frame()).await;
+        let _ = tokio::time::timeout(drain_timeout, self.send_frame(&build_leave_frame())).await;
         let _ = tokio::time::timeout(drain_timeout, self.next_frame()).await;
         self.close().await;
     }
 
-    /// Close the websocket cleanly.
+    /// Close the websocket cleanly with a bounded timeout so half-open sockets never stall teardown.
     pub async fn close(mut self) {
-        let _ = self.ws.close(None).await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), self.ws.close(None)).await;
     }
 }
 

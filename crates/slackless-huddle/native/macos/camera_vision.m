@@ -478,6 +478,12 @@ void slackless_cam_capture_stop(SlacklessCamCapture *cap) {
     if (!cap) return;
     @autoreleasepool {
         atomic_store(&cap->enc.stopped, true);
+        // Drain any already-queued `set_compact` / sample blocks on `sample_queue` BEFORE
+        // touching `session_obj` or calling `[session stopRunning]`, so `set_compact` can never
+        // dereference a released `session_obj` or AB-BA deadlock `AVCaptureSession` locks.
+        if (cap->sample_queue) {
+            dispatch_sync(cap->sample_queue, ^{});
+        }
         if (cap->session_obj) {
             AVCaptureSession *session = (__bridge_transfer AVCaptureSession *)cap->session_obj;
             cap->session_obj = NULL;

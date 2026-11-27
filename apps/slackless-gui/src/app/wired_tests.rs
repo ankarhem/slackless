@@ -479,11 +479,11 @@ fn wired_confirmed_send_stays_on_the_channel_it_was_submitted_to(cx: &mut gpui::
         app.update(cx, |app, cx| {
             app.select(big.clone(), cx);
             let content = crate::composer::content_of("<!channel> again", &app.fixtures);
-            let file = crate::composer::PendingAttachment {
-                filename: "notes.txt".into(),
-                bytes: b"notes".to_vec(),
-                preview: None,
-            };
+            let file = crate::composer::PendingAttachment::new(
+                "notes.txt".into(),
+                b"notes".to_vec(),
+                None,
+            );
             app.upload_files(big.clone(), None, Some(content), vec![file], window, cx);
             app.select(small.clone(), cx);
         });
@@ -533,11 +533,11 @@ fn wired_confirmed_send_stays_on_the_channel_it_was_submitted_to(cx: &mut gpui::
         app.update(cx, |app, cx| {
             app.select(big.clone(), cx);
             let content = crate::composer::content_of("<!channel> notes attached", &app.fixtures);
-            let file = crate::composer::PendingAttachment {
-                filename: "notes.txt".into(),
-                bytes: b"notes".to_vec(),
-                preview: None,
-            };
+            let file = crate::composer::PendingAttachment::new(
+                "notes.txt".into(),
+                b"notes".to_vec(),
+                None,
+            );
             app.upload_files(big.clone(), None, Some(content), vec![file], window, cx);
             app.select(small.clone(), cx);
         });
@@ -587,7 +587,7 @@ fn wired_multi_workspace_event_isolation_and_switching(cx: &mut gpui::TestAppCon
         )
     });
     let mut fx = b1.snapshot(&HashMap::new()).expect("ws1 snapshot");
-    fx.workspaces = vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()];
+    fx.set_rail_workspaces(vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()]);
     // T0TWO already holds a draft of its own, restored on its first visit.
     let seed = b2
         .remember(
@@ -837,7 +837,7 @@ fn wired_huddle_commands_follow_the_workspace_running_it(cx: &mut gpui::TestAppC
         )
     });
     let mut fx = b1.snapshot(&HashMap::new()).expect("ws1 snapshot");
-    fx.workspaces = vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()];
+    fx.set_rail_workspaces(vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()]);
     let (root, app, cx) = mount_wired(fx, vec![b1, b2], cx);
     let one = ChannelId::from("C0ONE");
     let session = |muted: bool| {
@@ -1013,7 +1013,7 @@ fn wired_unread_counts_fold_alike_in_shown_and_background_workspaces(
     };
     let ((b1, c1), (b2, c2)) = cx.update(|cx| (workspace("T0ONE", cx), workspace("T0TWO", cx)));
     let mut fx = b1.snapshot(&HashMap::new()).expect("ws1 snapshot");
-    fx.workspaces = vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()];
+    fx.set_rail_workspaces(vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()]);
     let (root, app, cx) = mount_wired(fx, vec![b1, b2], cx);
     // The shown workspace reads #open, so neither workspace sees the rows below arrive.
     cx.update(|_, cx| app.update(cx, |app, cx| app.select(ChannelId::from("C0OPEN"), cx)));
@@ -1812,5 +1812,747 @@ fn wired_remote_channel_pick_leaves_the_store_to_the_core(cx: &mut gpui::TestApp
         stored.is_none(),
         "the UI thread must never write the picked channel into the core's store (its conversations.info does): {stored:?}"
     );
+    drop(root);
+}
+
+#[gpui::test]
+fn wired_rail_reorder_keeps_own_team_across_all_surfaces(cx: &mut gpui::TestAppContext) {
+    let mut fx = fixtures::load();
+    let own = Team {
+        id: TeamId::from("T0OWN"),
+        name: "Own Co".into(),
+        domain: "ownco".into(),
+        ..Default::default()
+    };
+    let other = Team {
+        id: TeamId::from("T0OTHER"),
+        name: "Other Co".into(),
+        domain: "otherco".into(),
+        ..Default::default()
+    };
+    // Rail puts `other` FIRST while `own` is the shown workspace's own team.
+    fx.teams = vec![own.clone(), other.clone()];
+    fx.set_rail_workspaces(vec![other.clone(), own.clone()]);
+    fx.users_mut().push(User {
+        id: UserId::from("U0OWNMATE"),
+        name: "ownmate".into(),
+        team_id: Some(own.id.clone()),
+        ..Default::default()
+    });
+    fx.users_mut().push(User {
+        id: UserId::from("U0EXTMATE"),
+        name: "extmate".into(),
+        team_id: Some(other.id.clone()),
+        ..Default::default()
+    });
+
+    assert_eq!(fx.own_team().map(|t| t.id.as_str()), Some("T0OWN"));
+    assert!(!fx.is_external_user(&UserId::from("U0OWNMATE")));
+    assert!(fx.is_external_user(&UserId::from("U0EXTMATE")));
+
+    let ch = ChannelId::from("C0GENERAL");
+    let ts = Ts::from("1700000000.000100");
+    assert_eq!(
+        actions::permalink(&fx, &ch, &ts),
+        "https://ownco.slack.com/archives/C0GENERAL/p1700000000000100",
+        "message permalink must use own_team(), never rail_workspaces()[0]"
+    );
+    assert_eq!(
+        crate::huddle_video::huddle_browser_url(&fx, &ch, None),
+        "https://app.slack.com/huddle/T0OWN/C0GENERAL",
+        "huddle browser URL must use own_team(), never rail_workspaces()[0]"
+    );
+
+    let view = cx.update(|cx| SearchView::new(Arc::new(fx), None, cx));
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).active_workspace_for_test(),
+            own.id,
+            "SearchView must initialize from own_team(), never rail_workspaces()[0]"
+        );
+    });
+}
+
+#[test]
+fn fresh_people_and_transcript_overlays_propagate_to_pickers_search_and_exports() {
+    let mut fx = fixtures::load();
+    let own = Team {
+        id: TeamId::from("T0OVL"),
+        name: "Overlay Co".into(),
+        domain: "overlay".into(),
+        ..Default::default()
+    };
+    fx.teams = vec![own.clone()];
+    fx.set_rail_workspaces(vec![own.clone()]);
+    let alice = UserId::from("U0ALICE_OVL");
+    let bob = UserId::from("U0BOB_OVL");
+    fx.replace_users(vec![
+        User {
+            id: fx.self_user.clone(),
+            name: "me".into(),
+            ..Default::default()
+        },
+        User {
+            id: alice.clone(),
+            name: "alice".into(),
+            real_name: Some("Alice Old".into()),
+            ..Default::default()
+        },
+        User {
+            id: bob.clone(),
+            name: "bob".into(),
+            real_name: Some("Bob Active".into()),
+            ..Default::default()
+        },
+    ]);
+    let ch = fx.channels[0].id.clone();
+    let fid_keep = slackless_core::types::FileId::from("F0KEEP");
+    let fid_clear = slackless_core::types::FileId::from("F0CLEAR");
+    fx.file_transcripts_mut()
+        .insert(fid_clear.clone(), "Stale transcript to clear".into());
+    let root_ts = Ts::from("1700555000.000100");
+    fx.messages.entry(ch.clone()).or_default().push(Message {
+        ts: root_ts.clone(),
+        user: Some(alice.clone()),
+        text: "Voice note".into(),
+        files: vec![
+            File {
+                id: fid_keep.clone(),
+                name: Some("voice.m4a".into()),
+                ..Default::default()
+            },
+            File {
+                id: fid_clear.clone(),
+                name: Some("old.m4a".into()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+
+    // Apply live overlays (without rebuilding WorkspaceData): deactivate Bob, rename Alice,
+    // add a fresh transcript for F0KEEP, and clear F0CLEAR.
+    let updated = fx
+        .with_users(vec![
+            User {
+                id: alice.clone(),
+                name: "alice".into(),
+                real_name: Some("Alice Fresh".into()),
+                ..Default::default()
+            },
+            User {
+                id: bob.clone(),
+                name: "bob".into(),
+                real_name: Some("Bob Active".into()),
+                deleted: true,
+                ..Default::default()
+            },
+        ])
+        .with_file_transcript_cues(fid_keep.clone(), "Freshly transcribed clip".into(), vec![])
+        .with_file_transcript_cues(fid_clear.clone(), String::new(), vec![]);
+
+    // 1. Compose recipient picker excludes deactivated Bob and finds renamed Alice.
+    let bob_hits = crate::compose_targets::suggestions(&updated, &[], "bob");
+    assert!(
+        bob_hits.iter().all(
+            |s| !matches!(&s.recipient, crate::compose_targets::Recipient::User(u) if *u == bob)
+        ),
+        "deactivated user in fresh_people overlay must not be suggested"
+    );
+    assert!(
+        updated
+            .people()
+            .any(|u| u.id == alice && u.real_name.as_deref() == Some("Alice Fresh"))
+    );
+
+    // 2. all_file_transcripts merges additions and removes cleared transcripts.
+    let all_tx = updated.all_file_transcripts();
+    assert_eq!(
+        all_tx.get(&fid_keep).map(String::as_str),
+        Some("Freshly transcribed clip")
+    );
+    assert!(!all_tx.contains_key(&fid_clear));
+
+    // 3. Fixture channel & thread exports see freshly landed transcripts and omit cleared ones.
+    let ch_doc =
+        super::dialogs::storage::build_fixture_channel_export(&updated, &own, &ch, "#general");
+    let exported_msg = ch_doc
+        .messages
+        .iter()
+        .find(|m| m.ts == root_ts.as_str())
+        .expect("exported message");
+    assert_eq!(
+        exported_msg.files[0].transcript.as_deref(),
+        Some("Freshly transcribed clip")
+    );
+    assert_eq!(exported_msg.files[1].transcript, None);
+
+    let th_doc = super::dialogs::storage::build_fixture_thread_export(
+        &updated, &own, &ch, "#general", &root_ts,
+    );
+    assert_eq!(
+        th_doc.messages[0].files[0].transcript.as_deref(),
+        Some("Freshly transcribed clip")
+    );
+    assert_eq!(th_doc.messages[0].files[1].transcript, None);
+
+    // 4. Fixture search archive seeds fresh users and overlaid transcripts.
+    let archive = fixture_archive_for(&updated, &own.id).expect("fixture archive");
+    let store = archive.lock().expect("store lock");
+    assert_eq!(
+        store.user(&own.id, &bob).expect("bob").map(|u| u.deleted),
+        Some(true)
+    );
+    assert_eq!(
+        store
+            .file_transcript(&own.id, &fid_keep)
+            .expect("tx")
+            .map(|t| t.text),
+        Some("Freshly transcribed clip".to_owned())
+    );
+    assert!(
+        store
+            .file_transcript(&own.id, &fid_clear)
+            .expect("cleared tx")
+            .is_none()
+    );
+}
+
+#[test]
+fn gui_text_parsers_survive_hostile_utf8_and_arbitrary_offsets() {
+    let fx = fixtures::load();
+    let pieces = [
+        "@",
+        "#",
+        ":",
+        ":+1:",
+        ":handshake::skin-tone-4:",
+        ":tada:",
+        "åäö",
+        "日本語",
+        "مرحبا",
+        "Привет",
+        "👨‍👩‍👧‍👦",
+        "🤝🏽",
+        "e\u{0301}",
+        "\u{200b}",
+        " ",
+        "\n",
+        "`",
+        "```",
+        "## ",
+        "<@U0ALICE>",
+        "<#C0GENERAL|general>",
+        "https://example.com/åäö",
+        "(",
+        ")",
+        "_",
+        "-",
+        "12:30",
+    ];
+    let mut state: u64 = 0x51A0_CAFE_BEEF_1234;
+    let mut next_usize = |bound: usize| -> usize {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state as usize) % bound
+    };
+
+    for _ in 0..120 {
+        let len = 1 + next_usize(14);
+        let mut s = String::new();
+        for _ in 0..len {
+            s.push_str(pieces[next_usize(pieces.len())]);
+        }
+        // Shortcode expander and plain-text renderer must never panic on any UTF-8 mix.
+        let _ = crate::emoji::replace_shortcodes(&s);
+        let _ = crate::messages::plain_text(&s, &fx);
+        let _ = crate::editor::rank(&s, "å");
+        let _ = crate::editor::rank(&s, "日");
+
+        // Autocomplete trigger must never panic even for mid-UTF-8 or out-of-bounds byte offsets.
+        let doc = crate::editor::Doc::from(s.as_str());
+        for caret in 0..=s.len() + 2 {
+            let _ = crate::editor::trigger(&doc, caret);
+        }
+    }
+}
+
+#[gpui::test]
+fn wired_background_workspace_applies_same_thread_reply_and_vip_notification_rules(
+    cx: &mut gpui::TestAppContext,
+) {
+    let people = [
+        user("U0ME", "me"),
+        user("U0ALICE", "alice"),
+        user("U0BOB", "bob"),
+    ];
+    let (b1, _c1) =
+        cx.update(|cx| make_wired_workspace("T0ONE", "One", &[("C0OPEN", "open")], &people, cx));
+    let (b2, c2) = cx
+        .update(|cx| make_wired_workspace("T0TWO", "Two", &[("C0BG", "background")], &people, cx));
+    let mut fx = b1.snapshot(&HashMap::new()).expect("ws1 snapshot");
+    fx.set_rail_workspaces(vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()]);
+    let (root, app, cx) = mount_wired(fx, vec![b1, b2], cx);
+
+    // Enable desktop notifications for all messages + thread replies to own threads.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.preferences.update(cx, |prefs, cx| {
+                let mut s = prefs.settings().clone();
+                s.desktop_notifications = true;
+                s.notify_level = 0; // Everything
+                s.thread_replies = true;
+                prefs.load_settings(s, window, cx);
+            });
+            app.recent_notified_tags.clear();
+        });
+    });
+
+    // 1. Thread reply to someone ELSE's thread in a background workspace must NOT notify.
+    let unfollowed_reply = Message {
+        ts: Ts::from("1700000200.000100"),
+        thread_ts: Some(Ts::from("1700000100.000100")),
+        parent_user_id: Some(UserId::from("U0BOB")),
+        user: Some(UserId::from("U0ALICE")),
+        text: "replying to bob".into(),
+        ..Default::default()
+    };
+    cx.update(|_, cx| {
+        c2.emit(
+            Event::MessagePosted {
+                channel: ChannelId::from("C0BG"),
+                message: Box::new(unfollowed_reply),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert!(
+            app.read(cx).recent_notified_tags.is_empty(),
+            "background workspace must suppress replies to other users' threads just like shown workspace"
+        );
+    });
+
+    // 2. Thread reply to MY thread in a background workspace MUST notify.
+    let my_thread_reply = Message {
+        ts: Ts::from("1700000201.000100"),
+        thread_ts: Some(Ts::from("1700000100.000100")),
+        parent_user_id: Some(UserId::from("U0ME")),
+        user: Some(UserId::from("U0ALICE")),
+        text: "replying to your thread".into(),
+        ..Default::default()
+    };
+    cx.update(|_, cx| {
+        c2.emit(
+            Event::MessagePosted {
+                channel: ChannelId::from("C0BG"),
+                message: Box::new(my_thread_reply),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert!(
+            app.read(cx)
+                .recent_notified_tags
+                .iter()
+                .any(|(tag, _)| tag.contains("C0BG:1700000201.000100")),
+            "background workspace must notify on replies to user's own thread"
+        );
+    });
+    drop(root);
+}
+
+#[gpui::test]
+fn wired_background_workspace_honors_marked_read_and_schedules_parked_reloads(
+    cx: &mut gpui::TestAppContext,
+) {
+    let people = [user("U0ME", "me"), user("U0ALICE", "alice")];
+    let (b1, _c1) =
+        cx.update(|cx| make_wired_workspace("T0ONE", "One", &[("C0OPEN", "open")], &people, cx));
+    let (b2, c2) = cx
+        .update(|cx| make_wired_workspace("T0TWO", "Two", &[("C0BG", "background")], &people, cx));
+    let mut fx = b1.snapshot(&HashMap::new()).expect("ws1 snapshot");
+    fx.set_rail_workspaces(vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()]);
+    let (root, app, cx) = mount_wired(fx, vec![b1, b2], cx);
+
+    let bg_ch = ChannelId::from("C0BG");
+    let ts_read = Ts::from("1700000500.000100");
+    // Visit workspace 1, finish its initial reload, mark C0BG read, then park it by switching to 0.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.switch_workspace(1, window, cx);
+            app.ws.reload = None;
+            app.ws.fold_read_marker(&bg_ch, &ts_read, false);
+            app.switch_workspace(0, window, cx);
+            assert!(app.slots[1].parked.is_some());
+            assert!(app.slots[1].state.reload.is_none());
+        });
+    });
+
+    // 1. A stale client.counts predating `ts_read` arriving while workspace 1 is in background
+    //    must NOT resurrect unreads on C0BG.
+    let stale_counts = slackless_core::api::ClientCounts {
+        channels: vec![ConversationCounts {
+            id: bg_ch.clone(),
+            last_read: Some(Ts::from("1700000100.000100")),
+            latest: Some(ts_read.clone()),
+            has_unreads: true,
+            mention_count: 2,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    cx.update(|_, cx| {
+        c2.emit(Event::Counts(Box::new(stale_counts)), cx);
+        // 2. A UsersChanged event for the parked background workspace schedules a Users reload.
+        c2.emit(Event::UsersChanged(vec![UserId::from("U0ALICE")]), cx);
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let app_ref = app.read(cx);
+        let entry = app_ref.slots[1]
+            .state
+            .counts
+            .get(&bg_ch)
+            .expect("counts entry");
+        assert!(
+            !entry.has_unreads && entry.mention_count == 0,
+            "stale counts in background workspace must honor marked_read guard: {entry:?}"
+        );
+        assert!(
+            matches!(app_ref.slots[1].state.reload, Some(Reload::Users(_))),
+            "UsersChanged on parked workspace must schedule a reload on return"
+        );
+    });
+
+    // 3. Conversations update escalates the parked workspace's pending reload to Full.
+    cx.update(|_, cx| {
+        c2.emit(Event::Conversations(vec![bg_ch.clone()]), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert!(
+            matches!(app.read(cx).slots[1].state.reload, Some(Reload::Full)),
+            "Conversations event on parked workspace must escalate reload to Full"
+        );
+    });
+    drop(root);
+}
+
+#[gpui::test]
+fn wired_activity_toggle_read_workspace_isolation_and_drafts_cancel_routing(
+    cx: &mut gpui::TestAppContext,
+) {
+    let people = [user("U0ME", "me"), user("U0ALICE", "alice")];
+    let (b1, c1) =
+        cx.update(|cx| make_wired_workspace("T0ONE", "One", &[("C0ONE", "one")], &people, cx));
+    let (b2, c2) =
+        cx.update(|cx| make_wired_workspace("T0TWO", "Two", &[("C0TWO", "two")], &people, cx));
+    let mut fx = b1.snapshot(&HashMap::new()).expect("ws1 snapshot");
+    fx.set_rail_workspaces(vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()]);
+    let (root, app, cx) = mount_wired(fx, vec![b1, b2], cx);
+    let _ = c1.drain_commands();
+    let _ = c2.drain_commands();
+
+    // 1. Load an unread Activity item in workspace 0 and click toggle_read: must emit read=true!
+    let item = slackless_core::api::ActivityItem {
+        kind: slackless_core::api::ActivityKind::Mention,
+        unread: true,
+        feed_ts: Ts::from("1700000100.000100"),
+        key: "act-1".into(),
+        channel: ChannelId::from("C0ONE"),
+        thread_ts: None,
+        ts: Ts::from("1700000100.000100"),
+        actor: Some(UserId::from("U0ALICE")),
+        reaction: None,
+        count: 1,
+        message: Some(Message {
+            ts: Ts::from("1700000100.000100"),
+            user: Some(UserId::from("U0ALICE")),
+            text: "ping <@U0ME>".into(),
+            ..Default::default()
+        }),
+    };
+    cx.update(|_, cx| {
+        c1.emit(
+            Event::ActivityView {
+                feed: Ok(Box::new(slackless_core::api::ActivityFeed {
+                    items: vec![item],
+                    next_cursor: None,
+                })),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(app.read(cx).activity.read(cx).unread_count(), 1);
+        app.read(cx).activity.clone().update(cx, |feed, cx| {
+            feed.toggle_read_for_test(0, cx);
+        });
+    });
+    cx.run_until_parked();
+    let cmds1 = c1.drain_commands();
+    assert!(
+        cmds1.iter().any(|c| matches!(
+            c,
+            Command::Messaging(MessagingCommand::MarkActivity { read: true, .. })
+        )),
+        "toggling an unread Activity item to read must emit MarkActivity {{ read: true }}, got: {cmds1:?}"
+    );
+
+    // 2. Switching to workspace 1 must clear live Activity items from workspace 0.
+    cx.update(|_, cx| {
+        app.read(cx).activity.clone().update(cx, |feed, cx| {
+            feed.toggle_read_for_test(0, cx);
+        });
+        assert_eq!(app.read(cx).activity.read(cx).unread_count(), 1);
+    });
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.switch_workspace(1, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(
+            app.read(cx).activity.read(cx).unread_count(),
+            0,
+            "switching workspaces must clear the outgoing workspace's live Activity feed"
+        );
+    });
+    let _ = c1.drain_commands();
+    let _ = c2.drain_commands();
+
+    // 3. Cancelling a scheduled message belonging to workspace 0 while viewing workspace 1 must
+    //    send DeleteScheduledMessage to workspace 0's bridge, NOT workspace 1's bridge.
+    cx.update(|_, cx| {
+        app.read(cx).drafts.clone().update(cx, |_, cx| {
+            cx.emit(DraftsEvent::CancelScheduled(Entry {
+                id: Some("Q0SCHED1".into()),
+                workspace: 0,
+                channel: ChannelId::from("C0ONE"),
+                label: "#one".into(),
+                text: "scheduled in ws0".into(),
+                at: 1_900_000_000,
+            }));
+        });
+    });
+    cx.run_until_parked();
+    let cmds1 = c1.drain_commands();
+    let cmds2 = c2.drain_commands();
+    assert!(
+        cmds1.iter().any(|c| matches!(
+            c,
+            Command::Messaging(MessagingCommand::DeleteScheduledMessage {
+                scheduled_message_id,
+                ..
+            }) if scheduled_message_id == "Q0SCHED1"
+        )),
+        "CancelScheduled for ws0 must route to ws0's bridge, got ws0={cmds1:?} ws1={cmds2:?}"
+    );
+    assert!(
+        cmds2.iter().all(|c| !matches!(
+            c,
+            Command::Messaging(MessagingCommand::DeleteScheduledMessage { .. })
+        )),
+        "CancelScheduled for ws0 must never reach ws1's bridge: {cmds2:?}"
+    );
+
+    // 4. Composer::load_draft must clear staged attachments so switching channels/workspaces
+    //    cannot leak staged files to the wrong destination.
+    cx.update(|_, cx| {
+        let composer = app.read(cx).composer.clone();
+        composer.update(cx, |c, cx| {
+            c.restore_attachments(
+                vec![composer::PendingAttachment::new(
+                    "secret.pdf".into(),
+                    vec![1, 2, 3],
+                    None,
+                )],
+                cx,
+            );
+            assert_eq!(c.attachments().len(), 1);
+            c.load_draft("next channel draft", cx);
+            assert!(
+                c.attachments().is_empty(),
+                "load_draft must clear staged attachments from the previous target"
+            );
+        });
+    });
+
+    drop(root);
+}
+
+#[gpui::test]
+fn wired_thread_rollback_cache_sync_and_search_workspace_reset(cx: &mut gpui::TestAppContext) {
+    let people = [user("U0ME", "me"), user("U0PEER", "peer")];
+    let ((b1, _c1), (b2, _c2)) = cx.update(|cx| {
+        (
+            make_wired_workspace("T0ONE", "One", &[("C0ONE", "one")], &people, cx),
+            make_wired_workspace("T0TWO", "Two", &[("C0TWO", "two")], &people, cx),
+        )
+    });
+    let mut fx = b1.snapshot(&HashMap::new()).expect("ws1 snapshot");
+    fx.set_rail_workspaces(vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()]);
+    let (root, app, cx) = mount_wired(fx, vec![b1, b2], cx);
+
+    // 1. ThreadPanel::rollback_pending_reply removes a phantom optimistic reply from both live
+    //    replies and the thread cache, and restores the typed draft into the thread composer.
+    let ch = ChannelId::from("C0ONE");
+    let root_ts = Ts::from("1700000100.000100");
+    let root_msg = Message {
+        ts: root_ts.clone(),
+        user: Some(UserId::from("U0PEER")),
+        text: "thread root".into(),
+        ..Default::default()
+    };
+    let my_reply = Message {
+        ts: Ts::from("1700000101.000100"),
+        thread_ts: Some(root_ts.clone()),
+        user: Some(UserId::from("U0ME")),
+        text: "ghp_secret_draft".into(),
+        ..Default::default()
+    };
+    cx.update(|_, cx| {
+        let panel = app.read(cx).thread.clone();
+        panel.update(cx, |panel, cx| {
+            panel.open(ch.clone(), root_ts.clone(), Some(root_msg.clone()), cx);
+            panel.set_thread(
+                ch.clone(),
+                root_ts.clone(),
+                vec![root_msg.clone(), my_reply.clone()],
+                cx,
+            );
+            panel.rollback_pending_reply(&ch, &root_ts, "ghp_secret_draft", cx);
+            // Re-opening from cache must not resurrect the rolled-back reply.
+            panel.open(ch.clone(), root_ts.clone(), Some(root_msg.clone()), cx);
+        });
+    });
+    cx.update(|_, cx| {
+        let panel = app.read(cx).thread.clone();
+        let reply_count = panel.read(cx).reply_count_for_test();
+        assert_eq!(
+            reply_count, 0,
+            "rolled-back reply must stay gone even after reopening from ThreadPanel cache"
+        );
+    });
+
+    // 2. SearchView::set_workspace clears stale results from the previous workspace.
+    cx.update(|_, cx| {
+        let results = app.read(cx).results.clone();
+        results.update(cx, |view, cx| {
+            view.set_workspace(TeamId::from("T0TWO"), cx);
+            assert_eq!(view.active_workspace_for_test(), TeamId::from("T0TWO"));
+            assert!(view.local_hits_for_test().is_empty());
+            assert_eq!(view.remote_messages_len_for_test(), 0);
+        });
+    });
+
+    drop(root);
+}
+
+#[gpui::test]
+fn wired_wave9_usergroups_later_todos_and_vip_sound_guards(cx: &mut gpui::TestAppContext) {
+    use crate::directory::{
+        cached_usergroup_members, record_usergroup_disabled, record_usergroup_members,
+    };
+    use crate::later::{LaterEvent, LaterItem, LaterState, PERSONAL_TODO_CHANNEL};
+
+    let people = [user("U0ME", "me"), user("U0PEER", "peer")];
+    let ((b1, c1), (b2, _c2)) = cx.update(|cx| {
+        (
+            make_wired_workspace("T0ONE", "One", &[("C0ONE", "one")], &people, cx),
+            make_wired_workspace("T0TWO", "Two", &[("C0TWO", "two")], &people, cx),
+        )
+    });
+    let mut fx = b1.snapshot(&HashMap::new()).expect("ws1 snapshot");
+    fx.set_rail_workspaces(vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()]);
+    let (root, app, cx) = mount_wired(fx, vec![b1, b2], cx);
+
+    // 1. UsergroupLiveState is strictly workspace-scoped by TeamId.
+    let ug_id = slackless_core::types::UsergroupId::from("S0ENG");
+    cx.update(|_, cx| {
+        record_usergroup_members(
+            TeamId::from("T0ONE"),
+            ug_id.clone(),
+            vec![UserId::from("U0ME")],
+            cx,
+        );
+        record_usergroup_disabled(
+            TeamId::from("T0ONE"),
+            slackless_core::types::Usergroup {
+                id: ug_id.clone(),
+                name: "Eng".into(),
+                handle: "eng".into(),
+                ..Default::default()
+            },
+            cx,
+        );
+        assert_eq!(
+            cached_usergroup_members(&TeamId::from("T0ONE"), &ug_id, cx),
+            Some(vec![UserId::from("U0ME")])
+        );
+        assert_eq!(
+            cached_usergroup_members(&TeamId::from("T0TWO"), &ug_id, cx),
+            None,
+            "usergroup member cache must not bleed into another workspace"
+        );
+    });
+
+    // 2. LaterView::replace_live preserves local personal to-dos and LaterEvent::Update for
+    //    PERSONAL_TODO_CHANNEL never sends UpdateSavedItem("TODO") to Slack.
+    let _ = c1.drain_commands();
+    cx.update(|_, cx| {
+        let later = app.read(cx).later.clone();
+        later.update(cx, |view, cx| {
+            view.add_todo("Ship Wave 9".into(), cx);
+            view.replace_live(
+                0,
+                vec![LaterItem {
+                    workspace: 0,
+                    channel: ChannelId::from("C0ONE"),
+                    ts: Ts::from("1700000100.000100"),
+                    label: "#one".into(),
+                    author: "peer".into(),
+                    text: "saved msg".into(),
+                    state: LaterState::InProgress,
+                    due: None,
+                    fired: false,
+                    is_todo: false,
+                }],
+                cx,
+            );
+            let items = view.items_for_popout();
+            assert!(
+                items
+                    .iter()
+                    .any(|it| it.is_personal_todo() && it.text == "Ship Wave 9"),
+                "replace_live must preserve personal to-dos"
+            );
+            cx.emit(LaterEvent::Update {
+                workspace: 0,
+                channel: ChannelId::from(PERSONAL_TODO_CHANNEL),
+                ts: Ts::from("1700000999.000001"),
+                mark: Some(slackless_core::api::SavedMark::Completed),
+                date_due: None,
+            });
+        });
+    });
+    cx.run_until_parked();
+    let cmds = c1.drain_commands();
+    assert!(
+        cmds.iter().all(|c| !matches!(
+            c,
+            Command::Messaging(MessagingCommand::UpdateSavedItem { .. })
+        )),
+        "updating a local personal to-do must never hit Slack's saved.update API: {cmds:?}"
+    );
+
     drop(root);
 }

@@ -71,11 +71,13 @@ struct SlacklessScCapture {
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error API_AVAILABLE(macos(12.3)) {
     (void)stream;
-    SlacklessScCapture *cap = self.owner;
-    if (!cap || atomic_load(&cap->enc.stopped) || !error) return;
-    if (cap->on_error) {
-        const char *msg = error.localizedDescription.UTF8String;
-        cap->on_error(cap->enc.ctx, msg ? msg : "SCStream stopped with error");
+    @synchronized (self) {
+        SlacklessScCapture *cap = self.owner;
+        if (!cap || atomic_load(&cap->enc.stopped) || !error) return;
+        if (cap->on_error) {
+            const char *msg = error.localizedDescription.UTF8String;
+            cap->on_error(cap->enc.ctx, msg ? msg : "SCStream stopped with error");
+        }
     }
 }
 
@@ -88,8 +90,13 @@ static void slackless_sc_capture_release(SlacklessScCapture *cap) {
     if (!cap) return;
     cap->sample_queue = nil;
     if (cap->delegate_obj) {
-        ((__bridge_transfer SlacklessStreamDelegate *)cap->delegate_obj).owner = NULL;
+        SlacklessStreamDelegate *del = (__bridge_transfer SlacklessStreamDelegate *)cap->delegate_obj;
         cap->delegate_obj = NULL;
+        // Wait for any in-flight `stream:didStopWithError:` callback on ScreenCaptureKit's
+        // delegate queue before invalidating `cap` or freeing Rust's `ctx`.
+        @synchronized (del) {
+            del.owner = NULL;
+        }
     }
     (void)(__bridge_transfer SCStream *)cap->stream_obj;
     cap->stream_obj = NULL;
@@ -117,6 +124,7 @@ SlacklessScCapture *slackless_sc_capture_start(
     SlacklessH264Callback on_h264,
     SlacklessSurfaceCallback on_surface_preview,
     SlacklessErrorCallback on_error,
+    SlacklessCaptureReleasedCallback on_released,
     char *err_buf,
     size_t err_buf_len) {
     @autoreleasepool {
@@ -133,6 +141,7 @@ SlacklessScCapture *slackless_sc_capture_start(
                                                          }];
             if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC)) != 0) {
                 slackless_write_err(err_buf, err_buf_len, "timed out querying ScreenCaptureKit shareable content");
+                if (on_released) on_released(ctx);
                 return NULL;
             }
             if (!content) {
@@ -141,6 +150,7 @@ SlacklessScCapture *slackless_sc_capture_start(
                     err_buf_len,
                     contentErr ? contentErr.localizedDescription.UTF8String
                                : "ScreenCaptureKit unavailable (check Screen Recording permission)");
+                if (on_released) on_released(ctx);
                 return NULL;
             }
 
@@ -161,6 +171,7 @@ SlacklessScCapture *slackless_sc_capture_start(
                 }
                 if (!picked) {
                     slackless_write_err(err_buf, err_buf_len, "no matching ScreenCaptureKit display found");
+                    if (on_released) on_released(ctx);
                     return NULL;
                 }
                 filter = [[SCContentFilter alloc] initWithDisplay:picked excludingWindows:@[]];
@@ -186,6 +197,7 @@ SlacklessScCapture *slackless_sc_capture_start(
                 }
                 if (!picked) {
                     slackless_write_err(err_buf, err_buf_len, "matching ScreenCaptureKit window not found");
+                    if (on_released) on_released(ctx);
                     return NULL;
                 }
                 filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:picked];
@@ -210,6 +222,7 @@ SlacklessScCapture *slackless_sc_capture_start(
             SlacklessScCapture *cap = (SlacklessScCapture *)calloc(1, sizeof(SlacklessScCapture));
             if (!cap) {
                 slackless_write_err(err_buf, err_buf_len, "out of memory allocating capture handle");
+                if (on_released) on_released(ctx);
                 return NULL;
             }
             cap->enc.ctx = ctx;
@@ -221,6 +234,7 @@ SlacklessScCapture *slackless_sc_capture_start(
             atomic_store(&cap->enc.force_keyframe, true);
             cap->on_surface_preview = on_surface_preview;
             cap->on_error = on_error;
+            cap->on_released = on_released;
 
             OSStatus vt_st = slackless_configure_vt_encoder(
                 out_w, out_h, cap->enc.fps, bitrate_bps, 10.0, &cap->enc, &cap->enc.vt);
@@ -228,6 +242,7 @@ SlacklessScCapture *slackless_sc_capture_start(
                 char msg[128];
                 snprintf(msg, sizeof(msg), "VTCompressionSessionCreate failed (OSStatus %d)", (int)vt_st);
                 slackless_write_err(err_buf, err_buf_len, msg);
+                if (on_released) on_released(ctx);
                 free(cap);
                 return NULL;
             }
@@ -259,7 +274,8 @@ SlacklessScCapture *slackless_sc_capture_start(
                     err_buf,
                     err_buf_len,
                     addErr ? addErr.localizedDescription.UTF8String : "addStreamOutput failed");
-                // Never started: no callback was queued, so the handle can be freed in place.
+                // Never started: no callback was queued, so the handle can be freed in place
+                // (calling `cap->on_released(ctx)`).
                 slackless_sc_capture_release(cap);
                 return NULL;
             }
@@ -276,15 +292,16 @@ SlacklessScCapture *slackless_sc_capture_start(
                     err_buf,
                     err_buf_len,
                     startErr ? startErr.localizedDescription.UTF8String : "SCStream startCapture timed out");
-                // A timed-out start may still come up: go through the stop path so a late sample
-                // never reaches freed memory.
-                slackless_sc_capture_stop(cap, NULL);
+                // A timed-out start may still come up: go through the stop path with `on_released`
+                // so `ctx` stays alive until `slackless_sc_capture_release` drains callbacks.
+                slackless_sc_capture_stop(cap, on_released);
                 return NULL;
             }
 
             return cap;
         } else {
             slackless_write_err(err_buf, err_buf_len, "ScreenCaptureKit requires macOS 12.3+");
+            if (on_released) on_released(ctx);
             return NULL;
         }
     }

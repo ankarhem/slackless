@@ -552,34 +552,7 @@ impl App {
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_thread_counts(has_unreads, mentions, cx)
         });
-        let mut next_counts: HashMap<ChannelId, ConversationCounts> =
-            [&counts.channels, &counts.ims, &counts.mpims]
-                .into_iter()
-                .flatten()
-                .map(|entry| (entry.id.clone(), entry.clone()))
-                .collect();
-        let mut newly_unread: Vec<ChannelId> = Vec::new();
-        for (id, entry) in &mut next_counts {
-            if let Some(marked) = self.ws.marked_read.get(id).cloned() {
-                let server_has_newer = entry.latest.as_ref().is_some_and(|latest| *latest > marked);
-                if !server_has_newer {
-                    // Keep local read state when an in-flight `client.counts` predates our
-                    // `conversations.mark`.
-                    entry.clear_unreads();
-                    if entry.last_read.as_ref().is_none_or(|r| marked > *r) {
-                        entry.last_read = Some(marked);
-                    }
-                } else {
-                    // Genuinely newer messages landed since we last marked this read.
-                    self.ws.marked_read.remove(id);
-                    if entry.is_unread() {
-                        newly_unread.push(id.clone());
-                    }
-                }
-            } else if entry.is_unread() {
-                newly_unread.push(id.clone());
-            }
-        }
+        let newly_unread = self.ws.fold_counts(counts);
         if !newly_unread.is_empty() {
             self.sidebar.update(cx, |sidebar, cx| {
                 for id in &newly_unread {
@@ -587,7 +560,6 @@ impl App {
                 }
             });
         }
-        self.ws.counts = next_counts;
         // Fast path: when every conversation in `counts` is already known in memory,
         // update counts + `last_read` in-place without re-reading the whole SQLite store.
         let all_known = !self.fixtures.sample
@@ -641,10 +613,14 @@ impl App {
             let expanded = self.threads.read(cx).expanded_in(channel);
             for thread_ts in expanded {
                 if let Some(read) = self.bridge.thread(channel.clone(), thread_ts.clone()) {
+                    let epoch = self.workspace_epoch;
                     let (ch, ts) = (channel.clone(), thread_ts);
                     cx.spawn(async move |this, cx| {
                         let msgs = cx.background_executor().spawn(read).await;
                         let _ = this.update(cx, |app, cx| {
+                            if app.workspace_epoch != epoch {
+                                return;
+                            }
                             app.resolve_named_users(&msgs);
                             let replies: Vec<_> = msgs.into_iter().filter(|m| m.ts != ts).collect();
                             app.threads.update(cx, |view, cx| {
@@ -1128,6 +1104,7 @@ impl App {
             return;
         };
         let fixtures = self.fixtures.clone();
+        let epoch = self.workspace_epoch;
         cx.spawn_in(window, async move |this, cx| {
             let opened_channel = channel.clone();
             let opened = cx
@@ -1141,6 +1118,9 @@ impl App {
                 return;
             }
             let _ = this.update_in(cx, |app, window, cx| {
+                if app.workspace_epoch != epoch {
+                    return;
+                }
                 // Once, even when the same DM is announced twice.
                 if let Some(pending) = app.pending_dm.take_if(|waiting| waiting.users == users) {
                     app.submit(
@@ -1150,6 +1130,7 @@ impl App {
                             broadcast: false,
                             content: pending.content,
                             files: None,
+                            origin: messaging::OutgoingOrigin::External,
                         },
                         window,
                         cx,
@@ -1186,6 +1167,9 @@ pub(crate) fn user_facing_error_title(error: &str) -> Option<&'static str> {
         ("files.upload:", "Could not upload file"),
         ("files.delete:", "Could not delete file"),
         ("files.undelete:", "Could not restore file"),
+        ("files.requestPermission:", "Could not request file access"),
+        ("files.collections.create:", "Could not create collection"),
+        ("files.collections.delete:", "Could not delete collection"),
         ("canvases.create:", "Could not create canvas"),
         ("conversations.canvases.create:", "Could not create canvas"),
         ("canvases.edit:", "Could not save canvas"),
@@ -1195,9 +1179,13 @@ pub(crate) fn user_facing_error_title(error: &str) -> Option<&'static str> {
         ("canvas.comment.post:", "Could not post comment"),
         ("quip.thread.", "Could not update comment thread"),
         ("lists.create:", "Could not create list"),
-        ("lists.records.", "Could not update list"),
+        ("lists.records.create:", "Could not create list item"),
+        ("lists.records.delete:", "Could not delete list item"),
+        ("lists.records.archive:", "Could not archive list item"),
         ("lists.cells.update:", "Could not update list cell"),
         ("lists.addToList:", "Could not add to list"),
+        ("slackLists.access.set:", "Could not share list"),
+        ("slackLists.access.delete:", "Could not update list access"),
         ("pins.add:", "Could not pin message"),
         ("pins.remove:", "Could not unpin message"),
         ("bookmarks.add:", "Could not add bookmark"),
@@ -1205,18 +1193,63 @@ pub(crate) fn user_facing_error_title(error: &str) -> Option<&'static str> {
         ("saved.add", "Could not save for later"),
         ("saved.update:", "Could not update saved item"),
         ("saved.delete:", "Could not remove saved item"),
+        ("saved.clearCompleted:", "Could not clear completed items"),
         ("conversations.create:", "Could not create channel"),
         ("conversations.open:", "Could not open conversation"),
+        ("conversations.join:", "Could not join channel"),
+        ("conversations.leave:", "Could not leave channel"),
         ("conversations.rename:", "Could not rename channel"),
         ("conversations.archive:", "Could not archive channel"),
         ("conversations.unarchive:", "Could not unarchive channel"),
+        (
+            "conversations.convertToPrivate:",
+            "Could not make channel private",
+        ),
+        ("admin.conversations.delete:", "Could not delete channel"),
         ("conversations.invite:", "Could not invite member"),
         ("conversations.setTopic:", "Could not update topic"),
         ("conversations.setPurpose:", "Could not update description"),
+        ("conversations.addTab:", "Could not add tab"),
+        ("conversations.removeTab:", "Could not remove tab"),
+        ("conversations.moveTab:", "Could not reorder tab"),
+        ("users.channelSections.create:", "Could not create section"),
+        ("users.channelSections.set:", "Could not update section"),
+        ("users.channelSections.delete:", "Could not delete section"),
+        (
+            "users.channelSections.channels.bulkUpdate:",
+            "Could not move channel",
+        ),
         ("users.profile.set:", "Could not update profile"),
         ("users.setPhoto:", "Could not update profile photo"),
+        (
+            "users.prefs.setNotifications",
+            "Could not update notification settings",
+        ),
+        ("users.prefs.set:", "Could not update preference"),
+        ("presence.set:", "Could not update presence"),
+        ("auth.revoke:", "Could not sign out"),
+        ("usergroups.create:", "Could not create user group"),
+        ("usergroups.update:", "Could not update user group"),
+        ("usergroups.disable:", "Could not disable user group"),
+        ("usergroups.enable:", "Could not enable user group"),
+        (
+            "usergroups.users.update:",
+            "Could not update user group members",
+        ),
         ("dnd.setSnooze:", "Could not pause notifications"),
+        ("dnd.endSnooze:", "Could not resume notifications"),
+        ("workflows.triggers.trip:", "Could not run workflow"),
+        ("views.submit:", "Could not submit form"),
+        ("blocks.actions:", "Action failed"),
         ("rooms.join:", "Could not join huddle"),
+        ("rooms.notifyMember:", "Could not invite to huddle"),
+        ("rooms.getLink:", "Could not get huddle link"),
+        (
+            "rooms.inviteResponse:",
+            "Could not respond to huddle invite",
+        ),
+        ("screenhero.rooms.rename:", "Could not rename huddle"),
+        ("huddles.update:", "Could not update huddle"),
     ];
     if error.starts_with("chat.postMessage:")
         && (error.contains("at_channel_restricted")
@@ -1272,5 +1305,89 @@ mod tests {
                 "unexpected toast for {bg}"
             );
         }
+    }
+
+    /// Structural regression guard: every `self.spawn("<ctx>", ...)` in
+    /// `slackless-core/src/client/commands/*.rs` must either be mapped to a user-facing toast in
+    /// `user_facing_error_title` OR explicitly allowlisted below as a background/read operation.
+    /// Prevents new user mutations from silently swallowing errors as log-only.
+    #[test]
+    fn every_core_command_spawn_context_is_classified_for_error_toasts() {
+        const READ_OR_BACKGROUND: &[&str] = &[
+            "activity.mark",
+            "admin.roles.entity.listAssignments",
+            "apps.home.open",
+            "blocks.suggestions",
+            "bookmarks.list",
+            "bots.info",
+            "calls.info",
+            "canvas.comments.list",
+            "chat.scheduledMessages.list",
+            "conversations.history",
+            "conversations.info(app_home)",
+            "conversations.mark",
+            "conversations.replies",
+            "drafts.list",
+            "drafts.sync",
+            "edgeapi.search",
+            "files.extras",
+            "files.favorites",
+            "files.info(canvas)",
+            "files.list",
+            "lists.getThreadsForRecord",
+            "lists.records.list",
+            "media.transcribe",
+            "pins.list",
+            "search.modules.files",
+            "search.modules.messages",
+            "subscriptions.thread.getView",
+            "subscriptions.thread.mark",
+            "usergroups.users.list",
+            "users.markAllRead",
+            "users.profile.get",
+            "views.close",
+            "workflows.triggers.info",
+        ];
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/slackless-core/src/client/commands");
+        let mut unclassified = Vec::new();
+        let mut count = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("read commands dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read command source");
+            let mut rest = src.as_str();
+            while let Some(idx) = rest.find("self.spawn(\"") {
+                rest = &rest[idx + "self.spawn(\"".len()..];
+                let Some(end) = rest.find('"') else {
+                    break;
+                };
+                let ctx = &rest[..end];
+                rest = &rest[end + 1..];
+                count += 1;
+                let probe = format!("{ctx}: slack api error");
+                let has_toast = user_facing_error_title(&probe).is_some();
+                let is_bg = READ_OR_BACKGROUND.contains(&ctx);
+                if !has_toast && !is_bg {
+                    unclassified.push(format!("{} ({})", ctx, path.display()));
+                }
+                assert!(
+                    !(has_toast && is_bg),
+                    "context {ctx} is both toasted and listed in READ_OR_BACKGROUND"
+                );
+            }
+        }
+        assert!(
+            count >= 40,
+            "expected >= 40 command spawn contexts, found {count}"
+        );
+        assert!(
+            unclassified.is_empty(),
+            "unclassified slackless-core command spawn contexts (add to user_facing_error_title or READ_OR_BACKGROUND):\n{}",
+            unclassified.join("\n")
+        );
     }
 }

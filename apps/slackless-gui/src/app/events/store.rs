@@ -130,7 +130,7 @@ impl App {
                 if let Some(own) = snapshot.own_team().cloned() {
                     app.slots[app.workspace].team = own;
                 }
-                snapshot.workspaces = app.rail_teams();
+                snapshot.set_rail_workspaces(app.rail_teams());
                 // The store's cached bot profiles join the map every snapshot shares (a first
                 // visit's state starts it empty); profiles resolved this session stay.
                 let cached = mem::take(
@@ -325,10 +325,14 @@ impl App {
         let Some(read) = is_dm.then(|| self.bridge.latest(channel.clone())).flatten() else {
             return;
         };
+        let epoch = self.workspace_epoch;
         let channel = channel.clone();
         cx.spawn(async move |this, cx| {
             let latest = cx.background_executor().spawn(read).await;
             this.update(cx, |app, cx| {
+                if app.workspace_epoch != epoch {
+                    return;
+                }
                 app.sidebar
                     .update(cx, |sidebar, cx| sidebar.set_latest(channel, latest, cx));
             })
@@ -342,11 +346,15 @@ impl App {
         };
         self.history_generation += 1;
         let generation = self.history_generation;
+        let epoch = self.workspace_epoch;
         let channel = channel.clone();
         cx.spawn(async move |this, cx| {
             let history = cx.background_executor().spawn(read).await;
             this.update(cx, |app, cx| {
-                if app.history_generation == generation && app.channel == channel {
+                if app.workspace_epoch == epoch
+                    && app.history_generation == generation
+                    && app.channel == channel
+                {
                     app.resolve_named_users(&history);
                     let newest = history
                         .last()
@@ -397,11 +405,15 @@ impl App {
             return;
         };
         let generation = self.history_generation;
+        let epoch = self.workspace_epoch;
         let channel = channel.clone();
         cx.spawn(async move |this, cx| {
             let older = cx.background_executor().spawn(read).await;
             this.update(cx, |app, cx| {
-                if app.history_generation != generation || app.channel != channel {
+                if app.workspace_epoch != epoch
+                    || app.history_generation != generation
+                    || app.channel != channel
+                {
                     return;
                 }
                 if older.is_empty() {
@@ -429,11 +441,13 @@ impl App {
         /// Pages one jump may load; past it the list stops at the oldest page read.
         const JUMP_PAGES: usize = 20;
         let generation = self.history_generation;
+        let epoch = self.workspace_epoch;
         let channel = channel.clone();
         cx.spawn(async move |this, cx| {
             for _ in 0..JUMP_PAGES {
                 let read = this.update(cx, |app, cx| {
-                    if app.history_generation != generation
+                    if app.workspace_epoch != epoch
+                        || app.history_generation != generation
                         || app.channel != channel
                         || app.ws.history_complete.contains(&channel)
                     {
@@ -451,7 +465,10 @@ impl App {
                     .and_then(|message| message.ts.secs())
                     .is_none_or(|secs| secs <= since);
                 let landed = this.update(cx, |app, cx| {
-                    if app.history_generation != generation || app.channel != channel {
+                    if app.workspace_epoch != epoch
+                        || app.history_generation != generation
+                        || app.channel != channel
+                    {
                         return false;
                     }
                     if older.is_empty() {
@@ -468,7 +485,12 @@ impl App {
                 }
             }
             let _ = this.update(cx, |app, cx| {
-                app.messages.update(cx, |list, cx| list.finish_jump(cx))
+                if app.workspace_epoch == epoch
+                    && app.history_generation == generation
+                    && app.channel == channel
+                {
+                    app.messages.update(cx, |list, cx| list.finish_jump(cx));
+                }
             });
         })
         .detach();
@@ -488,11 +510,12 @@ impl App {
         };
         self.thread_generation += 1;
         let generation = self.thread_generation;
+        let epoch = self.workspace_epoch;
         let (channel, thread_ts) = (channel.clone(), thread_ts.clone());
         cx.spawn(async move |this, cx| {
             let messages = cx.background_executor().spawn(read).await;
             this.update(cx, |app, cx| {
-                if app.thread_generation == generation {
+                if app.workspace_epoch == epoch && app.thread_generation == generation {
                     app.resolve_named_users(&messages);
                     let newest = (messages.len() > 1)
                         .then(|| messages.last().map(|m| m.ts.clone()))

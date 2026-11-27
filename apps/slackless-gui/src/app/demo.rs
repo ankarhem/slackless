@@ -193,14 +193,14 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
                         let ch = ChannelId::from("C0ENG");
                         let u_alice = app
                             .fixtures
-                            .users
-                            .first()
+                            .people()
+                            .next()
                             .map(|u| u.id.clone())
                             .unwrap_or_else(|| UserId::from("U0ALICE"));
                         let u_bob = app
                             .fixtures
-                            .users
-                            .get(1)
+                            .people()
+                            .nth(1)
                             .map(|u| u.id.clone())
                             .unwrap_or_else(|| UserId::from("U0BOB"));
                         let segs = vec![
@@ -276,8 +276,7 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
                         let u_self = app.fixtures.self_user.clone();
                         let u_peer = app
                             .fixtures
-                            .users
-                            .iter()
+                            .people()
                             .find(|u| u.id != u_self)
                             .map(|u| u.id.clone())
                             .unwrap_or_else(|| u_self.clone());

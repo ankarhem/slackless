@@ -25,6 +25,9 @@ impl WorkerWake {
 
     /// Real-time side: wake the worker only if it is currently parked.
     pub(crate) fn wake_if_parked(&self) {
+        // Pair with the `SeqCst` fence in `park_while` (Dekker ordering): prevents ARM64
+        // store-load reordering between publishing ring indices and observing `parked`.
+        std::sync::atomic::fence(Ordering::SeqCst);
         if self.parked.swap(false, Ordering::AcqRel)
             && let Some(t) = self.worker.get()
         {
@@ -34,6 +37,7 @@ impl WorkerWake {
 
     /// Unconditional wake used on shutdown/hot-plug so the worker reacts immediately.
     pub(crate) fn wake_now(&self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
         self.parked.store(false, Ordering::Release);
         if let Some(t) = self.worker.get() {
             t.unpark();
@@ -45,6 +49,8 @@ impl WorkerWake {
     pub(crate) fn park_while(&self, timeout: Duration, idle: impl Fn() -> bool) {
         if idle() {
             self.parked.store(true, Ordering::Release);
+            // Full barrier ensures `parked = true` is visible before `idle()` loads ring indices.
+            std::sync::atomic::fence(Ordering::SeqCst);
             if idle() {
                 std::thread::park_timeout(timeout);
             }

@@ -47,8 +47,7 @@ pub fn huddle_browser_url(
         return link.to_owned();
     }
     let team = fixtures
-        .workspaces
-        .first()
+        .own_team()
         .map(|t| t.id.as_str())
         .unwrap_or_default();
     slackless_core::types::net::huddle_fallback_url(team, channel.as_str())
@@ -97,6 +96,9 @@ pub fn frame_into_render_image(frame: VideoFrame) -> Option<Arc<RenderImage>> {
 }
 
 fn bgra_render_image(width: u32, height: u32, bgra: Vec<u8>) -> Option<Arc<RenderImage>> {
+    if width == 0 || height == 0 {
+        return None;
+    }
     let rgba = image::RgbaImage::from_raw(width, height, bgra)?;
     Some(Arc::new(RenderImage::new(smallvec::smallvec![
         image::Frame::new(rgba)
@@ -180,6 +182,10 @@ pub struct HuddleVideoStore {
     /// The newest frame per tile still to convert, and the tiles converting now.
     pending: HashMap<VideoTileKey, PendingFrame>,
     converting: HashSet<VideoTileKey>,
+    /// Bumped on [`Self::clear`] so in-flight conversions never resurrect cleared tiles.
+    clear_gen: u64,
+    /// Bumped per tile on [`Self::close_tile`] so in-flight conversions never resurrect closed tiles.
+    tile_gen: HashMap<VideoTileKey, u64>,
 }
 
 impl HuddleVideoStore {
@@ -190,6 +196,8 @@ impl HuddleVideoStore {
             active_popouts: Arc::new(AtomicUsize::new(0)),
             pending: HashMap::new(),
             converting: HashSet::new(),
+            clear_gen: 0,
+            tile_gen: HashMap::new(),
         })
     }
 
@@ -201,13 +209,28 @@ impl HuddleVideoStore {
         }
     }
 
+    pub fn active_popout_count(&self) -> usize {
+        self.active_popouts.load(Ordering::Acquire)
+    }
+
     pub fn update_frame(&mut self, tile: VideoTileKey, frame: &VideoFrame, cx: &mut Context<Self>) {
+        if frame.width == 0 || frame.height == 0 {
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(surface) = frame.mac_surface() {
+            if surface.width() == 0 || surface.height() == 0 {
+                return;
+            }
             if matches!(
                 tile,
                 VideoTileKey::LocalScreen | VideoTileKey::RemoteScreen(_)
             ) {
+                // Invalidate any in-flight software BGRA conversion for this tile so it cannot
+                // later overwrite this newer zero-copy GPU surface.
+                let entry = self.tile_gen.entry(tile.clone()).or_insert(0);
+                *entry = entry.wrapping_add(1);
+                self.pending.remove(&tile);
                 // Zero-copy Metal GPU surface for 1080p/1200p screen shares (~50ns retain).
                 let popout_visible = self.active_popouts.load(Ordering::Acquire) > 0;
                 self.insert_display_frame(
@@ -249,12 +272,33 @@ impl HuddleVideoStore {
             self.converting.remove(&tile);
             return;
         };
+        let clear_gen = self.clear_gen;
+        let tile_gen = self.tile_gen.get(&tile).copied().unwrap_or(0);
         cx.spawn(async move |this, cx| {
             let rendered = cx
                 .background_executor()
                 .spawn(async move { frame.into_render_image() })
                 .await;
             let _ = this.update(cx, |store: &mut HuddleVideoStore, cx| {
+                let stale = store.clear_gen != clear_gen
+                    || store.tile_gen.get(&tile).copied().unwrap_or(0) != tile_gen;
+                if stale {
+                    if let Some(img) = rendered {
+                        cx.drop_image(img, None);
+                    }
+                    // If `clear_gen` matches, no new clear happened; kick off any newer pending
+                    // frame for this tile that arrived after `close_tile`, else release the slot.
+                    if store.clear_gen == clear_gen {
+                        let popout_visible = store.active_popouts.load(Ordering::Acquire) > 0;
+                        if popout_visible && store.pending.contains_key(&tile) {
+                            store.spawn_conversion(tile, cx);
+                        } else {
+                            store.pending.remove(&tile);
+                            store.converting.remove(&tile);
+                        }
+                    }
+                    return;
+                }
                 let popout_visible = store.active_popouts.load(Ordering::Acquire) > 0;
                 if let Some(img) = rendered {
                     store.insert_display_frame(
@@ -296,6 +340,8 @@ impl HuddleVideoStore {
     }
 
     pub fn close_tile(&mut self, tile: &VideoTileKey, cx: &mut Context<Self>) {
+        let entry = self.tile_gen.entry(tile.clone()).or_insert(0);
+        *entry = entry.wrapping_add(1);
         self.pending.remove(tile);
         if let Some(old) = self.frames.remove(tile) {
             if let DisplayVideoFrame::Image(img) = old {
@@ -306,6 +352,8 @@ impl HuddleVideoStore {
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.clear_gen = self.clear_gen.wrapping_add(1);
+        self.tile_gen.clear();
         self.pending.clear();
         self.converting.clear();
         for (_, old) in self.frames.drain() {
@@ -441,6 +489,30 @@ mod tests {
             store.frames().get(&tile).map(DisplayVideoFrame::dimensions)
         });
         assert_eq!(shown, Some((4, 2)));
+
+        // Closing a tile while a conversion is still in flight must drop the completed image
+        // instead of resurrecting a dead tile.
+        let frame2 = VideoFrame::from_bgra(8, 4, vec![0x55; 8 * 4 * 4]);
+        store.update(cx, |store, cx| {
+            store.update_frame(tile.clone(), &frame2, cx);
+            store.close_tile(&tile, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            store.read_with(cx, |store, _| !store.frames().contains_key(&tile)),
+            "in-flight conversion must not resurrect a closed tile"
+        );
+
+        // Clearing the store while a conversion is in flight must also leave frames empty.
+        store.update(cx, |store, cx| {
+            store.update_frame(tile.clone(), &frame2, cx);
+            store.clear(cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            store.read_with(cx, |store, _| store.frames().is_empty()),
+            "in-flight conversion must not resurrect frames after clear()"
+        );
     }
 
     #[test]

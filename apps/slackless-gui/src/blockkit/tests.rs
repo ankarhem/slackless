@@ -366,13 +366,13 @@ fn filtered_conversations_supports_private_im_mpim_and_exclude_bot_users() {
     use slackless_core::types::{Conversation, User};
 
     let mut fixtures = crate::fixtures::load();
-    fixtures.users.push(User {
+    fixtures.users_mut().push(User {
         id: UserId::from("U_BOT"),
         name: "bot".into(),
         is_bot: true,
         ..Default::default()
     });
-    fixtures.users.push(User {
+    fixtures.users_mut().push(User {
         id: UserId::from("U_HUM"),
         name: "human".into(),
         ..Default::default()

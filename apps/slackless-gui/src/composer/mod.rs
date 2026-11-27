@@ -59,13 +59,31 @@ pub use submit::content_of;
 /// Slack's per-file upload cap (1 GiB, `F-CORE-123`).
 pub const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 
+static NEXT_ATTACHMENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn next_attachment_id() -> u64 {
+    NEXT_ATTACHMENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A file or clipboard image staged in the composer, waiting to upload on send.
 #[derive(Clone)]
 pub struct PendingAttachment {
+    pub id: u64,
     pub filename: String,
     pub bytes: Vec<u8>,
     /// Thumbnail preview for pasted screenshots and attached image files.
     pub preview: Option<Arc<Image>>,
+}
+
+impl PendingAttachment {
+    pub(crate) fn new(filename: String, bytes: Vec<u8>, preview: Option<Arc<Image>>) -> Self {
+        Self {
+            id: next_attachment_id(),
+            filename,
+            bytes,
+            preview,
+        }
+    }
 }
 
 pub enum ComposerEvent {
@@ -329,6 +347,7 @@ pub(crate) fn confirm_secret_send_dialog(
     window: &mut Window,
     cx: &mut App,
     on_send: impl Fn(&mut Window, &mut App) + 'static,
+    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
 ) {
     use gpui_kit::gpui::{FontWeight, IntoElement as _};
 
@@ -340,6 +359,7 @@ pub(crate) fn confirm_secret_send_dialog(
     )
     .danger()
     .width(px(460.))
+    .on_cancel(on_cancel)
     .extra(move |cx| {
         let theme = cx.theme();
         v_flex()
@@ -469,6 +489,10 @@ pub struct Composer {
     edit_mode: bool,
     /// Files and pasted images staged for upload on send.
     attachments: Vec<PendingAttachment>,
+    /// Monotonic generation bumped whenever the composer target resets (`load_draft`) or an
+    /// active clip is cancelled, so stale async file-picker / read / clip-encode tasks never
+    /// inject attachments into a different channel or resurrect cancelled clips.
+    pub(super) draft_gen: u64,
     /// Friendly warning when a chosen/dropped file exceeds Slack's 1 GB upload cap (`F-CORE-123`).
     upload_warning: Option<String>,
     /// Native OS spellchecking (`F-SHELL-098`, `F-SHELL-099`).
@@ -584,6 +608,7 @@ impl Composer {
                 plus_last_click: None,
                 edit_mode,
                 attachments: Vec::new(),
+                draft_gen: 0,
                 upload_warning: None,
                 spellcheck: true,
                 spellcheck_lang: None,
@@ -735,10 +760,18 @@ impl Composer {
     }
 
     /// Replace the draft with `draft` (a saved per-conversation draft as mrkdwn, or empty).
+    /// Clears any staged files, GIFs, or slash disambiguation belonging to the previous target so
+    /// switching channels or workspaces can never upload them to the wrong destination.
     pub fn load_draft(&mut self, draft: &str, cx: &mut Context<Self>) {
+        self.draft_gen = self.draft_gen.wrapping_add(1);
         self.editor.load(from_mrkdwn(draft, &*self.fixtures));
         self.is_stale = true;
         self.link_open = false;
+        self.attachments.clear();
+        self.upload_warning = None;
+        self.selected_slash_target = None;
+        self.cancel_clip(cx);
+        let _ = self.clear_clip_review(cx);
         if let Some(old) = self.pending_gif.take() {
             self.stale_gif_urls.push(old.preview_url);
         }

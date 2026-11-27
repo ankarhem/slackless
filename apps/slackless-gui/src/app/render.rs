@@ -254,6 +254,8 @@ impl App {
         });
         actions.on_upload_file = file_id.as_ref().map(|_| {
             let ch = self.channel.clone();
+            let origin_ws = self.workspace;
+            let origin_epoch = self.workspace_epoch;
             let this = cx.weak_entity();
             Rc::new(
                 move |on_done: crate::canvas::CanvasUploadCompleteFn,
@@ -275,11 +277,20 @@ impl App {
                             let Some(path) = paths.into_iter().next() else {
                                 return;
                             };
-                            // A picked file can be gigabytes: read it off the UI thread.
+                            // Check Slack's 1 GiB cap before reading so a huge file cannot OOM.
                             let read_path = path.clone();
                             let bytes = cx
                                 .background_executor()
-                                .spawn(async move { std::fs::read(&read_path) })
+                                .spawn(async move {
+                                    let meta = std::fs::metadata(&read_path)?;
+                                    if meta.len() > crate::composer::MAX_UPLOAD_BYTES {
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            "File exceeds Slack's 1 GB upload limit.",
+                                        ));
+                                    }
+                                    std::fs::read(&read_path)
+                                })
                                 .await;
                             let bytes = match bytes {
                                 Ok(bytes) if !bytes.is_empty() => bytes,
@@ -298,17 +309,28 @@ impl App {
                                 .to_owned();
                             let url = format!("file://{}", path.display());
                             let _ = cx.update(|window, cx| {
-                                let _ = this_u.update(cx, |app, _| {
-                                    app.bridge.send(CollabCommand::UploadFiles {
-                                        channel: ch_u.clone(),
-                                        thread_ts: None,
-                                        content: None,
-                                        files: vec![slackless_core::api::UploadFile {
-                                            filename: filename.clone(),
-                                            bytes: bytes.into(),
-                                        }],
-                                    });
-                                });
+                                let still_active = this_u
+                                    .update(cx, |app, _| {
+                                        if app.workspace_epoch != origin_epoch {
+                                            return false;
+                                        }
+                                        if let Some(bridge) = app.workspace_bridge(origin_ws) {
+                                            bridge.send(CollabCommand::UploadFiles {
+                                                channel: ch_u.clone(),
+                                                thread_ts: None,
+                                                content: None,
+                                                files: vec![slackless_core::api::UploadFile {
+                                                    filename: filename.clone(),
+                                                    bytes: bytes.into(),
+                                                }],
+                                            });
+                                        }
+                                        true
+                                    })
+                                    .unwrap_or(false);
+                                if !still_active {
+                                    return;
+                                }
                                 on_done(
                                     crate::canvas::UploadedCanvasFile {
                                         filename: filename.clone(),

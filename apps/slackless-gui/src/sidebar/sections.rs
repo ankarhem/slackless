@@ -553,7 +553,7 @@ impl Sidebar {
     /// other one however quiet, so a silent but undormant channel such as
     /// #partner_support_klarna stays.
     pub(super) fn active_recent(&self, conversation: &Conversation) -> bool {
-        !self.active_only || !self.is_dormant(conversation)
+        !self.is_dormant(conversation)
     }
 
     /// Whether Slack marks the conversation dormant ("No messages in at least 30 days");

@@ -18,10 +18,12 @@ impl std::fmt::Display for NotSignedIn {
 }
 
 /// Whether `id` is a plain workspace (team) id. It names `<data>/<id>.sqlite`, so path
-/// separators, dots, and spaces are refused.
+/// separators, dots, spaces, and reserved sibling database stems (like `semantic_index`) are
+/// refused.
 pub(crate) fn is_valid_workspace_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
+        && !id.eq_ignore_ascii_case(slackless_core::paths::SEMANTIC_INDEX_STEM)
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
@@ -240,5 +242,13 @@ mod tests {
         assert!(resolve_session_from(None, &[no_token, s1]).is_err());
 
         assert!(NotSignedIn.to_string().contains("slackless auth login"));
+    }
+
+    #[test]
+    fn validate_workspace_id_rejects_reserved_semantic_index_stem() {
+        assert!(validate_workspace_id("T0ACME").is_ok());
+        assert!(validate_workspace_id("semantic_index").is_err());
+        assert!(validate_workspace_id("SEMANTIC_INDEX").is_err());
+        assert!(!is_valid_workspace_id("semantic_index"));
     }
 }

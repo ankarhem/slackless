@@ -252,7 +252,7 @@ impl ThreadsView {
 
     /// Drop cached threads when switching to another workspace.
     pub fn clear_for_workspace(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
-        self.fixtures = fixtures;
+        self.fixtures = fixtures.clone();
         self.remote = false;
         self.loading = false;
         self.cards.clear();
@@ -260,6 +260,10 @@ impl ThreadsView {
         self.editing = None;
         self.filter = ThreadsFilter::All;
         self.active = None;
+        self.composer.update(cx, |composer, cx| {
+            composer.set_fixtures(fixtures, cx);
+            composer.load_draft("", cx);
+        });
         self.sync_also_send(cx);
         cx.notify();
     }
@@ -597,7 +601,9 @@ impl ThreadsView {
 
     /// Live refresh: keep the cards, draw them from `fixtures`.
     pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
-        self.fixtures = fixtures;
+        self.fixtures = fixtures.clone();
+        self.composer
+            .update(cx, |composer, cx| composer.set_fixtures(fixtures, cx));
         self.sync_also_send(cx);
         cx.notify();
     }
@@ -667,6 +673,35 @@ impl ThreadsView {
             broadcast,
         });
         cx.notify();
+    }
+
+    /// Undo an optimistic reply on `(channel, thread_ts)` and put `text` back in the composer when
+    /// a send guard (secret warning or `@channel` confirmation) was cancelled.
+    pub fn rollback_pending_reply(
+        &mut self,
+        channel: &ChannelId,
+        thread_ts: &Ts,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let me = self.fixtures.self_user.clone();
+        if let Some(card) = self
+            .cards
+            .iter_mut()
+            .find(|card| card.channel == *channel && card.thread_ts == *thread_ts)
+            && let Some(pos) = card
+                .replies
+                .iter()
+                .rposition(|m| m.user.as_ref() == Some(&me) && m.text == text)
+        {
+            card.replies.remove(pos);
+            card.reply_total = card.reply_total.saturating_sub(1);
+            if self.active.as_ref() == Some(&(channel.clone(), thread_ts.clone())) {
+                self.composer
+                    .update(cx, |composer, cx| composer.load_draft(text, cx));
+            }
+            cx.notify();
+        }
     }
 
     /// The message `ts` of the thread `(channel, thread_ts)` this view shows: its root, or

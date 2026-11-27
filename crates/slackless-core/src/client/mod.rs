@@ -483,6 +483,7 @@ pub(super) struct HuddleSlot {
     /// Atomic generation counter checked lock-free by the 60Hz huddle media watcher.
     pub generation: Arc<AtomicU64>,
     pub joining: bool,
+    pub joining_channel: Option<ChannelId>,
     pub handle: Option<crate::huddle::HuddleHandle>,
     pub call_id: Option<String>,
 }
@@ -671,6 +672,7 @@ impl<B: Backend> Core<B> {
             let mut slot = self.huddle.lock().unwrap_or_else(PoisonError::into_inner);
             slot.generation.fetch_add(1, Ordering::AcqRel);
             slot.joining = false;
+            slot.joining_channel = None;
             slot.call_id = None;
             slot.handle.take()
         };

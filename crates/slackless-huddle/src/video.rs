@@ -29,6 +29,61 @@ pub const CAMERA_MAX_FPS: u32 = 24;
 /// Target average H.264 bitrate for webcam streams (1.2 Mbps).
 pub const CAMERA_BITRATE_BPS: u32 = 1_200_000;
 
+/// Maximum queued outbound H.264 frames before trimming stale backlog during egress stalls.
+pub(crate) const MAX_H264_EGRESS_BACKLOG: usize = 30;
+
+/// Returns `true` when an Annex-B H.264 access unit contains an IDR slice (NAL type 5) or SPS
+/// (NAL type 7).
+pub(crate) fn annex_b_contains_idr(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < data.len() {
+        let start_len = if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            3
+        } else if i + 4 < data.len()
+            && data[i] == 0
+            && data[i + 1] == 0
+            && data[i + 2] == 0
+            && data[i + 3] == 1
+        {
+            4
+        } else {
+            i += 1;
+            continue;
+        };
+        let nal_idx = i + start_len;
+        if nal_idx < data.len() {
+            let nal_type = data[nal_idx] & 0x1F;
+            if nal_type == 5 || nal_type == 7 {
+                return true;
+            }
+        }
+        i = nal_idx + 1;
+    }
+    false
+}
+
+/// If `rx` has accumulated more than `max_backlog` encoded H.264 frames behind a slow network
+/// write, drain the backlog to the newest frame and report whether a fresh keyframe is needed
+/// (i.e., the newest frame is not itself an IDR/SPS) so memory stays bounded and the decoder
+/// immediately recovers cleanly on the next keyframe.
+pub(crate) fn trim_h264_backlog(
+    first: Vec<u8>,
+    rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    max_backlog: usize,
+) -> (Vec<u8>, usize, bool) {
+    if rx.len() <= max_backlog {
+        return (first, 0, false);
+    }
+    let mut latest = first;
+    let mut dropped = 0usize;
+    while let Ok(next) = rx.try_recv() {
+        latest = next;
+        dropped += 1;
+    }
+    let needs_keyframe = !annex_b_contains_idr(&latest);
+    (latest, dropped, needs_keyframe)
+}
+
 /// Platform-extensible backing storage for a decoded or captured [`VideoFrame`].
 #[derive(Debug, Clone)]
 pub enum VideoFrameData {
@@ -406,8 +461,17 @@ impl H264VideoDecoder {
         payload: &[u8],
         marker: bool,
     ) -> Option<VideoFrame> {
+        /// Hard cap on a single reassembled H.264 access unit (8 MiB) so missing `marker` bits
+        /// or malformed RTP streams can never grow memory unboundedly.
+        const MAX_ANNEX_B_BYTES: usize = 8 * 1024 * 1024;
+
         let is_fua_continuation =
             payload.len() >= 2 && (payload[0] & 0x1F) == 28 && (payload[1] & 0x80) == 0;
+        let starts_clean_keyframe = !is_fua_continuation
+            && payload
+                .first()
+                .map(|b| b & 0x1F)
+                .is_some_and(|nal_type| matches!(nal_type, 5 | 7 | 8 | 24));
 
         match self.seq_tracker.advance(seq) {
             RtpSeqStep::First => {
@@ -423,7 +487,7 @@ impl H264VideoDecoder {
                 self.depacketizer = H264Packet::default();
                 if !self.annex_b_buf.is_empty() {
                     self.annex_b_buf.clear();
-                    self.broken = true;
+                    self.broken = !starts_clean_keyframe;
                 } else if is_fua_continuation {
                     self.broken = !marker;
                     return None;
@@ -432,18 +496,32 @@ impl H264VideoDecoder {
         }
 
         if self.broken {
-            if marker {
+            if starts_clean_keyframe {
+                // Recover immediately when a fresh SPS/PPS/IDR/STAP-A arrives after a lost marker.
                 self.broken = false;
                 self.annex_b_buf.clear();
                 self.depacketizer = H264Packet::default();
+            } else {
+                if marker {
+                    self.broken = false;
+                    self.annex_b_buf.clear();
+                    self.depacketizer = H264Packet::default();
+                }
+                return None;
             }
-            return None;
         }
 
         let raw = bytes::Bytes::copy_from_slice(payload);
         if let Ok(nal) = self.depacketizer.depacketize(&raw)
             && !nal.is_empty()
         {
+            if self.annex_b_buf.len().saturating_add(nal.len()) > MAX_ANNEX_B_BYTES {
+                self.annex_b_buf.clear();
+                self.depacketizer = H264Packet::default();
+                self.needs_keyframe = true;
+                self.broken = !marker;
+                return None;
+            }
             self.annex_b_buf.extend_from_slice(&nal);
         }
         if !marker || self.annex_b_buf.is_empty() {
@@ -562,11 +640,15 @@ pub fn resize_rgb_even(
     max_h: u32,
 ) -> (Vec<u8>, u32, u32) {
     let (dst_w, dst_h) = compute_fit_dimensions(src_w, src_h, max_w, max_h, true);
-    if dst_w == 0 || dst_h == 0 {
+    let expected = (src_w as usize)
+        .checked_mul(src_h as usize)
+        .and_then(|px| px.checked_mul(3));
+    if dst_w == 0 || dst_h == 0 || expected.is_none_or(|need| rgb.len() < need) {
         return (Vec::new(), 0, 0);
     }
     if dst_w == src_w && dst_h == src_h {
-        return (rgb.to_vec(), src_w, src_h);
+        let need = expected.unwrap_or(rgb.len());
+        return (rgb[..need].to_vec(), src_w, src_h);
     }
     let dw = dst_w as usize;
     let dh = dst_h as usize;
@@ -1568,5 +1650,45 @@ mod tests {
         );
         assert_eq!((dst_w, dst_h), (640, 360));
         assert!(total_bytes > 0);
+    }
+
+    #[test]
+    fn trim_h264_backlog_preserves_small_queues_and_drains_oversized_queues() {
+        let p_frame = vec![0, 0, 0, 1, 0x41, 0x9A];
+        let idr_frame = vec![0, 0, 0, 1, 0x65, 0x88];
+        let sps_frame = vec![0, 0, 1, 0x67, 0x42];
+        assert!(!annex_b_contains_idr(&p_frame));
+        assert!(annex_b_contains_idr(&idr_frame));
+        assert!(annex_b_contains_idr(&sps_frame));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(p_frame.clone()).unwrap();
+        let (frame, dropped, needs_kf) = trim_h264_backlog(p_frame.clone(), &mut rx, 2);
+        assert_eq!(frame, p_frame);
+        assert_eq!(dropped, 0);
+        assert!(!needs_kf);
+        assert_eq!(rx.len(), 1);
+        let _ = rx.try_recv();
+
+        // Exceed backlog ending on a P-frame -> drains all and requests a keyframe.
+        for _ in 0..4 {
+            tx.send(p_frame.clone()).unwrap();
+        }
+        let (frame, dropped, needs_kf) = trim_h264_backlog(idr_frame.clone(), &mut rx, 2);
+        assert_eq!(frame, p_frame);
+        assert_eq!(dropped, 4);
+        assert!(needs_kf);
+        assert_eq!(rx.len(), 0);
+
+        // Exceed backlog ending on an IDR -> drains all and does NOT need an extra keyframe.
+        for _ in 0..3 {
+            tx.send(p_frame.clone()).unwrap();
+        }
+        tx.send(idr_frame.clone()).unwrap();
+        let (frame, dropped, needs_kf) = trim_h264_backlog(p_frame.clone(), &mut rx, 2);
+        assert_eq!(frame, idr_frame);
+        assert_eq!(dropped, 4);
+        assert!(!needs_kf);
+        assert_eq!(rx.len(), 0);
     }
 }

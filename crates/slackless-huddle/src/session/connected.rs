@@ -61,6 +61,12 @@ pub(super) struct SessionRuntime<'a, M: MediaDevices = LiveMediaDevices> {
     pub(super) remote_speakers: Vec<(UserId, f32)>,
     pub(super) ssrc_to_stream_id: HashMap<u32, u32>,
     pub(super) last_sdp_answer: Option<String>,
+    /// Timestamp when an unacknowledged renegotiation `SUBSCRIBE` was sent (prevents SDP glare).
+    pub(super) subscribe_in_flight: Option<Instant>,
+    /// Set when an `INDEX` or camera change arrives while another `SUBSCRIBE` awaits its ACK.
+    pub(super) pending_resubscribe: bool,
+    /// Most recent `SdkIndexFrame` received from Chime (retained across `audio_only` toggles).
+    pub(super) last_index: Option<crate::proto::SdkIndexFrame>,
     pub(super) vdec_routing: Arc<Mutex<VideoRoutingTable>>,
     pub(super) vdec_audio_only: Arc<AtomicBool>,
     pub(super) vdec_clear: Arc<AtomicBool>,
@@ -161,9 +167,28 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
     updates: &mpsc::UnboundedSender<HuddleUpdate>,
     is_reconnect: bool,
 ) -> LoopExit {
-    let hs = match perform_handshake_with(factory, creds, config, snap, is_reconnect).await {
-        Ok(hs) => hs,
-        Err(exit) => return exit,
+    // Allow `HuddleControl::Leave` to cancel an in-flight handshake immediately instead of
+    // waiting up to 10-20s for signaling/TURN timeouts; non-Leave controls are queued for once
+    // connected.
+    let hs = {
+        let handshake = perform_handshake_with(factory, creds, config, snap, is_reconnect);
+        tokio::pin!(handshake);
+        loop {
+            tokio::select! {
+                res = &mut handshake => {
+                    match res {
+                        Ok(hs) => break hs,
+                        Err(exit) => return exit,
+                    }
+                }
+                ctrl = ctrl_rx.recv() => {
+                    match ctrl {
+                        Some(HuddleControl::Leave) | None => return LoopExit::LeftCleanly,
+                        Some(other) => pending_controls.push_back(other),
+                    }
+                }
+            }
+        }
     };
 
     let mut signal = hs.signal;
@@ -213,10 +238,13 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
     let mut ever_connected = peer.connection_state() == RTCPeerConnectionState::Connected;
     if ever_connected {
         snap.phase = HuddlePhase::Connected;
-        snap.started_at_secs = now_secs();
+        if !is_reconnect || snap.started_at_secs == 0 {
+            snap.started_at_secs = now_secs();
+        }
         let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
     }
     let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    let mut disconnected_deadline: Option<tokio::time::Instant> = None;
 
     // A slow control or signaling arm must never hold back 20 ms audio, so Opus packets are
     // written by their own task like camera video.
@@ -281,6 +309,9 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
         remote_speakers: Vec::new(),
         ssrc_to_stream_id: hs.ssrc_to_stream_id,
         last_sdp_answer: hs.last_sdp_answer,
+        subscribe_in_flight: None,
+        pending_resubscribe: false,
+        last_index: None,
         vdec_routing,
         vdec_audio_only,
         vdec_clear,
@@ -300,9 +331,25 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
 
     let video_tx_task = {
         let video_sender = peer.video_sender();
+        let cam_fb_tx = hs.cam_fb_tx;
         tokio::spawn(async move {
             let mut write_warn = WriteWarn::default();
             while let Some(h264_frame) = outbound_h264_rx.recv().await {
+                let (h264_frame, dropped, needs_keyframe) = crate::video::trim_h264_backlog(
+                    h264_frame,
+                    &mut outbound_h264_rx,
+                    crate::video::MAX_H264_EGRESS_BACKLOG,
+                );
+                if dropped > 0 {
+                    tracing::warn!(
+                        dropped,
+                        needs_keyframe,
+                        "camera H.264 egress backlog trimmed"
+                    );
+                    if needs_keyframe {
+                        let _ = cam_fb_tx.send(VideoSenderFeedback::ForceKeyframe);
+                    }
+                }
                 if let Err(err) = video_sender
                     .write_h264_frame(h264_frame, Duration::from_millis(42))
                     .await
@@ -327,9 +374,23 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
                 tokio::time::sleep_until(connect_deadline).await;
             }
         };
+        let disconnect_watchdog = async {
+            if let Some(deadline) = disconnected_deadline {
+                tokio::time::sleep_until(deadline).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         tokio::select! {
             _ = connect_timeout => {
                 exit_reason = Some(classify_handshake_err(HuddleError::UdpBlocked, is_reconnect));
+            }
+            _ = disconnect_watchdog => {
+                tracing::warn!("RTCPeerConnection remained Disconnected past watchdog; reconnecting");
+                exit_reason = Some(LoopExit::Reconnect {
+                    err: HuddleError::Signaling("ICE disconnected timeout".to_owned()),
+                    was_connected: ever_connected,
+                });
             }
             Some(fb) = cam_fb_rx.recv() => {
                 match fb {
@@ -352,9 +413,12 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
                 tracing::info!(state = ?pc_state, "huddle RTCPeerConnection state changed");
                 match pc_state {
                     RTCPeerConnectionState::Connected => {
+                        disconnected_deadline = None;
                         if !ever_connected {
                             ever_connected = true;
-                            snap.started_at_secs = now_secs();
+                            if !is_reconnect || snap.started_at_secs == 0 {
+                                snap.started_at_secs = now_secs();
+                            }
                         }
                         if snap.phase != HuddlePhase::Connected {
                             snap.phase = HuddlePhase::Connected;
@@ -364,10 +428,14 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
                         }
                     }
                     RTCPeerConnectionState::Disconnected => {
+                        if disconnected_deadline.is_none() {
+                            disconnected_deadline =
+                                Some(tokio::time::Instant::now() + Duration::from_secs(10));
+                        }
                         snap.phase = HuddlePhase::Reconnecting;
                         let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
                     }
-                    RTCPeerConnectionState::Failed => {
+                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
                         exit_reason = Some(if ever_connected || is_reconnect {
                             LoopExit::Reconnect {
                                 err: HuddleError::UdpBlocked,
@@ -411,7 +479,16 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
             _ = metric_tick.tick() => {
                 let stats = peer.take_metrics_snapshot(state.shared.local_rms());
                 if let Err(err) = signal.send_frame(&build_client_metric_frame(stats)).await {
-                    tracing::warn!(%err, "failed to send CLIENT_METRIC");
+                    tracing::warn!(%err, "failed to send CLIENT_METRIC; reconnecting");
+                    exit_reason = Some(if ever_connected || is_reconnect {
+                        LoopExit::Reconnect {
+                            err,
+                            was_connected: ever_connected,
+                        }
+                    } else {
+                        LoopExit::Fatal(err)
+                    });
+                    continue;
                 }
                 let tx_pkts = peer.total_packets_sent();
                 let rx_pkts = peer.total_packets_received();
@@ -526,14 +603,34 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
     let share_stop = state.media.stop_screen_share();
     tokio::join!(camera_stop, share_stop);
     state.media.set_jukebox(None, None);
+    if snap.video {
+        snap.video = false;
+        let _ = updates.send(HuddleUpdate::VideoTileClosed(VideoTileKey::LocalCamera));
+    }
+    if snap.sharing {
+        snap.sharing = false;
+        snap.share_source_id = None;
+        snap.screen_audio_device = None;
+        let _ = updates.send(HuddleUpdate::VideoTileClosed(VideoTileKey::LocalScreen));
+    }
+    snap.jukebox_song = None;
+    for tile in state.active_remote_tiles.drain() {
+        let _ = updates.send(HuddleUpdate::VideoTileClosed(tile));
+    }
     snap.packets_sent = peer.total_packets_sent();
     snap.packets_received = peer.total_packets_received();
-    snap.phase = HuddlePhase::Leaving;
-    let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
-    signal
-        .send_leave_and_close(Duration::from_millis(800))
-        .await;
-    state.media.stop_audio();
+    if matches!(exit_reason, Some(LoopExit::Reconnect { .. })) {
+        // Reconnecting: close the socket without sending Chime `LEAVE` so our session can
+        // immediately rejoin cleanly without evicting our attendee state.
+        signal.close().await;
+    } else {
+        snap.phase = HuddlePhase::Leaving;
+        let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
+        signal
+            .send_leave_and_close(Duration::from_millis(800))
+            .await;
+    }
+    state.media.stop_audio().await;
     opus_tx_task.abort();
     video_tx_task.abort();
     // Workers exit without decoding their backlog and the dispatcher drops its queue instead of
@@ -545,6 +642,15 @@ pub(super) async fn run_connected_loop_with<F: SessionFactory>(
     drop(peer);
     if let Some(handle) = vdec_handle {
         let _ = tokio::task::spawn_blocking(move || handle.join()).await;
+    }
+    let transcriber = state
+        .shared
+        .transcribe_tap
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take());
+    if let Some(transcriber) = transcriber {
+        let _ = tokio::task::spawn_blocking(move || drop(transcriber)).await;
     }
     tracing::info!("huddle session teardown complete");
 

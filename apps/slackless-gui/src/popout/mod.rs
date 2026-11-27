@@ -83,6 +83,7 @@ pub enum PopoutKind {
     Canvas {
         doc: crate::canvas::CanvasDoc,
         file_id: Option<String>,
+        channel: Option<ChannelId>,
         open_browser_url: Option<String>,
         on_jump: JumpHandler,
     },
@@ -194,15 +195,17 @@ pub struct PopoutRequest {
 
 /// Open a new native GPUI window showing `req.kind`, centered (with cascade offset) on
 /// `req.display_id` (the main window's display) or the primary display if `None`.
-pub fn open_popout(req: PopoutRequest, cx: &mut App) {
+pub fn open_popout(req: PopoutRequest, cx: &mut App) -> Option<gpui_kit::gpui::AnyWindowHandle> {
     let slot = CASCADE_STEP.fetch_add(1, Ordering::Relaxed);
     let is_huddle = matches!(req.kind, PopoutKind::Huddle { .. });
     let options = popout_window_options(&req.title, is_huddle, req.display_id, slot, cx);
-    let _ = open_window(options, cx, move |window, cx| {
+    open_window(options, cx, move |window, cx| {
         window.set_window_title(&format!("{} — slackless", req.title));
         window.activate_window();
         cx.new(|cx| PopoutWindow::new(req, window, cx))
-    });
+    })
+    .ok()
+    .map(|(handle, _)| handle)
 }
 
 pub(super) enum PopoutPickerTarget {
@@ -459,6 +462,13 @@ impl PopoutWindow {
                     }));
                     subscriptions.push(cx.observe(&state_entity, |this, state_entity, cx| {
                         let (channel, root) = huddle_session_of(&state_entity, cx);
+                        if !state_entity.read(cx).draw_mode() {
+                            this.huddle_draw_mode = false;
+                            this.huddle_drawing_active = false;
+                            this.huddle_draw_points.clear();
+                            this.huddle_draw_local_segments.clear();
+                            this.huddle_draw_local_item.clear();
+                        }
                         let (channel_changed, root_changed) = this
                             .huddle_session_key
                             .as_ref()
@@ -592,18 +602,27 @@ impl Render for PopoutWindow {
             ..
         } = &self.kind
         {
-            // Immediately free replaced Metal sprite-atlas tiles on this owning window.
+            // Immediately free replaced Metal sprite-atlas tiles. When multiple popouts observe
+            // the same video store, pass `None` so GPUI drops textures across every window safely.
             if let Some(vs) = self.huddle_video.as_ref().and_then(WeakEntity::upgrade) {
+                let multi_popout = vs.read(cx).active_popout_count() > 1;
                 let stale = vs.update(cx, |store, _| store.drain_stale_images());
                 for img in stale {
-                    cx.drop_image(img, Some(window));
+                    cx.drop_image(img, if multi_popout { None } else { Some(window) });
                 }
             }
             let root = self
                 .render_huddle_window(on_jump.clone(), on_open_canvas.clone(), cx)
                 .on_action(|_: &crate::menu_bar::CloseWindow, window, _| {
                     window.remove_window();
-                });
+                })
+                .on_action(
+                    cx.listener(|this, _: &crate::app::ToggleHuddleMute, _, cx| {
+                        if let Some(st) = this.huddle_state_entity() {
+                            st.update(cx, |s, cx| s.request_toggle_mute(cx));
+                        }
+                    }),
+                );
             return self
                 .render_overlays(root, px(38.), window, cx)
                 .into_any_element();
@@ -632,9 +651,10 @@ impl Render for PopoutWindow {
             PopoutKind::Canvas {
                 doc,
                 file_id,
+                channel,
                 open_browser_url,
                 on_jump,
-            } => self.render_canvas_body(doc, file_id, open_browser_url, on_jump, cx),
+            } => self.render_canvas_body(doc, file_id, channel, open_browser_url, on_jump, cx),
             PopoutKind::Files { .. } => self.render_files_body(cx),
             PopoutKind::Huddle { .. } => v_flex().id("popout-huddle-noop").flex_1(),
         };

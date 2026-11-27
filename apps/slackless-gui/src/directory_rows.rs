@@ -29,8 +29,7 @@ use crate::fixtures::Fixtures;
 /// case-insensitive, `F-SHELL-005`), sorted by name.
 pub(super) fn people(fixtures: &Fixtures, needle: &str) -> Vec<UserId> {
     let mut people: Vec<UserId> = fixtures
-        .users
-        .iter()
+        .people()
         .filter(|user| {
             if needle.is_empty() {
                 return true;
@@ -413,7 +412,11 @@ pub(super) fn usergroup_row(
         theme.warning,
     );
     let disabled = group.is_deleted();
-    let cached_users = cached_usergroup_members(&group.id, cx);
+    let ws_id = fixtures
+        .own_team()
+        .map(|t| t.id.clone())
+        .unwrap_or_default();
+    let cached_users = cached_usergroup_members(&ws_id, &group.id, cx);
     let user_ids: Vec<UserId> = cached_users
         .clone()
         .unwrap_or_else(|| usergroup_embedded_users(group));

@@ -266,7 +266,7 @@ fn cell_sort_key_covers_all_variants_and_sanitize_filename_cleans_names() {
         cell_sort_key(Some(&SlackListCellValue::Checkbox(false)), &col, &fixtures),
         "0"
     );
-    let user_id = fixtures.users[0].id.clone();
+    let user_id = fixtures.people().next().unwrap().id.clone();
     let expected_user = fixtures.user_name(&user_id).to_lowercase();
     assert_eq!(
         cell_sort_key(
@@ -564,10 +564,33 @@ fn list_share_drawer_and_ui_store_round_trip(cx: &mut gpui::TestAppContext) {
             ],
         };
         select_list_record("F0SHARE", "RecB", &data, cx);
-        assert_eq!(panel_state("F0SHARE", cx).selected_row, Some(1));
+        assert_eq!(
+            panel_state("F0SHARE", cx).selected_record_id.as_deref(),
+            Some("RecB")
+        );
+        // Prepending a new row must NOT shift the open selection away from RecB.
+        let mut reordered = data.clone();
+        reordered.rows.insert(
+            0,
+            SlackListRow {
+                id: "RecNew".into(),
+                cells: HashMap::new(),
+            },
+        );
+        let sel = panel_state("F0SHARE", cx).selected_record_id;
+        assert_eq!(
+            sel.as_deref()
+                .and_then(|id| reordered.rows.iter().find(|r| r.id == id))
+                .map(|r| r.id.as_str()),
+            Some("RecB"),
+            "selected record must stay locked by record ID across row insertions/reorders"
+        );
 
         select_fixture_record("fix_2", cx);
-        assert_eq!(panel_state("fixture", cx).selected_row, Some(1));
+        assert_eq!(
+            panel_state("fixture", cx).selected_record_id.as_deref(),
+            Some("fix_2")
+        );
 
         // Render live_list_view with share drawer open across all three share tabs.
         let fixtures = crate::fixtures::load();

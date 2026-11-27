@@ -311,8 +311,9 @@ fn run_audio_dsp_loop(args: AudioDspLoopArgs) {
         outbound_opus_tx,
         configured_in,
         configured_out,
-        mut io,
+        io,
     } = args;
+    let mut io = Some(io);
 
     let Ok(mut encoder) = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip) else {
         return;
@@ -372,52 +373,126 @@ fn run_audio_dsp_loop(args: AudioDspLoopArgs) {
         None
     };
     let mut last_device_check = Instant::now();
+    let mut hw_retry_failures: u32 = 0;
 
     while shared.running.load(Ordering::Acquire) {
         let check_in = in_dirty.swap(false, Ordering::AcqRel);
         let check_out = out_dirty.swap(false, Ordering::AcqRel);
         let poll_due =
             use_polling_hotplug && last_device_check.elapsed() >= Duration::from_millis(1500);
-        if check_in || check_out || poll_due {
-            if poll_due {
+        // Even with event-driven CoreAudio hot-plug (`use_polling_hotplug == false`), retry
+        // periodically whenever `io` is `None` after a transient hot-plug failure so audio never
+        // stays permanently dead.
+        let recovery_due =
+            io.is_none() && last_device_check.elapsed() >= Duration::from_millis(400);
+        if check_in || check_out || poll_due || recovery_due {
+            if poll_due || recovery_due {
                 last_device_check = Instant::now();
             }
             match &mut io {
-                AudioIoBackend::Hardware(_) => {
-                    // Restart hardware VoiceProcessingIO cleanly when the system default input or
-                    // output changes (e.g. AirPods connect/disconnect).
-                    let now_in = current_default_input_name();
-                    let now_out = current_default_output_name();
-                    if now_in != last_default_in || now_out != last_default_out {
-                        last_default_in = now_in;
-                        last_default_out = now_out;
+                None => {
+                    if let Some(next_hw) = open_hw_duplex(
+                        configured_in.as_deref(),
+                        configured_out.as_deref(),
+                        !cur_muted && cur_aec,
+                        !cur_muted && cur_ns,
+                        !cur_muted && cur_agc,
+                        &capture_ring,
+                        &playout,
+                    ) {
+                        hw_retry_failures = 0;
+                        io = Some(AudioIoBackend::Hardware(next_hw));
+                    } else {
+                        hw_retry_failures = hw_retry_failures.saturating_add(1);
+                        if hw_retry_failures >= 3
+                            && let Ok(in_stream) = open_input_stream(
+                                configured_in.as_deref(),
+                                Arc::clone(&capture_ring),
+                            )
+                            && let Ok(out_stream) = open_output_stream(
+                                configured_out.as_deref(),
+                                Arc::clone(&playout),
+                                Arc::clone(&aec_render_tap),
+                            )
+                        {
+                            tracing::warn!(
+                                hw_retry_failures,
+                                "hardware audio hot-plug recovery failed; falling back to cpal + sonora"
+                            );
+                            hw_retry_failures = 0;
+                            io = Some(AudioIoBackend::Cpal {
+                                in_stream,
+                                out_stream,
+                                apm: Box::new(build_sonora(cur_aec, cur_ns, cur_agc)),
+                            });
+                        }
+                    }
+                }
+                Some(AudioIoBackend::Hardware(_)) => {
+                    // Restart hardware VoiceProcessingIO cleanly when a default (unpinned) input or
+                    // output changes (e.g. AirPods connect/disconnect). Drop the old AudioUnit
+                    // BEFORE opening the new one so two live callbacks never race on `SpscRing`.
+                    let in_changed = if configured_in.is_none() {
+                        let now_in = current_default_input_name();
+                        if now_in != last_default_in {
+                            last_default_in = now_in;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    let out_changed = if configured_out.is_none() {
+                        let now_out = current_default_output_name();
+                        if now_out != last_default_out {
+                            last_default_out = now_out;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if in_changed || out_changed {
+                        io = None;
+                        last_device_check = Instant::now();
                         if let Some(next_hw) = open_hw_duplex(
-                            None,
-                            None,
+                            configured_in.as_deref(),
+                            configured_out.as_deref(),
                             !cur_muted && cur_aec,
                             !cur_muted && cur_ns,
                             !cur_muted && cur_agc,
                             &capture_ring,
                             &playout,
                         ) {
-                            io = AudioIoBackend::Hardware(next_hw);
+                            hw_retry_failures = 0;
+                            io = Some(AudioIoBackend::Hardware(next_hw));
+                        } else {
+                            hw_retry_failures = 1;
                         }
                     }
                 }
-                AudioIoBackend::Cpal {
+                Some(AudioIoBackend::Cpal {
                     in_stream,
                     out_stream,
                     ..
-                } => {
+                }) => {
                     if configured_in.is_none() && (check_in || poll_due) {
                         let now_in = current_default_input_name();
-                        if now_in.is_some()
-                            && now_in != last_default_in
-                            && let Ok(next_stream) =
-                                open_input_stream(None, Arc::clone(&capture_ring))
-                        {
-                            *in_stream = next_stream;
-                            last_default_in = now_in;
+                        if now_in.is_some() && now_in != last_default_in {
+                            // Pause the old input stream first: `capture_ring` is SPSC, so two
+                            // live capture callbacks must never push concurrently.
+                            let _ = in_stream.pause();
+                            match open_input_stream(None, Arc::clone(&capture_ring)) {
+                                Ok(next_stream) => {
+                                    *in_stream = next_stream;
+                                    last_default_in = now_in;
+                                }
+                                Err(_) => {
+                                    let _ = in_stream.play();
+                                }
+                            }
                         }
                     }
                     if configured_out.is_none() && (check_out || poll_due) {
@@ -457,20 +532,28 @@ fn run_audio_dsp_loop(args: AudioDspLoopArgs) {
         if dsp_changed || mute_changed {
             (cur_aec, cur_ns, cur_agc, cur_muted) = (next_aec, next_ns, next_agc, next_muted);
             match &mut io {
-                AudioIoBackend::Hardware(hw) => {
+                Some(AudioIoBackend::Hardware(hw)) => {
                     hw.set_processing(!cur_muted && (cur_aec || cur_ns), !cur_muted && cur_agc);
                 }
-                AudioIoBackend::Cpal { apm, .. } if dsp_changed => {
+                Some(AudioIoBackend::Cpal { apm, .. }) if dsp_changed => {
                     **apm = build_sonora(cur_aec, cur_ns, cur_agc);
                 }
-                AudioIoBackend::Cpal { .. } => {}
+                Some(AudioIoBackend::Cpal { .. }) | None => {}
+            }
+            if cur_muted
+                && let Ok(guard) = shared.transcribe_tap.lock()
+                && let Some(tap) = guard.as_ref()
+            {
+                // Flush any buffered local speech immediately on mute so muting mid-sentence
+                // doesn't leave `local_vad` stuck in speech until unmute.
+                tap.flush_local();
             }
         }
 
         // 1. Feed Sonora's AEC render reference only when running the software `cpal` fallback:
         // the samples its render callback actually played, so reference and echo stay aligned
         // whatever the jitter buffer depth. (Hardware `VoiceProcessingIO` taps its own render bus.)
-        if let AudioIoBackend::Cpal { apm, .. } = &mut io {
+        if let Some(AudioIoBackend::Cpal { apm, .. }) = &mut io {
             if !cur_muted && cur_aec {
                 let tap_len = aec_render_tap.len();
                 if tap_len > FRAME_20MS * 6 {
@@ -502,8 +585,8 @@ fn run_audio_dsp_loop(args: AudioDspLoopArgs) {
                 let _ = outbound_opus_tx.send(cached_silence_opus.clone());
             } else {
                 let pcm_to_encode: &mut [f32] = match &mut io {
-                    AudioIoBackend::Hardware(_) => &mut mic_frame,
-                    AudioIoBackend::Cpal { apm, .. } => {
+                    Some(AudioIoBackend::Hardware(_)) | None => &mut mic_frame,
+                    Some(AudioIoBackend::Cpal { apm, .. }) => {
                         processed_capture.clear();
                         for chunk in mic_frame.as_chunks::<FRAME_10MS>().0 {
                             let mut out_chunk = [0.0f32; FRAME_10MS];

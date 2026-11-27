@@ -175,19 +175,25 @@ impl Av1Frames {
     }
 
     fn parse_packet(&mut self, payload: &[u8]) -> Option<()> {
+        /// Hard cap on a single reassembled AV1 temporal unit (8 MiB) so missing `marker` bits
+        /// or malformed RTP streams can never grow memory unboundedly.
+        const MAX_AV1_UNIT_BYTES: usize = 8 * 1024 * 1024;
+
         let (&header, mut rest) = payload.split_first()?;
         let z_continues_prev = header & 0b1000_0000 != 0;
         let y_continues_next = header & 0b0100_0000 != 0;
         let w_count = (header & 0b0011_0000) >> 4;
 
-        if !z_continues_prev && !self.partial.is_empty() {
+        if (!z_continues_prev && !self.partial.is_empty())
+            || (z_continues_prev && self.partial.is_empty())
+        {
             return None;
         }
 
-        let mut idx = 0u8;
+        let mut idx = 0usize;
         while !rest.is_empty() {
             idx += 1;
-            let (elem, next_rest) = if w_count != 0 && idx == w_count {
+            let (elem, next_rest) = if w_count != 0 && idx == usize::from(w_count) {
                 (rest, &[][..])
             } else {
                 let (len, n) = read_leb128(rest)?;
@@ -198,6 +204,16 @@ impl Av1Frames {
                 (&body[..len], &body[len..])
             };
             rest = next_rest;
+
+            if self
+                .unit
+                .len()
+                .saturating_add(self.partial.len())
+                .saturating_add(elem.len())
+                > MAX_AV1_UNIT_BYTES
+            {
+                return None;
+            }
 
             let is_first = idx == 1;
             let is_last = rest.is_empty();
@@ -271,13 +287,24 @@ impl Av1Decoder {
         // SAFETY: `Dav1dData` and `Dav1dPicture` are initialized per dav1d's FFI contract and
         // released with `dav1d_picture_unref` before returning.
         unsafe {
-            let mut data = Dav1dData {
+            struct Dav1dDataGuard(Dav1dData);
+            impl Drop for Dav1dDataGuard {
+                fn drop(&mut self) {
+                    if self.0.sz > 0 || self.0.data.is_some() || self.0.r#ref.is_some() {
+                        // SAFETY: `self.0` was allocated by `dav1d_data_create` and not yet
+                        // consumed by `dav1d_send_data`.
+                        unsafe { dav1d_data_unref(NonNull::new(&mut self.0 as *mut _)) };
+                    }
+                }
+            }
+
+            let mut data = Dav1dDataGuard(Dav1dData {
                 data: None,
                 sz: 0,
                 r#ref: None,
                 m: Dav1dDataProps::default(),
-            };
-            let buf = dav1d_data_create(NonNull::new(&mut data as *mut _), total_len);
+            });
+            let buf = dav1d_data_create(NonNull::new(&mut data.0 as *mut _), total_len);
             if buf.is_null() {
                 return Err(HuddleError::Codec("rav1d buffer allocation failed".into()));
             }
@@ -290,24 +317,23 @@ impl Av1Decoder {
             }
 
             let mut out_frame = None;
-            let mut send_res = dav1d_send_data(self.ctx, NonNull::new(&mut data as *mut _));
-            if send_res.0 == NEG_EAGAIN {
+            let mut send_res = dav1d_send_data(self.ctx, NonNull::new(&mut data.0 as *mut _));
+            let mut drain_attempts = 0u8;
+            while send_res.0 == NEG_EAGAIN && drain_attempts < 8 {
+                drain_attempts += 1;
                 // EAGAIN: drain any queued picture first, then retry sending the new unit.
                 if let Some(frame) = self.drain_picture()? {
                     out_frame = Some(frame);
                 }
-                send_res = dav1d_send_data(self.ctx, NonNull::new(&mut data as *mut _));
+                send_res = dav1d_send_data(self.ctx, NonNull::new(&mut data.0 as *mut _));
             }
             if send_res.0 < 0 && send_res.0 != NEG_EAGAIN {
-                dav1d_data_unref(NonNull::new(&mut data as *mut _));
                 return Err(HuddleError::Codec(format!(
                     "rav1d send_data error {}",
                     send_res.0
                 )));
             }
-            if send_res.0 == NEG_EAGAIN {
-                dav1d_data_unref(NonNull::new(&mut data as *mut _));
-            }
+            drop(data);
 
             if let Some(frame) = self.drain_picture()? {
                 out_frame = Some(frame);
@@ -360,12 +386,14 @@ impl Drop for Av1Decoder {
 /// halved, rounding up, along each subsampled axis), `stride[1]` bytes apart. A sample is one
 /// `u8` at 8 bits per component and one native-endian `u16` at 10; strides count bytes for both.
 unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
+    const MAX_VIDEO_DIM: usize = 8192;
     let w = pic.p.w.max(0) as usize;
     let h = pic.p.h.max(0) as usize;
     let bpc = pic.p.bpc;
-    if w == 0 || h == 0 || (bpc != 8 && bpc != 10) {
+    if w == 0 || h == 0 || w > MAX_VIDEO_DIM || h > MAX_VIDEO_DIM || (bpc != 8 && bpc != 10) {
         return None;
     }
+    let bgra_len = w.checked_mul(h)?.checked_mul(4)?;
     let layout = pic.p.layout;
     let (cw_shift, ch_shift, has_chroma) = match layout {
         DAV1D_PIXEL_LAYOUT_I420 => (1usize, 1usize, true),
@@ -388,7 +416,7 @@ unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
     };
     let y_stride = pic.stride[0];
     let c_stride = pic.stride[1];
-    let mut bgra = vec![0u8; w * h * 4];
+    let mut bgra = vec![0u8; bgra_len];
 
     #[inline(always)]
     fn write_yuv_pixel(dst: &mut [u8], y: i32, u: i32, v: i32) {
@@ -1137,5 +1165,14 @@ mod tests {
         });
         // SAFETY: 12 bits per component is rejected before any plane is read.
         assert!(unsafe { picture_to_bgra(&pic_12bit) }.is_none());
+    }
+
+    #[test]
+    fn av1_depacketizer_handles_over_255_zero_length_obu_elements_without_overflow() {
+        let mut frames = Av1Frames::default();
+        // Header 0x00 => Z=0, Y=0, W=0 (unlimited LEB128-prefixed OBU elements), followed by 260
+        // zero-length OBU elements. Previously overflowed `idx: u8` at element 256.
+        let payload = vec![0x00u8; 261];
+        let _ = frames.push(1, true, &payload);
     }
 }

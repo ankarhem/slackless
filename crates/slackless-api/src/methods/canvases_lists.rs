@@ -738,13 +738,24 @@ impl SlackApi {
                 limit: Some(100),
                 ..Default::default()
             };
-            if let Ok(replies) = paginate_at_most(MAX_PAGES, |cursor| {
+            match paginate_at_most(MAX_PAGES, |cursor| {
                 self.conversations_replies(&comment_ch, &synthetic_ts, &opts, cursor)
             })
             .try_collect()
             .await
             {
-                out = replies;
+                Ok(replies) => out = replies,
+                Err(err) if err.is_auth_expired() => return Err(err),
+                Err(ApiError::Slack(code))
+                    if matches!(
+                        code.as_str(),
+                        "channel_not_found"
+                            | "thread_not_found"
+                            | "not_in_channel"
+                            | "missing_scope"
+                            | "unknown_method"
+                    ) => {}
+                Err(err) => return Err(err),
             }
         }
         Ok(out)

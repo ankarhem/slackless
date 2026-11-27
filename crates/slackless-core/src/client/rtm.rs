@@ -385,8 +385,18 @@ impl<B: Backend> Core<B> {
             let ids = with_store(&ctx.store, move |s| {
                 let mut unknown = Vec::with_capacity(ids.len());
                 for id in ids {
-                    if s.user(&ws_known, &id)?.is_none() {
-                        unknown.push(id);
+                    match s.user(&ws_known, &id) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => unknown.push(id),
+                        Err(slackless_store::StoreError::Json(error)) => {
+                            tracing::warn!(
+                                %error,
+                                user = %id,
+                                "stored user JSON is corrupt; re-fetching via users.info"
+                            );
+                            unknown.push(id);
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 Ok(unknown)

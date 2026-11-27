@@ -706,8 +706,9 @@ mod state_machine {
         /// Loopback device feeding the share's audio.
         type ScreenShare = Option<String>;
 
-        fn stop_audio(&mut self) {
+        fn stop_audio(&mut self) -> crate::session::io::BoxFuture<'static, ()> {
             self.running_audio = None;
+            Box::pin(async {})
         }
 
         fn switch_audio(
@@ -894,6 +895,9 @@ mod state_machine {
             remote_speakers: Vec::new(),
             ssrc_to_stream_id: HashMap::new(),
             last_sdp_answer: None,
+            last_index: None,
+            subscribe_in_flight: None,
+            pending_resubscribe: false,
             vdec_routing: Arc::new(Mutex::new(VideoRoutingTable::default())),
             vdec_audio_only: Arc::new(AtomicBool::new(false)),
             vdec_clear: Arc::new(AtomicBool::new(false)),
@@ -2423,11 +2427,12 @@ mod handshake_and_connected_loop_tests {
         type Camera = ();
         type ScreenShare = ();
 
-        fn stop_audio(&mut self) {
+        fn stop_audio(&mut self) -> crate::session::io::BoxFuture<'static, ()> {
             if self.running_audio {
                 self.running_audio = false;
                 self.log.audio_stop_count.fetch_add(1, Ordering::SeqCst);
             }
+            Box::pin(async {})
         }
 
         fn switch_audio(
@@ -2436,9 +2441,10 @@ mod handshake_and_connected_loop_tests {
             _prev: HuddleAudioConfig,
             _parked: Option<()>,
         ) -> BoxFuture<'static, AudioSwitch<(), ()>> {
-            self.stop_audio();
+            let stop = self.stop_audio();
             let gate = self.restart_gate.take();
             Box::pin(async move {
+                stop.await;
                 tokio::task::spawn_blocking(move || {
                     if let Some(gate) = gate {
                         gate.block();

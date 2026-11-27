@@ -1,19 +1,22 @@
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use slackless_types::UserId;
 
 use super::connected::{SessionRuntime, announce_screen_share_capabilities};
+use super::controls::send_camera_subscription;
 use super::io::{RtcController, SignalSink};
 use super::media::MediaDevices;
 use super::supervisor::LoopExit;
 use super::video_rx::same_remote_video_sources;
 use crate::peer_message::{
     CHIME_TRANSCRIPTION_TOPIC, SLACK_DATA_CHANNEL_TOPIC, decode_chime_transcript_frame,
-    decode_slack_peer_message,
+    decode_slack_peer_message, is_kick_notification_for_self,
 };
 use crate::proto::{
     SdkAudioStreamIdInfoFrame, SdkDataMessagePayload, SdkIndexFrame, SdkSignalFrame,
+    sdk_signal_frame,
 };
 use crate::signaling::{
     RemoteVideoSource, build_audio_control_frame, build_remote_video_update_frame,
@@ -23,6 +26,9 @@ use crate::signaling::{
 use crate::video::VideoTileKey;
 use crate::{HuddleAudioConfig, HuddleDataEvent, HuddleError, HuddleSessionSnapshot, HuddleUpdate};
 
+/// Maximum time we hold a renegotiation `SUBSCRIBE` in flight before assuming the ACK was lost.
+pub(super) const SUBSCRIBE_IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(8);
+
 pub(super) async fn handle_signal_frame<R: RtcController, S: SignalSink, M: MediaDevices>(
     frame: SdkSignalFrame,
     config: &mut HuddleAudioConfig,
@@ -31,6 +37,10 @@ pub(super) async fn handle_signal_frame<R: RtcController, S: SignalSink, M: Medi
     signal: &mut S,
     state: &mut SessionRuntime<'_, M>,
 ) -> Option<LoopExit> {
+    if frame.r#type == Some(sdk_signal_frame::Type::Leave as i32) || frame.leave.is_some() {
+        tracing::info!("received server-initiated Chime LEAVE; ending huddle cleanly");
+        return Some(LoopExit::LeftCleanly);
+    }
     if let Some(pp) = frame.ping_pong
         && signal.reply_ping_if_needed(&pp).await
     {
@@ -40,6 +50,7 @@ pub(super) async fn handle_signal_frame<R: RtcController, S: SignalSink, M: Medi
         apply_index_frame(&index, config, snap, peer, signal, state).await;
     }
     if let Some(ack) = frame.suback {
+        state.subscribe_in_flight = None;
         for tm in &ack.tracks {
             if let (Some(ssrc), Some(sid)) = (tm.ssrc, tm.stream_id) {
                 state.ssrc_to_stream_id.insert(ssrc, sid);
@@ -59,18 +70,36 @@ pub(super) async fn handle_signal_frame<R: RtcController, S: SignalSink, M: Medi
             state.last_sdp_answer.as_deref(),
         ) {
             Ok(answer) => {
-                state.last_sdp_answer = Some(answer.clone());
-                if let Err(err) = peer.set_remote_answer(answer).await {
+                if let Err(err) = peer.set_remote_answer(answer.clone()).await {
                     tracing::error!(%err, "renegotiation set_remote_answer failed");
+                } else {
+                    // Only advance XOR-diff baseline once the peer actually applied the answer.
+                    state.last_sdp_answer = Some(answer);
                 }
             }
             Err(err) => {
                 tracing::error!(%err, "renegotiation decode_sdp_answer failed");
             }
         }
+        if state.pending_resubscribe {
+            state.pending_resubscribe = false;
+            if let Some(index) = state.last_index.clone() {
+                apply_index_frame(&index, config, snap, peer, signal, state).await;
+            }
+            if state.subscribe_in_flight.is_none() {
+                send_camera_subscription(config, peer, signal, state, snap.video).await;
+            }
+        }
     }
     if let Some(dm) = frame.data_message {
         for msg in dm.messages {
+            if msg.topic.as_deref() == Some(SLACK_DATA_CHANNEL_TOPIC)
+                && let Some(data) = msg.data.as_deref()
+                && is_kick_notification_for_self(data, &state.self_user, &state.creds.attendee_id)
+            {
+                tracing::info!("received PeerMessage kick_notification for self; leaving huddle");
+                return Some(LoopExit::LeftCleanly);
+            }
             for ev in parse_incoming_data_message(&msg, &state.creds.attendee_id) {
                 match &ev {
                     HuddleDataEvent::Topic { topic, .. } => {
@@ -138,10 +167,19 @@ pub(super) async fn handle_signal_frame<R: RtcController, S: SignalSink, M: Medi
             .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     }
     if let Some(err) = frame.error {
-        return Some(LoopExit::Fatal(HuddleError::Protocol {
-            status: err.status.unwrap_or(500),
+        let status = err.status.unwrap_or(500);
+        let protocol_err = HuddleError::Protocol {
+            status,
             description: err.description.unwrap_or_default(),
-        }));
+        };
+        return Some(if (400..500).contains(&status) {
+            LoopExit::Fatal(protocol_err)
+        } else {
+            LoopExit::Reconnect {
+                err: protocol_err,
+                was_connected: true,
+            }
+        });
     }
     None
 }
@@ -202,6 +240,10 @@ pub(super) async fn apply_index_frame<R: RtcController, S: SignalSink, M: MediaD
     signal: &mut S,
     state: &mut SessionRuntime<'_, M>,
 ) {
+    // Remember the latest INDEX even while `audio_only` is active so turning `audio_only` off
+    // immediately re-subscribes to active remote cameras and screen shares.
+    state.last_index = Some(index.clone());
+
     // Ignore our own camera and our own `#content` screen share.
     let next_raw: Vec<RemoteVideoSource> = if snap.audio_only {
         Vec::new()
@@ -256,10 +298,37 @@ pub(super) async fn apply_index_frame<R: RtcController, S: SignalSink, M: MediaD
                 rt.remote_sources.clear();
             }
         } else {
+            // Serialize SDP renegotiations: never overlap two SUBSCRIBE offers while waiting for
+            // SUBSCRIBE_ACK, which corrupts WebRTC's offer/answer state machine.
+            if state
+                .subscribe_in_flight
+                .is_some_and(|t| t.elapsed() < SUBSCRIBE_IN_FLIGHT_TIMEOUT)
+            {
+                state.pending_resubscribe = true;
+                state.active_remote_tiles = next_tiles;
+                return;
+            }
+            let prev_mids: Vec<String> = state
+                .remote_sources
+                .iter()
+                .map(|(m, _)| m.clone())
+                .collect();
             match peer.prepare_video_receive_offer(next_raw.len()).await {
                 Ok((offer, mids)) => {
                     let paired: Vec<(String, RemoteVideoSource)> =
                         mids.into_iter().zip(next_raw).collect();
+                    let next_mid_set: HashSet<&str> =
+                        paired.iter().map(|(m, _)| m.as_str()).collect();
+                    let removed_mids: Vec<String> = prev_mids
+                        .into_iter()
+                        .filter(|m| !next_mid_set.contains(m.as_str()))
+                        .collect();
+                    if !removed_mids.is_empty() {
+                        let upd = build_remote_video_update_frame(Vec::new(), removed_mids);
+                        if let Err(err) = signal.send_frame(&upd).await {
+                            tracing::warn!(%err, "failed to send shrinking REMOTE_VIDEO_UPDATE");
+                        }
+                    }
                     tracing::info!(
                         count = paired.len(),
                         mids = ?paired.iter().map(|(m, s)| (m.as_str(), s.stream_id, s.is_content)).collect::<Vec<_>>(),
@@ -278,6 +347,7 @@ pub(super) async fn apply_index_frame<R: RtcController, S: SignalSink, M: MediaD
                             if let Err(err) = signal.send_frame(&sub_f).await {
                                 tracing::error!(%err, "failed to send renegotiation SUBSCRIBE");
                             } else {
+                                state.subscribe_in_flight = Some(Instant::now());
                                 state.remote_sources = paired.clone();
                                 if let Ok(mut rt) = state.vdec_routing.lock() {
                                     rt.remote_sources = paired;

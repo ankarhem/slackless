@@ -35,6 +35,116 @@ fn unread_arrival(kind: Option<ConversationKind>, mentioned: bool) -> Arrival {
     }
 }
 
+/// Inputs to the single notification policy shared by shown and background workspaces.
+pub(super) struct NotificationInput<'a> {
+    pub(super) self_user: &'a UserId,
+    pub(super) channel: &'a ChannelId,
+    pub(super) message: &'a Message,
+    pub(super) sender: Option<&'a slackless_core::types::User>,
+    pub(super) kind: Option<ConversationKind>,
+    pub(super) level: Option<NotifyLevel>,
+    pub(super) on_screen_active: bool,
+    pub(super) paused: bool,
+    pub(super) focused: bool,
+    pub(super) settings: &'a crate::preferences::Settings,
+    pub(super) rule_eval: &'a slackless_core::rules::RuleEvaluation,
+}
+
+/// Decision returned by [`decide_message_notification`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct NotificationDecision {
+    pub(super) notify: bool,
+    pub(super) breakthrough: bool,
+    pub(super) sender_is_vip: bool,
+    pub(super) is_direct_or_mention: bool,
+}
+
+/// Single notification policy for incoming messages across both shown and background workspaces:
+/// desktop toggle, self-message guard, smart rules (`BreakThroughMute` > `Suppress` >
+/// `PriorityHighlight`), VIP & urgent-DM breakthrough, DND/Focus/schedule, active on-screen check,
+/// per-channel mute/level, mentions/keywords, and thread-reply rules.
+pub(super) fn decide_message_notification(input: &NotificationInput<'_>) -> NotificationDecision {
+    let suppress = NotificationDecision {
+        notify: false,
+        breakthrough: false,
+        sender_is_vip: false,
+        is_direct_or_mention: false,
+    };
+    let settings = input.settings;
+    if !settings.desktop_notifications || input.message.user.as_ref() == Some(input.self_user) {
+        return suppress;
+    }
+    if input.rule_eval.is_suppressed() {
+        return suppress;
+    }
+    let dm = matches!(
+        input.kind,
+        Some(ConversationKind::Im | ConversationKind::Mpim)
+    );
+    let sender_is_vip = input.message.user.as_ref().is_some_and(|u| {
+        let handle = input.sender.map(|x| x.name.as_str()).unwrap_or("");
+        let display = input
+            .sender
+            .map(slackless_core::types::User::display_name)
+            .unwrap_or("");
+        settings.is_vip(u.as_str(), handle, display)
+    });
+    let breakthrough = sender_is_vip
+        || settings.is_urgent_dm_breakthrough(dm, &input.message.text)
+        || input.rule_eval.breaks_through_mute();
+    if !breakthrough && (input.paused || input.focused || !settings.notifications_allowed_now()) {
+        return suppress;
+    }
+    if input.on_screen_active {
+        return suppress;
+    }
+    if input.level == Some(NotifyLevel::Muted) && !breakthrough {
+        return suppress;
+    }
+    let mentioned = mentions_me(&input.message.text, input.self_user, &settings.keywords);
+    let is_direct_or_mention =
+        breakthrough || input.rule_eval.is_priority_highlight() || dm || mentioned;
+    if breakthrough || input.rule_eval.is_priority_highlight() {
+        return NotificationDecision {
+            notify: true,
+            breakthrough,
+            sender_is_vip,
+            is_direct_or_mention,
+        };
+    }
+    let wanted = match (input.level, settings.notify_level) {
+        (Some(NotifyLevel::Everything), _) => true,
+        (Some(NotifyLevel::Mentions), _) => dm || mentioned,
+        (Some(NotifyLevel::Muted), _) => false,
+        (None, 0) => true,
+        (None, 1) => dm || mentioned,
+        (None, _) => false,
+    };
+    let reply = input
+        .message
+        .thread_ts
+        .as_ref()
+        .is_some_and(|ts| *ts != input.message.ts);
+    let notify = if reply && !dm && !mentioned {
+        let channel_followed = settings
+            .follow_all_threads_channels
+            .iter()
+            .any(|id| id == input.channel.as_str());
+        (wanted
+            && settings.thread_replies
+            && input.message.parent_user_id.as_ref() == Some(input.self_user))
+            || channel_followed
+    } else {
+        wanted
+    };
+    NotificationDecision {
+        notify,
+        breakthrough,
+        sender_is_vip,
+        is_direct_or_mention,
+    }
+}
+
 impl App {
     /// Rebuild the menu bar when its moving parts change: the workspaces (File > Workspace,
     /// Sign Out) and the History menu's places, labelled as Slack's.
@@ -55,7 +165,7 @@ impl App {
             },
         };
         let bar = MenuBar {
-            workspaces: (self.fixtures.workspaces.iter())
+            workspaces: (self.fixtures.rail_workspaces().iter())
                 .map(|team| team.name.clone().into())
                 .collect(),
             recent: (self.recent_entries().into_iter().take(PLACES))

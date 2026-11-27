@@ -166,11 +166,13 @@ impl Composer {
                                             );
                                             if let Some(this) = this.upgrade() {
                                                 this.update(cx, |composer, cx| {
-                                                    composer.attachments.push(PendingAttachment {
-                                                        filename: name,
-                                                        bytes: content.into_bytes(),
-                                                        preview: None,
-                                                    });
+                                                    composer.attachments.push(
+                                                        PendingAttachment::new(
+                                                            name,
+                                                            content.into_bytes(),
+                                                            None,
+                                                        ),
+                                                    );
                                                     cx.notify();
                                                 });
                                             }

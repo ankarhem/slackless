@@ -107,10 +107,7 @@ impl App {
         let owner_suffix = channel_details::host_team(conversation)
             .and_then(|host_id| {
                 self.fixtures
-                    .teams
-                    .iter()
-                    .chain(&self.fixtures.workspaces)
-                    .find(|t| t.id == host_id)
+                    .workspace_by_id(&host_id)
                     .map(|t| t.name.clone())
             })
             .map(|name| format!(" \u{b7} Owned by {name}"))
@@ -279,10 +276,11 @@ impl App {
             let Some(read) = self.bridge.history(channel.clone(), None) else {
                 return;
             };
+            let epoch = self.workspace_epoch;
             cx.spawn(async move |this, cx| {
                 let history = cx.background_executor().spawn(read).await;
                 this.update(cx, |app, cx| {
-                    if app.channel == channel {
+                    if app.workspace_epoch == epoch && app.channel == channel {
                         app.channel_people = Some(app.people(&channel, &history));
                         if app.members_hover.0 || app.members_hover.1 {
                             cx.notify();

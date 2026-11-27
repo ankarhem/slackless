@@ -392,6 +392,20 @@ impl FilesPage {
         cx.notify();
     }
 
+    /// Clear cached live files, favorites, collections, and deleted items when switching
+    /// workspaces so the outgoing workspace's files and Lists never leak into the incoming one.
+    pub fn clear_for_workspace(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.fixtures = fixtures;
+        self.rows = [Rows::default(), Rows::default()];
+        self.shown.clear();
+        self.favorites.clear();
+        self.collections.clear();
+        self.active_collection = None;
+        self.deleted.clear();
+        self.reload();
+        cx.notify();
+    }
+
     /// Show `section`'s page with its chips and search reset, fetching it when stale.
     pub fn show_section(
         &mut self,

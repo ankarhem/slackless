@@ -159,8 +159,7 @@ impl SearchView {
         cx: &mut App,
     ) -> Entity<SearchView> {
         let workspace = fixtures
-            .workspaces
-            .first()
+            .own_team()
             .map(|team| team.id.clone())
             .unwrap_or_default();
         cx.new(|_| SearchView {
@@ -255,9 +254,16 @@ impl SearchView {
     }
 
     /// Point this view at the active workspace's `TeamId` (especially when workspace index > 0).
+    /// Drops any results or in-flight local queries from the previous workspace.
     pub fn set_workspace(&mut self, workspace: TeamId, cx: &mut Context<Self>) {
         if self.workspace != workspace {
             self.workspace = workspace;
+            self.local_gen = self.local_gen.wrapping_add(1);
+            self.local_results.clear();
+            self.transcript_results.clear();
+            self.local_error = None;
+            self.local_loading = false;
+            self.clear_remote();
             cx.notify();
         }
     }

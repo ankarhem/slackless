@@ -139,27 +139,33 @@ pub fn is_dev_build() -> bool {
 }
 
 /// Return the installed app's version string (prefers `SLACKLESS_VERSION` compiled into the binary;
-/// falls back to reading `CFBundleShortVersionString` from `Info.plist` when running bundled).
+/// falls back to reading `CFBundleShortVersionString` from `Info.plist` once per process when
+/// running bundled, cached so render frames never spawn `PlistBuddy`).
 pub fn installed_version() -> String {
-    if CURRENT_VERSION != "0.1.0" {
-        return CURRENT_VERSION.to_owned();
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(app) = current_app_bundle() {
-        let plist = app.join("Contents/Info.plist");
-        if let Ok(out) = Command::new("/usr/libexec/PlistBuddy")
-            .args(["-c", "Print :CFBundleShortVersionString"])
-            .arg(&plist)
-            .output()
-            && out.status.success()
-        {
-            let v = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-            if !v.is_empty() {
-                return v;
+    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            if CURRENT_VERSION != "0.1.0" {
+                return CURRENT_VERSION.to_owned();
             }
-        }
-    }
-    CURRENT_VERSION.to_owned()
+            #[cfg(target_os = "macos")]
+            if let Some(app) = current_app_bundle() {
+                let plist = app.join("Contents/Info.plist");
+                if let Ok(out) = Command::new("/usr/libexec/PlistBuddy")
+                    .args(["-c", "Print :CFBundleShortVersionString"])
+                    .arg(&plist)
+                    .output()
+                    && out.status.success()
+                {
+                    let v = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                    if !v.is_empty() {
+                        return v;
+                    }
+                }
+            }
+            CURRENT_VERSION.to_owned()
+        })
+        .clone()
 }
 
 /// Query GitHub Releases for the latest macOS arm64 release on `channel` (`Stable` or `Beta`,

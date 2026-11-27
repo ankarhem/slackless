@@ -504,12 +504,12 @@ mod tests {
             status_emoji: Some(":books:".to_owned()),
             ..Default::default()
         };
-        fixtures.users.push(User {
+        fixtures.users_mut().push(User {
             id: UserId::from("U0EXPIRED"),
             profile: expired,
             ..Default::default()
         });
-        fixtures.users.push(User {
+        fixtures.users_mut().push(User {
             id: UserId::from("U0CURRENT"),
             profile: current,
             ..Default::default()
@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn local_time_reads_the_users_zone() {
         let mut fixtures = crate::fixtures::load();
-        fixtures.users.push(User {
+        fixtures.users_mut().push(User {
             id: UserId::from("U0TZ"),
             tz_offset: Some(3_600),
             ..Default::default()
@@ -545,7 +545,7 @@ mod tests {
             id: UserId::from("U0NOTZ"),
             ..Default::default()
         };
-        fixtures.users.push(zoneless);
+        fixtures.users_mut().push(zoneless);
         assert_eq!(
             derive(&fixtures, &SelfState::default(), &UserId::from("U0NOTZ")).local_time,
             None

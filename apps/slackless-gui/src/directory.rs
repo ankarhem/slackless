@@ -109,16 +109,16 @@ pub(crate) struct UsergroupLocalEdit {
 }
 
 /// Live client-side user-group membership cache and session disable/edit state shared between the
-/// Directory view and user-group modals.
+/// Directory view and user-group modals, strictly scoped by workspace `TeamId`.
 #[derive(Default)]
 struct UsergroupLiveState {
     /// Fresh member lists returned by `usergroups.users.list` / `usergroups.users.update`.
-    members: HashMap<UsergroupId, Vec<UserId>>,
+    members: HashMap<(slackless_core::types::TeamId, UsergroupId), Vec<UserId>>,
     /// Groups disabled during this session (kept visible under "Show disabled" so they can be
     /// re-enabled even when `usergroups.list` omits disabled groups).
-    disabled_groups: HashMap<UsergroupId, Usergroup>,
+    disabled_groups: HashMap<slackless_core::types::TeamId, HashMap<UsergroupId, Usergroup>>,
     /// Optimistic detail edits applied locally before the next `usergroups.list` round-trip.
-    edited_groups: HashMap<UsergroupId, UsergroupLocalEdit>,
+    edited_groups: HashMap<slackless_core::types::TeamId, HashMap<UsergroupId, UsergroupLocalEdit>>,
 }
 
 impl Global for UsergroupLiveState {}
@@ -130,39 +130,62 @@ fn ensure_live_state(cx: &mut App) -> &mut UsergroupLiveState {
     cx.global_mut::<UsergroupLiveState>()
 }
 
-/// Record a fresh member list for `id` (from `Event::UsergroupUsersLoaded` or local save).
-pub(crate) fn record_usergroup_members(id: UsergroupId, users: Vec<UserId>, cx: &mut App) {
-    ensure_live_state(cx).members.insert(id, users);
+/// Record a fresh member list for `(workspace, id)` (from `Event::UsergroupUsersLoaded` or local save).
+pub(crate) fn record_usergroup_members(
+    workspace: slackless_core::types::TeamId,
+    id: UsergroupId,
+    users: Vec<UserId>,
+    cx: &mut App,
+) {
+    ensure_live_state(cx).members.insert((workspace, id), users);
 }
 
-/// Return the cached fresh member list for `id`, if already loaded this session.
-pub(crate) fn cached_usergroup_members(id: &UsergroupId, cx: &App) -> Option<Vec<UserId>> {
+/// Return the cached fresh member list for `(workspace, id)`, if already loaded this session.
+pub(crate) fn cached_usergroup_members(
+    workspace: &slackless_core::types::TeamId,
+    id: &UsergroupId,
+    cx: &App,
+) -> Option<Vec<UserId>> {
     cx.try_global::<UsergroupLiveState>()
-        .and_then(|s| s.members.get(id).cloned())
+        .and_then(|s| s.members.get(&(workspace.clone(), id.clone())).cloned())
 }
 
 /// Record a user group as disabled locally so it immediately appears under "Show disabled" with an
-/// Enable action.
-pub(crate) fn record_usergroup_disabled(mut group: Usergroup, cx: &mut App) {
+/// Enable action for `workspace` only.
+pub(crate) fn record_usergroup_disabled(
+    workspace: slackless_core::types::TeamId,
+    mut group: Usergroup,
+    cx: &mut App,
+) {
     if group.date_delete == 0 {
         group.date_delete = 1;
     }
     ensure_live_state(cx)
         .disabled_groups
+        .entry(workspace)
+        .or_default()
         .insert(group.id.clone(), group);
 }
 
-/// Clear any local disabled override when a group is re-enabled.
-pub(crate) fn record_usergroup_enabled(id: &UsergroupId, cx: &mut App) {
-    if cx.has_global::<UsergroupLiveState>() {
-        cx.global_mut::<UsergroupLiveState>()
+/// Clear any local disabled override when a group is re-enabled in `workspace`.
+pub(crate) fn record_usergroup_enabled(
+    workspace: &slackless_core::types::TeamId,
+    id: &UsergroupId,
+    cx: &mut App,
+) {
+    if cx.has_global::<UsergroupLiveState>()
+        && let Some(ws_map) = cx
+            .global_mut::<UsergroupLiveState>()
             .disabled_groups
-            .remove(id);
+            .get_mut(workspace)
+    {
+        ws_map.remove(id);
     }
 }
 
-/// Record an optimistic detail edit (`name`, `handle`, `description`) for instant feedback.
+/// Record an optimistic detail edit (`name`, `handle`, `description`) for instant feedback in `workspace`.
 pub(crate) fn record_usergroup_edit(
+    workspace: slackless_core::types::TeamId,
     id: UsergroupId,
     name: String,
     handle: String,
@@ -170,14 +193,18 @@ pub(crate) fn record_usergroup_edit(
     cx: &mut App,
 ) {
     let state = ensure_live_state(cx);
-    if let Some(disabled) = state.disabled_groups.get_mut(&id) {
+    if let Some(disabled) = state
+        .disabled_groups
+        .get_mut(&workspace)
+        .and_then(|m| m.get_mut(&id))
+    {
         disabled.name = name.clone();
         if !handle.is_empty() {
             disabled.handle = handle.clone();
         }
         disabled.description = description.clone();
     }
-    state.edited_groups.insert(
+    state.edited_groups.entry(workspace).or_default().insert(
         id,
         UsergroupLocalEdit {
             name,
@@ -188,14 +215,24 @@ pub(crate) fn record_usergroup_edit(
 }
 
 /// Reconcile local optimistic overrides after a fresh `Event::Usergroups` list lands from Slack.
-pub(crate) fn reconcile_usergroups_from_server(groups: &[Usergroup], cx: &mut App) {
+pub(crate) fn reconcile_usergroups_from_server(
+    workspace: &slackless_core::types::TeamId,
+    groups: &[Usergroup],
+    cx: &mut App,
+) {
     if cx.has_global::<UsergroupLiveState>() {
         let state = cx.global_mut::<UsergroupLiveState>();
+        let mut disabled = state.disabled_groups.get_mut(workspace);
+        let mut edited = state.edited_groups.get_mut(workspace);
         for group in groups {
-            if !group.is_deleted() {
-                state.disabled_groups.remove(&group.id);
+            if !group.is_deleted()
+                && let Some(map) = disabled.as_mut()
+            {
+                map.remove(&group.id);
             }
-            state.edited_groups.remove(&group.id);
+            if let Some(map) = edited.as_mut() {
+                map.remove(&group.id);
+            }
         }
     }
 }
@@ -225,13 +262,21 @@ enum TabList {
 }
 
 fn live_overrides(
+    workspace: &slackless_core::types::TeamId,
     cx: &App,
 ) -> Option<(
     HashMap<UsergroupId, Usergroup>,
     HashMap<UsergroupId, UsergroupLocalEdit>,
 )> {
-    cx.try_global::<UsergroupLiveState>()
-        .map(|s| (s.disabled_groups.clone(), s.edited_groups.clone()))
+    cx.try_global::<UsergroupLiveState>().map(|s| {
+        (
+            s.disabled_groups
+                .get(workspace)
+                .cloned()
+                .unwrap_or_default(),
+            s.edited_groups.get(workspace).cloned().unwrap_or_default(),
+        )
+    })
 }
 
 pub struct DirectoryView {
@@ -290,7 +335,12 @@ impl DirectoryView {
     /// The active tab's matches for the current query, recomputed only when an input changed.
     fn refresh_memo(&mut self, cx: &Context<Self>) {
         let needle = self.needle(cx);
-        let overrides = live_overrides(cx);
+        let ws_id = self
+            .fixtures
+            .own_team()
+            .map(|t| t.id.clone())
+            .unwrap_or_default();
+        let overrides = live_overrides(&ws_id, cx);
         let up_to_date = self.memo.as_ref().is_some_and(|memo| {
             memo.tab == self.tab
                 && memo.needle == needle

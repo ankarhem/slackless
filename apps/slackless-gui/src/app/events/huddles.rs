@@ -18,10 +18,14 @@ impl App {
 
     pub(in crate::app) fn on_huddle_media_event(
         &mut self,
+        from: usize,
         event: &HuddleMediaEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.huddle_owner != Some(from) {
+            return;
+        }
         let Some(state) = self.huddle_state.clone() else {
             return;
         };
@@ -81,7 +85,7 @@ impl App {
                     && let Some(state) = self.huddle_state.clone()
                     && state.read(cx).session().channel == *channel
                 {
-                    let self_uid = &self.fixtures.self_user;
+                    let self_uid = state.read(cx).fixtures().self_user.clone();
                     let new_peers = if *ended {
                         &[][..]
                     } else {
@@ -89,10 +93,10 @@ impl App {
                     };
                     let remote_joined = new_peers
                         .iter()
-                        .any(|u| u != self_uid && !prev_participants.contains(u));
+                        .any(|u| *u != self_uid && !prev_participants.contains(u));
                     let remote_left = prev_participants
                         .iter()
-                        .any(|u| u != self_uid && !new_peers.contains(u));
+                        .any(|u| *u != self_uid && !new_peers.contains(u));
                     if remote_joined {
                         self.play_huddle_chime(slackless_core::huddle::HuddleChime::PeerJoin, cx);
                     } else if remote_left {
@@ -133,45 +137,73 @@ impl App {
                 cx.notify();
             }
             HuddleEvent::SessionChanged(snap) => {
-                if !runs_huddle {
-                    return;
-                }
                 let snap = (**snap).clone();
-                let prev_phase = self.huddle_session.as_ref().map(|s| s.phase);
                 if snap.phase == slackless_core::huddle::HuddlePhase::Idle {
-                    if prev_phase.is_some() {
+                    let was_leaving = self.huddle_leaving_call.as_ref().is_some_and(|(w, cid)| {
+                        *w == from
+                            && (cid.is_empty() || snap.call_id.is_empty() || cid == &snap.call_id)
+                    });
+                    if was_leaving {
+                        self.huddle_leaving_call = None;
+                    }
+                    if !runs_huddle {
+                        return;
+                    }
+                    let prev_phase = self.huddle_session.as_ref().map(|s| s.phase);
+                    if prev_phase.is_some() && !was_leaving {
                         self.play_huddle_chime(slackless_core::huddle::HuddleChime::Leave, cx);
                     }
                     self.clear_huddle_dock(cx);
+                    cx.notify();
+                    return;
+                }
+                if !runs_huddle {
+                    return;
+                }
+                let stale_leaving = self
+                    .huddle_leaving_call
+                    .as_ref()
+                    .is_some_and(|(w, cid)| *w == from && (cid.is_empty() || cid == &snap.call_id));
+                if stale_leaving
+                    || (snap.phase == slackless_core::huddle::HuddlePhase::Leaving
+                        && self.huddle_state.is_none())
+                {
+                    return;
+                }
+                let prev_phase = self.huddle_session.as_ref().map(|s| s.phase);
+                let newly_connected = snap.phase == slackless_core::huddle::HuddlePhase::Connected
+                    && matches!(
+                        prev_phase,
+                        None | Some(
+                            slackless_core::huddle::HuddlePhase::Joining
+                                | slackless_core::huddle::HuddlePhase::Connecting
+                        )
+                    );
+                self.huddle_session = Some(snap.clone());
+                if let Some(state) = self.huddle_state.clone() {
+                    state.update(cx, |s, cx| s.update_session(snap.clone(), cx));
                 } else {
-                    let newly_connected = snap.phase
-                        == slackless_core::huddle::HuddlePhase::Connected
-                        && prev_phase != Some(slackless_core::huddle::HuddlePhase::Connected);
-                    self.huddle_session = Some(snap.clone());
-                    if let Some(state) = self.huddle_state.clone() {
-                        state.update(cx, |s, cx| s.update_session(snap.clone(), cx));
-                    } else {
-                        self.mount_huddle_dock(from, snap.clone(), window, cx);
+                    self.mount_huddle_dock(from, snap.clone(), window, cx);
+                }
+                if newly_connected {
+                    self.play_huddle_chime(slackless_core::huddle::HuddleChime::Join, cx);
+                    let is_sample = self.huddle_owner_is_sample(cx);
+                    let settings = self.preferences.read(cx).settings();
+                    if settings.huddle_auto_captions
+                        && !settings.transcription_provider().is_local()
+                        && !snap.captions_enabled
+                        && !is_sample
+                    {
+                        self.send_huddle(HuddleCommand::SetCaptions(true));
                     }
-                    if newly_connected {
-                        self.play_huddle_chime(slackless_core::huddle::HuddleChime::Join, cx);
-                        let settings = self.preferences.read(cx).settings();
-                        if settings.huddle_auto_captions
-                            && !settings.transcription_provider().is_local()
-                            && !snap.captions_enabled
-                            && !self.fixtures.sample
-                        {
-                            self.send_huddle(HuddleCommand::SetCaptions(true));
-                        }
-                        let peer_count =
-                            (self.huddle_rooms(from).get(&snap.channel)).map_or(0, Vec::len);
-                        if settings.huddle_music_when_alone
-                            && peer_count <= 1
-                            && snap.jukebox_song.is_none()
-                            && !self.fixtures.sample
-                        {
-                            self.arm_huddle_alone_music(snap.channel.clone(), cx);
-                        }
+                    let peer_count =
+                        (self.huddle_rooms(from).get(&snap.channel)).map_or(0, Vec::len);
+                    if settings.huddle_music_when_alone
+                        && peer_count <= 1
+                        && snap.jukebox_song.is_none()
+                        && !is_sample
+                    {
+                        self.arm_huddle_alone_music(snap.channel.clone(), cx);
                     }
                 }
                 cx.notify();
@@ -220,9 +252,11 @@ impl App {
                 }
             }
             HuddleEvent::InviteCancelled { channel, .. } => {
-                let should_dismiss = self.huddle_invite.as_ref().is_some_and(|b| {
-                    channel.is_none() || channel.as_ref() == Some(&b.read(cx).invite().channel)
-                });
+                let same_workspace = self.huddle_invite_owner == Some(from);
+                let should_dismiss = same_workspace
+                    && self.huddle_invite.as_ref().is_some_and(|b| {
+                        channel.is_none() || channel.as_ref() == Some(&b.read(cx).invite().channel)
+                    });
                 if should_dismiss {
                     self.dismiss_huddle_invite(cx);
                 }

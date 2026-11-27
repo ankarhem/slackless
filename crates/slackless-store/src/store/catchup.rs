@@ -35,7 +35,7 @@ impl Store {
              LIMIT ?3",
         )?;
         let rows = stmt.query_map(
-            params![workspace.as_str(), cutoff_key, limit as i64],
+            params![workspace.as_str(), cutoff_key, super::sql_limit(limit)],
             raw_row,
         )?;
         collect(rows)
@@ -91,7 +91,7 @@ impl Store {
              LIMIT ?3"
         ))?;
         let rows = stmt.query_map(
-            params![workspace.as_str(), cutoff_secs, limit as i64],
+            params![workspace.as_str(), cutoff_secs, super::sql_limit(limit)],
             |r| {
                 let fid: String = r.get(0)?;
                 let source: String = r.get(1)?;
@@ -148,7 +148,7 @@ impl Store {
              LIMIT ?3",
         )?;
         let rows = stmt.query_map(
-            params![workspace.as_str(), cutoff_ms, limit as i64],
+            params![workspace.as_str(), cutoff_ms, super::sql_limit(limit)],
             transcripts::row_to_session,
         )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

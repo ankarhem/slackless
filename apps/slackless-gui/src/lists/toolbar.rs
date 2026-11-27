@@ -283,7 +283,12 @@ pub(super) fn render_live_toolbar(
                                 for id in &ids_local {
                                     s.archived_rows.insert(id.clone());
                                 }
-                                s.selected_row = None;
+                                if s.selected_record_id
+                                    .as_ref()
+                                    .is_some_and(|sel| ids_local.contains(sel))
+                                {
+                                    s.selected_record_id = None;
+                                }
                             },
                             window,
                             cx,
@@ -330,7 +335,11 @@ pub(super) fn render_live_toolbar(
                                 let Some(path) = paths.into_iter().next() else {
                                     return;
                                 };
-                                let Ok(content) = std::fs::read_to_string(&path) else {
+                                let Ok(content) = cx
+                                    .background_executor()
+                                    .spawn(async move { std::fs::read_to_string(&path) })
+                                    .await
+                                else {
                                     return;
                                 };
                                 let rows = parse_csv_rows(&content);

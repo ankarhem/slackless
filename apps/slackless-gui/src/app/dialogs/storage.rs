@@ -562,12 +562,16 @@ impl App {
             self.open_revision_history_with(subtitle, revisions, window, cx);
             return;
         };
+        let epoch = self.workspace_epoch;
         let read = cx
             .background_executor()
             .spawn(async move { store.lock().ok()?.revisions(&team, &channel, &ts).ok() });
         cx.spawn_in(window, async move |this, cx| {
             let revisions = read.await.unwrap_or_default();
             let _ = this.update_in(cx, |app, window, cx| {
+                if app.workspace_epoch != epoch {
+                    return;
+                }
                 let revisions = revisions
                     .into_iter()
                     .map(|rev| {
@@ -782,6 +786,7 @@ impl App {
             return;
         };
         // Read off the UI thread, which never waits behind a background read.
+        let epoch = self.workspace_epoch;
         let call_id = open.call_id.clone();
         let read = cx.background_executor().spawn(async move {
             store
@@ -793,6 +798,9 @@ impl App {
         cx.spawn_in(window, async move |this, cx| {
             open.segments = read.await.unwrap_or_default();
             let _ = this.update_in(cx, |app, window, cx| {
+                if app.workspace_epoch != epoch {
+                    return;
+                }
                 app.open_huddle_transcript_with(open, window, cx);
             });
         })
@@ -860,9 +868,7 @@ impl App {
             let ws = (self.bridge.team_id().cloned()).unwrap_or_else(|| self.team().id.clone());
             let ws_name = self
                 .fixtures
-                .workspaces
-                .iter()
-                .find(|t| t.id == ws)
+                .workspace_by_id(&ws)
                 .map(|t| t.name.clone())
                 .filter(|n| !n.trim().is_empty());
             let mut users = HashMap::new();
@@ -1165,23 +1171,51 @@ impl App {
                                     .icon(IconName::Trash)
                                     .tooltip("Delete local transcript")
                                     .on_click(move |_, window, cx| {
-                                        if let (Some(st), Some(tm)) = (&del_store, &del_team)
-                                            && let Ok(mut guard) = st.lock()
-                                        {
-                                            let _ = guard.delete_huddle_transcript(tm, &del_id);
-                                        }
                                         window.close_dialog(cx);
-                                        let _ = del_this.update(cx, |app, cx| {
-                                            if app.page == MainPage::Huddles {
-                                                app.show_huddles(cx);
-                                            }
-                                        });
-                                        notify(
-                                            "Transcript deleted",
-                                            "Removed local huddle transcript from SQLite.",
-                                            window,
-                                            cx,
-                                        );
+                                        let Some(st) = del_store.clone() else {
+                                            return;
+                                        };
+                                        let Some(tm) = del_team.clone() else {
+                                            return;
+                                        };
+                                        let del_id = del_id.clone();
+                                        let del_this = del_this.clone();
+                                        window
+                                            .spawn(cx, async move |cx| {
+                                                let res = cx
+                                                    .background_executor()
+                                                    .spawn(async move {
+                                                        let mut guard = st.lock().map_err(|_| {
+                                                            "local store lock poisoned".to_owned()
+                                                        })?;
+                                                        guard
+                                                            .delete_huddle_transcript(&tm, &del_id)
+                                                            .map_err(|e| e.to_string())
+                                                    })
+                                                    .await;
+                                                let _ = cx.update(|window, cx| match res {
+                                                    Ok(_) => {
+                                                        let _ = del_this.update(cx, |app, cx| {
+                                                            if app.page == MainPage::Huddles {
+                                                                app.show_huddles(cx);
+                                                            }
+                                                        });
+                                                        notify(
+                                                            "Transcript deleted",
+                                                            "Removed local huddle transcript from SQLite.",
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                    Err(err) => notify(
+                                                        "Delete failed",
+                                                        err,
+                                                        window,
+                                                        cx,
+                                                    ),
+                                                });
+                                            })
+                                            .detach();
                                     }),
                             )
                         }),
@@ -2542,7 +2576,7 @@ pub(in crate::app) fn build_fixture_channel_export(
     for u in fixtures.people() {
         users.insert(u.id.clone(), fixtures.name_of(u).to_owned());
     }
-    let transcripts = &fixtures.file_transcripts;
+    let transcripts = fixtures.all_file_transcripts();
     let messages: Vec<slackless_core::export::ExportedMessage> = fixtures
         .messages
         .get(channel)
@@ -2555,7 +2589,7 @@ pub(in crate::app) fn build_fixture_channel_export(
                 deleted: false,
             };
             let mut row =
-                slackless_core::export::build_exported_message(&stored, &users, transcripts, true);
+                slackless_core::export::build_exported_message(&stored, &users, &transcripts, true);
             if let Some(replies) = fixtures.threads.get(&(channel.clone(), msg.ts.clone())) {
                 for r in replies {
                     if r.ts == msg.ts {
@@ -2570,7 +2604,7 @@ pub(in crate::app) fn build_fixture_channel_export(
                         .push(slackless_core::export::build_exported_message(
                             &rs,
                             &users,
-                            transcripts,
+                            &transcripts,
                             true,
                         ));
                 }
@@ -2605,7 +2639,7 @@ pub(in crate::app) fn build_fixture_thread_export(
     for u in fixtures.people() {
         users.insert(u.id.clone(), fixtures.name_of(u).to_owned());
     }
-    let transcripts = &fixtures.file_transcripts;
+    let transcripts = fixtures.all_file_transcripts();
     let mut raw: Vec<Message> = Vec::new();
     if let Some(root) = fixtures
         .messages
@@ -2629,7 +2663,7 @@ pub(in crate::app) fn build_fixture_thread_export(
                 message: msg,
                 deleted: false,
             };
-            slackless_core::export::build_exported_message(&stored, &users, transcripts, true)
+            slackless_core::export::build_exported_message(&stored, &users, &transcripts, true)
         })
         .collect();
     slackless_core::export::ExportedMessagesDoc {

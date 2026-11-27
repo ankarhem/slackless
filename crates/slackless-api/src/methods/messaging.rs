@@ -311,21 +311,39 @@ impl SlackApi {
         if self.uses_drafts_schedule() {
             return self.drafts_list_scheduled(channel).await;
         }
-        let mut params = Vec::new();
-        if let Some(channel) = channel {
-            params.push(("channel", channel.to_string()));
-        }
-        match self
-            .call::<ScheduledMessagesList>(method::CHAT_SCHEDULED_MESSAGES_LIST, params)
-            .await
-        {
-            Ok(resp) => Ok(resp.data.scheduled_messages),
-            Err(ApiError::Slack(ref code)) if code == "not_allowed_token_type" => {
-                self.mark_drafts_schedule();
-                self.drafts_list_scheduled(channel).await
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let mut params = vec![("limit", "100".to_owned())];
+            if let Some(channel) = channel {
+                params.push(("channel", channel.to_string()));
             }
-            Err(e) => Err(e),
+            if let Some(ref c) = cursor {
+                params.push(("cursor", c.clone()));
+            }
+            match self
+                .call::<ScheduledMessagesList>(method::CHAT_SCHEDULED_MESSAGES_LIST, params)
+                .await
+            {
+                Ok(resp) => {
+                    let next = resp.next_cursor().map(str::to_owned);
+                    all.extend(resp.data.scheduled_messages);
+                    match next {
+                        Some(c) if !c.is_empty() && seen.insert(c.clone()) => cursor = Some(c),
+                        _ => break,
+                    }
+                }
+                Err(ApiError::Slack(ref code))
+                    if code == "not_allowed_token_type" && all.is_empty() =>
+                {
+                    self.mark_drafts_schedule();
+                    return self.drafts_list_scheduled(channel).await;
+                }
+                Err(e) => return Err(e),
+            }
         }
+        Ok(all)
     }
 
     /// `chat.deleteScheduledMessage`: cancel a pending scheduled message.

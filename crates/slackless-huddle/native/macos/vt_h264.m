@@ -73,10 +73,24 @@ static void vt_common_compress_cb(
     CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sampleBuffer);
     if (!block) return;
 
+    size_t len_at_offset = 0;
     size_t total_len = 0;
     char *data_ptr = NULL;
-    if (CMBlockBufferGetDataPointer(block, 0, NULL, &total_len, &data_ptr) != kCMBlockBufferNoErr || !data_ptr) {
+    uint8_t *contig_copy = NULL;
+    if (CMBlockBufferGetDataPointer(block, 0, &len_at_offset, &total_len, &data_ptr) != kCMBlockBufferNoErr ||
+        total_len == 0) {
         return;
+    }
+    if (!data_ptr || len_at_offset < total_len) {
+        contig_copy = (uint8_t *)malloc(total_len);
+        if (!contig_copy) {
+            return;
+        }
+        if (CMBlockBufferCopyDataBytes(block, 0, total_len, contig_copy) != kCMBlockBufferNoErr) {
+            free(contig_copy);
+            return;
+        }
+        data_ptr = (char *)contig_copy;
     }
 
     static const uint8_t start_code[4] = {0, 0, 0, 1};
@@ -89,6 +103,7 @@ static void vt_common_compress_cb(
             if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, i, &ps_ptr, &ps_size, NULL, NULL) == noErr &&
                 ps_ptr && ps_size > 0) {
                 if (!slackless_ensure_buf(&enc->annex_b_buf, &enc->annex_b_cap, out_len + 4 + ps_size)) {
+                    free(contig_copy);
                     return;
                 }
                 memcpy(enc->annex_b_buf + out_len, start_code, 4);
@@ -110,6 +125,7 @@ static void vt_common_compress_cb(
             break;
         }
         if (!slackless_ensure_buf(&enc->annex_b_buf, &enc->annex_b_cap, out_len + 4 + nal_size)) {
+            free(contig_copy);
             return;
         }
         memcpy(enc->annex_b_buf + out_len, start_code, 4);
@@ -118,6 +134,7 @@ static void vt_common_compress_cb(
         out_len += nal_size;
         offset += nal_size;
     }
+    free(contig_copy);
 
     if (out_len > 0 && enc->on_h264) {
         enc->on_h264(enc->ctx, enc->annex_b_buf, out_len, enc->width, enc->height, encode_us, is_keyframe);
@@ -220,11 +237,15 @@ void slackless_vt_decompress_surface_cb(
     CVImageBufferRef imageBuffer,
     CMTime presentationTimeStamp,
     CMTime presentationDuration) {
-    (void)decompressionOutputRefCon;
+    (void)sourceFrameRefCon;
     (void)infoFlags;
     (void)presentationTimeStamp;
     (void)presentationDuration;
-    VtSurfaceDecodeCtx *call = (VtSurfaceDecodeCtx *)sourceFrameRefCon;
+    // Read the currently-live decode call from the decoder-owned slot rather than
+    // `sourceFrameRefCon`, so any delayed/reordered frame flushed on a later decode or during
+    // `VTDecompressionSessionInvalidate` never dereferences a popped stack frame.
+    VtSurfaceDecodeCtx **slot = (VtSurfaceDecodeCtx **)decompressionOutputRefCon;
+    VtSurfaceDecodeCtx *call = slot ? *slot : NULL;
     if (!call || status != noErr || !imageBuffer || !call->on_surface) return;
 
     size_t w = CVPixelBufferGetWidth(imageBuffer);
@@ -252,6 +273,7 @@ NSDictionary *slackless_vt_surface_output_attrs(void) {
 typedef struct SlacklessVtDecoder {
     VTDecompressionSessionRef session;
     CMVideoFormatDescriptionRef fmt;
+    VtSurfaceDecodeCtx *active_call;
     uint8_t *sps;
     size_t sps_len;
     uint8_t *pps;
@@ -264,6 +286,7 @@ static bool vt_decoder_rebuild(SlacklessVtDecoder *dec) {
     if (!dec->sps || dec->sps_len == 0 || !dec->pps || dec->pps_len == 0) {
         return false;
     }
+    dec->active_call = NULL;
     if (dec->session) {
         VTDecompressionSessionInvalidate(dec->session);
         CFRelease(dec->session);
@@ -285,7 +308,7 @@ static bool vt_decoder_rebuild(SlacklessVtDecoder *dec) {
     NSDictionary *decSpec = @{
         (__bridge NSString *)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder : @YES,
     };
-    VTDecompressionOutputCallbackRecord cb = {slackless_vt_decompress_surface_cb, NULL};
+    VTDecompressionOutputCallbackRecord cb = {slackless_vt_decompress_surface_cb, &dec->active_call};
     st = VTDecompressionSessionCreate(
         kCFAllocatorDefault,
         dec->fmt,
@@ -308,6 +331,7 @@ SlacklessVtDecoder *slackless_vt_decoder_new(void) {
 
 void slackless_vt_decoder_free(SlacklessVtDecoder *dec) {
     if (!dec) return;
+    dec->active_call = NULL;
     if (dec->session) {
         VTDecompressionSessionInvalidate(dec->session);
         CFRelease(dec->session);
@@ -432,7 +456,12 @@ bool slackless_vt_decoder_decode(
 
         VtSurfaceDecodeCtx call = {ctx, on_surface, false};
         VTDecodeInfoFlags flagsOut = 0;
-        st = VTDecompressionSessionDecodeFrame(dec->session, sbuf, 0, &call, &flagsOut);
+        dec->active_call = &call;
+        st = VTDecompressionSessionDecodeFrame(dec->session, sbuf, 0, NULL, &flagsOut);
+        if (st == noErr && (flagsOut & kVTDecodeInfo_Asynchronous)) {
+            VTDecompressionSessionWaitForAsynchronousFrames(dec->session);
+        }
+        dec->active_call = NULL;
         CFRelease(sbuf);
         return st == noErr && call.got_frame;
     }

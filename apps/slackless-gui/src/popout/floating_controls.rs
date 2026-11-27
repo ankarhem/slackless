@@ -308,6 +308,13 @@ impl Render for HuddleFloatingPanel {
             .on_action(cx.listener(|this, _: &CloseWindow, window, cx| {
                 this.close(window, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::app::ToggleHuddleMute, _, cx| {
+                    if let Some(st) = this.state.upgrade() {
+                        st.update(cx, |s, cx| s.request_toggle_mute(cx));
+                    }
+                }),
+            )
             .size_full()
             .p(px(2.))
             .child(

@@ -2,74 +2,95 @@
 
 use serde::Deserialize;
 
+use crate::de::null_default;
 use crate::types::{ChannelId, Ts};
 
 /// Chime attendee capabilities returned inside `rooms.join`'s `call.free_willy.attendee`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ChimeCapabilities {
-    #[serde(default, rename = "Audio")]
+    #[serde(default, deserialize_with = "null_default", rename = "Audio")]
     pub audio: String,
-    #[serde(default, rename = "Video")]
+    #[serde(default, deserialize_with = "null_default", rename = "Video")]
     pub video: String,
-    #[serde(default, rename = "Content")]
+    #[serde(default, deserialize_with = "null_default", rename = "Content")]
     pub content: String,
 }
 
 /// Chime attendee credentials returned by `rooms.join`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ChimeAttendee {
-    #[serde(default, rename = "AttendeeId")]
+    #[serde(default, deserialize_with = "null_default", rename = "AttendeeId")]
     pub attendee_id: String,
-    #[serde(default, rename = "ExternalUserId")]
+    #[serde(default, deserialize_with = "null_default", rename = "ExternalUserId")]
     pub external_user_id: String,
-    #[serde(default, rename = "JoinToken")]
+    #[serde(default, deserialize_with = "null_default", rename = "JoinToken")]
     pub join_token: String,
-    #[serde(default, rename = "Capabilities")]
+    #[serde(default, deserialize_with = "null_default", rename = "Capabilities")]
     pub capabilities: ChimeCapabilities,
 }
 
 /// Chime media placement URLs returned by `rooms.join`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ChimeMediaPlacement {
-    #[serde(default, rename = "SignalingUrl")]
+    #[serde(default, deserialize_with = "null_default", rename = "SignalingUrl")]
     pub signaling_url: String,
-    #[serde(default, rename = "AudioHostUrl")]
+    #[serde(default, deserialize_with = "null_default", rename = "AudioHostUrl")]
     pub audio_host_url: String,
-    #[serde(default, rename = "AudioFallbackUrl")]
+    #[serde(
+        default,
+        deserialize_with = "null_default",
+        rename = "AudioFallbackUrl"
+    )]
     pub audio_fallback_url: String,
-    #[serde(default, rename = "TurnControlUrl")]
+    #[serde(default, deserialize_with = "null_default", rename = "TurnControlUrl")]
     pub turn_control_url: String,
-    #[serde(default, rename = "ScreenSharingUrl")]
+    #[serde(
+        default,
+        deserialize_with = "null_default",
+        rename = "ScreenSharingUrl"
+    )]
     pub screen_sharing_url: String,
-    #[serde(default, rename = "ScreenViewingUrl")]
+    #[serde(
+        default,
+        deserialize_with = "null_default",
+        rename = "ScreenViewingUrl"
+    )]
     pub screen_viewing_url: String,
-    #[serde(default, rename = "ScreenDataUrl")]
+    #[serde(default, deserialize_with = "null_default", rename = "ScreenDataUrl")]
     pub screen_data_url: String,
-    #[serde(default, rename = "EventIngestionUrl")]
+    #[serde(
+        default,
+        deserialize_with = "null_default",
+        rename = "EventIngestionUrl"
+    )]
     pub event_ingestion_url: String,
 }
 
 /// Chime meeting descriptor returned by `rooms.join`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ChimeMeeting {
-    #[serde(default, rename = "MeetingId")]
+    #[serde(default, deserialize_with = "null_default", rename = "MeetingId")]
     pub meeting_id: String,
-    #[serde(default, rename = "ExternalMeetingId")]
+    #[serde(
+        default,
+        deserialize_with = "null_default",
+        rename = "ExternalMeetingId"
+    )]
     pub external_meeting_id: String,
-    #[serde(default, rename = "MediaRegion")]
+    #[serde(default, deserialize_with = "null_default", rename = "MediaRegion")]
     pub media_region: String,
-    #[serde(default, rename = "MeetingArn")]
+    #[serde(default, deserialize_with = "null_default", rename = "MeetingArn")]
     pub meeting_arn: String,
-    #[serde(default, rename = "MediaPlacement")]
+    #[serde(default, deserialize_with = "null_default", rename = "MediaPlacement")]
     pub media_placement: ChimeMediaPlacement,
 }
 
 /// `call.free_willy`: Amazon Chime SDK session credentials handed out by `rooms.join`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ChimeJoinData {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub attendee: ChimeAttendee,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub meeting: ChimeMeeting,
 }
 
@@ -101,11 +122,11 @@ pub(in crate::methods) struct RoomsJoinWire {
 
 #[derive(Deserialize, Default)]
 pub(in crate::methods) struct RoomCallWire {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub(in crate::methods) call_id: String,
     #[serde(default)]
     pub(in crate::methods) free_willy: Option<ChimeJoinData>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub(in crate::methods) huddle: crate::types::HuddleRoom,
     #[serde(default)]
     pub(in crate::methods) canvas: Option<HuddleCanvasRef>,
@@ -137,7 +158,7 @@ pub struct CallParticipant {
 /// Third-party Call object returned by `calls.info` (`docs/research/api-huddles.md`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct CallInfo {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub id: String,
     #[serde(default)]
     pub title: Option<String>,
@@ -153,14 +174,14 @@ pub struct CallInfo {
     pub join_url: Option<String>,
     #[serde(default)]
     pub desktop_app_join_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub users: Vec<CallParticipant>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub channels: Vec<ChannelId>,
 }
 
 #[derive(Deserialize, Default)]
 pub(in crate::methods) struct CallsInfoWire {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub(in crate::methods) call: CallInfo,
 }

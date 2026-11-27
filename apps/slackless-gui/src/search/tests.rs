@@ -95,11 +95,13 @@ fn search_view_local_fts_exclusions_remote_query_pagination_and_channel_dedup(
 
     let mut fx = crate::fixtures::load();
     fx.sample = false;
-    fx.workspaces = vec![Team {
+    let team = Team {
         id: team_id,
         name: "Acme".into(),
         ..Default::default()
-    }];
+    };
+    fx.teams = vec![team.clone()];
+    fx.set_rail_workspaces(vec![team]);
     fx.channels = vec![ch_eng.clone(), ch_noise.clone()];
     fx.directory = vec![ch_eng, ch_dir_only, dm.clone()];
     fx.dms = vec![dm];
@@ -383,7 +385,7 @@ fn search_view_all_workspaces_scope_merges_hits_and_snippets_across_stores(
 
     let mut fx = crate::fixtures::load();
     fx.sample = true;
-    fx.workspaces = vec![
+    let teams = vec![
         Team {
             id: ws_a.clone(),
             name: "Alpha".into(),
@@ -395,6 +397,8 @@ fn search_view_all_workspaces_scope_merges_hits_and_snippets_across_stores(
             ..Default::default()
         },
     ];
+    fx.teams = teams.clone();
+    fx.set_rail_workspaces(teams);
 
     let view = cx.update(|cx| SearchView::new(Arc::new(fx), Some(shared_a.clone()), cx));
     view.update(cx, |v, cx| {
@@ -540,11 +544,13 @@ fn search_view_keyword_hybrid_semantic_modes_and_missing_model_prompt(cx: &mut T
 
     let mut fx = crate::fixtures::load();
     fx.sample = true;
-    fx.workspaces = vec![Team {
+    let team = Team {
         id: ws,
         name: "SemanticCorp".into(),
         ..Default::default()
-    }];
+    };
+    fx.teams = vec![team.clone()];
+    fx.set_rail_workspaces(vec![team]);
     fx.channels = vec![ch];
 
     let view = cx.update(|cx| SearchView::new(Arc::new(fx), Some(archive), cx));
@@ -738,11 +744,13 @@ fn search_view_tracks_local_loading_and_rejects_duplicate_remote_pages(cx: &mut 
 
     let mut fx = crate::fixtures::load();
     fx.sample = true;
-    fx.workspaces = vec![Team {
+    let team = Team {
         id: ws_a.clone(),
         name: "RaceWS".into(),
         ..Default::default()
-    }];
+    };
+    fx.teams = vec![team.clone()];
+    fx.set_rail_workspaces(vec![team]);
 
     // Archive is None, but AllWorkspaces has workspace_sources -> must still query!
     let view = cx.update(|cx| SearchView::new(Arc::new(fx), None, cx));
@@ -832,4 +840,12 @@ fn search_view_tracks_local_loading_and_rejects_duplicate_remote_pages(cx: &mut 
         );
         assert_eq!(v.remote_messages_len_for_test(), 2);
     });
+}
+
+#[test]
+fn transcript_match_excerpt_handles_oversized_query_without_panicking() {
+    let long_tx = "a".repeat(150);
+    let long_q = "a".repeat(121);
+    let excerpt = super::query::transcript_match_excerpt(&long_tx, &long_q);
+    assert!(excerpt.is_some());
 }

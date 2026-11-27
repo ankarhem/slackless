@@ -207,6 +207,7 @@ pub(crate) fn subtask_rows_for_parent(
 pub(super) fn live_cell(
     val: Option<&SlackListCellValue>,
     column: &SlackListColumn,
+    id_scope: &str,
     fixtures: &Fixtures,
     cx: &App,
 ) -> Div {
@@ -235,7 +236,7 @@ pub(super) fn live_cell(
             div().child(
                 div()
                     .id(gpui_kit::gpui::SharedString::from(format!(
-                        "list-link-{href}"
+                        "list-link-{id_scope}-{href}"
                     )))
                     .truncate()
                     .text_color(theme.link)
@@ -460,8 +461,7 @@ pub(super) fn render_record_comments_section(
             .map(|(_, token)| {
                 let q = token.to_ascii_lowercase();
                 fixtures
-                    .users
-                    .iter()
+                    .people()
                     .filter(|u| !u.deleted && !u.is_bot)
                     .filter(|u| {
                         q.is_empty()
@@ -582,7 +582,11 @@ pub(super) fn export_file(
             let Ok(Ok(Some(path))) = receiver.await else {
                 return;
             };
-            let result = std::fs::write(&path, content);
+            let write_path = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { std::fs::write(&write_path, content) })
+                .await;
             let _ = cx.update(|window, cx| match result {
                 Ok(()) => crate::actions::notify(
                     "List exported",

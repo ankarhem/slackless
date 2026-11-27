@@ -2,6 +2,7 @@
 //! popped-out secondary windows.
 
 use std::cell::Cell;
+use std::rc::Rc;
 
 use gpui_kit::component::input::TextareaState;
 use gpui_kit::gpui::{
@@ -490,22 +491,55 @@ impl PopoutWindow {
         if composer::outgoing_guard_prefs(cx).warn_before_sending_secrets {
             let matches = slackless_core::detect_secrets(&outgoing.content.text);
             if !matches.is_empty() {
-                let this = cx.entity().downgrade();
-                let pending = Cell::new(Some(outgoing));
-                composer::confirm_secret_send_dialog(matches, window, cx, move |window, cx| {
-                    if let Some(outgoing) = pending.take() {
-                        let _ =
-                            this.update(cx, |win, cx| win.guard_broadcast(outgoing, window, cx));
-                    }
-                });
+                let (this_send, this_cancel) = (cx.entity().downgrade(), cx.entity().downgrade());
+                let pending = Rc::new(Cell::new(Some(outgoing)));
+                let pending_send = Rc::clone(&pending);
+                composer::confirm_secret_send_dialog(
+                    matches,
+                    window,
+                    cx,
+                    move |window, cx| {
+                        if let Some(outgoing) = pending_send.take() {
+                            let _ = this_send
+                                .update(cx, |win, cx| win.guard_broadcast(outgoing, window, cx));
+                        }
+                    },
+                    move |_, cx| {
+                        if let Some(outgoing) = pending.take() {
+                            let _ = this_cancel
+                                .update(cx, |win, cx| win.restore_outgoing_draft(outgoing, cx));
+                        }
+                    },
+                );
                 return;
             }
         }
         self.guard_broadcast(outgoing, window, cx);
     }
 
+    /// Put a canceled pop-out send's text and staged files back into the composer (unless it was
+    /// a broadcast repost of an existing reply, which was never typed in the composer).
+    fn restore_outgoing_draft(&mut self, outgoing: Outgoing, cx: &mut Context<Self>) {
+        if outgoing.broadcast {
+            return;
+        }
+        if let Some(composer) = &self.composer {
+            let files: Vec<composer::PendingAttachment> = outgoing
+                .files
+                .into_iter()
+                .map(|f| composer::PendingAttachment::new(f.filename, f.bytes.to_vec(), None))
+                .collect();
+            composer.update(cx, |composer, cx| {
+                composer.load_draft(&outgoing.content.text, cx);
+                if !files.is_empty() {
+                    composer.restore_attachments(files, cx);
+                }
+            });
+        }
+    }
+
     /// [`Self::send_guarded`] once the text holds no secret: ask before a broadcast goes out, as
-    /// the main window does; canceling puts the text back in the composer.
+    /// the main window does; canceling puts the text and staged files back in the composer.
     fn guard_broadcast(&mut self, outgoing: Outgoing, window: &mut Window, cx: &mut Context<Self>) {
         let guard = self.send_target(cx).and_then(|(channel, _)| {
             crate::app::broadcast_guard(&outgoing.content, &self.fixtures, &channel, None)
@@ -515,22 +549,21 @@ impl PopoutWindow {
             return;
         };
         let (this_send, this_cancel) = (cx.entity().downgrade(), cx.entity().downgrade());
-        // Canceling puts typed text back; a reply sent to the channel was never typed here.
-        let typed = (!outgoing.broadcast).then(|| outgoing.content.text.clone());
-        let pending = Cell::new(Some(outgoing));
+        // Taken once on Send or Cancel, so staged files are neither copied nor dropped.
+        let pending = Rc::new(Cell::new(Some(outgoing)));
+        let pending_send = Rc::clone(&pending);
         crate::app::confirm_broadcast(
             guard,
             move |_, cx| {
-                if let Some(outgoing) = pending.take() {
+                if let Some(outgoing) = pending_send.take() {
                     let _ = this_send.update(cx, |win, cx| win.deliver(outgoing, cx));
                 }
             },
             move |_, cx| {
-                let _ = this_cancel.update(cx, |win, cx| {
-                    if let (Some(composer), Some(text)) = (&win.composer, &typed) {
-                        composer.update(cx, |composer, cx| composer.load_draft(text, cx));
-                    }
-                });
+                if let Some(outgoing) = pending.take() {
+                    let _ =
+                        this_cancel.update(cx, |win, cx| win.restore_outgoing_draft(outgoing, cx));
+                }
             },
             window,
             cx,

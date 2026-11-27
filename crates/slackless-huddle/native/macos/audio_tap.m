@@ -111,8 +111,10 @@ static OSStatus tap_io_proc(
 SlacklessAudioTap *slackless_audio_tap_start(
     void *ctx,
     SlacklessAudioTapCallback on_pcm,
+    uint32_t *out_sample_rate,
     char *err_buf,
     size_t err_buf_len) {
+    if (out_sample_rate) *out_sample_rate = 48000;
     if (!on_pcm) {
         slackless_write_err(err_buf, err_buf_len, "missing audio tap callback");
         return NULL;
@@ -211,6 +213,13 @@ SlacklessAudioTap *slackless_audio_tap_start(
 
             bool non_interleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
             uint32_t channels = asbd.mChannelsPerFrame > 0 ? asbd.mChannelsPerFrame : 2;
+            uint32_t sample_rate =
+                (asbd.mSampleRate >= 8000.0 && asbd.mSampleRate <= 384000.0)
+                    ? (uint32_t)llround(asbd.mSampleRate)
+                    : 48000;
+            if (out_sample_rate) {
+                *out_sample_rate = sample_rate;
+            }
 
             // Unique aggregate device UID per start (`pid` + atomic counter) so rapid stop/restart
             // never collides in CoreAudio's device registry.

@@ -278,6 +278,20 @@ impl ActivityFeed {
         cx.notify();
     }
 
+    /// Drop cached live activity rows when switching to another workspace so the outgoing
+    /// workspace's feed and unread badge never leak into the incoming workspace.
+    pub fn clear_for_workspace(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.fixtures = fixtures;
+        self.load = Load::Idle;
+        self.selected = None;
+        if self.fixtures.sample {
+            self.items = fixture_items(&self.fixtures);
+        } else {
+            self.items.clear();
+        }
+        cx.notify();
+    }
+
     /// A live fetch started; only the first page shows a loading state (refreshes keep the
     /// rows visible).
     pub fn start_loading(&mut self, cx: &mut Context<Self>) {
@@ -328,10 +342,42 @@ impl ActivityFeed {
         rows
     }
 
+    fn item_index(&self, channel: &ChannelId, ts: &Ts, thread_ts: Option<&Ts>) -> Option<usize> {
+        self.items.iter().position(|item| {
+            item.channel == *channel && item.ts == *ts && item.thread_ts.as_ref() == thread_ts
+        })
+    }
+
+    fn toggle_read_by_id(
+        &mut self,
+        channel: &ChannelId,
+        ts: &Ts,
+        thread_ts: Option<&Ts>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ix) = self.item_index(channel, ts, thread_ts) {
+            self.toggle_read(ix, cx);
+        }
+    }
+
+    fn open_by_id(
+        &mut self,
+        channel: &ChannelId,
+        ts: &Ts,
+        thread_ts: Option<&Ts>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ix) = self.item_index(channel, ts, thread_ts) {
+            self.open(ix, cx);
+        }
+    }
+
     fn toggle_read(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let item = &mut self.items[ix];
+        let Some(item) = self.items.get_mut(ix) else {
+            return;
+        };
         item.unread = !item.unread;
-        let read = item.unread;
+        let read = !item.unread;
         if let Some(entry) = item.entry.clone() {
             cx.emit(ActivityEvent::Mark {
                 entries: vec![entry],
@@ -341,8 +387,15 @@ impl ActivityFeed {
         cx.notify();
     }
 
+    #[cfg(test)]
+    pub(crate) fn toggle_read_for_test(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.toggle_read(ix, cx);
+    }
+
     fn open(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let item = &mut self.items[ix];
+        let Some(item) = self.items.get_mut(ix) else {
+            return;
+        };
         let was_unread = item.unread;
         item.unread = false;
         if was_unread && let Some(entry) = item.entry.clone() {
@@ -474,17 +527,32 @@ impl ActivityFeed {
                     .child(context_line(item, dim, cx)),
             )
             .child(self.row_edge(ix, unread, cx))
-            .on_click(cx.listener(move |this, _, _, cx| this.open(ix, cx)))
+            .on_click({
+                let (ch, ts, thread_ts) = (
+                    item.channel.clone(),
+                    item.ts.clone(),
+                    item.thread_ts.clone(),
+                );
+                cx.listener(move |this, _, _, cx| {
+                    this.open_by_id(&ch, &ts, thread_ts.as_ref(), cx);
+                })
+            })
     }
 
     /// The row's right edge: the unread pill (or dot) and the hover action bar.
     fn row_edge(&self, ix: usize, unread: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let (badge_bg, badge_fg) = crate::theme::mention_badge(cx);
         // Slack counts an unread item as at least one.
+        let item = &self.items[ix];
+        let (row_ch, row_ts, row_thread_ts) = (
+            item.channel.clone(),
+            item.ts.clone(),
+            item.thread_ts.clone(),
+        );
         let count = if unread {
-            self.items[ix].count.max(1)
+            item.count.max(1)
         } else {
-            self.items[ix].count
+            item.count
         };
         v_flex()
             .flex_none()
@@ -526,7 +594,12 @@ impl ActivityFeed {
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.toggle_read(ix, cx);
+                                this.toggle_read_by_id(
+                                    &row_ch,
+                                    &row_ts,
+                                    row_thread_ts.as_ref(),
+                                    cx,
+                                );
                             })),
                     ),
             )
@@ -1053,7 +1126,7 @@ mod tests {
     #[test]
     fn vips_match_ids_handles_and_display_names_in_any_case() {
         let mut fixtures = crate::fixtures::load();
-        fixtures.users.push(slackless_core::types::User {
+        fixtures.users_mut().push(slackless_core::types::User {
             id: UserId::from("U0GRACE"),
             name: "grace".to_owned(),
             profile: slackless_core::types::Profile {

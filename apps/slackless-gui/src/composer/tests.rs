@@ -1056,7 +1056,8 @@ fn composer_edit_mode_blank_rejection_attachments_and_draft_roundtrip(cx: &mut T
             assert_eq!(c.attachments[0].filename, "image-1.png");
             assert_eq!(c.attachments[1].filename, "image-2.jpg");
 
-            c.remove_attachment(0, cx);
+            let first_id = c.attachments[0].id;
+            c.remove_attachment(first_id, cx);
             assert_eq!(c.attachments.len(), 1);
             assert_eq!(c.attachments[0].filename, "image-2.jpg");
 

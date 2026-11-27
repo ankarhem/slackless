@@ -138,6 +138,7 @@ unsafe extern "C" {
         on_h264: SlacklessH264Callback,
         on_surface_preview: SlacklessSurfaceCallback,
         on_error: SlacklessErrorCallback,
+        on_released: Option<SlacklessCaptureReleasedCallback>,
         err_buf: *mut c_char,
         err_buf_len: usize,
     ) -> *mut SlacklessScCapture;
@@ -145,7 +146,6 @@ unsafe extern "C" {
     pub(crate) fn slackless_sc_capture_set_bitrate(cap: *mut SlacklessScCapture, bitrate_bps: u32);
     pub(crate) fn slackless_sc_capture_stop(
         cap: *mut SlacklessScCapture,
-        ctx: *mut c_void,
         on_released: Option<SlacklessCaptureReleasedCallback>,
     );
 
@@ -239,6 +239,7 @@ unsafe extern "C" {
     pub(crate) fn slackless_audio_tap_start(
         ctx: *mut c_void,
         on_pcm: SlacklessAudioTapCallback,
+        out_sample_rate: *mut u32,
         err_buf: *mut c_char,
         err_buf_len: usize,
     ) -> *mut SlacklessAudioTap;
@@ -357,4 +358,192 @@ pub(crate) unsafe extern "C" fn on_error_cb(_ctx: *mut c_void, message: *const c
             .unwrap_or("macOS capture stream stopped")
     };
     tracing::warn!(error = msg, "macOS hardware media capture error");
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    fn count_params(param_list: &str) -> usize {
+        let trimmed = param_list.trim();
+        if trimmed.is_empty() || trimmed == "void" {
+            return 0;
+        }
+        // Count top-level commas (ignore commas inside nested parentheses like function pointers).
+        let mut depth = 0usize;
+        let mut count = 1usize;
+        let mut has_trailing_comma = false;
+        let chars: Vec<char> = trimmed.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    let rest = trimmed[trimmed
+                        .char_indices()
+                        .nth(i + 1)
+                        .map_or(trimmed.len(), |(b, _)| b)..]
+                        .trim();
+                    if rest.is_empty() {
+                        has_trailing_comma = true;
+                    } else {
+                        count += 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let _ = has_trailing_comma;
+        count
+    }
+
+    fn parse_rust_extern_fns(src: &str) -> HashMap<String, usize> {
+        let mut out = HashMap::new();
+        let mut rest = src;
+        while let Some(pos) = rest.find("fn slackless_") {
+            let after_fn = &rest[pos + 3..];
+            let Some(open) = after_fn.find('(') else {
+                break;
+            };
+            let name = after_fn[..open].trim().to_owned();
+            // Find matching ')'
+            let mut depth = 0usize;
+            let mut close = None;
+            for (idx, ch) in after_fn[open..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open + idx);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = close else {
+                break;
+            };
+            // Strip line comments inside the param list before counting.
+            let raw_params = &after_fn[open + 1..close];
+            let cleaned: String = raw_params
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.insert(name, count_params(&cleaned));
+            rest = &after_fn[close + 1..];
+        }
+        out
+    }
+
+    fn parse_objc_fn_defs(src: &str) -> HashMap<String, usize> {
+        let mut out = HashMap::new();
+        let bytes = src.as_bytes();
+        let mut search_from = 0usize;
+        while let Some(rel) = src[search_from..].find("slackless_") {
+            let pos = search_from + rel;
+            search_from = pos + "slackless_".len();
+            // Must be preceded by whitespace or '*' on a non-indented top-level definition line.
+            let line_start = src[..pos].rfind('\n').map_or(0, |n| n + 1);
+            let prefix = &src[line_start..pos];
+            if prefix.trim().is_empty()
+                || prefix.starts_with(' ')
+                || prefix.starts_with('\t')
+                || prefix.contains("//")
+                || prefix.contains("static ")
+            {
+                continue;
+            }
+            let after_name_start = &src[pos..];
+            let name_end = after_name_start
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(after_name_start.len());
+            let name = &after_name_start[..name_end];
+            let after_name = &after_name_start[name_end..];
+            if !after_name.starts_with('(') {
+                continue;
+            }
+            let mut depth = 0usize;
+            let mut close = None;
+            for (idx, ch) in after_name.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(idx);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = close else {
+                continue;
+            };
+            // Definition is followed by `{` (skipping whitespace).
+            let tail = after_name[close + 1..].trim_start();
+            if !tail.starts_with('{') {
+                continue;
+            }
+            let _ = bytes;
+            let raw_params = &after_name[1..close];
+            let cleaned: String = raw_params
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.insert(name.to_owned(), count_params(&cleaned));
+        }
+        out
+    }
+
+    /// Structural ABI guardrail: every `extern "C" fn slackless_*` declared in `ffi.rs` must
+    /// match the exact parameter count of its Objective-C definition in `native/macos/*.m`.
+    #[test]
+    fn objc_ffi_parameter_counts_match_rust_declarations() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ffi_src = std::fs::read_to_string(crate_dir.join("src/macos/ffi.rs"))
+            .expect("read src/macos/ffi.rs");
+        let prod_src = ffi_src.split("#[cfg(test)]").next().unwrap_or(&ffi_src);
+        let rust_fns = parse_rust_extern_fns(prod_src);
+        assert!(
+            rust_fns.len() >= 20,
+            "expected >= 20 extern C declarations in ffi.rs, found {}",
+            rust_fns.len()
+        );
+
+        let mut objc_fns = HashMap::new();
+        let native_dir = crate_dir.join("native/macos");
+        for entry in std::fs::read_dir(&native_dir).expect("read native/macos") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) == Some("m") {
+                let src = std::fs::read_to_string(&path).expect("read .m");
+                objc_fns.extend(parse_objc_fn_defs(&src));
+            }
+        }
+
+        let mut mismatches = Vec::new();
+        for (name, rust_arity) in &rust_fns {
+            match objc_fns.get(name) {
+                Some(objc_arity) if objc_arity == rust_arity => {}
+                Some(objc_arity) => mismatches.push(format!(
+                    "{name}: Rust declares {rust_arity} params, ObjC defines {objc_arity} params"
+                )),
+                None => mismatches.push(format!(
+                    "{name}: declared in ffi.rs ({rust_arity} params) but no ObjC definition found in native/macos/*.m"
+                )),
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "FFI ABI arity mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
 }

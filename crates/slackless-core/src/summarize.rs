@@ -1387,8 +1387,12 @@ pub fn load_channel_target(
     limit: usize,
 ) -> Result<SummaryTarget, SummarizeError> {
     let limit = limit.clamp(1, 500);
-    let rows = store
-        .channel_history(workspace, channel, None, limit)
+    let window = crate::export::ChannelWindow {
+        limit,
+        include_deleted: false,
+        ..Default::default()
+    };
+    let rows = crate::export::read_channel_window(store, workspace, channel, &window)
         .map_err(|e| SummarizeError::EmptyInput(format!("reading channel: {e}")))?;
     let users = store.user_labels(workspace).unwrap_or_default();
     let (channel_label, topic) = channel_label_and_topic(store, workspace, channel, &users);
@@ -2006,5 +2010,54 @@ mod tests {
             summarize(&cfg_huge, &target).await,
             Err(SummarizeError::InvalidResponse(_))
         ));
+    }
+
+    #[test]
+    fn load_channel_target_paginates_past_deleted_tombstones() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ws = TeamId::from("T1");
+        let ch = ChannelId::from("C1");
+        store
+            .upsert_conversation(
+                &ws,
+                &crate::types::Conversation {
+                    id: ch.clone(),
+                    name: Some("general".into()),
+                    is_channel: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut msgs = Vec::new();
+        for i in 1..=6 {
+            msgs.push(crate::types::Message {
+                ts: Ts::from(format!("170000000{i}.000100")),
+                user: Some(UserId::from("U1")),
+                text: format!("msg {i}"),
+                ..Default::default()
+            });
+        }
+        store.upsert_messages(&ws, &ch, &msgs).unwrap();
+        // Delete the 4 newest messages so a naive limit=3 read sees only tombstones.
+        for i in 3..=6 {
+            store
+                .record_deletion(
+                    &ws,
+                    &ch,
+                    &Ts::from(format!("170000000{i}.000100")),
+                    Some(&Ts::from(format!("170000010{i}.000100"))),
+                    None,
+                )
+                .unwrap();
+        }
+        let target = load_channel_target(&store, &ws, &ch, 3).unwrap();
+        match target {
+            SummaryTarget::Channel { messages, .. } => {
+                assert_eq!(messages.len(), 2);
+                assert_eq!(messages[0].text, "msg 1");
+                assert_eq!(messages[1].text, "msg 2");
+            }
+            other => panic!("expected Channel target, got {other:?}"),
+        }
     }
 }

@@ -56,7 +56,7 @@ impl Sidebar {
             .gap_2()
             .children(
                 self.fixtures
-                    .workspaces
+                    .rail_workspaces()
                     .iter()
                     .enumerate()
                     .map(|(index, team)| self.workspace_tile(index, team, cx))
@@ -439,7 +439,7 @@ impl Sidebar {
                 .border_color(badge_ring)
                 .bg(theme.sidebar_foreground)
         });
-        let ws_len = self.fixtures.workspaces.len();
+        let ws_len = self.fixtures.rail_workspaces().len();
         let this_ws = cx.entity().downgrade();
         // Slack rings the active workspace's icon; the others take a faint ring on hover.
         div()
@@ -517,7 +517,7 @@ impl Sidebar {
 
     pub(super) fn workspace_header(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
-        let team = &self.fixtures.workspaces[self.active_workspace];
+        let team = &self.fixtures.rail_workspaces()[self.active_workspace];
         let dim = theme.sidebar_foreground.opacity(0.6);
         let hover = theme.sidebar_foreground.opacity(0.08);
         // Slack's "Norce ⌄": the chevron rides right after the name, the icons sit right.

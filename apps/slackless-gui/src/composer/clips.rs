@@ -17,7 +17,7 @@ impl Composer {
         }
     }
 
-    fn clear_clip_review(&mut self, cx: &mut Context<Self>) -> Option<ClipReview> {
+    pub(super) fn clear_clip_review(&mut self, cx: &mut Context<Self>) -> Option<ClipReview> {
         let review = self.clip_review.take()?;
         for thumb in &review.thumbs {
             cx.drop_image(Arc::clone(thumb), None);
@@ -79,14 +79,18 @@ impl Composer {
 
     /// Discard an active clip recording without attaching it.
     pub fn cancel_clip(&mut self, cx: &mut Context<Self>) {
+        self.draft_gen = self.draft_gen.wrapping_add(1);
         self.clip_ticker = None;
         self.clear_clip_preview(cx);
         self.clip_stopping = false;
         if let Some(active) = self.clip_recorder.take() {
-            match active {
-                ActiveClipRecorder::Audio(r) => r.cancel(),
-                ActiveClipRecorder::Video { recorder, .. } => recorder.cancel(),
-            }
+            // Stopping OS audio/video streams and joining worker threads can block: offload it.
+            let _ = std::thread::Builder::new()
+                .name("slackless-clip-cancel".to_owned())
+                .spawn(move || match active {
+                    ActiveClipRecorder::Audio(r) => r.cancel(),
+                    ActiveClipRecorder::Video { recorder, .. } => recorder.cancel(),
+                });
         }
         cx.notify();
     }
@@ -96,45 +100,45 @@ impl Composer {
         let Some(active) = self.clip_recorder.take() else {
             return;
         };
+        let draft_gen = self.draft_gen;
         self.clip_ticker = None;
         self.clear_clip_preview(cx);
         self.clip_stopping = true;
         cx.notify();
 
         match active {
-            ActiveClipRecorder::Audio(recorder) => match recorder.stop_to_pcm() {
-                Ok((pcm, elapsed_ms)) => {
-                    cx.spawn(async move |this, cx| {
-                        let res = cx
-                            .background_executor()
-                            .spawn(async move { finish_audio_clip(pcm, elapsed_ms) })
-                            .await;
-                        let _ = this.update(cx, |composer, cx| {
-                            composer.clip_stopping = false;
-                            match res {
-                                Ok(clip) => {
-                                    composer.attachments.push(PendingAttachment {
-                                        filename: clip.filename,
-                                        bytes: clip.bytes,
-                                        preview: None,
-                                    });
-                                }
-                                Err(err) => {
-                                    composer.upload_warning =
-                                        Some(format!("Audio clip encoding failed: {err}"));
-                                }
+            ActiveClipRecorder::Audio(recorder) => {
+                cx.spawn(async move |this, cx| {
+                    let res = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let (pcm, elapsed_ms) = recorder.stop_to_pcm()?;
+                            finish_audio_clip(pcm, elapsed_ms)
+                        })
+                        .await;
+                    let _ = this.update(cx, |composer, cx| {
+                        if composer.draft_gen != draft_gen || composer.edit_mode {
+                            return;
+                        }
+                        composer.clip_stopping = false;
+                        match res {
+                            Ok(clip) => {
+                                composer.attachments.push(PendingAttachment::new(
+                                    clip.filename,
+                                    clip.bytes,
+                                    None,
+                                ));
                             }
-                            cx.notify();
-                        });
-                    })
-                    .detach();
-                }
-                Err(err) => {
-                    self.clip_stopping = false;
-                    self.upload_warning = Some(format!("Audio clip error: {err}"));
-                    cx.notify();
-                }
-            },
+                            Err(err) => {
+                                composer.upload_warning =
+                                    Some(format!("Audio clip encoding failed: {err}"));
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
             ActiveClipRecorder::Video { recorder, .. } => {
                 cx.spawn(async move |this, cx| {
                     let res = cx
@@ -142,6 +146,9 @@ impl Composer {
                         .spawn(async move { recorder.stop() })
                         .await;
                     let _ = this.update(cx, |composer, cx| {
+                        if composer.draft_gen != draft_gen || composer.edit_mode {
+                            return;
+                        }
                         composer.clip_stopping = false;
                         match res {
                             Ok(clip) => {
@@ -151,11 +158,11 @@ impl Composer {
                                     .filter_map(crate::huddle_video::frame_to_render_image)
                                     .collect::<Vec<_>>();
                                 if thumbs.is_empty() {
-                                    composer.attachments.push(PendingAttachment {
-                                        filename: clip.filename,
-                                        bytes: clip.bytes,
-                                        preview: None,
-                                    });
+                                    composer.attachments.push(PendingAttachment::new(
+                                        clip.filename,
+                                        clip.bytes,
+                                        None,
+                                    ));
                                 } else {
                                     let _ = composer.clear_clip_review(cx);
                                     composer.clip_review = Some(ClipReview {
@@ -183,11 +190,8 @@ impl Composer {
     /// Confirm the reviewed video clip (keeping the chosen thumbnail) and attach it (`F-COLLAB-099`).
     pub fn confirm_clip_review(&mut self, cx: &mut Context<Self>) {
         if let Some(review) = self.clear_clip_review(cx) {
-            self.attachments.push(PendingAttachment {
-                filename: review.filename,
-                bytes: review.bytes,
-                preview: None,
-            });
+            self.attachments
+                .push(PendingAttachment::new(review.filename, review.bytes, None));
             cx.notify();
         }
     }

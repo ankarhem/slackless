@@ -167,8 +167,15 @@ impl App {
         let order: Vec<String> = (self.rail.iter())
             .map(|&ix| self.slots[ix].team.id.as_str().to_owned())
             .collect();
-        if let Some(write) = self.bridge.remember(&WORKSPACE_ORDER, order.as_slice()) {
-            cx.background_executor().spawn(write).detach();
+        // Persist the rail order to every workspace's local store so cold launch reads the
+        // latest order no matter which workspace sits first in SessionStore.
+        for ix in 0..self.slots.len() {
+            if let Some(write) = self
+                .workspace_bridge(ix)
+                .and_then(|bridge| bridge.remember(&WORKSPACE_ORDER, order.as_slice()))
+            {
+                cx.background_executor().spawn(write).detach();
+            }
         }
         self.sync_rail(cx);
         self.sync_badge(cx);
@@ -814,9 +821,9 @@ impl App {
     /// team refresh (or a sample workspace's own list) takes the current order first.
     pub(super) fn sync_rail(&mut self, cx: &mut Context<Self>) {
         let teams = self.rail_teams();
-        if self.fixtures.workspaces != teams {
+        if self.fixtures.rail_workspaces() != teams {
             let mut fixtures = self.fixtures.with_counts(self.fixtures.counts.clone());
-            fixtures.workspaces = teams;
+            fixtures.set_rail_workspaces(teams);
             let fixtures = Arc::new(fixtures);
             self.sync_all_views_fixtures(fixtures.clone(), cx);
             self.fixtures = fixtures;
@@ -844,6 +851,7 @@ impl App {
         crate::media::stop_active_inline_video(window, cx);
         self.close_image_viewer(window, cx);
         crate::media::clear_pdf_cache(window, cx);
+        window.close_dialog(cx);
         self.modal_stack
             .update(cx, |stack, cx| stack.dismiss_all(window, cx));
         self.workflow_details = None;
@@ -866,7 +874,7 @@ impl App {
                 let local = self.bridge.all_local();
                 let (fixtures, channel, archive, chosen, reload) =
                     if let Some(mut snap) = self.bridge.placeholder(&state.counts) {
-                        snap.workspaces = self.rail_teams();
+                        snap.set_rail_workspaces(self.rail_teams());
                         // The conversation last open here opens at once; the snapshot confirms
                         // it when it lands, else the first conversation opens instead.
                         let restored = LAST_CONVERSATION.read(&local);
@@ -909,6 +917,17 @@ impl App {
                         .sidebar
                         .update(cx, |sidebar, cx| sidebar.restore_section_prefs(prefs, cx));
                 }
+                if self.huddle_session.is_some() {
+                    views
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.set_self_in_huddle(true, cx));
+                }
+                if !state.active_huddles.is_empty() {
+                    let active_huddles = state.active_huddles.clone();
+                    views
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.set_huddles(active_huddles, cx));
+                }
                 let initial_outbox = self.bridge.outbox_sync();
                 if !initial_outbox.is_empty() {
                     views
@@ -938,22 +957,48 @@ impl App {
         left.parked = Some(outgoing);
         left.state = outgoing_state;
         self.workspace = index;
+        self.workspace_epoch = self.workspace_epoch.wrapping_add(1);
+        self.history_generation = self.history_generation.wrapping_add(1);
+        self.thread_generation = self.thread_generation.wrapping_add(1);
+        self.catchup_generation = self.catchup_generation.wrapping_add(1);
+        self.unreads_refresh.overtake();
         // The outgoing workspace's read in flight is dropped (its reload stays pending in its
         // parked state); the incoming one's pending reload resumes.
         self.start_reload(window, cx);
         self.open_members = None;
         self.members_hover = (false, false);
         self.channel_people = None;
+        self.typing.clear();
+        self.typing_expiry = gpui::Task::ready(());
+        self.show_typing(cx);
+        self.picker = None;
+        self.remind_menu = None;
+        self.profile_hover = hover_card::Lifecycle::default();
         self.sync_connect_orgs(cx);
         self.load_join_people(cx);
         self.page = MainPage::Channel;
         self.unreads_fetched.clear();
         self.back.clear();
         self.forward.clear();
+        self.recent.clear();
         self.pending_dm = None;
+        self.last_right_pane = None;
+        self.user_menu_open = false;
+        self.canvas_query.clear();
+        self.list_query.clear();
+        self.list_sort = None;
         self.set_right_pane(RightPane::None, cx);
         let fixtures = self.fixtures.clone();
         self.threads.update(cx, |view, cx| {
+            view.clear_for_workspace(fixtures.clone(), cx)
+        });
+        self.activity.update(cx, |view, cx| {
+            view.clear_for_workspace(fixtures.clone(), cx)
+        });
+        self.unreads.update(cx, |view, cx| {
+            view.clear_for_workspace(fixtures.clone(), cx)
+        });
+        self.files_page.update(cx, |view, cx| {
             view.clear_for_workspace(fixtures.clone(), cx)
         });
         self.later.update(cx, |later, cx| {
@@ -1117,6 +1162,7 @@ impl App {
         };
         let team = self.team().id.clone();
         let me = self.fixtures.self_user.clone();
+        let epoch = self.workspace_epoch;
         cx.spawn(async move |this, cx| {
             let cards = cx
                 .background_executor()
@@ -1128,6 +1174,9 @@ impl App {
                 })
                 .await;
             let _ = this.update(cx, |app, cx| {
+                if app.workspace_epoch != epoch {
+                    return;
+                }
                 app.threads
                     .update(cx, |view, cx| view.show_store(cards, cx));
             });
@@ -1274,6 +1323,7 @@ impl App {
             self.refresh_catchup(cx);
             return;
         }
+        let epoch = self.workspace_epoch;
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .spawn(async move {
@@ -1283,7 +1333,9 @@ impl App {
                 })
                 .await;
             let _ = this.update(cx, |app, cx| {
-                app.refresh_catchup(cx);
+                if app.workspace_epoch == epoch {
+                    app.refresh_catchup(cx);
+                }
             });
         })
         .detach();
@@ -1388,6 +1440,7 @@ impl App {
         // Keep already-loaded store groups on screen while refreshing off-thread (never flash
         // empty `local_groups` placeholders).
         let fixtures = self.fixtures.clone();
+        let epoch = self.workspace_epoch;
         self.unreads
             .update(cx, |view, cx| view.begin_live_refresh(fixtures, cx));
         cx.spawn(async move |this, cx| {
@@ -1404,6 +1457,9 @@ impl App {
                 let Some(again) = app.unreads_refresh.land(generation) else {
                     return;
                 };
+                if app.workspace_epoch != epoch {
+                    return;
+                }
                 // The view closed while the store was read: its next opening reads again.
                 if app.page != MainPage::Unreads {
                     return;

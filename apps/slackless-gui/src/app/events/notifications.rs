@@ -68,14 +68,36 @@ impl App {
         is_direct_or_mention: bool,
         breakthrough: bool,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        self.system_notification_with_sound(
+            tag,
+            title,
+            body,
+            is_direct_or_mention,
+            breakthrough,
+            None,
+            cx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::app) fn system_notification_with_sound(
+        &mut self,
+        tag: &str,
+        title: &str,
+        body: &str,
+        is_direct_or_mention: bool,
+        breakthrough: bool,
+        sound_override: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         // Duplicate-notification guard (`F-SHELL-181`): ignore identical notification tags
         // arriving within 60 seconds (e.g. reconnect replay or dual socket/poll delivery).
         let now = Instant::now();
         self.recent_notified_tags
             .retain(|(_, at)| now.duration_since(*at) < Duration::from_secs(60));
         if self.recent_notified_tags.iter().any(|(t, _)| t == tag) {
-            return;
+            return false;
         }
         self.recent_notified_tags.push((tag.to_owned(), now));
         if self.recent_notified_tags.len() > 128 {
@@ -93,7 +115,13 @@ impl App {
         if bounce && is_direct_or_mention && !self.window_active {
             self.os.request_attention(false);
         }
-        self.play_notification_sound_with_breakthrough(is_direct_or_mention, breakthrough, cx);
+        self.play_notification_sound_with_breakthrough(
+            is_direct_or_mention,
+            breakthrough,
+            sound_override,
+            cx,
+        );
+        true
     }
 
     /// Check whether today's opt-in Daily Catch-Up reminder is due and fire it at most once per
@@ -289,6 +317,7 @@ impl App {
         let (rules, owned_ctx) = self.build_owned_rule_context(channel, message, cx);
         let channel_owned = channel.clone();
         let message_owned = message.clone();
+        let epoch = self.workspace_epoch;
         let window_handle = self.window_handle;
         cx.spawn(async move |this, cx| {
             let rule_eval = cx
@@ -301,6 +330,9 @@ impl App {
                 .await;
             let _ = window_handle.update(cx, |_, window, cx| {
                 let _ = this.update(cx, |app, cx| {
+                    if app.workspace_epoch != epoch {
+                        return;
+                    }
                     app.dispatch_message_notification(
                         &channel_owned,
                         &message_owned,
@@ -333,7 +365,8 @@ impl App {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.should_notify_with_eval(channel, message, rule_eval, window, cx) {
+        let decision = self.decide_notification_with_eval(channel, message, rule_eval, window, cx);
+        if !decision.notify {
             return;
         }
         let Some(kind) = self.conversation_kind(channel, message) else {
@@ -377,24 +410,20 @@ impl App {
         } else {
             raw_title
         };
-        let is_dm_or_mention = rule_eval.breaks_through_mute()
-            || rule_eval.is_priority_highlight()
-            || matches!(kind, ConversationKind::Im | ConversationKind::Mpim)
-            || mentions_me(
-                &message.text,
-                &self.fixtures.self_user,
-                &self.preferences.read(cx).settings().keywords,
-            );
         let tag = format!("msg:{channel}:{}", message.ts);
-        self.system_notification_with_breakthrough(
+        let vip_sound = decision
+            .sender_is_vip
+            .then(|| self.preferences.read(cx).settings().vip_sound);
+        let shown = self.system_notification_with_sound(
             &tag,
             &title,
             &body,
-            is_dm_or_mention,
-            rule_eval.breaks_through_mute(),
+            decision.is_direct_or_mention,
+            decision.breakthrough,
+            vip_sound,
             cx,
         );
-        if self.preferences.read(cx).settings().announce_incoming {
+        if shown && self.preferences.read(cx).settings().announce_incoming {
             #[cfg(all(target_os = "macos", not(test)))]
             {
                 let announcement: String = format!("{title}. {body}").chars().take(160).collect();
@@ -514,45 +543,19 @@ impl App {
         cx: &gpui::App,
     ) -> bool {
         let eval = self.evaluate_smart_rules(channel, message, cx);
-        self.should_notify_with_eval(channel, message, &eval, window, cx)
+        self.decide_notification_with_eval(channel, message, &eval, window, cx)
+            .notify
     }
 
-    fn should_notify_with_eval(
+    fn decide_notification_with_eval(
         &self,
         channel: &ChannelId,
         message: &Message,
         rule_eval: &slackless_core::rules::RuleEvaluation,
         window: &Window,
         cx: &gpui::App,
-    ) -> bool {
-        let me = &self.fixtures.self_user;
+    ) -> super::NotificationDecision {
         let settings = self.preferences.read(cx).settings();
-        if !settings.desktop_notifications || message.user.as_ref() == Some(me) {
-            return false;
-        }
-        if rule_eval.is_suppressed() {
-            return false;
-        }
-        let dm = matches!(
-            self.conversation_kind(channel, message),
-            Some(ConversationKind::Im | ConversationKind::Mpim)
-        );
-        let sender_is_vip = message.user.as_ref().is_some_and(|u| {
-            let user_obj = self.fixtures.user(u);
-            let handle = user_obj.map(|x| x.name.as_str()).unwrap_or("");
-            let display = user_obj.map(|x| x.display_name()).unwrap_or("");
-            settings.is_vip(u.as_str(), handle, display)
-        });
-        let breakthrough = sender_is_vip
-            || settings.is_urgent_dm_breakthrough(dm, &message.text)
-            || rule_eval.breaks_through_mute();
-        if !breakthrough
-            && (self.self_state.paused()
-                || self.self_state.focused()
-                || !settings.notifications_allowed_now())
-        {
-            return false;
-        }
         let reply = message
             .thread_ts
             .as_ref()
@@ -569,36 +572,19 @@ impl App {
         } else {
             self.channel == *channel
         };
-        if on_screen && window.is_window_active() {
-            return false;
-        }
-        let level = self.fixtures.notify_levels.get(channel).copied();
-        if level == Some(NotifyLevel::Muted) && !breakthrough {
-            return false;
-        }
-        if breakthrough || rule_eval.is_priority_highlight() {
-            return true;
-        }
-        let mentioned = mentions_me(&message.text, me, &settings.keywords);
-        let wanted = match (level, settings.notify_level) {
-            (Some(NotifyLevel::Everything), _) => true,
-            (Some(NotifyLevel::Mentions), _) => dm || mentioned,
-            (Some(NotifyLevel::Muted), _) => false,
-            (None, 0) => true,
-            (None, 1) => dm || mentioned,
-            (None, _) => false,
-        };
-        if reply && !dm && !mentioned {
-            let channel_followed = settings
-                .follow_all_threads_channels
-                .iter()
-                .any(|id| id == channel.as_str());
-            return (wanted
-                && settings.thread_replies
-                && message.parent_user_id.as_ref() == Some(me))
-                || channel_followed;
-        }
-        wanted
+        super::decide_message_notification(&super::NotificationInput {
+            self_user: &self.fixtures.self_user,
+            channel,
+            message,
+            sender: message.user.as_ref().and_then(|u| self.fixtures.user(u)),
+            kind: self.conversation_kind(channel, message),
+            level: self.fixtures.notify_levels.get(channel).copied(),
+            on_screen_active: on_screen && window.is_window_active(),
+            paused: self.self_state.paused(),
+            focused: self.self_state.focused(),
+            settings,
+            rule_eval,
+        })
     }
 
     /// Play the notification sound chosen in Preferences, unless muted or in quiet hours / DND
@@ -607,6 +593,7 @@ impl App {
         &mut self,
         is_direct_or_mention: bool,
         breakthrough: bool,
+        sound_override: Option<usize>,
         cx: &mut Context<Self>,
     ) {
         let settings = self.preferences.read(cx).settings();
@@ -620,11 +607,11 @@ impl App {
         {
             return;
         }
-        let choice = if is_direct_or_mention {
+        let choice = sound_override.unwrap_or(if is_direct_or_mention {
             settings.dm_sound
         } else {
             settings.sound
-        };
+        });
         self.play_sound(choice, cx);
     }
 

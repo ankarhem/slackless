@@ -607,14 +607,28 @@ impl PopoutWindow {
             .text_color(pal.drawer_fg)
             .on_key_down(
                 cx.listener(|this, event: &gpui_kit::gpui::KeyDownEvent, _, cx| {
-                    if event.keystroke.key == "escape"
-                        && (this.huddle_topic_editing.take().is_some()
+                    if event.keystroke.key == "escape" {
+                        let exited_draw = this
+                            .huddle_state_entity()
+                            .filter(|st| st.read(cx).draw_mode())
+                            .map(|st| {
+                                st.update(cx, |s, cx| s.set_draw_mode(false, cx));
+                                this.huddle_draw_mode = false;
+                                this.huddle_drawing_active = false;
+                                this.huddle_draw_points.clear();
+                                this.huddle_draw_local_segments.clear();
+                                this.huddle_draw_local_item.clear();
+                            })
+                            .is_some();
+                        if exited_draw
+                            || this.huddle_topic_editing.take().is_some()
                             || this.huddle_popover.is_some()
-                            || this.huddle_drawer.take().is_some())
-                    {
-                        this.close_share_modal(cx);
-                        this.close_huddle_popovers();
-                        cx.notify();
+                            || this.huddle_drawer.take().is_some()
+                        {
+                            this.close_share_modal(cx);
+                            this.close_huddle_popovers();
+                            cx.notify();
+                        }
                     }
                 }),
             )

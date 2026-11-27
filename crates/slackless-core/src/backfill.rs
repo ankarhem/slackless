@@ -135,6 +135,7 @@ pub async fn walk_history<S: HistorySink>(
     let mut catch_up_newest: Option<Ts> = None;
     let mut latest: Option<Ts> = None;
     let mut cursor: Option<String> = None;
+    let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut first = true;
     loop {
         if opts.max_pages > 0 && stats.pages_fetched >= opts.max_pages as u64 {
@@ -150,7 +151,7 @@ pub async fn walk_history<S: HistorySink>(
         let next = page
             .next_cursor
             .clone()
-            .filter(|c| Some(c) != cursor.as_ref());
+            .filter(|c| seen_cursors.insert(c.clone()));
         let newest = page.items.iter().map(|m| &m.ts).max().cloned();
         let oldest = page.items.iter().map(|m| &m.ts).min().cloned();
         let overlaps = catching_up
@@ -223,6 +224,7 @@ pub async fn walk_history<S: HistorySink>(
             }
             latest = Some(span.oldest);
             cursor = None;
+            seen_cursors.clear();
             continue;
         }
 
@@ -267,6 +269,7 @@ pub async fn walk_history<S: HistorySink>(
 /// replies stored. Read-only on Slack: it never moves the user's read cursor.
 pub async fn walk_thread<S: HistorySink>(thread_ts: &Ts, sink: &mut S) -> Result<u64, CoreError> {
     let mut cursor: Option<String> = None;
+    let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut first = true;
     let mut stored = 0u64;
     loop {
@@ -279,7 +282,7 @@ pub async fn walk_thread<S: HistorySink>(thread_ts: &Ts, sink: &mut S) -> Result
             .await?;
         let next = page
             .next_cursor
-            .filter(|next| Some(next) != cursor.as_ref());
+            .filter(|next| seen_cursors.insert(next.clone()));
         stored += page.items.iter().filter(|m| &m.ts != thread_ts).count() as u64;
         sink.store_replies(page.items, fetched_at).await?;
         match next {
@@ -817,6 +820,33 @@ impl<B: Backend> Backfill<B> {
         channel_name: Option<String>,
         include_threads: bool,
     ) {
+        /// Ensures `BackfillControl` never stays stuck in `Running` if the explicit single-channel
+        /// backfill task is aborted (e.g. closing the conversation or shutting down).
+        struct ChannelRunGuard {
+            control: BackfillControl,
+            events: Emitter,
+            channel: ChannelId,
+            channel_name: Option<String>,
+            finished: bool,
+        }
+        impl Drop for ChannelRunGuard {
+            fn drop(&mut self) {
+                if !self.finished {
+                    let _ = self.control.update_channel(
+                        &self.channel,
+                        self.channel_name.as_deref(),
+                        |c| {
+                            if c.status == BackfillStatus::Running {
+                                c.status = BackfillStatus::Idle;
+                            }
+                        },
+                    );
+                    let done = self.control.finish_run(false);
+                    self.events.emit(Event::BackfillProgress(done));
+                }
+            }
+        }
+
         let _ = self
             .control
             .update_channel(&channel, channel_name.as_deref(), |c| {
@@ -826,15 +856,25 @@ impl<B: Backend> Backfill<B> {
         let snap = self.control.set_active_channel(Some(channel.clone()));
         self.events.emit(Event::BackfillProgress(snap));
 
+        let mut guard = ChannelRunGuard {
+            control: self.control.clone(),
+            events: self.events.clone(),
+            channel: channel.clone(),
+            channel_name: channel_name.clone(),
+            finished: false,
+        };
+
         match self
             .walk(&channel, channel_name.as_deref(), include_threads, true)
             .await
         {
             Ok(()) => {
+                guard.finished = true;
                 let done = self.control.finish_run(false);
                 self.events.emit(Event::BackfillProgress(done));
             }
             Err(e) => {
+                guard.finished = true;
                 let msg = e.to_string();
                 let _ = self
                     .control
@@ -1547,5 +1587,38 @@ mod tests {
         assert_eq!(snap.status, BackfillStatus::Paused);
         assert!(snap.paused);
         assert_eq!(snap.active_channel, Some(ChannelId::from("C_WS")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aborting_explicit_channel_backfill_clears_running_status() {
+        let fake = FakeBackend::with_history(1..=10);
+        let (bf, _rx) = backfill(&fake);
+        let control = bf.control.clone();
+        control.pause();
+        let ch = ChannelId::from("C_ABORT");
+
+        let task = tokio::spawn(bf.clone().run_with_options(
+            ch.clone(),
+            Some("abort-me".into()),
+            false,
+        ));
+        // Yield until the task marks the channel Running and parks on pause.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if control.snapshot().active_channel.as_ref() == Some(&ch) {
+                break;
+            }
+        }
+        assert_eq!(control.snapshot().active_channel.as_ref(), Some(&ch));
+
+        task.abort();
+        let _ = task.await;
+        let snap = control.snapshot();
+        assert_ne!(
+            snap.status,
+            BackfillStatus::Running,
+            "aborted channel backfill must not leave BackfillControl stuck in Running"
+        );
+        assert_eq!(snap.active_channel, None);
     }
 }

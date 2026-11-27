@@ -369,11 +369,12 @@ impl PopoutWindow {
         let strokes: Vec<_> = state
             .draw_strokes()
             .iter()
-            .filter(|s| s.item_id.is_empty() || s.item_id == filter_id || pane_ix == 0)
+            .filter(|s| s.item_id == filter_id || (s.item_id.is_empty() && pane_ix == 0))
             .cloned()
             .collect();
         let active_hue = state.draw_hue();
         let local_live_segments = if pane_ix == 0
+            && state.draw_mode()
             && self.huddle_drawing_active
             && !self.huddle_draw_local_segments.is_empty()
         {
@@ -384,7 +385,7 @@ impl PopoutWindow {
         let cursors: Vec<_> = state
             .draw_cursors()
             .iter()
-            .filter(|(_, c)| c.item_id.is_empty() || c.item_id == filter_id || pane_ix == 0)
+            .filter(|(_, c)| c.item_id == filter_id || (c.item_id.is_empty() && pane_ix == 0))
             .map(|(uid, c)| {
                 let is_me = *uid == self.fixtures.self_user;
                 (is_me, c.clone())
@@ -418,13 +419,17 @@ impl PopoutWindow {
                 } else {
                     bounds
                 };
-                let image_bounds = ObjectFit::Contain.get_bounds(
-                    fit_bounds,
-                    size(
-                        gpui_kit::gpui::DevicePixels(fw as i32),
-                        gpui_kit::gpui::DevicePixels(fh as i32),
-                    ),
-                );
+                let image_bounds = if fw == 0 || fh == 0 {
+                    Bounds::default()
+                } else {
+                    ObjectFit::Contain.get_bounds(
+                        fit_bounds,
+                        size(
+                            gpui_kit::gpui::DevicePixels(fw as i32),
+                            gpui_kit::gpui::DevicePixels(fh as i32),
+                        ),
+                    )
+                };
                 if pane_ix == 0
                     && let Ok(mut guard) = bounds_cell.lock()
                 {

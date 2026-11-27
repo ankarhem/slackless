@@ -941,6 +941,8 @@ impl Preferences {
         // Clear the input buffer immediately so the secret does not sit in UI memory.
         self.ai_api_key_input
             .update(cx, |st, cx| st.set_value(String::new(), window, cx));
+        self.ai_key_gen = self.ai_key_gen.wrapping_add(1);
+        let key_gen = self.ai_key_gen;
         self.ai_key_status_note = Some("Saving API key to Keychain\u{2026}".to_owned());
         cx.notify();
 
@@ -956,6 +958,9 @@ impl Preferences {
                 })
                 .await;
             let _ = this.update(cx, |prefs, cx| {
+                if prefs.ai_key_gen != key_gen {
+                    return;
+                }
                 match outcome {
                     Ok(()) => {
                         prefs.ai_api_key_stored = Some(true);
@@ -974,6 +979,8 @@ impl Preferences {
     }
 
     fn clear_ai_api_key(&mut self, cx: &mut Context<Self>) {
+        self.ai_key_gen = self.ai_key_gen.wrapping_add(1);
+        let key_gen = self.ai_key_gen;
         self.ai_key_status_note = Some("Removing API key from Keychain\u{2026}".to_owned());
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -988,6 +995,9 @@ impl Preferences {
                 })
                 .await;
             let _ = this.update(cx, |prefs, cx| {
+                if prefs.ai_key_gen != key_gen {
+                    return;
+                }
                 match outcome {
                     Ok(()) => {
                         prefs.ai_api_key_stored = Some(false);

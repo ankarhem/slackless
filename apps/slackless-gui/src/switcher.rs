@@ -645,7 +645,7 @@ mod tests {
         ];
         fixtures.dms.clear();
         fixtures.directory.clear();
-        fixtures.users.clear();
+        fixtures.users_mut().clear();
 
         let fixtures = Arc::new(fixtures);
         let mounted = std::rc::Rc::new(std::cell::RefCell::new(None));

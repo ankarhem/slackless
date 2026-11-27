@@ -586,7 +586,12 @@ impl MessageList {
             if !old_urls.is_empty() {
                 self.pending_evict_urls.extend(old_urls);
             }
-            self.data.update(cx, |data, _| data.toggled_deleted.clear());
+            self.pending_jump = None;
+            self.pending_highlight = None;
+            self.data.update(cx, |data, _| {
+                data.toggled_deleted.clear();
+                data.highlighted = None;
+            });
         }
         self.channel = channel.clone();
         self.touch_cache(&channel);
@@ -985,10 +990,15 @@ impl MessageList {
                     return;
                 };
                 let fixtures = data.fixtures.clone();
+                let target_channel = self.channel.clone();
                 let (this, ts) = (cx.entity().downgrade(), ts.clone());
                 actions::confirm_delete(message, fixtures, window, cx, move |cx| {
-                    // Gone only if the list itself was dropped meanwhile: nothing to delete.
-                    let _ = this.update(cx, |list, cx| list.delete(&ts, cx));
+                    // Gone if the list was dropped or navigated to another channel meanwhile.
+                    let _ = this.update(cx, |list, cx| {
+                        if list.channel == target_channel {
+                            list.delete(&ts, cx);
+                        }
+                    });
                 });
             }
             MessageAction::TogglePin => {

@@ -590,19 +590,35 @@ pub fn hybrid_search_disk_archives(
         if inner_ws.is_empty() {
             inner_ws.push(ws.clone());
         }
-        let first_ws = inner_ws[0].clone();
-        for w in &inner_ws {
-            if seen_ws.insert(w.clone()) {
-                workspace_ids.push(w.clone());
+        let mut iter = inner_ws.into_iter();
+        let Some(first_ws) = iter.next() else {
+            continue;
+        };
+        if seen_ws.insert(first_ws.clone()) {
+            workspace_ids.push(first_ws.clone());
+            let name = store
+                .team(&first_ws)
+                .ok()
+                .flatten()
+                .map(|t| t.name)
+                .filter(|n| !n.trim().is_empty());
+            opened.push((first_ws, name, store));
+        }
+        for extra_ws in iter {
+            if !seen_ws.insert(extra_ws.clone()) {
+                continue;
+            }
+            workspace_ids.push(extra_ws.clone());
+            if let Ok(extra_store) = Store::open_for_reading(path) {
+                let name = extra_store
+                    .team(&extra_ws)
+                    .ok()
+                    .flatten()
+                    .map(|t| t.name)
+                    .filter(|n| !n.trim().is_empty());
+                opened.push((extra_ws, name, extra_store));
             }
         }
-        let name = store
-            .team(&first_ws)
-            .ok()
-            .flatten()
-            .map(|t| t.name)
-            .filter(|n| !n.trim().is_empty());
-        opened.push((first_ws, name, store));
     }
 
     let query_vec = embedder.embed_query(&free_text)?;
@@ -1072,14 +1088,17 @@ fn hydrate_one_hit(
                 SearchHitKind::Canvas | SearchHitKind::Snippet => stored
                     .message
                     .files
-                    .first()
-                    .map(|f| {
-                        let body = extract_inline_file_body(f).unwrap_or_default();
+                    .iter()
+                    .find_map(|f| {
+                        let body = extract_inline_file_body(f)?;
+                        if body.is_empty() {
+                            return None;
+                        }
                         let ex = match_excerpt(&body, &query.terms)
-                            .or_else(|| (!body.is_empty()).then(|| truncate_chars(&body, 140)));
-                        (Some(f.id.clone()), ex)
+                            .or_else(|| Some(truncate_chars(&body, 140)));
+                        Some((Some(f.id.clone()), ex))
                     })
-                    .unwrap_or((None, None)),
+                    .unwrap_or_else(|| (stored.message.files.first().map(|f| f.id.clone()), None)),
                 _ => (None, None),
             };
             Some(UnifiedSearchHit {
@@ -1248,10 +1267,12 @@ fn message_matches_filters(
         }
     }
 
-    if let Some(uid) = &f.includes_user
-        && !message.text.contains(&format!("<@{uid}>"))
-    {
-        return false;
+    if let Some(uid) = &f.includes_user {
+        let plain = format!("<@{uid}>");
+        let aliased = format!("<@{uid}|");
+        if !message.text.contains(&plain) && !message.text.contains(&aliased) {
+            return false;
+        }
     }
     if f.threads_only && message.thread_ts.is_none() {
         return false;

@@ -19,7 +19,6 @@ use super::audio::{
     AudioClipRecorder, downsample_waveform, encode_wav_pcm16, parse_adts_frames,
     transcode_wav_to_aac_adts,
 };
-use super::mp4::mux_h264_aac_mp4;
 use super::{CLIP_FPS, ClipVideoSource, MAX_VIDEO_FRAMES, RecordedClip, timestamp_slug};
 
 /// Live camera or screen video clip recorder (`F-CORE-128`) with synchronized microphone audio.
@@ -258,7 +257,7 @@ impl VideoClipRecorder {
             None
         };
 
-        let worker = std::thread::Builder::new()
+        let worker = match std::thread::Builder::new()
             .name("slackless-video-clip".to_owned())
             .spawn(move || {
                 let mut enc = match H264VideoEncoder::new() {
@@ -319,8 +318,16 @@ impl VideoClipRecorder {
                     }
                 }
                 drop(source);
-            })
-            .map_err(|e| HuddleError::Video(e.to_string()))?;
+            }) {
+            Ok(w) => w,
+            Err(e) => {
+                running.store(false, Ordering::Relaxed);
+                if let Some(h) = audio_worker {
+                    let _ = h.join();
+                }
+                return Err(HuddleError::Video(e.to_string()));
+            }
+        };
 
         if let Err(err) = ready_rx
             .recv()
@@ -405,8 +412,13 @@ impl VideoClipRecorder {
                 transcode_wav_to_aac_adts(&wav).and_then(|adts| parse_adts_frames(&adts))
             })
             .flatten();
-        let fps = ((frames.len() as u64 * 1000) / elapsed_ms.max(250)).clamp(4, 30) as u32;
-        let mp4 = mux_h264_aac_mp4(w, h, fps, &frames, aac_track.as_ref())?;
+        let mp4 = super::mp4::mux_h264_aac_mp4_with_duration(
+            w,
+            h,
+            elapsed_ms,
+            &frames,
+            aac_track.as_ref(),
+        )?;
         let slug = timestamp_slug();
         Ok(RecordedClip {
             filename: format!("video-clip-{slug}.mp4"),
@@ -456,12 +468,19 @@ fn record_encoded_frame(
         if (w, h) == (target_w, target_h) {
             (Cow::Borrowed(rgb), w, h, precomputed_preview)
         } else {
+            // Fit within `(target_w, target_h)` and center-letterbox with black bars so resizing a
+            // recorded window smaller or to a different aspect ratio never drops frames.
             let (resized, rw, rh) = resize_rgb_even(rgb, w, h, target_w, target_h);
-            (Cow::Owned(resized), rw, rh, None)
+            if rw == 0 || rh == 0 {
+                return;
+            }
+            if rw == target_w && rh == target_h {
+                (Cow::Owned(resized), rw, rh, None)
+            } else {
+                let padded = letterbox_rgb(&resized, rw, rh, target_w, target_h);
+                (Cow::Owned(padded), target_w, target_h, None)
+            }
         };
-    if ew != target_w || eh != target_h {
-        return;
-    }
     let frame_idx = state.frames.lock().map(|g| g.len()).unwrap_or(0);
     let vf = reused_preview.unwrap_or_else(|| VideoFrame::from_bgra(ew, eh, rgb_to_bgra(&enc_rgb)));
     if let Ok(mut p) = state.preview.lock() {
@@ -480,4 +499,28 @@ fn record_encoded_frame(
     {
         list.push(EncodedH264Frame { annex_b });
     }
+}
+
+/// Center-pad an RGB888 image `(src_w, src_h)` into exact `(dst_w, dst_h)` with black bars.
+pub(super) fn letterbox_rgb(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+    let sw = src_w as usize;
+    let sh = src_h as usize;
+    let dw = dst_w as usize;
+    let dh = dst_h as usize;
+    let mut out = vec![0u8; dw * dh * 3];
+    let copy_w = sw.min(dw);
+    let copy_h = sh.min(dh);
+    let x_off = (dw - copy_w) / 2;
+    let y_off = (dh - copy_h) / 2;
+    let src_row_bytes = sw * 3;
+    let dst_row_bytes = dw * 3;
+    let copy_bytes = copy_w * 3;
+    for y in 0..copy_h {
+        let s_start = y * src_row_bytes;
+        let d_start = (y + y_off) * dst_row_bytes + x_off * 3;
+        if s_start + copy_bytes <= src.len() && d_start + copy_bytes <= out.len() {
+            out[d_start..d_start + copy_bytes].copy_from_slice(&src[s_start..s_start + copy_bytes]);
+        }
+    }
+    out
 }

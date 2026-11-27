@@ -326,6 +326,27 @@ pub fn decode_slack_peer_message(
     out
 }
 
+/// Returns `true` if `raw` is a Slack `PeerMessage` containing a `kick_notification` targeting
+/// `self_user` or `self_attendee_id`.
+pub fn is_kick_notification_for_self(
+    raw: &[u8],
+    self_user: &UserId,
+    self_attendee_id: &str,
+) -> bool {
+    let Ok(msg) = PeerMessage::decode(raw) else {
+        return false;
+    };
+    let Some(kick) = msg.kick_notification else {
+        return false;
+    };
+    let Some(target) = kick.kicked_user_id.as_deref() else {
+        return false;
+    };
+    target == self_user.as_str()
+        || target == self_attendee_id
+        || parse_external_user_id(target).as_ref() == Some(self_user)
+}
+
 /// Decode an official AWS Chime `SdkTranscriptFrame` (`"aws:chime:transcription"`).
 pub fn decode_chime_transcript_frame(raw: &[u8], now_ms: u64) -> Vec<HuddleDataEvent> {
     let Ok(frame) = SdkTranscriptFrame::decode(raw) else {

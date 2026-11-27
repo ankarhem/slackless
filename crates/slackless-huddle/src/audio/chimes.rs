@@ -297,10 +297,16 @@ impl AmbientMusicPlayer {
             .name("slackless-huddle-music".to_owned())
             .spawn(move || {
                 wake_worker.register();
+                if !run_flag.load(Ordering::Acquire) {
+                    return;
+                }
                 let backend = platform_backend();
                 if backend.supports_routed_audio_files()
                     && let Some(path) = ensure_cached_slack_audio(&filename)
                 {
+                    if !run_flag.load(Ordering::Acquire) {
+                        return;
+                    }
                     // Normalize every lounge track to an identical gentle background loudness
                     // (-30 dBFS 200Hz-weighted RMS = 0.032 linear). Slack's CDN MP3s span a
                     // 30 dB range (-46 dBFS piano_concerto to -16 dBFS lofihaus), so allow

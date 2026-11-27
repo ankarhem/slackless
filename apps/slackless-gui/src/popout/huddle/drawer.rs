@@ -184,7 +184,7 @@ impl PopoutWindow {
                     (Some(ms), Some(ls)) => (ms - ls) >= -10.0 && (ms - ls) <= 30.0,
                     _ => false,
                 };
-                exact || same_preview || close_in_time
+                (exact || same_preview) && close_in_time
             });
             if let Some((ix, _)) = found {
                 matched_store[ix] = true;
@@ -224,7 +224,7 @@ impl PopoutWindow {
                     (Some(ms), Some(ls)) => (ms - ls) >= -10.0 && (ms - ls) <= 30.0,
                     _ => false,
                 };
-                exact || same_preview || close_in_time
+                (exact || same_preview) && close_in_time
             });
             if let Some((ix, _)) = found {
                 matched[ix] = true;
@@ -980,7 +980,13 @@ impl PopoutWindow {
                                             .child("Test speaker")
                                             .on_click(move |_, _, _| {
                                                 #[cfg(not(test))]
-                                                let _ = play_speaker_test_tone(test_out.as_deref());
+                                                {
+                                                    let out = test_out.clone();
+                                                    std::thread::spawn(move || {
+                                                        let _ =
+                                                            play_speaker_test_tone(out.as_deref());
+                                                    });
+                                                }
                                                 #[cfg(test)]
                                                 let _ = &test_out;
                                             }),
@@ -1005,10 +1011,15 @@ impl PopoutWindow {
                                             .child("Test chime")
                                             .on_click(move |_, _, _| {
                                                 #[cfg(not(test))]
-                                                let _ = play_huddle_chime(
-                                                    HuddleChime::Join,
-                                                    chime_out.as_deref(),
-                                                );
+                                                {
+                                                    let out = chime_out.clone();
+                                                    std::thread::spawn(move || {
+                                                        let _ = play_huddle_chime(
+                                                            HuddleChime::Join,
+                                                            out.as_deref(),
+                                                        );
+                                                    });
+                                                }
                                                 #[cfg(test)]
                                                 let _ = (&chime_out, HuddleChime::Join);
                                             }),

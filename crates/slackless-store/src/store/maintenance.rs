@@ -293,7 +293,7 @@ impl Store {
                  ORDER BY cnt DESC
                  LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![ws, top_n as i64], |r| {
+            let rows = stmt.query_map(params![ws, super::sql_limit(top_n)], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<String>>(1)?,

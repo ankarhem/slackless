@@ -974,7 +974,7 @@ impl Sidebar {
         let row_h = if self.home_prefs.compact { 24. } else { 28. };
         let row_hover = theme.sidebar_foreground.opacity(0.08);
         let mut row = h_flex()
-            .id(SharedString::from(format!("conversation-{id}")))
+            .id(SharedString::from(format!("conversation-{key}-{id}")))
             .h(px(row_h))
             .ml(px(2.))
             .mr(px(2.))

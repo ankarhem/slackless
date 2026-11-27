@@ -4796,17 +4796,24 @@ async fn huddle_commands_and_lifecycle_races() {
     )
     .await;
 
-    // 1. JoinHuddle error (UnsupportedHuddleBackend) emits Event::Error and resets `joining`.
+    // 1. JoinHuddle error (UnsupportedHuddleBackend) emits SessionChanged(Failed) + Event::Error
+    //    and resets `joining`.
     core.handle(Command::Huddle(HuddleCommand::Join {
         channel: c1(),
         audio: crate::huddle::HuddleAudioConfig::default(),
     }))
     .await;
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::Huddle(HuddleEvent::SessionChanged(ref snap))
+            if snap.phase == crate::huddle::HuddlePhase::Failed && snap.channel == c1()
+    ));
     assert!(matches!(next(&mut rx).await, Event::Error(e) if e.contains("rooms.join")));
     assert!(!core.huddle.lock().unwrap().joining);
 
-    // 2. Concurrent duplicate JoinHuddle while rooms_join is in-flight only calls rooms_join once,
-    //    and LeaveHuddle during in-flight rooms_join prevents activating the session.
+    // 2. Concurrent duplicate JoinHuddle to the SAME channel while rooms_join is in-flight only
+    //    calls rooms_join once, and LeaveHuddle during in-flight rooms_join prevents activating
+    //    the session and emits SessionChanged(Idle).
     let gate = Arc::new(tokio::sync::Notify::new());
     {
         let mut state = fake.state.lock().unwrap();
@@ -4822,17 +4829,22 @@ async fn huddle_commands_and_lifecycle_races() {
         audio: crate::huddle::HuddleAudioConfig::default(),
     }))
     .await;
-    // Second concurrent JoinHuddle is ignored while `joining == true`.
+    // Duplicate JoinHuddle to the same channel is ignored while `joining == true`.
     core.handle(Command::Huddle(HuddleCommand::Join {
-        channel: ChannelId::from("C2"),
+        channel: c1(),
         audio: crate::huddle::HuddleAudioConfig::default(),
     }))
     .await;
     tokio::task::yield_now().await;
     assert_eq!(fake.state.lock().unwrap().rooms_join_calls, vec![c1()]);
 
-    // LeaveHuddle cancels the in-flight join before rooms_join returns.
+    // LeaveHuddle cancels the in-flight join before rooms_join returns and emits Idle.
     core.handle(Command::Huddle(HuddleCommand::Leave)).await;
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::Huddle(HuddleEvent::SessionChanged(ref snap))
+            if snap.phase == crate::huddle::HuddlePhase::Idle && snap.channel == c1()
+    ));
     gate.notify_waiters();
     wait_until("cancelled join clears joining flag", || {
         !core.huddle.lock().unwrap().joining
@@ -4849,6 +4861,44 @@ async fn huddle_commands_and_lifecycle_races() {
             "cancelled join must not install call_id"
         );
     }
+
+    // 2b. Joining a DIFFERENT channel while C1's rooms_join is in-flight supersedes C1.
+    let gate2 = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.rooms_join_calls.clear();
+        state.rooms_join_gate = Some(Arc::clone(&gate2));
+    }
+    core.handle(Command::Huddle(HuddleCommand::Join {
+        channel: c1(),
+        audio: crate::huddle::HuddleAudioConfig::default(),
+    }))
+    .await;
+    tokio::task::yield_now().await;
+    core.handle(Command::Huddle(HuddleCommand::Join {
+        channel: ChannelId::from("C2"),
+        audio: crate::huddle::HuddleAudioConfig::default(),
+    }))
+    .await;
+    wait_until("second channel supersedes in-flight join", || {
+        fake.state.lock().unwrap().rooms_join_calls.len() == 2
+    })
+    .await;
+    assert_eq!(
+        fake.state.lock().unwrap().rooms_join_calls,
+        vec![c1(), ChannelId::from("C2")]
+    );
+    core.handle(Command::Huddle(HuddleCommand::Leave)).await;
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::Huddle(HuddleEvent::SessionChanged(ref snap))
+            if snap.phase == crate::huddle::HuddlePhase::Idle && snap.channel == ChannelId::from("C2")
+    ));
+    gate2.notify_waiters();
+    wait_until("superseded joins settle", || {
+        !core.huddle.lock().unwrap().joining
+    })
+    .await;
 
     // 3. CopyHuddleLink (fallback default & custom API URL), InviteToHuddle, DeclineHuddleInvite.
     core.handle(Command::Huddle(HuddleCommand::GetLink { channel: c1() }))
@@ -6196,6 +6246,7 @@ async fn huddle_watcher_ignores_stale_generation_idle_and_preserves_new_session(
     let huddle = Arc::new(Mutex::new(HuddleSlot {
         generation: Arc::new(AtomicU64::new(2)),
         joining: true,
+        joining_channel: None,
         handle: None,
         call_id: Some("R_NEW".into()),
     }));
@@ -6551,6 +6602,7 @@ async fn huddle_watcher_persists_finalized_multilingual_captions_and_skips_parti
     let huddle = Arc::new(Mutex::new(HuddleSlot {
         generation: Arc::new(AtomicU64::new(1)),
         joining: false,
+        joining_channel: None,
         call_id: Some("R0BILINGUAL".into()),
         handle: None,
     }));
@@ -6622,6 +6674,20 @@ async fn huddle_watcher_persists_finalized_multilingual_captions_and_skips_parti
     for _ in 0..4 {
         let _ = next(&mut rx).await;
     }
+    drop(tx);
+    wait_until(
+        "async transcript writer persists finalized captions",
+        || {
+            store
+                .lock()
+                .unwrap()
+                .huddle_transcript_for_call(&TeamId::from("T1"), "R0BILINGUAL")
+                .unwrap()
+                .len()
+                == 2
+        },
+    )
+    .await;
 
     let stored = store
         .lock()

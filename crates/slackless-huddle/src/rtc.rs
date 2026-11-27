@@ -543,13 +543,22 @@ impl PeerConnectionEventHandler for ChimePeerHandler {
                                 if rtp.payload.is_empty() {
                                     continue;
                                 }
-                                if ssrc == 0 {
-                                    ssrc = rtp.header.ssrc;
+                                let pkt_ssrc = rtp.header.ssrc;
+                                if pkt_ssrc != 0 && pkt_ssrc != ssrc {
                                     if let Ok(mut map) = remote_tracks.lock() {
-                                        map.insert(ssrc, Arc::clone(&track));
+                                        if ssrc != 0 {
+                                            map.remove(&ssrc);
+                                        }
+                                        map.insert(pkt_ssrc, Arc::clone(&track));
                                     }
-                                }
-                                if mime_type.is_empty() {
+                                    ssrc = pkt_ssrc;
+                                    mime_type = track
+                                        .codec(ssrc)
+                                        .await
+                                        .map(|c| c.mime_type)
+                                        .unwrap_or_default()
+                                        .into();
+                                } else if mime_type.is_empty() && ssrc != 0 {
                                     mime_type = track
                                         .codec(ssrc)
                                         .await

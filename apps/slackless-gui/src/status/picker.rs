@@ -25,8 +25,8 @@ pub enum StatusEvent {
     Save(Option<UserStatus>),
     /// Schedule a status to activate automatically at a future time (`F-SHELL-018`).
     Schedule(ScheduledStatus),
-    /// Remove a pending scheduled status by index (`F-SHELL-019`).
-    RemoveScheduled(usize),
+    /// Remove a pending scheduled status by value (`F-SHELL-019`).
+    RemoveScheduled(ScheduledStatus),
     Cancel,
 }
 
@@ -629,20 +629,23 @@ impl Render for StatusPicker {
                                     div().text_xs().text_color(muted).child(format!("· {when}")),
                                 ),
                         )
-                        .child(
+                        .child({
+                            let target = sched.clone();
                             Button::new(("status-sched-remove", ix))
                                 .ghost()
                                 .with_size(gpui_kit::component::Size::XSmall)
                                 .icon(IconName::X)
                                 .tooltip("Cancel scheduled status")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if ix < this.scheduled.len() {
-                                        this.scheduled.remove(ix);
+                                    if let Some(pos) =
+                                        this.scheduled.iter().position(|s| s == &target)
+                                    {
+                                        this.scheduled.remove(pos);
                                     }
-                                    cx.emit(StatusEvent::RemoveScheduled(ix));
+                                    cx.emit(StatusEvent::RemoveScheduled(target.clone()));
                                     cx.notify();
-                                })),
-                        )
+                                }))
+                        })
                 }))
         });
 

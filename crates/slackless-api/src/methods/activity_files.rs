@@ -80,14 +80,44 @@ impl SlackApi {
         self.call_ok(method::BOOKMARKS_REMOVE, params).await
     }
 
-    /// Raw `drafts.list` response (`is_active=true`, `limit=100`).
+    /// Raw `drafts.list` response (`is_active=true`, `limit=100`), following `next_cursor`
+    /// across pages and merging all returned `"drafts"` arrays.
     pub(super) async fn drafts_list_raw(&self) -> Result<Value> {
-        let params = vec![
-            ("limit", "100".to_owned()),
-            ("is_active", "true".to_owned()),
-            ("_x_mode", MODE_ONLINE.to_owned()),
-        ];
-        Ok(self.call(method::DRAFTS_LIST, params).await?.data)
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut merged: Option<Value> = None;
+        for _ in 0..100 {
+            let mut params = vec![
+                ("limit", "100".to_owned()),
+                ("is_active", "true".to_owned()),
+                ("_x_mode", MODE_ONLINE.to_owned()),
+            ];
+            if let Some(ref c) = cursor {
+                params.push(("cursor", c.clone()));
+            }
+            let resp = self.call::<Value>(method::DRAFTS_LIST, params).await?;
+            let next = resp
+                .next_cursor()
+                .or_else(|| resp.data.get("next_cursor").and_then(Value::as_str))
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            match &mut merged {
+                None => merged = Some(resp.data),
+                Some(first) => {
+                    if let (Some(dest), Some(more)) = (
+                        first.get_mut("drafts").and_then(Value::as_array_mut),
+                        resp.data.get("drafts").and_then(Value::as_array),
+                    ) {
+                        dest.extend(more.iter().cloned());
+                    }
+                }
+            }
+            match next {
+                Some(c) if seen.insert(c.clone()) => cursor = Some(c),
+                _ => break,
+            }
+        }
+        Ok(merged.unwrap_or_else(|| serde_json::json!({})))
     }
 
     /// `drafts.list`: fetch the signed-in user's unsent cloud-synced drafts (`F-CORE-089`).

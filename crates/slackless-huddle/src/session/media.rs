@@ -64,8 +64,8 @@ pub(super) trait MediaDevices: 'static {
     /// Running `#content` screen-share session while it is installed.
     type ScreenShare: Send + 'static;
 
-    /// Stop audio and drop the hardware (blocking); for teardown before the event loop runs.
-    fn stop_audio(&mut self);
+    /// Stop audio and drop the hardware off the async worker thread.
+    fn stop_audio(&mut self) -> BoxFuture<'static, ()>;
 
     /// Stop whatever audio is running and start it on `new`, falling back to `prev` when that
     /// fails (`parked` is the inbound stream of an earlier failed switch). Resolves with the
@@ -122,6 +122,27 @@ pub(super) trait MediaDevices: 'static {
     /// Stop the running share (if any) and wait briefly for its `LEAVE` to flush.
     fn stop_screen_share(&mut self) -> BoxFuture<'static, ()>;
 
+    /// Stop a detached screen-share handle (superseded or post-teardown) and wait briefly for its
+    /// Chime `LEAVE` to flush.
+    fn stop_detached_screen_share(share: Self::ScreenShare) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let _ = tokio::task::spawn_blocking(move || drop(share)).await;
+        })
+    }
+
+    /// Drop a detached audio or camera handle off the Tokio async worker thread.
+    fn drop_detached_audio(audio: Self::Audio) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let _ = tokio::task::spawn_blocking(move || drop(audio)).await;
+        })
+    }
+
+    fn drop_detached_camera(camera: Self::Camera) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let _ = tokio::task::spawn_blocking(move || drop(camera)).await;
+        })
+    }
+
     fn set_jukebox(&mut self, output_device: Option<String>, song_key: Option<&str>);
 }
 
@@ -166,8 +187,13 @@ impl MediaDevices for LiveMediaDevices {
     type Camera = Box<dyn CameraHandle>;
     type ScreenShare = ContentShareSession;
 
-    fn stop_audio(&mut self) {
-        drop(self.audio_engine.take());
+    fn stop_audio(&mut self) -> BoxFuture<'static, ()> {
+        let engine = self.audio_engine.take();
+        Box::pin(async move {
+            if let Some(engine) = engine {
+                let _ = tokio::task::spawn_blocking(move || drop(engine)).await;
+            }
+        })
     }
 
     fn switch_audio(
@@ -312,9 +338,15 @@ impl MediaDevices for LiveMediaDevices {
         Box::pin(Self::stop_detached_share(share))
     }
 
+    fn stop_detached_screen_share(share: ContentShareSession) -> BoxFuture<'static, ()> {
+        Box::pin(Self::stop_detached_share(Some(share)))
+    }
+
     fn set_jukebox(&mut self, output_device: Option<String>, song_key: Option<&str>) {
         if let Some(mut prev) = self.music_player.take() {
-            prev.stop();
+            // Joining the music worker can wait for an in-flight CDN download: never block a
+            // Tokio worker thread.
+            tokio::task::spawn_blocking(move || prev.stop());
         }
         if song_key.is_some() {
             self.music_player = AmbientMusicPlayer::start(output_device, song_key).ok();

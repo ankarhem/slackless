@@ -41,7 +41,7 @@ use slackless_core::domain::mrkdwn::mrkdwn_to_plain;
 use slackless_core::export::format_utc_timestamp;
 use slackless_core::export::{ChannelWindow, ExportFormat, ExportOptions, ExportRequest};
 use slackless_core::search::truncate_chars;
-use slackless_core::store::{Has, SearchQuery, SearchSort, StoredFileTranscript, StoredMessage};
+use slackless_core::store::{SearchQuery, SearchSort, StoredFileTranscript, StoredMessage};
 use slackless_core::types::time::now_epoch_secs;
 use slackless_core::types::{ChannelId, FileId, Message, TeamId, TranscriptCue, Ts, UserId};
 
@@ -575,24 +575,14 @@ impl McpServer {
             if matches!(kind, TranscriptKind::All | TranscriptKind::File) {
                 let allowed_files: Option<HashSet<FileId>> =
                     if let Some(ch_id) = resolved_channel_id.as_ref() {
-                        let mut q = SearchQuery::default();
-                        q.filters.in_channels.push(ch_id.as_str().to_owned());
-                        q.filters.has.push(Has::File);
-                        let msgs = archive
-                            .store()
-                            .search_sorted(ws, &q, SearchSort::Recent, 500)
-                            .map_err(|err| {
-                                format!("listing files in channel {ch_id} of {ws}: {err}")
-                            })?;
-                        let mut set = HashSet::new();
-                        for msg in msgs {
-                            for f in msg.message.files {
-                                if !f.id.as_str().is_empty() {
-                                    set.insert(f.id);
-                                }
-                            }
-                        }
-                        Some(set)
+                        Some(
+                            archive
+                                .store()
+                                .file_transcript_ids_in_channel(ws, ch_id)
+                                .map_err(|err| {
+                                    format!("listing files in channel {ch_id} of {ws}: {err}")
+                                })?,
+                        )
                     } else {
                         None
                     };

@@ -619,9 +619,17 @@ pub(super) async fn resolve_teams<B: Backend>(
     }
     let mut teams = Vec::new();
     for id in fresh {
-        match ctx.backend.team_info(id).await {
+        match ctx.backend.team_info(id.clone()).await {
             Ok(team) => teams.push(team),
-            Err(e) => ctx.events.report("team.info", e.into()),
+            Err(e) => {
+                if crate::outbox::is_transient_send_error(&e) {
+                    asked
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&id);
+                }
+                ctx.events.report("team.info", e.into());
+            }
         }
     }
     if teams.is_empty() {

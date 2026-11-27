@@ -42,7 +42,7 @@ pub enum ListLayout {
 struct ListPanelState {
     layout: ListLayout,
     hidden_cols: HashSet<String>,
-    selected_row: Option<usize>,
+    selected_record_id: Option<String>,
     adding: bool,
     new_item_input: Option<Entity<TextareaState>>,
     /// Currently edited `(row_id, col_id, input)` in the item detail drawer.
@@ -87,7 +87,7 @@ impl Default for ListPanelState {
         Self {
             layout: ListLayout::Table,
             hidden_cols: HashSet::new(),
-            selected_row: None,
+            selected_record_id: None,
             adding: false,
             new_item_input: None,
             editing_cell: None,
@@ -167,13 +167,13 @@ pub fn set_list_status(list_id: &str, is_err: bool, msg: String, cx: &mut App) {
 /// Pre-select a list row by `record_id` (e.g., when navigating from a list item thread in
 /// Threads view).
 pub fn select_list_record(list_id: &str, record_id: &str, data: &SlackListData, cx: &mut App) {
-    if let Some(ix) = data.rows.iter().position(|r| r.id == record_id) {
+    if data.rows.iter().any(|r| r.id == record_id) {
         let entry = cx
             .default_global::<ListUiStore>()
             .panels
             .entry(list_id.to_owned())
             .or_default();
-        entry.selected_row = Some(ix);
+        entry.selected_record_id = Some(record_id.to_owned());
     }
 }
 

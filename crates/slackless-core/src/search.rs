@@ -527,6 +527,7 @@ fn append_standalone_file_transcripts(
     let f = &query.filters;
     let has_incompatible_filter = !f.in_channels.is_empty()
         || !f.from_users.is_empty()
+        || !f.exclude_users.is_empty()
         || f.includes_user.is_some()
         || f.threads_only
         || f.has.iter().any(|h| *h != crate::store::Has::File);
@@ -551,14 +552,26 @@ fn append_standalone_file_transcripts(
             continue;
         }
         let meta = meta_map.get(&entry.workspace);
-        let channel = entry
-            .channel
-            .clone()
-            .unwrap_or_else(|| ChannelId::from(format!("file:{}", entry.transcript.file_id)));
         let channel_name = entry
             .channel
             .as_ref()
             .and_then(|c| meta.and_then(|m| m.channels.get(c.as_str()).cloned()));
+        if !f.exclude_channels.is_empty()
+            && let Some(ch_id) = entry.channel.as_ref()
+            && f.exclude_channels.iter().any(|ex| {
+                let norm = ex.trim_start_matches('#');
+                norm.eq_ignore_ascii_case(ch_id.as_str())
+                    || channel_name
+                        .as_deref()
+                        .is_some_and(|name| norm.eq_ignore_ascii_case(name.trim_start_matches('#')))
+            })
+        {
+            continue;
+        }
+        let channel = entry
+            .channel
+            .clone()
+            .unwrap_or_else(|| ChannelId::from(format!("file:{}", entry.transcript.file_id)));
         let ts = entry
             .message_ts
             .clone()
@@ -1081,5 +1094,92 @@ mod tests {
         let ex2 = match_excerpt(&dotted, &["i\u{307}stanbul_canary".to_owned()])
             .expect("must match folded Turkish dotted I");
         assert!(ex2.contains("İSTANBUL_CANARY"));
+    }
+
+    #[test]
+    fn standalone_file_transcript_search_honors_channel_and_user_exclusions() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ws = TeamId::from("T1");
+        let c_priv = ChannelId::from("C_PRIV");
+        let c_pub = ChannelId::from("C_PUB");
+        for (id, name) in [(&c_priv, "private"), (&c_pub, "public")] {
+            store
+                .upsert_conversation(
+                    &ws,
+                    &Conversation {
+                        id: id.clone(),
+                        name: Some(name.into()),
+                        is_channel: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        // Attach F_PRIV to a message in #private (whose own text doesn't mention "budget") and
+        // upsert a standalone transcript for F_PRIV & F_PUB.
+        let mut m = Message {
+            ts: Ts::from("1700000010.000100"),
+            user: Some(UserId::from("U1")),
+            text: "audio clip".into(),
+            ..Default::default()
+        };
+        m.files.push(File {
+            id: FileId::from("F_PRIV"),
+            ..Default::default()
+        });
+        store.upsert_messages(&ws, &c_priv, &[m]).unwrap();
+        store
+            .upsert_file_transcript(
+                &ws,
+                &FileId::from("F_PRIV"),
+                "whisper",
+                "secret budget review",
+            )
+            .unwrap();
+        store
+            .upsert_file_transcript(
+                &ws,
+                &FileId::from("F_SOLO"),
+                "whisper",
+                "standalone budget notes",
+            )
+            .unwrap();
+
+        // `-in:#private` must exclude F_PRIV (carrier is #private) while keeping F_SOLO.
+        let res = search_single_store_all_workspaces(
+            &store,
+            &SearchQuery::parse("budget -in:#private"),
+            SearchSort::Recent,
+            10,
+        )
+        .unwrap();
+        assert!(
+            res.hits
+                .iter()
+                .all(|h| h.transcript_file_id.as_ref().map(FileId::as_str) != Some("F_PRIV")),
+            "excluded channel transcript leaked: {:?}",
+            res.hits
+        );
+        assert!(
+            res.hits
+                .iter()
+                .any(|h| h.transcript_file_id.as_ref().map(FileId::as_str) == Some("F_SOLO"))
+        );
+
+        // `-from:@alice` must not synthesize unattributed standalone transcripts.
+        let res_u = search_single_store_all_workspaces(
+            &store,
+            &SearchQuery::parse("budget -from:@alice"),
+            SearchSort::Recent,
+            10,
+        )
+        .unwrap();
+        assert!(
+            res_u
+                .hits
+                .iter()
+                .all(|h| h.transcript_file_id.as_ref().map(FileId::as_str) != Some("F_SOLO")),
+            "standalone transcript leaked past -from: filter"
+        );
     }
 }

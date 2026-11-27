@@ -32,6 +32,10 @@ struct RetryState {
     delay: Duration,
     /// The pending timer task, if any.
     pending: Option<AbortHandle>,
+    /// Monotonic counter bumped on every [`OutboxRetry::schedule`], so a flushing pass that
+    /// finishes with `Flush::Proceed` does not cancel a retry armed concurrently by
+    /// [`park_transient_send`].
+    generation: u64,
 }
 
 impl Default for RetryState {
@@ -39,15 +43,22 @@ impl Default for RetryState {
         Self {
             delay: OUTBOX_RETRY_INITIAL,
             pending: None,
+            generation: 0,
         }
     }
 }
 
 impl OutboxRetry {
+    /// Current schedule generation, captured before a flush pass snapshots pending items.
+    fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
     /// Schedules the single re-flush with the current backoff (then doubles it), replacing any
     /// pending timer.
     fn schedule<B: Backend>(&self, flush: OutboxFlush<B>) {
         let mut state = self.lock();
+        state.generation = state.generation.wrapping_add(1);
         let delay = state.delay;
         state.delay = next_outbox_retry_delay(delay);
         state.abort_pending();
@@ -68,6 +79,16 @@ impl OutboxRetry {
         let mut state = self.lock();
         state.delay = OUTBOX_RETRY_INITIAL;
         state.abort_pending();
+    }
+
+    /// Like [`Self::reset`], but keeps any retry timer armed *after* `expected_generation`
+    /// (e.g. an item parked while a flush pass was delivering earlier items).
+    fn reset_if_unchanged(&self, expected_generation: u64) {
+        let mut state = self.lock();
+        if state.generation == expected_generation {
+            state.delay = OUTBOX_RETRY_INITIAL;
+            state.abort_pending();
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RetryState> {
@@ -108,10 +129,18 @@ impl<B: Backend> OutboxFlush<B> {
     /// Delivers every pending item in order under the flush lock, then schedules the re-flush a
     /// transient failure needs or resets the backoff once the queue is drained.
     async fn run(&self) {
+        let generation = self.retry.generation();
         let outcome = {
             let _guard = self.lock.lock().await;
             let ws = self.ctx.workspace.clone();
-            match with_store(&self.ctx.store, move |s| s.list_outbox_pending(&ws)).await {
+            // `self.lock` serializes every in-process delivery, so any row still marked `sending`
+            // here was stranded by a failed SQLite status update on an earlier pass: recover it.
+            match with_store(&self.ctx.store, move |s| {
+                let _ = s.reset_outbox_sending_to_pending(&ws)?;
+                s.list_outbox_pending(&ws)
+            })
+            .await
+            {
                 Ok(pending) => {
                     let mut outcome = Flush::Proceed;
                     for item in pending {
@@ -131,7 +160,7 @@ impl<B: Backend> OutboxFlush<B> {
             }
         };
         match outcome {
-            Flush::Proceed => self.retry.reset(),
+            Flush::Proceed => self.retry.reset_if_unchanged(generation),
             Flush::RetryLater => self.retry.schedule(self.clone()),
             Flush::Stop => {}
         }

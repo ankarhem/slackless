@@ -123,6 +123,13 @@ impl App {
             self.bridge.send(WorkspaceCommand::SetSaveHuddleTranscripts(
                 settings.huddle_save_transcripts,
             ));
+            for slot in &self.slots {
+                if let Some(bridge) = &slot.bridge {
+                    bridge.send(WorkspaceCommand::SetSaveHuddleTranscripts(
+                        settings.huddle_save_transcripts,
+                    ));
+                }
+            }
         }
         crate::preferences::set_display_prefs(&settings, cx);
         window.set_background_appearance(if settings.window_transparency {
@@ -374,7 +381,10 @@ impl App {
                 }
             }
             if prev.launch_at_login != settings.launch_at_login {
-                sync_launch_at_login(settings.launch_at_login);
+                let enable = settings.launch_at_login;
+                cx.background_executor()
+                    .spawn(async move { sync_launch_at_login(enable) })
+                    .detach();
             }
             if prev.proxy_url != settings.proxy_url {
                 slackless_core::api::set_proxy_url(Some(settings.proxy_url.clone()));
@@ -406,6 +416,15 @@ impl App {
                     self.send_huddle(HuddleControlCommand::SetBlurBackground(
                         settings.huddle_blur_background,
                     ));
+                }
+                if prev.huddle_camera_device != settings.huddle_camera_device
+                    && self.huddle_session.as_ref().is_some_and(|s| s.video)
+                {
+                    self.send_huddle(HuddleControlCommand::SetCamera {
+                        enabled: true,
+                        device_index: settings.huddle_camera_device,
+                        blur: settings.huddle_blur_background,
+                    });
                 }
             }
             self.saved_settings = Some(settings.clone());

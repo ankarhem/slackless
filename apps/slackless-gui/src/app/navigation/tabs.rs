@@ -212,12 +212,11 @@ impl App {
             });
         }
     }
-    /// Callback for popped-out windows: brings the main window to the front, shows the
-    /// workspace the popout belongs to (`workspace`, like the huddle dock's handlers), and
-    /// navigates to the clicked conversation, message, or thread.
-    pub(in crate::app) fn popout_jump_handler(
+    /// Callback for popped-out windows: brings the main window to the front, optionally switches
+    /// to a pinned `workspace`, and navigates to the clicked conversation, message, or thread.
+    fn popout_jump_handler_for(
         &self,
-        workspace: usize,
+        workspace: Option<usize>,
         window: &mut Window,
         cx: &Context<Self>,
     ) -> crate::popout::JumpHandler {
@@ -228,7 +227,9 @@ impl App {
             let _ = main_win.update(cx, |_, window, cx| {
                 window.activate_window();
                 let _ = app.update(cx, |app, cx| {
-                    app.switch_workspace(workspace, window, cx);
+                    if let Some(ws) = workspace {
+                        app.switch_workspace(ws, window, cx);
+                    }
                     app.select(channel.clone(), cx);
                     if let Some(ts) = ts.clone() {
                         if is_thread {
@@ -240,6 +241,27 @@ impl App {
                 });
             });
         })
+    }
+
+    /// Callback for workspace-pinned popout windows (Conversation, Thread, Canvas, Huddle):
+    /// brings the main window to the front, switches to `workspace`, and navigates.
+    pub(in crate::app) fn popout_jump_handler(
+        &self,
+        workspace: usize,
+        window: &mut Window,
+        cx: &Context<Self>,
+    ) -> crate::popout::JumpHandler {
+        self.popout_jump_handler_for(Some(workspace), window, cx)
+    }
+
+    /// Callback for live-following popout windows (Activity, Saved/Later, Files) whose rows
+    /// dynamically track whichever workspace is currently active in the main window.
+    fn popout_active_jump_handler(
+        &self,
+        window: &mut Window,
+        cx: &Context<Self>,
+    ) -> crate::popout::JumpHandler {
+        self.popout_jump_handler_for(None, window, cx)
     }
 
     /// Pop out `channel` into a separate native GPUI window (`F-CORE-010`, `F-CORE-026`).
@@ -299,7 +321,7 @@ impl App {
 
     /// Pop out the live Activity feed into a separate native GPUI window (`F-SHELL-149`).
     pub(in crate::app) fn pop_out_activity(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let on_jump = self.popout_jump_handler(self.workspace, window, cx);
+        let on_jump = self.popout_active_jump_handler(window, cx);
         let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
             crate::popout::PopoutRequest {
@@ -321,7 +343,7 @@ impl App {
 
     /// Pop out the live Saved / Later view into a separate native GPUI window (`F-SHELL-149`).
     pub(in crate::app) fn pop_out_later(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let on_jump = self.popout_jump_handler(self.workspace, window, cx);
+        let on_jump = self.popout_active_jump_handler(window, cx);
         let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
             crate::popout::PopoutRequest {
@@ -353,11 +375,13 @@ impl App {
         let open_browser_url = file_id.as_deref().map(|id| self.canvas_link(id));
         let on_jump = self.popout_jump_handler(self.workspace, window, cx);
         let display_id = window.display(cx).map(|d| d.id());
+        let channel = (!self.channel.as_str().is_empty()).then(|| self.channel.clone());
         crate::popout::open_popout(
             crate::popout::PopoutRequest {
                 kind: crate::popout::PopoutKind::Canvas {
                     doc,
                     file_id,
+                    channel,
                     open_browser_url,
                     on_jump,
                 },
@@ -375,7 +399,7 @@ impl App {
 
     /// Pop out the live Files browser into a separate native GPUI window (`F-COLLAB-127`, `F-SHELL-150`).
     pub(in crate::app) fn pop_out_files(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let on_jump = self.popout_jump_handler(self.workspace, window, cx);
+        let on_jump = self.popout_active_jump_handler(window, cx);
         let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
             crate::popout::PopoutRequest {

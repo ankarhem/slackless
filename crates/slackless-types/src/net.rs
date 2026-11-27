@@ -47,7 +47,8 @@ pub fn is_trusted_slack_host(host: &str) -> bool {
     }
     let suffix = ".slack.com";
     normalized.len() > suffix.len()
-        && normalized[normalized.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        && normalized.as_bytes()[normalized.len() - suffix.len()..]
+            .eq_ignore_ascii_case(suffix.as_bytes())
 }
 
 /// Canonical web-client huddle join URL when `rooms.getLink` does not return one.
@@ -116,9 +117,13 @@ mod tests {
             "slack.com.evil.example",
             "example.com",
             "not-slack.com",
+            "ééééééa",
+            "a.éééééa",
+            "😀😀😀.slack.com.evil",
         ] {
             assert!(!is_trusted_slack_host(bad), "expected untrusted: {bad:?}");
         }
+        assert!(is_trusted_slack_host("é.slack.com"));
     }
 
     #[test]

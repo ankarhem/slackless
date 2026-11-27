@@ -130,7 +130,12 @@ pub trait VideoDecoderHandle: Send {
 pub trait AudioDeviceMonitorHandle: Send {}
 
 /// Active OS-native system audio tap streaming stereo `i16` PCM; dropping stops the tap.
-pub trait SystemAudioTapHandle: Send {}
+pub trait SystemAudioTapHandle: Send {
+    /// Native sample rate (Hz) of the stereo `i16` frames pushed into the ring.
+    fn sample_rate(&self) -> u32 {
+        48_000
+    }
+}
 
 /// Active OS-native routed looping audio file player.
 pub trait AudioLoopHandle: Send {

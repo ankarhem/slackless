@@ -299,7 +299,7 @@ mod tests {
             team_id: Some(ext_team_id),
             ..Default::default()
         };
-        fixtures.users.push(ext_user);
+        fixtures.users_mut().push(ext_user);
 
         // External reactor + unknown custom shortcode -> annotated as external workspace emoji.
         let reaction = Reaction {

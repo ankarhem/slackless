@@ -25,7 +25,14 @@ impl<M: MediaDevices> SessionRuntime<'_, M> {
         let done_tx = self.bg_done_tx.clone();
         tokio::spawn(async move {
             let outcome = switch.await;
-            let _ = done_tx.send(BackgroundDone::AudioSwitch { new, prev, outcome });
+            if let Err(err) = done_tx.send(BackgroundDone::AudioSwitch { new, prev, outcome })
+                && let BackgroundDone::AudioSwitch {
+                    outcome: AudioSwitch::Switched(audio) | AudioSwitch::Reverted { audio, .. },
+                    ..
+                } = err.0
+            {
+                M::drop_detached_audio(audio).await;
+            }
         });
     }
 
@@ -60,7 +67,13 @@ impl<M: MediaDevices> SessionRuntime<'_, M> {
         let done_tx = self.bg_done_tx.clone();
         tokio::spawn(async move {
             let result = start.await;
-            let _ = done_tx.send(BackgroundDone::CameraStart { generation, result });
+            if let Err(err) = done_tx.send(BackgroundDone::CameraStart { generation, result })
+                && let BackgroundDone::CameraStart {
+                    result: Ok(camera), ..
+                } = err.0
+            {
+                M::drop_detached_camera(camera).await;
+            }
         });
     }
 
@@ -82,11 +95,16 @@ impl<M: MediaDevices> SessionRuntime<'_, M> {
         let done_tx = self.bg_done_tx.clone();
         tokio::spawn(async move {
             let result = start.await;
-            let _ = done_tx.send(BackgroundDone::ScreenShareStart {
+            if let Err(err) = done_tx.send(BackgroundDone::ScreenShareStart {
                 generation,
                 source_id,
                 result,
-            });
+            }) && let BackgroundDone::ScreenShareStart {
+                result: Ok(share), ..
+            } = err.0
+            {
+                M::stop_detached_screen_share(share).await;
+            }
         });
     }
 }
@@ -152,7 +170,10 @@ pub(super) async fn apply_background_done<R: RtcController, S: SignalSink, M: Me
         }
         BackgroundDone::CameraStart { generation, result } => {
             if generation != state.camera_gen {
-                return; // superseded: dropping the result stops that capture
+                if let Ok(camera) = result {
+                    tokio::spawn(M::drop_detached_camera(camera));
+                }
+                return;
             }
             match result {
                 Ok(camera) => {
@@ -179,7 +200,10 @@ pub(super) async fn apply_background_done<R: RtcController, S: SignalSink, M: Me
             result,
         } => {
             if generation != state.screen_share_gen {
-                return; // superseded: dropping the result stops that share
+                if let Ok(share) = result {
+                    tokio::spawn(M::stop_detached_screen_share(share));
+                }
+                return;
             }
             match result {
                 Ok(share) => {

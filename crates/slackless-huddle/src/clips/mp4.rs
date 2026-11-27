@@ -161,6 +161,24 @@ pub fn mux_h264_mp4(width: u32, height: u32, fps: u32, frames: &[Vec<u8>]) -> Re
 }
 
 /// Mux Annex-B H.264 video frames + optional raw AAC-LC audio track into an ISO-BMFF `.mp4`.
+/// Mux Annex-B H.264 video frames (and optional AAC audio) into an ISO BMFF MP4 container using
+/// the exact recorded duration in milliseconds so fractional frame rates never drift A/V sync.
+pub(crate) fn mux_h264_aac_mp4_with_duration(
+    width: u32,
+    height: u32,
+    elapsed_ms: u64,
+    frames: &[Vec<u8>],
+    audio: Option<&AacAudioTrack>,
+) -> Result<Vec<u8>> {
+    let timescale: u32 = 90_000;
+    let count = frames.len().max(1) as u64;
+    // Exact ticks per frame at 90 kHz: 30 fps = 3_000 ticks, 4 fps = 22_500 ticks.
+    let sample_delta: u32 =
+        ((elapsed_ms.max(250).saturating_mul(90)) / count).clamp(3_000, 22_500) as u32;
+    mux_h264_aac_mp4_inner(width, height, timescale, sample_delta, frames, audio)
+}
+
+/// Mux Annex-B H.264 video frames (and optional AAC audio) into an ISO BMFF MP4 container.
 pub fn mux_h264_aac_mp4(
     width: u32,
     height: u32,
@@ -171,7 +189,17 @@ pub fn mux_h264_aac_mp4(
     let fps = fps.max(1);
     let timescale: u32 = 90_000;
     let sample_delta: u32 = timescale / fps;
+    mux_h264_aac_mp4_inner(width, height, timescale, sample_delta, frames, audio)
+}
 
+fn mux_h264_aac_mp4_inner(
+    width: u32,
+    height: u32,
+    timescale: u32,
+    sample_delta: u32,
+    frames: &[Vec<u8>],
+    audio: Option<&AacAudioTrack>,
+) -> Result<Vec<u8>> {
     let mut sps: Option<Vec<u8>> = None;
     let mut pps: Option<Vec<u8>> = None;
     let mut mdat_payload = Vec::new();
@@ -242,7 +270,16 @@ pub fn mux_h264_aac_mp4(
         }
     }
     let mdat = mp4_box(b"mdat", &mdat_payload);
-    let total_duration = sample_sizes.len() as u32 * sample_delta;
+    let total_duration = (sample_sizes.len() as u32).saturating_mul(sample_delta);
+    let audio_duration_90k = audio
+        .filter(|_| !audio_sizes.is_empty())
+        .map(|a| {
+            let sr = u64::from(a.sample_rate.max(8_000));
+            let samples = (audio_sizes.len() as u64).saturating_mul(1024);
+            ((samples.saturating_mul(u64::from(timescale))) / sr).min(u64::from(u32::MAX)) as u32
+        })
+        .unwrap_or(0);
+    let movie_duration = total_duration.max(audio_duration_90k);
 
     let video_trak = build_video_mp4_trak(&VideoTrakParams {
         width,
@@ -263,7 +300,7 @@ pub fn mux_h264_aac_mp4(
     mvhd_body.extend_from_slice(&0u32.to_be_bytes());
     mvhd_body.extend_from_slice(&0u32.to_be_bytes());
     mvhd_body.extend_from_slice(&timescale.to_be_bytes());
-    mvhd_body.extend_from_slice(&total_duration.to_be_bytes());
+    mvhd_body.extend_from_slice(&movie_duration.to_be_bytes());
     mvhd_body.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate 1.0
     mvhd_body.extend_from_slice(&0x0100u16.to_be_bytes()); // volume 1.0
     mvhd_body.extend_from_slice(&[0u8; 10]); // reserved
@@ -278,7 +315,7 @@ pub fn mux_h264_aac_mp4(
     moov_body.extend_from_slice(&mvhd);
     moov_body.extend_from_slice(&video_trak);
     if has_audio && let Some(a) = audio {
-        let audio_trak = build_aac_mp4_trak(a, &audio_sizes, audio_chunk_offset, total_duration);
+        let audio_trak = build_aac_mp4_trak(a, &audio_sizes, audio_chunk_offset, movie_duration);
         moov_body.extend_from_slice(&audio_trak);
     }
     let moov = mp4_box(b"moov", &moov_body);

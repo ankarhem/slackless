@@ -458,7 +458,12 @@ impl RemoteAudioMixer {
             if self.frame.muted() {
                 continue;
             }
-            for (dst, &src) in self.scratch.iter_mut().zip(self.frame.data()) {
+            let data = self.frame.data();
+            let n = data.len().min(FRAME_10MS);
+            if n < FRAME_10MS {
+                self.scratch[n..].fill(0.0);
+            }
+            for (dst, &src) in self.scratch[..n].iter_mut().zip(&data[..n]) {
                 *dst = f32::from(src) / 32_768.0;
             }
             // Per-stream speech leveling: lifts quiet mics and tames hot ones before the mix.

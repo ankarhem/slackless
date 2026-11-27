@@ -4,10 +4,12 @@
 mod peer_messages;
 
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use super::connected::SessionRuntime;
 use super::io::{RtcController, SignalSink};
 use super::media::MediaDevices;
+use super::signaling_handlers::{SUBSCRIBE_IN_FLIGHT_TIMEOUT, apply_index_frame};
 use super::supervisor::LoopExit;
 use crate::peer_message::{SLACK_DATA_CHANNEL_TOPIC, build_capabilities_message};
 use crate::signaling::{
@@ -27,6 +29,13 @@ pub(super) async fn send_camera_subscription<R: RtcController, S: SignalSink, M:
     state: &mut SessionRuntime<'_, M>,
     video: bool,
 ) {
+    if state
+        .subscribe_in_flight
+        .is_some_and(|t| t.elapsed() < SUBSCRIBE_IN_FLIGHT_TIMEOUT)
+    {
+        state.pending_resubscribe = true;
+        return;
+    }
     let offer = match peer.create_gathered_offer().await {
         Ok(offer) => offer,
         Err(err) => {
@@ -50,6 +59,8 @@ pub(super) async fn send_camera_subscription<R: RtcController, S: SignalSink, M:
     };
     if let Err(err) = signal.send_frame(&frame).await {
         tracing::warn!(%err, video, "failed to send the camera SUBSCRIBE");
+    } else {
+        state.subscribe_in_flight = Some(Instant::now());
     }
 }
 
@@ -201,6 +212,7 @@ impl<R: RtcController, S: SignalSink, M: MediaDevices> Control<'_, '_, R, S, M> 
             tokio::spawn(self.state.media.stop_screen_share());
             self.snap.sharing = false;
             self.snap.share_source_id = None;
+            self.snap.screen_audio_device = None;
             self.state.media.set_camera_compact(false);
             let cap_bytes = build_capabilities_message(&self.state.creds.attendee_id, false);
             let frame = build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, cap_bytes, 30_000);
@@ -237,9 +249,14 @@ impl<R: RtcController, S: SignalSink, M: MediaDevices> Control<'_, '_, R, S, M> 
             .vdec_audio_only
             .store(audio_only, Ordering::Relaxed);
         if audio_only {
+            let had_video = self.snap.video;
             self.state.camera_gen += 1;
             tokio::spawn(self.state.media.stop_camera());
             self.close_local_camera_tile();
+            if had_video {
+                send_camera_subscription(self.config, self.peer, self.signal, self.state, false)
+                    .await;
+            }
             let removed_mids: Vec<String> = self
                 .state
                 .remote_sources
@@ -260,6 +277,16 @@ impl<R: RtcController, S: SignalSink, M: MediaDevices> Control<'_, '_, R, S, M> 
             for tile in self.state.active_remote_tiles.drain() {
                 let _ = self.state.updates.send(HuddleUpdate::VideoTileClosed(tile));
             }
+        } else if let Some(index) = self.state.last_index.clone() {
+            apply_index_frame(
+                &index,
+                self.config,
+                self.snap,
+                self.peer,
+                self.signal,
+                self.state,
+            )
+            .await;
         }
         self.publish_state();
     }

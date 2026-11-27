@@ -149,9 +149,9 @@ pub fn notify_saved_toggled(
 /// Slack's permalink to the message `ts` in `channel`.
 pub fn permalink(fixtures: &Fixtures, channel: &ChannelId, ts: &Ts) -> String {
     let domain = fixtures
-        .workspaces
-        .first()
+        .own_team()
         .map(|team| team.domain.as_str())
+        .filter(|d| !d.is_empty())
         .unwrap_or("app");
     format!(
         "https://{domain}.slack.com/archives/{channel}/p{}",

@@ -129,12 +129,9 @@ impl Archive {
         if !path.is_file() {
             return Ok(None);
         }
-        // A WAL database without its shm file cannot be opened read-only; fall back once.
-        let store = match Store::open_read_only(path) {
-            Ok(store) => store,
-            Err(_) => Store::open(path)?,
-        };
-        Ok(Some(Self { store }))
+        Ok(Some(Self {
+            store: Store::open_for_reading(path)?,
+        }))
     }
 
     /// Opens an existing workspace archive read-write; returns `Ok(None)` when no file exists yet.

@@ -161,6 +161,14 @@ impl RateConverter {
     /// Converter for one channel; `chunk_in` is the wanted input block length in frames (10 ms
     /// keeps real-time latency low, 100 ms suits offline media).
     pub(crate) fn new(src_rate: u32, dst_rate: u32, chunk_in: usize) -> Result<Self> {
+        if chunk_in == 0
+            || !(8_000..=384_000).contains(&src_rate)
+            || !(8_000..=384_000).contains(&dst_rate)
+        {
+            return Err(HuddleError::Audio(format!(
+                "unsupported audio sample rate or chunk ({src_rate} Hz -> {dst_rate} Hz, chunk {chunk_in})"
+            )));
+        }
         let resampler = FftFixedInOut::new(src_rate as usize, dst_rate as usize, chunk_in, 1)
             .map_err(|e| {
                 HuddleError::Audio(format!(

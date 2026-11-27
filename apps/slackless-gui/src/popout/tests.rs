@@ -822,8 +822,7 @@ fn popout_huddle_renders_all_drawers_popovers_themes_and_floating_panel(cx: &mut
     let fixtures = Arc::new(crate::fixtures::load());
     let channel = fixtures.channels[0].id.clone();
     let peer = fixtures
-        .users
-        .iter()
+        .people()
         .find(|u| u.id != fixtures.self_user)
         .unwrap()
         .id

@@ -826,8 +826,7 @@ mod tests {
         let fx = Arc::new(crate::fixtures::load());
         let me = fx.self_user.clone();
         let peers: Vec<UserId> = fx
-            .users
-            .iter()
+            .people()
             .filter(|u| u.id != me)
             .take(5)
             .map(|u| u.id.clone())

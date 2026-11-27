@@ -15,12 +15,11 @@ impl App {
                 list.run_action(&ts, MessageAction::Delete, window, cx);
             });
         } else {
-            let channel = self.channel.clone();
+            // `list.delete` emits `MessageListEvent::Changed(MessageChange::Delete)`, which
+            // routes through `post_change` to send `MessagingCommand::DeleteMessage` once.
             self.messages.update(cx, |list, cx| {
                 list.delete(&ts, cx);
             });
-            self.bridge
-                .send(MessagingCommand::DeleteMessage { channel, ts });
             actions::notify("Message unsent", "Deleted your last message.", window, cx);
         }
     }
@@ -706,7 +705,7 @@ impl App {
         }
     }
 
-    /// Deliver a scheduled message now, through the send pipeline like any other message (the
+    /// Deliver a scheduled message now, through the send pipeline in its own workspace (the
     /// scheduled copy is deleted on Slack first, as "Send now" means).
     pub(super) fn deliver(
         &mut self,
@@ -714,8 +713,13 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(id) = entry.id.take() {
-            self.bridge.send(MessagingCommand::DeleteScheduledMessage {
+        if entry.workspace != self.workspace {
+            self.switch_workspace(entry.workspace, window, cx);
+        }
+        if let Some(id) = entry.id.take()
+            && let Some(bridge) = self.workspace_bridge(entry.workspace)
+        {
+            bridge.send(MessagingCommand::DeleteScheduledMessage {
                 channel: entry.channel.clone(),
                 scheduled_message_id: id,
             });
@@ -727,6 +731,7 @@ impl App {
             broadcast: false,
             content: composer::content_of(&entry.text, &self.fixtures),
             files: None,
+            origin: OutgoingOrigin::External,
         };
         if self.submit(msg, window, cx) {
             notify(
@@ -737,6 +742,17 @@ impl App {
             );
         }
     }
+}
+
+/// Where an [`OutgoingMessage`] originated, so cancelling a send guard restores the right
+/// composer (and rolls back any optimistic thread echo) without clobbering unrelated state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum OutgoingOrigin {
+    #[default]
+    MainComposer,
+    ThreadPanel,
+    ThreadsView,
+    External,
 }
 
 /// A message on its way out, with the target captured when it was submitted: a channel switch
@@ -751,6 +767,7 @@ pub(super) struct OutgoingMessage {
     /// Staged files the message uploads with (`None` for a plain message), shared so a held
     /// confirmation does not copy them.
     pub files: Option<Rc<Vec<composer::PendingAttachment>>>,
+    pub origin: OutgoingOrigin,
 }
 
 /// The list a message-level action was triggered from: an unread group's row or a Threads card.
@@ -1334,6 +1351,7 @@ impl App {
                 broadcast: false,
                 content,
                 files: None,
+                origin: OutgoingOrigin::MainComposer,
             },
             window,
             cx,
@@ -1393,12 +1411,9 @@ impl App {
             {
                 let pending = Rc::clone(&pending);
                 move |_, cx| {
-                    // Only a top-level send came out of the main composer.
-                    if let Some(msg) = pending.take()
-                        && msg.thread_ts.is_none()
-                    {
+                    if let Some(msg) = pending.take() {
                         let _ = this_cancel.update(cx, |app, cx| {
-                            app.restore_composer(&msg.channel, &msg.content.text, msg.files, cx);
+                            app.restore_canceled_send(msg, cx);
                         });
                     }
                 }
@@ -1453,12 +1468,9 @@ impl App {
         .on_cancel({
             let pending = Rc::clone(&pending);
             move |_, cx| {
-                // Only a top-level send came out of the main composer.
-                if let Some(msg) = pending.take()
-                    && msg.thread_ts.is_none()
-                {
+                if let Some(msg) = pending.take() {
                     let _ = this_cancel.update(cx, |app, cx| {
-                        app.restore_composer(&msg.channel, &msg.content.text, msg.files, cx);
+                        app.restore_canceled_send(msg, cx);
                     });
                 }
             }
@@ -1642,6 +1654,7 @@ impl App {
             broadcast,
             content,
             files: _,
+            origin: _,
         } = msg;
         let Some(thread_ts) = thread_ts else {
             self.send_to_conversation(channel, content, cx);
@@ -1654,6 +1667,36 @@ impl App {
             broadcast,
         });
         self.sync_thread_sidebar_counts(cx);
+    }
+
+    /// Restore the originating composer (and roll back any optimistic thread echo) when the user
+    /// cancels a secret warning or `@channel` broadcast confirmation dialog.
+    fn restore_canceled_send(&mut self, msg: OutgoingMessage, cx: &mut Context<Self>) {
+        match msg.origin {
+            OutgoingOrigin::MainComposer => {
+                self.restore_composer(&msg.channel, &msg.content.text, msg.files, cx);
+            }
+            OutgoingOrigin::ThreadPanel => {
+                if let Some(thread_ts) = &msg.thread_ts {
+                    self.thread.update(cx, |panel, cx| {
+                        panel.rollback_pending_reply(
+                            &msg.channel,
+                            thread_ts,
+                            &msg.content.text,
+                            cx,
+                        );
+                    });
+                }
+            }
+            OutgoingOrigin::ThreadsView => {
+                if let Some(thread_ts) = &msg.thread_ts {
+                    self.threads.update(cx, |view, cx| {
+                        view.rollback_pending_reply(&msg.channel, thread_ts, &msg.content.text, cx);
+                    });
+                }
+            }
+            OutgoingOrigin::External => {}
+        }
     }
 
     /// Put a canceled send back into the main composer of `channel`: its `text` and staged
@@ -1757,12 +1800,18 @@ impl App {
         }
         let count = valid_files.len();
         // The message rides the one send pipeline (secret check, `@channel` guard) with its files.
+        let origin = if thread_ts.is_none() {
+            OutgoingOrigin::MainComposer
+        } else {
+            OutgoingOrigin::External
+        };
         let msg = OutgoingMessage {
             channel,
             thread_ts,
             broadcast: false,
             content: content.unwrap_or_default(),
             files: Some(Rc::new(valid_files)),
+            origin,
         };
         if self.submit(msg, window, cx) && self.bridge.store().is_some() {
             let label = if count == 1 { "file" } else { "files" };
@@ -2042,6 +2091,7 @@ impl App {
                         broadcast: true,
                         content: crate::composer::content_of(&message.text, &self.fixtures),
                         files: None,
+                        origin: OutgoingOrigin::External,
                     };
                     if self.submit(msg, window, cx) {
                         window.push_notification("Sent reply to channel", cx);

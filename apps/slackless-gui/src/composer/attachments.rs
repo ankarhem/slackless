@@ -82,11 +82,7 @@ pub(super) fn load_attachment_paths(
         }
         let preview = image_format_for_ext(&path)
             .map(|format| Arc::new(Image::from_bytes(format, bytes.clone())));
-        out.push(PendingAttachment {
-            filename,
-            bytes,
-            preview,
-        });
+        out.push(PendingAttachment::new(filename, bytes, preview));
     }
     (out, too_big)
 }
@@ -115,6 +111,7 @@ impl Composer {
         if self.edit_mode {
             return;
         }
+        let draft_gen = self.draft_gen;
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -125,7 +122,12 @@ impl Composer {
             let Ok(Ok(Some(paths))) = receiver.await else {
                 return;
             };
-            let _ = this.update(cx, |composer, cx| composer.attach_paths(paths, cx));
+            let _ = this.update(cx, |composer, cx| {
+                if composer.draft_gen != draft_gen || composer.edit_mode {
+                    return;
+                }
+                composer.attach_paths(paths, cx);
+            });
         })
         .detach();
     }
@@ -135,6 +137,7 @@ impl Composer {
         if self.edit_mode || paths.is_empty() {
             return;
         }
+        let draft_gen = self.draft_gen;
         self.upload_warning = None;
         cx.spawn(async move |this, cx| {
             let (loaded, rejected) = cx
@@ -145,6 +148,9 @@ impl Composer {
                 return;
             }
             let _ = this.update(cx, |composer, cx| {
+                if composer.draft_gen != draft_gen || composer.edit_mode {
+                    return;
+                }
                 composer.attachments.extend(loaded);
                 if let Some(warning) = format_upload_rejection(&rejected) {
                     composer.upload_warning = Some(warning);
@@ -164,11 +170,11 @@ impl Composer {
         let n = self.next_paste_id;
         self.next_paste_id += 1;
         let bytes = image.bytes.clone();
-        self.attachments.push(PendingAttachment {
-            filename: format!("image-{n}.{ext}"),
+        self.attachments.push(PendingAttachment::new(
+            format!("image-{n}.{ext}"),
             bytes,
-            preview: Some(Arc::new(image)),
-        });
+            Some(Arc::new(image)),
+        ));
         cx.notify();
     }
 
@@ -182,9 +188,10 @@ impl Composer {
         cx.notify();
     }
 
-    pub(super) fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.attachments.len() {
-            self.attachments.remove(index);
+    pub(super) fn remove_attachment(&mut self, id: u64, cx: &mut Context<Self>) {
+        let before = self.attachments.len();
+        self.attachments.retain(|att| att.id != id);
+        if self.attachments.len() != before {
             cx.notify();
         }
     }

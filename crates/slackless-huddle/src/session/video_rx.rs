@@ -177,6 +177,33 @@ pub(super) fn spawn_video_decoder_thread(
             let mut workers: HashMap<u32, TrackWorker> = HashMap::new();
             let mut retiring: Vec<std::thread::JoinHandle<()>> = Vec::new();
             let mut unsupported_video_ssrcs: HashSet<u32> = HashSet::new();
+            let sweep_interval = idle_timeout.min(Duration::from_secs(1));
+            let mut next_sweep = Instant::now() + sweep_interval;
+
+            let sweep_idle_and_reap = |workers: &mut HashMap<u32, TrackWorker>,
+                                       retiring: &mut Vec<std::thread::JoinHandle<()>>,
+                                       now: Instant| {
+                let idle: Vec<u32> = workers
+                    .iter()
+                    .filter(|(_, w)| w.last_packet + idle_timeout <= now)
+                    .map(|(ssrc, _)| *ssrc)
+                    .collect();
+                for ssrc in idle {
+                    if let Some(worker) = workers.remove(&ssrc) {
+                        tracing::info!(ssrc, "dropping idle remote video decoder");
+                        retiring.push(worker.retire());
+                    }
+                }
+                let mut i = 0;
+                while i < retiring.len() {
+                    if retiring[i].is_finished() {
+                        let _ = retiring.swap_remove(i).join();
+                    } else {
+                        i += 1;
+                    }
+                }
+                perf.set_rx_decoders(workers.len());
+            };
 
             loop {
                 // Wake exactly when the oldest worker exceeds `idle_timeout`, or after
@@ -193,26 +220,22 @@ pub(super) fn spawn_video_decoder_thread(
                     Ok(None) | Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {
                         let now = Instant::now();
-                        let idle: Vec<u32> = workers
-                            .iter()
-                            .filter(|(_, w)| w.last_packet + idle_timeout <= now)
-                            .map(|(ssrc, _)| *ssrc)
-                            .collect();
-                        for ssrc in idle {
-                            if let Some(worker) = workers.remove(&ssrc) {
-                                tracing::info!(ssrc, "dropping idle remote video decoder");
-                                retiring.push(worker.retire());
-                            }
-                        }
-                        perf.set_rx_decoders(workers.len());
+                        sweep_idle_and_reap(&mut workers, &mut retiring, now);
+                        next_sweep = now + sweep_interval;
                         continue;
                     }
                 };
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
+                let now = Instant::now();
+                if now >= next_sweep {
+                    sweep_idle_and_reap(&mut workers, &mut retiring, now);
+                    next_sweep = now + sweep_interval;
+                }
                 if clear_decoders.swap(false, Ordering::Relaxed) {
                     stop_all(&mut workers, &mut retiring);
+                    unsupported_video_ssrcs.clear();
                     perf.set_rx_decoders(0);
                 }
                 if audio_only.load(Ordering::Relaxed) {
@@ -222,6 +245,11 @@ pub(super) fn spawn_video_decoder_thread(
 
                 let ssrc = pkt.ssrc;
                 if !workers.contains_key(&ssrc) && !unsupported_video_ssrcs.contains(&ssrc) {
+                    if pkt.mime_type.is_empty() {
+                        // Early packet arrived before `track.codec(ssrc)` resolved: skip without
+                        // permanently blacklisting the SSRC.
+                        continue;
+                    }
                     if let Some(dec) = RemoteVideoDecoder::for_mime(&pkt.mime_type) {
                         let backend = dec.backend_name();
                         tracing::info!(

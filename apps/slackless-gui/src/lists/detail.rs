@@ -17,8 +17,9 @@ pub(super) fn render_live_detail_drawer(
     let theme = cx.theme();
     let list_key = list_key.to_owned();
     state
-        .selected_row
-        .and_then(|row_ix| data.rows.get(row_ix))
+        .selected_record_id
+        .as_deref()
+        .and_then(|record_id| data.rows.iter().find(|r| r.id == record_id))
         .map(|rec| {
             let key_close = list_key.clone();
             let key_del = list_key.clone();
@@ -87,7 +88,7 @@ pub(super) fn render_live_detail_drawer(
                                                     &key_arch,
                                                     |s| {
                                                         s.archived_rows.insert(rid.clone());
-                                                        s.selected_row = None;
+                                                        s.selected_record_id = None;
                                                     },
                                                     window,
                                                     cx,
@@ -106,7 +107,7 @@ pub(super) fn render_live_detail_drawer(
                                             .on_click(move |_, window, cx| {
                                                 mutate_panel(
                                                     &key_del,
-                                                    |s| s.selected_row = None,
+                                                    |s| s.selected_record_id = None,
                                                     window,
                                                     cx,
                                                 );
@@ -123,7 +124,7 @@ pub(super) fn render_live_detail_drawer(
                                             mutate_panel(
                                                 &key_close,
                                                 |s| {
-                                                    s.selected_row = None;
+                                                    s.selected_record_id = None;
                                                     s.editing_cell = None;
                                                 },
                                                 window,
@@ -135,6 +136,7 @@ pub(super) fn render_live_detail_drawer(
                 );
             for (col_ix, col) in data.columns.iter().enumerate() {
                 let val = row_cell(rec, col);
+                let cell_scope = format!("det-{}-{}", rec.id, col.id);
                 let control = if let Some(update_cb) = actions.on_update_cell.clone() {
                     let row_id = rec.id.clone();
                     let col_id = col.id.clone();
@@ -157,7 +159,7 @@ pub(super) fn render_live_detail_drawer(
                                         cx,
                                     );
                                 })
-                                .child(live_cell(val, col, fixtures, cx))
+                                .child(live_cell(val, col, &cell_scope, fixtures, cx))
                                 .child(
                                     div()
                                         .text_xs()
@@ -226,8 +228,7 @@ pub(super) fn render_live_detail_drawer(
                                 _ => "Assign…".to_owned(),
                             };
                             let users: Vec<(slackless_core::types::UserId, String)> = fixtures
-                                .users
-                                .iter()
+                                .people()
                                 .filter(|u| !u.deleted && !u.is_bot)
                                 .take(40)
                                 .map(|u| (u.id.clone(), fixtures.user_name(&u.id).to_owned()))
@@ -395,7 +396,7 @@ pub(super) fn render_live_detail_drawer(
                                             cx,
                                         );
                                     })
-                                    .child(live_cell(val, col, fixtures, cx))
+                                    .child(live_cell(val, col, &cell_scope, fixtures, cx))
                                     .child(
                                         Icon::new(IconName::Pencil)
                                             .size(px(12.))
@@ -407,14 +408,14 @@ pub(super) fn render_live_detail_drawer(
                         _ => h_flex()
                             .items_center()
                             .text_sm()
-                            .child(live_cell(val, col, fixtures, cx))
+                            .child(live_cell(val, col, &cell_scope, fixtures, cx))
                             .into_any_element(),
                     }
                 } else {
                     h_flex()
                         .items_center()
                         .text_sm()
-                        .child(live_cell(val, col, fixtures, cx))
+                        .child(live_cell(val, col, &cell_scope, fixtures, cx))
                         .into_any_element()
                 };
                 panel = panel.child(
@@ -459,7 +460,10 @@ pub(super) fn render_live_detail_drawer(
                     let key_sub = list_key.clone();
                     let on_arch = actions.on_archive_item.clone();
                     let sub_label = match primary_col {
-                        Some(col) => live_cell(row_cell(sub_row, col), col, fixtures, cx),
+                        Some(col) => {
+                            let sub_scope = format!("sub-{}-{}", sub_row.id, col.id);
+                            live_cell(row_cell(sub_row, col), col, &sub_scope, fixtures, cx)
+                        }
                         None => div().child(sub_row.id.clone()),
                     };
                     sub_section = sub_section.child(

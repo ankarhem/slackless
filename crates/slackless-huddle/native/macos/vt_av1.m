@@ -173,6 +173,7 @@ static bool find_av1_seq_obu(
 typedef struct SlacklessVtAv1Decoder {
     VTDecompressionSessionRef session;
     CMVideoFormatDescriptionRef fmt;
+    VtSurfaceDecodeCtx *active_call;
     uint8_t *seq_obu;
     size_t seq_obu_len;
 } SlacklessVtAv1Decoder;
@@ -186,6 +187,7 @@ SlacklessVtAv1Decoder *slackless_vt_av1_decoder_new(void) {
 
 void slackless_vt_av1_decoder_free(SlacklessVtAv1Decoder *dec) {
     if (!dec) return;
+    dec->active_call = NULL;
     if (dec->session) {
         VTDecompressionSessionInvalidate(dec->session);
         CFRelease(dec->session);
@@ -202,6 +204,7 @@ static bool vt_av1_rebuild(
     const uint8_t *seq_obu,
     size_t seq_obu_len,
     const Av1SeqInfo *info) {
+    dec->active_call = NULL;
     if (dec->session) {
         VTDecompressionSessionInvalidate(dec->session);
         CFRelease(dec->session);
@@ -243,7 +246,7 @@ static bool vt_av1_rebuild(
     NSDictionary *decSpec = @{
         (__bridge NSString *)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder : @YES,
     };
-    VTDecompressionOutputCallbackRecord cb = {slackless_vt_decompress_surface_cb, NULL};
+    VTDecompressionOutputCallbackRecord cb = {slackless_vt_decompress_surface_cb, &dec->active_call};
     st = VTDecompressionSessionCreate(
         kCFAllocatorDefault,
         dec->fmt,
@@ -319,7 +322,12 @@ bool slackless_vt_av1_decoder_decode(
 
         VtSurfaceDecodeCtx call = {ctx, on_surface, false};
         VTDecodeInfoFlags flagsOut = 0;
-        st = VTDecompressionSessionDecodeFrame(dec->session, sbuf, 0, &call, &flagsOut);
+        dec->active_call = &call;
+        st = VTDecompressionSessionDecodeFrame(dec->session, sbuf, 0, NULL, &flagsOut);
+        if (st == noErr && (flagsOut & kVTDecodeInfo_Asynchronous)) {
+            VTDecompressionSessionWaitForAsynchronousFrames(dec->session);
+        }
+        dec->active_call = NULL;
         CFRelease(sbuf);
         return st == noErr && call.got_frame;
     }

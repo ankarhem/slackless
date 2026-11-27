@@ -4463,3 +4463,298 @@ fn backup_to_rejects_live_database_sidecars_directories_and_missing_parents() {
     assert_eq!(store.message_count(&ws()).unwrap(), 10);
     assert!(store.integrity_check().unwrap().ok);
 }
+
+#[test]
+fn multi_row_json_lists_skip_undecodable_rows_instead_of_failing_workspace() {
+    let mut store = Store::open_in_memory().unwrap();
+    let workspace = ws();
+
+    store
+        .upsert_conversation(
+            &workspace,
+            &Conversation {
+                id: ChannelId::from("C0GOOD"),
+                name: Some("good".into()),
+                is_channel: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .upsert_users(
+            &workspace,
+            &[User {
+                id: UserId::from("U0GOOD"),
+                name: "good".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    store
+        .upsert_team(
+            &workspace,
+            &Team {
+                id: workspace.clone(),
+                name: "Good Team".into(),
+                domain: "good".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .replace_sections(
+            &workspace,
+            &[ChannelSection {
+                id: "L0GOOD".into(),
+                name: "Good Section".into(),
+                kind: "custom".into(),
+                emoji: String::new(),
+                next_id: None,
+                channel_ids: vec![ChannelId::from("C0GOOD")],
+            }],
+        )
+        .unwrap();
+
+    // Seed a second row in each table, then corrupt only its stored JSON blob.
+    store
+        .upsert_conversation(
+            &workspace,
+            &Conversation {
+                id: ChannelId::from("C0BAD"),
+                name: Some("bad".into()),
+                is_channel: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .upsert_users(
+            &workspace,
+            &[User {
+                id: UserId::from("U0BAD"),
+                name: "bad".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    store
+        .upsert_team(
+            &workspace,
+            &Team {
+                id: TeamId::from("T0BAD"),
+                name: "Bad Team".into(),
+                domain: "bad".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .replace_sections(
+            &workspace,
+            &[
+                ChannelSection {
+                    id: "L0GOOD".into(),
+                    name: "Good Section".into(),
+                    kind: "custom".into(),
+                    emoji: String::new(),
+                    next_id: None,
+                    channel_ids: vec![ChannelId::from("C0GOOD")],
+                },
+                ChannelSection {
+                    id: "L0BAD".into(),
+                    name: "Bad Section".into(),
+                    kind: "custom".into(),
+                    emoji: String::new(),
+                    next_id: None,
+                    channel_ids: vec![],
+                },
+            ],
+        )
+        .unwrap();
+
+    store
+        .conn
+        .execute(
+            "UPDATE conversation SET json = '{not-json' WHERE workspace_id = ?1 AND id = 'C0BAD'",
+            params![workspace.as_str()],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            r#"UPDATE "user" SET json = '{not-json' WHERE workspace_id = ?1 AND id = 'U0BAD'"#,
+            params![workspace.as_str()],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE team SET json = '{not-json' WHERE workspace_id = ?1 AND id = 'T0BAD'",
+            params![workspace.as_str()],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE channel_section SET json = '{not-json' WHERE workspace_id = ?1 AND id = 'L0BAD'",
+            params![workspace.as_str()],
+        )
+        .unwrap();
+
+    let convs = store.conversations(&workspace).unwrap();
+    assert_eq!(convs.len(), 1);
+    assert_eq!(convs[0].id.as_str(), "C0GOOD");
+
+    let users = store.users(&workspace).unwrap();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].id.as_str(), "U0GOOD");
+
+    let teams = store.teams(&workspace).unwrap();
+    assert_eq!(teams.len(), 1);
+    assert_eq!(teams[0].id, workspace);
+
+    let sections = store.sections(&workspace).unwrap();
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0].id, "L0GOOD");
+}
+
+#[test]
+fn open_for_reading_propagates_future_schema_and_sql_limit_never_wraps_negative() {
+    assert_eq!(super::sql_limit(0), 0);
+    assert_eq!(super::sql_limit(50), 50);
+    assert_eq!(super::sql_limit(usize::MAX), i64::MAX);
+    assert!(super::sql_limit(usize::MAX) > 0);
+
+    let dir = MaintTempDir::new("future-schema-ro");
+    let path = dir.0.join("T1.sqlite");
+    {
+        let store = Store::open(&path).unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA user_version = 999;")
+            .unwrap();
+    }
+    let err = Store::open_for_reading(&path)
+        .err()
+        .expect("expected FutureSchema error");
+    assert!(
+        matches!(err, StoreError::FutureSchema { found: 999, .. }),
+        "open_for_reading must not fall back to read-write on FutureSchema: {err:?}"
+    );
+}
+
+#[test]
+fn corrupt_zlib_and_json_rows_skip_and_self_heal_across_reads_revisions_merge_and_deletion() {
+    let mut store = Store::open_in_memory().unwrap();
+    let ws = TeamId::from("T1");
+    let ch = ChannelId::from("C1");
+
+    // 1. merge_conversation self-heals a corrupt stored conversation row.
+    let mk_conv = |id: &str, name: &str| Conversation {
+        id: ChannelId::from(id),
+        name: Some(name.into()),
+        is_channel: true,
+        ..Default::default()
+    };
+    store
+        .upsert_conversation(&ws, &mk_conv("C1", "old"))
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE conversation SET json = '{broken' WHERE workspace_id = ?1 AND id = 'C1'",
+            params![ws.as_str()],
+        )
+        .unwrap();
+    store
+        .merge_conversation(&ws, &mk_conv("C1", "healed"))
+        .unwrap();
+    let healed = store.conversation(&ws, &ch).unwrap().unwrap();
+    assert_eq!(healed.name.as_deref(), Some("healed"));
+
+    // 2. Corrupt zlib blob in message_current is skipped by multi-row reads (channel_history &
+    //    search_sorted), fails strict single-row Store::message, and self-heals on record_deletion.
+    let good = msg("1700000001.000100", "U1", "good searchable message");
+    let bad = msg("1700000002.000100", "U1", "bad blob searchable message");
+    store.upsert_messages(&ws, &ch, &[good, bad]).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE message_current SET json = ?1 WHERE workspace_id = ?2 AND channel_id = ?3 AND ts = '1700000002.000100'",
+            params![vec![0xFFu8, 0x00, 0xAB, 0xCD], ws.as_str(), ch.as_str()],
+        )
+        .unwrap();
+
+    let history = store.channel_history(&ws, &ch, None, 20).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].message.ts.as_str(), "1700000001.000100");
+
+    let hits = store
+        .search_sorted(
+            &ws,
+            &SearchQuery::parse("searchable"),
+            SearchSort::Recent,
+            20,
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].message.ts.as_str(), "1700000001.000100");
+
+    assert!(
+        store
+            .message(&ws, &ch, &Ts::from("1700000002.000100"))
+            .is_err(),
+        "single-row Store::message stays strict on corrupt blob"
+    );
+
+    // 3. Corrupt revision row is skipped by revisions(), and record_deletion self-heals.
+    store
+        .record_deletion(
+            &ws,
+            &ch,
+            &Ts::from("1700000002.000100"),
+            Some(&Ts::from("1700000003.000100")),
+            None,
+        )
+        .unwrap();
+    let revs = store
+        .revisions(&ws, &ch, &Ts::from("1700000002.000100"))
+        .unwrap();
+    assert_eq!(
+        revs.len(),
+        1,
+        "corrupt prior revision skipped, tombstone kept"
+    );
+    assert!(revs[0].deleted);
+}
+
+#[test]
+fn file_transcript_ids_in_channel_returns_only_matching_channel_files() {
+    let mut store = Store::open_in_memory().unwrap();
+    let ws = TeamId::from("T1");
+    let c1 = ChannelId::from("C1");
+    let c2 = ChannelId::from("C2");
+    let mut m1 = msg("1700000010.000100", "U1", "clip in c1");
+    m1.files.push(File {
+        id: FileId::from("F1"),
+        ..Default::default()
+    });
+    let mut m2 = msg("1700000011.000100", "U1", "clip in c2");
+    m2.files.push(File {
+        id: FileId::from("F2"),
+        ..Default::default()
+    });
+    store.upsert_messages(&ws, &c1, &[m1]).unwrap();
+    store.upsert_messages(&ws, &c2, &[m2]).unwrap();
+    store
+        .upsert_file_transcript(&ws, &FileId::from("F1"), "whisper", "hello one")
+        .unwrap();
+    store
+        .upsert_file_transcript(&ws, &FileId::from("F2"), "whisper", "hello two")
+        .unwrap();
+
+    let in_c1 = store.file_transcript_ids_in_channel(&ws, &c1).unwrap();
+    assert_eq!(in_c1.len(), 1);
+    assert!(in_c1.contains(&FileId::from("F1")));
+    assert!(!in_c1.contains(&FileId::from("F2")));
+}

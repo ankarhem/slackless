@@ -1085,7 +1085,8 @@ impl Composer {
                 .when(self.pending_gif.is_some(), |el| el.pt_1p5())
                 .pb_1p5()
                 .children(gif_card)
-                .children(self.attachments.iter().enumerate().map(|(ix, file)| {
+                .children(self.attachments.iter().map(|file| {
+                    let file_id = file.id;
                     let thumb = match &file.preview {
                         Some(preview) => img(ImageSource::Image(preview.clone()))
                             .size(px(36.))
@@ -1122,7 +1123,7 @@ impl Composer {
                         }
                     };
                     h_flex()
-                        .id(("attach-chip", ix))
+                        .id(("attach-chip", file_id))
                         .items_center()
                         .gap_2()
                         .pl_1p5()
@@ -1154,13 +1155,13 @@ impl Composer {
                                 ),
                         )
                         .child(
-                            Button::new(("attach-rm", ix))
+                            Button::new(("attach-rm", file_id))
                                 .ghost()
                                 .with_size(Size::XSmall)
                                 .icon(IconName::X)
                                 .tooltip("Remove attachment")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.remove_attachment(ix, cx);
+                                    this.remove_attachment(file_id, cx);
                                 })),
                         )
                 })),

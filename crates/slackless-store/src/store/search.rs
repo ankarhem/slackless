@@ -188,14 +188,14 @@ impl Store {
         } else {
             sql.push_str(" ORDER BY m.ts_key DESC LIMIT ?");
         }
-        args.push(SqlValue::Integer(limit as i64));
+        args.push(SqlValue::Integer(super::sql_limit(limit)));
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(args), |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
-                decode_json_value(r.get_ref(2)?)?,
+                decode_json_value(r.get_ref(2)?),
                 r.get::<_, bool>(3)?,
                 r.get::<_, Option<f64>>(4)?,
             ))

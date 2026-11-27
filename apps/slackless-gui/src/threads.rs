@@ -91,6 +91,8 @@ pub enum ThreadPanelEvent {
         thread_ts: Ts,
         content: MessageContent,
     },
+    /// A huddle card's "Join huddle" button was clicked in the thread panel.
+    JoinHuddle(ChannelId),
     /// The header menu followed or unfollowed the open thread (already shown here); the root
     /// tells Slack. `last_read` is the thread's newest message.
     SetSubscribed {
@@ -406,6 +408,16 @@ impl ThreadPanel {
         }
     }
 
+    /// Mirror the open thread's current `root` / `replies` back into `self.cache` so closing and
+    /// immediately reopening the thread never flashes stale pre-edit / pre-delete / pre-react state.
+    fn sync_cache(&mut self) {
+        if let Some(key) = self.thread.clone()
+            && self.cache.contains_key(&key)
+        {
+            self.cache_put(key, self.root.clone(), self.replies.clone());
+        }
+    }
+
     pub fn open(
         &mut self,
         channel: ChannelId,
@@ -457,6 +469,11 @@ impl ThreadPanel {
 
     pub fn open_thread(&self) -> Option<(ChannelId, Ts)> {
         self.thread.clone()
+    }
+
+    #[cfg(test)]
+    pub fn reply_count_for_test(&self) -> usize {
+        self.replies.len()
     }
 
     /// Replace the open thread's messages (live mode: re-read from the store after it
@@ -573,6 +590,7 @@ impl ThreadPanel {
             .message_at_mut(ts)
             .is_some_and(|message| actions::add_reaction(message, &me, name));
         if added {
+            self.sync_cache();
             self.post(
                 MessageChange::React {
                     ts: ts.clone(),
@@ -607,6 +625,7 @@ impl ThreadPanel {
             message.blocks = content.blocks.clone();
             message.attachments = content.attachments.clone();
             self.replies.push(message);
+            self.sync_cache();
         }
         self.reply_hint = false;
         let broadcast = self
@@ -619,6 +638,38 @@ impl ThreadPanel {
             broadcast,
         });
         cx.notify();
+    }
+
+    /// Undo a synthetic optimistic reply and put `text` back in the reply composer when a send
+    /// guard (secret warning or `@channel` confirmation) was cancelled.
+    pub fn rollback_pending_reply(
+        &mut self,
+        channel: &ChannelId,
+        thread_ts: &Ts,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (channel.clone(), thread_ts.clone());
+        let me = self.fixtures.self_user.clone();
+        if self.thread.as_ref() == Some(&key) {
+            if let Some(pos) = self
+                .replies
+                .iter()
+                .rposition(|m| m.user.as_ref() == Some(&me) && m.text == text)
+            {
+                self.replies.remove(pos);
+            }
+            self.sync_cache();
+            self.composer
+                .update(cx, |composer, cx| composer.load_draft(text, cx));
+            cx.notify();
+        } else if let Some((_, cached_replies)) = self.cache.get_mut(&key)
+            && let Some(pos) = cached_replies
+                .iter()
+                .rposition(|m| m.user.as_ref() == Some(&me) && m.text == text)
+        {
+            cached_replies.remove(pos);
+        }
     }
 
     fn message_at_mut(&mut self, ts: &Ts) -> Option<&mut Message> {
@@ -643,6 +694,7 @@ impl ThreadPanel {
                     .message_at_mut(ts)
                     .map(|message| actions::toggle_reaction(message, &me, &name));
                 if let Some(add) = toggled {
+                    self.sync_cache();
                     self.post(
                         MessageChange::React {
                             ts: ts.clone(),
@@ -748,6 +800,7 @@ impl ThreadPanel {
                     .map(|message| self.fixtures.preview(message))
                     .unwrap_or_default();
                 actions::notify_pin_toggled(pinned, preview, window, cx);
+                self.sync_cache();
                 self.post(
                     MessageChange::Pin {
                         ts: ts.clone(),
@@ -761,15 +814,21 @@ impl ThreadPanel {
                     return;
                 };
                 let fixtures = self.fixtures.clone();
+                let target_thread = self.thread.clone();
                 let (this, ts) = (cx.entity().downgrade(), ts.clone());
                 actions::confirm_delete(message, fixtures, window, cx, move |cx| {
-                    // Gone only if the panel itself was dropped meanwhile: nothing to delete.
-                    let _ = this.update(cx, |panel, cx| panel.delete_message(&ts, cx));
+                    // Gone if the panel was dropped or switched to another thread meanwhile.
+                    let _ = this.update(cx, |panel, cx| {
+                        if panel.thread == target_thread {
+                            panel.delete_message(&ts, cx);
+                        }
+                    });
                 });
             }
             MessageAction::DismissEphemeral => {
                 let target = ts.clone();
                 self.replies.retain(|m| m.ts != target);
+                self.sync_cache();
                 cx.notify();
             }
             MessageAction::OpenProfile(user) => cx.emit(ThreadPanelEvent::OpenProfile(user)),
@@ -801,7 +860,11 @@ impl ThreadPanel {
                     });
                 }
             }
-            MessageAction::JoinHuddle => {}
+            MessageAction::JoinHuddle => {
+                if let Some((channel, _)) = &self.thread {
+                    cx.emit(ThreadPanelEvent::JoinHuddle(channel.clone()));
+                }
+            }
             MessageAction::OpenImage(origin) => {
                 // The viewer pages through the thread's images, root first.
                 let Some((channel, _)) = self.thread.clone() else {
@@ -855,6 +918,7 @@ impl ThreadPanel {
         let me = self.fixtures.self_user.clone();
         if let Some(message) = self.message_at_mut(&ts) {
             actions::apply_edit(message, &me, content.clone());
+            self.sync_cache();
             self.post(MessageChange::Edit { ts, content }, cx);
         }
         self.editing = None;
@@ -881,6 +945,7 @@ impl ThreadPanel {
         };
         let subscribed = root.subscribed != Some(true);
         root.subscribed = Some(subscribed);
+        self.sync_cache();
         cx.emit(ThreadPanelEvent::SetSubscribed {
             channel,
             thread_ts,
@@ -920,10 +985,13 @@ impl ThreadPanel {
     fn delete_message(&mut self, ts: &Ts, cx: &mut Context<Self>) {
         self.post(MessageChange::Delete { ts: ts.clone() }, cx);
         if self.root.as_ref().is_some_and(|root| &root.ts == ts) {
-            // Deleting the root discards the whole thread and closes the panel.
+            // Deleting the root discards the whole thread, evicts it from cache, and closes the panel.
+            if let Some(key) = self.thread.take() {
+                self.cache.remove(&key);
+                self.cache_lru.retain(|k| k != &key);
+            }
             self.root = None;
             self.replies.clear();
-            self.thread = None;
             self.editing = None;
             self.unread_after = None;
             self.reply_hint = false;
@@ -932,6 +1000,7 @@ impl ThreadPanel {
             return;
         }
         self.replies.retain(|message| &message.ts != ts);
+        self.sync_cache();
         if self.editing.as_ref() == Some(ts) {
             self.editing = None;
         }

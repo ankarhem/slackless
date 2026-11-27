@@ -588,6 +588,10 @@ impl VadSegmenter {
         None
     }
 
+    pub fn is_in_speech(&self) -> bool {
+        self.in_speech
+    }
+
     /// Force-flush any buffered speech (e.g. when leaving a huddle).
     pub fn flush(&mut self) -> Option<Vec<i16>> {
         let ready = self.speech_samples >= MIN_SPEECH_SAMPLES;
@@ -907,6 +911,7 @@ fn parakeet_segments_to_cues(
 /// and joins its worker thread / terminates any spawned `whisper-server` synchronously on drop.
 pub struct LocalTranscriber {
     tx: Option<SyncSender<TranscribeChunk>>,
+    cancel_startup: Arc<std::sync::atomic::AtomicBool>,
     server_child: Arc<Mutex<Option<Child>>>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -931,13 +936,16 @@ impl LocalTranscriber {
             );
             return None;
         }
+        let cancel_startup = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel_startup);
         let server_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         let worker_server_child = Arc::clone(&server_child);
-        let (tx, rx) = mpsc::sync_channel::<TranscribeChunk>(64);
+        let (tx, rx) = mpsc::sync_channel::<TranscribeChunk>(256);
         let worker = std::thread::Builder::new()
             .name(format!("slackless-stt-{}", provider.source_tag()))
             .spawn(move || {
-                let Some(mut backend) = init_stt_backend(provider, &setup, worker_server_child)
+                let Some(mut backend) =
+                    init_stt_backend(provider, &setup, worker_server_child, worker_cancel)
                 else {
                     return;
                 };
@@ -953,20 +961,68 @@ impl LocalTranscriber {
                 let mut seq: u64 = 0;
 
                 while let Ok(chunk) = rx.recv() {
-                    let utterance = if chunk.is_local {
+                    if chunk.pcm_48k.is_empty() {
+                        // Explicit flush sentinel (e.g. mic muted mid-sentence).
+                        if chunk.is_local
+                            && let Some(pcm_16k) = local_vad.flush()
+                        {
+                            seq = seq.wrapping_add(1);
+                            emit_transcribed(
+                                &mut backend,
+                                seq,
+                                last_local_speaker.clone(),
+                                &pcm_16k,
+                                &updates,
+                            );
+                        }
+                        continue;
+                    }
+                    if chunk.is_local {
                         last_local_speaker = chunk.speaker;
-                        local_vad
-                            .push_48k(&chunk.pcm_48k)
-                            .map(|pcm| (last_local_speaker.clone(), pcm))
+                        if let Some(pcm_16k) = local_vad.push_48k(&chunk.pcm_48k) {
+                            seq = seq.wrapping_add(1);
+                            emit_transcribed(
+                                &mut backend,
+                                seq,
+                                last_local_speaker.clone(),
+                                &pcm_16k,
+                                &updates,
+                            );
+                        }
                     } else {
-                        last_remote_speaker = chunk.speaker;
-                        remote_vad
-                            .push_48k(&chunk.pcm_48k)
-                            .map(|pcm| (last_remote_speaker.clone(), pcm))
-                    };
-                    if let Some((speaker, pcm_16k)) = utterance {
-                        seq = seq.wrapping_add(1);
-                        emit_transcribed(&mut backend, seq, speaker, &pcm_16k, &updates);
+                        // Never overwrite the active remote speaker with the `"U0REMOTE"` fallback
+                        // during trailing silence (when `active_remote_speaker` clears before VAD's
+                        // 650 ms silence tail completes). On a real speaker handoff mid-utterance,
+                        // flush the previous speaker's audio first.
+                        let is_named_speaker = chunk.speaker.as_str() != "U0REMOTE";
+                        if is_named_speaker
+                            && remote_vad.is_in_speech()
+                            && last_remote_speaker.as_str() != "U0REMOTE"
+                            && last_remote_speaker != chunk.speaker
+                            && let Some(pcm_16k) = remote_vad.flush()
+                        {
+                            seq = seq.wrapping_add(1);
+                            emit_transcribed(
+                                &mut backend,
+                                seq,
+                                last_remote_speaker.clone(),
+                                &pcm_16k,
+                                &updates,
+                            );
+                        }
+                        if is_named_speaker {
+                            last_remote_speaker = chunk.speaker;
+                        }
+                        if let Some(pcm_16k) = remote_vad.push_48k(&chunk.pcm_48k) {
+                            seq = seq.wrapping_add(1);
+                            emit_transcribed(
+                                &mut backend,
+                                seq,
+                                last_remote_speaker.clone(),
+                                &pcm_16k,
+                                &updates,
+                            );
+                        }
                     }
                 }
                 if let Some(pcm_16k) = local_vad.flush() {
@@ -982,6 +1038,7 @@ impl LocalTranscriber {
             .ok()?;
         Some(Self {
             tx: Some(tx),
+            cancel_startup,
             server_child,
             worker: Some(worker),
         })
@@ -998,17 +1055,39 @@ impl LocalTranscriber {
             });
         }
     }
+
+    /// Request an immediate non-blocking flush of buffered local speech (e.g. on mute).
+    pub fn flush_local(&self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(TranscribeChunk {
+                is_local: true,
+                speaker: UserId::from("U0SELF"),
+                pcm_48k: Vec::new(),
+            });
+        }
+    }
 }
 
 impl Drop for LocalTranscriber {
     fn drop(&mut self) {
-        // Close channel first so the worker exits its receive loop, then kill any active
-        // `whisper-server` child synchronously so an in-flight HTTP inference cannot hang drop.
+        // Signal any in-progress `whisper-server` startup health probe to abort immediately and
+        // close the channel so the worker flushes its trailing utterances cleanly. Wait briefly
+        // for final flush inference before forcefully killing `whisper-server` so leave/hangup
+        // neither drops final sentences nor hangs indefinitely.
+        self.cancel_startup
+            .store(true, std::sync::atomic::Ordering::Release);
         drop(self.tx.take());
-        kill_whisper_server(&self.server_child);
         if let Some(handle) = self.worker.take() {
+            let deadline = std::time::Instant::now() + Duration::from_millis(2500);
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if !handle.is_finished() {
+                kill_whisper_server(&self.server_child);
+            }
             let _ = handle.join();
         }
+        kill_whisper_server(&self.server_child);
     }
 }
 
@@ -1022,6 +1101,7 @@ fn init_stt_backend(
     provider: TranscriptionProvider,
     setup: &ProviderSetupStatus,
     server_child: Arc<Mutex<Option<Child>>>,
+    cancel_startup: Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<ActiveSttBackend> {
     match provider {
         TranscriptionProvider::SlackBuiltIn => None,
@@ -1034,8 +1114,12 @@ fn init_stt_backend(
         },
         TranscriptionProvider::WhisperTurbo => {
             if let Some(server_bin) = find_whisper_binary(&["whisper-server"])
-                && let Some(srv) =
-                    spawn_whisper_server(&server_bin, &setup.model_path, server_child)
+                && let Some(srv) = spawn_whisper_server(
+                    &server_bin,
+                    &setup.model_path,
+                    server_child,
+                    cancel_startup,
+                )
             {
                 return Some(srv);
             }
@@ -1052,7 +1136,11 @@ fn spawn_whisper_server(
     bin: &Path,
     model: &Path,
     server_child: Arc<Mutex<Option<Child>>>,
+    cancel_startup: Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<ActiveSttBackend> {
+    if cancel_startup.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
     let port = listener.local_addr().ok()?.port();
     drop(listener);
@@ -1075,16 +1163,32 @@ fn spawn_whisper_server(
     }
 
     crate::signaling::install_default_crypto_provider();
-    let http = reqwest::Client::builder()
+    let Ok(http) = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
-        .ok()?;
+    else {
+        kill_whisper_server(&server_child);
+        return None;
+    };
 
-    // Wait up to 8s for `whisper-server` to finish loading the model onto Metal/CPU.
+    // Wait up to 8s for `whisper-server` to finish loading the model onto Metal/CPU, stopping
+    // immediately if `LocalTranscriber` is dropped or the child exits early.
     let health_url = format!("http://127.0.0.1:{port}/");
     let http_probe = http.clone();
+    let child_probe = Arc::clone(&server_child);
     let ready = block_on_http(async move {
         for _ in 0..80 {
+            if cancel_startup.load(std::sync::atomic::Ordering::Acquire) {
+                return false;
+            }
+            let exited = child_probe
+                .lock()
+                .ok()
+                .and_then(|mut g| g.as_mut().and_then(|c| c.try_wait().ok().flatten()))
+                .is_some();
+            if exited {
+                return false;
+            }
             if http_probe.get(&health_url).send().await.is_ok() {
                 return true;
             }
@@ -1126,6 +1230,8 @@ fn emit_transcribed(
     }));
 }
 
+static WHISPER_CLI_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn run_whisper_cli_utterance_timed(
     bin: &Path,
     model: &Path,
@@ -1135,7 +1241,8 @@ fn run_whisper_cli_utterance_timed(
     chunk_dur_secs: f64,
 ) -> Option<(Option<String>, String, Vec<TranscriptCue>)> {
     let pid = std::process::id();
-    let stem = std::env::temp_dir().join(format!("slackless-stt-{pid}-{seq}"));
+    let uniq = WHISPER_CLI_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = std::env::temp_dir().join(format!("slackless-stt-{pid}-{seq}-{uniq}"));
     let wav_path = stem.with_extension("wav");
     let json_path = stem.with_extension("json");
 
@@ -1194,27 +1301,58 @@ const SPLIT_HOP_SAMPLES: usize = TARGET_RATE / 20;
 fn decode_wav_bytes_to_16k_mono(bytes: &[u8]) -> std::result::Result<Vec<f32>, String> {
     let reader = hound::WavReader::new(bytes).map_err(|e| format!("unreadable WAV: {e}"))?;
     let spec = reader.spec();
+    let sample_rate = spec.sample_rate;
+    if !(8_000..=384_000).contains(&sample_rate) {
+        return Err(format!("unsupported WAV sample rate: {sample_rate} Hz"));
+    }
+    if spec.channels == 0 || spec.bits_per_sample == 0 {
+        return Err("invalid WAV channel count or bit depth".to_owned());
+    }
+    // Cap decoded source frames to at most the number needed to fill `MAX_OFFLINE_AUDIO_SAMPLES`
+    // after resampling (plus one chunk of headroom) and never trust the WAV header's declared
+    // duration beyond the actual slice length.
+    let bytes_per_frame =
+        (usize::from(spec.channels) * usize::from(spec.bits_per_sample).div_ceil(8)).max(1);
+    let max_frames_from_bytes = bytes.len() / bytes_per_frame;
+    let max_src_frames = ((MAX_OFFLINE_AUDIO_SAMPLES as u64).saturating_mul(u64::from(sample_rate))
+        / (TARGET_RATE as u64))
+        .saturating_add(u64::from(sample_rate))
+        .min(usize::MAX as u64) as usize;
+    let frame_cap = max_frames_from_bytes.min(max_src_frames);
     let mono = match spec.sample_format {
         hound::SampleFormat::Int => {
             let scale = 2f32.powi(1 - i32::from(spec.bits_per_sample));
-            downmix_wav(reader, |s: i32| s as f32 * scale)
+            downmix_wav(reader, frame_cap, |s: i32| s as f32 * scale)
         }
         hound::SampleFormat::Float => {
-            downmix_wav(reader, |s: f32| if s.is_finite() { s } else { 0.0 })
+            downmix_wav(
+                reader,
+                frame_cap,
+                |s: f32| if s.is_finite() { s } else { 0.0 },
+            )
         }
     };
-    let sample_rate = spec.sample_rate;
 
     let mut resampled = if sample_rate == TARGET_RATE as u32 {
         mono
     } else {
         // 100 ms blocks: a steep anti-aliasing filter, so nothing above 8 kHz folds into the
-        // speech band; the converter's delay is irrelevant for a file.
-        let mut converter =
-            RateConverter::new(sample_rate, TARGET_RATE as u32, sample_rate as usize / 10)
-                .map_err(|e| e.to_string())?;
-        let mut out = Vec::with_capacity(converter.output_capacity(mono.len()));
+        // speech band; pad one chunk of trailing zeros to flush the final partial block.
+        let chunk_in = (sample_rate as usize / 10).max(1);
+        let mut converter = RateConverter::new(sample_rate, TARGET_RATE as u32, chunk_in)
+            .map_err(|e| e.to_string())?;
+        let expected_out = ((mono.len() as u64)
+            .saturating_mul(TARGET_RATE as u64)
+            .div_ceil(u64::from(sample_rate))) as usize;
+        let mut out = Vec::with_capacity(converter.output_capacity(mono.len() + chunk_in));
         converter.process(&mono, &mut out);
+        if !mono.is_empty() {
+            let pad = vec![0.0f32; chunk_in];
+            converter.process(&pad, &mut out);
+            if out.len() > expected_out {
+                out.truncate(expected_out);
+            }
+        }
         out
     };
     if resampled.len() > MAX_OFFLINE_AUDIO_SAMPLES {
@@ -1227,10 +1365,12 @@ fn decode_wav_bytes_to_16k_mono(bytes: &[u8]) -> std::result::Result<Vec<f32>, S
 /// chunk ends the audio early rather than failing the whole file.
 fn downmix_wav<S: hound::Sample>(
     mut reader: hound::WavReader<&[u8]>,
+    frame_cap: usize,
     to_f32: impl Fn(S) -> f32,
 ) -> Vec<f32> {
-    let channels = usize::from(reader.spec().channels);
-    let mut mono = Vec::with_capacity(reader.duration() as usize);
+    let channels = usize::from(reader.spec().channels).max(1);
+    let declared = usize::try_from(reader.duration()).unwrap_or(frame_cap);
+    let mut mono = Vec::with_capacity(declared.min(frame_cap));
     let mut sum = 0.0f32;
     for (i, sample) in reader.samples::<S>().enumerate() {
         match sample {
@@ -1243,6 +1383,9 @@ fn downmix_wav<S: hound::Sample>(
         if (i + 1) % channels == 0 {
             mono.push((sum / channels as f32).clamp(-1.0, 1.0));
             sum = 0.0;
+            if mono.len() >= frame_cap {
+                break;
+            }
         }
     }
     mono
@@ -1491,8 +1634,9 @@ pub fn transcribe_media_file_timed(
         }
         TranscriptionProvider::WhisperTurbo => {
             let server_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
-            let mut backend =
-                init_stt_backend(provider, &setup, server_child).ok_or_else(|| {
+            let cancel_startup = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut backend = init_stt_backend(provider, &setup, server_child, cancel_startup)
+                .ok_or_else(|| {
                     "failed to initialize local Whisper transcription backend".to_owned()
                 })?;
             for (idx, (start_sample, chunk)) in chunks.into_iter().enumerate() {
@@ -1915,5 +2059,35 @@ mod tests {
             rebuilt.extend_from_slice(chunk);
         }
         assert_eq!(rebuilt, continuous);
+    }
+
+    #[test]
+    fn decode_wav_rejects_out_of_range_sample_rates_and_caps_bogus_data_chunk_size() {
+        // Minimal 44-byte PCM WAV header with custom sample_rate and declared data chunk size.
+        let make_wav = |sample_rate: u32, declared_data_bytes: u32| {
+            let mut buf = Vec::with_capacity(44);
+            buf.extend_from_slice(b"RIFF");
+            buf.extend_from_slice(&36u32.to_le_bytes());
+            buf.extend_from_slice(b"WAVE");
+            buf.extend_from_slice(b"fmt ");
+            buf.extend_from_slice(&16u32.to_le_bytes());
+            buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+            buf.extend_from_slice(&1u16.to_le_bytes()); // mono
+            buf.extend_from_slice(&sample_rate.to_le_bytes());
+            buf.extend_from_slice(&sample_rate.to_le_bytes()); // byte rate
+            buf.extend_from_slice(&1u16.to_le_bytes()); // block align
+            buf.extend_from_slice(&8u16.to_le_bytes()); // 8-bit
+            buf.extend_from_slice(b"data");
+            buf.extend_from_slice(&declared_data_bytes.to_le_bytes());
+            buf
+        };
+
+        // 1. sample_rate < 8000 (e.g. 5 Hz -> sample_rate / 10 == 0) must return Err, not panic.
+        assert!(decode_wav_bytes_to_16k_mono(&make_wav(5, 16)).is_err());
+        // 2. Huge bogus sample_rate must return Err, not OOM in FFT planning.
+        assert!(decode_wav_bytes_to_16k_mono(&make_wav(1_000_000_007, 16)).is_err());
+        // 3. Valid sample_rate with declared data_len = u32::MAX (16 GiB if trusted) must NOT OOM.
+        let samples = decode_wav_bytes_to_16k_mono(&make_wav(16_000, u32::MAX)).unwrap();
+        assert!(samples.is_empty());
     }
 }

@@ -238,8 +238,7 @@ impl App {
                 .unwrap_or_default()
         };
         let candidates: Vec<(UserId, String, String)> = fixtures
-            .users
-            .iter()
+            .people()
             .filter(|u| !u.deleted && !u.is_bot && u.id.as_str() != "USLACKBOT")
             .filter(|u| !existing.contains(&u.id))
             .map(|u| {

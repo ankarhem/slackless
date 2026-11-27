@@ -248,8 +248,7 @@ pub(super) fn filter_choices(fixtures: &Fixtures, rows: &[MemberRow]) -> Vec<Fil
     ]);
     if !externals.is_empty() {
         let workspace = fixtures
-            .workspaces
-            .first()
+            .own_team()
             .map_or_else(|| "Your workspace".to_owned(), |team| team.name.to_string());
         filters.push((workspace, MemberFilter::Team(None)));
         // Every row's team came from `external_team`, whose record is in `teams`.

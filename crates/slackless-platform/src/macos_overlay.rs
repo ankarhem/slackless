@@ -40,10 +40,24 @@ pub struct OverlayCursorState {
 /// active over the shared monitor or window.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OverlayPenEvent {
-    Down { x: f64, y: f64 },
-    Drag { x: f64, y: f64 },
-    Up { x: f64, y: f64 },
-    Move { x: f64, y: f64 },
+    Down {
+        x: f64,
+        y: f64,
+    },
+    Drag {
+        x: f64,
+        y: f64,
+    },
+    Up {
+        x: f64,
+        y: f64,
+    },
+    Move {
+        x: f64,
+        y: f64,
+    },
+    /// User pressed Escape (or the shared window disappeared) to exit interactive desktop pen mode.
+    Escape,
 }
 
 impl OverlayPenEvent {
@@ -53,6 +67,7 @@ impl OverlayPenEvent {
             Self::Down { x, y } | Self::Drag { x, y } | Self::Up { x, y } | Self::Move { x, y } => {
                 (x, y)
             }
+            Self::Escape => (0.0, 0.0),
         }
     }
 }
@@ -112,6 +127,7 @@ mod imp {
             0 => OverlayPenEvent::Down { x: nx, y: ny },
             1 => OverlayPenEvent::Drag { x: nx, y: ny },
             2 => OverlayPenEvent::Up { x: nx, y: ny },
+            4 => OverlayPenEvent::Escape,
             _ => OverlayPenEvent::Move { x: nx, y: ny },
         };
         let handler = OVERLAY_PEN_HANDLER
@@ -119,7 +135,7 @@ mod imp {
             .and_then(|m| m.lock().ok())
             .and_then(|g| g.clone());
         if let Some(cb) = handler {
-            cb(ev);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(ev)));
         }
     }
 
@@ -339,5 +355,122 @@ mod tests {
             OverlayPenEvent::Move { x: 0.1, y: 0.2 }.coords(),
             (0.1, 0.2)
         );
+    }
+
+    /// Structural ABI guardrail: every `extern "C" fn slackless_*` declared in `macos_overlay.rs`
+    /// must match the parameter count of its Objective-C definition in `native/macos/appkit_overlay.m`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn objc_overlay_ffi_parameter_counts_match_rust_declarations() {
+        use std::collections::HashMap;
+        use std::path::Path;
+
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let rust_src = std::fs::read_to_string(manifest_dir.join("src/macos_overlay.rs")).unwrap();
+        let objc_src =
+            std::fs::read_to_string(manifest_dir.join("native/macos/appkit_overlay.m")).unwrap();
+
+        let count_params = |params: &str| -> usize {
+            let trimmed = params.trim();
+            if trimmed.is_empty() || trimmed == "void" {
+                return 0;
+            }
+            let mut depth = 0usize;
+            let mut count = 1usize;
+            let mut has_trailing = false;
+            for ch in trimmed.chars() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => depth = depth.saturating_sub(1),
+                    ',' if depth == 0 => {
+                        count += 1;
+                        has_trailing = true;
+                    }
+                    c if !c.is_whitespace() => has_trailing = false,
+                    _ => {}
+                }
+            }
+            if has_trailing { count - 1 } else { count }
+        };
+
+        let mut rust_fns: HashMap<String, usize> = HashMap::new();
+        let mut cursor = rust_src.as_str();
+        while let Some(idx) = cursor.find("fn slackless_") {
+            let rest = &cursor[idx + 3..];
+            let Some(open) = rest.find('(') else { break };
+            let name = rest[..open].trim();
+            if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                cursor = &rest[open..];
+                continue;
+            }
+            let after_open = &rest[open + 1..];
+            let mut depth = 1usize;
+            let mut close = None;
+            for (i, ch) in after_open.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = close else { break };
+            rust_fns.insert(name.to_owned(), count_params(&after_open[..close]));
+            cursor = &after_open[close + 1..];
+        }
+        assert!(
+            !rust_fns.is_empty(),
+            "expected extern C slackless_* declarations in macos_overlay.rs"
+        );
+
+        let mut objc_fns: HashMap<String, usize> = HashMap::new();
+        for name in rust_fns.keys() {
+            let needle = format!("{name}(");
+            let mut search = objc_src.as_str();
+            while let Some(pos) = search.find(&needle) {
+                let prefix_line = search[..pos].rsplit('\n').next().unwrap_or("");
+                let after = &search[pos + needle.len()..];
+                let mut depth = 1usize;
+                let mut close = None;
+                for (i, ch) in after.char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(close) = close {
+                    let tail = after[close + 1..].trim_start();
+                    if tail.starts_with('{') && !prefix_line.trim_start().starts_with("//") {
+                        objc_fns.insert(name.clone(), count_params(&after[..close]));
+                        break;
+                    }
+                    search = &after[close + 1..];
+                } else {
+                    break;
+                }
+            }
+        }
+
+        for (name, rust_argc) in &rust_fns {
+            let objc_argc = objc_fns.get(name).unwrap_or_else(|| {
+                panic!("extern \"C\" fn {name} declared in macos_overlay.rs has no Objective-C definition")
+            });
+            assert_eq!(
+                rust_argc, objc_argc,
+                "FFI ABI mismatch for {name}: Rust declares {rust_argc} params, Objective-C defines {objc_argc} params"
+            );
+        }
     }
 }

@@ -31,7 +31,6 @@ pub fn parse_screen_source_id(source_id: &str) -> Option<(bool, u32)> {
 /// Hardware-accelerated macOS `ScreenCaptureKit` (`420f`) + `VideoToolbox` H.264 High/CABAC screen share.
 pub struct ScVtScreenCapture {
     handle: NonNull<SlacklessScCapture>,
-    ctx: NonNull<CaptureCallbackCtx>,
 }
 
 // SAFETY: `SlacklessScCapture` is thread-safe for keyframe/bitrate control and stopped once on `Drop`.
@@ -57,9 +56,9 @@ impl ScVtScreenCapture {
             perf: Some(perf),
         })));
         let mut err_buf = [0 as c_char; 512];
-        // SAFETY: `ctx` stays valid until the stop in `Drop` releases it through
-        // `on_released_cb`, the callbacks have the signatures the capture invokes, and `err_buf` is
-        // writable for its length.
+        // SAFETY: `ctx` ownership transfers to native side, which releases it via `on_released_cb`
+        // on both start failure and `Drop` once all callbacks have drained. `err_buf` is writable
+        // for its length.
         let handle = unsafe {
             slackless_sc_capture_start(
                 is_monitor,
@@ -72,13 +71,14 @@ impl ScVtScreenCapture {
                 on_h264_cb,
                 on_surface_preview_cb,
                 on_error_cb,
+                Some(on_released_cb),
                 err_buf.as_mut_ptr(),
                 err_buf.len(),
             )
         };
         let Some(handle) = NonNull::new(handle) else {
-            // SAFETY: the capture did not start, so nothing else holds `ctx`; reclaim the leak.
-            unsafe { drop(Box::from_raw(ctx.as_ptr())) };
+            // `slackless_sc_capture_start` already invoked (or deferred to stop completion)
+            // `on_released_cb(ctx)`; never double-free `ctx` here.
             // SAFETY: `err_buf` starts zeroed and the native side only `snprintf`s into it, so it
             // holds a NUL-terminated string.
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
@@ -95,7 +95,7 @@ impl ScVtScreenCapture {
             bitrate_kbps = config.bitrate_bps / 1000,
             "started macOS ScreenCaptureKit (420f) + VideoToolbox H.264 High HW screen capture"
         );
-        Ok(Self { handle, ctx })
+        Ok(Self { handle })
     }
 
     pub fn force_keyframe(&self) {
@@ -119,12 +119,12 @@ unsafe extern "C" fn on_released_cb(ctx: *mut c_void) {
 
 impl Drop for ScVtScreenCapture {
     fn drop(&mut self) {
-        // Native code releases `ctx` from its stop completion handler, once no ScreenCaptureKit
-        // callback can still reach it (which may be after this returns if the stop is slow).
-        let (handle, ctx) = (self.handle.as_ptr(), self.ctx.as_ptr().cast());
+        // Native code releases `ctx` (stored in `cap->enc.ctx` at start) from its stop completion
+        // handler, once no ScreenCaptureKit callback can still reach it.
+        let handle = self.handle.as_ptr();
         // SAFETY: `handle` came from a successful start and is stopped once, here; the stop takes
-        // over `ctx` and frees it through `on_released_cb`.
-        unsafe { slackless_sc_capture_stop(handle, ctx, Some(on_released_cb)) };
+        // over `self.ctx` via `cap->enc.ctx` and frees it through `on_released_cb`.
+        unsafe { slackless_sc_capture_stop(handle, Some(on_released_cb)) };
     }
 }
 

@@ -35,6 +35,7 @@ pub(super) struct HandshakeResult<S, R, M> {
     pub(super) keyframe_req_rx: mpsc::UnboundedReceiver<u32>,
     pub(super) codec_tx: mpsc::UnboundedSender<String>,
     pub(super) codec_rx: mpsc::UnboundedReceiver<String>,
+    pub(super) cam_fb_tx: mpsc::UnboundedSender<VideoSenderFeedback>,
     pub(super) cam_fb_rx: mpsc::UnboundedReceiver<VideoSenderFeedback>,
     pub(super) wants_compressed: bool,
 }
@@ -74,7 +75,7 @@ impl<M: MediaDevices + Send + 'static> AudioStartGuard<M> {
             let res = handle.await;
             self.handle = None;
             if let Ok(Ok(mut media)) = res {
-                media.stop_audio();
+                media.stop_audio().await;
             }
         }
     }
@@ -87,7 +88,7 @@ impl<M: MediaDevices + Send + 'static> Drop for AudioStartGuard<M> {
         if let Some(handle) = self.handle.take() {
             tokio::spawn(async move {
                 if let Ok(Ok(mut media)) = handle.await {
-                    media.stop_audio();
+                    media.stop_audio().await;
                 }
             });
         }
@@ -213,7 +214,7 @@ pub(super) async fn perform_handshake_with<F: SessionFactory>(
     // Single fallible block so every post-peer failure closes `peer`, stops `audio_guard`, and
     // sends Chime `LEAVE` before returning.
     let sub_res: Result<(HashMap<u32, u32>, Option<String>)> = async {
-        peer.attach_video_feedback(cam_fb_tx).await;
+        peer.attach_video_feedback(cam_fb_tx.clone()).await;
         let sdp_offer = peer.create_gathered_offer().await?;
 
         // 4. Send SUBSCRIBE and await SUBSCRIBE_ACK with SDP answer.
@@ -311,6 +312,7 @@ pub(super) async fn perform_handshake_with<F: SessionFactory>(
         keyframe_req_rx,
         codec_tx,
         codec_rx,
+        cam_fb_tx,
         cam_fb_rx,
         wants_compressed,
     })

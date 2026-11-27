@@ -166,7 +166,9 @@ impl NewMessageView {
 
     /// Live refresh: match the query against the conversations and people in `fixtures`.
     pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
-        self.fixtures = fixtures;
+        self.fixtures = fixtures.clone();
+        self.composer
+            .update(cx, |composer, cx| composer.set_fixtures(fixtures, cx));
         cx.notify();
     }
 

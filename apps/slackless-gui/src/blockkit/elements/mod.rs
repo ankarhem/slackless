@@ -178,8 +178,7 @@ pub(super) fn block_element(
         "users_select" | "multi_users_select" => {
             let users = kcx
                 .fixtures
-                .users
-                .iter()
+                .people()
                 .map(|user| (user.display_name().to_owned(), user.id.to_string()))
                 .collect();
             select(element, block, key, users, kcx, cx)

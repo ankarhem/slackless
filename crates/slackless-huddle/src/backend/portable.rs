@@ -461,11 +461,13 @@ impl LazyOpenH264Decoder {
             self.decoder = H264Decoder::new().ok();
         }
         let yuv = self.decoder.as_mut()?.decode(bitstream).ok()??;
+        const MAX_VIDEO_DIM: usize = 8192;
         let (w, h) = yuv.dimensions();
-        if w == 0 || h == 0 {
+        if w == 0 || h == 0 || w > MAX_VIDEO_DIM || h > MAX_VIDEO_DIM {
             return None;
         }
-        let mut rgba = vec![0u8; w * h * 4];
+        let rgba_len = w.checked_mul(h)?.checked_mul(4)?;
+        let mut rgba = vec![0u8; rgba_len];
         yuv.write_rgba8(&mut rgba);
         for px in rgba.as_chunks_mut::<4>().0 {
             px.swap(0, 2);

@@ -466,10 +466,14 @@ pub(super) fn subscribe_workspace(
                         broadcast: true,
                         content: content.clone(),
                         files: None,
+                        origin: messaging::OutgoingOrigin::External,
                     };
                     if this.submit(msg, window, cx) {
                         window.push_notification("Sent reply to channel", cx);
                     }
+                }
+                ThreadPanelEvent::JoinHuddle(channel) => {
+                    this.start_huddle_in(channel.clone(), window, cx);
                 }
                 ThreadPanelEvent::Reply {
                     channel,
@@ -484,6 +488,7 @@ pub(super) fn subscribe_workspace(
                             broadcast: *broadcast,
                             content: content.clone(),
                             files: None,
+                            origin: messaging::OutgoingOrigin::ThreadPanel,
                         },
                         window,
                         cx,

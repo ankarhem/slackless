@@ -123,8 +123,12 @@ fn team_icon_url_picks_the_smallest_size() {
 #[test]
 fn filter_choices_follow_slacks_order_and_counts() {
     let mut fixtures = crate::fixtures::load();
-    fixtures.workspaces = vec![team("T0ACME", "Acme Corp")];
-    fixtures.teams = vec![team("T0KLARNA", "Klarna"), team("T0ZETA", "Zeta")];
+    fixtures.set_rail_workspaces(vec![team("T0OTHER", "Other"), team("T0ACME", "Acme Corp")]);
+    fixtures.teams = vec![
+        team("T0ACME", "Acme Corp"),
+        team("T0KLARNA", "Klarna"),
+        team("T0ZETA", "Zeta"),
+    ];
     let row = |team: Option<&str>, manager: bool, guest: bool| MemberRow {
         id: UserId::from("U1"),
         name: "A Person".to_owned(),

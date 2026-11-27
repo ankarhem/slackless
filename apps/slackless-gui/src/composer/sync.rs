@@ -127,8 +127,14 @@ impl Composer {
     pub(super) fn convert_typed_emoji(&mut self) -> bool {
         let caret = self.editor.selection().end;
         let doc = self.editor.doc();
+        if caret > doc.text().len() || !doc.text().is_char_boundary(caret) {
+            return false;
+        }
         let before = &doc.text()[..caret];
-        let Some(open) = before[..before.len().saturating_sub(1)].rfind(':') else {
+        let Some(prefix) = before.strip_suffix(':') else {
+            return false;
+        };
+        let Some(open) = prefix.rfind(':') else {
             return false;
         };
         let parsed = doc.parse();

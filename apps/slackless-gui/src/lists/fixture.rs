@@ -159,12 +159,12 @@ fn fixture_users_snapshot() -> &'static Fixtures {
             ..Default::default()
         };
         let mut f = crate::fixtures::load();
-        f.users = vec![
+        f.replace_users(vec![
             mk_user("U_MAYA", "maya", "Maya Chen"),
             mk_user("U_LEO", "leo", "Leo Park"),
             mk_user("U_SAM", "sam", "Sam Rivera"),
             mk_user("U_ANA", "ana", "Ana Silva"),
-        ];
+        ]);
         f
     })
 }
@@ -250,7 +250,9 @@ pub fn list_view(cx: &App) -> Stateful<Div> {
             |s| {
                 let list = s.fixture_data.get_or_insert_with(sample_list_data);
                 list.rows.retain(|r| r.id != row_id);
-                s.selected_row = None;
+                if s.selected_record_id.as_deref() == Some(row_id.as_str()) {
+                    s.selected_record_id = None;
+                }
             },
             window,
             cx,

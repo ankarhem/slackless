@@ -241,7 +241,7 @@ impl Store {
             sql.push_str(&format!(" AND channel_id = ?{}", bind.len()));
         }
         sql.push_str(SESSION_GROUP_SUFFIX);
-        bind.push(SqlValue::Integer(limit as i64));
+        bind.push(SqlValue::Integer(super::sql_limit(limit)));
         sql.push_str(&format!(" LIMIT ?{}", bind.len()));
 
         let mut stmt = self.conn.prepare_cached(&sql)?;
@@ -302,7 +302,7 @@ impl Store {
                 bind.len()
             ));
         }
-        bind.push(SqlValue::Integer(limit as i64));
+        bind.push(SqlValue::Integer(super::sql_limit(limit)));
         sql.push_str(&format!(
             " ORDER BY t.at_ms DESC, t.id DESC LIMIT ?{}",
             bind.len()
@@ -362,7 +362,7 @@ impl Store {
                 bind.len()
             ));
         }
-        bind.push(SqlValue::Integer(limit as i64));
+        bind.push(SqlValue::Integer(super::sql_limit(limit)));
         sql.push_str(&format!(
             " ORDER BY t.at_ms DESC, t.id DESC LIMIT ?{}",
             bind.len()

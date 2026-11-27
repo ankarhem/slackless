@@ -139,16 +139,18 @@ pub(super) fn render_huddle_thread_card(message: &Message, kcx: &KitCx, cx: &App
                                 .child(format!("{title}.{who}")),
                         )
                         .when_some(kcx.on_action.clone(), |col, handler| {
+                            let scope = kcx.kit.map(|k| k.entity_id().as_u64()).unwrap_or(0);
                             let ts_key = message.ts.as_str().to_owned();
                             let join_handler = handler.clone();
-                            let thread_id = SharedString::from(format!("huddle-thread-{ts_key}"));
+                            let thread_id =
+                                SharedString::from(format!("huddle-thread-{scope}-{ts_key}"));
                             col.child(
                                 h_flex()
                                     .items_center()
                                     .gap_2()
                                     .child(
                                         Button::new(SharedString::from(format!(
-                                            "huddle-join-{ts_key}"
+                                            "huddle-join-{scope}-{ts_key}"
                                         )))
                                         .primary()
                                         .with_size(Size::Small)
@@ -251,6 +253,7 @@ pub(super) fn render_huddle_thread_card(message: &Message, kcx: &KitCx, cx: &App
                 )
             })
             .when_some(kcx.on_action.clone(), |row, handler| {
+                let scope = kcx.kit.map(|k| k.entity_id().as_u64()).unwrap_or(0);
                 let ts_key = message.ts.as_str().to_owned();
                 let join_handler = handler.clone();
                 row.child(
@@ -259,7 +262,7 @@ pub(super) fn render_huddle_thread_card(message: &Message, kcx: &KitCx, cx: &App
                         .gap_1p5()
                         .flex_none()
                         .when(!has_ended, |btns| {
-                            let id = SharedString::from(format!("huddle-join-{ts_key}"));
+                            let id = SharedString::from(format!("huddle-join-{scope}-{ts_key}"));
                             btns.child(
                                 Button::new(id)
                                     .primary()
@@ -275,17 +278,15 @@ pub(super) fn render_huddle_thread_card(message: &Message, kcx: &KitCx, cx: &App
                             )
                         })
                         .child(
-                            Button::new(SharedString::from(format!("huddle-thread-{ts_key}")))
-                                .outline()
-                                .with_size(Size::XSmall)
-                                .label("Thread")
-                                .on_click(move |_, window, cx| {
-                                    handler(
-                                        crate::actions::MessageAction::ReplyInThread,
-                                        window,
-                                        cx,
-                                    );
-                                }),
+                            Button::new(SharedString::from(format!(
+                                "huddle-thread-{scope}-{ts_key}"
+                            )))
+                            .outline()
+                            .with_size(Size::XSmall)
+                            .label("Thread")
+                            .on_click(move |_, window, cx| {
+                                handler(crate::actions::MessageAction::ReplyInThread, window, cx);
+                            }),
                         ),
                 )
             }),

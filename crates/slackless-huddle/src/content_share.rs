@@ -8,7 +8,7 @@
 //! as a native screen share on official Slack desktop/web clients.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use cpal::Sample as _;
@@ -16,6 +16,7 @@ use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use tokio::sync::mpsc;
 use webrtc::peer_connection::RTCPeerConnectionState;
 
+use crate::audio::RateConverter;
 use crate::audio::ring::{SpscRing, WorkerWake};
 use crate::backend::{ScreenShareConfig, VideoFrameSink, platform_backend};
 use crate::metrics::HuddlePerfCounters;
@@ -128,51 +129,87 @@ impl ContentShareSession {
         );
         let mut sig = ChimeSignalClient::connect(&content_creds).await?;
         let audio_session_id: u64 = rand::random();
-        sig.send_frame(&build_join_frame(audio_session_id)).await?;
+        if let Err(err) = sig.send_frame(&build_join_frame(audio_session_id)).await {
+            sig.close().await;
+            return Err(err);
+        }
 
-        let join_ack = sig
+        let join_ack = match sig
             .wait_for_join_ack(CONTENT_HANDSHAKE_TIMEOUT, |_| {})
-            .await?;
-        let turn = join_ack
-            .turn_credentials
-            .as_ref()
-            .ok_or_else(|| HuddleError::Signaling("content JOIN_ACK missing TURN creds".into()))?;
+            .await
+        {
+            Ok(ack) => ack,
+            Err(err) => {
+                sig.send_leave_and_close(Duration::from_millis(300)).await;
+                return Err(err);
+            }
+        };
+        let Some(turn) = join_ack.turn_credentials.as_ref() else {
+            sig.send_leave_and_close(Duration::from_millis(300)).await;
+            return Err(HuddleError::Signaling(
+                "content JOIN_ACK missing TURN creds".into(),
+            ));
+        };
 
         let (state_tx, mut state_rx) = mpsc::unbounded_channel();
-        let rtc = Arc::new(ChimeRtcPeer::new_content_sender(turn, state_tx).await?);
+        let rtc = match ChimeRtcPeer::new_content_sender(turn, state_tx).await {
+            Ok(rtc) => Arc::new(rtc),
+            Err(err) => {
+                sig.send_leave_and_close(Duration::from_millis(300)).await;
+                return Err(err);
+            }
+        };
 
-        let offer_sdp = rtc.create_gathered_offer().await?;
-        let sub_frame = build_content_subscribe_frame(&content_creds, &offer_sdp, false)?;
-        sig.send_frame(&sub_frame).await?;
-
-        let sub_ack = sig
-            .wait_for_subscribe_ack(CONTENT_HANDSHAKE_TIMEOUT, |_| {})
-            .await?;
-        let answer = decode_sdp_answer(
-            sub_ack.sdp_answer.as_deref(),
-            sub_ack.compressed_sdp_answer.as_deref(),
-        )?;
-        rtc.set_remote_answer(answer).await?;
-        tracing::info!(
-            source_id = %source_id,
-            "#content SUBSCRIBE_ACK applied; starting screen capture"
+        type ContentShareSetup = (
+            mpsc::UnboundedReceiver<Vec<u8>>,
+            mpsc::UnboundedReceiver<VideoSenderFeedback>,
+            Box<dyn crate::backend::ScreenShareHandle>,
         );
+        let setup_res: Result<ContentShareSetup> = async {
+            let offer_sdp = rtc.create_gathered_offer().await?;
+            let sub_frame = build_content_subscribe_frame(&content_creds, &offer_sdp, false)?;
+            sig.send_frame(&sub_frame).await?;
 
-        let (h264_tx, mut h264_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (video_fb_tx, mut video_fb_rx) = mpsc::unbounded_channel::<VideoSenderFeedback>();
-        rtc.attach_video_feedback(video_fb_tx).await;
-        let capture = platform_backend().start_screen_share(
-            ScreenShareConfig {
-                source_id,
-                max_w: SCREEN_MAX_W,
-                max_h: SCREEN_MAX_H,
-                max_fps: SCREEN_MAX_FPS,
-                bitrate_bps: SCREEN_BITRATE_BPS,
-            },
-            h264_tx,
-            on_preview,
-            Arc::clone(&perf),
-        )?;
+            let sub_ack = sig
+                .wait_for_subscribe_ack(CONTENT_HANDSHAKE_TIMEOUT, |_| {})
+                .await?;
+            let answer = decode_sdp_answer(
+                sub_ack.sdp_answer.as_deref(),
+                sub_ack.compressed_sdp_answer.as_deref(),
+            )?;
+            rtc.set_remote_answer(answer).await?;
+            tracing::info!(
+                source_id = %source_id,
+                "#content SUBSCRIBE_ACK applied; starting screen capture"
+            );
+
+            let (h264_tx, h264_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (video_fb_tx, video_fb_rx) = mpsc::unbounded_channel::<VideoSenderFeedback>();
+            rtc.attach_video_feedback(video_fb_tx).await;
+            let capture = platform_backend().start_screen_share(
+                ScreenShareConfig {
+                    source_id,
+                    max_w: SCREEN_MAX_W,
+                    max_h: SCREEN_MAX_H,
+                    max_fps: SCREEN_MAX_FPS,
+                    bitrate_bps: SCREEN_BITRATE_BPS,
+                },
+                h264_tx,
+                on_preview,
+                Arc::clone(&perf),
+            )?;
+            Ok((h264_rx, video_fb_rx, capture))
+        }
+        .await;
+
+        let (mut h264_rx, mut video_fb_rx, capture) = match setup_res {
+            Ok(ok) => ok,
+            Err(err) => {
+                sig.send_leave_and_close(Duration::from_millis(300)).await;
+                rtc.close().await;
+                return Err(err);
+            }
+        };
         let video = rtc.video_sender();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
@@ -212,6 +249,13 @@ impl ContentShareSession {
             detect_system_audio_loopback()
         };
 
+        let loopback_rate = Arc::new(AtomicU32::new(
+            native_tap
+                .as_ref()
+                .map_or(48_000, |t| t.sample_rate().clamp(8_000, 384_000)),
+        ));
+        let loopback_rate_writer = Arc::clone(&loopback_rate);
+
         if native_tap.is_none()
             && let Some(dev_name) = loopback_device.clone()
         {
@@ -229,6 +273,10 @@ impl ContentShareSession {
                     let Ok(supported) = dev.default_input_config() else {
                         return;
                     };
+                    loopback_rate_writer.store(
+                        supported.sample_rate().clamp(8_000, 384_000),
+                        Ordering::Release,
+                    );
                     let ch = usize::from(supported.channels()).max(1);
                     let stream =
                         crate::audio::build_input_stream_any_format(&dev, supported, move |data| {
@@ -264,10 +312,10 @@ impl ContentShareSession {
                     loopback_wake_worker.park_until_cleared(&loopback_capture_running);
                 });
         }
-        // Feed live system audio (CoreAudio tap or loopback, `F-COLLAB-022`) or a cached 20ms
-        // stereo Opus silence packet (skipping 50 Hz Opus encode when `share_audio == false`).
-        tokio::spawn(async move {
-            let _tap_guard = native_tap;
+        // Feed live system audio (CoreAudio tap or loopback, `F-COLLAB-022`) resampled to 48 kHz
+        // stereo when the capture device runs at another rate (e.g. AirPods 16/24 kHz or DAC
+        // 44.1/96 kHz), or a cached 20ms stereo Opus silence packet when `share_audio == false`.
+        let audio_task = tokio::spawn(async move {
             let Ok(mut enc) =
                 opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio)
             else {
@@ -278,6 +326,15 @@ impl ContentShareSession {
             let _ = enc.set_inband_fec(true);
             let silence = vec![0i16; 960 * 2];
             let mut pcm = vec![0i16; 960 * 2];
+            let mut raw_buf = vec![0i16; 4096 * 2];
+            let mut resampled_fifo: std::collections::VecDeque<i16> =
+                std::collections::VecDeque::with_capacity(960 * 8);
+            let mut resampler_rate: u32 = 48_000;
+            let mut resamplers: Option<(RateConverter, RateConverter)> = None;
+            let mut l_in: Vec<f32> = Vec::new();
+            let mut r_in: Vec<f32> = Vec::new();
+            let mut l_out: Vec<f32> = Vec::new();
+            let mut r_out: Vec<f32> = Vec::new();
             let mut out = vec![0u8; 4000];
             let cached_silence: bytes::Bytes = enc
                 .encode(&silence, &mut out)
@@ -289,10 +346,66 @@ impl ContentShareSession {
                 tick.tick().await;
                 let has_audio = if share_audio {
                     trim_loopback_ring_overflow(&loopback_pcm);
-                    if loopback_pcm.len() >= pcm.len() {
-                        loopback_pcm.pop_slice(&mut pcm) == pcm.len()
+                    let src_rate = loopback_rate.load(Ordering::Acquire);
+                    if src_rate == 48_000 {
+                        if loopback_pcm.len() >= pcm.len() {
+                            loopback_pcm.pop_slice(&mut pcm) == pcm.len()
+                        } else {
+                            false
+                        }
                     } else {
-                        false
+                        if resampler_rate != src_rate || resamplers.is_none() {
+                            resampler_rate = src_rate;
+                            resampled_fifo.clear();
+                            let chunk = (src_rate as usize / 100).max(16);
+                            resamplers =
+                                RateConverter::new(src_rate, 48_000, chunk)
+                                    .ok()
+                                    .and_then(|l| {
+                                        RateConverter::new(src_rate, 48_000, chunk)
+                                            .ok()
+                                            .map(|r| (l, r))
+                                    });
+                        }
+                        if let Some((conv_l, conv_r)) = resamplers.as_mut() {
+                            let avail_pairs = (loopback_pcm.len() / 2).min(raw_buf.len() / 2);
+                            if avail_pairs > 0 {
+                                let popped =
+                                    loopback_pcm.pop_slice(&mut raw_buf[..avail_pairs * 2]);
+                                let pairs = popped / 2;
+                                l_in.clear();
+                                r_in.clear();
+                                l_out.clear();
+                                r_out.clear();
+                                for frame in raw_buf[..pairs * 2].as_chunks::<2>().0 {
+                                    l_in.push(f32::from(frame[0]) / 32_768.0);
+                                    r_in.push(f32::from(frame[1]) / 32_768.0);
+                                }
+                                conv_l.process(&l_in, &mut l_out);
+                                conv_r.process(&r_in, &mut r_out);
+                                let n = l_out.len().min(r_out.len());
+                                for i in 0..n {
+                                    resampled_fifo
+                                        .push_back(i16::from_sample(l_out[i].clamp(-1.0, 1.0)));
+                                    resampled_fifo
+                                        .push_back(i16::from_sample(r_out[i].clamp(-1.0, 1.0)));
+                                }
+                                // Keep resampled latency bounded to <= 1s.
+                                while resampled_fifo.len() > 48_000 * 2 {
+                                    resampled_fifo.drain(..960 * 2);
+                                }
+                            }
+                            if resampled_fifo.len() >= pcm.len() {
+                                for dst in &mut pcm {
+                                    *dst = resampled_fifo.pop_front().unwrap_or(0);
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
                     }
                 } else {
                     false
@@ -311,6 +424,7 @@ impl ContentShareSession {
 
         tokio::spawn(async move {
             let capture = capture;
+            let native_tap = native_tap;
             let mut metric_tick = tokio::time::interval(Duration::from_secs(1));
             metric_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut connected = false;
@@ -347,7 +461,27 @@ impl ContentShareSession {
                             _ => {}
                         }
                     }
-                    Some(annex_b) = h264_rx.recv() => {
+                    frame = h264_rx.recv() => {
+                        let Some(annex_b) = frame else {
+                            // Screen/window capture ended (e.g. shared window closed): tear down `#content`.
+                            tracing::info!("#content capture channel closed; ending screen share");
+                            break;
+                        };
+                        let (annex_b, dropped, needs_keyframe) = crate::video::trim_h264_backlog(
+                            annex_b,
+                            &mut h264_rx,
+                            crate::video::MAX_H264_EGRESS_BACKLOG,
+                        );
+                        if dropped > 0 {
+                            tracing::warn!(
+                                dropped,
+                                needs_keyframe,
+                                "#content H.264 egress backlog trimmed"
+                            );
+                            if needs_keyframe {
+                                capture.force_keyframe();
+                            }
+                        }
                         if connected {
                             match video.write_h264_frame(annex_b, Duration::from_millis(33)).await {
                                 Ok(()) if !sent_first_frame => {
@@ -385,8 +519,14 @@ impl ContentShareSession {
 
             running.store(false, Ordering::Release);
             loopback_wake.wake_now();
-            // Screen capture teardown waits on ScreenCaptureKit (up to 1.5 s): keep it off the executor.
-            let _ = tokio::task::spawn_blocking(move || drop(capture)).await;
+            audio_task.abort();
+            // Screen capture and CoreAudio Process Tap teardown block on OS APIs: keep both off the
+            // Tokio worker pool and finish them before signalling `done_tx`.
+            let _ = tokio::task::spawn_blocking(move || {
+                drop(native_tap);
+                drop(capture);
+            })
+            .await;
             perf.clear_tx();
             sig.send_leave_and_close(Duration::from_millis(300)).await;
             rtc.close().await;
@@ -406,11 +546,11 @@ impl ContentShareSession {
         }
     }
 
-    /// Stop the `#content` share and wait briefly for its Chime `LEAVE` frame to flush.
+    /// Stop the `#content` share and wait briefly for capture/tap teardown and Chime `LEAVE` flush.
     pub async fn stop_and_wait(&mut self) {
         self.stop();
         if let Some(rx) = self.done_rx.take() {
-            let _ = tokio::time::timeout(Duration::from_millis(500), rx).await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
         }
     }
 }

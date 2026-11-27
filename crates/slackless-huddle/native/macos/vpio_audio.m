@@ -141,11 +141,14 @@ static OSStatus vpio_render_cb(
     if (!ioData || ioData->mNumberBuffers == 0) return noErr;
     float *dst = (float *)ioData->mBuffers[0].mData;
     if (!dst) return noErr;
+    size_t max_frames = (size_t)ioData->mBuffers[0].mDataByteSize / sizeof(float);
+    size_t count = (size_t)inNumberFrames < max_frames ? (size_t)inNumberFrames : max_frames;
+    if (count == 0) return noErr;
     if (!vpio || atomic_load(&vpio->stopped) || !vpio->on_render) {
-        memset(dst, 0, (size_t)inNumberFrames * sizeof(float));
+        memset(dst, 0, count * sizeof(float));
         return noErr;
     }
-    vpio->on_render(vpio->ctx, dst, (size_t)inNumberFrames);
+    vpio->on_render(vpio->ctx, dst, count);
     return noErr;
 }
 
@@ -197,8 +200,15 @@ SlacklessVpio *slackless_vpio_start(
     }
 
     UInt32 one = 1;
-    AudioUnitSetProperty(vpio->au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &one, sizeof(one));
-    AudioUnitSetProperty(vpio->au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &one, sizeof(one));
+    OSStatus en_in = AudioUnitSetProperty(
+        vpio->au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &one, sizeof(one));
+    OSStatus en_out = AudioUnitSetProperty(
+        vpio->au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &one, sizeof(one));
+    if (en_in != noErr || en_out != noErr) {
+        AudioComponentInstanceDispose(vpio->au);
+        free(vpio);
+        return NULL;
+    }
 
     AudioStreamBasicDescription fmt = {0};
     fmt.mSampleRate = (Float64)(sample_rate > 0 ? sample_rate : 48000);
@@ -235,12 +245,17 @@ SlacklessVpio *slackless_vpio_start(
     }
 
     AURenderCallbackStruct inCb = {vpio_input_cb, vpio};
-    AudioUnitSetProperty(
+    OSStatus cb_in = AudioUnitSetProperty(
         vpio->au, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 1, &inCb, sizeof(inCb));
 
     AURenderCallbackStruct outCb = {vpio_render_cb, vpio};
-    AudioUnitSetProperty(
+    OSStatus cb_out = AudioUnitSetProperty(
         vpio->au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &outCb, sizeof(outCb));
+    if (cb_in != noErr || cb_out != noErr) {
+        AudioComponentInstanceDispose(vpio->au);
+        free(vpio);
+        return NULL;
+    }
 
     slackless_vpio_set_processing(vpio, enable_vp, enable_agc);
 

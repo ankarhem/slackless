@@ -444,7 +444,7 @@ impl SlackApi {
         if !self.is_trusted_file_url(&url) {
             return Err(ApiError::UntrustedUrl(url_private.to_owned()));
         }
-        self.send_with_retry(|| {
+        self.send_with_retry_on(&self.files, || {
             Ok(self
                 .files
                 .get(url.clone())
@@ -516,16 +516,26 @@ impl SlackApi {
         url.origin() == self.base.origin() || is_trusted_slack_https_url(url)
     }
 
-    /// Sends the request built by `build`, retrying on HTTP 429 after `Retry-After`, at most
-    /// [`MAX_RATE_LIMIT_RETRIES`] times.
+    /// Sends the request built by `build` on `self.http`, retrying on HTTP 429 after
+    /// `Retry-After`, at most [`MAX_RATE_LIMIT_RETRIES`] times.
     async fn send_with_retry(&self, build: impl Fn() -> Result<Request>) -> Result<Response> {
+        self.send_with_retry_on(&self.http, build).await
+    }
+
+    /// Sends the request built by `build` on `client`, retrying on HTTP 429 after `Retry-After`,
+    /// at most [`MAX_RATE_LIMIT_RETRIES`] times.
+    async fn send_with_retry_on(
+        &self,
+        client: &reqwest::Client,
+        build: impl Fn() -> Result<Request>,
+    ) -> Result<Response> {
         let mut attempt = 0;
         loop {
             let req = build()?;
             let capture = NET_LOG_ENABLED.load(Ordering::Relaxed);
             let meta =
                 capture.then(|| (req.method().to_string(), req.url().clone(), Instant::now()));
-            let resp = match self.http.execute(req).await {
+            let resp = match client.execute(req).await {
                 Ok(resp) => {
                     if let Some((method, url, started)) = meta {
                         record_net_log(

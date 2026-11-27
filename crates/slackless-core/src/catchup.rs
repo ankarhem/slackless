@@ -471,8 +471,9 @@ fn collect_workspace_into(
             && (!is_reply || is_broadcast)
             && last_read.is_none_or(|read| msg.ts > *read);
         if is_unread_msg {
-            let direct_hit = detect_mention_kind(&msg.text, self_user, is_dm).is_some();
-            if !is_muted || direct_hit {
+            let mention_kind = detect_mention_kind(&msg.text, self_user, is_dm);
+            let direct_mention = mention_kind == Some(MentionKind::DirectMention);
+            if !is_muted || direct_mention {
                 let agg = channel_aggs
                     .entry(stored.channel.clone())
                     .or_insert_with(|| ChannelAgg {
@@ -484,7 +485,11 @@ fn collect_workspace_into(
                         excerpts: Vec::with_capacity(EXCERPTS_PER_CHANNEL),
                     });
                 agg.count = agg.count.saturating_add(1);
-                if direct_hit {
+                if if is_muted {
+                    direct_mention
+                } else {
+                    mention_kind.is_some()
+                } {
                     agg.mentions = agg.mentions.saturating_add(1);
                 }
                 if msg.ts > agg.latest_ts {
@@ -1155,5 +1160,90 @@ mod tests {
 
         let human = format_catchup_human(&briefing, true);
         assert!(human.contains("[Beta]"));
+    }
+
+    #[test]
+    fn catchup_muted_channel_broadcast_and_muted_dm_do_not_leak_into_unread_channels() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ws = TeamId::from("T1");
+        let c_muted = ChannelId::from("C_MUTED");
+        let d_muted = ChannelId::from("D_MUTED");
+        let now = 1_700_005_000;
+        store
+            .upsert_conversation(
+                &ws,
+                &Conversation {
+                    id: c_muted.clone(),
+                    name: Some("noisy".into()),
+                    is_channel: true,
+                    is_member: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .upsert_conversation(
+                &ws,
+                &Conversation {
+                    id: d_muted.clone(),
+                    is_im: true,
+                    user: Some(UserId::from("U_PEER")),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let prefs = serde_json::json!({
+            "all_notifications_prefs": serde_json::json!({
+                "channels": {
+                    "C_MUTED": { "muted": true },
+                    "D_MUTED": { "muted": true }
+                }
+            }).to_string()
+        });
+        store.replace_prefs(&ws, &prefs).unwrap();
+        store
+            .upsert_messages(
+                &ws,
+                &c_muted,
+                &[Message {
+                    ts: Ts::from(format!("{}.000100", now - 60)),
+                    user: Some(UserId::from("U_PEER")),
+                    text: "<!here> noisy broadcast".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        store
+            .upsert_messages(
+                &ws,
+                &d_muted,
+                &[Message {
+                    ts: Ts::from(format!("{}.000100", now - 60)),
+                    user: Some(UserId::from("U_PEER")),
+                    text: "muted dm ping".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+
+        let target = WorkspaceCatchUpTarget {
+            workspace: ws,
+            workspace_name: Some("Acme".into()),
+            self_user: Some(UserId::from("U_ME")),
+            store: Arc::new(Mutex::new(store)),
+        };
+        let briefing = build_catchup_across_stores(
+            &[target],
+            CatchUpWindow::Last24h,
+            now,
+            DEFAULT_CATCHUP_LIMIT,
+        )
+        .unwrap();
+        assert!(briefing.mentions.is_empty());
+        assert!(
+            briefing.unread_channels.is_empty(),
+            "muted broadcasts and muted DMs must not leak into unread_channels: {:?}",
+            briefing.unread_channels
+        );
     }
 }

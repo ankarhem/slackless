@@ -57,6 +57,8 @@ url = "2"
 linker_messages = "allow"
 
 [workspace.lints.clippy]
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"

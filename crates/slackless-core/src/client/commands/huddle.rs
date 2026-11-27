@@ -6,11 +6,11 @@ use crate::huddle::{HuddleAudioConfig, HuddleControl, HuddlePhase, HuddleUpdate}
 
 impl<B: Backend> Core<B> {
     pub(super) fn join_huddle(&mut self, channel: ChannelId, audio: HuddleAudioConfig) {
-        // Reject duplicate concurrent join while `rooms.join` is already in-flight;
-        // otherwise leave any active huddle and claim a fresh atomic generation id.
-        let (my_gen, gen_counter) = {
+        // Reject duplicate concurrent join for the SAME channel while `rooms.join` is already
+        // in-flight; joining a DIFFERENT channel supersedes the in-flight join via generation.
+        let (my_gen, gen_counter, prev_handle) = {
             let mut slot = self.huddle.lock().unwrap_or_else(PoisonError::into_inner);
-            if slot.joining {
+            if slot.joining && slot.joining_channel.as_ref() == Some(&channel) {
                 return;
             }
             let next_gen = slot
@@ -18,11 +18,10 @@ impl<B: Backend> Core<B> {
                 .fetch_add(1, Ordering::AcqRel)
                 .wrapping_add(1);
             slot.joining = true;
+            slot.joining_channel = Some(channel.clone());
             slot.call_id = None;
-            if let Some(prev) = slot.handle.take() {
-                prev.leave();
-            }
-            (next_gen, Arc::clone(&slot.generation))
+            let prev = slot.handle.take();
+            (next_gen, Arc::clone(&slot.generation), prev)
         };
         let ctx = self.ctx();
         let huddle = Arc::clone(&self.huddle);
@@ -39,6 +38,7 @@ impl<B: Backend> Core<B> {
                     let mut slot = self.huddle.lock().unwrap_or_else(PoisonError::into_inner);
                     if slot.generation.load(Ordering::Acquire) == self.generation {
                         slot.joining = false;
+                        slot.joining_channel = None;
                     }
                 }
             }
@@ -46,7 +46,33 @@ impl<B: Backend> Core<B> {
                 huddle: Arc::clone(&huddle),
                 generation: my_gen,
             };
-            let joined = ctx.backend.rooms_join(channel.clone()).await?;
+            // Tear down any prior huddle session concurrently with `rooms.join` so CoreAudio /
+            // cpal hardware is released before the new session opens audio.
+            let prev_leave = async {
+                if let Some(prev) = prev_handle {
+                    prev.leave_and_wait(std::time::Duration::from_millis(1500))
+                        .await;
+                }
+            };
+            let (joined_res, ()) =
+                tokio::join!(ctx.backend.rooms_join(channel.clone()), prev_leave);
+            let joined = match joined_res {
+                Ok(joined) => joined,
+                Err(err) => {
+                    if gen_counter.load(Ordering::Acquire) == my_gen {
+                        ctx.events
+                            .emit(Event::Huddle(HuddleEvent::SessionChanged(Box::new(
+                                crate::huddle::HuddleSessionSnapshot {
+                                    phase: HuddlePhase::Failed,
+                                    channel,
+                                    error: Some(err.to_string()),
+                                    ..Default::default()
+                                },
+                            ))));
+                    }
+                    return Err(err.into());
+                }
+            };
             if gen_counter.load(Ordering::Acquire) != my_gen {
                 return Ok(());
             }
@@ -88,6 +114,7 @@ impl<B: Backend> Core<B> {
                 let mut slot = huddle.lock().unwrap_or_else(PoisonError::into_inner);
                 if slot.generation.load(Ordering::Acquire) == my_gen {
                     slot.joining = false;
+                    slot.joining_channel = None;
                     slot.call_id = Some(call_id.clone());
                     slot.handle = Some(handle);
                     None
@@ -122,15 +149,28 @@ impl<B: Backend> Core<B> {
     }
 
     pub(super) fn leave_huddle(&mut self) {
-        let prev = {
+        let (prev, cancelled_joining_channel) = {
             let mut slot = self.huddle.lock().unwrap_or_else(PoisonError::into_inner);
             slot.generation.fetch_add(1, Ordering::AcqRel);
+            let cancelled = slot.joining.then(|| slot.joining_channel.take()).flatten();
             slot.joining = false;
+            slot.joining_channel = None;
             slot.call_id = None;
-            slot.handle.take()
+            (slot.handle.take(), cancelled)
         };
         if let Some(handle) = prev {
             handle.leave();
+        } else if let Some(channel) = cancelled_joining_channel {
+            // Leaving while `rooms.join` was still in flight: emit `Idle` so callers waiting on
+            // lifecycle events don't stay stuck in `Joining`.
+            self.events
+                .emit(Event::Huddle(HuddleEvent::SessionChanged(Box::new(
+                    crate::huddle::HuddleSessionSnapshot {
+                        phase: HuddlePhase::Idle,
+                        channel,
+                        ..Default::default()
+                    },
+                ))));
         }
     }
 
@@ -159,12 +199,18 @@ impl<B: Backend> Core<B> {
     pub(super) fn invite_to_huddle(&self, channel: ChannelId, users: Vec<UserId>) {
         let ctx = self.ctx();
         self.spawn("rooms.notifyMember", async move {
+            let mut first_err: Option<CoreError> = None;
             for user in users {
-                ctx.backend
-                    .rooms_notify_member(channel.clone(), user)
-                    .await?;
+                if let Err(err) = ctx.backend.rooms_notify_member(channel.clone(), user).await
+                    && first_err.is_none()
+                {
+                    first_err = Some(err.into());
+                }
             }
-            Ok(())
+            match first_err {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
         });
     }
 
@@ -312,12 +358,52 @@ fn spawn_huddle_watcher_tracked(
             .unwrap_or_else(PoisonError::into_inner)
             .generation,
     );
+    // Offload SQLite transcript writes to a dedicated sequential writer task so Store mutex
+    // contention (backfill, VACUUM, FTS queries) can never stall 60 fps huddle video forwarding.
+    struct PendingSegment {
+        speaker_id: UserId,
+        lang: Option<String>,
+        text: String,
+        at_ms: i64,
+    }
+    let transcript_tx = persist.map(|ctx| {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PendingSegment>();
+        tasks.spawn(async move {
+            while let Some(item) = rx.recv().await {
+                let ws = ctx.workspace.clone();
+                let channel = ctx.channel.clone();
+                let call_id = ctx.call_id.clone();
+                let thread_root_ts = ctx.thread_root_ts.clone();
+                let source = ctx.source;
+                if let Err(err) = with_store(&ctx.store, move |store| {
+                    let seg = slackless_store::NewHuddleTranscriptSegment {
+                        channel: &channel,
+                        call_id: &call_id,
+                        thread_root_ts: thread_root_ts.as_ref(),
+                        speaker_id: Some(&item.speaker_id),
+                        lang: item.lang.as_deref(),
+                        source,
+                        text: &item.text,
+                        at_ms: item.at_ms,
+                    };
+                    store.insert_huddle_transcript_segment(&ws, &seg)
+                })
+                .await
+                {
+                    tracing::warn!(%err, "failed to persist huddle transcript segment");
+                }
+            }
+        });
+        (tx, ctx.enabled)
+    });
+
     tasks.spawn(async move {
         let mut deduper = CaptionDeduper::default();
         while let Some(upd) = upd_rx.recv().await {
             match upd {
                 HuddleUpdate::State(snap) => {
                     let done = matches!(snap.phase, HuddlePhase::Idle | HuddlePhase::Failed);
+                    let is_idle = snap.phase == HuddlePhase::Idle;
                     let should_emit = {
                         let mut slot = huddle.lock().unwrap_or_else(PoisonError::into_inner);
                         let is_current = slot.generation.load(Ordering::Acquire) == my_gen;
@@ -325,7 +411,8 @@ fn spawn_huddle_watcher_tracked(
                             slot.handle = None;
                             slot.call_id = None;
                         }
-                        is_current || (done && slot.handle.is_none() && !slot.joining)
+                        // Only emit `Idle` (not a stale `Failed` error) on fallback after Leave.
+                        is_current || (is_idle && slot.handle.is_none() && !slot.joining)
                     };
                     if should_emit {
                         events.emit(Event::Huddle(HuddleEvent::SessionChanged(snap)));
@@ -351,44 +438,28 @@ fn spawn_huddle_watcher_tracked(
                     }
                 }
                 HuddleUpdate::DataEvent(ev) => {
+                    // Always persist finalized captions flushed during teardown even after
+                    // `leave_huddle` bumped `generation`; only gate UI event forwarding on
+                    // `is_current`.
+                    if let crate::huddle::HuddleDataEvent::Caption {
+                        ref user,
+                        ref text,
+                        is_partial,
+                        at_ms,
+                        ref lang,
+                    } = ev
+                        && let Some((tx, enabled)) = transcript_tx.as_ref()
+                        && enabled.load(Ordering::Relaxed)
+                        && let Some(trimmed) = deduper.accept(user, text, is_partial, at_ms)
+                    {
+                        let _ = tx.send(PendingSegment {
+                            speaker_id: user.clone(),
+                            lang: lang.clone(),
+                            text: trimmed,
+                            at_ms: resolve_segment_at_ms(at_ms),
+                        });
+                    }
                     if gen_counter.load(Ordering::Acquire) == my_gen {
-                        if let crate::huddle::HuddleDataEvent::Caption {
-                            ref user,
-                            ref text,
-                            is_partial,
-                            at_ms,
-                            ref lang,
-                        } = ev
-                            && let Some(ctx) = persist.as_ref()
-                            && ctx.enabled.load(Ordering::Relaxed)
-                            && let Some(trimmed) = deduper.accept(user, text, is_partial, at_ms)
-                        {
-                            let seg_at_ms = resolve_segment_at_ms(at_ms);
-                            let ws = ctx.workspace.clone();
-                            let channel = ctx.channel.clone();
-                            let call_id = ctx.call_id.clone();
-                            let thread_root_ts = ctx.thread_root_ts.clone();
-                            let speaker_id = user.clone();
-                            let lang_owned = lang.clone();
-                            let source = ctx.source;
-                            if let Err(err) = with_store(&ctx.store, move |store| {
-                                let seg = slackless_store::NewHuddleTranscriptSegment {
-                                    channel: &channel,
-                                    call_id: &call_id,
-                                    thread_root_ts: thread_root_ts.as_ref(),
-                                    speaker_id: Some(&speaker_id),
-                                    lang: lang_owned.as_deref(),
-                                    source,
-                                    text: &trimmed,
-                                    at_ms: seg_at_ms,
-                                };
-                                store.insert_huddle_transcript_segment(&ws, &seg)
-                            })
-                            .await
-                            {
-                                tracing::warn!(%err, "failed to persist huddle transcript segment");
-                            }
-                        }
                         events.emit(Event::Huddle(HuddleEvent::Data(ev)));
                     }
                 }

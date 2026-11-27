@@ -689,8 +689,9 @@ fn mirror_live(
     }
 }
 
-/// Fetches one live page of a thread from Slack, mirrors it into the local archive, and returns
-/// it like an archive read (to render with `live: true`). `archive` may have failed to open.
+/// Fetches a live thread from Slack (following `next_cursor` up to `limit` messages), mirrors
+/// every fetched page into the local archive, and returns it like an archive read (to render
+/// with `live: true`). `archive` may have failed to open.
 pub(crate) async fn live_thread_read(
     api: &SlackApi,
     workspace: &TeamId,
@@ -700,24 +701,46 @@ pub(crate) async fn live_thread_read(
     limit: u32,
 ) -> Result<ThreadRead, slackless_core::api::ApiError> {
     let (channel, label) = resolve_channel_with(archive.as_ref().ok(), workspace, channel_arg);
-    let opts = HistoryOpts {
-        limit: Some(limit.clamp(1, 999)),
-        ..HistoryOpts::default()
-    };
+    let target = (limit.max(1)) as usize;
     let fetched_at = now_epoch_secs();
-    let page = api
-        .conversations_replies(&channel, thread_ts, &opts, None)
-        .await?;
-    let items = &page.items;
-    mirror_live(
-        archive,
-        |archive| {
-            archive
-                .store_mut()
-                .upsert_replies_page(workspace, &channel, items, fetched_at)
-        },
-        "replies",
-    );
+    let mut collected = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let remaining = target.saturating_sub(collected.len());
+        if remaining == 0 {
+            break;
+        }
+        let page_limit = u32::try_from(remaining).unwrap_or(200).clamp(1, 200);
+        let opts = HistoryOpts {
+            limit: Some(page_limit),
+            ..HistoryOpts::default()
+        };
+        let page = api
+            .conversations_replies(&channel, thread_ts, &opts, cursor.clone())
+            .await?;
+        let items = &page.items;
+        mirror_live(
+            archive,
+            |archive| {
+                archive
+                    .store_mut()
+                    .upsert_replies_page(workspace, &channel, items, fetched_at)
+            },
+            "replies",
+        );
+        collected.extend(page.items);
+        if collected.len() >= target {
+            collected.truncate(target);
+            break;
+        }
+        match page.next_cursor {
+            Some(next) if !next.is_empty() && seen_cursors.insert(next.clone()) => {
+                cursor = Some(next);
+            }
+            _ => break,
+        }
+    }
     let user_names = archive
         .as_ref()
         .ok()
@@ -726,8 +749,7 @@ pub(crate) async fn live_thread_read(
     Ok(ThreadRead {
         channel: channel.clone(),
         label,
-        messages: page
-            .items
+        messages: collected
             .into_iter()
             .map(|message| StoredMessage {
                 channel: channel.clone(),
@@ -739,8 +761,9 @@ pub(crate) async fn live_thread_read(
     })
 }
 
-/// Fetches one live page of a conversation's history (bounded by `window`) from Slack, mirrors
-/// it into the local archive, and returns it oldest first like an archive read.
+/// Fetches live conversation history (bounded by `window`, following `next_cursor` until
+/// `window.limit` messages are collected or exhausted) from Slack, mirrors every page into the
+/// local archive, and returns it oldest first like an archive read.
 pub(crate) async fn live_channel_read(
     api: &SlackApi,
     workspace: &TeamId,
@@ -749,25 +772,49 @@ pub(crate) async fn live_channel_read(
     window: &ChannelWindow,
 ) -> Result<ChannelRead, slackless_core::api::ApiError> {
     let (channel, label) = resolve_channel_with(archive.as_ref().ok(), workspace, channel_arg);
-    let opts = HistoryOpts {
-        oldest: window.since_secs.map(|s| Ts::from(format!("{s}.000000"))),
-        latest: window.before.clone(),
-        inclusive: false,
-        limit: Some(u32::try_from(window.limit).unwrap_or(200)),
-    };
+    let target = window.limit.max(1);
     let fetched_at = now_epoch_secs();
-    let page = api.conversations_history(&channel, &opts, None).await?;
-    let items = &page.items;
-    mirror_live(
-        archive,
-        |archive| {
-            archive
-                .store_mut()
-                .upsert_history_page(workspace, &channel, items, fetched_at)
-                .map(|_| ())
-        },
-        "messages",
-    );
+    let mut collected = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let remaining = target.saturating_sub(collected.len());
+        if remaining == 0 {
+            break;
+        }
+        let page_limit = u32::try_from(remaining).unwrap_or(200).clamp(1, 200);
+        let opts = HistoryOpts {
+            oldest: window.since_secs.map(|s| Ts::from(format!("{s}.000000"))),
+            latest: window.before.clone(),
+            inclusive: false,
+            limit: Some(page_limit),
+        };
+        let page = api
+            .conversations_history(&channel, &opts, cursor.clone())
+            .await?;
+        let items = &page.items;
+        mirror_live(
+            archive,
+            |archive| {
+                archive
+                    .store_mut()
+                    .upsert_history_page(workspace, &channel, items, fetched_at)
+                    .map(|_| ())
+            },
+            "messages",
+        );
+        collected.extend(page.items);
+        if collected.len() >= target {
+            collected.truncate(target);
+            break;
+        }
+        match page.next_cursor {
+            Some(next) if !next.is_empty() && seen_cursors.insert(next.clone()) => {
+                cursor = Some(next);
+            }
+            _ => break,
+        }
+    }
     let user_names = archive
         .as_ref()
         .ok()
@@ -778,8 +825,7 @@ pub(crate) async fn live_channel_read(
         row: None,
         label,
         // Slack returns newest first; reverse so output is oldest-first like local read.
-        messages: page
-            .items
+        messages: collected
             .into_iter()
             .rev()
             .map(|message| StoredMessage {

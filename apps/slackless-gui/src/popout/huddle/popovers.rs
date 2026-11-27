@@ -1295,8 +1295,7 @@ impl PopoutWindow {
     ) -> gpui_kit::gpui::Div {
         let candidates: Vec<_> = self
             .fixtures
-            .users
-            .iter()
+            .people()
             .filter(|u| !u.is_bot && !u.deleted && !people.contains(&u.id))
             .take(12)
             .cloned()

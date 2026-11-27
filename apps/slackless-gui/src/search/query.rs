@@ -177,9 +177,7 @@ impl SearchView {
         let workspace = self.workspace.clone();
         let workspace_name = self
             .fixtures
-            .workspaces
-            .iter()
-            .find(|t| t.id == workspace)
+            .workspace_by_id(&workspace)
             .map(|t| t.name.clone())
             .filter(|n| !n.trim().is_empty());
         let scope = self.scope;
@@ -631,8 +629,7 @@ impl SearchView {
     pub(super) fn matching_people(&self) -> Vec<&User> {
         let needle = self.query.trim().to_lowercase();
         self.fixtures
-            .users
-            .iter()
+            .people()
             .filter(|u| !u.deleted && !u.is_bot && u.id.as_str() != "USLACKBOT")
             .filter(|u| {
                 if needle.is_empty() {
@@ -722,10 +719,10 @@ pub fn fixture_archive(fixtures: &Fixtures) -> Option<SharedStore> {
 pub fn fixture_archive_for(fixtures: &Fixtures, workspace: &TeamId) -> Option<SharedStore> {
     let seed = || -> slackless_core::store::Result<Store> {
         let mut store = Store::open_in_memory()?;
-        if let Some(team) = fixtures.workspaces.iter().find(|t| t.id == *workspace) {
+        if let Some(team) = fixtures.workspace_by_id(workspace) {
             store.upsert_team(workspace, team)?;
         }
-        for user in &fixtures.users {
+        for user in fixtures.people() {
             store.upsert_user(workspace, user)?;
         }
         for conversation in fixtures
@@ -745,8 +742,8 @@ pub fn fixture_archive_for(fixtures: &Fixtures, workspace: &TeamId) -> Option<Sh
                 store.upsert_message(workspace, channel, message)?;
             }
         }
-        for (file_id, text) in &fixtures.file_transcripts {
-            store.upsert_file_transcript(workspace, file_id, "local", text)?;
+        for (file_id, text) in fixtures.all_file_transcripts() {
+            store.upsert_file_transcript(workspace, &file_id, "local", &text)?;
         }
         Ok(store)
     };
@@ -824,16 +821,19 @@ pub(crate) fn transcript_match_excerpt(transcript: &str, query: &str) -> Option<
 
     if win_start > 0 {
         let search_limit = (win_start + WORD_SNAP_LIMIT).min(match_start);
-        if let Some(offset) = chars[win_start..search_limit]
-            .iter()
-            .position(|c| *c == ' ')
+        if search_limit > win_start
+            && let Some(offset) = chars[win_start..search_limit]
+                .iter()
+                .position(|c| *c == ' ')
         {
             win_start += offset + 1;
         }
     }
     if win_end < total {
         let search_floor = win_end.saturating_sub(WORD_SNAP_LIMIT).max(match_end);
-        if let Some(offset) = chars[search_floor..win_end].iter().rposition(|c| *c == ' ') {
+        if search_floor < win_end
+            && let Some(offset) = chars[search_floor..win_end].iter().rposition(|c| *c == ' ')
+        {
             win_end = search_floor + offset;
         }
     }

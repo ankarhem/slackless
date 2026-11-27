@@ -74,8 +74,7 @@ pub(crate) fn suggestions(fixtures: &Fixtures, picked: &[Picked], query: &str) -
 
     let all: Vec<Suggestion> = if people_only {
         fixtures
-            .users
-            .iter()
+            .people()
             .filter(|u| !u.deleted && !chosen_users.contains(&u.id) && u.id != fixtures.self_user)
             .map(|user| Suggestion {
                 label: fixtures.user_name(&user.id).to_owned(),
@@ -138,8 +137,7 @@ pub(crate) fn suggestions(fixtures: &Fixtures, picked: &[Picked], query: &str) -
             })
             .chain(
                 fixtures
-                    .users
-                    .iter()
+                    .people()
                     .filter(|user| !user.deleted && !with_dm.contains(&user.id))
                     .map(|user| {
                         let is_self = user.id == fixtures.self_user;

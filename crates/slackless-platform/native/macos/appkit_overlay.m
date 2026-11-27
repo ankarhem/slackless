@@ -217,6 +217,64 @@ static void hsl_hue_to_rgb(int32_t hue_deg, CGFloat *r, CGFloat *g, CGFloat *b) 
 
 static NSPanel *g_draw_overlay_win = nil;
 static SlacklessDrawOverlayView *g_draw_overlay_view = nil;
+static id g_pen_esc_local_monitor = nil;
+static id g_pen_esc_global_monitor = nil;
+
+static void remove_pen_escape_monitors(void) {
+    if (g_pen_esc_local_monitor) {
+        [NSEvent removeMonitor:g_pen_esc_local_monitor];
+        g_pen_esc_local_monitor = nil;
+    }
+    if (g_pen_esc_global_monitor) {
+        [NSEvent removeMonitor:g_pen_esc_global_monitor];
+        g_pen_esc_global_monitor = nil;
+    }
+}
+
+static void disable_pen_mode_now(bool notify_escape) {
+    remove_pen_escape_monitors();
+    SlacklessOverlayMouseCallback cb = NULL;
+    void *ctx = NULL;
+    if (g_draw_overlay_view) {
+        cb = g_draw_overlay_view->mouse_cb;
+        ctx = g_draw_overlay_view->mouse_ctx;
+        g_draw_overlay_view->pen_enabled = false;
+        g_draw_overlay_view->mouse_cb = NULL;
+        g_draw_overlay_view->mouse_ctx = NULL;
+        [g_draw_overlay_view syncTrackingArea];
+        [g_draw_overlay_view setNeedsDisplay:YES];
+    }
+    if (g_draw_overlay_win) {
+        g_draw_overlay_win.ignoresMouseEvents = YES;
+        if (!g_draw_overlay_view ||
+            (g_draw_overlay_view->segment_count == 0 && g_draw_overlay_view->cursor_count == 0)) {
+            [g_draw_overlay_win orderOut:nil];
+        }
+    }
+    if (notify_escape && cb) {
+        cb(ctx, 4, 0.0, 0.0);
+    }
+}
+
+static void install_pen_escape_monitors(void) {
+    remove_pen_escape_monitors();
+    g_pen_esc_local_monitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                                                    handler:^NSEvent *(NSEvent *event) {
+                                                                        if (event.keyCode == 53) {
+                                                                            disable_pen_mode_now(true);
+                                                                            return nil;
+                                                                        }
+                                                                        return event;
+                                                                    }];
+    g_pen_esc_global_monitor = [NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                                                      handler:^(NSEvent *event) {
+                                                                          if (event.keyCode == 53) {
+                                                                              dispatch_async(dispatch_get_main_queue(), ^{
+                                                                                  disable_pen_mode_now(true);
+                                                                              });
+                                                                          }
+                                                                      }];
+}
 
 static void ensure_draw_overlay_window(NSRect frame) {
     if (!g_draw_overlay_win) {
@@ -287,12 +345,12 @@ void slackless_draw_overlay_update(
     const SlacklessOverlayCursor *cur,
     size_t cur_count) {
     SlacklessOverlaySegment *segs_copy = NULL;
-    if (segs && seg_count > 0) {
+    if (segs && seg_count > 0 && seg_count <= SIZE_MAX / sizeof(SlacklessOverlaySegment)) {
         segs_copy = (SlacklessOverlaySegment *)malloc(seg_count * sizeof(SlacklessOverlaySegment));
         if (segs_copy) memcpy(segs_copy, segs, seg_count * sizeof(SlacklessOverlaySegment));
     }
     SlacklessOverlayCursor *cur_copy = NULL;
-    if (cur && cur_count > 0) {
+    if (cur && cur_count > 0 && cur_count <= SIZE_MAX / sizeof(SlacklessOverlayCursor)) {
         cur_copy = (SlacklessOverlayCursor *)malloc(cur_count * sizeof(SlacklessOverlayCursor));
         if (cur_copy) memcpy(cur_copy, cur, cur_count * sizeof(SlacklessOverlayCursor));
     }
@@ -312,7 +370,16 @@ void slackless_draw_overlay_update(
                     g_draw_overlay_view->cursor_count = 0;
                     [g_draw_overlay_view setNeedsDisplay:YES];
                 }
-                if (g_draw_overlay_win && !pen_on) {
+                if (pen_on) {
+                    // Keep tracking window moves while pen mode is active; if the shared window
+                    // disappeared/minimized, exit pen mode immediately so clicks are never trapped.
+                    NSRect frame = NSZeroRect;
+                    if (resolve_share_target_nsrect(is_monitor, target_id, &frame)) {
+                        ensure_draw_overlay_window(frame);
+                    } else {
+                        disable_pen_mode_now(true);
+                    }
+                } else if (g_draw_overlay_win) {
                     [g_draw_overlay_win orderOut:nil];
                 }
                 return;
@@ -321,6 +388,12 @@ void slackless_draw_overlay_update(
             if (!resolve_share_target_nsrect(is_monitor, target_id, &frame)) {
                 free(segs_copy);
                 free(cur_copy);
+                if (pen_on) {
+                    disable_pen_mode_now(true);
+                } else if (g_draw_overlay_win) {
+                    g_draw_overlay_win.ignoresMouseEvents = YES;
+                    [g_draw_overlay_win orderOut:nil];
+                }
                 return;
             }
             ensure_draw_overlay_window(frame);
@@ -348,25 +421,18 @@ void slackless_draw_overlay_set_pen_mode(
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             if (!enabled) {
-                if (g_draw_overlay_view) {
-                    g_draw_overlay_view->pen_enabled = false;
-                    g_draw_overlay_view->mouse_cb = NULL;
-                    g_draw_overlay_view->mouse_ctx = NULL;
-                    [g_draw_overlay_view syncTrackingArea];
-                    [g_draw_overlay_view setNeedsDisplay:YES];
-                }
-                if (g_draw_overlay_win) {
-                    g_draw_overlay_win.ignoresMouseEvents = YES;
-                    if (!g_draw_overlay_view ||
-                        (g_draw_overlay_view->segment_count == 0 && g_draw_overlay_view->cursor_count == 0)) {
-                        [g_draw_overlay_win orderOut:nil];
-                    }
-                }
+                disable_pen_mode_now(false);
                 return;
             }
 
             NSRect frame = NSZeroRect;
             if (!resolve_share_target_nsrect(is_monitor, target_id, &frame)) {
+                // Never leave a stale click-intercepting pen overlay behind if the shared window
+                // closed or minimized before pen mode could attach to it.
+                disable_pen_mode_now(false);
+                if (g_draw_overlay_win) {
+                    [g_draw_overlay_win orderOut:nil];
+                }
                 return;
             }
             ensure_draw_overlay_window(frame);
@@ -375,6 +441,7 @@ void slackless_draw_overlay_set_pen_mode(
             g_draw_overlay_view->mouse_cb = cb;
             g_draw_overlay_view->mouse_ctx = ctx;
             g_draw_overlay_win.ignoresMouseEvents = NO;
+            install_pen_escape_monitors();
             [g_draw_overlay_view syncTrackingArea];
             [g_draw_overlay_view setNeedsDisplay:YES];
             [g_draw_overlay_win orderFrontRegardless];
@@ -385,6 +452,7 @@ void slackless_draw_overlay_set_pen_mode(
 void slackless_draw_overlay_hide(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
+            remove_pen_escape_monitors();
             if (g_draw_overlay_view) {
                 g_draw_overlay_view->pen_enabled = false;
                 g_draw_overlay_view->mouse_cb = NULL;
@@ -403,6 +471,18 @@ void slackless_draw_overlay_hide(void) {
             }
         }
     });
+}
+
+static bool floating_panel_intersects_any_screen(NSWindow *win) {
+    if (!win) return true;
+    NSRect f = win.frame;
+    for (NSScreen *scr in [NSScreen screens]) {
+        NSRect inter = NSIntersectionRect(f, scr.visibleFrame);
+        if (inter.size.width >= 24.0 && inter.size.height >= 20.0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void clamp_floating_panel_to_visible_frame(NSWindow *win, CGFloat bottomMargin) {
@@ -459,12 +539,17 @@ void slackless_configure_floating_panel(void *ns_view_ptr) {
 
             NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
             __weak NSWindow *weakWin = win;
+            // Allow dragging freely across multiple displays; only pull the panel back onscreen if
+            // it ends up completely outside every display's visible frame (e.g. monitor unplugged).
             id moveObs = [nc addObserverForName:NSWindowDidMoveNotification
                                          object:win
                                           queue:[NSOperationQueue mainQueue]
                                      usingBlock:^(NSNotification *note) {
                                          (void)note;
-                                         clamp_floating_panel_to_visible_frame(weakWin, 0.0);
+                                         NSWindow *w = weakWin;
+                                         if (w && !floating_panel_intersects_any_screen(w)) {
+                                             clamp_floating_panel_to_visible_frame(w, 0.0);
+                                         }
                                      }];
             id resizeObs = [nc addObserverForName:NSWindowDidResizeNotification
                                            object:win
@@ -473,28 +558,29 @@ void slackless_configure_floating_panel(void *ns_view_ptr) {
                                            (void)note;
                                            clamp_floating_panel_to_visible_frame(weakWin, 0.0);
                                        }];
-            __block id closeObs = nil;
-            closeObs = [nc addObserverForName:NSWindowWillCloseNotification
-                                       object:win
-                                        queue:[NSOperationQueue mainQueue]
-                                   usingBlock:^(NSNotification *note) {
-                                       (void)note;
-                                       NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
-                                       [center removeObserver:moveObs];
-                                       [center removeObserver:resizeObs];
-                                       if (closeObs) {
-                                           [center removeObserver:closeObs];
-                                           closeObs = nil;
-                                       }
-                                       NSWindow *strongWin = weakWin;
-                                       if (strongWin) {
-                                           objc_setAssociatedObject(
-                                               strongWin,
-                                               &kSlacklessFloatingPanelObserversKey,
-                                               nil,
-                                               OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                                       }
-                                   }];
+            __block __weak id weakCloseObs = nil;
+            id closeObs = [nc addObserverForName:NSWindowWillCloseNotification
+                                          object:win
+                                           queue:[NSOperationQueue mainQueue]
+                                      usingBlock:^(NSNotification *note) {
+                                          (void)note;
+                                          NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+                                          [center removeObserver:moveObs];
+                                          [center removeObserver:resizeObs];
+                                          id strongClose = weakCloseObs;
+                                          if (strongClose) {
+                                              [center removeObserver:strongClose];
+                                          }
+                                          NSWindow *strongWin = weakWin;
+                                          if (strongWin) {
+                                              objc_setAssociatedObject(
+                                                  strongWin,
+                                                  &kSlacklessFloatingPanelObserversKey,
+                                                  nil,
+                                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                                          }
+                                      }];
+            weakCloseObs = closeObs;
             objc_setAssociatedObject(
                 win,
                 &kSlacklessFloatingPanelObserversKey,

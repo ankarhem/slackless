@@ -168,7 +168,7 @@ fn main() {
             let mut first = bridges[0]
                 .snapshot(&Default::default())
                 .unwrap_or_else(fixtures::load);
-            first.workspaces = teams;
+            first.set_rail_workspaces(teams);
             (first, bridges)
         } else {
             (fixtures::load(), vec![CoreBridge::offline()])

@@ -355,12 +355,19 @@ fn transcode_wav_with_afconvert(wav: &[u8], file_format: &str, out_ext: &str) ->
     let wav_path = dir.join(format!("slackless-clip-{pid}-{stamp}-{seq}.wav"));
     let out_path = dir.join(format!("slackless-clip-{pid}-{stamp}-{seq}.{out_ext}"));
     std::fs::write(&wav_path, wav).ok()?;
-    let status = std::process::Command::new("/usr/bin/afconvert")
+    let status = match std::process::Command::new("/usr/bin/afconvert")
         .args(["-f", file_format, "-d", "aac", "-b", "96000"])
         .arg(&wav_path)
         .arg(&out_path)
         .status()
-        .ok()?;
+    {
+        Ok(status) => status,
+        Err(_) => {
+            let _ = std::fs::remove_file(&wav_path);
+            let _ = std::fs::remove_file(&out_path);
+            return None;
+        }
+    };
     let _ = std::fs::remove_file(&wav_path);
     if !status.success() {
         let _ = std::fs::remove_file(&out_path);

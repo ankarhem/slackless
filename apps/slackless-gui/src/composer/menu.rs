@@ -475,7 +475,7 @@ mod tests {
     #[test]
     fn people_filters_deleted_orders_users_groups_broadcasts_and_caps_limit() {
         let mut fixtures = crate::fixtures::load();
-        fixtures.users = vec![
+        fixtures.replace_users(vec![
             User {
                 id: UserId::from("U_DEL"),
                 name: "herbie".into(),
@@ -487,7 +487,7 @@ mod tests {
                 name: "herman".into(),
                 ..Default::default()
             },
-        ];
+        ]);
         fixtures.usergroups = vec![
             Usergroup {
                 id: UsergroupId::from("S_DEL"),
@@ -537,7 +537,7 @@ mod tests {
 
         // Respects LIMIT = 8.
         for i in 0..12 {
-            fixtures.users.push(User {
+            fixtures.users_mut().push(User {
                 id: UserId::from(format!("U{i:02}")),
                 name: format!("alpha{i:02}"),
                 ..Default::default()

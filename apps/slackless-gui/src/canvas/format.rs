@@ -230,15 +230,13 @@ pub(crate) fn apply_inline_format(
     }
 
     // Case 2: markers immediately surround the selection (`**` before, `**` after).
-    let surrounded = sel.start >= mlen
-        && sel.end + mlen <= text.len()
-        && &text[sel.start - mlen..sel.start] == marker
-        && &text[sel.end..sel.end + mlen] == marker;
-    let bold_guard = fmt == InlineFormat::Italic
-        && sel.start >= 2
-        && sel.end + 2 <= text.len()
-        && &text[sel.start - 2..sel.start] == "**"
-        && &text[sel.end..sel.end + 2] == "**";
+    // Use `ends_with` / `starts_with` on the already-boundary-aligned prefix/suffix slices so
+    // adjacent multi-byte UTF-8 characters can never cause a mid-character byte slice panic.
+    let before = &text[..sel.start];
+    let after = &text[sel.end..];
+    let surrounded = before.ends_with(marker) && after.starts_with(marker);
+    let bold_guard =
+        fmt == InlineFormat::Italic && before.ends_with("**") && after.starts_with("**");
     if surrounded && !bold_guard {
         let mut out = String::with_capacity(text.len() - mlen * 2);
         out.push_str(&text[..sel.start - mlen]);
@@ -681,4 +679,21 @@ pub(crate) fn move_last_line(markdown: &str, delta: isize) -> String {
     }
     lines.swap(ix, target as usize);
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod utf8_tests {
+    use super::*;
+
+    #[test]
+    fn apply_inline_format_handles_adjacent_multibyte_utf8_without_panicking() {
+        let (out1, _) = apply_inline_format("éword!", 2..6, InlineFormat::Italic);
+        assert_eq!(out1, "é*word*!");
+
+        let (out2, _) = apply_inline_format("🎉word🎉", 4..8, InlineFormat::Bold);
+        assert_eq!(out2, "🎉**word**🎉");
+
+        let (out3, _) = apply_inline_format("é*word*é", 3..7, InlineFormat::Italic);
+        assert_eq!(out3, "éwordé");
+    }
 }

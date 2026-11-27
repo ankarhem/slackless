@@ -79,8 +79,7 @@ impl ToolsPage {
     fn apps(&self, needle: &str) -> Vec<(Option<UserId>, String, String)> {
         let mut list: Vec<(Option<UserId>, String, String)> = self
             .fixtures
-            .users
-            .iter()
+            .people()
             .filter(|u| u.is_bot && !u.deleted && u.id.as_str() != "USLACKBOT")
             .map(|u| {
                 let title = u
@@ -301,8 +300,7 @@ impl Render for ToolsPage {
                                 .when_some(uid_opt, |row, uid| {
                                     let team_id = self
                                         .fixtures
-                                        .workspaces
-                                        .first()
+                                        .own_team()
                                         .map(|t| t.id.as_str().to_owned())
                                         .unwrap_or_default();
                                     let app_link = format!(

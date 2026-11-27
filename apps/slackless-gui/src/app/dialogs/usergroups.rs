@@ -114,8 +114,7 @@ fn filtered_workspace_candidates(
 ) -> Vec<(UserId, String, String)> {
     let needle = needle.trim().to_lowercase();
     let mut candidates: Vec<(UserId, String, String)> = fixtures
-        .users
-        .iter()
+        .people()
         .filter(|u| !u.deleted && !u.is_bot && u.id.as_str() != "USLACKBOT")
         .filter_map(|u| {
             let name = fixtures.name_of(u).to_owned();
@@ -427,7 +426,12 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let initial_members = cached_usergroup_members(&group.id, cx)
+        let ws_id = self
+            .fixtures
+            .own_team()
+            .map(|t| t.id.clone())
+            .unwrap_or_default();
+        let initial_members = cached_usergroup_members(&ws_id, &group.id, cx)
             .unwrap_or_else(|| usergroup_embedded_users(&group));
         let loading = !self.fixtures.sample;
         if !self.fixtures.sample {
@@ -575,8 +579,20 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let ws_id = self
+            .fixtures
+            .own_team()
+            .map(|t| t.id.clone())
+            .unwrap_or_default();
         let desc_opt = (!description.is_empty()).then_some(description.clone());
-        record_usergroup_edit(id.clone(), name.clone(), handle.clone(), desc_opt, cx);
+        record_usergroup_edit(
+            ws_id,
+            id.clone(),
+            name.clone(),
+            handle.clone(),
+            desc_opt,
+            cx,
+        );
         if !self.fixtures.sample {
             self.bridge.send(WorkspaceCommand::UpdateUsergroup {
                 usergroup: id.to_string(),
@@ -607,7 +623,12 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         let count = users.len();
-        record_usergroup_members(usergroup.clone(), users.clone(), cx);
+        let ws_id = self
+            .fixtures
+            .own_team()
+            .map(|t| t.id.clone())
+            .unwrap_or_default();
+        record_usergroup_members(ws_id, usergroup.clone(), users.clone(), cx);
         if !self.fixtures.sample {
             self.bridge
                 .send(WorkspaceCommand::UpdateUsergroupUsers { usergroup, users });
@@ -636,7 +657,12 @@ impl App {
         } else {
             format!("{} (@{})", group.name, group.handle)
         };
-        record_usergroup_disabled(group, cx);
+        let ws_id = self
+            .fixtures
+            .own_team()
+            .map(|t| t.id.clone())
+            .unwrap_or_default();
+        record_usergroup_disabled(ws_id, group, cx);
         if !self.fixtures.sample {
             self.bridge.send(WorkspaceCommand::DisableUsergroup(id));
         }
@@ -656,7 +682,12 @@ impl App {
         } else {
             format!("{} (@{})", group.name, group.handle)
         };
-        record_usergroup_enabled(&id, cx);
+        let ws_id = self
+            .fixtures
+            .own_team()
+            .map(|t| t.id.clone())
+            .unwrap_or_default();
+        record_usergroup_enabled(&ws_id, &id, cx);
         if !self.fixtures.sample {
             self.bridge.send(WorkspaceCommand::EnableUsergroup(id));
         }
@@ -672,7 +703,12 @@ impl App {
         users: Vec<UserId>,
         cx: &mut Context<Self>,
     ) {
-        record_usergroup_members(usergroup.clone(), users.clone(), cx);
+        let ws_id = self
+            .fixtures
+            .own_team()
+            .map(|t| t.id.clone())
+            .unwrap_or_default();
+        record_usergroup_members(ws_id, usergroup.clone(), users.clone(), cx);
         let active_modal = cx
             .try_global::<ActiveUsergroupMembersModal>()
             .and_then(|slot| slot.0.as_ref())

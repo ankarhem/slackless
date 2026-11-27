@@ -512,6 +512,19 @@ impl UnreadsView {
         cx.notify();
     }
 
+    /// Drop cached unread groups and open reply state when switching workspaces so the outgoing
+    /// workspace's unread cards never show in the incoming workspace.
+    pub fn clear_for_workspace(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.fixtures = fixtures;
+        self.groups.clear();
+        self.collapsed.clear();
+        self.replying = None;
+        self.focused = None;
+        self.open_thread = None;
+        self.loading = false;
+        cx.notify();
+    }
+
     /// The view's keys (Slack's "Navigate unread messages"): Up/Down move the focus,
     /// Left/Right collapse or expand the focused group, Esc marks it read. Returns whether
     /// the key was taken; with nothing unread no key is.
@@ -555,13 +568,11 @@ impl UnreadsView {
         }
     }
 
-    /// Collapse or expand group `ix` (its chevron) without triggering keyboard-focus styling.
-    fn toggle(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if let Some(group) = self.groups.get(ix) {
-            let channel = group.channel.clone();
-            if !self.collapsed.remove(&channel) {
-                self.collapsed.insert(channel);
-            }
+    /// Collapse or expand `channel`'s group (its chevron) by channel identity rather than list
+    /// position so a live refresh reordering groups cannot collapse the wrong channel.
+    fn toggle(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(channel) {
+            self.collapsed.insert(channel.clone());
         }
         cx.notify();
     }
@@ -569,7 +580,7 @@ impl UnreadsView {
     /// Mark `channel`'s group read, looked up when the action runs (a refresh that moved the
     /// groups cannot redirect it): drop its card, pass the focus to the group that takes its
     /// place, and tell the root where Slack's read cursor moves.
-    fn mark_read(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+    pub(crate) fn mark_read(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
         let Some(ix) = self
             .groups
             .iter()
@@ -626,7 +637,6 @@ impl UnreadsView {
             channel: channel.clone(),
             text,
         });
-        self.mark_read(&channel, cx);
     }
 }
 
@@ -904,7 +914,10 @@ fn card_view(args: UnreadCardArgs<'_>, cx: &mut Context<UnreadsView>) -> AnyElem
                             .text_color(muted)
                             .size(px(14.)),
                         )
-                        .on_click(cx.listener(move |this, _, _, cx| this.toggle(ix, cx))),
+                        .on_click({
+                            let toggle_ch = group.channel.clone();
+                            cx.listener(move |this, _, _, cx| this.toggle(&toggle_ch, cx))
+                        }),
                 )
                 .child(
                     h_flex()
@@ -1375,7 +1388,7 @@ mod tests {
         let targets = vec![(channel, Some(last_read), None, 0)];
         let store =
             crate::search::fixture_archive(&fixtures).expect("the fixture archive seeds a store");
-        let team = fixtures.workspaces[0].id.clone();
+        let team = fixtures.rail_workspaces()[0].id.clone();
         assert!(
             store_groups(&store.lock().unwrap(), &team, &targets).is_empty(),
             "the store agrees: no row is newer"
@@ -1387,7 +1400,7 @@ mod tests {
         let fixtures = fixtures::load();
         let store =
             crate::search::fixture_archive(&fixtures).expect("the fixture archive seeds a store");
-        let team = fixtures.workspaces[0].id.clone();
+        let team = fixtures.rail_workspaces()[0].id.clone();
         let channel = ChannelId::from("C0GENERAL");
         let history = fixtures.messages.get(&channel).unwrap();
         let last_read = history.first().unwrap().ts.clone();
@@ -1458,7 +1471,7 @@ mod tests {
         let fixtures = fixtures::load();
         let store =
             crate::search::fixture_archive(&fixtures).expect("the fixture archive seeds a store");
-        let team = fixtures.workspaces[0].id.clone();
+        let team = fixtures.rail_workspaces()[0].id.clone();
         // A directory channel: the conversation is stored, its history is not.
         let unsynced = ChannelId::from("C0OPS");
         let ahead = vec![(
@@ -1645,17 +1658,21 @@ mod tests {
         let view = mounted.borrow_mut().take().unwrap();
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let seen = events.clone();
+        let view_handle = view.clone();
         let recorder = cx.new(|cx| {
             struct Recorder {
                 _sub: Subscription,
             }
             let subscription =
-                cx.subscribe(&view, move |_, _, event: &UnreadsEvent, _| match event {
+                cx.subscribe(&view, move |_, _, event: &UnreadsEvent, cx| match event {
                     UnreadsEvent::MarkRead { channel, .. } => {
                         seen.borrow_mut().push(format!("read {channel}"));
                     }
                     UnreadsEvent::Reply { channel, .. } => {
                         seen.borrow_mut().push(format!("reply {channel}"));
+                        // Mirrors `App`: mark the group read only once submit succeeds.
+                        let ch = channel.clone();
+                        view_handle.update(cx, |view, cx| view.mark_read(&ch, cx));
                     }
                     _ => {}
                 });
@@ -1680,15 +1697,18 @@ mod tests {
                     cx,
                 );
                 view.submit_reply(cx);
-                assert_eq!(
-                    view.groups
-                        .iter()
-                        .map(|group| group.channel.clone())
-                        .collect::<Vec<_>>(),
-                    vec![c3],
-                    "C3 stays unread"
-                );
             });
+        });
+        cx.update(|_, cx| {
+            assert_eq!(
+                view.read(cx)
+                    .groups
+                    .iter()
+                    .map(|group| group.channel.clone())
+                    .collect::<Vec<_>>(),
+                vec![c3],
+                "C3 stays unread"
+            );
         });
         assert_eq!(
             *events.borrow(),

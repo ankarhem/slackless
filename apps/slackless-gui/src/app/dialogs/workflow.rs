@@ -615,8 +615,7 @@ impl App {
         }
         let bot_names: Vec<&str> = self
             .fixtures
-            .users
-            .iter()
+            .people()
             .filter(|u| u.is_bot && !u.deleted)
             .map(|u| u.display_name())
             .collect();

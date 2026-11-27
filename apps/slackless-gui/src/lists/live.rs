@@ -217,7 +217,7 @@ pub(super) fn render_live_list(
     let selected_bg = theme.accent.opacity(0.28);
     let rows_ui = visible_indices.iter().map(|&row_ix| {
         let rec = &data.rows[row_ix];
-        let is_sel = state.selected_row == Some(row_ix);
+        let is_sel = state.selected_record_id.as_deref() == Some(rec.id.as_str());
         let is_archived = state.archived_rows.contains(&rec.id);
         let is_subtask = is_subtask_row(rec, &data.columns);
         let key_click = list_key.clone();
@@ -235,13 +235,14 @@ pub(super) fn render_live_list(
                 .when(!is_sel, |r| r.hover(move |h| h.bg(hover_bg)))
                 .on_click(move |_, window, cx| {
                     let mut opened = false;
+                    let rec_id = rec_id_click.clone();
                     mutate_panel(
                         &key_click,
                         |s| {
-                            if s.selected_row == Some(row_ix) {
-                                s.selected_row = None;
+                            if s.selected_record_id.as_deref() == Some(rec_id.as_str()) {
+                                s.selected_record_id = None;
                             } else {
-                                s.selected_row = Some(row_ix);
+                                s.selected_record_id = Some(rec_id);
                                 opened = true;
                             }
                         },
@@ -256,6 +257,7 @@ pub(super) fn render_live_list(
                 let column = &data.columns[col_ix];
                 let width = live_column_width(column);
                 let val = row_cell(rec, column);
+                let cell_scope = format!("tbl-{}-{}", rec.id, column.id);
                 let is_checkbox = matches!(
                     column.kind.as_str(),
                     "checkbox" | "todo_completed" | "completed"
@@ -282,13 +284,13 @@ pub(super) fn render_live_list(
                                     cx,
                                 );
                             })
-                            .child(live_cell(val, column, fixtures, cx))
+                            .child(live_cell(val, column, &cell_scope, fixtures, cx))
                             .into_any_element()
                     } else {
-                        live_cell(val, column, fixtures, cx).into_any_element()
+                        live_cell(val, column, &cell_scope, fixtures, cx).into_any_element()
                     }
                 } else {
-                    live_cell(val, column, fixtures, cx).into_any_element()
+                    live_cell(val, column, &cell_scope, fixtures, cx).into_any_element()
                 };
                 row.child(
                     h_flex()
@@ -398,11 +400,13 @@ pub(super) fn render_live_list(
                             )
                             .children(lane_rows.into_iter().map(|row_ix| {
                                 let rec = &data.rows[row_ix];
-                                let is_sel = state.selected_row == Some(row_ix);
+                                let is_sel =
+                                    state.selected_record_id.as_deref() == Some(rec.id.as_str());
                                 let key_click = list_key.clone();
                                 let rec_id_card = rec.id.clone();
                                 let load_comments_card = actions.on_load_comments.clone();
                                 let primary_col = &data.columns[primary_ix];
+                                let primary_scope = format!("brd-{}-{}", rec.id, primary_col.id);
                                 let mut card = v_flex()
                                     .id(("list-live-card", row_ix))
                                     .gap_1p5()
@@ -414,9 +418,10 @@ pub(super) fn render_live_list(
                                     .cursor_pointer()
                                     .hover(move |c| c.bg(card_hover))
                                     .on_click(move |_, window, cx| {
+                                        let rec_id = rec_id_card.clone();
                                         mutate_panel(
                                             &key_click,
-                                            |s| s.selected_row = Some(row_ix),
+                                            |s| s.selected_record_id = Some(rec_id),
                                             window,
                                             cx,
                                         );
@@ -429,6 +434,7 @@ pub(super) fn render_live_list(
                                             live_cell(
                                                 row_cell(rec, primary_col),
                                                 primary_col,
+                                                &primary_scope,
                                                 fixtures,
                                                 cx,
                                             ),
@@ -443,6 +449,7 @@ pub(super) fn render_live_list(
                                     if matches!(val, None | Some(SlackListCellValue::Empty)) {
                                         continue;
                                     }
+                                    let cell_scope = format!("brd-{}-{}", rec.id, col.id);
                                     card = card.child(
                                         h_flex()
                                             .items_center()
@@ -455,7 +462,7 @@ pub(super) fn render_live_list(
                                                     .text_color(theme.muted_foreground)
                                                     .child(col.name.clone()),
                                             )
-                                            .child(live_cell(val, col, fixtures, cx)),
+                                            .child(live_cell(val, col, &cell_scope, fixtures, cx)),
                                     );
                                 }
                                 card

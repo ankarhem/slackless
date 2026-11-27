@@ -73,7 +73,11 @@ struct MacAudioDeviceMonitor {
 
 impl AudioDeviceMonitorHandle for MacAudioDeviceMonitor {}
 
-impl SystemAudioTapHandle for MacSystemAudioTap {}
+impl SystemAudioTapHandle for MacSystemAudioTap {
+    fn sample_rate(&self) -> u32 {
+        MacSystemAudioTap::sample_rate(self)
+    }
+}
 
 impl AudioLoopHandle for MacRoutedAudioLoop {
     fn stop(&mut self) {
@@ -87,11 +91,14 @@ impl HwAudioDuplexHandle for MacVoiceProcessingIo {
     }
 }
 
+const HW_H264_FAILURE_FALLBACK_THRESHOLD: u32 = 8;
+
 /// Hardware VideoToolbox H.264 decoder with **lazy** OpenH264 fallback (allocates 0 MB of SW
-/// decoder memory unless HW fails).
+/// decoder memory unless HW fails repeatedly or is unavailable).
 struct MacH264Decoder {
     vt: Option<VtH264Decoder>,
     sw: LazyOpenH264Decoder,
+    hw_consecutive_failures: u32,
 }
 
 impl MacH264Decoder {
@@ -99,6 +106,7 @@ impl MacH264Decoder {
         Self {
             vt: VtH264Decoder::new().ok(),
             sw: LazyOpenH264Decoder::new(),
+            hw_consecutive_failures: 0,
         }
     }
 }
@@ -113,10 +121,20 @@ impl VideoDecoderHandle for MacH264Decoder {
     }
 
     fn decode_unit(&mut self, unit: &[u8]) -> Option<VideoFrame> {
-        if let Some(vt) = self.vt.as_mut()
-            && let Some(frame) = vt.decode_annex_b(unit)
-        {
-            return Some(frame);
+        if let Some(vt) = self.vt.as_mut() {
+            if let Some(frame) = vt.decode_annex_b(unit) {
+                self.hw_consecutive_failures = 0;
+                return Some(frame);
+            }
+            self.hw_consecutive_failures = self.hw_consecutive_failures.saturating_add(1);
+            if self.hw_consecutive_failures < HW_H264_FAILURE_FALLBACK_THRESHOLD {
+                return None;
+            }
+            tracing::warn!(
+                failures = self.hw_consecutive_failures,
+                "VideoToolbox H.264 decode failed repeatedly; falling back to OpenH264 SW"
+            );
+            self.vt = None;
         }
         self.sw.decode_annex_b(unit)
     }

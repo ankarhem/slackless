@@ -313,15 +313,23 @@ async fn backfill_targets(
     if !stored.is_empty() {
         return Ok(stored);
     }
-    // Fresh archive: pull the conversation list from Slack once so `--all` has targets.
+    // Fresh archive: pull every conversation kind from Slack so `--all` covers public/private
+    // channels, DMs, and group DMs without silent truncation at a small page cap.
+    let opts = ListOpts {
+        kinds: vec![
+            slackless_core::types::ConversationKind::PublicChannel,
+            slackless_core::types::ConversationKind::PrivateChannel,
+            slackless_core::types::ConversationKind::Im,
+            slackless_core::types::ConversationKind::Mpim,
+        ],
+        exclude_archived: true,
+        limit: Some(200),
+    };
     let mut cursor: Option<String> = None;
+    let mut seen_cursors = std::collections::HashSet::new();
     let mut convs = Vec::new();
-    for _ in 0..10 {
-        let page = match session
-            .api
-            .conversations_list(&ListOpts::default(), cursor.clone())
-            .await
-        {
+    for _ in 0..100 {
+        let page = match session.api.conversations_list(&opts, cursor.clone()).await {
             Ok(page) => page,
             Err(err) => {
                 let (code, msg) = classify_api_error(&err);
@@ -330,8 +338,8 @@ async fn backfill_targets(
         };
         convs.extend(page.items);
         match next_backfill_cursor(cursor.as_deref(), page.next_cursor) {
-            Some(next) => cursor = Some(next),
-            None => break,
+            Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
+            _ => break,
         }
     }
     if convs.is_empty() {

@@ -187,7 +187,7 @@ impl Store {
                 channel.as_str(),
                 before_key,
                 MessageSubtype::ThreadBroadcast.as_str(),
-                limit as i64,
+                super::sql_limit(limit),
             ],
             raw_row,
         )?;
@@ -243,7 +243,7 @@ impl Store {
              ORDER BY ts_key DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(
-            params![workspace.as_str(), user.as_str(), limit as i64],
+            params![workspace.as_str(), user.as_str(), super::sql_limit(limit)],
             raw_row,
         )?;
         collect(rows)
@@ -312,7 +312,9 @@ impl Store {
         )?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(decode_revision(row?)?);
+            if let Some(rev) = decode_revision_or_skip(row?) {
+                out.push(rev);
+            }
         }
         if out.is_empty() {
             let mut cur_stmt = self.conn.prepare_cached(
@@ -325,8 +327,10 @@ impl Store {
                     raw_revision_row,
                 )
                 .optional()?;
-            if let Some(raw) = current {
-                out.push(decode_revision(raw)?);
+            if let Some(raw) = current
+                && let Some(rev) = decode_revision_or_skip(raw)
+            {
+                out.push(rev);
             }
         }
         Ok(out)
@@ -352,14 +356,17 @@ impl Store {
                      ORDER BY ts_key DESC LIMIT ?3",
                 )?;
                 let rows = stmt.query_map(
-                    params![workspace.as_str(), ch.as_str(), limit as i64],
+                    params![workspace.as_str(), ch.as_str(), super::sql_limit(limit)],
                     raw_row,
                 )?;
                 collect(rows)
             }
             None => {
                 let mut stmt = self.conn.prepare_cached(RECENT_THREADS_WORKSPACE_SQL)?;
-                let rows = stmt.query_map(params![workspace.as_str(), limit as i64], raw_row)?;
+                let rows = stmt.query_map(
+                    params![workspace.as_str(), super::sql_limit(limit)],
+                    raw_row,
+                )?;
                 collect(rows)
             }
         }
@@ -383,14 +390,34 @@ fn record_deletion_in_tx(
                 "SELECT json FROM message_current
                      WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3",
             )?;
-            let stored: Option<String> = stmt
+            let stored: Option<rusqlite::Result<String>> = stmt
                 .query_row(
                     params![workspace.as_str(), channel.as_str(), deleted_ts.as_str()],
-                    |r| decode_json_value(r.get_ref(0)?),
+                    |r| Ok(decode_json_value(r.get_ref(0)?)),
                 )
                 .optional()?;
             match stored {
-                Some(json) => serde_json::from_str(&json)?,
+                Some(Ok(json)) => match serde_json::from_str(&json) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            channel = %channel,
+                            ts = %deleted_ts,
+                            "corrupt stored message JSON during deletion; recording tombstone"
+                        );
+                        Message::default()
+                    }
+                },
+                Some(Err(error)) => {
+                    tracing::warn!(
+                        %error,
+                        channel = %channel,
+                        ts = %deleted_ts,
+                        "corrupt stored message payload during deletion; recording tombstone"
+                    );
+                    Message::default()
+                }
                 None => Message::default(),
             }
         }
@@ -762,15 +789,16 @@ fn upsert_message_in_tx(
     Ok(())
 }
 
-pub(super) type RawRow = (String, String, bool);
-type RawRevisionRow = (String, bool, String);
+pub(super) type RawRow = (String, rusqlite::Result<String>, bool);
+type RawRevisionRow = (String, bool, rusqlite::Result<String>);
 
 pub(super) fn raw_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
-    Ok((r.get(0)?, decode_json_value(r.get_ref(1)?)?, r.get(2)?))
+    Ok((r.get(0)?, decode_json_value(r.get_ref(1)?), r.get(2)?))
 }
 
 pub(super) fn decode_stored_message(raw: RawRow) -> Result<StoredMessage> {
     let (channel, json, deleted) = raw;
+    let json = json?;
     Ok(stored_message(
         channel,
         serde_json::from_str(&json)?,
@@ -778,11 +806,18 @@ pub(super) fn decode_stored_message(raw: RawRow) -> Result<StoredMessage> {
     ))
 }
 
-/// [`decode_stored_message`] for reads that return many messages: a row whose JSON no longer
-/// matches [`Message`] (a field type tightened by an upgrade, say) is logged and skipped, so one
-/// stale row cannot fail a whole channel, digest or search. [`Store::message`] stays strict.
+/// [`decode_stored_message`] for reads that return many messages: a row whose zlib payload or
+/// JSON no longer decodes is logged and skipped, so one stale or corrupt row cannot fail a whole
+/// channel, digest or search. [`Store::message`] stays strict.
 pub(super) fn decode_or_skip(raw: RawRow) -> Option<StoredMessage> {
     let (channel, json, deleted) = raw;
+    let json = match json {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::warn!(%error, %channel, "skipping stored message with undecodable payload");
+            return None;
+        }
+    };
     match serde_json::from_str(&json) {
         Ok(message) => Some(stored_message(channel, message, deleted)),
         Err(error) => {
@@ -818,17 +853,30 @@ fn raw_revision_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRevisionRow> {
     Ok((
         r.get::<_, String>(0)?,
         r.get::<_, bool>(1)?,
-        decode_json_value(r.get_ref(2)?)?,
+        decode_json_value(r.get_ref(2)?),
     ))
 }
 
-fn decode_revision(raw: RawRevisionRow) -> Result<Revision> {
+fn decode_revision_or_skip(raw: RawRevisionRow) -> Option<Revision> {
     let (edit_ts, deleted, json) = raw;
-    Ok(Revision {
-        edit_ts,
-        deleted,
-        message: serde_json::from_str(&json)?,
-    })
+    let json = match json {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::warn!(%error, %edit_ts, "skipping stored revision with undecodable payload");
+            return None;
+        }
+    };
+    match serde_json::from_str(&json) {
+        Ok(message) => Some(Revision {
+            edit_ts,
+            deleted,
+            message,
+        }),
+        Err(error) => {
+            tracing::warn!(%error, %edit_ts, "skipping stored revision that no longer decodes");
+            None
+        }
+    }
 }
 
 /// Strictly parses a Slack timestamp (`"<secs>[.<frac>]"`) into a microsecond sort key, returning

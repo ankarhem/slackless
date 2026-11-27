@@ -93,7 +93,7 @@ impl RichTextReader<'_> {
                 true
             }
             RichTextContainer::List(list) => {
-                let mut number = list.offset.unwrap_or(0);
+                let mut number = u64::from(list.offset.unwrap_or(0));
                 let mut any = false;
                 for item in &list.elements {
                     let elements = match item {
@@ -107,7 +107,7 @@ impl RichTextReader<'_> {
                     };
                     match list.style {
                         ListStyle::Ordered => {
-                            number += 1;
+                            number = number.saturating_add(1);
                             self.begin_line(&format!("{number}. "));
                         }
                         ListStyle::Bullet | ListStyle::Other(_) => {

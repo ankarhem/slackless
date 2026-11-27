@@ -1414,7 +1414,7 @@ fn classify_author_badge_distinguishes_human_bot_and_via_app() {
         is_bot: true,
         ..Default::default()
     };
-    fixtures.users.push(bot_user);
+    fixtures.users_mut().push(bot_user);
 
     // 1. Plain human message -> None
     let human_msg = Message {
@@ -1473,7 +1473,7 @@ fn classify_author_badge_distinguishes_human_bot_and_via_app() {
         team_id: Some(ext_team_id),
         ..Default::default()
     };
-    fixtures.users.push(ext_user);
+    fixtures.users_mut().push(ext_user);
 
     let mut file_msg = Message {
         user: Some(ext_user_id),

@@ -520,15 +520,26 @@ fn wire_feature_view_subscriptions(
                             .unwrap_or_else(std::env::temp_dir)
                     };
                     let path = dir.join("slackless-net-log.json");
-                    match std::fs::write(&path, json) {
-                        Ok(()) => notify(
-                            "Net log exported",
-                            format!("Saved to {}", path.display()),
-                            window,
-                            cx,
-                        ),
-                        Err(err) => notify("Net log export failed", err.to_string(), window, cx),
-                    }
+                    window
+                        .spawn(cx, async move |cx| {
+                            let write_path = path.clone();
+                            let result = cx
+                                .background_executor()
+                                .spawn(async move { std::fs::write(&write_path, json) })
+                                .await;
+                            let _ = cx.update(|window, cx| match result {
+                                Ok(()) => notify(
+                                    "Net log exported",
+                                    format!("Saved to {}", path.display()),
+                                    window,
+                                    cx,
+                                ),
+                                Err(err) => {
+                                    notify("Net log export failed", err.to_string(), window, cx)
+                                }
+                            });
+                        })
+                        .detach();
                 }
                 PreferencesEvent::TestSpeaker(output_device) => {
                     if this.fixtures.sample {
@@ -604,9 +615,14 @@ fn wire_feature_view_subscriptions(
                             cx,
                         );
                     }
-                    StatusEvent::RemoveScheduled(ix) => {
-                        if *ix < this.self_state.scheduled_statuses.len() {
-                            this.self_state.scheduled_statuses.remove(*ix);
+                    StatusEvent::RemoveScheduled(target) => {
+                        if let Some(pos) = this
+                            .self_state
+                            .scheduled_statuses
+                            .iter()
+                            .position(|s| s == target)
+                        {
+                            this.self_state.scheduled_statuses.remove(pos);
                             notify(
                                 "Scheduled status removed",
                                 "Cancelled upcoming scheduled status.",
@@ -644,8 +660,10 @@ fn wire_feature_view_subscriptions(
                 }
                 DraftsEvent::SendNow(entry) => this.deliver(entry.clone(), window, cx),
                 DraftsEvent::CancelScheduled(entry) => {
-                    if let Some(id) = entry.id.clone() {
-                        this.bridge.send(MessagingCommand::DeleteScheduledMessage {
+                    if let Some(id) = entry.id.clone()
+                        && let Some(bridge) = this.workspace_bridge(entry.workspace)
+                    {
+                        bridge.send(MessagingCommand::DeleteScheduledMessage {
                             channel: entry.channel.clone(),
                             scheduled_message_id: id,
                         });
@@ -718,6 +736,9 @@ fn wire_feature_view_subscriptions(
                     mark,
                     date_due,
                 } => {
+                    if channel.as_str() == crate::later::PERSONAL_TODO_CHANNEL {
+                        return;
+                    }
                     let cmd = MessagingCommand::UpdateSavedItem {
                         channel: channel.clone(),
                         ts: ts.clone(),
@@ -765,10 +786,14 @@ fn wire_feature_view_subscriptions(
                         thread_ts: thread_ts.clone(),
                     });
                     if let Some(read) = this.bridge.thread(channel.clone(), thread_ts.clone()) {
+                        let epoch = this.workspace_epoch;
                         let (ch, ts) = (channel.clone(), thread_ts.clone());
                         cx.spawn(async move |this, cx| {
                             let msgs = cx.background_executor().spawn(read).await;
                             let _ = this.update(cx, |app, cx| {
+                                if app.workspace_epoch != epoch {
+                                    return;
+                                }
                                 app.resolve_named_users(&msgs);
                                 let replies: Vec<_> =
                                     msgs.into_iter().filter(|m| m.ts != ts).collect();
@@ -793,6 +818,7 @@ fn wire_feature_view_subscriptions(
                             broadcast: *broadcast,
                             content: content.clone(),
                             files: None,
+                            origin: messaging::OutgoingOrigin::ThreadsView,
                         },
                         window,
                         cx,
@@ -904,10 +930,13 @@ fn wire_feature_view_subscriptions(
                         channel: channel.clone(),
                         thread_ts: None,
                         broadcast: false,
-                        content: slackless_core::api::MessageContent::plain(text.clone()),
+                        content: composer::content_of(text, &this.fixtures),
                         files: None,
+                        origin: messaging::OutgoingOrigin::External,
                     };
                     if this.submit(msg, window, cx) {
+                        this.unreads
+                            .update(cx, |view, cx| view.mark_read(channel, cx));
                         actions::notify("Reply sent", this.label(channel), window, cx);
                     }
                 }
@@ -1388,33 +1417,67 @@ fn install_os_and_lifecycle_hooks(app: &Entity<App>, window: &mut Window, cx: &m
         }
     });
     // Graceful app quit cleanup: whenever Slackless quits (Cmd+Q, Menu Quit, Status Bar Quit,
-    // Dock Quit, OS logout, or SIGTERM/SIGINT), send `Command::Shutdown` to every live core
-    // bridge and wait briefly for active huddles to flush Chime `LEAVE` before exit.
+    // Dock Quit, OS logout, or SIGTERM/SIGINT), immediately send `Command::Shutdown` to EVERY
+    // live core bridge up-front, then join their threads in parallel (huddle owner prioritized)
+    // inside GPUI's quit budget so later workspaces never miss Chime `LEAVE`.
     let quit_app = app.downgrade();
     let quit_sub = cx.on_app_quit(move |cx| {
-        let mut tasks: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+        let mut join_tasks: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
         if let Some(a) = quit_app.upgrade() {
             let app = a.read(cx);
-            if let Some(t) = app.bridge.shutdown_task() {
-                tasks.push(t);
-            }
+            let owner = app.huddle_owner;
+            // Phase 1: signal ALL bridges synchronously before joining any thread.
+            app.bridge.send_shutdown();
             for parked in app.slots.iter().filter_map(|slot| slot.bridge.as_ref()) {
-                if let Some(t) = parked.shutdown_task() {
-                    tasks.push(t);
+                parked.send_shutdown();
+            }
+            // Phase 2: collect join handles, prioritizing the huddle-owning workspace first.
+            if owner == Some(app.workspace)
+                && let Some(t) = app.bridge.join_shutdown_task()
+            {
+                join_tasks.push(t);
+            }
+            for (ix, slot) in app.slots.iter().enumerate() {
+                if owner == Some(ix)
+                    && let Some(t) = slot
+                        .bridge
+                        .as_ref()
+                        .and_then(CoreBridge::join_shutdown_task)
+                {
+                    join_tasks.push(t);
+                }
+            }
+            if owner != Some(app.workspace)
+                && let Some(t) = app.bridge.join_shutdown_task()
+            {
+                join_tasks.push(t);
+            }
+            for (ix, slot) in app.slots.iter().enumerate() {
+                if owner != Some(ix)
+                    && let Some(t) = slot
+                        .bridge
+                        .as_ref()
+                        .and_then(CoreBridge::join_shutdown_task)
+                {
+                    join_tasks.push(t);
                 }
             }
         }
         let bg = cx.background_executor().clone();
         async move {
-            if tasks.is_empty() {
+            if join_tasks.is_empty() {
                 return;
             }
             let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
             let _ = std::thread::Builder::new()
                 .name("slackless-shutdown".into())
                 .spawn(move || {
-                    for task in tasks {
-                        task();
+                    let handles: Vec<_> = join_tasks
+                        .into_iter()
+                        .filter_map(|task| std::thread::Builder::new().spawn(task).ok())
+                        .collect();
+                    for h in handles {
+                        let _ = h.join();
                     }
                     let _ = done_tx.send(());
                 });
@@ -1608,10 +1671,10 @@ impl App {
             // Slot 0 is shown (its bridge is `bridge`); every other workspace keeps its own
             // bridge in its slot. A snapshot without teams still gets one slot.
             let mut background = bridges.into_iter();
-            let teams = if fixtures.workspaces.is_empty() {
+            let teams = if fixtures.rail_workspaces().is_empty() {
                 vec![Team::default()]
             } else {
-                fixtures.workspaces.clone()
+                fixtures.rail_workspaces().to_vec()
             };
             let mut slots: Vec<WorkspaceSlot> = (teams.into_iter().enumerate())
                 .map(|(ix, team)| WorkspaceSlot {
@@ -1765,7 +1828,7 @@ impl App {
                 window,
                 cx,
                 |this: &mut App, event, window, cx| {
-                    this.on_huddle_media_event(event, window, cx);
+                    this.on_huddle_media_event(0, event, window, cx);
                 },
             ));
             subscriptions.extend(wire_feature_view_subscriptions(&feature_views, window, cx));
@@ -1784,8 +1847,8 @@ impl App {
                     subscriptions.push(bg_bridge.subscribe_huddle_media_in(
                         window,
                         cx,
-                        |this: &mut App, event, window, cx| {
-                            this.on_huddle_media_event(event, window, cx);
+                        move |this: &mut App, event, window, cx| {
+                            this.on_huddle_media_event(ws_ix, event, window, cx);
                         },
                     ));
                 }
@@ -1859,6 +1922,7 @@ impl App {
                 slots,
                 rail,
                 workspace: 0,
+                workspace_epoch: 0,
                 ws: WorkspaceState {
                     chosen,
                     bots: cached_bots,
@@ -1885,9 +1949,14 @@ impl App {
                 huddle_state: None,
                 _huddle_state_sub: None,
                 huddle_dock: None,
+                huddle_popout: None,
                 huddle_floating_panel: None,
+                huddle_leaving_call: None,
                 _huddle_dock_sub: None,
                 huddle_invite: None,
+                huddle_invite_owner: None,
+                huddle_invite_ring_task: None,
+                huddle_invite_expire_task: None,
                 _huddle_invite_sub: None,
                 huddle_alone_music_task: None,
                 preferences,

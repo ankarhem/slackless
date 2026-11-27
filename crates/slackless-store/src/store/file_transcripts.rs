@@ -292,6 +292,34 @@ impl Store {
         Ok(out)
     }
 
+    /// Return the distinct `file_id`s that have a persisted transcript and are attached to at
+    /// least one non-deleted message in `channel` (without any message-count truncation cap).
+    pub fn file_transcript_ids_in_channel(
+        &self,
+        workspace: &TeamId,
+        channel: &ChannelId,
+    ) -> Result<HashSet<FileId>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT ft.file_id
+             FROM file_transcript ft
+             JOIN message_file mf
+               ON mf.workspace_id = ft.workspace_id AND mf.file_id = ft.file_id
+             JOIN message_current mc
+               ON mc.id = mf.message_id
+             WHERE ft.workspace_id = ?1
+               AND mc.channel_id = ?2
+               AND mc.deleted = 0",
+        )?;
+        let rows = stmt.query_map(params![workspace.as_str(), channel.as_str()], |r| {
+            Ok(FileId::from(r.get::<_, String>(0)?))
+        })?;
+        let mut out = HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
     /// Load timed transcript cues for every file in `workspace` that has stored cue timestamps.
     pub fn all_file_transcript_cues(
         &self,

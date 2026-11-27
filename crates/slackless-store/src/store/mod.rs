@@ -196,11 +196,16 @@ impl Store {
         Self::init(conn)
     }
 
-    /// Opens an existing archive for reading: read-only when possible, read-write otherwise (a
-    /// WAL database whose `-shm` file is missing cannot be opened read-only).
+    /// Opens an existing archive for reading: read-only when possible, falling back to read-write
+    /// only on SQLite open errors (e.g. a WAL database whose `-shm` file is missing). Structural
+    /// errors like [`StoreError::FutureSchema`] are never bypassed by opening read-write.
     pub fn open_for_reading(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        Self::open_read_only(path).or_else(|_| Self::open(path))
+        match Self::open_read_only(path) {
+            Ok(store) => Ok(store),
+            Err(StoreError::Sqlite(_)) => Self::open(path),
+            Err(err) => Err(err),
+        }
     }
 
     /// Opens a read-only WAL connection to an existing database at `path`, allowing UI reads to
@@ -357,12 +362,21 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let merged = match load_conversation(&tx, workspace, &fresh.id)? {
-            Some(mut stored) => {
+        let merged = match load_conversation(&tx, workspace, &fresh.id) {
+            Ok(Some(mut stored)) => {
                 stored.merge(fresh);
                 stored
             }
-            None => fresh.clone(),
+            Ok(None) => fresh.clone(),
+            Err(StoreError::Json(error)) => {
+                tracing::warn!(
+                    %error,
+                    channel = %fresh.id,
+                    "overwriting corrupt stored conversation during merge"
+                );
+                fresh.clone()
+            }
+            Err(e) => return Err(e),
         };
         upsert_conversation_in_tx(&tx, workspace, &merged, now_epoch_secs())?;
         tx.commit()?;
@@ -370,15 +384,14 @@ impl Store {
         Ok(())
     }
 
-    /// Every stored conversation of `workspace`, by name, as last upserted.
+    /// Every stored conversation of `workspace`, by name, as last upserted. A row whose JSON no
+    /// longer decodes is logged and skipped, so one stale row cannot fail the whole list.
     pub fn conversations(&self, workspace: &TeamId) -> Result<Vec<Conversation>> {
-        self.json_column(
+        self.decode_json_rows(
             "SELECT json FROM conversation WHERE workspace_id = ?1 ORDER BY name",
             workspace,
-        )?
-        .iter()
-        .map(|json| Ok(serde_json::from_str(json)?))
-        .collect()
+            "conversation",
+        )
     }
 
     /// One stored user by id, as last written (single primary-key lookup).
@@ -418,20 +431,11 @@ impl Store {
     /// (a field type tightened by an upgrade, say) is logged and skipped, so one stale row cannot
     /// fail the whole list.
     pub fn users(&self, workspace: &TeamId) -> Result<Vec<User>> {
-        Ok(self
-            .json_column(
-                r#"SELECT json FROM "user" WHERE workspace_id = ?1"#,
-                workspace,
-            )?
-            .iter()
-            .filter_map(|json| match serde_json::from_str(json) {
-                Ok(user) => Some(user),
-                Err(error) => {
-                    tracing::warn!(%error, %workspace, "skipping stored user that no longer decodes");
-                    None
-                }
-            })
-            .collect())
+        self.decode_json_rows(
+            r#"SELECT json FROM "user" WHERE workspace_id = ?1"#,
+            workspace,
+            "user",
+        )
     }
 
     /// Stores the workspace's team record (`client.userBoot.team`).
@@ -468,14 +472,14 @@ impl Store {
     }
 
     /// Every stored team of `workspace`: its own record first, then the connected
-    /// organizations Slack Connect shared channels introduced, by name.
+    /// organizations Slack Connect shared channels introduced, by name. Undecodable rows are
+    /// logged and skipped so one stale record cannot break the whole list.
     pub fn teams(&self, workspace: &TeamId) -> Result<Vec<Team>> {
-        let teams: Vec<Team> = self
-            .json_column("SELECT json FROM team WHERE workspace_id = ?1", workspace)?
-            .iter()
-            .map(|json| serde_json::from_str(json))
-            .collect::<std::result::Result<_, _>>()?;
-        let mut sorted = teams;
+        let mut sorted: Vec<Team> = self.decode_json_rows(
+            "SELECT json FROM team WHERE workspace_id = ?1",
+            workspace,
+            "team",
+        )?;
         sorted.sort_by(|a, b| {
             let own = |team: &Team| team.id == *workspace;
             own(b).cmp(&own(a)).then_with(|| a.name.cmp(&b.name))
@@ -551,16 +555,14 @@ impl Store {
     }
 
     /// The sidebar sections in display order: the `next_id` chain starting at the section no
-    /// other section points to, then any leftovers in stored order.
+    /// other section points to, then any leftovers in stored order. Undecodable rows are logged
+    /// and skipped.
     pub fn sections(&self, workspace: &TeamId) -> Result<Vec<ChannelSection>> {
-        let stored: Vec<ChannelSection> = self
-            .json_column(
-                "SELECT json FROM channel_section WHERE workspace_id = ?1 ORDER BY seq",
-                workspace,
-            )?
-            .iter()
-            .map(|json| Ok(serde_json::from_str(json)?))
-            .collect::<Result<_>>()?;
+        let stored: Vec<ChannelSection> = self.decode_json_rows(
+            "SELECT json FROM channel_section WHERE workspace_id = ?1 ORDER BY seq",
+            workspace,
+            "channel_section",
+        )?;
         Ok(display_order(stored))
     }
 
@@ -678,12 +680,35 @@ impl Store {
         Ok(json.map(|json| serde_json::from_str(&json)).transpose()?)
     }
 
-    /// The `json` column of `sql`'s rows; `?1` is bound to `workspace`.
-    fn json_column(&self, sql: &str, workspace: &TeamId) -> Result<Vec<String>> {
+    /// Decodes the `json` column of every row returned by `sql` (`?1` bound to `workspace`),
+    /// logging and skipping any row whose JSON no longer decodes so one stale record cannot fail
+    /// a multi-row read.
+    fn decode_json_rows<T: serde::de::DeserializeOwned>(
+        &self,
+        sql: &str,
+        workspace: &TeamId,
+        kind: &'static str,
+    ) -> Result<Vec<T>> {
         let mut stmt = self.conn.prepare_cached(sql)?;
-        let rows = stmt.query_map(params![workspace.as_str()], |r| r.get(0))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let rows = stmt.query_map(params![workspace.as_str()], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let raw = row?;
+            match serde_json::from_str(&raw) {
+                Ok(item) => out.push(item),
+                Err(error) => {
+                    tracing::warn!(%error, %workspace, kind, "skipping stored row that no longer decodes");
+                }
+            }
+        }
+        Ok(out)
     }
+}
+
+/// Converts a `usize` row limit into a non-negative SQLite `LIMIT` integer, saturating at
+/// `i64::MAX` so values above `i64::MAX` never wrap to negative (`LIMIT -1` = unlimited rows).
+pub(super) fn sql_limit(limit: usize) -> i64 {
+    i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
 /// Joins each `file_transcript ft` row with the newest live message carrying its file

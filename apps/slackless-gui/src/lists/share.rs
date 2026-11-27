@@ -92,13 +92,11 @@ pub(super) fn render_list_share_panel(
         .map(str::to_owned)
         .unwrap_or_else(|| {
             let team = fixtures
-                .workspaces
-                .first()
+                .own_team()
                 .map(|t| t.id.as_str())
                 .unwrap_or("T0SAMPLE");
             let domain = fixtures
-                .workspaces
-                .first()
+                .own_team()
                 .map(|t| t.domain.as_str())
                 .filter(|d| !d.is_empty())
                 .unwrap_or("slackless");
@@ -378,8 +376,7 @@ fn render_share_tab(
         })
         .collect();
     let quick_users: Vec<(UserId, String)> = fixtures
-        .users
-        .iter()
+        .people()
         .filter(|u| !u.deleted && !u.is_bot && u.id != fixtures.self_user)
         .take(4)
         .map(|u| (u.id.clone(), format!("@{}", u.display_name())))
@@ -642,8 +639,7 @@ fn render_access_tab(
     if editors.is_empty()
         && is_fixture
         && let Some(u) = fixtures
-            .users
-            .iter()
+            .people()
             .find(|u| !u.deleted && !u.is_bot && u.id != fixtures.self_user)
     {
         editors.push(u.id.clone());

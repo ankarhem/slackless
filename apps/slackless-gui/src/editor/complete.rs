@@ -30,6 +30,10 @@ const EMOJI_QUERY_MIN: usize = 2;
 /// start of a line (markdown heading syntax `# ` / `## ` / `### `) does not open channel
 /// completion until a word character follows `#`, and `##` never opens channel completion.
 pub fn trigger(doc: &Doc, caret: usize) -> Option<Trigger<'_>> {
+    let text = doc.text();
+    if caret > text.len() || !text.is_char_boundary(caret) {
+        return None;
+    }
     let parsed = doc.parse();
     let line = parsed.line_at(caret);
     if matches!(
@@ -48,7 +52,9 @@ pub fn trigger(doc: &Doc, caret: usize) -> Option<Trigger<'_>> {
         .map_or(line.content.start, |placed| {
             placed.range.end.max(line.content.start)
         });
-    let text = doc.text();
+    if floor > caret || !text.is_char_boundary(floor) {
+        return None;
+    }
     let start = floor + text[floor..caret].rfind(['@', '#', ':'])?;
     let query = &text[start + 1..caret];
     let lookup = match &text[start..=start] {

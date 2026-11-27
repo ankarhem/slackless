@@ -33,7 +33,12 @@ impl App {
                     return;
                 }
                 Event::Usergroups(groups) => {
-                    crate::directory::reconcile_usergroups_from_server(groups, cx);
+                    let ws_id = self
+                        .fixtures
+                        .own_team()
+                        .map(|t| t.id.clone())
+                        .unwrap_or_default();
+                    crate::directory::reconcile_usergroups_from_server(&ws_id, groups, cx);
                 }
                 Event::Conversations(_) | Event::SidebarChanged => self.ws.notify_levels = None,
                 _ => {}
@@ -46,11 +51,17 @@ impl App {
         };
         match event {
             Event::Counts(counts) => {
-                slot.state.counts = [&counts.channels, &counts.ims, &counts.mpims]
-                    .into_iter()
-                    .flatten()
-                    .map(|entry| (entry.id.clone(), entry.clone()))
-                    .collect();
+                let newly_unread = slot.state.fold_counts(counts);
+                let threads = &counts.threads;
+                let (has_unreads, mentions) = (threads.has_unreads, threads.mention_count);
+                if let Some(parked) = &slot.parked {
+                    parked.views.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.set_thread_counts(has_unreads, mentions, cx);
+                        for id in &newly_unread {
+                            sidebar.mark_unread(id, cx);
+                        }
+                    });
+                }
                 self.sync_badge(cx);
                 cx.notify();
             }
@@ -65,9 +76,67 @@ impl App {
             Event::SavedLoaded(Ok(items)) => {
                 self.apply_saved_loaded(ws_index, items, cx);
             }
+            Event::MessageScheduled {
+                channel,
+                scheduled_message_id,
+                post_at,
+            } => {
+                self.drafts.update(cx, |drafts, cx| {
+                    drafts.confirm_scheduled(
+                        ws_index,
+                        channel,
+                        *post_at,
+                        scheduled_message_id.clone(),
+                        cx,
+                    );
+                });
+                cx.notify();
+            }
+            Event::Error(error) => {
+                tracing::warn!(workspace = %slot.team.id, error = %error, "background workspace core error");
+                if error.starts_with("chat.scheduleMessage:")
+                    || error.starts_with("chat.deleteScheduledMessage:")
+                {
+                    self.drafts
+                        .update(cx, |drafts, cx| drafts.drop_pending_scheduled(ws_index, cx));
+                }
+            }
+            Event::AuthExpired(error) => {
+                tracing::warn!(
+                    workspace = %slot.team.id,
+                    error = %error,
+                    "Slack rejected the saved session for background workspace"
+                );
+            }
+            Event::UsersChanged(users) => {
+                if slot.parked.is_some() && !users.is_empty() {
+                    let next = Reload::Users(users.iter().cloned().collect());
+                    slot.state.reload = Some(match slot.state.reload.take() {
+                        Some(prev) => prev.merge(next),
+                        None => next,
+                    });
+                }
+            }
+            Event::FileTranscriptReady {
+                file_id,
+                text,
+                cues,
+            } => {
+                if let Some(parked) = &mut slot.parked {
+                    parked.fixtures = Arc::new(parked.fixtures.with_file_transcript_cues(
+                        file_id.clone(),
+                        text.clone(),
+                        cues.clone(),
+                    ));
+                }
+            }
             Event::Conversations(_) | Event::SidebarChanged => {
                 // Notification levels may have changed: read them again when next needed.
                 slot.state.notify_levels = None;
+                // A visited background workspace's parked snapshot is now stale: reload it on return.
+                if slot.parked.is_some() {
+                    slot.state.reload = Some(Reload::Full);
+                }
                 // Refresh this background workspace's team name/icon if hydrate just stored a
                 // richer `team.info` record (O(1) single-row team lookup).
                 let fresh_team = slot.bridge.as_ref().and_then(CoreBridge::team_summary);
@@ -253,19 +322,20 @@ impl App {
                     };
                     self.dispatch_bg_message_notification(
                         ws_index,
+                        &bg_ctx.self_user,
                         channel,
                         message,
                         conv,
                         bg_ctx.sender.as_ref(),
                         level,
                         kind,
-                        mentioned,
                         &rule_eval,
                         cx,
                     );
                     return;
                 }
                 let rules = rules.clone();
+                let self_user = bg_ctx.self_user.clone();
                 let channel_owned = channel.clone();
                 let message_owned = message.clone();
                 let conv_owned = conv.cloned();
@@ -286,13 +356,13 @@ impl App {
                     let _ = this.update(cx, |app, cx| {
                         app.dispatch_bg_message_notification(
                             ws_index,
+                            &self_user,
                             &channel_owned,
                             &message_owned,
                             conv_owned.as_ref(),
                             sender_owned.as_ref(),
                             level,
                             kind,
-                            mentioned,
                             &rule_eval,
                             cx,
                         );
@@ -308,54 +378,36 @@ impl App {
     fn dispatch_bg_message_notification(
         &mut self,
         ws_index: usize,
+        self_user: &UserId,
         channel: &ChannelId,
         message: &Message,
         conv: Option<&Conversation>,
         sender_user: Option<&slackless_core::types::User>,
         level: Option<NotifyLevel>,
         kind: ConversationKind,
-        mentioned: bool,
         rule_eval: &slackless_core::rules::RuleEvaluation,
         cx: &mut Context<Self>,
     ) {
-        let dm = matches!(kind, ConversationKind::Im | ConversationKind::Mpim);
-        let settings = self.preferences.read(cx).settings();
-        if !settings.desktop_notifications || rule_eval.is_suppressed() {
+        let decision = {
+            let settings = self.preferences.read(cx).settings();
+            super::decide_message_notification(&super::NotificationInput {
+                self_user,
+                channel,
+                message,
+                sender: sender_user,
+                kind: Some(kind),
+                level,
+                on_screen_active: false,
+                paused: self.self_state.paused(),
+                focused: self.self_state.focused(),
+                settings,
+                rule_eval,
+            })
+        };
+        if !decision.notify {
             return;
         }
-        let sender_is_vip = message.user.as_ref().is_some_and(|u| {
-            let handle = sender_user.map(|x| x.name.as_str()).unwrap_or("");
-            let display = sender_user
-                .map(slackless_core::types::User::display_name)
-                .unwrap_or("");
-            settings.is_vip(u.as_str(), handle, display)
-        });
-        let breakthrough = sender_is_vip
-            || settings.is_urgent_dm_breakthrough(dm, &message.text)
-            || rule_eval.breaks_through_mute();
-        if level == Some(NotifyLevel::Muted) && !breakthrough {
-            return;
-        }
-        if !breakthrough
-            && (self.self_state.paused()
-                || self.self_state.focused()
-                || !settings.notifications_allowed_now())
-        {
-            return;
-        }
-        let wanted = breakthrough
-            || rule_eval.is_priority_highlight()
-            || match (level, settings.notify_level) {
-                (Some(NotifyLevel::Everything), _) => true,
-                (Some(NotifyLevel::Mentions), _) => dm || mentioned,
-                (Some(NotifyLevel::Muted), _) => false,
-                (None, 0) => true,
-                (None, 1) => dm || mentioned,
-                (None, _) => false,
-            };
-        if !wanted {
-            return;
-        }
+        let show_preview = self.preferences.read(cx).settings().show_preview;
         let ws_name = self
             .slots
             .get(ws_index)
@@ -366,7 +418,7 @@ impl App {
             .map(|u| u.display_name().to_owned())
             .or_else(|| message.user.as_ref().map(|u| u.as_str().to_owned()))
             .unwrap_or_default();
-        let text = if settings.show_preview {
+        let text = if show_preview {
             if !message.text.trim().is_empty() {
                 message.text.trim().to_owned()
             } else if let Some(file) = message.files.first() {
@@ -406,17 +458,17 @@ impl App {
             raw_title
         };
         let tag = format!("bg:{ws_index}:{channel}:{}", message.ts);
-        self.system_notification_with_breakthrough(
+        let vip_sound = decision
+            .sender_is_vip
+            .then(|| self.preferences.read(cx).settings().vip_sound);
+        self.system_notification_with_sound(
             &tag,
             &title,
             &body,
-            dm || mentioned || rule_eval.breaks_through_mute() || rule_eval.is_priority_highlight(),
-            breakthrough,
+            decision.is_direct_or_mention,
+            decision.breakthrough,
+            vip_sound,
             cx,
         );
-        if sender_is_vip {
-            let vip_sound = self.preferences.read(cx).settings().vip_sound;
-            self.play_sound(vip_sound, cx);
-        }
     }
 }
