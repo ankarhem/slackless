@@ -238,23 +238,25 @@ impl DownloadDestination {
     }
 }
 
-/// Shared download execution pipeline used by both [`download`] and [`download_as`]: streams
-/// `url` via `fetcher` into `destination` from the background executor, updates
-/// `DownloadRegistry`, notifies the user, and refreshes the window.
-async fn execute_download(
-    fetcher: Fetcher,
-    url: String,
+/// Shared download execution pipeline used by [`download`], [`download_as`] and
+/// `save_download`: from the background executor, `write` fills the file reserved for
+/// `destination` and resolves to its length; then the listed download `id` is updated in
+/// `DownloadRegistry`, the user notified, and the window refreshed.
+async fn execute_download<F>(
+    write: impl FnOnce(PathBuf) -> F + Send + 'static,
     id: Option<usize>,
     destination: DownloadDestination,
     cx: &mut AsyncWindowContext,
-) {
+) where
+    F: Future<Output = Result<u64, String>> + Send + 'static,
+{
     let fail_title = destination.failure_title();
     let saved = cx
         .background_executor()
         .spawn(async move {
             let res = match destination.reserve() {
                 Ok(path) => {
-                    let written = fetcher.download_to_path(url, path.clone()).await;
+                    let written = write(path.clone()).await;
                     destination.finish(path, written)
                 }
                 Err(e) => Err(e),
@@ -322,7 +324,8 @@ pub fn download(url: String, name: String, window: &mut Window, cx: &mut App) {
     let destination = DownloadDestination::DefaultFolder { dir, name };
     window
         .spawn(cx, async move |cx| {
-            execute_download(fetcher, url, Some(id), destination, cx).await;
+            let write = move |path| fetcher.download_to_path(url, path);
+            execute_download(write, Some(id), destination, cx).await;
         })
         .detach();
 }
@@ -358,14 +361,27 @@ pub fn download_as(url: String, name: String, window: &mut Window, cx: &mut App)
                     id
                 })
                 .ok();
-            execute_download(
-                fetcher,
-                url,
-                id,
-                DownloadDestination::ExplicitPath(dest),
-                cx,
-            )
-            .await;
+            let write = move |path| fetcher.download_to_path(url, path);
+            execute_download(write, id, DownloadDestination::ExplicitPath(dest), cx).await;
+        })
+        .detach();
+}
+
+/// Save `bytes` the app made itself (the canvas PDF) into ~/Downloads as `name` (`name (1).pdf`
+/// when that is taken), with the toast a finished download shows. It stays out of the in-app
+/// Downloads list, whose Retry fetches a URL again.
+#[cfg(target_os = "macos")]
+pub fn save_download(name: String, bytes: Vec<u8>, window: &mut Window, cx: &mut App) {
+    let dir = effective_download_dir(cx);
+    let destination = DownloadDestination::DefaultFolder { dir, name };
+    let write = move |path: PathBuf| async move {
+        std::fs::write(&path, &bytes)
+            .map(|()| bytes.len() as u64)
+            .map_err(|e| e.to_string())
+    };
+    window
+        .spawn(cx, async move |cx| {
+            execute_download(write, None, destination, cx).await;
         })
         .detach();
 }

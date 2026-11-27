@@ -16,6 +16,8 @@ pub use audio_player::{
     stop_audio, toggle_audio, toggle_audio_mute,
 };
 pub(crate) use downloads::active_fetcher;
+#[cfg(target_os = "macos")]
+pub use downloads::save_download;
 pub use downloads::{
     DownloadStatus, clear_finished_downloads, download, download_as, downloads, enable_downloads,
     fetch, open_local_file, reveal_in_finder, set_ask_download_location, set_download_dir,

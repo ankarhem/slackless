@@ -29,6 +29,8 @@ use crate::canvas::blocks::{
 };
 use crate::canvas::comments::{render_comments_drawer, sample_comment_threads};
 use crate::canvas::editor::{CanvasEditorCtx, render_canvas_editor};
+#[cfg(target_os = "macos")]
+use crate::canvas::export::download_canvas_pdf;
 use crate::canvas::export::{canvas_print_allowed, trigger_canvas_print};
 use crate::canvas::format::{canvas_file_markdown, is_image_filename};
 use crate::canvas::keyboard::{
@@ -694,8 +696,8 @@ fn render_comments_toggle_btn(doc_ctx: &CanvasDocCtx<'_>) -> impl IntoElement {
         })
 }
 
-/// Header overflow menu (`...`): Print / Save as PDF…, Export Markdown, Delete canvas
-/// (`F-COLLAB-158`, `F-COLLAB-182..184`).
+/// Header overflow menu (`...`): Download PDF (macOS), Print canvas, Export Markdown, Delete
+/// canvas (`F-COLLAB-158`, `F-COLLAB-182..184`).
 fn render_overflow_menu_btn(doc_ctx: &CanvasDocCtx<'_>) -> impl IntoElement {
     let key = doc_ctx.key;
     let print_allowed = canvas_print_allowed(doc_ctx.actions.meta.as_ref());
@@ -715,21 +717,29 @@ fn render_overflow_menu_btn(doc_ctx: &CanvasDocCtx<'_>) -> impl IntoElement {
             "Canvas actions (Printing disabled by workspace admin)"
         })
         .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+            // The workspace's print policy covers the PDF too (`F-COLLAB-184`).
+            let policy = if print_allowed {
+                ""
+            } else {
+                " (disabled by workspace admin)"
+            };
+            #[cfg(target_os = "macos")]
+            {
+                let d_pdf = doc_print.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(format!("Download PDF{policy}"))
+                        .icon(IconName::Download)
+                        .disabled(!print_allowed)
+                        .on_click(move |_, window, cx| download_canvas_pdf(&d_pdf, window, cx)),
+                );
+            }
             let d_print = doc_print.clone();
             let print_cb = on_print.clone();
-            let print_label = if print_allowed {
-                "Print / Save as PDF…"
-            } else {
-                "Print / Save as PDF… (disabled by workspace admin)"
-            };
             menu = menu.item(
-                PopupMenuItem::new(print_label)
-                    .icon(IconName::FileText)
+                PopupMenuItem::new(format!("Print canvas{policy}"))
+                    .icon(IconName::Printer)
                     .disabled(!print_allowed)
                     .on_click(move |_, window, cx| {
-                        if !print_allowed {
-                            return;
-                        }
                         if let Some(cb) = &print_cb {
                             cb(d_print.clone(), window, cx);
                         } else {

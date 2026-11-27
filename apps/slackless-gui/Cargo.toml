@@ -41,6 +41,12 @@ libc = "0.2"
 # Already in Cargo.lock via gpui-pre; used for zero-copy CVPixelBuffer -> window.paint_surface.
 objc2-core-foundation = "0.3.2"
 objc2-core-video = "0.3.2"
+# The canvas PDF: WebKit lays the export page out in an offscreen web view and draws it
+# (canvas/export/webkit.rs). Already in Cargo.lock via slackless-auth's sign-in window.
+objc2 = "0.6.5"
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData", "NSError", "NSGeometry", "NSString", "objc2-core-foundation"] }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKNavigation", "WKNavigationDelegate", "WKPDFConfiguration", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore"] }
 
 [dev-dependencies]
 # Headless window tests: drag selection and link clicks over rendered message text. The

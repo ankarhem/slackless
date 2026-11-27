@@ -1,11 +1,16 @@
-//! Canvas Print export helpers and print-availability policy guard (`F-COLLAB-182`,
+//! Canvas Print and PDF export helpers and print-availability policy guard (`F-COLLAB-182`,
 //! `F-COLLAB-184`).
+
+#[cfg(target_os = "macos")]
+mod webkit;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
+#[cfg(target_os = "macos")]
+use gpui_kit::gpui::{App, Window};
 use slackless_core::api::CanvasMeta;
 
 use crate::canvas::mentions::{CanvasInlineSegment, parse_inline_canvas_segments};
@@ -373,6 +378,45 @@ pub fn canvas_export_stem(title: &str) -> String {
     }
 }
 
+/// The page "Print canvas" opens in the browser: the export page, plus a script that brings up
+/// the print panel once it has loaded.
+fn print_page_html(doc: &CanvasDoc) -> String {
+    canvas_to_printable_html(doc).replace(
+        "</body>",
+        "<script>window.addEventListener('load',function(){window.print();});</script>\n</body>",
+    )
+}
+
+/// The PDF's file name: the title as shown (emoji resolved), without the `/` and `:` a macOS file
+/// name cannot show or a leading dot that would hide the file.
+#[cfg(target_os = "macos")]
+fn canvas_pdf_name(title: &str) -> String {
+    let title = resolve_canvas_emoji(title).replace(['/', ':'], "-");
+    let title = title.trim().trim_start_matches('.').trim_start();
+    // A file name holds 255 bytes; this leaves room for " (12).pdf".
+    let title = title[..title.floor_char_boundary(200)].trim_end();
+    let title = if title.is_empty() { "Canvas" } else { title };
+    format!("{title}.pdf")
+}
+
+/// Save `doc` as a PDF in the download folder (`F-COLLAB-182`): WebKit draws the export page off
+/// screen, and the file is named, numbered and announced like a download.
+#[cfg(target_os = "macos")]
+pub(super) fn download_canvas_pdf(doc: &CanvasDoc, window: &mut Window, cx: &mut App) {
+    let html = canvas_to_printable_html(doc);
+    let name = canvas_pdf_name(&doc.title);
+    window
+        .spawn(cx, async move |cx| {
+            let pdf = webkit::render_pdf(&html).await;
+            cx.update(|window, cx| match pdf {
+                Ok(pdf) => crate::media::save_download(name, pdf, window, cx),
+                Err(err) => crate::actions::notify("Download failed", err, window, cx),
+            })
+            .ok();
+        })
+        .detach();
+}
+
 /// Write printable HTML for `doc` to `path` (pure filesystem helper, safe to test on temp dirs).
 #[cfg(test)]
 pub fn write_printable_html(doc: &CanvasDoc, path: &Path) -> std::io::Result<()> {
@@ -399,10 +443,7 @@ pub fn trigger_canvas_print(doc: &CanvasDoc) -> Result<PathBuf, String> {
     {
         let stem = canvas_export_stem(&doc.title);
         let path = next_temp_html_path("slackless-print", &stem);
-        let html = canvas_to_printable_html(doc).replace(
-            "</body>",
-            "<script>window.addEventListener('load',function(){window.print();});</script>\n</body>",
-        );
+        let html = print_page_html(doc);
         let path_bg = path.clone();
         std::thread::Builder::new()
             .name("canvas-print".into())
@@ -434,6 +475,33 @@ pub fn trigger_canvas_print(doc: &CanvasDoc) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_print_page_brings_up_the_print_panel() {
+        let doc =
+            CanvasDoc::from_markdown("Plan".into(), "Live canvas".into(), "# Overview\n\nBody");
+        // WebKit draws the PDF from the export page as it is.
+        assert!(!canvas_to_printable_html(&doc).contains("window.print()"));
+        assert!(print_page_html(&doc).contains("window.print()"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn canvas_pdfs_are_named_after_their_title() {
+        for (title, name) in [
+            ("Q4 Launch / Plan: Draft", "Q4 Launch - Plan- Draft.pdf"),
+            ("Möte om Q4 :rocket:", "Möte om Q4 🚀.pdf"),
+            ("  .hidden notes ", "hidden notes.pdf"),
+            ("", "Canvas.pdf"),
+        ] {
+            assert_eq!(canvas_pdf_name(title), name, "{title:?}");
+        }
+        // A long title is cut between characters, well within a file name's 255 bytes.
+        assert_eq!(
+            canvas_pdf_name(&":rocket:".repeat(100)),
+            format!("{}.pdf", "🚀".repeat(50))
+        );
+    }
 
     #[test]
     fn stale_pruning_keeps_the_newest_print_files_and_everything_else() {
