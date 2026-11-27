@@ -6,6 +6,7 @@
 //! Persisted schema, GPUI global caches, media probes, standalone window hosting, and per-section
 //! renderers live in focused submodules and are re-exported here.
 
+mod download;
 mod prefs_globals;
 mod probes;
 mod sections;

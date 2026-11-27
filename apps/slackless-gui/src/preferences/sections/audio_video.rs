@@ -437,6 +437,7 @@ impl Preferences {
         provider: slackless_core::huddle::TranscriptionProvider,
         cx: &mut Context<Self>,
     ) {
+        use crate::preferences::download::{ModelProgress, ModelUpdate, spawn_model_download};
         if self.stt_downloading.is_some() || !provider.is_local() {
             return;
         }
@@ -444,74 +445,40 @@ impl Preferences {
         self.stt_download_status = Some("Connecting to Hugging Face…".to_owned());
         cx.notify();
 
-        let progress_note: std::sync::Arc<std::sync::Mutex<Option<String>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
-        let done_result: std::sync::Arc<
-            std::sync::Mutex<Option<Result<std::path::PathBuf, String>>>,
-        > = std::sync::Arc::new(std::sync::Mutex::new(None));
-
-        let prog_writer = std::sync::Arc::clone(&progress_note);
-        let done_writer = std::sync::Arc::clone(&done_result);
-        std::thread::Builder::new()
-            .name("slackless-stt-download".to_owned())
-            .spawn(move || {
-                let res = slackless_core::huddle::download_provider_model(provider, move |p| {
-                    let pct = p
-                        .total_bytes
-                        .filter(|&t| t > 0)
-                        .map(|t| format!(" · {}%", (p.downloaded_bytes * 100 / t).min(100)))
-                        .unwrap_or_default();
-                    let line = format!(
-                        "[{}/{}] {} ({}{})",
-                        p.file_index,
-                        p.file_count,
-                        p.file_name,
-                        format_bytes(p.downloaded_bytes),
-                        pct
-                    );
-                    if let Ok(mut guard) = prog_writer.lock() {
-                        *guard = Some(line);
-                    }
-                });
-                if let Ok(mut guard) = done_writer.lock() {
-                    *guard = Some(res);
-                }
-            })
-            .ok();
-
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(180))
-                    .await;
-                let latest_prog = progress_note.lock().ok().and_then(|g| g.clone());
-                let finished = done_result.lock().ok().and_then(|mut g| g.take());
-                let keep = this
-                    .update(cx, |prefs, cx| {
-                        if let Some(res) = finished {
-                            prefs.stt_downloading = None;
-                            prefs.stt_download_status = match res {
-                                Ok(_) => None,
-                                Err(err) => Some(format!("Download failed: {err}")),
-                            };
-                            cx.notify();
-                            return false;
-                        }
-                        if let Some(line) = latest_prog
-                            && prefs.stt_download_status.as_deref() != Some(line.as_str())
-                        {
-                            prefs.stt_download_status = Some(line);
-                            cx.notify();
-                        }
-                        prefs.stt_downloading.is_some()
+        let started = spawn_model_download(
+            "slackless-stt-download",
+            move |progress| {
+                slackless_core::huddle::download_provider_model(provider, move |p| {
+                    progress(ModelProgress {
+                        file_name: p.file_name,
+                        file_index: p.file_index,
+                        file_count: p.file_count,
+                        downloaded_bytes: p.downloaded_bytes,
+                        total_bytes: p.total_bytes,
                     })
-                    .unwrap_or(false);
-                if !keep {
-                    break;
+                })
+            },
+            cx,
+            |prefs, update, _cx| match update {
+                ModelUpdate::Progress(line) => {
+                    if prefs.stt_download_status.as_deref() != Some(line.as_str()) {
+                        prefs.stt_download_status = Some(line);
+                    }
                 }
-            }
-        })
-        .detach();
+                ModelUpdate::Done(res) => {
+                    prefs.stt_downloading = None;
+                    prefs.stt_download_status = match res {
+                        Ok(_) => None,
+                        Err(err) => Some(format!("Download failed: {err}")),
+                    };
+                }
+            },
+        );
+        if let Err(err) = started {
+            self.stt_downloading = None;
+            self.stt_download_status = Some(format!("Failed to start download thread: {err}"));
+            cx.notify();
+        }
     }
 
     fn audio_video_camera(&mut self, cx: &mut Context<Self>) -> Div {

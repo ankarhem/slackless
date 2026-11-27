@@ -9837,6 +9837,7 @@ name = "slackless-gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "emojis",
  "futures",
  "gpui-kit",

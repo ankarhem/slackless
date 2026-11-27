@@ -516,6 +516,7 @@ impl Preferences {
     }
 
     fn start_semantic_model_download(&mut self, cx: &mut Context<Self>) {
+        use crate::preferences::download::{ModelProgress, ModelUpdate, spawn_model_download};
         if self.semantic_downloading {
             return;
         }
@@ -529,87 +530,42 @@ impl Preferences {
         self.semantic_status_note = Some("Connecting to Hugging Face…".to_owned());
         cx.notify();
 
-        let progress_note: std::sync::Arc<std::sync::Mutex<Option<String>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
-        let done_result: std::sync::Arc<
-            std::sync::Mutex<Option<Result<std::path::PathBuf, String>>>,
-        > = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let prog_writer = std::sync::Arc::clone(&progress_note);
-        let done_writer = std::sync::Arc::clone(&done_result);
-
-        if let Err(err) = std::thread::Builder::new()
-            .name("slackless-prefs-embed-dl".to_owned())
-            .spawn(move || {
+        if let Err(err) = spawn_model_download(
+            "slackless-prefs-embed-dl",
+            move |progress| {
                 let _guard = task_guard;
-                let res = slackless_core::embeddings::download_embedding_model(model, move |p| {
-                    let pct = p
-                        .total_bytes
-                        .filter(|&t| t > 0)
-                        .map(|t| format!(" · {}%", (p.downloaded_bytes * 100 / t).min(100)))
-                        .unwrap_or_default();
-                    let line = format!(
-                        "[{}/{}] {} ({}{})",
-                        p.file_index,
-                        p.file_count,
-                        p.file_name,
-                        format_bytes(p.downloaded_bytes),
-                        pct
-                    );
-                    if let Ok(mut g) = prog_writer.lock() {
-                        *g = Some(line);
-                    }
-                });
-                if let Ok(mut g) = done_writer.lock() {
-                    *g = Some(res);
+                slackless_core::embeddings::download_embedding_model(model, move |p| {
+                    progress(ModelProgress {
+                        file_name: p.file_name,
+                        file_index: p.file_index,
+                        file_count: p.file_count,
+                        downloaded_bytes: p.downloaded_bytes,
+                        total_bytes: p.total_bytes,
+                    })
+                })
+            },
+            cx,
+            |prefs, update, cx| match update {
+                ModelUpdate::Progress(line) => {
+                    prefs.semantic_status_note = Some(line);
                 }
-            })
-        {
+                ModelUpdate::Done(res) => {
+                    prefs.semantic_downloading = false;
+                    prefs.semantic_status_note = Some(match res {
+                        Ok(_) => {
+                            "Model downloaded. Click 'Index archive' to build semantic_index.sqlite."
+                                .to_owned()
+                        }
+                        Err(err) => format!("Download failed: {err}"),
+                    });
+                    prefs.refresh_semantic_snapshot(cx);
+                }
+            },
+        ) {
             self.semantic_downloading = false;
             self.semantic_status_note = Some(format!("Failed to start download thread: {err}"));
             cx.notify();
-            return;
         }
-
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(180))
-                    .await;
-                let latest = progress_note.lock().ok().and_then(|g| g.clone());
-                let finished = done_result.lock().ok().and_then(|mut g| g.take());
-                let keep = this
-                    .update(cx, |prefs, cx| {
-                        if let Some(line) = latest {
-                            prefs.semantic_status_note = Some(line);
-                        }
-                        if let Some(res) = finished {
-                            prefs.semantic_downloading = false;
-                            match res {
-                                Ok(_) => {
-                                    prefs.semantic_status_note = Some(
-                                        "Model downloaded. Click 'Index archive' to build semantic_index.sqlite.".to_owned(),
-                                    );
-                                }
-                                Err(err) => {
-                                    prefs.semantic_status_note =
-                                        Some(format!("Download failed: {err}"));
-                                }
-                            }
-                            prefs.refresh_semantic_snapshot(cx);
-                            cx.notify();
-                            false
-                        } else {
-                            cx.notify();
-                            true
-                        }
-                    })
-                    .unwrap_or(false);
-                if !keep {
-                    break;
-                }
-            }
-        })
-        .detach();
     }
 
     fn start_semantic_archive_index(&mut self, cx: &mut Context<Self>) {
