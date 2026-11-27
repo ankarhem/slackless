@@ -861,11 +861,12 @@ fn triple_click_is_bounded_inside_inline_code_and_fenced_code_blocks(cx: &mut Te
             let _ = window.draw(cx);
         });
 
-        // Double-click inside multi-word inline code selects only that word.
+        // Double-click inside multi-word inline code selects only the word under it: the whole
+        // dotted identifier, as UAX #29 (and Slack) read it, still inside the pill.
         let word_ix = inline_line.find("customerType").unwrap() + 2;
         let at = press_at(inline_line, word_ix, 2, cx);
         release_at(at, 2, cx);
-        assert_eq!(selected_text(cx), "customerType");
+        assert_eq!(selected_text(cx), "order.customerType");
 
         // Triple-click inside inline code selects ONLY the inline code span, not the whole line.
         let at = press_at(inline_line, word_ix, 3, cx);

@@ -9857,6 +9857,7 @@ dependencies = [
  "slackless-platform",
  "smallvec",
  "tracing",
+ "unicode-segmentation",
 ]
 
 [[package]]

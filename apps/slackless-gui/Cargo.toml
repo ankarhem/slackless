@@ -21,6 +21,8 @@ raw-window-handle = "0.6"
 smallvec = "1"
 # Bare `http(s)://` autolinking in message text.
 linkify = "0.12"
+# Double-click word selection in every script (UAX #29 word boundaries).
+unicode-segmentation = "1.13"
 # Word-level diffs between message revisions (revision history dialog).
 similar = "2"
 # Named (IANA) time zones for the display clock's manual time zone preference.

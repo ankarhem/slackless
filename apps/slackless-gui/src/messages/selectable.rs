@@ -19,6 +19,7 @@ use gpui_kit::gpui::{
 use super::render::RunTheme;
 use super::{APP_ICON, APP_ICON_SLOT, LinkHandler, LinkTarget, route_link};
 use crate::hover_card::{self, Trigger};
+use unicode_segmentation::UnicodeSegmentation as _;
 
 /// One paragraph of message-body text that participates in the window text selection: a
 /// [`StyledText`] with styled runs whose link ranges stay clickable (see
@@ -519,8 +520,8 @@ impl SelectableParagraph {
     }
 }
 
-/// Word range around `offset`, strictly clamped to `bounds` so double-clicking inside an
-/// inline code span never bleeds into adjacent prose.
+/// Word range around `offset` (UAX #29 word boundaries, every script), strictly clamped to
+/// `bounds` so double-clicking inside an inline code span never bleeds into adjacent prose.
 fn word_range_bounded(text: &str, bounds: Range<usize>, offset: usize) -> Option<Range<usize>> {
     if bounds.is_empty() || bounds.end > text.len() {
         return None;
@@ -534,46 +535,10 @@ fn word_range_bounded(text: &str, bounds: Range<usize>, offset: usize) -> Option
             rel -= 1;
         }
     }
-    let ch = slice[rel..].chars().next()?;
-    let classify = |c: char| -> u8 {
-        if c == '_'
-            || c.is_ascii_alphanumeric()
-            || matches!(
-                c,
-                '\u{00C0}'..='\u{024F}'
-                    | '\u{0400}'..='\u{04FF}'
-                    | '\u{1E00}'..='\u{1EFF}'
-                    | '\u{0300}'..='\u{036F}'
-            )
-        {
-            1 // Word
-        } else if matches!(c, '\n' | '\r') {
-            2 // Newline
-        } else if c.is_whitespace() {
-            3 // Whitespace
-        } else {
-            4 // Other
-        }
-    };
-    let kind = classify(ch);
-    let connects = |next: char| matches!((kind, classify(next)), (1, 1) | (3, 3));
-    let mut start = rel;
-    for prev in slice[..rel].chars().rev().take(128) {
-        if connects(prev) {
-            start -= prev.len_utf8();
-        } else {
-            break;
-        }
-    }
-    let mut end = rel + ch.len_utf8();
-    for next in slice[end..].chars().take(128) {
-        if connects(next) {
-            end += next.len_utf8();
-        } else {
-            break;
-        }
-    }
-    Some((bounds.start + start)..(bounds.start + end))
+    slice
+        .split_word_bound_indices()
+        .find(|(start, word)| *start <= rel && rel < start + word.len())
+        .map(|(start, word)| bounds.start + start..bounds.start + start + word.len())
 }
 
 impl Element for SelectableParagraph {
@@ -758,5 +723,32 @@ impl Element for SelectableParagraph {
         if !self.links.is_empty() {
             self.paint_links(global_id, &layout, hitbox, window);
         }
+    }
+}
+
+#[cfg(test)]
+mod word_bounds_tests {
+    use super::word_range_bounded;
+
+    /// Double-clicking a word selects it whatever script it is written in, and stays inside
+    /// the inline-code pill it was clamped to.
+    #[test]
+    fn word_range_selects_whole_words_in_every_script() {
+        for (text, at, expected) in [
+            ("έλα μού εδώ", 7, "μού"),
+            ("שלום עולם", 9, "עולם"),
+            ("مرحبا بالعالم", 11, "بالعالم"),
+            ("hello_world x", 3, "hello_world"),
+            ("x y.z w", 3, "y.z"),
+            ("a  b", 2, "  "),
+        ] {
+            let range = word_range_bounded(text, 0..text.len(), at).expect("a word");
+            assert_eq!(
+                &text[range], expected,
+                "double-click at byte {at} of {text:?}"
+            );
+        }
+        let clamped = word_range_bounded("x μόρο y", 2..11, 6).expect("a word");
+        assert_eq!(&"x μόρο y"[clamped], "μόρο");
     }
 }
