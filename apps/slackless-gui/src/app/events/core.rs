@@ -758,7 +758,7 @@ impl App {
                         raw,
                         &crate::emoji::display_glyph,
                     )),
-                    Err(err) => Err(err.clone()),
+                    Err(err) => Err(slackless_core::api::format_canvas_error(err)),
                 };
                 if was_loaded && parsed.is_ok() {
                     self.ws

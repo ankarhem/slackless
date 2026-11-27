@@ -13,7 +13,7 @@ use gpui_kit::gpui::{
     App, AppContext as _, Div, FontWeight, InteractiveElement as _, ParentElement as _,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use slackless_core::api::{CanvasCommentReply, CanvasCommentThread, format_canvas_error};
+use slackless_core::api::{CanvasCommentReply, CanvasCommentThread};
 use slackless_core::types::{Ts, UserId};
 
 use crate::canvas::keyboard::CanvasFocusRegion;
@@ -210,7 +210,7 @@ pub(super) fn render_comments_drawer(
             .bg(fg.opacity(0.12))
             .text_xs()
             .text_color(theme.foreground)
-            .child(format_canvas_error(msg))
+            .child(msg.clone())
     });
 
     let mut body = v_flex()

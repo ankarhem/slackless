@@ -51,10 +51,7 @@ pub use model::{CanvasDoc, CanvasEmbedKind, CanvasUserProfile, MediaKind};
 pub use render::{canvas_view, live_canvas_view, read_only_badge, render_popout_canvas};
 pub use share::{CanvasAccessDeleteFn, CanvasAccessSetFn, CanvasDeleteFn, ShareAccessRequest};
 #[cfg(test)]
-pub use share::{
-    build_share_access_request, canvas_server_rule_notice, general_access_summary,
-    parse_share_targets,
-};
+pub use share::{build_share_access_request, general_access_summary, parse_share_targets};
 
 /// Callback invoked when the user clicks "Open in browser" to edit a live canvas.
 pub type OpenBrowserFn = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -182,7 +179,7 @@ pub struct CanvasActions {
     pub on_print_canvas: Option<CanvasExportFn>,
     /// Reload this canvas from Slack (`F-COLLAB-185`).
     pub on_refresh_canvas: Option<OpenBrowserFn>,
-    /// Optional inline `(is_error, message)` status/error banner (surfaced via `format_canvas_error`).
+    /// Optional inline `(is_error, message)` status banner; the message is already user-facing.
     pub status_banner: Option<(bool, String)>,
     /// Optional unobtrusive "Canvas updated" notice (`F-COLLAB-185`).
     pub updated_note: Option<String>,

@@ -19,7 +19,7 @@ use gpui_kit::gpui::{
     IntoElement, KeyDownEvent, ParentElement as _, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use slackless_core::api::{CanvasEditOp, format_canvas_error};
+use slackless_core::api::CanvasEditOp;
 use slackless_core::types::UserId;
 
 use crate::canvas::blocks::{
@@ -161,7 +161,7 @@ fn render_error_state(err: &str, open_browser: Option<OpenBrowserFn>, cx: &App) 
             div()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(format_canvas_error(err)),
+                .child(err.to_owned()),
         )
         .when_some(open_browser, |col, open| {
             col.child(
@@ -909,7 +909,7 @@ fn render_updated_banner(doc_ctx: &CanvasDocCtx<'_>, cx: &App) -> Option<Div> {
     )
 }
 
-/// Surface server-enforced canvas errors inline when neither drawer is open
+/// Surface canvas errors, already user-facing, inline when neither drawer is open
 /// (`F-COLLAB-120`, `F-COLLAB-171..174`, `F-COLLAB-204`).
 fn render_status_banner(doc_ctx: &CanvasDocCtx<'_>, cx: &App) -> Option<Div> {
     if doc_ctx.ui.share_open || doc_ctx.ui.comments_open {
@@ -935,7 +935,7 @@ fn render_status_banner(doc_ctx: &CanvasDocCtx<'_>, cx: &App) -> Option<Div> {
             .bg(fg.opacity(0.1))
             .text_xs()
             .child(Icon::new(icon).size(px(14.)).text_color(fg))
-            .child(format_canvas_error(msg)),
+            .child(msg.clone()),
     )
 }
 

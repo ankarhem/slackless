@@ -11,7 +11,7 @@ use gpui_kit::gpui::{
     App, ClipboardItem, Div, FontWeight, InteractiveElement as _, ParentElement as _, SharedString,
     Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use slackless_core::api::{CanvasAccessLevel, CanvasMeta, format_canvas_error};
+use slackless_core::api::{CanvasAccessLevel, CanvasMeta};
 use slackless_core::types::{ChannelId, UserId};
 
 use crate::canvas::{CanvasActions, CanvasUiState, mutate_ui};
@@ -28,12 +28,6 @@ pub type CanvasAccessSetFn = Rc<dyn Fn(ShareAccessRequest, &mut Window, &mut App
 pub type CanvasAccessDeleteFn = Rc<dyn Fn(Vec<ChannelId>, Vec<UserId>, &mut Window, &mut App)>;
 /// Callback invoked when deleting a canvas permanently (`Command::DeleteCanvas`, `F-COLLAB-158`).
 pub type CanvasDeleteFn = Rc<dyn Fn(&mut Window, &mut App)>;
-
-/// Translate Slack server-enforced canvas errors into clear user-facing guidance
-/// (`F-COLLAB-120`, `F-COLLAB-171..174`, `F-COLLAB-204`).
-pub fn canvas_server_rule_notice(err: &str) -> String {
-    format_canvas_error(err)
-}
 
 /// Render the docked Share & Access Management panel (`F-COLLAB-160..174`).
 pub(super) fn render_share_panel(
@@ -84,7 +78,7 @@ pub(super) fn render_share_panel(
                 .text_xs()
                 .text_color(theme.foreground)
                 .child(Icon::new(icon).size(px(14.)).text_color(fg))
-                .child(div().flex_1().child(canvas_server_rule_notice(msg)))
+                .child(div().flex_1().child(msg.clone()))
         });
 
     let access_level_btn = |id_tag: &str, label: &str, level: CanvasAccessLevel| {

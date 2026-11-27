@@ -27,12 +27,12 @@ use crate::canvas::{
     CanvasOpenChannelFn, CanvasOpenEmbedFn, CanvasOpenMediaFn, CanvasOpenProfileFn,
     CanvasUploadCompleteFn, CanvasUploadFileFn, CanvasUserLookupFn, CanvasUserProfile, MediaKind,
     OpenBrowserFn, ShareAccessRequest, UploadedCanvasFile, activate_focused_block,
-    build_share_access_request, canvas_export_stem, canvas_print_allowed,
-    canvas_server_rule_notice, canvas_to_printable_html, canvas_view, comment_thread_counts,
-    cycle_canvas_focus_region, cycle_region, filter_comment_threads, general_access_summary,
-    live_canvas_view, parse_inline_canvas_segments, parse_share_targets, resolve_profile_card,
-    section_delete_op, section_insert_after_op, section_replace_op, step_block,
-    toggle_section_actions_shortcut, trigger_canvas_print, write_printable_html,
+    build_share_access_request, canvas_export_stem, canvas_print_allowed, canvas_to_printable_html,
+    canvas_view, comment_thread_counts, cycle_canvas_focus_region, cycle_region,
+    filter_comment_threads, general_access_summary, live_canvas_view, parse_inline_canvas_segments,
+    parse_share_targets, resolve_profile_card, section_delete_op, section_insert_after_op,
+    section_replace_op, step_block, toggle_section_actions_shortcut, trigger_canvas_print,
+    write_printable_html,
 };
 
 /// Parse a Canvas HTML export the way the canvas loader does, with the GUI's emoji catalog.
@@ -1236,14 +1236,6 @@ fn share_access_request_builder_general_access_and_server_rule_notices() {
     };
     let (badge_w, _) = general_access_summary(Some(&meta_write), None, false);
     assert_eq!(badge_w, "Workspace can edit");
-
-    assert!(
-        canvas_server_rule_notice("free_teams_cannot_create_standalone_canvases")
-            .contains("Free Slack workspaces")
-    );
-    assert!(canvas_server_rule_notice("canvas_printing_disabled").contains("Printing"));
-    assert!(canvas_server_rule_notice("cant_delete_file").contains("deleted"));
-    assert!(canvas_server_rule_notice("restricted_action").contains("permission"));
 }
 
 #[test]
