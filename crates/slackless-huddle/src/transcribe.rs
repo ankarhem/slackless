@@ -68,6 +68,7 @@ impl TranscriptionProvider {
         }
     }
 
+    #[cfg(test)]
     pub const fn to_index(self) -> usize {
         match self {
             Self::SlackBuiltIn => 0,
@@ -733,6 +734,7 @@ pub fn parse_whisper_json_cues(
 }
 
 /// Parse `whisper-cli -oj` or `whisper-server` JSON output into `(detected_language, cleaned_text)`.
+#[cfg(test)]
 pub fn parse_whisper_json(raw: &str) -> Option<(Option<String>, String)> {
     parse_whisper_json_cues(raw, 0.0, 0.0).map(|(lang, text, _)| (lang, text))
 }

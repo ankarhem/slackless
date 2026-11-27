@@ -510,6 +510,7 @@ pub fn build_content_subscribe_frame(
 
 /// Build the audio-only Chime `SUBSCRIBE` frame (note: `duplex = RX` describes video direction
 /// even while sending audio, and `framerate = 15` is expected by Chime's SFU on audio too).
+#[cfg(test)]
 pub fn build_audio_subscribe_frame(
     creds: &HuddleCredentials,
     sdp_offer: &str,
