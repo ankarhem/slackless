@@ -90,16 +90,14 @@ pub fn proxy_url() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-pub(crate) fn record_net_log(
+fn push_net_log_entry(
+    buf: &mut VecDeque<NetLogEntry>,
     method: &str,
     url: &Url,
     status: Option<u16>,
     elapsed: Duration,
     error: Option<String>,
 ) {
-    if !NET_LOG_ENABLED.load(Ordering::Relaxed) {
-        return;
-    }
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -111,11 +109,24 @@ pub(crate) fn record_net_log(
         elapsed_ms: elapsed.as_millis() as u64,
         error,
     };
+    if buf.len() >= MAX_NET_LOG_ENTRIES {
+        buf.pop_front();
+    }
+    buf.push_back(entry);
+}
+
+pub(crate) fn record_net_log(
+    method: &str,
+    url: &Url,
+    status: Option<u16>,
+    elapsed: Duration,
+    error: Option<String>,
+) {
+    if !NET_LOG_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     if let Ok(mut g) = NET_LOG.get_or_init(|| Mutex::new(VecDeque::new())).lock() {
-        if g.len() >= MAX_NET_LOG_ENTRIES {
-            g.pop_front();
-        }
-        g.push_back(entry);
+        push_net_log_entry(&mut g, method, url, status, elapsed, error);
     }
 }
 
@@ -707,27 +718,31 @@ mod tests {
 
     #[test]
     fn net_log_redacts_query_strings_and_caps_entries() {
-        static TEST_GUARD: Mutex<()> = Mutex::new(());
-        let _lock = TEST_GUARD.lock().unwrap();
-
-        clear_net_log();
-        set_net_log_enabled(true);
-        assert!(net_log_enabled());
-
+        // Test URL redaction and exact FIFO ring-buffer eviction on a local buffer so parallel
+        // HTTP tests (`assets::tests`) cannot race with global `NET_LOG` and flake CI.
+        let mut local = VecDeque::new();
         let url =
             Url::parse("https://acme.slack.com/api/auth.test?token=xoxc-secret#frag").unwrap();
-        record_net_log("POST", &url, Some(200), Duration::from_millis(12), None);
-        let snap = net_log_snapshot();
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].url, "https://acme.slack.com/api/auth.test");
-        assert_eq!(snap[0].status, Some(200));
-        assert!(!net_log_export_json().contains("xoxc-secret"));
+        push_net_log_entry(
+            &mut local,
+            "POST",
+            &url,
+            Some(200),
+            Duration::from_millis(12),
+            None,
+        );
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].url, "https://acme.slack.com/api/auth.test");
+        assert_eq!(local[0].status, Some(200));
+        let json = serde_json::to_string_pretty(&local).unwrap();
+        assert!(!json.contains("xoxc-secret"));
 
         // Pushing more than MAX_NET_LOG_ENTRIES (500) evicts oldest entries first.
-        clear_net_log();
+        local.clear();
         for i in 0..(MAX_NET_LOG_ENTRIES + 25) {
             let entry_url = Url::parse(&format!("https://acme.slack.com/api/m{i}")).unwrap();
-            record_net_log(
+            push_net_log_entry(
+                &mut local,
                 "POST",
                 &entry_url,
                 Some(200),
@@ -735,14 +750,27 @@ mod tests {
                 None,
             );
         }
-        let capped = net_log_snapshot();
-        assert_eq!(capped.len(), MAX_NET_LOG_ENTRIES);
-        assert_eq!(capped[0].url, "https://acme.slack.com/api/m25");
+        assert_eq!(local.len(), MAX_NET_LOG_ENTRIES);
+        assert_eq!(local[0].url, "https://acme.slack.com/api/m25");
         assert_eq!(
-            capped.last().unwrap().url,
+            local.back().unwrap().url,
             format!("https://acme.slack.com/api/m{}", MAX_NET_LOG_ENTRIES + 24)
         );
 
+        // Also smoke-test the global toggle/snapshot/export/clear surface without assuming zero
+        // concurrent HTTP calls from sibling tests.
+        static TEST_GUARD: Mutex<()> = Mutex::new(());
+        let _lock = TEST_GUARD.lock().unwrap();
+        clear_net_log();
+        set_net_log_enabled(true);
+        assert!(net_log_enabled());
+        record_net_log("POST", &url, Some(200), Duration::from_millis(12), None);
+        let snap = net_log_snapshot();
+        assert!(
+            snap.iter()
+                .any(|e| e.url == "https://acme.slack.com/api/auth.test" && e.status == Some(200))
+        );
+        assert!(!net_log_export_json().contains("xoxc-secret"));
         set_net_log_enabled(false);
         assert!(!net_log_enabled());
         clear_net_log();
