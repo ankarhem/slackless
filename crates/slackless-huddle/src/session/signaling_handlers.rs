@@ -37,6 +37,23 @@ pub(super) async fn handle_signal_frame<R: RtcController, S: SignalSink, M: Medi
     signal: &mut S,
     state: &mut SessionRuntime<'_, M>,
 ) -> Option<LoopExit> {
+    // Check server error BEFORE `Type::Leave` / `frame.leave` because Chime often pairs an
+    // `SdkErrorFrame` (4xx fatal or 5xx transient) with `Type::Leave`.
+    if let Some(err) = frame.error {
+        let status = err.status.unwrap_or(500);
+        let protocol_err = HuddleError::Protocol {
+            status,
+            description: err.description.unwrap_or_default(),
+        };
+        return Some(if (400..500).contains(&status) {
+            LoopExit::Fatal(protocol_err)
+        } else {
+            LoopExit::Reconnect {
+                err: protocol_err,
+                was_connected: true,
+            }
+        });
+    }
     if frame.r#type == Some(sdk_signal_frame::Type::Leave as i32) || frame.leave.is_some() {
         tracing::info!("received server-initiated Chime LEAVE; ending huddle cleanly");
         return Some(LoopExit::LeftCleanly);
@@ -165,21 +182,6 @@ pub(super) async fn handle_signal_frame<R: RtcController, S: SignalSink, M: Medi
         state
             .remote_speakers
             .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    }
-    if let Some(err) = frame.error {
-        let status = err.status.unwrap_or(500);
-        let protocol_err = HuddleError::Protocol {
-            status,
-            description: err.description.unwrap_or_default(),
-        };
-        return Some(if (400..500).contains(&status) {
-            LoopExit::Fatal(protocol_err)
-        } else {
-            LoopExit::Reconnect {
-                err: protocol_err,
-                was_connected: true,
-            }
-        });
     }
     None
 }

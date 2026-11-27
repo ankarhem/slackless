@@ -623,3 +623,41 @@ fn video_clip_recorder_pipeline_captures_locks_dims_muxes_mp4_and_handles_errors
     cancel_rec.cancel();
     assert!(cancel_stopped.load(Ordering::Relaxed));
 }
+
+#[test]
+fn letterbox_rgb_centers_smaller_frame_and_mp4_duration_matches_audio_without_drift() {
+    // 1. Letterboxing a 2x2 white square into a 6x4 canvas centers it with black borders.
+    let src = vec![255u8; 2 * 2 * 3];
+    let padded = super::video::letterbox_rgb(&src, 2, 2, 6, 4);
+    assert_eq!(padded.len(), 6 * 4 * 3);
+    // Top-left corner (0,0) is black, interior (2,1) is white.
+    assert_eq!(&padded[0..3], &[0, 0, 0]);
+    let white_off = (6 + 2) * 3;
+    assert_eq!(&padded[white_off..white_off + 3], &[255, 255, 255]);
+
+    // 2. Duration-accurate MP4 muxing: 3500 frames over 300s (~11.67 fps) with matching 300s
+    //    audio must align mvhd duration with the real 300s wall-clock duration instead of
+    //    truncating to integer 11 fps or drifting A/V.
+    let (_sps, _pps, base) = synthetic_h264_frames();
+    let frames: Vec<Vec<u8>> = (0..35).map(|i| base[i % base.len()].clone()).collect();
+    // 3s clip (3000 ms) with 35 video frames (~11.67 fps) + 141 AAC frames (~3.008s @ 48kHz).
+    let audio = AacAudioTrack {
+        sample_rate: 48_000,
+        channels: 1,
+        audio_specific_config: [0x11, 0x88],
+        frames: vec![vec![0xAA, 0xBB]; 141],
+    };
+    let mp4 = super::mp4::mux_h264_aac_mp4_with_duration(320, 240, 3_000, &frames, Some(&audio))
+        .expect("duration-based mux must succeed");
+    let top = parse_mp4_boxes(&mp4);
+    let moov_kids = parse_mp4_boxes(top[2].payload);
+    let mvhd = find_box(&moov_kids, b"mvhd").payload;
+    // mvhd v0: FullBox(4) + creation(4) + mod(4) + timescale(4) + duration(4).
+    let mvhd_timescale = read_u32_be(mvhd, 12);
+    let mvhd_duration = read_u32_be(mvhd, 16);
+    assert_eq!(mvhd_timescale, 90_000);
+    // Audio duration is 141 * 1024 / 48000 * 90000 = 270_720 ticks (~3.008s).
+    // Video duration is 35 * round(270_000 / 35) = 35 * 7714 = 269_990 ticks (~2.9999s).
+    // mvhd must take max(video, audio) so players never cut off trailing audio!
+    assert_eq!(mvhd_duration, 270_720);
+}

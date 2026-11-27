@@ -1113,6 +1113,8 @@ mod state_machine {
             sig.sent.last().and_then(|f| f.r#type),
             Some(sdk_signal_frame::Type::Subscribe as i32)
         );
+        // Simulate server SUBSCRIBE_ACK for step 1's camera SUBSCRIBE before step 3's INDEX.
+        rt.subscribe_in_flight = None;
 
         handle_control(
             Some(HuddleControl::SetScreenShare {
@@ -1779,6 +1781,7 @@ mod state_machine {
         assert!(!rt.muted_peers.contains(&UserId::from("U0DAVE")));
 
         // 6. INDEX bitrate-only change skips renegotiation, then empty INDEX unsubscribes.
+        rt.subscribe_in_flight = None;
         let one_peer_idx = SdkSignalFrame {
             index: Some(SdkIndexFrame {
                 sources: vec![SdkStreamDescriptor {
@@ -2096,6 +2099,125 @@ mod state_machine {
 
         let _ = kf_rx.try_recv();
         assert_eq!(perf.sample(1.0, 0, 0).rx_seq_gaps, 4);
+    }
+
+    #[tokio::test]
+    async fn audio_only_replay_restores_remote_video_and_serializes_subscribe_renegotiation() {
+        let creds = test_creds();
+        let (upd_tx, _upd_rx) = mpsc::unbounded_channel();
+        let (mut rt, _bg_rx) = make_runtime(&creds, &upd_tx, FakeMedia::default());
+        let mut sig = FakeSignal::default();
+        let rtc = FakeRtc::default();
+        let mut snap = HuddleSessionSnapshot::default();
+        let mut cfg = HuddleAudioConfig::default();
+
+        // 1. Enable audio-only before an INDEX frame arrives: INDEX is cached in `last_index`
+        //    without triggering a SUBSCRIBE.
+        handle_control(
+            Some(HuddleControl::SetAudioOnly(true)),
+            &mut cfg,
+            &mut snap,
+            &rtc,
+            &mut sig,
+            &mut rt,
+        )
+        .await;
+        let idx_frame = SdkIndexFrame {
+            sources: vec![SdkStreamDescriptor {
+                stream_id: Some(7),
+                group_id: Some(7),
+                attendee_id: Some("att-peer".into()),
+                external_user_id: Some("U0PEER".into()),
+                max_bitrate_kbps: Some(600),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::session::signaling_handlers::apply_index_frame(
+            &idx_frame, &cfg, &snap, &rtc, &mut sig, &mut rt,
+        )
+        .await;
+        assert!(
+            sig.sent.is_empty(),
+            "audio_only must suppress video SUBSCRIBE"
+        );
+        assert!(rt.last_index.is_some());
+
+        // 2. Disabling audio-only replays `last_index` and immediately sends a SUBSCRIBE.
+        handle_control(
+            Some(HuddleControl::SetAudioOnly(false)),
+            &mut cfg,
+            &mut snap,
+            &rtc,
+            &mut sig,
+            &mut rt,
+        )
+        .await;
+        assert_eq!(
+            sig.sent.len(),
+            1,
+            "disabling audio_only must replay cached INDEX and SUBSCRIBE"
+        );
+        assert!(rt.subscribe_in_flight.is_some());
+
+        // 3. A second INDEX arriving while SUBSCRIBE is in-flight queues `pending_resubscribe`
+        //    rather than sending overlapping SUBSCRIBE offers.
+        let idx_frame2 = SdkIndexFrame {
+            sources: vec![
+                SdkStreamDescriptor {
+                    stream_id: Some(7),
+                    group_id: Some(7),
+                    attendee_id: Some("att-peer".into()),
+                    external_user_id: Some("U0PEER".into()),
+                    max_bitrate_kbps: Some(600),
+                    ..Default::default()
+                },
+                SdkStreamDescriptor {
+                    stream_id: Some(8),
+                    group_id: Some(8),
+                    attendee_id: Some("att-peer2".into()),
+                    external_user_id: Some("U0PEER2".into()),
+                    max_bitrate_kbps: Some(600),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        crate::session::signaling_handlers::apply_index_frame(
+            &idx_frame2,
+            &cfg,
+            &snap,
+            &rtc,
+            &mut sig,
+            &mut rt,
+        )
+        .await;
+        assert_eq!(
+            sig.sent.len(),
+            1,
+            "overlapping SUBSCRIBE must wait for SUBSCRIBE_ACK"
+        );
+        assert!(rt.pending_resubscribe);
+
+        // 4. SUBSCRIBE_ACK clears `subscribe_in_flight` and flushes the queued resubscribe.
+        let ack_frame = SdkSignalFrame {
+            r#type: Some(sdk_signal_frame::Type::SubscribeAck as i32),
+            suback: Some(SdkSubscribeAckFrame {
+                sdp_answer: Some("v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let exit =
+            handle_signal_frame(ack_frame, &mut cfg, &mut snap, &rtc, &mut sig, &mut rt).await;
+        assert!(exit.is_none());
+        assert_eq!(
+            sig.sent.len(),
+            2,
+            "pending_resubscribe must flush right after SUBSCRIBE_ACK"
+        );
+        assert!(rt.subscribe_in_flight.is_some());
+        assert!(!rt.pending_resubscribe);
     }
 }
 
@@ -3567,5 +3689,155 @@ mod handshake_and_connected_loop_tests {
             exit,
             LoopExit::Fatal(HuddleError::Protocol { status: 410, .. })
         ));
+
+        // Case I: Server-initiated LEAVE (no error) -> LoopExit::LeftCleanly (no reconnect loop!).
+        let (mut factory, sig_tx, _) = MockFactory::ok_default();
+        factory.rtc_initial_state = RTCPeerConnectionState::Connected;
+        sig_tx
+            .send(Ok(Some(SdkSignalFrame {
+                r#type: Some(sdk_signal_frame::Type::Leave as i32),
+                leave: Some(crate::proto::SdkLeaveFrame::default()),
+                ..Default::default()
+            })))
+            .unwrap();
+        let (_ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+        let (upd_tx, _upd_rx) = mpsc::unbounded_channel();
+        let mut cfg = HuddleAudioConfig::default();
+        let mut snap = HuddleSessionSnapshot::default();
+        let mut pending = VecDeque::new();
+        let exit = run_connected_loop_with(
+            &mut factory,
+            &creds(),
+            &mut cfg,
+            &mut snap,
+            &mut ctrl_rx,
+            &mut pending,
+            &upd_tx,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(exit, LoopExit::LeftCleanly),
+            "server-initiated LEAVE must exit cleanly instead of reconnecting"
+        );
+
+        // Case J: Transient 5xx SdkErrorFrame after connect -> LoopExit::Reconnect { was_connected: true }.
+        let (mut factory, sig_tx, _) = MockFactory::ok_default();
+        factory.rtc_initial_state = RTCPeerConnectionState::Connected;
+        sig_tx
+            .send(Ok(Some(SdkSignalFrame {
+                r#type: Some(sdk_signal_frame::Type::Leave as i32),
+                error: Some(crate::proto::SdkErrorFrame {
+                    status: Some(503),
+                    description: Some("sfu restart".into()),
+                }),
+                ..Default::default()
+            })))
+            .unwrap();
+        let (_ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+        let (upd_tx, _upd_rx) = mpsc::unbounded_channel();
+        let mut cfg = HuddleAudioConfig::default();
+        let mut snap = HuddleSessionSnapshot::default();
+        let mut pending = VecDeque::new();
+        let exit = run_connected_loop_with(
+            &mut factory,
+            &creds(),
+            &mut cfg,
+            &mut snap,
+            &mut ctrl_rx,
+            &mut pending,
+            &upd_tx,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(
+                exit,
+                LoopExit::Reconnect {
+                    err: HuddleError::Protocol { status: 503, .. },
+                    was_connected: true
+                }
+            ),
+            "5xx server error after connect must trigger Reconnect, got {exit:?}"
+        );
+
+        // Case K: HuddleControl::Leave cancels handshake immediately while audio startup is slow.
+        let (mut factory, _sig_tx, log) = MockFactory::ok_default();
+        factory.audio_script = AudioStartScript::DelayedOk(Duration::from_secs(5));
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+        let (upd_tx, _upd_rx) = mpsc::unbounded_channel();
+        let c = creds();
+        let task = tokio::spawn(async move {
+            let mut cfg = HuddleAudioConfig::default();
+            let mut snap = HuddleSessionSnapshot::default();
+            let mut pending = VecDeque::new();
+            run_connected_loop_with(
+                &mut factory,
+                &c,
+                &mut cfg,
+                &mut snap,
+                &mut ctrl_rx,
+                &mut pending,
+                &upd_tx,
+                false,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        ctrl_tx.send(HuddleControl::Leave).unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("Leave must cancel in-flight handshake promptly")
+            .unwrap();
+        assert!(matches!(exit, LoopExit::LeftCleanly));
+        // Advance virtual time so the detached audio startup completes and AudioStartGuard stops it.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(log.audio_stop_count.load(Ordering::SeqCst), 1);
+
+        // Case L: Kick notification peer message targeting self exits LeftCleanly.
+        let (mut factory, sig_tx, _) = MockFactory::ok_default();
+        factory.rtc_initial_state = RTCPeerConnectionState::Connected;
+        let kick_bytes =
+            crate::peer_message::encode_peer_message(&crate::peer_proto::PeerMessage {
+                kick_notification: Some(crate::peer_proto::peer_message::KickNotification {
+                    kicked_user_id: Some(creds().attendee_id),
+                }),
+                ..Default::default()
+            });
+        sig_tx
+            .send(Ok(Some(SdkSignalFrame {
+                r#type: Some(sdk_signal_frame::Type::DataMessage as i32),
+                data_message: Some(crate::proto::SdkDataMessageFrame {
+                    messages: vec![crate::proto::SdkDataMessagePayload {
+                        topic: Some(crate::peer_message::SLACK_DATA_CHANNEL_TOPIC.into()),
+                        data: Some(kick_bytes),
+                        sender_attendee_id: Some("att-host".into()),
+                        sender_external_user_id: Some("U0HOST".into()),
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            })))
+            .unwrap();
+        let (_ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+        let (upd_tx, _upd_rx) = mpsc::unbounded_channel();
+        let mut cfg = HuddleAudioConfig::default();
+        let mut snap = HuddleSessionSnapshot::default();
+        let mut pending = VecDeque::new();
+        let exit = run_connected_loop_with(
+            &mut factory,
+            &creds(),
+            &mut cfg,
+            &mut snap,
+            &mut ctrl_rx,
+            &mut pending,
+            &upd_tx,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(exit, LoopExit::LeftCleanly),
+            "kick_notification targeting self must exit cleanly"
+        );
     }
 }

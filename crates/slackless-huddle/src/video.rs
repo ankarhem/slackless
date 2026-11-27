@@ -1691,4 +1691,46 @@ mod tests {
         assert!(!needs_kf);
         assert_eq!(rx.len(), 0);
     }
+
+    #[test]
+    fn h264_decoder_recovers_after_lost_marker_and_caps_buffer_and_resize_guards_short_input() {
+        let (w, h) = (96usize, 64usize);
+        let annex_b = encode_test_keyframe(w, h, 30, 140, 200);
+        let nals = split_annex_b_nals(&annex_b);
+        assert!(nals.len() >= 3);
+
+        // 1. Simulate a lost RTP marker causing a sequence gap (`broken = true`), followed
+        //    immediately by clean SPS/PPS/IDR packets: must recover without discarding the IDR.
+        let mut dec = H264VideoDecoder::new().unwrap();
+        // Start an incomplete FU-A fragment (marker=false), then skip seq numbers so broken=true.
+        assert!(
+            dec.push_rtp_packet(1, &[0x60 | 28, 0x80 | 1, 0xAA, 0xBB], false)
+                .is_none()
+        );
+        // Clean SPS arrives after a sequence gap (seq 10) -> clears `broken` immediately.
+        let mut decoded = None;
+        for (i, nal) in nals.iter().enumerate() {
+            let seq = 10u16 + i as u16;
+            let marker = i + 1 == nals.len();
+            let out = dec.push_rtp_packet(seq, nal, marker);
+            if marker {
+                decoded = out;
+            }
+        }
+        let frame = decoded.expect("clean SPS/PPS/IDR after lost marker must recover immediately");
+        assert_eq!((frame.width, frame.height), (w as u32, h as u32));
+
+        // 2. Oversized Annex-B accumulation exceeding MAX_ANNEX_B_BYTES resets cleanly without OOM.
+        let mut dec_cap = H264VideoDecoder::new().unwrap();
+        let big_chunk = vec![0x41u8; 1024 * 1024];
+        for seq in 0u16..10 {
+            assert!(dec_cap.push_rtp_packet(seq, &big_chunk, false).is_none());
+        }
+        assert!(dec_cap.annex_b_buf.len() <= 8 * 1024 * 1024);
+
+        // 3. `resize_rgb_even` rejects short buffers even on the passthrough branch (w <= max_w).
+        let (out, rw, rh) = resize_rgb_even(&[0u8; 4], 16, 16, 64, 64);
+        assert!(out.is_empty());
+        assert_eq!((rw, rh), (0, 0));
+    }
 }

@@ -185,3 +185,62 @@ pub(in crate::methods) struct CallsInfoWire {
     #[serde(default, deserialize_with = "null_default")]
     pub(in crate::methods) call: CallInfo,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rooms_join_and_calls_info_tolerate_explicit_json_nulls() {
+        let join_json = r#"{
+            "call": {
+                "call_id": null,
+                "free_willy": {
+                    "attendee": {
+                        "AttendeeId": null,
+                        "ExternalUserId": null,
+                        "JoinToken": null,
+                        "Capabilities": { "Audio": null, "Video": null, "Content": null }
+                    },
+                    "meeting": {
+                        "MeetingId": null,
+                        "ExternalMeetingId": null,
+                        "MediaRegion": null,
+                        "MeetingArn": null,
+                        "MediaPlacement": {
+                            "SignalingUrl": null,
+                            "AudioHostUrl": null,
+                            "AudioFallbackUrl": null,
+                            "TurnControlUrl": null,
+                            "ScreenSharingUrl": null,
+                            "ScreenViewingUrl": null,
+                            "ScreenDataUrl": null,
+                            "EventIngestionUrl": null
+                        }
+                    }
+                },
+                "huddle": null,
+                "canvas": null
+            }
+        }"#;
+        let parsed: RoomsJoinWire =
+            serde_json::from_str(join_json).expect("rooms.join must tolerate explicit nulls");
+        let call = parsed.call.expect("call present");
+        assert!(call.call_id.is_empty());
+        assert!(call.free_willy.is_some());
+
+        let call_info_json = r#"{
+            "call": {
+                "id": null,
+                "title": null,
+                "users": null,
+                "channels": null
+            }
+        }"#;
+        let info: CallsInfoWire =
+            serde_json::from_str(call_info_json).expect("calls.info must tolerate explicit nulls");
+        assert!(info.call.id.is_empty());
+        assert!(info.call.users.is_empty());
+        assert!(info.call.channels.is_empty());
+    }
+}

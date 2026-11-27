@@ -1175,4 +1175,30 @@ mod tests {
         let payload = vec![0x00u8; 261];
         let _ = frames.push(1, true, &payload);
     }
+
+    #[test]
+    fn av1_frames_rejects_mid_obu_join_and_enforces_unit_size_cap() {
+        // 1. Mid-OBU join (`Z=1` when `partial` is empty) must be rejected cleanly instead of
+        //    emitting corrupt trailing bytes as a new OBU header.
+        let mut f = Av1Frames::default();
+        assert!(
+            f.push(1, true, &make_rtp_packet(true, false, &[b"orphan-tail"]))
+                .is_none()
+        );
+        // Subsequent clean frame starting at seq 2 decodes normally.
+        let obu = make_obu(6, b"clean");
+        let unit = f
+            .push(2, true, &make_rtp_packet(false, false, &[&obu]))
+            .expect("clean frame after rejected mid-OBU join must decode");
+        assert_eq!(unit, vec![(6 << 3) | 0b10, 5, b'c', b'l', b'e', b'a', b'n']);
+
+        // 2. Oversized fragmented OBU exceeding MAX_AV1_UNIT_BYTES resets cleanly without OOM.
+        let mut f_cap = Av1Frames::default();
+        let big = vec![0x30u8; 1024 * 1024];
+        for seq in 0u16..10 {
+            let pkt = make_rtp_packet(seq > 0, true, &[&big]);
+            assert!(f_cap.push(seq, false, &pkt).is_none());
+        }
+        assert!(f_cap.partial.len() + f_cap.unit.len() <= 8 * 1024 * 1024);
+    }
 }
