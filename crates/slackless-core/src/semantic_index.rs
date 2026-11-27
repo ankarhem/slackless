@@ -421,7 +421,7 @@ pub fn index_disk_archives_paced(
         if !path.is_file() {
             continue;
         }
-        let store = crate::search::open_archive_ro(path)
+        let store = Store::open_for_reading(path)
             .map_err(|e| format!("failed to open archive {}: {e}", path.display()))?;
         let mut inner_workspaces = store.list_workspaces().unwrap_or_default();
         if inner_workspaces.is_empty() {
@@ -584,7 +584,7 @@ pub fn hybrid_search_disk_archives(
         if !path.is_file() {
             continue;
         }
-        let store = crate::search::open_archive_ro(path)
+        let store = Store::open_for_reading(path)
             .map_err(|e| format!("failed to open archive {}: {e}", path.display()))?;
         let mut inner_ws = store.list_workspaces().unwrap_or_default();
         if inner_ws.is_empty() {
@@ -795,7 +795,7 @@ pub fn hybrid_search_huddle_transcripts_in_disk_archives(
         };
         if !store_cache.contains_key(hit.workspace.as_str())
             && let Some(path) = path_by_ws.get(hit.workspace.as_str())
-            && let Ok(s) = crate::search::open_archive_ro(path)
+            && let Ok(s) = Store::open_for_reading(path)
         {
             store_cache.insert(hit.workspace.as_str().to_owned(), s);
         }

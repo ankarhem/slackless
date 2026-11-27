@@ -15,7 +15,7 @@ use crate::client::read_store;
 use crate::domain::mrkdwn::mrkdwn_to_plain;
 use crate::export::user_display_map;
 use crate::notify::{NotifyLevel, notify_levels};
-use crate::search::{open_archive_ro, truncate_chars};
+use crate::search::truncate_chars;
 use crate::store::{Result as StoreResult, Store, StoredMessage};
 use crate::types::{
     ChannelId, Conversation, ConversationKind, FileId, MessageSubtype, TeamId, Ts, UserId,
@@ -342,7 +342,7 @@ pub fn build_catchup_disk_archives(
         if !path.is_file() {
             continue;
         }
-        let store = open_archive_ro(path)?;
+        let store = Store::open_for_reading(path)?;
         let mut inner_workspaces = store.list_workspaces()?;
         if inner_workspaces.is_empty() {
             inner_workspaces.push(ws.clone());

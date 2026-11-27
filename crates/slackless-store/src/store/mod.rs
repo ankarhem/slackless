@@ -191,6 +191,13 @@ impl Store {
         Self::init(conn)
     }
 
+    /// Opens an existing archive for reading: read-only when possible, read-write otherwise (a
+    /// WAL database whose `-shm` file is missing cannot be opened read-only).
+    pub fn open_for_reading(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        Self::open_read_only(path).or_else(|_| Self::open(path))
+    }
+
     /// Opens a read-only WAL connection to an existing database at `path`, allowing UI reads to
     /// run concurrently with background write transactions without waiting on the writer mutex.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {

@@ -118,14 +118,6 @@ pub fn discover_local_archives() -> Vec<(TeamId, PathBuf)> {
     discover_disk_archives(&dir)
 }
 
-/// Open an existing SQLite archive read-only (falling back once to RW if WAL lacks its shm file).
-pub(crate) fn open_archive_ro(path: &Path) -> StoreResult<Store> {
-    match Store::open_read_only(path) {
-        Ok(store) => Ok(store),
-        Err(_) => Store::open(path),
-    }
-}
-
 /// Search across all workspaces present inside a single [`Store`], returning unified attributed hits.
 pub fn search_single_store_all_workspaces(
     store: &Store,
@@ -267,7 +259,7 @@ pub fn search_disk_archives(
         if !path.is_file() {
             continue;
         }
-        let store = open_archive_ro(path)?;
+        let store = Store::open_for_reading(path)?;
         // A single SQLite file may hold one workspace (`ws`) or multiple workspaces.
         let mut workspaces = store.list_workspaces()?;
         if workspaces.is_empty() {
@@ -388,7 +380,7 @@ pub fn search_huddle_transcripts_in_disk_archives(
         if !path.is_file() {
             continue;
         }
-        let Ok(store) = open_archive_ro(path) else {
+        let Ok(store) = Store::open_for_reading(path) else {
             continue;
         };
         let mut workspaces = store.list_workspaces().unwrap_or_default();
