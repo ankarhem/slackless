@@ -22,6 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -198,7 +199,7 @@ pub type CallRefreshHandler = std::rc::Rc<dyn Fn(String, &mut App)>;
 
 /// What one message's blocks render with.
 pub struct KitCx<'a> {
-    pub fixtures: &'a Fixtures,
+    pub fixtures: &'a Arc<Fixtures>,
     /// Interactive state; `None` renders controls from the payload's initial values only.
     pub kit: Option<&'a Entity<BlockKitState>>,
     pub ts: &'a Ts,
@@ -227,7 +228,11 @@ pub struct KitCx<'a> {
 }
 
 impl<'a> KitCx<'a> {
-    pub fn new(fixtures: &'a Fixtures, kit: Option<&'a Entity<BlockKitState>>, ts: &'a Ts) -> Self {
+    pub fn new(
+        fixtures: &'a Arc<Fixtures>,
+        kit: Option<&'a Entity<BlockKitState>>,
+        ts: &'a Ts,
+    ) -> Self {
         Self {
             fixtures,
             kit,
@@ -286,7 +291,7 @@ impl<'a> KitCx<'a> {
     /// link routing and the selection order continuing after the parent's own text.
     pub fn nested<'b>(
         &self,
-        fixtures: &'b Fixtures,
+        fixtures: &'b Arc<Fixtures>,
         kit: Option<&'b Entity<BlockKitState>>,
         ts: &'b Ts,
     ) -> KitCx<'b> {
@@ -524,8 +529,7 @@ fn text_object(object: &Json, kcx: &KitCx, muted: bool, cx: &App) -> Option<AnyE
     if object["type"].as_str() == Some("mrkdwn") {
         let verbatim = object["verbatim"].as_bool().unwrap_or(false);
         return Some(
-            messages::mrkdwn_with_verbatim(text, kcx, muted, false, verbatim, cx)
-                .into_any_element(),
+            messages::mrkdwn_with_verbatim(text, kcx, muted, verbatim, cx).into_any_element(),
         );
     }
     Some(div().child(plain_label(text, cx)).into_any_element())
@@ -609,7 +613,7 @@ pub fn block(kind: &str, raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Option
             "markdown" => {
                 let text = raw["text"].as_str()?;
                 let converted = standard_markdown_to_mrkdwn(text);
-                messages::mrkdwn(&converted, kcx, false, false, cx).into_any_element()
+                messages::mrkdwn(&converted, kcx, false, cx).into_any_element()
             }
             "video" => video_block(raw, ix, kcx, cx).into_any_element(),
             "call" => call_block(raw, ix, kcx, cx).into_any_element(),

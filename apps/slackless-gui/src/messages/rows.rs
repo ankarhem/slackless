@@ -667,7 +667,7 @@ pub(crate) fn author_name_with(
 /// identically. Cards without a link handler stay plain (not selectable, links open as
 /// URLs).
 pub fn message_row(
-    fixtures: &Fixtures,
+    fixtures: &Arc<Fixtures>,
     message: &Message,
     handler: Option<&actions::ActionHandler>,
     cx: &App,
@@ -681,7 +681,7 @@ pub fn message_row(
 /// `grouped` (the row's hover group) the card continues the previous message's: no avatar or
 /// name, its time showing in the gutter on hover, as in Slack.
 pub fn message_row_linked(
-    fixtures: &Fixtures,
+    fixtures: &Arc<Fixtures>,
     message: &Message,
     handler: Option<&actions::ActionHandler>,
     links: Option<&LinkHandler>,

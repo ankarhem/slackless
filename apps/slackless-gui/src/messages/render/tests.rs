@@ -1,6 +1,44 @@
+use std::rc::Rc;
+use std::sync::Arc;
+
 use slackless_core::domain::mrkdwn::PlainDirectory;
 
-use super::plain_text;
+use super::{body::memoized_mrkdwn, plain_text};
+
+/// Block Kit text objects re-render every frame: their mrkdwn is modeled once per text (and
+/// `verbatim`), and modeled again once the text, the workspace data or the emoji preference
+/// changes (names and custom emoji resolve through both).
+#[test]
+fn block_kit_mrkdwn_is_modeled_once_per_text() {
+    let fixtures = Arc::new(crate::fixtures::load());
+    let text = "*hey* <@U0BOB> :rocket:";
+    let first = memoized_mrkdwn(text, false, &fixtures, false);
+    let again = memoized_mrkdwn(text, false, &fixtures, false);
+    assert!(Rc::ptr_eq(&first, &again), "the same text reuses its model");
+    assert!(
+        !Rc::ptr_eq(
+            &first,
+            &memoized_mrkdwn("*hey* <@U0CARA>", false, &fixtures, false)
+        ),
+        "changed text is modeled again"
+    );
+    assert!(
+        !Rc::ptr_eq(&first, &memoized_mrkdwn(text, true, &fixtures, false)),
+        "a verbatim text object is modeled again"
+    );
+    assert!(
+        !Rc::ptr_eq(&first, &memoized_mrkdwn(text, false, &fixtures, true)),
+        "the emoji preference re-models"
+    );
+    let other_workspace = Arc::new(crate::fixtures::load());
+    assert!(
+        !Rc::ptr_eq(
+            &first,
+            &memoized_mrkdwn(text, false, &other_workspace, false)
+        ),
+        "new workspace data re-models"
+    );
+}
 
 /// The clipboard / notification / list-preview text: references as the transcript names them,
 /// formatting and link syntax dropped, standard emoji as glyphs, custom emoji as `:name:`.

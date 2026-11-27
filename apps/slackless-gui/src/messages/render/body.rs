@@ -457,6 +457,66 @@ impl BodyModel {
     }
 }
 
+thread_local! {
+    /// The Block Kit text modeled this session, by text and `verbatim`, against the
+    /// workspace data and emoji preference the memo holds; a full memo starts over.
+    static MRKDWN: RefCell<Option<MrkdwnMemo>> = const { RefCell::new(None) };
+}
+
+struct MrkdwnMemo {
+    fixtures: Arc<Fixtures>,
+    emoji_text: bool,
+    /// Modeled blocks by text, one table per `verbatim` value.
+    blocks: [HashMap<String, Rc<Vec<MrkdwnBlock>>>; 2],
+}
+
+/// Texts kept per `verbatim` value before the memo starts over.
+const MRKDWN_MEMO_CAP: usize = 512;
+
+/// Block Kit text objects (sections, contexts, attachment text) re-render every frame: their
+/// mrkdwn is modeled once per text (and `verbatim`) while the workspace data and the emoji
+/// preference hold, the way [`BodyCache`] models a message body once.
+pub(in crate::messages) fn memoized_mrkdwn(
+    text: &str,
+    verbatim: bool,
+    fixtures: &Arc<Fixtures>,
+    emoji_text: bool,
+) -> Rc<Vec<MrkdwnBlock>> {
+    MRKDWN.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        // Names and custom emoji resolve through the workspace data and the preference.
+        let stale = memo.as_ref().is_some_and(|known| {
+            !known.fixtures.shares_data(fixtures) || known.emoji_text != emoji_text
+        });
+        if stale {
+            *memo = None;
+        }
+        let known = memo.get_or_insert_with(|| MrkdwnMemo {
+            fixtures: fixtures.clone(),
+            emoji_text,
+            blocks: Default::default(),
+        });
+        let texts = &mut known.blocks[usize::from(verbatim)];
+        if let Some(blocks) = texts.get(text) {
+            return blocks.clone();
+        }
+        let blocks = Rc::new(mrkdwn_blocks(
+            text,
+            fixtures,
+            TextOpts {
+                emoji_text,
+                verbatim,
+            },
+            false,
+        ));
+        if texts.len() >= MRKDWN_MEMO_CAP {
+            texts.clear();
+        }
+        texts.insert(text.to_owned(), blocks.clone());
+        blocks
+    })
+}
+
 /// Bodies modeled so far, by message allocation: a hit is the same `Rc<Message>` with the
 /// same edit, modeled against the same workspace data and emoji preference.
 #[derive(Default)]

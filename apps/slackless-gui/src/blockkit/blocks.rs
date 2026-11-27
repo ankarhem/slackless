@@ -641,7 +641,7 @@ pub(super) fn alert_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
             raw["message"]
                 .as_str()
                 .or_else(|| raw["text"].as_str())
-                .map(|s| messages::mrkdwn(s, kcx, false, false, cx).into_any_element())
+                .map(|s| messages::mrkdwn(s, kcx, false, cx).into_any_element())
         })
     {
         body = body.child(el);
@@ -923,7 +923,7 @@ pub(super) fn task_card_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> D
         if let Some(el) = text_object(field, kcx, false, cx).or_else(|| {
             field
                 .as_str()
-                .map(|s| messages::mrkdwn(s, kcx, false, false, cx).into_any_element())
+                .map(|s| messages::mrkdwn(s, kcx, false, cx).into_any_element())
         }) {
             card = card.child(div().pl(px(28.)).child(el));
         }

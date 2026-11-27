@@ -638,7 +638,7 @@ impl Render for UnreadsView {
         let groups = &self.groups;
         let collapsed = &self.collapsed;
         let (replying, open_thread, saved) = (&self.replying, &self.open_thread, &self.saved);
-        let fixtures: &Fixtures = &self.fixtures;
+        let fixtures = &self.fixtures;
         let focused = self.focused;
         let sort = self.sort;
         let this = cx.entity().downgrade();
@@ -778,7 +778,7 @@ impl Render for UnreadsView {
 }
 
 struct UnreadCardArgs<'a> {
-    fixtures: &'a Fixtures,
+    fixtures: &'a Arc<Fixtures>,
     ix: usize,
     group: &'a UnreadGroup,
     collapsed: bool,

@@ -15,7 +15,7 @@ use slackless_core::types::{Block, Message};
 
 use super::super::code_block::code_block;
 use super::body::{
-    BodyCache, BodyModel, BodyPart, Container, MrkdwnBlock, containers, mrkdwn_blocks,
+    BodyCache, BodyModel, BodyPart, Container, MrkdwnBlock, containers, memoized_mrkdwn,
 };
 use super::cards::render_huddle_thread_card;
 use super::inline::{RunTheme, jumbomoji_elements, render_segments};
@@ -284,9 +284,10 @@ pub(crate) fn render_block(
 /// `*bold*`, `_italic_`, `~strike~`, `` `code` ``, `<@user>` / `<#channel>` / `<!here>` chips,
 /// `<url|label>` links and `:emoji:` (custom emoji as images). `muted` renders plain runs in
 /// the muted color (Block Kit context blocks). Unknown markup stays literal. With a link
-/// handler (see [`KitCx`]) the text is selectable and its links route through it.
-pub(crate) fn mrkdwn(text: &str, kcx: &KitCx, muted: bool, edited: bool, cx: &App) -> Div {
-    mrkdwn_with_verbatim(text, kcx, muted, edited, false, cx)
+/// handler (see [`KitCx`]) the text is selectable and its links route through it. The text is
+/// modeled once per text (see [`memoized_mrkdwn`]), so a frame re-renders without parsing.
+pub(crate) fn mrkdwn(text: &str, kcx: &KitCx, muted: bool, cx: &App) -> Div {
+    mrkdwn_with_verbatim(text, kcx, muted, false, cx)
 }
 
 /// Render Slack `mrkdwn`, honoring Block Kit's `verbatim` flag (`F-COLLAB-758`): when `verbatim`
@@ -295,7 +296,6 @@ pub(crate) fn mrkdwn_with_verbatim(
     text: &str,
     kcx: &KitCx,
     muted: bool,
-    edited: bool,
     verbatim: bool,
     cx: &App,
 ) -> Div {
@@ -304,9 +304,11 @@ pub(crate) fn mrkdwn_with_verbatim(
     if muted {
         theme.foreground = theme.muted;
     }
-    let opts = TextOpts {
-        emoji_text: display_prefs(cx).emoji_text_mode,
+    let blocks = memoized_mrkdwn(
+        text,
         verbatim,
-    };
-    render_mrkdwn(&mrkdwn_blocks(text, kcx.fixtures, opts, edited), &theme)
+        kcx.fixtures,
+        display_prefs(cx).emoji_text_mode,
+    );
+    render_mrkdwn(&blocks, &theme)
 }

@@ -179,7 +179,7 @@ fn message_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> D
         attachment
             .text
             .as_deref()
-            .map(|text| messages::mrkdwn(text, &nested, false, false, cx))
+            .map(|text| messages::mrkdwn(text, &nested, false, cx))
             .map(IntoElement::into_any_element)
             .into_iter()
             .collect()
@@ -267,7 +267,7 @@ fn link_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div 
     let description = attachment
         .text
         .as_deref()
-        .map(|text| messages::mrkdwn(text, kcx, true, false, cx));
+        .map(|text| messages::mrkdwn(text, kcx, true, cx));
     let site = attachment.service_name.as_deref().map(|name| {
         h_flex()
             .gap_1()
@@ -502,7 +502,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         } else {
             text
         };
-        body = body.child(messages::mrkdwn(shown, kcx, false, false, cx));
+        body = body.child(messages::mrkdwn(shown, kcx, false, cx));
         if let Some(kit) = kcx.kit.filter(|_| long).cloned() {
             body = body.child(
                 div()
@@ -536,7 +536,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
                     )
                 })
                 .when_some(field.value.as_deref(), |cell, value| {
-                    cell.child(messages::mrkdwn(value, kcx, false, false, cx))
+                    cell.child(messages::mrkdwn(value, kcx, false, cx))
                 })
         };
         let mut row = h_flex().items_start().gap_4().child(cell(field));
@@ -583,7 +583,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
             .map(str::trim)
             .filter(|s| !s.is_empty())
     {
-        body = body.child(messages::mrkdwn(fallback, kcx, false, false, cx));
+        body = body.child(messages::mrkdwn(fallback, kcx, false, cx));
     }
     // Slack's footer line: the footer icon, then "<footer> | Yesterday at 9:25 AM", its
     // links shown as their labels.
@@ -633,7 +633,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         .gap_1()
         .min_w_0()
         .when_some(attachment.pretext.as_deref(), |card, pretext| {
-            card.child(messages::mrkdwn(pretext, kcx, false, false, cx))
+            card.child(messages::mrkdwn(pretext, kcx, false, cx))
         })
         .child(if has_bar {
             h_flex()

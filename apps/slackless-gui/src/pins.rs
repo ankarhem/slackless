@@ -7,6 +7,8 @@
 //! pins from the fixtures: its messages with files or at least two reactions (oldest first,
 //! at most four, else its first message).
 
+use std::sync::Arc;
+
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
@@ -54,7 +56,7 @@ pub fn pinned<'a>(fixtures: &'a Fixtures, channel: &ChannelId) -> Vec<&'a Messag
 /// The pinned-messages panel titled `label`: the pinned messages (oldest first) once
 /// loaded, else a loading or error line; `on_close` closes it.
 pub fn pins_panel(
-    fixtures: &Fixtures,
+    fixtures: &Arc<Fixtures>,
     pins: Option<&Loaded<Message>>,
     label: &str,
     on_close: impl Fn(&mut Window, &mut App) + 'static,
