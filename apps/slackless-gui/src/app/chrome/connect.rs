@@ -126,7 +126,7 @@ impl App {
             Some(conversation) if conversation.is_ext_shared => channel_details::external_orgs(
                 &channel_details::own_team(&self.fixtures),
                 self.member_ids(&self.channel, conversation),
-                &self.fixtures.users,
+                self.fixtures.people(),
                 &self.fixtures.teams,
             ),
             _ => Vec::new(),

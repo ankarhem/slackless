@@ -887,7 +887,7 @@ impl App {
                 .map(|t| t.name.clone())
                 .filter(|n| !n.trim().is_empty());
             let mut users = HashMap::new();
-            for u in &self.fixtures.users {
+            for u in self.fixtures.people() {
                 users.insert(u.id.clone(), self.fixtures.name_of(u).to_owned());
             }
             slackless_core::export::build_huddle_transcript_doc(
@@ -2575,7 +2575,7 @@ pub(in crate::app) fn build_fixture_channel_export(
     let ws = team.id.as_str().to_owned();
     let ws_name = Some(team.name.clone()).filter(|n| !n.trim().is_empty());
     let mut users = HashMap::new();
-    for u in &fixtures.users {
+    for u in fixtures.people() {
         users.insert(u.id.clone(), fixtures.name_of(u).to_owned());
     }
     let transcripts = &fixtures.file_transcripts;
@@ -2638,7 +2638,7 @@ pub(in crate::app) fn build_fixture_thread_export(
     let ws = team.id.as_str().to_owned();
     let ws_name = Some(team.name.clone()).filter(|n| !n.trim().is_empty());
     let mut users = HashMap::new();
-    for u in &fixtures.users {
+    for u in fixtures.people() {
         users.insert(u.id.clone(), fixtures.name_of(u).to_owned());
     }
     let transcripts = &fixtures.file_transcripts;

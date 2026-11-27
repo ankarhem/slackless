@@ -185,7 +185,7 @@ fn best<T>(mut found: Vec<(u8, &str, T)>) -> Vec<T> {
 }
 
 fn people(fixtures: &Fixtures, query: &str) -> Vec<Entry> {
-    let users = fixtures.users.iter().filter(|user| !user.deleted);
+    let users = fixtures.people().filter(|user| !user.deleted);
     let found = users
         .filter_map(|user| {
             let names = [
@@ -520,6 +520,20 @@ mod tests {
         // Non-prefix substring `"ere"` must NOT match broadcast `@here` (prefix-only `rank == 0`).
         let sub = people(&fixtures, "ere");
         assert!(sub.iter().all(|e| !matches!(e, Entry::Broadcast(_))));
+
+        // A deactivation that landed as a fresh record leaves the menu at once.
+        let deactivated = fixtures.with_users(vec![User {
+            id: UserId::from("U_HER"),
+            name: "herman".into(),
+            deleted: true,
+            ..Default::default()
+        }]);
+        let res = people(&deactivated, "her");
+        assert!(
+            res.iter()
+                .all(|e| !matches!(e, Entry::User(u) if u.as_str() == "U_HER")),
+            "a person deactivated since the snapshot must not be suggested"
+        );
 
         // Respects LIMIT = 8.
         for i in 0..12 {

@@ -25,7 +25,7 @@ fn orgs_count_members_per_team_with_own_first() {
     let members = ["U1", "U2", "UE1", "UE2", "UE3", "UU"]
         .map(UserId::from)
         .to_vec();
-    let users = vec![
+    let users = [
         user("U1", Some("T0ACME")),
         user("U2", Some("T0ACME")),
         user("UE1", Some("T0ZETA")),
@@ -39,7 +39,7 @@ fn orgs_count_members_per_team_with_own_first() {
         team("T0ACME", "Acme"),
     ];
 
-    let lines = orgs(&own, &members, &users, &teams);
+    let lines = orgs(&own, &members, users.iter(), &teams);
     let summary: Vec<(&str, u32)> = lines
         .iter()
         .map(|line| (line.team.name.as_str(), line.members))
@@ -55,7 +55,7 @@ fn orgs_count_members_per_team_with_own_first() {
 fn orgs_skip_bots_and_members_of_unknown_teams() {
     let own = TeamId::from("T0ACME");
     let members = ["U1", "UBOT", "UE1"].map(UserId::from).to_vec();
-    let users = vec![
+    let users = [
         user("U1", Some("T0ACME")),
         User {
             id: UserId::from("UBOT"),
@@ -66,7 +66,7 @@ fn orgs_skip_bots_and_members_of_unknown_teams() {
     ];
     let teams = vec![team("T0ACME", "Acme")];
 
-    let lines = orgs(&own, &members, &users, &teams);
+    let lines = orgs(&own, &members, users.iter(), &teams);
     assert_eq!(lines.len(), 1, "the bot never lists, T0GHOST has no record");
     assert_eq!((lines[0].team.name.as_str(), lines[0].members), ("Acme", 1));
 }
@@ -76,7 +76,7 @@ fn listed_members_keep_unknowns_and_drop_bots() {
     let members = ["U1", "UBOT", "UGONE", "UU", "USLACKBOT"]
         .map(UserId::from)
         .to_vec();
-    let users = vec![
+    let users = [
         user("U1", Some("T1")),
         User {
             id: UserId::from("UBOT"),
@@ -89,7 +89,7 @@ fn listed_members_keep_unknowns_and_drop_bots() {
             ..Default::default()
         },
     ];
-    let profiles = profiles_by_id(&users);
+    let profiles = profiles_by_id(users.iter());
     let listed: Vec<&UserId> = members
         .iter()
         .filter(|member| is_listed(member, &profiles))

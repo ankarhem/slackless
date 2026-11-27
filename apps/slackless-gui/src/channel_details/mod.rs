@@ -292,7 +292,7 @@ impl ChannelDetails {
         }
         let fixtures = Arc::clone(&self.fixtures);
         let own = own_team(&fixtures);
-        let profiles = profiles_by_id(&fixtures.users);
+        let profiles = profiles_by_id(fixtures.people());
         let now = now_secs();
         let mut rows: Vec<MemberRow> = self
             .members
@@ -323,7 +323,7 @@ impl ChannelDetails {
             .conversation(&self.channel)
             .is_some_and(|c| c.is_ext_shared || c.is_shared);
         self.orgs = if shared {
-            orgs(&own, &self.members, &fixtures.users, &fixtures.teams)
+            orgs(&own, &self.members, fixtures.people(), &fixtures.teams)
         } else {
             Vec::new()
         };

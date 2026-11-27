@@ -130,8 +130,10 @@ pub(crate) fn own_team(fixtures: &Fixtures) -> TeamId {
 
 /// Stored profiles by id, so member surfaces look each person up once instead of scanning
 /// the directory per member.
-pub(super) fn profiles_by_id(users: &[User]) -> HashMap<&UserId, &User> {
-    users.iter().map(|user| (&user.id, user)).collect()
+pub(super) fn profiles_by_id<'a>(
+    users: impl Iterator<Item = &'a User>,
+) -> HashMap<&'a UserId, &'a User> {
+    users.map(|user| (&user.id, user)).collect()
 }
 
 /// Whether Slack's member list shows `member`: everyone except the app/bot and deactivated
@@ -274,10 +276,10 @@ pub(super) fn filter_choices(fixtures: &Fixtures, rows: &[MemberRow]) -> Vec<Fil
 /// own organization carrying the members without one (own-workspace people need no lookup).
 /// The own organization comes first, the connected ones after it by name; an organization
 /// whose record has not been fetched yet is left out.
-pub(crate) fn orgs(
+pub(crate) fn orgs<'a>(
     own: &TeamId,
     members: &[UserId],
-    users: &[User],
+    users: impl Iterator<Item = &'a User>,
     teams: &[Team],
 ) -> Vec<OrgLine> {
     let profiles = profiles_by_id(users);
@@ -311,10 +313,10 @@ pub(crate) fn orgs(
 }
 
 /// The Slack Connect banner's lines: [`orgs`] minus the own organization.
-pub(crate) fn external_orgs(
+pub(crate) fn external_orgs<'a>(
     own: &TeamId,
     members: &[UserId],
-    users: &[User],
+    users: impl Iterator<Item = &'a User>,
     teams: &[Team],
 ) -> Vec<OrgLine> {
     orgs(own, members, users, teams)
