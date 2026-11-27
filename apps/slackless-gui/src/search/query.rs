@@ -135,6 +135,20 @@ impl SearchView {
         }
     }
 
+    /// Whether either free-text query or structured filter chips are active.
+    pub(super) fn has_active_query(&self) -> bool {
+        !self.query.trim().is_empty()
+            || !self.filters.in_channels.is_empty()
+            || !self.filters.exclude_channels.is_empty()
+            || !self.filters.from_users.is_empty()
+            || !self.filters.exclude_users.is_empty()
+            || !self.filters.has.is_empty()
+            || self.filters.includes_user.is_some()
+            || self.filters.before.is_some()
+            || self.filters.after.is_some()
+            || self.filters.threads_only
+    }
+
     pub(super) fn run_local(&mut self, cx: &mut Context<Self>) {
         self.local_gen = self.local_gen.wrapping_add(1);
         let generation = self.local_gen;
@@ -142,7 +156,7 @@ impl SearchView {
         self.transcript_results.clear();
         self.local_error = None;
         self.local_loading = false;
-        if self.query.is_empty() {
+        if !self.has_active_query() {
             return;
         }
         let mut parsed = SearchQuery::parse(&self.query);
@@ -171,6 +185,12 @@ impl SearchView {
         parsed.filters.has.extend(self.filters.has.iter().copied());
         if parsed.filters.includes_user.is_none() {
             parsed.filters.includes_user = self.filters.includes_user.clone();
+        }
+        if parsed.filters.before.is_none() {
+            parsed.filters.before = self.filters.before;
+        }
+        if parsed.filters.after.is_none() {
+            parsed.filters.after = self.filters.after;
         }
         parsed.filters.threads_only |= self.filters.threads_only;
         parsed.filters.include_deleted |= self.filters.include_deleted || self.include_deleted;
@@ -525,47 +545,99 @@ impl SearchView {
 
     /// Build the remote query string, appending any active filter-chip modifiers.
     pub(super) fn remote_query_string(&self) -> String {
-        let mut out = self.query.clone();
-        for ch in &self.filters.in_channels {
+        let is_slack_channel_id = |s: &str| {
+            s.len() >= 2
+                && matches!(s.as_bytes().first(), Some(b'C' | b'G' | b'D'))
+                && s.bytes()
+                    .skip(1)
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                && s.bytes().skip(1).any(|b| b.is_ascii_digit())
+        };
+        let is_slack_user_id = |s: &str| {
+            s.len() >= 2
+                && matches!(s.as_bytes().first(), Some(b'U' | b'W'))
+                && s.bytes()
+                    .skip(1)
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                && s.bytes().skip(1).any(|b| b.is_ascii_digit())
+        };
+        let mut out = self.query.trim().to_owned();
+        let mut push_tok = |tok: String| {
             if !out.is_empty() {
                 out.push(' ');
             }
-            if ch.starts_with('C') || ch.starts_with('G') || ch.starts_with('D') {
-                out.push_str(&format!("in:<#{ch}>"));
+            out.push_str(&tok);
+        };
+        for ch in &self.filters.in_channels {
+            if is_slack_channel_id(ch) {
+                push_tok(format!("in:<#{ch}>"));
             } else {
-                out.push_str(&format!("in:#{ch}"));
+                push_tok(format!("in:#{ch}"));
+            }
+        }
+        for ch in &self.filters.exclude_channels {
+            if is_slack_channel_id(ch) {
+                push_tok(format!("-in:<#{ch}>"));
+            } else {
+                push_tok(format!("-in:#{ch}"));
             }
         }
         for u in &self.filters.from_users {
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            if u.starts_with('U') || u.starts_with('W') {
-                out.push_str(&format!("from:<@{u}>"));
+            if is_slack_user_id(u) {
+                push_tok(format!("from:<@{u}>"));
             } else {
-                out.push_str(&format!("from:@{u}"));
+                push_tok(format!("from:@{u}"));
+            }
+        }
+        for u in &self.filters.exclude_users {
+            if is_slack_user_id(u) {
+                push_tok(format!("-from:<@{u}>"));
+            } else {
+                push_tok(format!("-from:@{u}"));
             }
         }
         if let Some(u) = &self.filters.includes_user {
-            if !out.is_empty() {
-                out.push(' ');
+            if is_slack_user_id(u) {
+                push_tok(format!("with:<@{u}>"));
+            } else {
+                push_tok(format!("with:@{u}"));
             }
-            out.push_str(&format!("with:<@{u}>"));
+        }
+        for has in &self.filters.has {
+            let label = match has {
+                slackless_core::store::Has::Link => "has:link",
+                slackless_core::store::Has::File => "has:file",
+                slackless_core::store::Has::Reaction => "has:reaction",
+                slackless_core::store::Has::Pin => "has:pin",
+            };
+            push_tok(label.to_owned());
+        }
+        if let Some(date) = self.filters.after {
+            push_tok(format!(
+                "after:{:04}-{:02}-{:02}",
+                date.year, date.month, date.day
+            ));
+        }
+        if let Some(date) = self.filters.before {
+            push_tok(format!(
+                "before:{:04}-{:02}-{:02}",
+                date.year, date.month, date.day
+            ));
         }
         if self.filters.threads_only {
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str("is:thread");
+            push_tok("is:thread".to_owned());
         }
         out
     }
 
     pub(super) fn request_remote_messages(&mut self, page: usize, cx: &mut Context<Self>) {
-        if self.fixtures.sample || self.query.is_empty() {
+        if self.fixtures.sample || !self.has_active_query() {
             return;
         }
         let query = self.remote_query_string();
+        if query.is_empty() {
+            return;
+        }
         self.remote_messages_loading = true;
         self.remote_messages_error = None;
         cx.emit(SearchEvent::RemoteMessages {
@@ -577,10 +649,13 @@ impl SearchView {
     }
 
     pub(super) fn request_remote_files(&mut self, page: usize, cx: &mut Context<Self>) {
-        if self.fixtures.sample || self.query.is_empty() {
+        if self.fixtures.sample || !self.has_active_query() {
             return;
         }
         let query = self.remote_query_string();
+        if query.is_empty() {
+            return;
+        }
         self.remote_files_loading = true;
         self.remote_files_error = None;
         cx.emit(SearchEvent::RemoteFiles {

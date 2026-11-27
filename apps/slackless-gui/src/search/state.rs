@@ -218,7 +218,7 @@ impl SearchView {
         cx: &mut Context<Self>,
     ) {
         self.workspace_sources = sources;
-        if self.scope == SearchScope::AllWorkspaces && !self.query.is_empty() {
+        if self.scope == SearchScope::AllWorkspaces && self.has_active_query() {
             self.run_local(cx);
         }
         cx.notify();
@@ -233,7 +233,7 @@ impl SearchView {
         if scope == SearchScope::AllWorkspaces {
             self.source = SearchSource::Local;
         }
-        if !self.query.is_empty() {
+        if self.has_active_query() {
             self.run_local(cx);
         }
         cx.notify();
@@ -287,7 +287,7 @@ impl SearchView {
             self.semantic_model_missing = false;
             self.semantic_index_empty = false;
         }
-        if !self.query.is_empty() {
+        if self.has_active_query() {
             self.run_local(cx);
         }
         cx.notify();
@@ -541,7 +541,7 @@ impl SearchView {
         if source == SearchSource::Remote
             && self.remote_messages.is_empty()
             && !self.remote_messages_loading
-            && !self.query.is_empty()
+            && self.has_active_query()
         {
             self.request_remote_messages(1, cx);
         } else {
@@ -573,7 +573,7 @@ impl SearchView {
         if tab == SearchTab::Files
             && self.remote_files.is_empty()
             && !self.remote_files_loading
-            && !self.query.is_empty()
+            && self.has_active_query()
         {
             self.request_remote_files(1, cx);
         } else {

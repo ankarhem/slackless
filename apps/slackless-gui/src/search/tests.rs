@@ -849,3 +849,120 @@ fn transcript_match_excerpt_handles_oversized_query_without_panicking() {
     let excerpt = super::query::transcript_match_excerpt(&long_tx, &long_q);
     assert!(excerpt.is_some());
 }
+
+#[gpui::test]
+fn search_filter_only_queries_and_remote_query_string_modifiers(cx: &mut gpui::TestAppContext) {
+    use slackless_core::store::{Date, Has, SearchFilters};
+    use slackless_core::types::{Conversation, Team};
+
+    let ws = TeamId::from("T_FLT");
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .upsert_conversation(
+            &ws,
+            &Conversation {
+                id: ChannelId::from("C01234567"),
+                name: Some("design".into()),
+                is_channel: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .upsert_message(
+            &ws,
+            &ChannelId::from("C01234567"),
+            &Message {
+                ts: Ts::from("1700002000.000000"),
+                text: "Check <https://example.com/spec>".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .upsert_message(
+            &ws,
+            &ChannelId::from("C01234567"),
+            &Message {
+                ts: Ts::from("1700002100.000000"),
+                text: "Plain message without links".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let shared: SharedStore = Arc::new(Mutex::new(store));
+
+    let mut fx = crate::fixtures::load();
+    fx.sample = false;
+    let team = Team {
+        id: ws.clone(),
+        name: "FilterWS".into(),
+        ..Default::default()
+    };
+    fx.teams = vec![team.clone()];
+    fx.set_rail_workspaces(vec![team]);
+
+    let view = cx.update(|cx| SearchView::new(Arc::new(fx), Some(shared), cx));
+    // 1. Filter-chip-only search (empty text + `has:link`) must execute locally and find the link msg.
+    view.update(cx, |v, cx| {
+        v.set_workspace(ws.clone(), cx);
+        v.run_with_filters(
+            String::new(),
+            SearchFilters {
+                has: vec![Has::Link],
+                ..Default::default()
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.local_hits_for_test().len(),
+            1,
+            "filter-only search with empty text must still return matching local messages"
+        );
+    });
+
+    // 2. `remote_query_string` must serialize `has:link`, exclusions, dates, and preserve
+    //    capitalized channel/user names without treating them as Slack IDs.
+    view.update(cx, |v, cx| {
+        v.run_with_filters(
+            "spec".into(),
+            SearchFilters {
+                in_channels: vec!["C01234567".into(), "Design".into()],
+                exclude_channels: vec!["spam".into()],
+                from_users: vec!["U01234567".into(), "Ulrika".into()],
+                exclude_users: vec!["bot".into()],
+                has: vec![Has::Link, Has::Pin],
+                before: Some(Date {
+                    year: 2026,
+                    month: 5,
+                    day: 1,
+                }),
+                after: Some(Date {
+                    year: 2026,
+                    month: 1,
+                    day: 15,
+                }),
+                threads_only: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        let remote_q = v.remote_query_string();
+        assert!(remote_q.contains("in:<#C01234567>"), "{remote_q}");
+        assert!(remote_q.contains("in:#Design"), "{remote_q}");
+        assert!(!remote_q.contains("in:<#Design>"), "{remote_q}");
+        assert!(remote_q.contains("-in:#spam"), "{remote_q}");
+        assert!(remote_q.contains("from:<@U01234567>"), "{remote_q}");
+        assert!(remote_q.contains("from:@Ulrika"), "{remote_q}");
+        assert!(!remote_q.contains("from:<@Ulrika>"), "{remote_q}");
+        assert!(remote_q.contains("-from:@bot"), "{remote_q}");
+        assert!(remote_q.contains("has:link"), "{remote_q}");
+        assert!(remote_q.contains("has:pin"), "{remote_q}");
+        assert!(remote_q.contains("after:2026-01-15"), "{remote_q}");
+        assert!(remote_q.contains("before:2026-05-01"), "{remote_q}");
+        assert!(remote_q.contains("is:thread"), "{remote_q}");
+    });
+}

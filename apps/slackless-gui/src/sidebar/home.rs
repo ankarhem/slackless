@@ -113,9 +113,15 @@ impl Sidebar {
             if !listed {
                 continue;
             }
-            self.rows
-                .borrow_mut()
-                .push((conversation.id.clone(), unread.count > 0));
+            {
+                let mut rows = self.rows.borrow_mut();
+                if !rows
+                    .iter()
+                    .any(|(existing, _)| existing == &conversation.id)
+                {
+                    rows.push((conversation.id.clone(), unread.count > 0));
+                }
+            }
             let kind = if unread.count > 0 {
                 ListChild::Unread(unread.mentions > 0)
             } else {
@@ -468,12 +474,13 @@ impl Sidebar {
                 .dms
                 .iter()
                 .filter(|conv| {
-                    conv.user.as_ref().is_some_and(|uid| {
-                        let u = self.fixtures.user(uid);
-                        let handle = u.map(|x| x.name.as_str()).unwrap_or("");
-                        let display = u.map(|x| x.display_name()).unwrap_or("");
-                        vip_settings.is_vip(uid.as_str(), handle, display)
-                    })
+                    home_keep(conv)
+                        && conv.user.as_ref().is_some_and(|uid| {
+                            let u = self.fixtures.user(uid);
+                            let handle = u.map(|x| x.name.as_str()).unwrap_or("");
+                            let display = u.map(|x| x.display_name()).unwrap_or("");
+                            vip_settings.is_vip(uid.as_str(), handle, display)
+                        })
                 })
                 .collect();
             if !vip_dms.is_empty() {
@@ -543,19 +550,21 @@ impl Sidebar {
             }
         }
         if sections.is_empty() {
-            let filtered_ch: Vec<&Conversation> = self
+            let mut filtered_ch: Vec<&Conversation> = self
                 .home_channels()
                 .filter(|c| !self.local_starred.contains(&c.id) && home_keep(c))
                 .collect();
-            let filtered_dm: Vec<&Conversation> = self
+            let mut filtered_dm: Vec<&Conversation> = self
                 .fixtures
                 .dms
                 .iter()
                 .filter(|c| !self.local_starred.contains(&c.id) && home_keep(c))
                 .collect();
             if self.home_prefs.separate_private {
-                let (private, public): (Vec<&Conversation>, Vec<&Conversation>) =
+                let (mut private, mut public): (Vec<&Conversation>, Vec<&Conversation>) =
                     filtered_ch.into_iter().partition(|c| c.is_private);
+                self.sort_section_rows(&"channels".into(), false, &mut public, watermark);
+                self.sort_section_rows(&"private-channels".into(), false, &mut private, watermark);
                 list.extend(self.section(
                     "channels".into(),
                     ("Channels", None),
@@ -575,6 +584,7 @@ impl Sidebar {
                     ));
                 }
             } else {
+                self.sort_section_rows(&"channels".into(), false, &mut filtered_ch, watermark);
                 list.extend(self.section(
                     "channels".into(),
                     ("Channels", None),
@@ -584,6 +594,7 @@ impl Sidebar {
                     cx,
                 ));
             }
+            self.sort_section_rows(&"dms".into(), true, &mut filtered_dm, watermark);
             list.extend(self.section(
                 "dms".into(),
                 ("Direct messages", None),
@@ -649,75 +660,94 @@ impl Sidebar {
                     .collect(),
             };
             rows.retain(|c| home_keep(c));
-            if rows.is_empty() && !builtin(&section.kind) {
+            if rows.is_empty() && !builtin(&section.kind) && section.kind != SectionKind::Standard {
                 continue;
             }
-            // The section's sort: its own choice, else Home preference (Recent / Priority / Alpha).
             let section_key: SharedString = section.id.clone().into();
-            let default_recent =
-                section.kind == SectionKind::DirectMessages || self.home_prefs.sort == 1;
-            let sort =
-                if self.home_prefs.sort == 2 && !self.section_sorts.contains_key(&section_key) {
-                    // Priority: mentions first, then unreads, then recency.
-                    rows.sort_by_key(|c| {
-                        let u = self.unread_in(c, watermark);
-                        let latest = self
-                            .fixtures
-                            .counts
-                            .get(&c.id)
-                            .and_then(|n| n.latest.clone());
-                        (
-                            std::cmp::Reverse(u.mentions),
-                            std::cmp::Reverse(u.count > 0),
-                            std::cmp::Reverse(latest),
-                        )
-                    });
-                    None
-                } else {
-                    Some(self.section_sort(&section_key, default_recent))
-                };
-            if let Some(sort) = sort {
-                match sort {
-                    SectionSort::Recency => {
-                        let latest = |c: &Conversation| {
-                            self.fixtures
-                                .counts
-                                .get(&c.id)
-                                .and_then(|n| n.latest.clone())
-                        };
-                        rows.sort_by_key(|c| std::cmp::Reverse(latest(c)));
-                    }
-                    SectionSort::Alpha => {
-                        rows.sort_by_cached_key(|c| alpha_key(&self.fixtures, c));
-                    }
-                    SectionSort::Priority => {
-                        rows.sort_by_key(|c| {
-                            let u = self.unread_in(c, watermark);
-                            let latest = self
-                                .fixtures
-                                .counts
-                                .get(&c.id)
-                                .and_then(|n| n.latest.clone());
-                            (
-                                std::cmp::Reverse(u.mentions),
-                                std::cmp::Reverse(u.count > 0),
-                                std::cmp::Reverse(latest),
-                            )
-                        });
-                    }
-                }
-            }
+            let default_recent = section.kind == SectionKind::DirectMessages;
             let (title, leading) = section_title(section, &self.fixtures);
-            list.extend(self.section(
-                section.id.clone().into(),
-                (&title, leading),
-                &rows,
-                watermark,
-                Some(section),
-                cx,
-            ));
+            if section.kind == SectionKind::Channels && self.home_prefs.separate_private {
+                let (mut private, mut public): (Vec<&Conversation>, Vec<&Conversation>) =
+                    rows.into_iter().partition(|c| c.is_private);
+                self.sort_section_rows(&section_key, default_recent, &mut public, watermark);
+                self.sort_section_rows(&"private-channels".into(), false, &mut private, watermark);
+                list.extend(self.section(
+                    section.id.clone().into(),
+                    (&title, leading),
+                    &public,
+                    watermark,
+                    Some(section),
+                    cx,
+                ));
+                if !private.is_empty() {
+                    list.extend(self.section(
+                        "private-channels".into(),
+                        ("Private channels", None),
+                        &private,
+                        watermark,
+                        None,
+                        cx,
+                    ));
+                }
+            } else {
+                self.sort_section_rows(&section_key, default_recent, &mut rows, watermark);
+                list.extend(self.section(
+                    section.id.clone().into(),
+                    (&title, leading),
+                    &rows,
+                    watermark,
+                    Some(section),
+                    cx,
+                ));
+            }
         }
         list
+    }
+
+    /// Sort one sidebar section's conversation rows using its per-section override, or else the
+    /// global Home sort preference (`0 = Alpha`, `1 = Recency`, `2 = Priority`).
+    fn sort_section_rows(
+        &self,
+        section_key: &SharedString,
+        is_dm_section: bool,
+        rows: &mut [&Conversation],
+        watermark: Option<&Ts>,
+    ) {
+        let default_recent = is_dm_section || self.home_prefs.sort == 1;
+        let sort = if self.home_prefs.sort == 2 && !self.section_sorts.contains_key(section_key) {
+            SectionSort::Priority
+        } else {
+            self.section_sort(section_key, default_recent)
+        };
+        match sort {
+            SectionSort::Recency => {
+                let latest = |c: &Conversation| {
+                    self.fixtures
+                        .counts
+                        .get(&c.id)
+                        .and_then(|n| n.latest.clone())
+                };
+                rows.sort_by_key(|c| std::cmp::Reverse(latest(c)));
+            }
+            SectionSort::Alpha => {
+                rows.sort_by_cached_key(|c| alpha_key(&self.fixtures, c));
+            }
+            SectionSort::Priority => {
+                rows.sort_by_key(|c| {
+                    let u = self.unread_in(c, watermark);
+                    let latest = self
+                        .fixtures
+                        .counts
+                        .get(&c.id)
+                        .and_then(|n| n.latest.clone());
+                    (
+                        std::cmp::Reverse(u.mentions),
+                        std::cmp::Reverse(u.count > 0),
+                        std::cmp::Reverse(latest),
+                    )
+                });
+            }
+        }
     }
 
     /// "Add channels" under the channel list: opens the channel browser.
@@ -1089,7 +1119,7 @@ impl Sidebar {
                 let word = if count == 1 { "person" } else { "people" };
                 format!("{count} {word} in the huddle — {}", names.join(", ")).into()
             };
-            let pill_id = SharedString::from(format!("sidebar-huddle-pill-{id}"));
+            let pill_id = SharedString::from(format!("sidebar-huddle-pill-{key}-{id}"));
             row = row.child(
                 h_flex()
                     .id(pill_id)

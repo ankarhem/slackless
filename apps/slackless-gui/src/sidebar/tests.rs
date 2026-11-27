@@ -793,3 +793,131 @@ fn custom_sections_list_only_joined_channels_and_dms(cx: &mut gpui::TestAppConte
         "the snapshot's copy and the session's join are one channel"
     );
 }
+
+#[gpui::test]
+fn sidebar_home_prefs_separate_private_dedup_step_and_custom_nav_order(
+    cx: &mut gpui::TestAppContext,
+) {
+    use slackless_core::api::ConversationCounts;
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::init(cx);
+    });
+
+    let mut fx = crate::fixtures::load();
+    fx.messages.clear();
+    fx.counts.clear();
+    fx.notify_levels.clear();
+    let pub_ch = fx.channels[0].id.clone();
+    let priv_ch = fx.channels[1].id.clone();
+    fx.channels[0].is_private = false;
+    fx.channels[1].is_private = true;
+    fx.counts.insert(
+        priv_ch.clone(),
+        ConversationCounts {
+            id: priv_ch.clone(),
+            has_unreads: true,
+            mention_count: 1,
+            latest: Some(slackless_core::types::Ts::from("1700000100.000100")),
+            ..Default::default()
+        },
+    );
+    let section = |id: &str, kind: SectionKind| ChannelSection {
+        id: id.into(),
+        name: id.into(),
+        kind,
+        emoji: String::new(),
+        next_id: None,
+        channel_ids: Vec::new(),
+    };
+    fx.sections = vec![
+        section("S_EMPTY_CUSTOM", SectionKind::Standard),
+        section("S_CHANNELS", SectionKind::Channels),
+        section("S_DMS", SectionKind::DirectMessages),
+    ];
+    let fx = Arc::new(fx);
+
+    let mounted = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = mounted.clone();
+    let init_sel = pub_ch.clone();
+    let (_root, cx) = cx.add_window_view(move |window, cx| {
+        let entity = Sidebar::new(fx.clone(), init_sel.clone(), window, cx);
+        *slot.borrow_mut() = Some(entity.clone());
+        gpui_kit::component::Root::new(entity, window, cx)
+    });
+    let sidebar = mounted.borrow_mut().take().unwrap();
+
+    // Enable both `unreads_section` (showing `priv_ch` in Unreads AND Private channels) and
+    // `separate_private` with server sections, plus an active huddle on `priv_ch`.
+    sidebar.update(cx, |s, cx| {
+        s.set_home_prefs(
+            HomePrefs {
+                separate_private: true,
+                unreads_section: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        s.set_huddles(
+            HashMap::from([(
+                priv_ch.clone(),
+                vec![slackless_core::types::UserId::from("U1")],
+            )]),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        // Drawing twice verifies section-scoped huddle pill IDs do not collide in GPUI.
+        let _ = window.draw(cx);
+        let _ = window.draw(cx);
+    });
+
+    // `rows` must contain no duplicate channel IDs, and `step` forward must terminate without
+    // looping even when `unreads_section` duplicates rows visually.
+    sidebar.read_with(cx, |s, _| {
+        let rows: Vec<ChannelId> = s.rows.borrow().iter().map(|(id, _)| id.clone()).collect();
+        let unique: std::collections::HashSet<&ChannelId> = rows.iter().collect();
+        assert_eq!(
+            rows.len(),
+            unique.len(),
+            "sidebar rows must be deduplicated"
+        );
+        assert!(rows.contains(&pub_ch));
+        assert!(rows.contains(&priv_ch));
+
+        let mut cur = rows[0].clone();
+        let mut visited = 1usize;
+        while let Some(next) = s.step(&cur, true, false) {
+            cur = next;
+            visited += 1;
+            assert!(
+                visited <= rows.len(),
+                "Sidebar::step must never infinite-loop on duplicate rows"
+            );
+        }
+        assert_eq!(visited, rows.len());
+    });
+
+    // `cycle_nav` must follow custom `NavPrefs::order` instead of hardcoded tab order.
+    sidebar.update(cx, |s, cx| {
+        s.set_nav_prefs(
+            NavPrefs {
+                show_home: true,
+                show_dms: false,
+                show_activity: true,
+                show_files: false,
+                show_later: true,
+                order: [4, 2, 0, 1, 3],
+                ..Default::default()
+            },
+            cx,
+        );
+        s.show_nav(NavItem::Todos, cx);
+        s.cycle_nav(true, cx);
+        assert_eq!(s.active_nav(), NavItem::Activity);
+        s.cycle_nav(true, cx);
+        assert_eq!(s.active_nav(), NavItem::Home);
+    });
+}

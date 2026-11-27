@@ -458,18 +458,17 @@ impl Sidebar {
         }
     }
 
-    /// Cycle through visible navigation rail tabs (`Ctrl+Tab` / `Ctrl+Shift+Tab`).
+    /// Cycle through visible navigation rail tabs (`Ctrl+Tab` / `Ctrl+Shift+Tab`), respecting the
+    /// user's configured tab order (`NavPrefs::order`).
     pub fn cycle_nav(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let visible: Vec<NavItem> = [
-            NavItem::Home,
-            NavItem::Dms,
-            NavItem::Activity,
-            NavItem::Files,
-            NavItem::Todos,
-        ]
-        .into_iter()
-        .filter(|&item| self.nav_prefs.shows(item))
-        .collect();
+        let visible: Vec<NavItem> = self
+            .nav_prefs
+            .ordered_items()
+            .into_iter()
+            .filter(|&item| {
+                !matches!(item, NavItem::Agents | NavItem::Admin) && self.nav_prefs.shows(item)
+            })
+            .collect();
         if visible.len() < 2 {
             return;
         }
