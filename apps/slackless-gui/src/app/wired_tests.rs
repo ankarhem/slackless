@@ -3407,3 +3407,139 @@ fn wired_multi_workspace_switch_isolation_and_catchup_unknown_guard(cx: &mut gpu
 
     drop(root);
 }
+
+#[gpui::test]
+fn wired_leave_steps_off_channel_cmd_dot_thread_isolation_and_app_home_guard(
+    cx: &mut gpui::TestAppContext,
+) {
+    let people = [user("U0ME", "me"), user("U0ALICE", "alice")];
+    let (b1, c1) = cx.update(|cx| {
+        make_wired_workspace(
+            "T0NAV1",
+            "Nav One",
+            &[("C0ONE", "one"), ("C0TWO", "two")],
+            &people,
+            cx,
+        )
+    });
+    let (b2, c2) = cx.update(|cx| {
+        make_wired_workspace("T0NAV2", "Nav Two", &[("C0OTHER", "other")], &people, cx)
+    });
+    let mut fx = b1.snapshot(&HashMap::new()).expect("snapshot");
+    fx.set_rail_workspaces(vec![
+        b1.team_summary().expect("ws0"),
+        b2.team_summary().expect("ws1"),
+    ]);
+    let (root, app, cx) = mount_wired(fx, vec![b1, b2], cx);
+    let _ = c1.drain_commands();
+    let _ = c2.drain_commands();
+
+    let one = ChannelId::from("C0ONE");
+    let two = ChannelId::from("C0TWO");
+
+    // 1. Hide thread in C0ONE via Cmd+., switch to C0TWO, press Cmd+. again: must NOT resurrect
+    //    C0ONE's thread panel over C0TWO.
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.open_thread(one.clone(), Ts::from("1700000100.000100"), cx);
+            app.toggle_right_pane(cx); // hide thread -> records last_right_pane = Some(Thread)
+            app.select(two.clone(), cx);
+            app.toggle_right_pane(cx); // must NOT reopen C0ONE's thread on C0TWO
+        });
+    });
+    cx.update(|_, cx| {
+        assert!(
+            !app.read(cx).right_pane.is_thread(),
+            "Cmd+. on a different channel must not resurrect the previous channel's thread"
+        );
+    });
+
+    // 2. Leave current channel when `back` history is empty: must move off the left channel
+    //    rather than staying stuck on it.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.back.clear();
+            let leaving = app.channel.clone();
+            app.leave(leaving.clone(), window, cx);
+            assert_ne!(
+                app.channel, leaving,
+                "leave() with empty back stack must navigate away from the left channel"
+            );
+        });
+    });
+
+    // 3. Event::AppHomeUpdated for App B must NOT overwrite App A's currently open Home tab.
+    cx.update(|_, cx| {
+        app.update(cx, |app, _| {
+            app.tab = ConversationTab::Home;
+            app.ws.app_homes.insert(
+                app.channel.clone(),
+                Ok(slackless_core::api::AppHomeResponse {
+                    home_tab_enabled: true,
+                    messages_tab_enabled: true,
+                    home_view: Some(serde_json::json!({ "app_id": "A0APP_A", "blocks": [] })),
+                }),
+            );
+        });
+        c1.emit(
+            Event::AppHomeUpdated(serde_json::json!({
+                "app_id": "A0APP_B",
+                "blocks": []
+            })),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let ch = app.read(cx).channel.clone();
+        let active_app_id = app
+            .read(cx)
+            .ws
+            .app_homes
+            .get(&ch)
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|h| h.home_view.as_ref())
+            .and_then(|v| v.get("app_id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        assert_eq!(
+            active_app_id.as_deref(),
+            Some("A0APP_A"),
+            "AppHomeUpdated for another app must not overwrite the open app's Home tab"
+        );
+    });
+
+    // 4. Deleting a draft belonging to workspace 1 while viewing workspace 0 must sync/persist on
+    //    workspace 1's bridge, not workspace 0's.
+    let _ = c1.drain_commands();
+    let _ = c2.drain_commands();
+    cx.update(|_, cx| {
+        app.read(cx).drafts.clone().update(cx, |_, cx| {
+            cx.emit(DraftsEvent::Deleted {
+                workspace: 1,
+                channel: ChannelId::from("C0OTHER"),
+            });
+        });
+    });
+    cx.run_until_parked();
+    let cmds1 = c1.drain_commands();
+    let cmds2 = c2.drain_commands();
+    assert!(
+        cmds2.iter().any(|c| matches!(
+            c,
+            Command::Messaging(MessagingCommand::SyncDraft { channel, text })
+                if *channel == ChannelId::from("C0OTHER") && text.is_empty()
+        )),
+        "deleting WS 1 draft while viewing WS 0 must sync empty draft on WS 1 bridge: {cmds2:?}"
+    );
+    assert!(
+        !cmds1.iter().any(|c| matches!(
+            c,
+            Command::Messaging(MessagingCommand::SyncDraft { channel, .. })
+                if *channel == ChannelId::from("C0OTHER")
+        )),
+        "WS 0 bridge must not receive WS 1 draft deletion: {cmds1:?}"
+    );
+
+    drop(root);
+}

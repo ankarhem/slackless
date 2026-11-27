@@ -40,9 +40,11 @@ impl App {
         if next.is_thread()
             && let Some((channel, thread_ts)) = self.thread.read(cx).open_thread()
         {
-            self.messages.update(cx, |list, cx| {
-                list.set_open_thread(Some(thread_ts.clone()), cx)
-            });
+            if channel == self.channel {
+                self.messages.update(cx, |list, cx| {
+                    list.set_open_thread(Some(thread_ts.clone()), cx)
+                });
+            }
             self.unreads.update(cx, |unreads, cx| {
                 unreads.set_open_thread(Some((channel, thread_ts)), cx)
             });
@@ -118,8 +120,19 @@ impl App {
             self.set_right_pane(RightPane::None, cx);
         } else {
             match self.last_right_pane {
-                Some(RightPane::Thread) if self.thread.read(cx).open_thread().is_some() => {
-                    self.set_right_pane(RightPane::Thread, cx);
+                Some(RightPane::Thread) => {
+                    if let Some((channel, thread_ts)) = self.thread.read(cx).open_thread()
+                        && (channel == self.channel || self.page == MainPage::Unreads)
+                    {
+                        self.set_right_pane(RightPane::Thread, cx);
+                        self.load_thread(&channel, &thread_ts, cx);
+                    } else {
+                        self.set_right_pane(RightPane::Pins, cx);
+                        if !self.fixtures.sample && !self.ws.pins.contains_key(&self.channel) {
+                            self.bridge
+                                .send(MessagingCommand::LoadPins(self.channel.clone()));
+                        }
+                    }
                 }
                 Some(pane @ RightPane::Profile { .. }) => {
                     self.set_right_pane(pane, cx);
@@ -617,10 +630,17 @@ impl App {
             .retain(|p| *p != NavPlace::Channel(channel.clone()));
         self.reload_live(window, cx);
         if self.channel == channel {
-            let next = self
-                .back
-                .pop()
-                .unwrap_or_else(|| NavPlace::Channel(first_conversation(&self.fixtures)));
+            let next = self.back.pop().unwrap_or_else(|| {
+                let fallback = self
+                    .fixtures
+                    .dms
+                    .iter()
+                    .chain(self.fixtures.channels.iter())
+                    .find(|c| c.id != channel)
+                    .map(|c| c.id.clone())
+                    .unwrap_or_else(|| first_conversation(&self.fixtures));
+                NavPlace::Channel(fallback)
+            });
             self.go_to_place(next, window, cx);
         }
         // Scrub `recent` after navigating away so `show_conversation` does not re-record the
@@ -687,6 +707,12 @@ impl App {
         self.sync_connect_orgs(cx);
         self.load_join_people(cx);
         self.close_thread(cx);
+        if self.last_right_pane == Some(RightPane::Thread) {
+            self.last_right_pane = None;
+        }
+        if matches!(self.right_pane, RightPane::Profile { over_thread: true }) {
+            self.right_pane = RightPane::Profile { over_thread: false };
+        }
         self.tab = ConversationTab::Messages;
         // An open pins panel follows the conversation: fetch the new one's pins.
         if self.right_pane.is_pins() {

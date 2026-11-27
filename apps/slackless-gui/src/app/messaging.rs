@@ -634,10 +634,15 @@ impl App {
 
     /// Persist the active workspace's unsent drafts into the local store off the UI thread.
     pub(super) fn persist_drafts(&self, cx: &Context<Self>) {
+        self.persist_drafts_for(self.workspace, cx);
+    }
+
+    /// Persist `workspace`'s unsent drafts into that workspace's local store off the UI thread.
+    pub(super) fn persist_drafts_for(&self, workspace: usize, cx: &Context<Self>) {
         let saved: Vec<SavedDraft> = self
             .drafts
             .read(cx)
-            .drafts_for(self.workspace)
+            .drafts_for(workspace)
             .into_iter()
             .map(|entry| SavedDraft {
                 channel: entry.channel,
@@ -646,7 +651,9 @@ impl App {
                 at: entry.at,
             })
             .collect();
-        if let Some(write) = self.bridge.remember(&DRAFTS, saved.as_slice()) {
+        if let Some(bridge) = self.workspace_bridge(workspace)
+            && let Some(write) = bridge.remember(&DRAFTS, saved.as_slice())
+        {
             cx.background_executor().spawn(write).detach();
         }
     }

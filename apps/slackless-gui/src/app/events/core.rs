@@ -1083,7 +1083,16 @@ impl App {
                         }
                     }
                 }
-                if !updated && self.tab == ConversationTab::Home {
+                let open_app_conflict = self
+                    .ws
+                    .app_homes
+                    .get(&self.channel)
+                    .and_then(|res| res.as_ref().ok())
+                    .and_then(|entry| entry.home_view.as_ref())
+                    .and_then(|v| v.get("app_id"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|existing| app_id.is_some_and(|incoming| existing != incoming));
+                if !updated && self.tab == ConversationTab::Home && !open_app_conflict {
                     self.ws.app_homes.insert(
                         self.channel.clone(),
                         Ok(slackless_core::api::AppHomeResponse {

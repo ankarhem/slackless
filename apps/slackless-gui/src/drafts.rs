@@ -139,7 +139,10 @@ pub enum DraftsEvent {
     /// Cancel a pending scheduled message (already removed from the schedule).
     CancelScheduled(Entry),
     /// A saved draft was deleted from the Drafts tab.
-    Deleted,
+    Deleted {
+        workspace: usize,
+        channel: ChannelId,
+    },
     Close,
 }
 
@@ -406,7 +409,10 @@ impl Render for DraftsView {
                                         e.workspace == workspace && e.channel == del_ch
                                     }) {
                                         this.drafts.remove(pos);
-                                        cx.emit(DraftsEvent::Deleted);
+                                        cx.emit(DraftsEvent::Deleted {
+                                            workspace,
+                                            channel: del_ch.clone(),
+                                        });
                                         cx.notify();
                                     }
                                 })),

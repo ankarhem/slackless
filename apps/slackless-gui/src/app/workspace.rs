@@ -586,8 +586,12 @@ pub(super) fn subscribe_workspace(
                     cx.notify();
                 }
                 ProfileEvent::Back => {
-                    if matches!(this.right_pane, RightPane::Profile { over_thread: true }) {
+                    if matches!(this.right_pane, RightPane::Profile { over_thread: true })
+                        && let Some((ch, ts)) = this.thread.read(cx).open_thread()
+                        && (ch == this.channel || this.page == MainPage::Unreads)
+                    {
                         this.set_right_pane(RightPane::Thread, cx);
+                        this.load_thread(&ch, &ts, cx);
                     } else {
                         this.set_right_pane(RightPane::None, cx);
                     }

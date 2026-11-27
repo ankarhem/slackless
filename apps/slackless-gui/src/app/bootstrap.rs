@@ -673,11 +673,21 @@ fn wire_feature_view_subscriptions(
                         });
                     }
                 }
-                DraftsEvent::Deleted => {
+                DraftsEvent::Deleted { workspace, channel } => {
                     let count = this.drafts.read(cx).draft_count();
                     this.sidebar
                         .update(cx, |sidebar, cx| sidebar.set_draft_count(count, cx));
-                    this.persist_drafts(cx);
+                    if *workspace == this.workspace && *channel == this.channel {
+                        this.composer
+                            .update(cx, |composer, cx| composer.load_draft("", cx));
+                    }
+                    this.persist_drafts_for(*workspace, cx);
+                    if let Some(bridge) = this.workspace_bridge(*workspace) {
+                        bridge.send(MessagingCommand::SyncDraft {
+                            channel: channel.clone(),
+                            text: String::new(),
+                        });
+                    }
                 }
             },
         ),
@@ -1388,10 +1398,29 @@ fn install_os_and_lifecycle_hooks(app: &Entity<App>, window: &mut Window, cx: &m
         let _ = notif_window.update(cx, |_, window, cx| {
             window.activate_window();
             let _ = notif_app.update(cx, |app, cx| {
-                if let Some(ws_ix) = ws_opt
-                    && ws_ix != app.workspace
-                {
-                    app.switch_workspace(ws_ix, window, cx);
+                if let Some(ws_ix) = ws_opt {
+                    if ws_ix != app.workspace {
+                        app.switch_workspace(ws_ix, window, cx);
+                    }
+                } else if app.fixtures.conversation(&channel).is_none() {
+                    // Foreground notification tags omit workspace index; if the user switched
+                    // workspaces before clicking, locate the workspace that actually owns `channel`
+                    // rather than opening a foreign channel ID in the active workspace.
+                    let owner = app.slots.iter().enumerate().find_map(|(ix, slot)| {
+                        if ix == app.workspace {
+                            return None;
+                        }
+                        let in_parked = slot
+                            .parked
+                            .as_ref()
+                            .is_some_and(|p| p.fixtures.conversation(&channel).is_some());
+                        if in_parked { Some(ix) } else { None }
+                    });
+                    if let Some(ws_ix) = owner {
+                        app.switch_workspace(ws_ix, window, cx);
+                    } else {
+                        return;
+                    }
                 }
                 app.select(channel, cx);
                 app.messages.update(cx, |list, cx| list.reveal(&ts, cx));
