@@ -580,6 +580,21 @@ fn composer_keys_paste_escape_up_auto_fence_and_typed_emoji_state_machines(
             c.editor.select(27..27);
             assert!(!c.convert_typed_emoji());
             assert!(c.editor.doc().atoms().is_empty());
+
+            // Adjacent custom emoji atom `:party:` followed by `smile:` must not eat `:party:`'s
+            // closing colon.
+            c.editor.replace_all("");
+            c.editor.place_atom(
+                0..0,
+                slackless_core::domain::mrkdwn::Atom::Emoji("party".into()),
+                ":party:",
+            );
+            let after_atom = c.editor.doc().text().len();
+            c.editor.select(after_atom..after_atom);
+            c.editor.insert_text("smile:");
+            assert!(!c.convert_typed_emoji());
+            assert_eq!(c.editor.doc().atoms().len(), 1);
+            assert_eq!(c.editor.doc().text(), ":party:smile:");
         });
     });
 

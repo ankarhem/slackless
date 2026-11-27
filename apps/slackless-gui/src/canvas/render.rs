@@ -15,9 +15,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    Anchor, App, AppContext as _, ClipboardItem, Div, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, KeyDownEvent, ParentElement as _, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    Anchor, App, AppContext as _, ClipboardItem, Div, Entity, FocusHandle, Focusable as _,
+    FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use slackless_core::api::CanvasEditOp;
 use slackless_core::types::UserId;
@@ -245,7 +245,9 @@ fn render_canvas_doc(
         canvas,
         ui: &ui,
         actions: &actions,
-        can_edit: is_fixture || actions.on_edit.is_some(),
+        can_edit: is_fixture
+            || (actions.on_edit.is_some()
+                && actions.meta.as_ref().is_none_or(|meta| meta.editable)),
         is_fixture,
     };
 
@@ -287,7 +289,8 @@ fn render_canvas_doc(
     let files_strip = render_files_strip(&doc_ctx, cx);
     let document = render_document_body(&doc_ctx, filtered, &needle, cx);
     let drawer = render_side_drawer(&doc_ctx, cx);
-    let handle_key_down = build_canvas_key_handler(&doc_ctx, has_outline);
+    let search_focus = search.map(|s| s.read(cx).focus_handle(cx));
+    let handle_key_down = build_canvas_key_handler(&doc_ctx, has_outline, search_focus);
 
     let main_scroll = div()
         .id("canvas-scroll")
@@ -437,23 +440,26 @@ fn render_canvas_header(doc_ctx: &CanvasDocCtx<'_>, cx: &App) -> Div {
     });
 
     let key_req = key.to_owned();
-    let req_btn = actions.on_request_access.clone().map(|req| {
-        let already = ui.access_requested;
-        Button::new(SharedString::from(format!("canvas-request-access-{key}")))
-            .outline()
-            .with_size(Size::XSmall)
-            .icon(IconName::Lock)
-            .label(if already {
-                "Access requested"
-            } else {
-                "Request edit"
-            })
-            .disabled(already)
-            .on_click(move |_, window, cx| {
-                mutate_ui(&key_req, |s| s.access_requested = true, window, cx);
-                req(window, cx);
-            })
-    });
+    let req_btn = (!doc_ctx.can_edit)
+        .then(|| actions.on_request_access.clone())
+        .flatten()
+        .map(|req| {
+            let already = ui.access_requested;
+            Button::new(SharedString::from(format!("canvas-request-access-{key}")))
+                .outline()
+                .with_size(Size::XSmall)
+                .icon(IconName::Lock)
+                .label(if already {
+                    "Access requested"
+                } else {
+                    "Request edit"
+                })
+                .disabled(already)
+                .on_click(move |_, window, cx| {
+                    mutate_ui(&key_req, |s| s.access_requested = true, window, cx);
+                    req(window, cx);
+                })
+        });
 
     let popout_btn = actions.on_pop_out.clone().map(|pop| {
         let doc = doc_ctx.canvas.clone();
@@ -595,6 +601,9 @@ fn render_header_upload_btn(doc_ctx: &CanvasDocCtx<'_>) -> Option<impl IntoEleme
                 let edit_done = edit_cb.clone();
                 let on_done: CanvasUploadCompleteFn = Rc::new(
                     move |uploaded: UploadedCanvasFile, window: &mut Window, cx: &mut App| {
+                        if !is_fixture && uploaded.url.starts_with("file://") {
+                            return;
+                        }
                         let md = canvas_file_markdown(&uploaded.filename, &uploaded.url);
                         let mut updated = doc_done.clone();
                         let block = if is_image_filename(&uploaded.filename) {
@@ -1412,6 +1421,7 @@ fn render_side_drawer(doc_ctx: &CanvasDocCtx<'_>, cx: &App) -> Option<Stateful<D
 fn build_canvas_key_handler(
     doc_ctx: &CanvasDocCtx<'_>,
     has_outline: bool,
+    search_focus: Option<FocusHandle>,
 ) -> impl Fn(&KeyDownEvent, &mut Window, &mut App) + 'static {
     let key_kb = doc_ctx.key.to_owned();
     let doc_kb = doc_ctx.canvas.clone();
@@ -1424,7 +1434,21 @@ fn build_canvas_key_handler(
 
     move |event: &KeyDownEvent, window: &mut Window, cx: &mut App| {
         let state = ui_state(&key_kb, cx);
-        if state.editing {
+        let input_focused = search_focus
+            .as_ref()
+            .is_some_and(|fh| fh.is_focused(window))
+            || [
+                state.editor.as_ref(),
+                state.comment_input.as_ref(),
+                state.reply_input.as_ref(),
+                state.share_target_input.as_ref(),
+                state.image_alt_input.as_ref(),
+                state.checklist_add_input.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|ed| ed.read(cx).focus_handle(cx).is_focused(window));
+        if state.editing || input_focused {
             return;
         }
         let ks = &event.keystroke;

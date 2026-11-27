@@ -307,12 +307,11 @@ impl App {
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("attachment")
                                 .to_owned();
-                            let url = format!("file://{}", path.display());
                             let _ = cx.update(|window, cx| {
-                                let still_active = this_u
+                                let uploaded_live = this_u
                                     .update(cx, |app, _| {
                                         if app.workspace_epoch != origin_epoch {
-                                            return false;
+                                            return None;
                                         }
                                         if let Some(bridge) = app.workspace_bridge(origin_ws) {
                                             bridge.send(CollabCommand::UploadFiles {
@@ -324,27 +323,37 @@ impl App {
                                                     bytes: bytes.into(),
                                                 }],
                                             });
+                                            return Some(true);
                                         }
-                                        true
+                                        Some(false)
                                     })
-                                    .unwrap_or(false);
-                                if !still_active {
-                                    return;
+                                    .unwrap_or(None);
+                                match uploaded_live {
+                                    Some(true) => {
+                                        // Never leak local `file://` paths into live Slack canvas
+                                        // documents; the file is uploaded to the conversation and
+                                        // can be linked once Slack assigns a remote URL.
+                                        let _ = on_done;
+                                        notify(
+                                            "Uploaded file to channel",
+                                            format!(
+                                                "Uploaded {filename} to the conversation. Paste its Slack link into the canvas once shared."
+                                            ),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                    Some(false) => {
+                                        notify(
+                                            "File upload unavailable",
+                                            "Connect to a live workspace to upload files."
+                                                .to_owned(),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                    None => {}
                                 }
-                                on_done(
-                                    crate::canvas::UploadedCanvasFile {
-                                        filename: filename.clone(),
-                                        url,
-                                    },
-                                    window,
-                                    cx,
-                                );
-                                notify(
-                                    "Uploaded file to canvas",
-                                    format!("Uploaded and inserted {filename}."),
-                                    window,
-                                    cx,
-                                );
                             });
                         })
                         .detach();

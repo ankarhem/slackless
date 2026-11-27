@@ -1594,4 +1594,11 @@ fn gpui_canvas_renders_mentions_comments_share_export_updated_banner_and_keyboar
     assert!(!print_called.get());
     assert!(!delete_called.get());
     assert!(!channel_opened.get());
+
+    // `clear_ui_store` drops cached per-canvas UI state cleanly (called on workspace switch).
+    cx.update(|_, cx| {
+        assert!(crate::canvas::ui_state("F01FULL", cx).share_open);
+        crate::canvas::clear_ui_store(cx);
+        assert!(!crate::canvas::ui_state("F01FULL", cx).share_open);
+    });
 }

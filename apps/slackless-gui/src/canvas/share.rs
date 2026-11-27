@@ -5,7 +5,9 @@ use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, h_flex, v_flex,
+};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     App, ClipboardItem, Div, FontWeight, InteractiveElement as _, ParentElement as _, SharedString,
@@ -255,7 +257,14 @@ pub(super) fn render_share_panel(
             .when(!active, |b| b.outline())
             .with_size(Size::XSmall)
             .label(label.to_owned())
+            .disabled(!is_fixture)
+            .when(!is_fixture, |b| {
+                b.tooltip("Change workspace-wide general access in Slack (Open in browser)")
+            })
             .on_click(move |_, window, cx| {
+                if !is_fixture {
+                    return;
+                }
                 mutate_ui(
                     &k,
                     |s| {
@@ -301,6 +310,14 @@ pub(super) fn render_share_panel(
                 .text_color(theme.muted_foreground)
                 .child(gen_desc),
         )
+        .when(!is_fixture, |col| {
+            col.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("Change workspace-wide general access in Slack (Open in browser)."),
+            )
+        })
         .child(
             h_flex()
                 .flex_wrap()
@@ -314,16 +331,19 @@ pub(super) fn render_share_panel(
                 .id(SharedString::from(format!("canvas-limit-share-{key}")))
                 .items_center()
                 .gap_1p5()
-                .cursor_pointer()
+                .when(is_fixture, |row| row.cursor_pointer())
+                .when(!is_fixture, |row| row.opacity(0.55))
                 .text_xs()
                 .text_color(theme.foreground)
-                .on_click(move |_, window, cx| {
-                    mutate_ui(
-                        &k_limit,
-                        |s| s.share_limit_sharing = !s.share_limit_sharing,
-                        window,
-                        cx,
-                    );
+                .when(is_fixture, |row| {
+                    row.on_click(move |_, window, cx| {
+                        mutate_ui(
+                            &k_limit,
+                            |s| s.share_limit_sharing = !s.share_limit_sharing,
+                            window,
+                            cx,
+                        );
+                    })
                 })
                 .child(
                     Icon::new(if ui.share_limit_sharing {

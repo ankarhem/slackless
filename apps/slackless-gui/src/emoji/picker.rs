@@ -209,6 +209,41 @@ impl EmojiPicker {
         })
     }
 
+    /// Refresh workspace fixtures (e.g. after `emoji_changed` or snapshot reload) so newly added
+    /// or removed custom workspace emoji appear immediately in the picker.
+    pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.fixtures = fixtures;
+        self.rebuild();
+        cx.notify();
+    }
+
+    /// Reset workspace-scoped state when switching workspaces: swap fixtures/frequent/skin tone,
+    /// cancel pending GIF fetches, evict decoded GIF GPU textures, and rebuild rows.
+    pub fn sync_workspace(
+        &mut self,
+        fixtures: Arc<Fixtures>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.release_gifs(window, cx);
+        self.tone = fixtures.skin_tone;
+        self.frequent = if fixtures.frequent_emoji.is_empty() {
+            FREQUENT_SEED
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect()
+        } else {
+            fixtures.frequent_emoji.clone()
+        };
+        self.fixtures = fixtures;
+        self.query.clear();
+        self.gif_query.clear();
+        self.tones_open = false;
+        self.external_channel = false;
+        self.rebuild();
+        cx.notify();
+    }
+
     /// Mark whether the picker is opened for an externally shared Slack Connect channel (`F-COLLAB-878`).
     pub fn set_external_channel(&mut self, external: bool, cx: &mut Context<Self>) {
         if self.external_channel != external {

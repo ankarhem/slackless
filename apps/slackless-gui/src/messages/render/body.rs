@@ -158,10 +158,7 @@ pub(in crate::messages) fn containers(
                 RichTextContainer::List(list) => {
                     let items = list_items(list, fixtures, opts, edited);
                     (!items.is_empty()).then_some(Container::List {
-                        indent: list
-                            .indent
-                            .unwrap_or(0)
-                            .saturating_add(list.offset.unwrap_or(0)),
+                        indent: list.indent.unwrap_or(0),
                         ordered: matches!(list.style, ListStyle::Ordered),
                         items,
                     })
@@ -214,6 +211,7 @@ fn list_items(
     edited: bool,
 ) -> Vec<(SharedString, Vec<Segment>)> {
     let ordered = matches!(list.style, ListStyle::Ordered);
+    let offset = list.offset.unwrap_or(0) as usize;
     let last = list.elements.len();
     list.elements
         .iter()
@@ -224,7 +222,7 @@ fn list_items(
             };
             let paragraph = paragraph(&section.elements, fixtures, opts, edited && n + 1 == last)?;
             let marker = if ordered {
-                format!("{}.", n + 1)
+                format!("{}.", offset.saturating_add(n).saturating_add(1))
             } else {
                 "•".to_owned()
             };
@@ -295,10 +293,14 @@ fn push_element(
             if opts.emoji_text {
                 builder.push_text(&format!(":{}:", el.name), run);
             } else {
-                match (
-                    el.unicode.as_deref().and_then(unicode_glyph),
-                    fixtures.custom_emoji(&el.name),
-                ) {
+                let glyph = el.unicode.as_deref().and_then(unicode_glyph).or_else(|| {
+                    el.skin_tone
+                        .and_then(|tone| {
+                            crate::emoji::display_glyph(&format!("{}::skin-tone-{tone}", el.name))
+                        })
+                        .or_else(|| crate::emoji::display_glyph(&el.name))
+                });
+                match (glyph, fixtures.custom_emoji(&el.name)) {
                     (Some(glyph), _) => builder.push_text(&glyph, run),
                     (None, Some(image)) => builder.push_image(image.source()),
                     (None, None) => builder.push_text(&format!(":{}:", el.name), run),
@@ -584,5 +586,90 @@ impl BodyCache {
             },
         );
         model
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slackless_core::types::rich_text::{EmojiElement, RichTextSection, TextElement};
+
+    #[test]
+    fn rich_text_emoji_catalog_fallback_and_list_offset_numbering() {
+        assert_eq!(unicode_glyph(""), None);
+        assert_eq!(unicode_glyph("d800"), None);
+        assert_eq!(unicode_glyph("110000"), None);
+        assert_eq!(unicode_glyph("1f389").as_deref(), Some("🎉"));
+
+        let fixtures = crate::fixtures::load();
+        let elements = vec![
+            RichTextContainer::Section(RichTextSection {
+                elements: vec![RichTextElement::Emoji(EmojiElement {
+                    name: "wave".into(),
+                    unicode: None,
+                    skin_tone: Some(3),
+                    style: None,
+                })],
+            }),
+            RichTextContainer::List(RichTextList {
+                style: ListStyle::Ordered,
+                indent: Some(1),
+                offset: Some(4),
+                border: None,
+                elements: vec![
+                    RichTextContainer::Section(RichTextSection {
+                        elements: vec![RichTextElement::Text(TextElement {
+                            text: "fifth".into(),
+                            style: None,
+                        })],
+                    }),
+                    RichTextContainer::Section(RichTextSection {
+                        elements: vec![RichTextElement::Text(TextElement {
+                            text: "sixth".into(),
+                            style: None,
+                        })],
+                    }),
+                ],
+            }),
+        ];
+
+        let containers = containers(
+            &elements,
+            &fixtures,
+            TextOpts {
+                emoji_text: false,
+                verbatim: false,
+            },
+            false,
+        );
+        assert_eq!(containers.len(), 2);
+        match &containers[0] {
+            Container::Paragraph(segments) => {
+                let joined: String = segments
+                    .iter()
+                    .filter_map(|s| match s {
+                        Segment::Text { pieces, .. } => {
+                            Some(pieces.iter().map(|p| p.text.as_ref()).collect::<String>())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(joined, "👋🏼");
+            }
+            _ => panic!("expected Paragraph for emoji section"),
+        }
+        match &containers[1] {
+            Container::List {
+                indent,
+                ordered,
+                items,
+            } => {
+                assert_eq!(*indent, 1, "list offset must not inflate horizontal indent");
+                assert!(*ordered);
+                let markers: Vec<&str> = items.iter().map(|(m, _)| m.as_ref()).collect();
+                assert_eq!(markers, vec!["5.", "6."]);
+            }
+            _ => panic!("expected List"),
+        }
     }
 }

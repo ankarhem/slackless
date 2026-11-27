@@ -97,7 +97,19 @@ fn make_upload_callback(
                 let st = ed.read(cx);
                 (st.value().to_string(), st.selected_range())
             };
-            let target = replace_range.clone().unwrap_or(sel);
+            // Re-validate the captured `/file` slash range at callback time because the user may
+            // have edited the buffer while the native file picker was open.
+            let target = replace_range
+                .as_ref()
+                .filter(|r| {
+                    r.start <= r.end
+                        && r.end <= current.len()
+                        && current.is_char_boundary(r.start)
+                        && current.is_char_boundary(r.end)
+                        && current[(*r).clone()].starts_with('/')
+                })
+                .cloned()
+                .unwrap_or(sel);
             let md = canvas_file_markdown(&uploaded.filename, &uploaded.url);
             let snippet = if current.trim().is_empty() || !target.is_empty() {
                 md
@@ -750,6 +762,9 @@ fn render_editor_footer(
         )
 }
 
+/// Maximum undo/redo snapshots retained per canvas editor instance.
+const MAX_CANVAS_UNDO_DEPTH: usize = 100;
+
 pub(super) fn push_undo_and_set(
     key: &str,
     editor: &Entity<TextareaState>,
@@ -769,6 +784,10 @@ pub(super) fn push_undo_and_set(
                 s.undo_stack.push(current);
             }
             s.undo_stack.push(next.clone());
+            if s.undo_stack.len() > MAX_CANVAS_UNDO_DEPTH {
+                let overflow = s.undo_stack.len() - MAX_CANVAS_UNDO_DEPTH;
+                s.undo_stack.drain(..overflow);
+            }
             s.redo_stack.clear();
         },
         window,

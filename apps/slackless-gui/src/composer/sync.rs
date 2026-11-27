@@ -134,9 +134,20 @@ impl Composer {
         let Some(prefix) = before.strip_suffix(':') else {
             return false;
         };
-        let Some(open) = prefix.rfind(':') else {
+        // Never scan back into an existing placed atom (e.g. custom emoji `:party:` followed by
+        // `smile:` must not steal `:party:`'s closing colon).
+        let atom_floor = doc
+            .atoms()
+            .iter()
+            .filter(|a| a.range.end <= caret)
+            .map(|a| a.range.end)
+            .max()
+            .unwrap_or(0)
+            .min(prefix.len());
+        let Some(rel_open) = prefix[atom_floor..].rfind(':') else {
             return false;
         };
+        let open = atom_floor + rel_open;
         let parsed = doc.parse();
         let line = parsed.line_at(open);
         if matches!(

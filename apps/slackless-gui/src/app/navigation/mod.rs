@@ -991,10 +991,14 @@ impl App {
         self.last_right_pane = None;
         self.user_menu_open = false;
         self.canvas_query.clear();
+        crate::canvas::clear_ui_store(cx);
         self.list_query.clear();
         self.list_sort = None;
         self.set_right_pane(RightPane::None, cx);
         let fixtures = self.fixtures.clone();
+        self.emoji_picker.update(cx, |picker, cx| {
+            picker.sync_workspace(fixtures.clone(), window, cx);
+        });
         self.threads.update(cx, |view, cx| {
             view.clear_for_workspace(fixtures.clone(), cx)
         });

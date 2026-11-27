@@ -288,6 +288,14 @@ struct CanvasUiStore {
 
 impl Global for CanvasUiStore {}
 
+/// Drop all cached per-canvas UI state (editor buffers, undo stacks, drawers) when switching
+/// workspaces so state from one workspace never leaks into or accumulates behind another.
+pub fn clear_ui_store(cx: &mut App) {
+    if cx.has_global::<CanvasUiStore>() {
+        cx.global_mut::<CanvasUiStore>().panels.clear();
+    }
+}
+
 pub(super) fn ui_state(key: &str, cx: &App) -> CanvasUiState {
     cx.try_global::<CanvasUiStore>()
         .and_then(|s| s.panels.get(key))

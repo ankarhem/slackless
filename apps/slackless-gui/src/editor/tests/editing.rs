@@ -208,6 +208,13 @@ fn toggle_style_handles_multiline_whitespace_double_pairs_and_atoms() {
     linked.select(4..10);
     linked.set_link("https://two.dev");
     assert_eq!(linked.doc().text(), "hi [@Alice](https://two.dev) ");
+
+    // Wrapping a selection that spans multiple existing same-style spans strips inner markers
+    // instead of producing corrupted nested `**foo* and *bar**`.
+    let mut nested = typed("*foo* and *bar*");
+    nested.select(0..15);
+    nested.toggle_style(Style::BOLD);
+    assert_eq!(nested.doc().text(), "*foo and bar*");
 }
 
 #[test]

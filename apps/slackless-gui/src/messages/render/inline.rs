@@ -476,17 +476,14 @@ pub(crate) fn render_preview(preview: &Preview, color: Hsla, key: String, cx: &A
 }
 
 /// Slack packs emoji code points as hex joined by `-` (`1f389`, skin tones appended).
+/// Returns `None` if any code point is invalid or the input is empty so callers fall back
+/// cleanly to the emoji catalog or shortcode.
 pub(in crate::messages) fn unicode_glyph(hex: &str) -> Option<String> {
-    let points = hex
+    let glyph: String = hex
         .split('-')
-        .map(|point| u32::from_str_radix(point, 16).ok())
-        .collect::<Option<Vec<u32>>>()?;
-    Some(
-        points
-            .iter()
-            .filter_map(|&point| char::from_u32(point))
-            .collect(),
-    )
+        .map(|point| u32::from_str_radix(point, 16).ok().and_then(char::from_u32))
+        .collect::<Option<_>>()?;
+    (!glyph.is_empty()).then_some(glyph)
 }
 
 pub(crate) fn hex_color(value: &str) -> Option<Hsla> {

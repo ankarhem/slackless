@@ -103,7 +103,10 @@ impl Editor {
                 close_r: Range<usize>,
                 inner_len: usize,
             },
-            Wrap(Range<usize>),
+            Wrap {
+                target: Range<usize>,
+                inner_delims: Vec<Range<usize>>,
+            },
         }
 
         let text = self.now.doc.text();
@@ -137,7 +140,22 @@ impl Editor {
                     inner_len: found.inner.len(),
                 });
             } else {
-                ops.push(LineOp::Wrap(target));
+                let mut inner_delims: Vec<Range<usize>> = Vec::new();
+                for c in &line.inlines {
+                    if c.kind == InlineKind::Style(style)
+                        && c.outer.start >= target.start
+                        && c.outer.end <= target.end
+                    {
+                        inner_delims.push(c.open.clone());
+                        inner_delims.push(c.close.clone());
+                    }
+                }
+                inner_delims.sort_unstable_by_key(|r| r.start);
+                inner_delims.dedup();
+                ops.push(LineOp::Wrap {
+                    target,
+                    inner_delims,
+                });
             }
         }
         if ops.is_empty() {
@@ -171,7 +189,11 @@ impl Editor {
         } else {
             let mut single_sel = None;
             for op in ops.into_iter().rev() {
-                if let LineOp::Wrap(target) = op {
+                if let LineOp::Wrap {
+                    target,
+                    inner_delims,
+                } = op
+                {
                     // Use `**` / `~~` if directly abutting word characters so single-marker
                     // word-boundary rules don't reject it.
                     let (o, c) = if style == Style::BOLD || style == Style::STRIKE {
@@ -196,9 +218,14 @@ impl Editor {
                         (open, close)
                     };
                     self.replace(target.end..target.end, c);
+                    let mut removed = 0usize;
+                    for delim in inner_delims.into_iter().rev() {
+                        removed += delim.len();
+                        self.replace(delim, "");
+                    }
                     self.replace(target.start..target.start, o);
                     if single_line {
-                        single_sel = Some(target.start + o.len()..target.end + o.len());
+                        single_sel = Some(target.start + o.len()..target.end - removed + o.len());
                     }
                 }
             }

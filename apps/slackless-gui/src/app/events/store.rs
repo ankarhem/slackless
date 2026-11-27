@@ -201,6 +201,8 @@ impl App {
             .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
         self.modal_stack
             .update(cx, |stack, cx| stack.set_fixtures(fixtures.clone(), cx));
+        self.emoji_picker
+            .update(cx, |picker, cx| picker.set_fixtures(fixtures.clone(), cx));
         if let Some(viewer) = &self.image_viewer {
             viewer.update(cx, |viewer, cx| viewer.set_fixtures(fixtures.clone(), cx));
         }
