@@ -1447,7 +1447,6 @@ fn gpui_canvas_renders_mentions_comments_share_export_updated_banner_and_keyboar
         meta: CanvasMeta,
         threads: Vec<CanvasCommentThread>,
         print_called: Rc<Cell<bool>>,
-        pdf_called: Rc<Cell<bool>>,
         delete_called: Rc<Cell<bool>>,
         channel_opened: Rc<Cell<bool>>,
     }
@@ -1455,8 +1454,6 @@ fn gpui_canvas_renders_mentions_comments_share_export_updated_banner_and_keyboar
         fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
             let p_flag = self.print_called.clone();
             let on_print: CanvasExportFn = Rc::new(move |_, _, _| p_flag.set(true));
-            let pdf_flag = self.pdf_called.clone();
-            let on_pdf: CanvasExportFn = Rc::new(move |_, _, _| pdf_flag.set(true));
             let del_flag = self.delete_called.clone();
             let on_del: CanvasDeleteFn = Rc::new(move |_, _| del_flag.set(true));
             let ch_flag = self.channel_opened.clone();
@@ -1503,7 +1500,6 @@ fn gpui_canvas_renders_mentions_comments_share_export_updated_banner_and_keyboar
                     on_delete_access: Some(on_delete_access),
                     on_delete_canvas: Some(on_del),
                     on_print_canvas: Some(on_print),
-                    on_save_pdf: Some(on_pdf),
                     on_refresh_canvas: Some(on_refresh),
                     status_banner: Some((true, "restricted_action".into())),
                     updated_note: Some("Canvas updated with latest changes".into()),
@@ -1552,13 +1548,11 @@ fn gpui_canvas_renders_mentions_comments_share_export_updated_banner_and_keyboar
     }];
 
     let print_called = Rc::new(Cell::new(false));
-    let pdf_called = Rc::new(Cell::new(false));
     let delete_called = Rc::new(Cell::new(false));
     let channel_opened = Rc::new(Cell::new(false));
 
-    let (p, pdf, del, ch) = (
+    let (p, del, ch) = (
         print_called.clone(),
-        pdf_called.clone(),
         delete_called.clone(),
         channel_opened.clone(),
     );
@@ -1567,7 +1561,6 @@ fn gpui_canvas_renders_mentions_comments_share_export_updated_banner_and_keyboar
         meta: meta.clone(),
         threads: threads.clone(),
         print_called: p,
-        pdf_called: pdf,
         delete_called: del,
         channel_opened: ch,
     });
@@ -1607,7 +1600,6 @@ fn gpui_canvas_renders_mentions_comments_share_export_updated_banner_and_keyboar
     cx.run_until_parked();
 
     assert!(!print_called.get());
-    assert!(!pdf_called.get());
     assert!(!delete_called.get());
     assert!(!channel_opened.get());
 }

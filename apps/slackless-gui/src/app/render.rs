@@ -107,8 +107,6 @@ impl App {
                     Err(err) => notify("Print canvas", err, window, cx),
                 },
             );
-        // Save as PDF is the print panel's PDF menu.
-        let on_save_pdf = on_print_canvas.clone();
         crate::canvas::CanvasActions {
             on_pop_out: Some(on_pop_out),
             on_open_media: Some(on_open_media),
@@ -118,7 +116,6 @@ impl App {
             on_open_channel: Some(on_open_channel),
             on_open_embed: Some(on_open_embed),
             on_print_canvas: Some(on_print_canvas),
-            on_save_pdf: Some(on_save_pdf),
             ..Default::default()
         }
     }

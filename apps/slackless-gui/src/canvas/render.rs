@@ -694,16 +694,14 @@ fn render_comments_toggle_btn(doc_ctx: &CanvasDocCtx<'_>) -> impl IntoElement {
         })
 }
 
-/// Header overflow menu (`...`): Print…, Save as PDF…, Export Markdown, Delete canvas
+/// Header overflow menu (`...`): Print / Save as PDF…, Export Markdown, Delete canvas
 /// (`F-COLLAB-158`, `F-COLLAB-182..184`).
 fn render_overflow_menu_btn(doc_ctx: &CanvasDocCtx<'_>) -> impl IntoElement {
     let key = doc_ctx.key;
     let print_allowed = canvas_print_allowed(doc_ctx.actions.meta.as_ref());
     let doc_print = doc_ctx.canvas.clone();
-    let doc_pdf = doc_ctx.canvas.clone();
     let full_md = doc_ctx.canvas.to_markdown();
     let on_print = doc_ctx.actions.on_print_canvas.clone();
-    let on_pdf = doc_ctx.actions.on_save_pdf.clone();
     let k_del = key.to_owned();
     let can_delete = doc_ctx.is_fixture || doc_ctx.actions.on_delete_canvas.is_some();
 
@@ -712,7 +710,7 @@ fn render_overflow_menu_btn(doc_ctx: &CanvasDocCtx<'_>) -> impl IntoElement {
         .with_size(Size::XSmall)
         .icon(IconName::Ellipsis)
         .tooltip(if print_allowed {
-            "Canvas actions (Print, Save as PDF, Delete)"
+            "Canvas actions (Print / Save as PDF, Delete)"
         } else {
             "Canvas actions (Printing disabled by workspace admin)"
         })
@@ -720,9 +718,9 @@ fn render_overflow_menu_btn(doc_ctx: &CanvasDocCtx<'_>) -> impl IntoElement {
             let d_print = doc_print.clone();
             let print_cb = on_print.clone();
             let print_label = if print_allowed {
-                "Print…"
+                "Print / Save as PDF…"
             } else {
-                "Print… (disabled by workspace admin)"
+                "Print / Save as PDF… (disabled by workspace admin)"
             };
             menu = menu.item(
                 PopupMenuItem::new(print_label)
@@ -746,34 +744,6 @@ fn render_overflow_menu_btn(doc_ctx: &CanvasDocCtx<'_>) -> impl IntoElement {
                                     crate::actions::notify("Print unavailable", err, window, cx)
                                 }
                             }
-                        }
-                    }),
-            );
-
-            let d_pdf = doc_pdf.clone();
-            let pdf_cb = on_pdf.clone();
-            let pdf_label = if print_allowed {
-                "Save as PDF…"
-            } else {
-                "Save as PDF… (disabled by workspace admin)"
-            };
-            menu = menu.item(
-                PopupMenuItem::new(pdf_label)
-                    .icon(IconName::Download)
-                    .disabled(!print_allowed)
-                    .on_click(move |_, window, cx| {
-                        if !print_allowed {
-                            return;
-                        }
-                        if let Some(cb) = &pdf_cb {
-                            cb(d_pdf.clone(), window, cx);
-                        } else {
-                            crate::actions::notify(
-                                "Save as PDF",
-                                "PDF export handler not configured.",
-                                window,
-                                cx,
-                            );
                         }
                     }),
             );

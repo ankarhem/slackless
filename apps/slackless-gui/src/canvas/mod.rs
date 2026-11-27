@@ -178,10 +178,8 @@ pub struct CanvasActions {
     pub on_delete_access: Option<CanvasAccessDeleteFn>,
     /// Permanently delete this canvas (`Command::DeleteCanvas`, `F-COLLAB-158`).
     pub on_delete_canvas: Option<CanvasDeleteFn>,
-    /// Print this canvas (`F-COLLAB-182`).
+    /// Print this canvas; the print panel's PDF menu saves a PDF (`F-COLLAB-182`, `F-COLLAB-183`).
     pub on_print_canvas: Option<CanvasExportFn>,
-    /// Save this canvas as PDF (`F-COLLAB-183`).
-    pub on_save_pdf: Option<CanvasExportFn>,
     /// Reload this canvas from Slack (`F-COLLAB-185`).
     pub on_refresh_canvas: Option<OpenBrowserFn>,
     /// Optional inline `(is_error, message)` status/error banner (surfaced via `format_canvas_error`).

@@ -573,8 +573,6 @@ impl PopoutWindow {
                     Err(err) => actions::notify("Print canvas", err, window, cx),
                 },
             );
-        // Save as PDF is the print panel's PDF menu.
-        let on_save_pdf = on_print_canvas.clone();
         let on_upload_file: crate::canvas::CanvasUploadFileFn = {
             let send = self.send.clone();
             let upload_channel = self.fixtures.messages.keys().next().cloned();
@@ -744,7 +742,6 @@ impl PopoutWindow {
                 on_delete_access,
                 on_delete_canvas,
                 on_print_canvas: Some(on_print_canvas),
-                on_save_pdf: Some(on_save_pdf),
                 ..Default::default()
             },
             file_id.is_none(),
