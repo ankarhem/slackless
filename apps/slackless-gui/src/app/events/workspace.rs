@@ -194,7 +194,10 @@ impl App {
                 if message.user.as_ref() == Some(&bg_ctx.self_user) {
                     return;
                 }
-                let Some(conv) = bg_ctx.conversation.as_ref() else {
+                let conv = bg_ctx.conversation.as_ref();
+                let Some(kind) =
+                    (conv.map(Conversation::kind)).or_else(|| super::event_kind(channel, message))
+                else {
                     return;
                 };
                 let Some(slot) = self.slots.get_mut(ws_index) else {
@@ -207,7 +210,6 @@ impl App {
                         .unwrap_or_default()
                 });
                 let level = levels.get(channel).copied();
-                let dm = matches!(conv.kind(), ConversationKind::Im | ConversationKind::Mpim);
                 let owned_ctx = super::notifications::OwnedRuleContext {
                     sender_id: message
                         .user
@@ -226,7 +228,7 @@ impl App {
                         .map(|u| u.display_name().to_owned())
                         .or_else(|| message.bot_profile.as_ref().map(|b| b.name.clone())),
                     channel_id: channel.as_str().to_owned(),
-                    channel_name: conv.name.clone(),
+                    channel_name: conv.and_then(|conv| conv.name.clone()),
                     text: message.text.clone(),
                     is_thread_reply: reply,
                     mentions_me: mentioned,
@@ -256,7 +258,7 @@ impl App {
                         conv,
                         bg_ctx.sender.as_ref(),
                         level,
-                        dm,
+                        kind,
                         mentioned,
                         &rule_eval,
                         cx,
@@ -266,7 +268,7 @@ impl App {
                 let rules = rules.clone();
                 let channel_owned = channel.clone();
                 let message_owned = message.clone();
-                let conv_owned = conv.clone();
+                let conv_owned = conv.cloned();
                 let sender_owned = bg_ctx.sender.clone();
                 cx.spawn(async move |this, cx| {
                     let rule_eval = cx
@@ -286,10 +288,10 @@ impl App {
                             ws_index,
                             &channel_owned,
                             &message_owned,
-                            &conv_owned,
+                            conv_owned.as_ref(),
                             sender_owned.as_ref(),
                             level,
-                            dm,
+                            kind,
                             mentioned,
                             &rule_eval,
                             cx,
@@ -308,14 +310,15 @@ impl App {
         ws_index: usize,
         channel: &ChannelId,
         message: &Message,
-        conv: &Conversation,
+        conv: Option<&Conversation>,
         sender_user: Option<&slackless_core::types::User>,
         level: Option<NotifyLevel>,
-        dm: bool,
+        kind: ConversationKind,
         mentioned: bool,
         rule_eval: &slackless_core::rules::RuleEvaluation,
         cx: &mut Context<Self>,
     ) {
+        let dm = matches!(kind, ConversationKind::Im | ConversationKind::Mpim);
         let settings = self.preferences.read(cx).settings();
         if !settings.desktop_notifications || rule_eval.is_suppressed() {
             return;
@@ -377,16 +380,25 @@ impl App {
         } else {
             "New message".to_owned()
         };
-        let (raw_title, body) = match conv.kind() {
+        let (raw_title, body) = match kind {
             ConversationKind::Im => (format!("{ws_name} — {sender}"), text),
             ConversationKind::Mpim => (
-                format!("{ws_name} — {}", conv.name.as_deref().unwrap_or("Group DM")),
+                format!(
+                    "{ws_name} — {}",
+                    (conv.and_then(|conv| conv.name.as_deref())).unwrap_or("Group DM")
+                ),
                 format!("{sender}: {text}"),
             ),
-            _ => (
-                format!("{ws_name} — #{}", conv.name.as_deref().unwrap_or_default()),
-                format!("{sender}: {text}"),
-            ),
+            ConversationKind::PublicChannel | ConversationKind::PrivateChannel => {
+                // A channel the store does not hold yet has no name to show.
+                let Some(conv) = conv else {
+                    return;
+                };
+                (
+                    format!("{ws_name} — #{}", conv.name.as_deref().unwrap_or_default()),
+                    format!("{sender}: {text}"),
+                )
+            }
         };
         let title = if rule_eval.is_priority_highlight() {
             format!("\u{2605} {raw_title}")

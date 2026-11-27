@@ -336,9 +336,10 @@ impl App {
         if !self.should_notify_with_eval(channel, message, rule_eval, window, cx) {
             return;
         }
-        let Some(conversation) = self.fixtures.conversation(channel) else {
+        let Some(kind) = self.conversation_kind(channel, message) else {
             return;
         };
+        let conversation = self.fixtures.conversation(channel);
         let sender = match &message.user {
             Some(user) => self.fixtures.user_name(user).to_owned(),
             None => (message.bot_profile.as_ref())
@@ -350,16 +351,26 @@ impl App {
         } else {
             "New message".to_owned()
         };
-        let (raw_title, body) = match conversation.kind() {
+        let (raw_title, body) = match kind {
             ConversationKind::Im => (sender, text),
+            // A group DM this message opens has no members to name yet.
             ConversationKind::Mpim => (
-                self.fixtures.conversation_label(conversation),
+                conversation.map_or_else(
+                    || "Group DM".to_owned(),
+                    |conversation| self.fixtures.conversation_label(conversation),
+                ),
                 format!("{sender}: {text}"),
             ),
-            _ => (
-                format!("#{}", conversation.name.clone().unwrap_or_default()),
-                format!("{sender}: {text}"),
-            ),
+            ConversationKind::PublicChannel | ConversationKind::PrivateChannel => {
+                // A channel the snapshot does not hold yet has no name to show.
+                let Some(conversation) = conversation else {
+                    return;
+                };
+                (
+                    format!("#{}", conversation.name.clone().unwrap_or_default()),
+                    format!("{sender}: {text}"),
+                )
+            }
         };
         let title = if rule_eval.is_priority_highlight() {
             format!("\u{2605} {raw_title}")
@@ -368,10 +379,7 @@ impl App {
         };
         let is_dm_or_mention = rule_eval.breaks_through_mute()
             || rule_eval.is_priority_highlight()
-            || matches!(
-                conversation.kind(),
-                ConversationKind::Im | ConversationKind::Mpim
-            )
+            || matches!(kind, ConversationKind::Im | ConversationKind::Mpim)
             || mentions_me(
                 &message.text,
                 &self.fixtures.self_user,
@@ -525,15 +533,10 @@ impl App {
         if rule_eval.is_suppressed() {
             return false;
         }
-        let dm = self
-            .fixtures
-            .conversation(channel)
-            .is_some_and(|conversation| {
-                matches!(
-                    conversation.kind(),
-                    ConversationKind::Im | ConversationKind::Mpim
-                )
-            });
+        let dm = matches!(
+            self.conversation_kind(channel, message),
+            Some(ConversationKind::Im | ConversationKind::Mpim)
+        );
         let sender_is_vip = message.user.as_ref().is_some_and(|u| {
             let user_obj = self.fixtures.user(u);
             let handle = user_obj.map(|x| x.name.as_str()).unwrap_or("");

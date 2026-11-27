@@ -1950,6 +1950,22 @@ fn should_notify_and_system_notification_dedup_cover_all_rules(cx: &mut gpui::Te
             );
             app.system_notification_kind("msg:C0ENG:1.2", "T", "B", false, cx);
             assert_eq!(app.recent_notified_tags.len(), 2);
+
+            // 9. A DM this very message opens, which the snapshot does not hold yet, notifies as
+            //    a DM under Mentions: its banner posts.
+            app.preferences.update(cx, |p, cx| {
+                let mut s = p.settings().clone();
+                s.notify_level = 1;
+                p.load_settings(s, window, cx);
+            });
+            let new_dm = ChannelId::from("D0NEW");
+            let opener = plain_msg(&peer, "hi");
+            app.message_posted(&new_dm, &opener, window, cx);
+            let tag = format!("msg:{new_dm}:{}", opener.ts);
+            assert!(
+                app.recent_notified_tags.iter().any(|(t, _)| *t == tag),
+                "a new DM's first message posts its banner"
+            );
         });
     });
     drop(root);
