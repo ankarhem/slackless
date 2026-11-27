@@ -2219,6 +2219,86 @@ mod state_machine {
         assert!(rt.subscribe_in_flight.is_some());
         assert!(!rt.pending_resubscribe);
     }
+
+    #[tokio::test]
+    async fn video_rx_empty_mime_does_not_blacklist_and_idle_worker_evicts_while_other_ssrc_streams()
+     {
+        use crate::session::video_rx::{VideoDecoderThreadArgs, spawn_video_decoder_thread};
+
+        let (vdec_tx, vdec_rx) = std::sync::mpsc::channel();
+        let (upd_tx, _upd_rx) = mpsc::unbounded_channel();
+        let (kf_tx, _kf_rx) = mpsc::unbounded_channel();
+        let (codec_tx, mut codec_rx) = mpsc::unbounded_channel();
+        let routing = Arc::new(Mutex::new(VideoRoutingTable::default()));
+        let perf = Arc::new(HuddlePerfCounters::default());
+        let audio_only = Arc::new(AtomicBool::new(false));
+        let clear_decoders = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let idle_timeout = Duration::from_millis(200);
+
+        let join = spawn_video_decoder_thread(VideoDecoderThreadArgs {
+            inbound_video_rx: vdec_rx,
+            audio_only,
+            clear_decoders,
+            shutdown,
+            idle_timeout,
+            routing,
+            perf: Arc::clone(&perf),
+            updates: upd_tx,
+            keyframe_req_tx: kf_tx,
+            codec_tx,
+        })
+        .expect("spawn video decoder thread");
+
+        let pkt = |ssrc: u32, seq: u16, mime: &str| InboundVideoPacket {
+            ssrc,
+            mid: "2".into(),
+            mime_type: mime.into(),
+            seq,
+            marker: false,
+            payload: bytes::Bytes::from_static(&[0x67, 0x42, 0x00, 0x1e]),
+        };
+
+        // 1. Early packet with empty `mime_type` must be skipped WITHOUT permanently blacklisting
+        //    SSRC 777 when `"video/H264"` arrives next.
+        vdec_tx.send(Some(pkt(777, 1, ""))).unwrap();
+        vdec_tx.send(Some(pkt(777, 2, "video/H264"))).unwrap();
+        let codec1 = tokio::time::timeout(Duration::from_secs(3), codec_rx.recv())
+            .await
+            .expect("codec notification for 777")
+            .expect("codec channel open");
+        assert!(codec1.contains("H264") || codec1.contains("H.264"));
+
+        // 2. Spawn a second decoder on SSRC 778, then stream packets to 778 continuously past
+        //    `idle_timeout` while 777 stays silent: 777 must STILL be evicted even though
+        //    `recv_timeout` never times out!
+        vdec_tx.send(Some(pkt(778, 1, "video/H264"))).unwrap();
+        let _codec2 = tokio::time::timeout(Duration::from_secs(3), codec_rx.recv())
+            .await
+            .expect("codec notification for 778")
+            .expect("codec channel open");
+        let spawn_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while perf.rx_decoders() != 2 && tokio::time::Instant::now() < spawn_deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(perf.rx_decoders(), 2);
+
+        let mut seq = 2u16;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while perf.rx_decoders() != 1 && tokio::time::Instant::now() < deadline {
+            vdec_tx.send(Some(pkt(778, seq, "video/H264"))).unwrap();
+            seq = seq.wrapping_add(1);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            perf.rx_decoders(),
+            1,
+            "idle SSRC 777 worker must be evicted even while SSRC 778 streams continuously"
+        );
+
+        vdec_tx.send(None).unwrap();
+        join.join().expect("decoder thread joins cleanly");
+    }
 }
 
 mod handshake_and_connected_loop_tests {

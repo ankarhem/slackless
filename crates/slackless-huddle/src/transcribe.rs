@@ -2090,4 +2090,40 @@ mod tests {
         let samples = decode_wav_bytes_to_16k_mono(&make_wav(16_000, u32::MAX)).unwrap();
         assert!(samples.is_empty());
     }
+
+    #[test]
+    fn vad_segmenter_flush_emits_speech_on_mute_and_resampler_flushes_tail_samples() {
+        // 1. VadSegmenter::flush() emits an in-progress utterance (>= 400ms) immediately when
+        //    muted or when a speaker switches, and resets internal state so a second flush is None.
+        let mut vad = VadSegmenter::new();
+        let voiced_20ms: Vec<f32> = (0..960)
+            .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.25)
+            .collect();
+        for _ in 0..30 {
+            assert!(vad.push_48k(&voiced_20ms).is_none());
+        }
+        let flushed = vad
+            .flush()
+            .expect("600ms buffered speech must emit on flush");
+        assert!(flushed.len() >= MIN_SPEECH_SAMPLES);
+        assert!(
+            vad.flush().is_none(),
+            "second flush after reset must return None"
+        );
+
+        // 2. 48 kHz -> 16 kHz WAV resampling flushes the RateConverter tail so 1.0s audio retains
+        //    at least 15,800 of the expected 16,000 samples (no truncated trailing words).
+        let pcm_48k: Vec<i16> = (0..48_000)
+            .map(|i| {
+                ((i as f32 * 300.0 * std::f32::consts::TAU / 48_000.0).sin() * 12_000.0) as i16
+            })
+            .collect();
+        let wav = crate::clips::encode_wav_pcm16(&pcm_48k, 48_000, 1);
+        let decoded = decode_wav_bytes_to_16k_mono(&wav).expect("48k WAV decode");
+        assert!(
+            decoded.len() >= 15_800 && decoded.len() <= 16_200,
+            "expected ~16000 samples after tail flush, got {}",
+            decoded.len()
+        );
+    }
 }
