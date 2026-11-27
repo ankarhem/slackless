@@ -1020,6 +1020,15 @@ fn wired_unread_counts_fold_alike_in_shown_and_background_workspaces(
     let (chan, dm) = (ChannelId::from("C0CHAN"), ChannelId::from("D0PEER"));
     // A DM opened by its first message: neither snapshot nor store holds it yet.
     let new_dm = ChannelId::from("D0NEW");
+    // A group DM opened so, its id (`C…`) any channel's: only the live event names its kind.
+    let new_group = ChannelId::from("C0NEWGROUP");
+    let group_opener: Message = serde_json::from_value(serde_json::json!({
+        "ts": "1700000006.000100",
+        "user": "U0PEER",
+        "text": "hi all",
+        "channel_type": "mpim",
+    }))
+    .expect("a live message");
     let post = |channel: &ChannelId, ts: &str, user: &str, text: &str| Event::MessagePosted {
         channel: channel.clone(),
         message: Box::new(Message {
@@ -1076,6 +1085,15 @@ fn wired_unread_counts_fold_alike_in_shown_and_background_workspaces(
             post(&new_dm, "1700000005.000100", "U0PEER", "hi"),
             &new_dm,
             (true, 1, 1, None),
+        ),
+        (
+            "a peer opens a new group DM",
+            Event::MessagePosted {
+                channel: new_group.clone(),
+                message: Box::new(group_opener),
+            },
+            &new_group,
+            (true, 1, 0, None),
         ),
     ];
     for (what, event, channel, expected) in rows {

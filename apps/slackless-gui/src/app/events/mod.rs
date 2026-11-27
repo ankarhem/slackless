@@ -8,16 +8,27 @@ mod workspace;
 
 use super::*;
 
-/// How someone else's unread message moves `channel`'s counts, `kind` being the conversation
-/// as the workspace knows it: a DM counts as a mention, also one this very message opens, which
-/// neither snapshot nor store holds yet and only its id names (`D…`).
-fn unread_arrival(channel: &ChannelId, kind: Option<ConversationKind>, mentioned: bool) -> Arrival {
-    let kind = kind.or_else(|| {
+/// What a conversation is that a live `message` opens, which neither snapshot nor store holds
+/// yet: what the event names (`channel_type`), else what its id does (`D…`, a DM).
+fn event_kind(channel: &ChannelId, message: &Message) -> Option<ConversationKind> {
+    let named = match (message.extra.get("channel_type")).and_then(serde_json::Value::as_str) {
+        Some("im") => Some(ConversationKind::Im),
+        Some("mpim") => Some(ConversationKind::Mpim),
+        Some("channel") => Some(ConversationKind::PublicChannel),
+        Some("group") => Some(ConversationKind::PrivateChannel),
+        _ => None,
+    };
+    named.or_else(|| {
         channel
             .as_str()
             .starts_with('D')
             .then_some(ConversationKind::Im)
-    });
+    })
+}
+
+/// How someone else's unread message moves its conversation's counts, `kind` being what the
+/// conversation is: a DM counts as a mention.
+fn unread_arrival(kind: Option<ConversationKind>, mentioned: bool) -> Arrival {
     Arrival::Unread {
         mention: mentioned || matches!(kind, Some(ConversationKind::Im | ConversationKind::Mpim)),
         im: kind == Some(ConversationKind::Im),

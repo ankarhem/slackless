@@ -253,11 +253,9 @@ impl App {
             } else if viewing && allow_mark {
                 Arrival::Seen
             } else {
-                let kind = self.fixtures.conversation(channel).map(Conversation::kind);
                 let me = &self.fixtures.self_user;
                 super::unread_arrival(
-                    channel,
-                    kind,
+                    self.conversation_kind(channel, message),
                     mentions_me(&message.text, me, &settings.keywords),
                 )
             };
@@ -314,6 +312,17 @@ impl App {
             });
         })
         .detach();
+    }
+
+    /// What `channel` is to the shown workspace, also when `message` opens it
+    /// ([`super::event_kind`]).
+    fn conversation_kind(
+        &self,
+        channel: &ChannelId,
+        message: &Message,
+    ) -> Option<ConversationKind> {
+        (self.fixtures.conversation(channel).map(Conversation::kind))
+            .or_else(|| super::event_kind(channel, message))
     }
 
     fn dispatch_message_notification(
