@@ -140,11 +140,15 @@ fn restore_initial_preferences(
     // Restore persisted Preferences settings first, then overlay the zoom/font/color_mode
     // values `main` installed before the first frame.
     let mut restored_settings = SETTINGS.read(local);
+    let had_saved_settings = restored_settings.is_some();
     let has_local_quick_pref = SETTINGS
         .raw(local)
         .is_some_and(|raw| raw.contains("\"show_quick_reactions\""));
     if !has_local_quick_pref {
         let mut base = restored_settings.unwrap_or_default();
+        if !had_saved_settings && let Some(palette) = fixtures.palette {
+            base.palette = palette;
+        }
         base.show_quick_reactions = !fixtures.quick_reactions.is_empty();
         if !fixtures.quick_reactions.is_empty() {
             let mut emojis = crate::actions::DEFAULT_QUICK_REACTIONS.map(String::from);
@@ -1594,6 +1598,31 @@ fn install_os_and_lifecycle_hooks(app: &Entity<App>, window: &mut Window, cx: &m
 
 fn hydrate_initial_channel(app: &Entity<App>, window: &mut Window, cx: &mut gpui::App) {
     app.update(cx, |app, cx| {
+        // Hydrate every persisted preference (composer, search, timezone, media policy, nav) and
+        // push non-default privacy flags (`stealth_mode`, `huddle_save_transcripts`) to ALL core
+        // bridges BEFORE frame-0 `mark_read` so Stealth Mode never leaks a read receipt on launch.
+        let (stealth_mode, save_huddle_transcripts) = {
+            let s = app.preferences.read(cx).settings();
+            (s.stealth_mode, s.huddle_save_transcripts)
+        };
+        if stealth_mode {
+            app.bridge.send(WorkspaceCommand::SetStealthMode(true));
+            for slot in &app.slots {
+                if let Some(bridge) = &slot.bridge {
+                    bridge.send(WorkspaceCommand::SetStealthMode(true));
+                }
+            }
+        }
+        if !save_huddle_transcripts {
+            app.bridge
+                .send(WorkspaceCommand::SetSaveHuddleTranscripts(false));
+            for slot in &app.slots {
+                if let Some(bridge) = &slot.bridge {
+                    bridge.send(WorkspaceCommand::SetSaveHuddleTranscripts(false));
+                }
+            }
+        }
+        app.apply_preferences(window, cx);
         app.push_self_state(cx);
         app.sync_saved(cx);
         app.sync_later_count(cx);

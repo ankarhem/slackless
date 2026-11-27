@@ -846,7 +846,9 @@ impl Preferences {
         let ai_model = settings.ai_summary.model.clone();
         let quick_emojis = settings.quick_reaction_emojis.clone();
         slackless_core::api::set_proxy_url(Some(proxy.clone()));
-        slackless_core::api::set_net_log_enabled(settings.net_log_enabled);
+        slackless_core::api::set_net_log_enabled(
+            settings.net_log_enabled || settings.debug_logging,
+        );
         let rgb_pair = settings.palette.rgb_pair();
         self.settings = settings;
         self.keywords
@@ -918,6 +920,7 @@ impl Preferences {
             .trim()
             .to_owned();
         if topic.is_empty() || text.is_empty() {
+            self.rule_editor.semantic_test_gen = self.rule_editor.semantic_test_gen.wrapping_add(1);
             self.rule_editor.semantic_test_loading = false;
             self.rule_editor.semantic_test_cache = None;
             return;

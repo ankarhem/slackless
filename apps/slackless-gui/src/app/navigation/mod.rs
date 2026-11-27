@@ -956,6 +956,9 @@ impl App {
                 }
             }
         };
+        // Clear the outgoing workspace's right pane BEFORE swapping views so its parked
+        // `MessageList` drops any active `open_thread` highlight before being stored away.
+        self.set_right_pane(RightPane::None, cx);
         let outgoing = Parked {
             fixtures: mem::replace(&mut self.fixtures, incoming.fixtures),
             channel: mem::replace(&mut self.channel, incoming.channel),
@@ -996,9 +999,9 @@ impl App {
         self.user_menu_open = false;
         self.canvas_query.clear();
         crate::canvas::clear_ui_store(cx);
+        crate::lists::clear_ui_store(cx);
         self.list_query.clear();
         self.list_sort = None;
-        self.set_right_pane(RightPane::None, cx);
         let fixtures = self.fixtures.clone();
         self.emoji_picker.update(cx, |picker, cx| {
             picker.sync_workspace(fixtures.clone(), window, cx);
@@ -1043,7 +1046,8 @@ impl App {
         });
         self.load_draft(cx);
         self.sync_composer_placeholder(cx);
-        // Apply per-workspace color theme palette (`F-SHELL-076`).
+        // Apply per-workspace color theme palette (`F-SHELL-076`) without triggering a spurious
+        // `SetUserPref("sidebar_theme")` write or clobbering the incoming workspace's `SETTINGS`.
         let ws_palette = self
             .bridge
             .settings()
@@ -1057,6 +1061,9 @@ impl App {
                     prefs.load_settings(next, window, cx);
                 }
             });
+            if let Some(ref mut saved) = self.saved_settings {
+                saved.palette = palette;
+            }
         }
         // New thread panels / profile panes pick up Enter-to-send and the self state.
         let active_team =
@@ -1067,6 +1074,7 @@ impl App {
         self.preferences.update(cx, |prefs, cx| {
             prefs.set_backfill_progress(bf_progress, cx);
         });
+        self.refresh_storage_stats(cx);
         self.sync_search_workspace_sources(cx);
         self.apply_preferences(window, cx);
         self.update_menus(cx);
@@ -1365,9 +1373,16 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(idx) = self.workspace_index_for(workspace)
-            && idx != self.workspace
-        {
+        let Some(idx) = self.workspace_index_for(workspace) else {
+            notify(
+                "Workspace unavailable",
+                format!("Workspace {} is not signed in.", workspace.as_str()),
+                window,
+                cx,
+            );
+            return;
+        };
+        if idx != self.workspace {
             self.switch_workspace(idx, window, cx);
         }
         self.select(channel, cx);
@@ -1385,9 +1400,16 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(idx) = self.workspace_index_for(workspace)
-            && idx != self.workspace
-        {
+        let Some(idx) = self.workspace_index_for(workspace) else {
+            notify(
+                "Workspace unavailable",
+                format!("Workspace {} is not signed in.", workspace.as_str()),
+                window,
+                cx,
+            );
+            return;
+        };
+        if idx != self.workspace {
             self.switch_workspace(idx, window, cx);
         }
         self.select(channel.clone(), cx);
@@ -1403,9 +1425,16 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(idx) = self.workspace_index_for(workspace)
-            && idx != self.workspace
-        {
+        let Some(idx) = self.workspace_index_for(workspace) else {
+            notify(
+                "Workspace unavailable",
+                format!("Workspace {} is not signed in.", workspace.as_str()),
+                window,
+                cx,
+            );
+            return;
+        };
+        if idx != self.workspace {
             self.switch_workspace(idx, window, cx);
         }
         let target_channel = channel.unwrap_or_else(|| self.channel.clone());

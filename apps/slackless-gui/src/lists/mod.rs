@@ -134,6 +134,17 @@ struct ListUiStore {
 
 impl Global for ListUiStore {}
 
+/// Clear cached per-list UI panels, comments, and metadata when switching workspaces so one
+/// workspace's list state never leaks into another.
+pub fn clear_ui_store(cx: &mut App) {
+    if cx.has_global::<ListUiStore>() {
+        let store = cx.global_mut::<ListUiStore>();
+        store.panels.clear();
+        store.record_comments.clear();
+        store.list_meta.clear();
+    }
+}
+
 /// Store loaded comment thread messages for a list record (`Event::ListRecordComments`).
 pub fn set_record_comments(
     list_id: &str,

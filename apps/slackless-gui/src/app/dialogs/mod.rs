@@ -114,6 +114,11 @@ impl App {
         {
             self.bridge
                 .send(WorkspaceCommand::SetStealthMode(settings.stealth_mode));
+            for slot in &self.slots {
+                if let Some(bridge) = &slot.bridge {
+                    bridge.send(WorkspaceCommand::SetStealthMode(settings.stealth_mode));
+                }
+            }
         }
         if self
             .saved_settings

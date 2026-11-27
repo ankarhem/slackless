@@ -27,13 +27,9 @@ impl App {
     }
 
     /// Open Slack's in-app Downloads list (`Cmd+Shift+J`): shows every file downloaded in this
-    /// session with Open / Show in Finder / Retry controls plus a shortcut to `~/Downloads`.
+    /// session with Open / Show in Finder / Retry controls plus a shortcut to the downloads folder.
     pub(in crate::app) fn open_downloads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let downloads_dir = std::env::var_os("HOME").map(|home| {
-            let mut p = std::path::PathBuf::from(home);
-            p.push("Downloads");
-            p
-        });
+        let downloads_dir = Some(self.default_export_dir(cx));
         window.open_dialog(cx, move |dialog, _, cx| {
             let theme = cx.theme();
             let (border, muted, foreground, danger) = (
@@ -244,13 +240,19 @@ impl App {
                 .update(cx, |prefs, cx| prefs.set_storage_stats(None, cx));
             return;
         };
-        let prefs = self.preferences.downgrade();
-        cx.spawn(async move |_, cx| {
+        let epoch = self.workspace_epoch;
+        cx.spawn(async move |this, cx| {
             let info = cx
                 .background_executor()
                 .spawn(async move { collect_storage_info(&store, &team) })
                 .await;
-            let _ = prefs.update(cx, |prefs, cx| prefs.set_storage_stats(info, cx));
+            let _ = this.update(cx, |app, cx| {
+                if app.workspace_epoch != epoch {
+                    return;
+                }
+                app.preferences
+                    .update(cx, |prefs, cx| prefs.set_storage_stats(info, cx));
+            });
         })
         .detach();
     }
@@ -266,8 +268,8 @@ impl App {
             .bridge
             .read_store_clone()
             .zip(self.bridge.team_id().cloned());
-        let prefs = self.preferences.downgrade();
-        cx.spawn_in(window, async move |_, cx| {
+        let epoch = self.workspace_epoch;
+        cx.spawn_in(window, async move |this, cx| {
             let (info, sem_snap) = cx
                 .background_executor()
                 .spawn(async move {
@@ -277,8 +279,11 @@ impl App {
                     (info, sem_snap)
                 })
                 .await;
-            let _ = cx.update(|window, cx| {
-                let _ = prefs.update(cx, |prefs, cx| {
+            let _ = this.update_in(cx, |app, window, cx| {
+                if app.workspace_epoch != epoch {
+                    return;
+                }
+                app.preferences.update(cx, |prefs, cx| {
                     prefs.set_storage_stats(info, cx);
                     prefs.set_semantic_snapshot(sem_snap, cx);
                 });
@@ -309,17 +314,17 @@ impl App {
             let outcome: Result<u64, String> = cx
                 .background_executor()
                 .spawn(async move {
-                    let before = store
-                        .lock()
-                        .ok()
-                        .and_then(|s| s.stats(&team).ok())
-                        .map(|s| s.db_bytes())
-                        .unwrap_or(0);
                     let mut guard = store
                         .lock()
                         .map_err(|_| "Could not acquire database lock.".to_owned())?;
+                    let total_bytes = |s: &slackless_core::store::Store| -> u64 {
+                        let db = s.stats(&team).ok().map(|st| st.db_bytes()).unwrap_or(0);
+                        let wal = s.file_info().map(|f| f.wal_bytes).unwrap_or(0);
+                        db.saturating_add(wal)
+                    };
+                    let before = total_bytes(&guard);
                     guard.vacuum().map_err(|err| err.to_string())?;
-                    let after = guard.stats(&team).ok().map(|s| s.db_bytes()).unwrap_or(0);
+                    let after = total_bytes(&guard);
                     Ok(before.saturating_sub(after))
                 })
                 .await;
@@ -327,7 +332,10 @@ impl App {
                 Ok(saved) => {
                     app.refresh_storage_stats_in(window, cx);
                     let msg = if saved > 0 {
-                        format!("Reclaimed {} KiB and optimized FTS5 indexes.", saved / 1024)
+                        format!(
+                            "Reclaimed {} KiB and optimized FTS5 indexes.",
+                            (saved / 1024).max(1)
+                        )
                     } else {
                         "Database is already compact; FTS5 statistics refreshed.".to_owned()
                     };

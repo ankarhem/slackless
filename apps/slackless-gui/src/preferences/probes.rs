@@ -11,8 +11,10 @@ impl Preferences {
         if self.section == Section::AudioVideo && self.mic_probe.is_none() && !self.audio_loading {
             self.refresh_audio_devices_and_probe(cx);
         }
-        if self.section == Section::Advanced {
+        if matches!(self.section, Section::Advanced | Section::Notifications) {
             self.refresh_semantic_snapshot(cx);
+        }
+        if self.section == Section::Advanced {
             self.refresh_ai_api_key_status(cx);
         }
     }

@@ -3197,3 +3197,213 @@ fn wired_cloud_draft_hydration_scheduled_send_now_and_broadcast_escape(
 
     drop(root);
 }
+
+#[gpui::test]
+fn wired_cold_launch_stealth_mode_huddle_transcript_and_palette_hydration(
+    cx: &mut gpui::TestAppContext,
+) {
+    let people = [user("U0ME", "me"), user("U0ALICE", "alice")];
+    let (b1, c1) = cx.update(|cx| {
+        make_wired_workspace(
+            "T0ST1",
+            "Stealth One",
+            &[("C0ENG", "engineering")],
+            &people,
+            cx,
+        )
+    });
+    let (b2, c2) = cx.update(|cx| {
+        make_wired_workspace("T0ST2", "Stealth Two", &[("C0OPS", "ops")], &people, cx)
+    });
+
+    // Persist non-default privacy & debug settings in WS 0 before cold launch, plus a message
+    // in C0ENG so `hydrate_initial_channel` hits the frame-0 `mark_read` path.
+    let persisted = crate::preferences::Settings {
+        stealth_mode: true,
+        huddle_save_transcripts: false,
+        debug_logging: true,
+        net_log_enabled: false,
+        ..Default::default()
+    };
+    {
+        let store = b1.store().expect("ws0 store");
+        let mut guard = store.lock().unwrap();
+        let ws = TeamId::from("T0ST1");
+        guard
+            .set_local(
+                &ws,
+                "preferences_settings",
+                &serde_json::to_string(&persisted).expect("serialize settings"),
+            )
+            .expect("write SETTINGS");
+        guard
+            .upsert_messages(
+                &ws,
+                &ChannelId::from("C0ENG"),
+                &[Message {
+                    ts: Ts::from("1700001000.000100"),
+                    user: Some(UserId::from("U0ALICE")),
+                    text: "hello before stealth launch".into(),
+                    ..Default::default()
+                }],
+            )
+            .expect("seed message");
+    }
+
+    let mut fx = b1.snapshot(&HashMap::new()).expect("snapshot");
+    fx.set_rail_workspaces(vec![
+        b1.team_summary().expect("ws0 team"),
+        b2.team_summary().expect("ws1 team"),
+    ]);
+    let (root, _app, vcx) = mount_wired(fx, vec![b1, b2], cx);
+    vcx.run_until_parked();
+
+    let cmds1 = c1.drain_commands();
+    let cmds2 = c2.drain_commands();
+
+    let stealth_pos = cmds1.iter().position(|c| {
+        matches!(
+            c,
+            Command::Workspace(WorkspaceCommand::SetStealthMode(true))
+        )
+    });
+    let mark_pos = cmds1
+        .iter()
+        .position(|c| matches!(c, Command::Messaging(MessagingCommand::MarkRead { .. })));
+    assert!(
+        stealth_pos.is_some(),
+        "cold launch must send SetStealthMode(true) to WS 0: {cmds1:?}"
+    );
+    if let (Some(s_ix), Some(m_ix)) = (stealth_pos, mark_pos) {
+        assert!(
+            s_ix < m_ix,
+            "SetStealthMode(true) must precede frame-0 MarkRead ({s_ix} < {m_ix})"
+        );
+    }
+    assert!(
+        cmds1.iter().any(|c| matches!(
+            c,
+            Command::Workspace(WorkspaceCommand::SetSaveHuddleTranscripts(false))
+        )),
+        "cold launch must send SetSaveHuddleTranscripts(false) to WS 0: {cmds1:?}"
+    );
+    assert!(
+        cmds2.iter().any(|c| matches!(
+            c,
+            Command::Workspace(WorkspaceCommand::SetStealthMode(true))
+        )),
+        "cold launch must propagate SetStealthMode(true) to background WS 1: {cmds2:?}"
+    );
+    assert!(
+        cmds2.iter().any(|c| matches!(
+            c,
+            Command::Workspace(WorkspaceCommand::SetSaveHuddleTranscripts(false))
+        )),
+        "cold launch must propagate SetSaveHuddleTranscripts(false) to background WS 1: {cmds2:?}"
+    );
+    assert!(
+        slackless_core::api::net_log_enabled(),
+        "debug_logging=true must keep net_log_enabled active after load_settings"
+    );
+    drop(root);
+}
+
+#[gpui::test]
+fn wired_first_launch_preserves_synced_workspace_palette(cx: &mut gpui::TestAppContext) {
+    let people = [user("U0ME", "me"), user("U0ALICE", "alice")];
+    let (b3, _c3) = cx.update(|cx| {
+        make_wired_workspace("T0PAL", "Palette Co", &[("C0GEN", "general")], &people, cx)
+    });
+    let mut fx3 = b3.snapshot(&HashMap::new()).expect("snapshot");
+    fx3.palette = Some(theme::Palette::Aubergine);
+    let (root3, app3, vcx3) = mount_wired(fx3, vec![b3], cx);
+    vcx3.update(|_, cx| {
+        assert_eq!(
+            app3.read(cx).preferences.read(cx).settings().palette,
+            theme::Palette::Aubergine,
+            "first launch with no local SETTINGS must preserve fixtures.palette"
+        );
+    });
+    drop(root3);
+}
+
+#[gpui::test]
+fn wired_multi_workspace_switch_isolation_and_catchup_unknown_guard(cx: &mut gpui::TestAppContext) {
+    let people = [user("U0ME", "me"), user("U0ALICE", "alice")];
+    let (b1, c1) =
+        cx.update(|cx| make_wired_workspace("T0ISO1", "Iso One", &[("C0ONE", "one")], &people, cx));
+    let (b2, c2) =
+        cx.update(|cx| make_wired_workspace("T0ISO2", "Iso Two", &[("C0TWO", "two")], &people, cx));
+    // Persist distinct workspace palettes so switching exercises per-workspace theme syncing.
+    for (bridge, team, palette) in [
+        (&b1, "T0ISO1", theme::Palette::Aubergine),
+        (&b2, "T0ISO2", theme::Palette::Lagoon),
+    ] {
+        let s = crate::preferences::Settings {
+            palette,
+            ..Default::default()
+        };
+        let store = bridge.store().expect("store");
+        store
+            .lock()
+            .unwrap()
+            .set_local(
+                &TeamId::from(team),
+                "preferences_settings",
+                &serde_json::to_string(&s).expect("serialize settings"),
+            )
+            .expect("write SETTINGS");
+    }
+
+    let mut fx1 = b1.snapshot(&HashMap::new()).expect("snapshot");
+    fx1.set_rail_workspaces(vec![
+        b1.team_summary().expect("ws0 team"),
+        b2.team_summary().expect("ws1 team"),
+    ]);
+    let (root, app, cx) = mount_wired(fx1, vec![b1, b2], cx);
+    let _ = c1.drain_commands();
+    let _ = c2.drain_commands();
+
+    // Switch 0 -> 1: must NOT fire a spurious `SetUserPref("sidebar_theme")` on WS 1.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.switch_workspace(1, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let cmds2 = c2.drain_commands();
+    assert!(
+        !cmds2.iter().any(|c| matches!(
+            c,
+            Command::Workspace(WorkspaceCommand::SetUserPref { name, .. })
+                if name == "sidebar_theme"
+        )),
+        "workspace switch must not emit spurious SetUserPref(sidebar_theme): {cmds2:?}"
+    );
+
+    // Unknown workspace in `open_catchup_channel` must bail without opening foreign channel ID.
+    let _ = c2.drain_commands();
+    let foreign = ChannelId::from("C0FOREIGN");
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_catchup_channel(
+                &TeamId::from("T0UNKNOWN"),
+                foreign.clone(),
+                None,
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    let cmds2 = c2.drain_commands();
+    assert!(
+        !cmds2.iter().any(|c| matches!(
+            c,
+            Command::Channel(ChannelCommand::OpenConversation(ch)) if *ch == foreign
+        )),
+        "open_catchup_channel for unknown workspace must not open foreign channel: {cmds2:?}"
+    );
+
+    drop(root);
+}
