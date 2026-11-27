@@ -8,7 +8,7 @@ use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, Div, FontWeight, Global, ImageSource, ImgResourceLoader,
     InteractiveElement as _, IntoElement, MouseButton, ObjectFit, ParentElement as _, RenderOnce,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, canvas, div, px,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use slackless_core::types::{ChannelId, File, FileId, TranscriptCue, Ts, UserId};
 
@@ -985,22 +985,7 @@ impl RenderOnce for VideoFrame {
                 None
             };
 
-            let id_vis = id_str.clone();
-            let visibility_probe = canvas(
-                move |bounds, window, cx| {
-                    let vp = window.viewport_size();
-                    let visible = bounds.size.width > px(0.)
-                        && bounds.size.height > px(0.)
-                        && bounds.bottom() > px(48.)
-                        && bounds.top() < vp.height - px(12.)
-                        && bounds.right() > px(0.)
-                        && bounds.left() < vp.width;
-                    crate::media::report_inline_video_painted(&id_vis, visible, cx);
-                },
-                |_, (), _, _| {},
-            )
-            .absolute()
-            .inset_0();
+            let visibility_probe = crate::media::inline_video_visibility_probe(id_str.clone());
 
             div()
                 .id(SharedString::from(format!("video-active-{}", file.id)))

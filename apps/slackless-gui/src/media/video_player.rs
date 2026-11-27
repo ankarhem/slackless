@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    AnyElement, App, Bounds, EntityId, Global, Hsla, ImageSource, InteractiveElement as _,
+    AnyElement, App, Bounds, Canvas, EntityId, Global, Hsla, ImageSource, InteractiveElement as _,
     IntoElement as _, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement as _,
     Pixels, SharedString, StatefulInteractiveElement as _, Styled as _, Window, WindowId, canvas,
     div, px, relative, rgb,
@@ -301,6 +301,27 @@ pub fn inline_video_begin_paint(window: &Window, cx: &mut App) -> u64 {
     } else {
         0
     }
+}
+
+/// An absolutely positioned overlay for the inline video card `file_id` that reports, from
+/// each paint's `prepaint` pass, whether the card is on screen (below the title bar and inside
+/// the viewport), so the mini-player dock follows the card it replaces.
+pub fn inline_video_visibility_probe(file_id: String) -> Canvas<()> {
+    canvas(
+        move |bounds, window, cx| {
+            let vp = window.viewport_size();
+            let visible = bounds.size.width > px(0.)
+                && bounds.size.height > px(0.)
+                && bounds.bottom() > px(48.)
+                && bounds.top() < vp.height - px(12.)
+                && bounds.right() > px(0.)
+                && bounds.left() < vp.width;
+            report_inline_video_painted(&file_id, visible, cx);
+        },
+        |_, (), _, _| {},
+    )
+    .absolute()
+    .inset_0()
 }
 
 /// Record from an active inline `VideoFrame`'s `prepaint` pass that its card is mounted in the

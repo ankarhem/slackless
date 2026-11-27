@@ -121,6 +121,8 @@ pub(super) fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                         poster,
                         px(6.),
                     ))
+                    // The dock follows this card's visibility, as it does the file card's.
+                    .child(crate::media::inline_video_visibility_probe(vid_id.clone()))
                     .child(
                         h_flex()
                             .absolute()
