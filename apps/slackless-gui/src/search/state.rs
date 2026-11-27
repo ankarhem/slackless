@@ -429,7 +429,7 @@ impl SearchView {
     /// Preserves `self.workspace` once initialized so workspace index > 0 is never clobbered.
     pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
         if self.workspace.as_str().is_empty()
-            && let Some(team) = fixtures.workspaces.first()
+            && let Some(team) = fixtures.own_team()
         {
             self.workspace = team.id.clone();
         }

@@ -1200,7 +1200,7 @@ impl Sidebar {
     ) -> Option<ChannelMenuInput> {
         let conversation = self.listed_conversation(channel)?;
         let section = section.and_then(|id| self.section_set().iter().find(|known| known.id == id));
-        let link = match self.fixtures.workspaces.first() {
+        let link = match self.fixtures.own_team() {
             Some(team) if !team.domain.is_empty() => {
                 format!(
                     "https://{}.slack.com/archives/{}",

@@ -125,11 +125,7 @@ pub(crate) struct OrgLine {
 
 /// The signed-in workspace's own team id.
 pub(crate) fn own_team(fixtures: &Fixtures) -> TeamId {
-    fixtures
-        .workspaces
-        .first()
-        .map(|team| team.id.clone())
-        .unwrap_or_default()
+    fixtures.own_team_id().cloned().unwrap_or_default()
 }
 
 /// Stored profiles by id, so member surfaces look each person up once instead of scanning

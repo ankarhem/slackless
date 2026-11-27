@@ -479,10 +479,15 @@ impl Fixtures {
         crate::messages::plain_text(&message.text, self).replace('\n', " ")
     }
 
-    /// The signed-in workspace's own team ID, if present: its record leads `teams`, while
-    /// `workspaces` lists every workspace in the rail's order.
+    /// The signed-in workspace's own team record: it leads `teams`, while `workspaces` lists
+    /// every workspace in the rail's order, whichever tile comes first.
+    pub fn own_team(&self) -> Option<&Team> {
+        self.teams.first()
+    }
+
+    /// The signed-in workspace's own team ID, if present (see [`Self::own_team`]).
     pub fn own_team_id(&self) -> Option<&TeamId> {
-        self.teams.first().map(|team| &team.id)
+        self.own_team().map(|team| &team.id)
     }
 
     /// Look up any known external organization record by team ID (returns `None` for own workspace).

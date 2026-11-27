@@ -552,6 +552,8 @@ fn sidebar_custom_sections_starring_notify_and_nav_cycling(cx: &mut gpui::TestAp
             ..Default::default()
         },
     );
+    // The rail lists Side Project first; the shown workspace is still Acme.
+    fx.workspaces.rotate_left(1);
     let fx = Arc::new(fx);
 
     let mounted = std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -566,6 +568,14 @@ fn sidebar_custom_sections_starring_notify_and_nav_cycling(cx: &mut gpui::TestAp
     let sidebar = mounted.borrow_mut().take().unwrap();
 
     sidebar.update(cx, |s, cx| {
+        // The row menu's archive link belongs to the shown workspace, whichever tile the rail
+        // lists first.
+        let link = s
+            .channel_menu_input(&ch0, None)
+            .expect("listed channel")
+            .link;
+        assert_eq!(link, format!("https://acme.slack.com/archives/{ch0}"));
+
         // #general is never considered dormant even with `is_dormant: true`.
         let general = s.fixtures.conversation(&ch0).unwrap();
         assert!(!s.is_dormant(general));

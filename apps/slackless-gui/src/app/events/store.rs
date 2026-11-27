@@ -127,7 +127,7 @@ impl App {
                 app.ws.reload = None;
                 // This workspace's stored team record refreshes its slot; the rail keeps every
                 // workspace, in its order.
-                if let Some(own) = snapshot.workspaces.first().cloned() {
+                if let Some(own) = snapshot.own_team().cloned() {
                     app.slots[app.workspace].team = own;
                 }
                 snapshot.workspaces = app.rail_teams();

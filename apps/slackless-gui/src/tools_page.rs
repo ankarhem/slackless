@@ -133,7 +133,7 @@ impl ToolsPage {
     }
 
     fn external_orgs(&self, needle: &str) -> Vec<&Team> {
-        let own = self.fixtures.workspaces.first().map(|t| &t.id);
+        let own = self.fixtures.own_team_id();
         self.fixtures
             .teams
             .iter()

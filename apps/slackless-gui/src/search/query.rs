@@ -713,7 +713,7 @@ pub(super) fn index_semantic_workspaces(
 /// Fixture mode's archive: an in-memory store holding the first fixture workspace (users,
 /// conversations, history and thread replies), searched exactly like a synced archive.
 pub fn fixture_archive(fixtures: &Fixtures) -> Option<SharedStore> {
-    let workspace = fixtures.workspaces.first()?.id.clone();
+    let workspace = fixtures.own_team_id()?.clone();
     fixture_archive_for(fixtures, &workspace)
 }
 

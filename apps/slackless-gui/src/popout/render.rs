@@ -669,7 +669,7 @@ impl PopoutWindow {
                 if is_live {
                     (send)(WorkspaceCommand::FetchUserProfile(user_id.clone()).into());
                 }
-                if let Some(team) = fixtures.workspaces.first().filter(|t| !t.domain.is_empty()) {
+                if let Some(team) = fixtures.own_team().filter(|t| !t.domain.is_empty()) {
                     cx.open_url(&format!(
                         "https://{}.slack.com/team/{}",
                         team.domain, user_id
@@ -685,8 +685,7 @@ impl PopoutWindow {
             Rc::new(move |kind, fid, url, window: &mut Window, cx: &mut App| {
                 if url.starts_with("https://") || url.starts_with("http://") {
                     cx.open_url(&url);
-                } else if let Some(team) =
-                    fixtures.workspaces.first().filter(|t| !t.domain.is_empty())
+                } else if let Some(team) = fixtures.own_team().filter(|t| !t.domain.is_empty())
                     && !fid.is_empty()
                 {
                     let seg = match kind {
