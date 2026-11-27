@@ -218,7 +218,8 @@ use self::helpers::{
     sync_launch_at_login, workspace_badge_from_counts,
 };
 pub(crate) use self::messaging::{
-    broadcast_autocomplete_hint, broadcast_guard, confirm_broadcast, mention_permission_summary,
+    MessageSurface, MessageTarget, broadcast_autocomplete_hint, broadcast_guard, confirm_broadcast,
+    mention_permission_summary,
 };
 #[cfg(test)]
 pub(crate) use self::messaging::{evaluate_broadcast_guard, matching_slash_candidates};

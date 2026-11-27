@@ -753,6 +753,21 @@ pub(super) struct OutgoingMessage {
     pub files: Option<Rc<Vec<composer::PendingAttachment>>>,
 }
 
+/// The list a message-level action was triggered from: an unread group's row or a Threads card.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessageSurface {
+    Unreads,
+    Threads,
+}
+
+/// The message a list-surface action names: its surface, conversation, and the card a Threads
+/// row belongs to.
+pub(crate) struct MessageTarget {
+    pub surface: MessageSurface,
+    pub channel: ChannelId,
+    pub thread_ts: Option<Ts>,
+}
+
 /// A New-message send waiting for [`ChannelCommand::OpenDm`] to open the DM with `users`.
 pub(super) struct PendingDm {
     pub users: Vec<UserId>,
@@ -1815,197 +1830,56 @@ impl App {
         }
     }
 
-    /// Dispatch a message-level action triggered from an unread row's hover toolbar, reaction
-    /// chips, image click, or context menu (`UnreadsEvent::MessageAction`).
-    pub(super) fn handle_unreads_message_action(
+    /// Dispatch a message-level action from a row's hover toolbar, reaction chips, image click,
+    /// Block Kit action or context menu on one of the two list surfaces (`UnreadsEvent::MessageAction`,
+    /// `ThreadsEvent::MessageAction`). `thread_ts` is the card a Threads row belongs to.
+    pub(super) fn handle_message_action(
         &mut self,
-        channel: ChannelId,
+        target: MessageTarget,
         message: Message,
         action: crate::actions::MessageAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use crate::actions::MessageAction;
-        let ts = message.ts.clone();
-        match action {
-            MessageAction::React(name) | MessageAction::ToggleReaction(name) => {
-                if let Some(add) = self
-                    .unreads
-                    .update(cx, |u, cx| u.toggle_reaction(&channel, &ts, &name, cx))
-                {
-                    self.post_change(
-                        &channel,
-                        &MessageChange::React {
-                            ts: ts.clone(),
-                            name: name.clone(),
-                            add,
-                        },
-                    );
-                }
-            }
-            MessageAction::PickReaction(position) => {
-                self.open_picker(PickerTarget::Message { channel, ts }, position, window, cx);
-            }
-            MessageAction::ReplyInThread => {
-                let thread_ts = message.thread_ts.clone().unwrap_or(ts);
-                self.open_thread(channel, thread_ts, cx);
-            }
-            MessageAction::CopyLink => {
-                actions::copy_link(&self.fixtures, &channel, &ts, window, cx);
-            }
-            MessageAction::CopyText => {
-                actions::copy_message_text(&self.fixtures, &message, window, cx);
-            }
-            MessageAction::Forward => {
-                let link = actions::permalink(&self.fixtures, &channel, &ts);
-                self.open_compose(&link, window, cx);
-            }
-            MessageAction::SaveForLater => {
-                let saved = !self
-                    .later
-                    .read(cx)
-                    .saved_in(self.workspace)
-                    .iter()
-                    .any(|(_, s_ts)| *s_ts == ts);
-                let request =
-                    actions::build_save_request(&self.fixtures, channel, &message, saved, None);
-                self.save_for_later(&request, cx);
-                self.sync_saved(cx);
-                actions::notify_saved_toggled(saved, String::new(), window, cx);
-            }
-            MessageAction::RemindMe(remind) => {
-                let due = Some(remind.at(crate::drafts::now_secs()));
-                let request =
-                    actions::build_save_request(&self.fixtures, channel, &message, true, due);
-                self.save_for_later(&request, cx);
-                self.sync_saved(cx);
-                notify("Reminder set", remind.label().to_lowercase(), window, cx);
-            }
-            MessageAction::RemindCustom => {
-                let this = cx.entity().downgrade();
-                let fixtures = self.fixtures.clone();
-                actions::open_custom_remind_for_message(
-                    &fixtures,
-                    channel,
-                    &message,
-                    window,
-                    cx,
-                    move |request, when, window, cx| {
-                        let _ = this.update(cx, |app, cx| {
-                            app.save_for_later(&request, cx);
-                            app.sync_saved(cx);
-                            notify("Reminder set", when, window, cx);
-                        });
-                    },
-                );
-            }
-            MessageAction::TogglePin => {
-                if let Some(pinned) = self
-                    .unreads
-                    .update(cx, |u, cx| u.toggle_pin(&channel, &ts, cx))
-                {
-                    self.post_change(&channel, &MessageChange::Pin { ts, pinned });
-                    actions::notify_pin_toggled(pinned, String::new(), window, cx);
-                }
-            }
-            MessageAction::MarkUnread => {
-                self.post_change(&channel, &MessageChange::MarkUnread { ts: ts.clone() });
-                self.apply_local_mark_unread(&channel, ts, cx);
-                notify("Marked unread", String::new(), window, cx);
-            }
-            MessageAction::Edit => {
-                self.select(channel, cx);
-                self.messages.update(cx, |list, cx| list.reveal(&ts, cx));
-            }
-            MessageAction::Delete => {
-                let this = cx.entity().downgrade();
-                let fixtures = self.fixtures.clone();
-                actions::confirm_delete(message, fixtures, window, cx, move |cx| {
-                    let _ = this.update(cx, |app, cx| {
-                        app.unreads
-                            .update(cx, |u, cx| u.remove_message(&channel, &ts, cx));
-                        app.post_change(&channel, &MessageChange::Delete { ts: ts.clone() });
-                    });
-                });
-            }
-            MessageAction::OpenProfile(user) => self.open_profile(user, cx),
-            MessageAction::OpenImage(origin) => {
-                if let Some((images, index)) = crate::image_viewer::collect_viewer_images(
-                    &self.fixtures,
-                    std::iter::once(&message),
-                    &message.ts,
-                    &origin,
-                ) {
-                    self.open_image_viewer(channel, images, index, window, cx);
-                }
-            }
-            MessageAction::ViewHistory => {
-                self.open_revision_history(channel, ts, window, cx);
-            }
-            MessageAction::AddToList => {
-                self.open_add_to_list_dialog(channel, ts, window, cx);
-            }
-            MessageAction::SendToChannel => {}
-            MessageAction::JoinHuddle => {
-                if self.channel != channel {
-                    self.select(channel, cx);
-                }
-                self.start_huddle(window, cx);
-            }
-            MessageAction::BlockAction { action, attachment } => {
-                if let Some(change) = actions::dispatch_block_action(
-                    !self.fixtures.sample,
-                    &message,
-                    &channel,
-                    action,
-                    attachment,
-                    window,
-                    cx,
-                ) {
-                    self.post_change(&channel, &change);
-                }
-            }
-            MessageAction::DismissEphemeral => {
-                self.unreads
-                    .update(cx, |u, cx| u.remove_message(&channel, &ts, cx));
-            }
-        }
-    }
-
-    /// Dispatch a message-level action triggered from a thread card message's hover toolbar,
-    /// reaction chips, image click, Block Kit action, or context menu (`ThreadsEvent::MessageAction`).
-    pub(super) fn handle_threads_message_action(
-        &mut self,
-        channel: ChannelId,
-        thread_ts: Ts,
-        message: Message,
-        action: crate::actions::MessageAction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use crate::actions::MessageAction;
+        let MessageTarget {
+            surface,
+            channel,
+            thread_ts,
+        } = target;
         let ts = message.ts.clone();
         match action {
             MessageAction::React(name) => {
-                if self
-                    .threads
-                    .update(cx, |t, cx| t.add_reaction(&channel, &ts, &name, cx))
-                {
+                let add = match surface {
+                    MessageSurface::Unreads => self
+                        .unreads
+                        .update(cx, |u, cx| u.toggle_reaction(&channel, &ts, &name, cx)),
+                    MessageSurface::Threads => self
+                        .threads
+                        .update(cx, |t, cx| t.add_reaction(&channel, &ts, &name, cx))
+                        .then_some(true),
+                };
+                if let Some(add) = add {
                     self.post_change(
                         &channel,
                         &MessageChange::React {
                             ts: ts.clone(),
                             name,
-                            add: true,
+                            add,
                         },
                     );
                 }
             }
             MessageAction::ToggleReaction(name) => {
-                if let Some(add) = self
-                    .threads
-                    .update(cx, |t, cx| t.toggle_reaction(&channel, &ts, &name, cx))
-                {
+                let add = match surface {
+                    MessageSurface::Unreads => self
+                        .unreads
+                        .update(cx, |u, cx| u.toggle_reaction(&channel, &ts, &name, cx)),
+                    MessageSurface::Threads => self
+                        .threads
+                        .update(cx, |t, cx| t.toggle_reaction(&channel, &ts, &name, cx)),
+                };
+                if let Some(add) = add {
                     self.post_change(
                         &channel,
                         &MessageChange::React {
@@ -2019,11 +1893,15 @@ impl App {
             MessageAction::PickReaction(position) => {
                 self.open_picker(PickerTarget::Message { channel, ts }, position, window, cx);
             }
-            MessageAction::ReplyInThread => {
-                self.threads.update(cx, |t, cx| {
-                    t.activate_thread(&channel, &thread_ts, window, cx)
-                });
-            }
+            MessageAction::ReplyInThread => match surface {
+                MessageSurface::Unreads => {
+                    let thread_ts = message.thread_ts.clone().unwrap_or(ts);
+                    self.open_thread(channel, thread_ts, cx);
+                }
+                MessageSurface::Threads => self.threads.update(cx, |t, cx| {
+                    t.activate_thread(&channel, &thread_ts.clone().unwrap_or_default(), window, cx)
+                }),
+            },
             MessageAction::CopyLink => {
                 actions::copy_link(&self.fixtures, &channel, &ts, window, cx);
             }
@@ -2074,44 +1952,77 @@ impl App {
                 );
             }
             MessageAction::TogglePin => {
-                if let Some(pinned) = self
-                    .threads
-                    .update(cx, |t, cx| t.toggle_pin(&channel, &ts, cx))
-                {
+                let pinned = match surface {
+                    MessageSurface::Unreads => self
+                        .unreads
+                        .update(cx, |u, cx| u.toggle_pin(&channel, &ts, cx)),
+                    MessageSurface::Threads => self
+                        .threads
+                        .update(cx, |t, cx| t.toggle_pin(&channel, &ts, cx)),
+                };
+                if let Some(pinned) = pinned {
                     self.post_change(&channel, &MessageChange::Pin { ts, pinned });
                     actions::notify_pin_toggled(pinned, String::new(), window, cx);
                 }
             }
-            MessageAction::MarkUnread => {
-                let cursor = self
-                    .threads
-                    .read(cx)
-                    .cursor_before(&channel, &thread_ts, &ts);
-                self.mark_thread_unread(channel, thread_ts, cursor, cx);
-                notify("Marked unread", String::new(), window, cx);
-            }
-            MessageAction::Edit => {
-                self.threads.update(cx, |t, cx| {
+            MessageAction::MarkUnread => match surface {
+                MessageSurface::Unreads => {
+                    self.post_change(&channel, &MessageChange::MarkUnread { ts: ts.clone() });
+                    self.apply_local_mark_unread(&channel, ts, cx);
+                }
+                MessageSurface::Threads => {
+                    let cursor = self.threads.read(cx).cursor_before(
+                        &channel,
+                        &thread_ts.clone().unwrap_or_default(),
+                        &ts,
+                    );
+                    self.mark_thread_unread(channel, thread_ts.unwrap_or_default(), cursor, cx);
+                }
+            },
+            MessageAction::Edit => match surface {
+                MessageSurface::Unreads => {
+                    self.select(channel, cx);
+                    self.messages.update(cx, |list, cx| list.reveal(&ts, cx));
+                }
+                MessageSurface::Threads => self.threads.update(cx, |t, cx| {
                     t.start_edit(channel, &message, window, cx);
-                });
-            }
+                }),
+            },
             MessageAction::Delete => {
                 let this = cx.entity().downgrade();
                 let fixtures = self.fixtures.clone();
                 actions::confirm_delete(message, fixtures, window, cx, move |cx| {
                     let _ = this.update(cx, |app, cx| {
-                        app.threads
-                            .update(cx, |t, cx| t.remove_message(&channel, &ts, cx));
+                        match surface {
+                            MessageSurface::Unreads => {
+                                app.unreads
+                                    .update(cx, |u, cx| u.remove_message(&channel, &ts, cx));
+                            }
+                            MessageSurface::Threads => {
+                                app.threads
+                                    .update(cx, |t, cx| t.remove_message(&channel, &ts, cx));
+                            }
+                        }
                         app.post_change(&channel, &MessageChange::Delete { ts: ts.clone() });
                     });
                 });
             }
             MessageAction::OpenProfile(user) => self.open_profile(user, cx),
             MessageAction::OpenImage(origin) => {
-                let images_and_ix = self
-                    .threads
-                    .read(cx)
-                    .card_images(&channel, &thread_ts, &ts, &origin);
+                let images_and_ix = match surface {
+                    MessageSurface::Unreads => crate::image_viewer::collect_viewer_images(
+                        &self.fixtures,
+                        std::iter::once(&message),
+                        &message.ts,
+                        &origin,
+                    ),
+                    MessageSurface::Threads => self.threads.read(cx).card_images(
+                        &channel,
+                        &thread_ts.clone().unwrap_or_default(),
+                        &ts,
+                        &origin,
+                    ),
+                };
                 if let Some((images, index)) = images_and_ix {
                     self.open_image_viewer(channel, images, index, window, cx);
                 }
@@ -2123,16 +2034,25 @@ impl App {
                 self.open_add_to_list_dialog(channel, ts, window, cx);
             }
             MessageAction::SendToChannel => {
-                let msg = OutgoingMessage {
-                    channel: channel.clone(),
-                    thread_ts: Some(thread_ts.clone()),
-                    broadcast: true,
-                    content: crate::composer::content_of(&message.text, &self.fixtures),
-                    files: None,
-                };
-                if self.submit(msg, window, cx) {
-                    window.push_notification("Sent reply to channel", cx);
+                // Only a thread card can broadcast its reply to the channel.
+                if let (MessageSurface::Threads, Some(thread_ts)) = (surface, thread_ts) {
+                    let msg = OutgoingMessage {
+                        channel: channel.clone(),
+                        thread_ts: Some(thread_ts),
+                        broadcast: true,
+                        content: crate::composer::content_of(&message.text, &self.fixtures),
+                        files: None,
+                    };
+                    if self.submit(msg, window, cx) {
+                        window.push_notification("Sent reply to channel", cx);
+                    }
                 }
+            }
+            MessageAction::JoinHuddle => {
+                if self.channel != channel {
+                    self.select(channel, cx);
+                }
+                self.start_huddle(window, cx);
             }
             MessageAction::BlockAction { action, attachment } => {
                 if let Some(change) = actions::dispatch_block_action(
@@ -2147,16 +2067,16 @@ impl App {
                     self.post_change(&channel, &change);
                 }
             }
-            MessageAction::DismissEphemeral => {
-                self.threads
-                    .update(cx, |t, cx| t.remove_message(&channel, &ts, cx));
-            }
-            MessageAction::JoinHuddle => {
-                if self.channel != channel {
-                    self.select(channel, cx);
+            MessageAction::DismissEphemeral => match surface {
+                MessageSurface::Unreads => {
+                    self.unreads
+                        .update(cx, |u, cx| u.remove_message(&channel, &ts, cx));
                 }
-                self.start_huddle(window, cx);
-            }
+                MessageSurface::Threads => {
+                    self.threads
+                        .update(cx, |t, cx| t.remove_message(&channel, &ts, cx));
+                }
+            },
         }
     }
 

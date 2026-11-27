@@ -817,9 +817,12 @@ fn wire_feature_view_subscriptions(
                     message,
                     action,
                 } => {
-                    this.handle_threads_message_action(
-                        channel.clone(),
-                        thread_ts.clone(),
+                    this.handle_message_action(
+                        MessageTarget {
+                            surface: MessageSurface::Threads,
+                            channel: channel.clone(),
+                            thread_ts: Some(thread_ts.clone()),
+                        },
                         message.as_ref().clone(),
                         action.clone(),
                         window,
@@ -911,8 +914,12 @@ fn wire_feature_view_subscriptions(
                     message,
                     action,
                 } => {
-                    this.handle_unreads_message_action(
-                        channel.clone(),
+                    this.handle_message_action(
+                        MessageTarget {
+                            surface: MessageSurface::Unreads,
+                            channel: channel.clone(),
+                            thread_ts: None,
+                        },
                         message.as_ref().clone(),
                         action.clone(),
                         window,
