@@ -9,7 +9,7 @@ use std::rc::Rc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::TextareaState;
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
@@ -780,8 +780,15 @@ pub(super) fn render_block(
                 _ => (480., 270.),
             };
             let is_editing_alt = ui.editing_image_block == Some(block_ix);
+            let menu_url = url.clone();
+            let menu_label = if alt.trim().is_empty() {
+                "Canvas image".to_owned()
+            } else {
+                alt.trim().to_owned()
+            };
             let mut col = v_flex().gap_1().child(
                 div()
+                    .id(SharedString::from(format!("canvas-img-{key}-{block_ix}")))
                     .w(px(box_w))
                     .h(px(box_h))
                     .rounded_md()
@@ -789,7 +796,16 @@ pub(super) fn render_block(
                     .border_1()
                     .border_color(theme.border)
                     .overflow_hidden()
-                    .child(img(url.clone()).size_full().object_fit(ObjectFit::Contain)),
+                    .child(img(url.clone()).size_full().object_fit(ObjectFit::Contain))
+                    .context_menu(move |menu, _, _| {
+                        crate::media::image_context_menu(
+                            menu,
+                            gpui_kit::gpui::ImageSource::from(SharedString::from(menu_url.clone())),
+                            None,
+                            Some(menu_url.clone()),
+                            menu_label.clone(),
+                        )
+                    }),
             );
 
             if is_editing_alt

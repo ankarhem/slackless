@@ -4,6 +4,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, Context, FontWeight, ImageSource, InteractiveElement as _, IntoElement, ObjectFit,
@@ -34,17 +35,31 @@ impl ImageViewer {
 
     /// A still image scaled to the zoom.
     fn image_stage(&self, zoom: f32) -> AnyElement {
+        let current = self.current();
+        let source = current.source.clone();
+        let download = current.download.clone();
+        let name = current.name.clone();
         div()
+            .id("viewer-image-stage")
             .w(relative(zoom))
             .h(relative(zoom))
             .flex()
             .items_center()
             .justify_center()
             .child(
-                crate::media::Picture::new(self.current().source.clone())
+                crate::media::Picture::new(source.clone())
                     .fit(ObjectFit::Contain)
                     .radius(px(8.)),
             )
+            .context_menu(move |menu, _, _| {
+                crate::media::image_context_menu(
+                    menu,
+                    source.clone(),
+                    download.clone(),
+                    None,
+                    name.clone(),
+                )
+            })
             .into_any_element()
     }
 

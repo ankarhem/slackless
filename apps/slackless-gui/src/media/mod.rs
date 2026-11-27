@@ -4,6 +4,7 @@
 //! live in focused submodules and are re-exported here.
 
 mod audio_player;
+mod clipboard;
 mod downloads;
 mod http;
 mod pdf;
@@ -15,6 +16,7 @@ pub use audio_player::{
     audio_state, cycle_audio_rate, media_cache_policy, seek_audio, set_media_cache_policy,
     stop_audio, toggle_audio, toggle_audio_mute,
 };
+pub use clipboard::image_context_menu;
 pub(crate) use downloads::active_fetcher;
 #[cfg(target_os = "macos")]
 pub use downloads::save_download;

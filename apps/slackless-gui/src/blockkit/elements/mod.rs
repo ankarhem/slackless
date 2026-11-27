@@ -5,6 +5,8 @@ mod inputs;
 mod pickers;
 mod selects;
 
+use gpui_kit::component::menu::ContextMenuExt as _;
+
 use super::*;
 
 pub(super) use buttons::{button, overflow, workflow_button};
@@ -284,6 +286,7 @@ pub(super) fn picture(
     let Some(source) = source else {
         return placeholder();
     };
+    let source_for_menu = source.clone();
     let image = div().w(px(width)).h(px(height)).child(
         crate::media::Picture::new(source)
             .fit(ObjectFit::Contain)
@@ -292,23 +295,52 @@ pub(super) fn picture(
             .radius(px(8.))
             .fallback(placeholder),
     );
-    if let (Some(url), Some(on_open)) = (url, kcx.image_open.clone())
-        && width >= OPENABLE_IMAGE
-    {
-        // Slack's `.p-file_image_thumbnail__wrapper`: 8px radius, a 1px border of the
-        // foreground at 13%, and the zoom cursor.
-        let origin = ImageOrigin::Url(url.to_owned());
+    if width >= OPENABLE_IMAGE {
+        let link_url = url.map(str::to_owned);
+        let label = if alt.trim().is_empty() {
+            "Image".to_owned()
+        } else {
+            alt.to_owned()
+        };
+        if let (Some(url), Some(on_open)) = (url, kcx.image_open.clone()) {
+            // Slack's `.p-file_image_thumbnail__wrapper`: 8px radius, a 1px border of the
+            // foreground at 13%, and the zoom cursor.
+            let origin = ImageOrigin::Url(url.to_owned());
+            return div()
+                .id(SharedString::from(format!("img-{}", kcx.text_key())))
+                // Hug the image: a column would stretch the frame to its width.
+                .self_start()
+                .cursor_pointer()
+                .rounded_lg()
+                .overflow_hidden()
+                .border_1()
+                .border_color(theme.foreground.opacity(0.13))
+                .on_click(move |_, window, cx| on_open(origin.clone(), window, cx))
+                .child(image)
+                .context_menu(move |menu, _, _| {
+                    crate::media::image_context_menu(
+                        menu,
+                        source_for_menu.clone(),
+                        None,
+                        link_url.clone(),
+                        label.clone(),
+                    )
+                })
+                .into_any_element();
+        }
         return div()
             .id(SharedString::from(format!("img-{}", kcx.text_key())))
-            // Hug the image: a column would stretch the frame to its width.
             .self_start()
-            .cursor_pointer()
-            .rounded_lg()
-            .overflow_hidden()
-            .border_1()
-            .border_color(theme.foreground.opacity(0.13))
-            .on_click(move |_, window, cx| on_open(origin.clone(), window, cx))
             .child(image)
+            .context_menu(move |menu, _, _| {
+                crate::media::image_context_menu(
+                    menu,
+                    source_for_menu.clone(),
+                    None,
+                    link_url.clone(),
+                    label.clone(),
+                )
+            })
             .into_any_element();
     }
     image.into_any_element()

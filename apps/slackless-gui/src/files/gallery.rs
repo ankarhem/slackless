@@ -1,6 +1,7 @@
 //! Inline image previews, Slack's multi-image [`Gallery`], and hover Download buttons.
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
@@ -223,6 +224,9 @@ fn image_tile(
     let theme = cx.theme();
     let file = &image.file;
     let group = SharedString::from(format!("file-tile-{}", file.id));
+    let name = file_name(file);
+    let download = download_url(file).map(|url| (url, name.clone()));
+    let source_for_menu = image.source.clone();
     div()
         .id(SharedString::from(format!("file-open-{}", file.id)))
         .group(group.clone())
@@ -244,6 +248,15 @@ fn image_tile(
                 .radius(px(8.)),
         )
         .children(download_button(file, group, cx))
+        .context_menu(move |menu, _, _| {
+            crate::media::image_context_menu(
+                menu,
+                source_for_menu.clone(),
+                download.clone(),
+                None,
+                name.clone(),
+            )
+        })
         .into_any_element()
 }
 
@@ -320,6 +333,9 @@ pub(super) fn image_attachment(
             .cursor_pointer()
             .on_click(move |_, window, cx| on_open(origin.clone(), window, cx));
     }
+    let name = file_name(file);
+    let download = download_url(file).map(|url| (url, name.clone()));
+    let source_for_menu = image.clone();
     v_flex()
         .gap_1()
         .child(
@@ -328,7 +344,7 @@ pub(super) fn image_attachment(
                 .items_center()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child(file_name(file))
+                .child(name.clone())
                 .child(
                     Icon::new(IconName::ChevronDown)
                         .text_color(theme.muted_foreground)
@@ -338,6 +354,15 @@ pub(super) fn image_attachment(
         .child(
             frame
                 .child(crate::media::Picture::new(image).radius(px(8.)))
-                .children(download_button(file, group, cx)),
+                .children(download_button(file, group, cx))
+                .context_menu(move |menu, _, _| {
+                    crate::media::image_context_menu(
+                        menu,
+                        source_for_menu.clone(),
+                        download.clone(),
+                        None,
+                        name.clone(),
+                    )
+                }),
         )
 }
