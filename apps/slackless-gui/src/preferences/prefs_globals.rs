@@ -94,17 +94,31 @@ pub fn set_display_prefs(settings: &Settings, cx: &mut App) {
         reduce_motion: settings.reduce_motion,
         show_deleted_messages: settings.show_deleted_messages,
     };
-    let changed = cx.try_global::<DisplayPrefs>().copied() != Some(next);
-    cx.set_global(next);
+    let display_changed = cx.try_global::<DisplayPrefs>().copied() != Some(next);
     let keywords: Vec<String> = settings
         .keywords
         .split([',', '\n'])
         .map(|k| k.trim().to_lowercase())
         .filter(|k| k.len() >= 2)
         .collect();
-    cx.set_global(KeywordPrefs(keywords));
-    cx.set_global(QuickReactionPrefs(settings.resolved_quick_reactions()));
-    if changed {
+    let keywords_changed = cx
+        .try_global::<KeywordPrefs>()
+        .is_none_or(|prefs| prefs.0 != keywords);
+    let reactions = settings.resolved_quick_reactions();
+    let reactions_changed = cx
+        .try_global::<QuickReactionPrefs>()
+        .is_none_or(|prefs| prefs.0 != reactions);
+    // Replacing a global re-renders whatever observes it; only replace what changed.
+    if display_changed {
+        cx.set_global(next);
+    }
+    if keywords_changed {
+        cx.set_global(KeywordPrefs(keywords));
+    }
+    if reactions_changed {
+        cx.set_global(QuickReactionPrefs(reactions));
+    }
+    if display_changed {
         cx.refresh_windows();
     }
 }
