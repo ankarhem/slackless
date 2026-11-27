@@ -139,9 +139,9 @@ fn restore_initial_preferences(
     let preferences = Preferences::new(window, cx);
     // Restore persisted Preferences settings first, then overlay the zoom/font/color_mode
     // values `main` installed before the first frame.
-    let mut restored_settings = CoreBridge::parse_settings(local);
-    let has_local_quick_pref = local
-        .get(crate::bridge::SETTINGS)
+    let mut restored_settings = SETTINGS.read(local);
+    let has_local_quick_pref = SETTINGS
+        .raw(local)
         .is_some_and(|raw| raw.contains("\"show_quick_reactions\""));
     if !has_local_quick_pref {
         let mut base = restored_settings.unwrap_or_default();
@@ -184,7 +184,9 @@ fn restore_initial_preferences(
     preferences.update(cx, |prefs, cx| prefs.set_zoom(zoom, cx));
     // Live: the remembered Color Mode over Slack's color theme (or persisted palette),
     // as `main` installed it before the first frame.
-    let color_mode = bridge.parse_color_mode(local);
+    let color_mode = bridge
+        .store()
+        .map(|_| COLOR_MODE.read(local).unwrap_or(AppearanceMode::System));
     let applied_theme = match color_mode {
         Some(mode) => {
             let palette = restored_settings
@@ -407,12 +409,12 @@ fn wire_feature_view_subscriptions(
                     this.run_message_search(query.clone(), cx);
                 }
                 SearchMenuEvent::SetHistoryShown(on) => {
-                    if let Some(write) = this.bridge.remember_search_history_shown(*on) {
+                    if let Some(write) = this.bridge.remember(&SEARCH_HISTORY_SHOWN, on) {
                         cx.background_executor().spawn(write).detach();
                     }
                 }
                 SearchMenuEvent::SetFiltersShown(on) => {
-                    if let Some(write) = this.bridge.remember_search_filters_shown(*on) {
+                    if let Some(write) = this.bridge.remember(&SEARCH_FILTERS_SHOWN, on) {
                         cx.background_executor().spawn(write).detach();
                     }
                 }
@@ -486,7 +488,7 @@ fn wire_feature_view_subscriptions(
                     }
                 }
                 EmojiPickerEvent::ToneChanged(tone) => {
-                    if let Some(write) = this.bridge.remember_emoji_tone(*tone) {
+                    if let Some(write) = this.bridge.remember(&EMOJI_TONE, tone) {
                         cx.background_executor().spawn(write).detach();
                     }
                     if !this.fixtures.sample {
@@ -1625,7 +1627,8 @@ impl App {
             let local = bridge.all_local();
             // Like Slack, reopen the conversation that was open last; a fresh store falls back
             // to the sidebar's first conversation until the user picks one.
-            let restored = CoreBridge::parse_last_conversation(&local)
+            let restored = LAST_CONVERSATION
+                .read(&local)
                 .filter(|channel| fixtures.conversation(channel).is_some());
             let chosen = restored.is_some();
             let channel = restored.unwrap_or_else(|| first_conversation(&fixtures));
@@ -1652,16 +1655,17 @@ impl App {
             let search_menu = SearchMenu::new(fixtures.clone(), search.clone(), cx);
             // The search panel's remembered state, restored at launch like Slack's: the
             // recent searches, both toggles and the recently visited conversations.
-            if let Some(history) = CoreBridge::parse_search_history(&local) {
+            if let Some(history) = SEARCH_HISTORY.read(&local) {
                 search_menu.update(cx, |menu, cx| menu.set_history(history, cx));
             }
-            if let Some(on) = CoreBridge::parse_search_history_shown(&local) {
+            if let Some(on) = SEARCH_HISTORY_SHOWN.read(&local) {
                 search_menu.update(cx, |menu, cx| menu.set_history_shown(on, cx));
             }
-            if let Some(on) = CoreBridge::parse_search_filters_shown(&local) {
+            if let Some(on) = SEARCH_FILTERS_SHOWN.read(&local) {
                 search_menu.update(cx, |menu, cx| menu.set_filters_shown(on, cx));
             }
-            let restored_recent = CoreBridge::parse_recent_places(&local)
+            let restored_recent = RECENT_PLACES
+                .read(&local)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|channel| fixtures.conversation(channel).is_some())
@@ -1671,15 +1675,15 @@ impl App {
             let status_picker = StatusPicker::new(window, cx);
             let user_menu = UserMenu::new(fixtures.clone(), cx);
             let emoji_picker = EmojiPicker::new(fixtures.clone(), window, cx);
-            let persisted_freq = CoreBridge::parse_frequent_emoji(&local);
-            let persisted_tone = CoreBridge::parse_emoji_tone(&local);
+            let persisted_freq = FREQUENT_EMOJI.read(&local);
+            let persisted_tone = EMOJI_TONE.read(&local);
             if persisted_freq.is_some() || persisted_tone.is_some() {
                 emoji_picker.update(cx, |picker, cx| {
                     picker.restore(persisted_freq, persisted_tone, cx);
                 });
             }
             let drafts = DraftsView::new(cx);
-            if let Some(saved_drafts) = CoreBridge::parse_drafts(&local) {
+            if let Some(saved_drafts) = DRAFTS.read(&local) {
                 let entries: Vec<Entry> = saved_drafts
                     .into_iter()
                     .map(|d| Entry {
@@ -1824,7 +1828,7 @@ impl App {
                 thread.update(cx, |panel, cx| panel.set_outbox(initial_outbox.clone(), cx));
             }
             let (cached_member_counts, cached_app_counts) =
-                CoreBridge::parse_channel_counts(&local);
+                CHANNEL_COUNTS_CACHE.read(&local).unwrap_or_default();
             let cached_bots = fixtures.bots.clone();
             let FeatureViews {
                 search,

@@ -47,7 +47,11 @@ use crate::actions::{
 use crate::activity::{ActivityEvent, ActivityFeed};
 use crate::avatars::conversation_avatar;
 use crate::bookmarks;
-use crate::bridge::{CoreBridge, SavedDraft};
+use crate::bridge::{
+    CHANNEL_COUNTS_CACHE, COLOR_MODE, CoreBridge, DRAFTS, EMOJI_TONE, FONT, FREQUENT_EMOJI,
+    LAST_CONVERSATION, RECENT_PLACES, SEARCH_FILTERS_SHOWN, SEARCH_HISTORY, SEARCH_HISTORY_SHOWN,
+    SECTION_PREFS, SETTINGS, SavedDraft, WINDOW_STATE, WORKSPACE_ORDER, ZOOM,
+};
 use crate::browser::{ChannelBrowser, ChannelBrowserEvent};
 use crate::canvas::canvas_view;
 use crate::catchup::{CatchUpEvent, CatchUpView};

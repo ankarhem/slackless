@@ -195,7 +195,7 @@ impl App {
             let _ = this.update_in(cx, |app, window, cx| {
                 let write = window
                     .native_window_state()
-                    .and_then(|state| app.bridge.remember_window_state(state));
+                    .and_then(|state| app.bridge.remember(&WINDOW_STATE, &state));
                 if let Some(write) = write {
                     cx.background_executor().spawn(write).detach();
                 }

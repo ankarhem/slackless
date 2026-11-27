@@ -212,7 +212,7 @@ impl App {
             }
         }
         let frequent = self.emoji_picker.read(cx).frequent().to_vec();
-        if let Some(write) = self.bridge.remember_frequent_emoji(&frequent) {
+        if let Some(write) = self.bridge.remember(&FREQUENT_EMOJI, frequent.as_slice()) {
             cx.background_executor().spawn(write).detach();
         }
         if !self.fixtures.sample && !frequent.is_empty() {
@@ -630,7 +630,7 @@ impl App {
                 at: entry.at,
             })
             .collect();
-        if let Some(write) = self.bridge.remember_drafts(&saved) {
+        if let Some(write) = self.bridge.remember(&DRAFTS, saved.as_slice()) {
             cx.background_executor().spawn(write).detach();
         }
     }

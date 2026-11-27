@@ -41,7 +41,7 @@ impl App {
             .is_some_and(|stored| stored != settings.mode)
         {
             self.color_mode = Some(settings.mode);
-            if let Some(write) = self.bridge.remember_color_mode(settings.mode) {
+            if let Some(write) = self.bridge.remember(&COLOR_MODE, &settings.mode) {
                 cx.background_executor().spawn(write).detach();
             }
         }
@@ -65,13 +65,13 @@ impl App {
             );
         }
         if crate::zoom::set_level(settings.zoom, cx)
-            && let Some(write) = self.bridge.remember_zoom(settings.zoom)
+            && let Some(write) = self.bridge.remember(&ZOOM, &settings.zoom)
         {
             cx.background_executor().spawn(write).detach();
         }
         if theme::font(cx) != settings.font {
             theme::set_font(settings.font, cx);
-            if let Some(write) = self.bridge.remember_font(settings.font) {
+            if let Some(write) = self.bridge.remember(&FONT, &settings.font) {
                 cx.background_executor().spawn(write).detach();
             }
         }
@@ -409,7 +409,7 @@ impl App {
                 }
             }
             self.saved_settings = Some(settings.clone());
-            if let Some(write) = self.bridge.remember_settings(&settings) {
+            if let Some(write) = self.bridge.remember(&SETTINGS, &settings) {
                 cx.background_executor().spawn(write).detach();
             }
             if reload_deleted {

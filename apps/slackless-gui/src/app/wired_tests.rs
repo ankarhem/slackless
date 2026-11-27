@@ -590,12 +590,15 @@ fn wired_multi_workspace_event_isolation_and_switching(cx: &mut gpui::TestAppCon
     fx.workspaces = vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()];
     // T0TWO already holds a draft of its own, restored on its first visit.
     let seed = b2
-        .remember_drafts(&[SavedDraft {
-            channel: ChannelId::from("C0TWO"),
-            label: "two-chan".into(),
-            text: "two's own draft".into(),
-            at: 1,
-        }])
+        .remember(
+            &DRAFTS,
+            &[SavedDraft {
+                channel: ChannelId::from("C0TWO"),
+                label: "two-chan".into(),
+                text: "two's own draft".into(),
+                at: 1,
+            }],
+        )
         .expect("a live bridge persists drafts");
     cx.executor().spawn(seed).detach();
     cx.run_until_parked();
@@ -788,7 +791,7 @@ fn wired_multi_workspace_event_isolation_and_switching(cx: &mut gpui::TestAppCon
     });
     cx.run_until_parked();
     cx.update(|_, cx| {
-        let stored: Vec<String> = (app.read(cx).bridge.drafts().unwrap_or_default())
+        let stored: Vec<String> = (app.read(cx).bridge.read_local(&DRAFTS).unwrap_or_default())
             .into_iter()
             .map(|draft| draft.text)
             .collect();

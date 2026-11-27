@@ -78,54 +78,210 @@ const HISTORY_LIMIT: usize = 200;
 /// while avoiding deserializing 500 messages before the first frame paints).
 const INITIAL_HISTORY_LIMIT: usize = 80;
 
-/// The store's local-state key for the last open conversation.
-const LAST_CONVERSATION: &str = "last_conversation";
+/// A `local_state` key: the string [`CoreBridge::remember`] writes from a `W`, the `R` a read
+/// decodes back, and `what` it names in the log line of a failed write.
+pub(crate) struct LocalKey<W: ?Sized, R> {
+    key: &'static str,
+    what: &'static str,
+    encode: fn(&W) -> Option<String>,
+    decode: fn(&str) -> Option<R>,
+}
 
-/// The store's local-state key for per-section sidebar filter and sort choices.
-const SECTION_PREFS: &str = "section_prefs";
+impl<W: ?Sized, R> LocalKey<W, R> {
+    const fn new(
+        key: &'static str,
+        what: &'static str,
+        encode: fn(&W) -> Option<String>,
+        decode: fn(&str) -> Option<R>,
+    ) -> Self {
+        Self {
+            key,
+            what,
+            encode,
+            decode,
+        }
+    }
 
-/// The store's local-state key for the window's frame (AppKit restorable state, hex-encoded).
-const WINDOW_STATE: &str = "window_state";
+    /// The store's key string (tests seed a `local` map by it).
+    #[cfg(test)]
+    pub(crate) fn name(&self) -> &'static str {
+        self.key
+    }
 
-/// The store's local-state key for the Color Mode chosen in Preferences.
-const COLOR_MODE: &str = "color_mode";
+    /// The key's value in `local`, decoded; `None` when unset or malformed.
+    pub(crate) fn read(&self, local: &HashMap<String, String>) -> Option<R> {
+        local.get(self.key).and_then(|raw| (self.decode)(raw))
+    }
 
-/// The store's local-state key for the search pill's recent searches.
-const SEARCH_HISTORY: &str = "search_history";
+    /// The key's stored string as is.
+    pub(crate) fn raw<'a>(&self, local: &'a HashMap<String, String>) -> Option<&'a str> {
+        local.get(self.key).map(String::as_str)
+    }
+}
 
-/// The store's local-state key for the search panel's history toggle.
-const SEARCH_HISTORY_SHOWN: &str = "search_history_shown";
+/// JSON codecs for [`LocalKey`] values.
+fn json_encode<T: serde::Serialize + ?Sized>(value: &T) -> Option<String> {
+    serde_json::to_string(value).ok()
+}
 
-/// The store's local-state key for the search panel's filter toggle.
-const SEARCH_FILTERS_SHOWN: &str = "search_filters_shown";
+fn json_decode<T: serde::de::DeserializeOwned>(raw: &str) -> Option<T> {
+    serde_json::from_str(raw).ok()
+}
 
-/// The store's local-state key for the recently visited conversations (the search menu's
-/// "Recent places" and the history clock's menu).
-const RECENT_PLACES: &str = "recent_places";
+/// `Display`/`FromStr` codecs for a scalar [`LocalKey`] value.
+fn text_encode<T: std::fmt::Display + ?Sized>(value: &T) -> Option<String> {
+    Some(value.to_string())
+}
 
-/// The store's local-state key for the Font chosen in Preferences (its family name).
-const FONT: &str = "font";
+fn text_decode<T: std::str::FromStr>(raw: &str) -> Option<T> {
+    raw.parse().ok()
+}
 
-/// The store's local-state key for the zoom chosen in Preferences (its level).
-const ZOOM: &str = "zoom";
+/// Hex round trip of the window frame's restorable state bytes.
+fn hex_encode(bytes: &[u8]) -> Option<String> {
+    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
 
-/// The store's local-state key for all Preferences settings (JSON).
-pub(crate) const SETTINGS: &str = "preferences_settings";
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
+}
 
-/// The store's local-state key for cached `(members, apps)` counts per channel (JSON).
-pub(crate) const CHANNEL_COUNTS_CACHE: &str = "channel_counts_cache";
+/// `(members, apps)` counts per channel, stored as one JSON map of optional pairs.
+type ChannelCounts = (HashMap<ChannelId, u32>, HashMap<ChannelId, u32>);
 
-/// The store's local-state key for per-conversation composer drafts (JSON).
-const DRAFTS: &str = "drafts";
+fn encode_channel_counts((members, apps): &ChannelCounts) -> Option<String> {
+    let mut combined: HashMap<&ChannelId, (Option<u32>, Option<u32>)> = HashMap::new();
+    for (channel, &count) in members {
+        combined.entry(channel).or_default().0 = Some(count);
+    }
+    for (channel, &count) in apps {
+        combined.entry(channel).or_default().1 = Some(count);
+    }
+    serde_json::to_string(&combined).ok()
+}
 
-/// The store's local-state key for recently/frequently used emoji shortcodes (JSON).
-const FREQUENT_EMOJI: &str = "frequent_emoji";
+fn decode_channel_counts(raw: &str) -> Option<ChannelCounts> {
+    let parsed: HashMap<String, (Option<u32>, Option<u32>)> = serde_json::from_str(raw).ok()?;
+    let mut counts = (HashMap::new(), HashMap::new());
+    for (channel, (members, apps)) in parsed {
+        let id = ChannelId::from(channel);
+        if let Some(count) = members {
+            counts.0.insert(id.clone(), count);
+        }
+        if let Some(count) = apps {
+            counts.1.insert(id, count);
+        }
+    }
+    Some(counts)
+}
 
-/// The store's local-state key for the chosen emoji skin tone (1..=6).
-const EMOJI_TONE: &str = "emoji_tone";
-
-/// The store's local-state key for the user's preferred workspace rail order (JSON array of TeamId strings).
-const WORKSPACE_ORDER: &str = "workspace_order";
+/// The conversation open last in this workspace, restored at launch like Slack.
+pub(crate) const LAST_CONVERSATION: LocalKey<ChannelId, ChannelId> = LocalKey::new(
+    "last_conversation",
+    "open conversation",
+    |channel| Some(channel.as_str().to_owned()),
+    |raw| Some(ChannelId::from(raw)),
+);
+/// Per-section sidebar filter and sort choices.
+pub(crate) const SECTION_PREFS: LocalKey<SectionPrefs, SectionPrefs> = LocalKey::new(
+    "section_prefs",
+    "sidebar section preferences",
+    json_encode,
+    json_decode,
+);
+/// The window's frame (AppKit restorable state, hex-encoded).
+pub(crate) const WINDOW_STATE: LocalKey<[u8], Vec<u8>> =
+    LocalKey::new("window_state", "window frame", hex_encode, hex_decode);
+/// The Color Mode chosen in Preferences.
+pub(crate) const COLOR_MODE: LocalKey<AppearanceMode, AppearanceMode> = LocalKey::new(
+    "color_mode",
+    "color mode",
+    |mode| Some(mode.key().to_owned()),
+    AppearanceMode::from_key,
+);
+/// The search pill's recent searches.
+pub(crate) const SEARCH_HISTORY: LocalKey<[String], Vec<String>> =
+    LocalKey::new("search_history", "search history", json_encode, json_decode);
+/// The search panel's history and filter toggles.
+pub(crate) const SEARCH_HISTORY_SHOWN: LocalKey<bool, bool> = LocalKey::new(
+    "search_history_shown",
+    "history toggle",
+    text_encode,
+    text_decode,
+);
+pub(crate) const SEARCH_FILTERS_SHOWN: LocalKey<bool, bool> = LocalKey::new(
+    "search_filters_shown",
+    "filter toggle",
+    text_encode,
+    text_decode,
+);
+/// The recently visited conversations (the search menu's "Recent places" and the history
+/// clock's menu).
+pub(crate) const RECENT_PLACES: LocalKey<[ChannelId], Vec<ChannelId>> =
+    LocalKey::new("recent_places", "recent places", json_encode, json_decode);
+/// The Font chosen in Preferences (its family name).
+pub(crate) const FONT: LocalKey<usize, usize> = LocalKey::new(
+    "font",
+    "font",
+    |font| {
+        theme::FONT_FAMILIES
+            .get(*font)
+            .map(|family| (*family).to_owned())
+    },
+    |family| {
+        theme::FONT_FAMILIES
+            .iter()
+            .position(|known| *known == family)
+    },
+);
+/// The zoom chosen in Preferences (its level).
+pub(crate) const ZOOM: LocalKey<usize, usize> = LocalKey::new(
+    "zoom",
+    "zoom",
+    |level| Some(level.to_string()),
+    |raw| {
+        raw.parse()
+            .ok()
+            .filter(|level| *level < crate::zoom::FACTORS.len())
+    },
+);
+/// All Preferences settings.
+pub(crate) const SETTINGS: LocalKey<Settings, Settings> = LocalKey::new(
+    "preferences_settings",
+    "preferences",
+    json_encode,
+    json_decode,
+);
+/// Cached `(members, apps)` counts per channel.
+pub(crate) const CHANNEL_COUNTS_CACHE: LocalKey<ChannelCounts, ChannelCounts> = LocalKey::new(
+    "channel_counts_cache",
+    "channel counts cache",
+    encode_channel_counts,
+    decode_channel_counts,
+);
+/// Per-conversation composer drafts.
+pub(crate) const DRAFTS: LocalKey<[SavedDraft], Vec<SavedDraft>> =
+    LocalKey::new("drafts", "drafts", json_encode, json_decode);
+/// Recently and frequently used emoji shortcodes.
+pub(crate) const FREQUENT_EMOJI: LocalKey<[String], Vec<String>> =
+    LocalKey::new("frequent_emoji", "frequent emoji", json_encode, json_decode);
+/// The chosen emoji skin tone (1..=6).
+pub(crate) const EMOJI_TONE: LocalKey<u8, u8> = LocalKey::new(
+    "emoji_tone",
+    "emoji skin tone",
+    |tone| Some(tone.to_string()),
+    |raw| raw.parse().ok().filter(|tone| (1..=6).contains(tone)),
+);
+/// The user's preferred workspace rail order (JSON array of TeamId strings).
+pub(crate) const WORKSPACE_ORDER: LocalKey<[String], Vec<String>> = LocalKey::new(
+    "workspace_order",
+    "workspace order",
+    json_encode,
+    json_decode,
+);
 
 /// Receives core events and re-emits them to subscribed views on the UI thread. The bridge
 /// emits through this entity so subscribers can use gpui's native `subscribe` machinery.
@@ -692,322 +848,26 @@ impl CoreBridge {
         self.session.as_ref().map(|s| &s.team_id)
     }
 
-    /// The conversation last open in this workspace, restored at launch like Slack. `None`
-    /// offline or before the first one.
-    pub fn last_conversation(&self) -> Option<ChannelId> {
-        let id = self.local(LAST_CONVERSATION)?;
-        Some(ChannelId::from(id.as_str()))
-    }
-
-    /// Live mode: a write remembering `channel` as the open conversation, to run off the UI
-    /// thread. `None` offline.
-    pub fn remember_conversation(
-        &self,
-        channel: ChannelId,
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.write_local(
-            LAST_CONVERSATION,
-            channel.as_str().to_owned(),
-            "open conversation",
-        )
-    }
-
-    /// Live mode: a write remembering the window's native state (`Window::native_window_state`),
-    /// to run off the UI thread. `None` offline.
-    pub fn remember_window_state(
-        &self,
-        state: Vec<u8>,
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        let hex = state.iter().map(|byte| format!("{byte:02x}")).collect();
-        self.write_local(WINDOW_STATE, hex, "window frame")
-    }
-
-    /// Live mode: a write remembering `mode` as the Color Mode, to run off the UI thread.
-    /// `None` offline.
-    pub fn remember_color_mode(
-        &self,
-        mode: AppearanceMode,
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.write_local(COLOR_MODE, mode.key().to_owned(), "color mode")
-    }
-
-    /// Live mode: a write remembering the search history, to run off the UI thread. `None`
-    /// offline.
-    pub fn remember_search_history(
-        &self,
-        queries: &[String],
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.write_local(
-            SEARCH_HISTORY,
-            serde_json::to_string(queries).ok()?,
-            "search history",
-        )
-    }
-
-    /// Live mode: a write remembering the history toggle, to run off the UI thread. `None`
-    /// offline.
-    pub fn remember_search_history_shown(
-        &self,
-        on: bool,
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.write_local(SEARCH_HISTORY_SHOWN, on.to_string(), "history toggle")
-    }
-
-    /// Live mode: a write remembering the filter toggle, to run off the UI thread. `None`
-    /// offline.
-    pub fn remember_search_filters_shown(
-        &self,
-        on: bool,
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.write_local(SEARCH_FILTERS_SHOWN, on.to_string(), "filter toggle")
-    }
-
-    /// Live mode: a write remembering the recently visited conversations, to run off the UI
-    /// thread. `None` offline.
-    pub fn remember_recent_places(
-        &self,
-        ids: &[ChannelId],
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.write_local(
-            RECENT_PLACES,
-            serde_json::to_string(ids).ok()?,
-            "recent places",
-        )
-    }
-
-    /// Live mode: a write remembering [`theme::FONT_LABELS`]`[font]` as the Font, to run off
-    /// the UI thread. `None` offline.
-    pub fn remember_font(&self, font: usize) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.write_local(FONT, theme::FONT_FAMILIES[font].to_owned(), "font")
-    }
-
-    /// Live mode: a write remembering zoom level `level`, to run off the UI thread. `None`
-    /// offline.
-    pub fn remember_zoom(&self, level: usize) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.write_local(ZOOM, level.to_string(), "zoom")
-    }
-
-    /// The Preferences settings saved locally; `None` offline or before the first save.
-    pub fn settings(&self) -> Option<Settings> {
-        self.store.as_ref()?;
-        serde_json::from_str(&self.local(SETTINGS)?).ok()
-    }
-
-    /// Live mode: persist Preferences `settings` locally, off the UI thread. `None` offline.
-    pub fn remember_settings(
-        &self,
-        settings: &Settings,
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.write_local(
-            SETTINGS,
-            serde_json::to_string(settings).ok()?,
-            "preferences",
-        )
-    }
-
-    /// Saved per-conversation composer drafts for this workspace; `None` offline or unset.
-    pub fn drafts(&self) -> Option<Vec<SavedDraft>> {
-        self.store.as_ref()?;
-        serde_json::from_str(&self.local(DRAFTS)?).ok()
-    }
-
-    /// Live mode: persist per-conversation composer drafts off the UI thread. `None` offline.
-    pub fn remember_drafts(
-        &self,
-        drafts: &[SavedDraft],
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.write_local(DRAFTS, serde_json::to_string(drafts).ok()?, "drafts")
-    }
-
-    /// Live mode: persist frequently used emoji shortcodes off the UI thread. `None` offline.
-    pub fn remember_frequent_emoji(
-        &self,
-        list: &[String],
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.write_local(
-            FREQUENT_EMOJI,
-            serde_json::to_string(list).ok()?,
-            "frequent emoji",
-        )
-    }
-
-    /// Live mode: persist emoji skin tone (1..=6) off the UI thread. `None` offline.
-    pub fn remember_emoji_tone(
-        &self,
-        tone: u8,
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.write_local(EMOJI_TONE, tone.to_string(), "emoji skin tone")
-    }
-
-    /// Saved workspace switcher order (`TeamId` strings); `None` offline or unset.
-    pub fn workspace_order(&self) -> Option<Vec<String>> {
-        self.store.as_ref()?;
-        serde_json::from_str(&self.local(WORKSPACE_ORDER)?).ok()
-    }
-
-    /// Live mode: persist workspace switcher order off the UI thread. `None` offline.
-    pub fn remember_workspace_order(
-        &self,
-        team_ids: &[String],
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.write_local(
-            WORKSPACE_ORDER,
-            serde_json::to_string(team_ids).ok()?,
-            "workspace order",
-        )
-    }
-
-    /// Saved per-section sidebar filter and sort choices; `None` offline or unset.
-    pub fn section_prefs(&self) -> Option<SectionPrefs> {
-        self.store.as_ref()?;
-        serde_json::from_str(&self.local(SECTION_PREFS)?).ok()
-    }
-
-    /// Live mode: persist per-section sidebar filter & sort choices off the UI thread.
-    pub fn remember_section_prefs(
-        &self,
-        prefs: &SectionPrefs,
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.write_local(
-            SECTION_PREFS,
-            serde_json::to_string(prefs).ok()?,
-            "sidebar section preferences",
-        )
-    }
-
-    /// This workspace's stored local-state `key`; `None` offline or when unset.
-    fn local(&self, key: &str) -> Option<String> {
+    /// `key`'s value for this workspace, decoded; `None` offline or when unset.
+    pub fn read_local<W: ?Sized, R>(&self, key: &LocalKey<W, R>) -> Option<R> {
         let team = &self.session.as_ref()?.team_id;
-        let store = self.read_store()?.lock().ok()?;
-        store.local(team, key).ok().flatten()
+        let store = self.read_store().and_then(|s| s.lock().ok())?;
+        let raw = store.local(team, key.key).ok().flatten()?;
+        (key.decode)(&raw)
     }
 
-    /// Parse helpers over a pre-loaded `all_local()` map (zero extra SQLite round-trips at launch).
-    pub fn parse_last_conversation(local: &HashMap<String, String>) -> Option<ChannelId> {
-        local
-            .get(LAST_CONVERSATION)
-            .map(|id| ChannelId::from(id.as_str()))
-    }
-
-    pub fn parse_window_state(local: &HashMap<String, String>) -> Option<Vec<u8>> {
-        let hex = local.get(WINDOW_STATE)?;
-        (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
-            .collect()
-    }
-
-    pub fn parse_color_mode(&self, local: &HashMap<String, String>) -> Option<AppearanceMode> {
-        self.store.as_ref()?;
-        Some(
-            local
-                .get(COLOR_MODE)
-                .map(String::as_str)
-                .and_then(AppearanceMode::from_key)
-                .unwrap_or(AppearanceMode::System),
-        )
-    }
-
-    pub fn parse_font(local: &HashMap<String, String>) -> Option<usize> {
-        let family = local.get(FONT)?;
-        theme::FONT_FAMILIES
-            .iter()
-            .position(|known| *known == family.as_str())
-    }
-
-    pub fn parse_zoom(local: &HashMap<String, String>) -> Option<usize> {
-        let level: usize = local.get(ZOOM)?.parse().ok()?;
-        (level < crate::zoom::FACTORS.len()).then_some(level)
-    }
-
-    pub fn parse_settings(local: &HashMap<String, String>) -> Option<Settings> {
-        serde_json::from_str(local.get(SETTINGS)?).ok()
-    }
-
-    pub fn parse_search_history(local: &HashMap<String, String>) -> Option<Vec<String>> {
-        serde_json::from_str(local.get(SEARCH_HISTORY)?).ok()
-    }
-
-    pub fn parse_search_history_shown(local: &HashMap<String, String>) -> Option<bool> {
-        local.get(SEARCH_HISTORY_SHOWN)?.parse().ok()
-    }
-
-    pub fn parse_search_filters_shown(local: &HashMap<String, String>) -> Option<bool> {
-        local.get(SEARCH_FILTERS_SHOWN)?.parse().ok()
-    }
-
-    pub fn parse_recent_places(local: &HashMap<String, String>) -> Option<Vec<ChannelId>> {
-        serde_json::from_str(local.get(RECENT_PLACES)?).ok()
-    }
-
-    pub fn parse_drafts(local: &HashMap<String, String>) -> Option<Vec<SavedDraft>> {
-        serde_json::from_str(local.get(DRAFTS)?).ok()
-    }
-
-    /// Live mode: a write remembering cached `(humans, apps)` member counts per channel so
-    /// cold launches paint header member/app badges immediately on frame 0.
-    pub fn remember_channel_counts(
+    /// Live mode: a write storing `value` under `key` for this workspace, to run off the UI
+    /// thread; a failure is logged naming what was not remembered. `None` offline.
+    pub fn remember<W: ?Sized, R>(
         &self,
-        members: &HashMap<ChannelId, u32>,
-        apps: &HashMap<ChannelId, u32>,
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        let mut combined: HashMap<String, (Option<u32>, Option<u32>)> = HashMap::new();
-        for (ch, &n) in members {
-            combined.entry(ch.to_string()).or_default().0 = Some(n);
-        }
-        for (ch, &a) in apps {
-            combined.entry(ch.to_string()).or_default().1 = Some(a);
-        }
-        self.write_local(
-            CHANNEL_COUNTS_CACHE,
-            serde_json::to_string(&combined).ok()?,
-            "channel counts cache",
-        )
-    }
-
-    pub fn parse_channel_counts(
-        local: &HashMap<String, String>,
-    ) -> (HashMap<ChannelId, u32>, HashMap<ChannelId, u32>) {
-        let mut members = HashMap::new();
-        let mut apps = HashMap::new();
-        let Some(raw) = local.get(CHANNEL_COUNTS_CACHE) else {
-            return (members, apps);
-        };
-        let Ok(parsed) = serde_json::from_str::<HashMap<String, (Option<u32>, Option<u32>)>>(raw)
-        else {
-            return (members, apps);
-        };
-        for (ch, (m, a)) in parsed {
-            let id = ChannelId::from(ch);
-            if let Some(n) = m {
-                members.insert(id.clone(), n);
-            }
-            if let Some(n) = a {
-                apps.insert(id, n);
-            }
-        }
-        (members, apps)
-    }
-
-    pub fn parse_frequent_emoji(local: &HashMap<String, String>) -> Option<Vec<String>> {
-        serde_json::from_str(local.get(FREQUENT_EMOJI)?).ok()
-    }
-
-    pub fn parse_emoji_tone(local: &HashMap<String, String>) -> Option<u8> {
-        let tone: u8 = local.get(EMOJI_TONE)?.parse().ok()?;
-        (1..=6).contains(&tone).then_some(tone)
-    }
-
-    /// A write storing `value` under this workspace's local-state `key`, to run off the UI
-    /// thread; a failure is logged naming `what` was not remembered. `None` offline.
-    fn write_local(
-        &self,
-        key: &'static str,
-        value: String,
-        what: &'static str,
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        key: &LocalKey<W, R>,
+        value: &W,
+    ) -> Option<impl Future<Output = ()> + Send + use<W, R>> {
         let team = self.session.as_ref()?.team_id.clone();
         let store = self.store.clone()?;
+        let value = (key.encode)(value)?;
+        let what = key.what;
+        let key = key.key;
         Some(async move {
             let Ok(mut store) = store.lock() else {
                 return;
@@ -1016,6 +876,21 @@ impl CoreBridge {
                 tracing::warn!(what, error = %e, "could not persist local state");
             }
         })
+    }
+
+    /// The Preferences settings saved locally; `None` offline or before the first save.
+    pub fn settings(&self) -> Option<Settings> {
+        self.read_local(&SETTINGS)
+    }
+
+    /// Saved per-section sidebar filter and sort choices; `None` offline or unset.
+    pub fn section_prefs(&self) -> Option<SectionPrefs> {
+        self.read_local(&SECTION_PREFS)
+    }
+
+    /// Saved workspace switcher order (`TeamId` strings); `None` offline or unset.
+    pub fn workspace_order(&self) -> Option<Vec<String>> {
+        self.read_local(&WORKSPACE_ORDER)
     }
 
     /// Subscribe to the core's [`Event`]s. The handler runs on the UI thread whenever the
@@ -1162,9 +1037,9 @@ mod tests {
         assert!(bridge.snapshot(&HashMap::new()).is_none());
         assert!(bridge.history(ChannelId::from("C1"), None).is_none());
         assert!(bridge.settings().is_none());
-        assert!(bridge.drafts().is_none());
+        assert!(bridge.read_local(&DRAFTS).is_none());
         assert!(bridge.section_prefs().is_none());
-        assert!(bridge.parse_color_mode(&HashMap::new()).is_none());
+        assert!(bridge.store().is_none() && COLOR_MODE.read(&HashMap::new()).is_none());
         bridge.send(slackless_core::MessagingCommand::MarkAllRead);
     }
 
@@ -1249,115 +1124,109 @@ mod tests {
         let mut local = HashMap::new();
 
         // parse_last_conversation
-        assert_eq!(CoreBridge::parse_last_conversation(&local), None);
-        local.insert(LAST_CONVERSATION.into(), "C0ENG".into());
+        assert_eq!(LAST_CONVERSATION.read(&local), None);
+        local.insert(LAST_CONVERSATION.name().into(), "C0ENG".into());
         assert_eq!(
-            CoreBridge::parse_last_conversation(&local),
+            LAST_CONVERSATION.read(&local),
             Some(ChannelId::from("C0ENG"))
         );
 
         // parse_window_state: valid hex, empty, odd length, non-hex, non-ASCII
-        assert_eq!(CoreBridge::parse_window_state(&local), None);
-        local.insert(WINDOW_STATE.into(), "007fFF".into());
-        assert_eq!(
-            CoreBridge::parse_window_state(&local),
-            Some(vec![0x00, 0x7f, 0xff])
-        );
-        local.insert(WINDOW_STATE.into(), String::new());
-        assert_eq!(CoreBridge::parse_window_state(&local), Some(vec![]));
-        local.insert(WINDOW_STATE.into(), "abc".into());
-        assert_eq!(CoreBridge::parse_window_state(&local), None);
-        local.insert(WINDOW_STATE.into(), "zzzz".into());
-        assert_eq!(CoreBridge::parse_window_state(&local), None);
-        local.insert(WINDOW_STATE.into(), "éé".into());
-        assert_eq!(CoreBridge::parse_window_state(&local), None);
+        assert_eq!(WINDOW_STATE.read(&local), None);
+        local.insert(WINDOW_STATE.name().into(), "007fFF".into());
+        assert_eq!(WINDOW_STATE.read(&local), Some(vec![0x00, 0x7f, 0xff]));
+        local.insert(WINDOW_STATE.name().into(), String::new());
+        assert_eq!(WINDOW_STATE.read(&local), Some(vec![]));
+        local.insert(WINDOW_STATE.name().into(), "abc".into());
+        assert_eq!(WINDOW_STATE.read(&local), None);
+        local.insert(WINDOW_STATE.name().into(), "zzzz".into());
+        assert_eq!(WINDOW_STATE.read(&local), None);
+        local.insert(WINDOW_STATE.name().into(), "éé".into());
+        assert_eq!(WINDOW_STATE.read(&local), None);
 
         // parse_font
-        assert_eq!(CoreBridge::parse_font(&local), None);
-        local.insert(FONT.into(), theme::FONT_FAMILIES[2].into());
-        assert_eq!(CoreBridge::parse_font(&local), Some(2));
-        local.insert(FONT.into(), "NonexistentFont".into());
-        assert_eq!(CoreBridge::parse_font(&local), None);
+        assert_eq!(FONT.read(&local), None);
+        local.insert(FONT.name().into(), theme::FONT_FAMILIES[2].into());
+        assert_eq!(FONT.read(&local), Some(2));
+        local.insert(FONT.name().into(), "NonexistentFont".into());
+        assert_eq!(FONT.read(&local), None);
 
         // parse_zoom bounds
-        assert_eq!(CoreBridge::parse_zoom(&local), None);
-        local.insert(ZOOM.into(), "0".into());
-        assert_eq!(CoreBridge::parse_zoom(&local), Some(0));
-        local.insert(ZOOM.into(), (crate::zoom::FACTORS.len() - 1).to_string());
-        assert_eq!(
-            CoreBridge::parse_zoom(&local),
-            Some(crate::zoom::FACTORS.len() - 1)
-        );
-        local.insert(ZOOM.into(), crate::zoom::FACTORS.len().to_string());
-        assert_eq!(CoreBridge::parse_zoom(&local), None);
-        local.insert(ZOOM.into(), "-1".into());
-        assert_eq!(CoreBridge::parse_zoom(&local), None);
-
-        // parse_channel_counts: merge & malformed JSON
-        assert_eq!(
-            CoreBridge::parse_channel_counts(&local),
-            (HashMap::new(), HashMap::new())
-        );
+        assert_eq!(ZOOM.read(&local), None);
+        local.insert(ZOOM.name().into(), "0".into());
+        assert_eq!(ZOOM.read(&local), Some(0));
         local.insert(
-            CHANNEL_COUNTS_CACHE.into(),
+            ZOOM.name().into(),
+            (crate::zoom::FACTORS.len() - 1).to_string(),
+        );
+        assert_eq!(ZOOM.read(&local), Some(crate::zoom::FACTORS.len() - 1));
+        local.insert(ZOOM.name().into(), crate::zoom::FACTORS.len().to_string());
+        assert_eq!(ZOOM.read(&local), None);
+        local.insert(ZOOM.name().into(), "-1".into());
+        assert_eq!(ZOOM.read(&local), None);
+
+        // channel counts: merge & malformed JSON
+        assert_eq!(CHANNEL_COUNTS_CACHE.read(&local), None);
+        local.insert(
+            CHANNEL_COUNTS_CACHE.name().into(),
             r#"{"C1":[12,3],"C2":[5,null],"C3":[null,2]}"#.into(),
         );
-        let (members, apps) = CoreBridge::parse_channel_counts(&local);
+        let (members, apps) = CHANNEL_COUNTS_CACHE.read(&local).unwrap();
         assert_eq!(members.get(&ChannelId::from("C1")), Some(&12));
         assert_eq!(members.get(&ChannelId::from("C2")), Some(&5));
         assert!(!members.contains_key(&ChannelId::from("C3")));
         assert_eq!(apps.get(&ChannelId::from("C1")), Some(&3));
         assert!(!apps.contains_key(&ChannelId::from("C2")));
         assert_eq!(apps.get(&ChannelId::from("C3")), Some(&2));
-        local.insert(CHANNEL_COUNTS_CACHE.into(), "{broken".into());
-        assert_eq!(
-            CoreBridge::parse_channel_counts(&local),
-            (HashMap::new(), HashMap::new())
-        );
+        local.insert(CHANNEL_COUNTS_CACHE.name().into(), "{broken".into());
+        assert_eq!(CHANNEL_COUNTS_CACHE.read(&local), None);
 
         // parse_emoji_tone 1..=6 bounds
         for valid in 1u8..=6 {
-            local.insert(EMOJI_TONE.into(), valid.to_string());
-            assert_eq!(CoreBridge::parse_emoji_tone(&local), Some(valid));
+            local.insert(EMOJI_TONE.name().into(), valid.to_string());
+            assert_eq!(EMOJI_TONE.read(&local), Some(valid));
         }
         for invalid in ["0", "7", "255", "abc"] {
-            local.insert(EMOJI_TONE.into(), invalid.into());
-            assert_eq!(CoreBridge::parse_emoji_tone(&local), None, "{invalid}");
+            local.insert(EMOJI_TONE.name().into(), invalid.into());
+            assert_eq!(EMOJI_TONE.read(&local), None, "{invalid}");
         }
 
         // parse_settings, search_history, toggles, recent_places, drafts, frequent_emoji
-        local.insert(SETTINGS.into(), "{bad".into());
-        assert!(CoreBridge::parse_settings(&local).is_none());
+        local.insert(SETTINGS.name().into(), "{bad".into());
+        assert!(SETTINGS.read(&local).is_none());
         local.insert(
-            SETTINGS.into(),
+            SETTINGS.name().into(),
             serde_json::to_string(&Settings::default()).unwrap(),
         );
-        assert!(CoreBridge::parse_settings(&local).is_some());
+        assert!(SETTINGS.read(&local).is_some());
 
-        local.insert(SEARCH_HISTORY.into(), r#"["deploy","incident"]"#.into());
+        local.insert(
+            SEARCH_HISTORY.name().into(),
+            r#"["deploy","incident"]"#.into(),
+        );
         assert_eq!(
-            CoreBridge::parse_search_history(&local),
+            SEARCH_HISTORY.read(&local),
             Some(vec!["deploy".into(), "incident".into()])
         );
-        local.insert(SEARCH_HISTORY_SHOWN.into(), "true".into());
-        local.insert(SEARCH_FILTERS_SHOWN.into(), "false".into());
-        assert_eq!(CoreBridge::parse_search_history_shown(&local), Some(true));
-        assert_eq!(CoreBridge::parse_search_filters_shown(&local), Some(false));
+        local.insert(SEARCH_HISTORY_SHOWN.name().into(), "true".into());
+        local.insert(SEARCH_FILTERS_SHOWN.name().into(), "false".into());
+        assert_eq!(SEARCH_HISTORY_SHOWN.read(&local), Some(true));
+        assert_eq!(SEARCH_FILTERS_SHOWN.read(&local), Some(false));
 
-        local.insert(RECENT_PLACES.into(), r#"["C0ENG","D0ALICE"]"#.into());
+        local.insert(RECENT_PLACES.name().into(), r#"["C0ENG","D0ALICE"]"#.into());
         assert_eq!(
-            CoreBridge::parse_recent_places(&local),
+            RECENT_PLACES.read(&local),
             Some(vec![ChannelId::from("C0ENG"), ChannelId::from("D0ALICE")])
         );
 
-        local.insert(FREQUENT_EMOJI.into(), r#"["tada","rocket"]"#.into());
+        local.insert(FREQUENT_EMOJI.name().into(), r#"["tada","rocket"]"#.into());
         assert_eq!(
-            CoreBridge::parse_frequent_emoji(&local),
+            FREQUENT_EMOJI.read(&local),
             Some(vec!["tada".into(), "rocket".into()])
         );
 
-        local.insert(DRAFTS.into(), "not json".into());
-        assert!(CoreBridge::parse_drafts(&local).is_none());
+        local.insert(DRAFTS.name().into(), "not json".into());
+        assert!(DRAFTS.read(&local).is_none());
     }
 
     #[test]
@@ -1391,84 +1260,94 @@ mod tests {
 
         run_ready(
             bridge
-                .remember_conversation(ChannelId::from("C0ENG"))
+                .remember(&LAST_CONVERSATION, &ChannelId::from("C0ENG"))
                 .unwrap(),
         );
         run_ready(
             bridge
-                .remember_window_state(vec![0xde, 0xad, 0xbe, 0xef])
+                .remember(&WINDOW_STATE, &[0xde, 0xad, 0xbe, 0xef])
                 .unwrap(),
         );
-        run_ready(bridge.remember_color_mode(AppearanceMode::Dark).unwrap());
+        run_ready(bridge.remember(&COLOR_MODE, &AppearanceMode::Dark).unwrap());
         run_ready(
             bridge
-                .remember_search_history(&["alpha".into(), "beta".into()])
+                .remember(&SEARCH_HISTORY, &["alpha".to_owned(), "beta".to_owned()])
                 .unwrap(),
         );
-        run_ready(bridge.remember_search_history_shown(false).unwrap());
-        run_ready(bridge.remember_search_filters_shown(true).unwrap());
+        run_ready(bridge.remember(&SEARCH_HISTORY_SHOWN, &false).unwrap());
+        run_ready(bridge.remember(&SEARCH_FILTERS_SHOWN, &true).unwrap());
         run_ready(
             bridge
-                .remember_recent_places(&[ChannelId::from("C0ENG"), ChannelId::from("D0ALICE")])
+                .remember(
+                    &RECENT_PLACES,
+                    &[ChannelId::from("C0ENG"), ChannelId::from("D0ALICE")],
+                )
                 .unwrap(),
         );
-        run_ready(bridge.remember_font(1).unwrap());
-        run_ready(bridge.remember_zoom(4).unwrap());
-        run_ready(bridge.remember_settings(&settings).unwrap());
-        run_ready(bridge.remember_drafts(&drafts).unwrap());
+        run_ready(bridge.remember(&FONT, &1).unwrap());
+        run_ready(bridge.remember(&ZOOM, &4).unwrap());
+        run_ready(bridge.remember(&SETTINGS, &settings).unwrap());
+        run_ready(bridge.remember(&DRAFTS, drafts.as_slice()).unwrap());
         run_ready(
             bridge
-                .remember_frequent_emoji(&["fire".into(), "100".into()])
+                .remember(&FREQUENT_EMOJI, &["fire".to_owned(), "100".to_owned()])
                 .unwrap(),
         );
-        run_ready(bridge.remember_emoji_tone(5).unwrap());
+        run_ready(bridge.remember(&EMOJI_TONE, &5).unwrap());
         run_ready(
             bridge
-                .remember_workspace_order(&["T2".into(), "T1".into()])
+                .remember(&WORKSPACE_ORDER, &["T2".to_owned(), "T1".to_owned()])
                 .unwrap(),
         );
-        run_ready(bridge.remember_section_prefs(&section_prefs).unwrap());
-        run_ready(bridge.remember_channel_counts(&members, &apps).unwrap());
+        run_ready(bridge.remember(&SECTION_PREFS, &section_prefs).unwrap());
+        run_ready(
+            bridge
+                .remember(&CHANNEL_COUNTS_CACHE, &(members.clone(), apps.clone()))
+                .unwrap(),
+        );
 
         let local = bridge.all_local();
         assert_eq!(
-            CoreBridge::parse_last_conversation(&local),
+            LAST_CONVERSATION.read(&local),
             Some(ChannelId::from("C0ENG"))
         );
-        assert_eq!(bridge.last_conversation(), Some(ChannelId::from("C0ENG")));
         assert_eq!(
-            CoreBridge::parse_window_state(&local),
+            bridge.read_local(&LAST_CONVERSATION),
+            Some(ChannelId::from("C0ENG"))
+        );
+        assert_eq!(
+            WINDOW_STATE.read(&local),
             Some(vec![0xde, 0xad, 0xbe, 0xef])
         );
-        assert_eq!(bridge.parse_color_mode(&local), Some(AppearanceMode::Dark));
+        assert_eq!(COLOR_MODE.read(&local), Some(AppearanceMode::Dark));
         assert_eq!(
-            CoreBridge::parse_search_history(&local),
+            SEARCH_HISTORY.read(&local),
             Some(vec!["alpha".into(), "beta".into()])
         );
-        assert_eq!(CoreBridge::parse_search_history_shown(&local), Some(false));
-        assert_eq!(CoreBridge::parse_search_filters_shown(&local), Some(true));
+        assert_eq!(SEARCH_HISTORY_SHOWN.read(&local), Some(false));
+        assert_eq!(SEARCH_FILTERS_SHOWN.read(&local), Some(true));
         assert_eq!(
-            CoreBridge::parse_recent_places(&local),
+            RECENT_PLACES.read(&local),
             Some(vec![ChannelId::from("C0ENG"), ChannelId::from("D0ALICE")])
         );
-        assert_eq!(CoreBridge::parse_font(&local), Some(1));
-        assert_eq!(CoreBridge::parse_zoom(&local), Some(4));
-        let decoded_settings = CoreBridge::parse_settings(&local).unwrap();
+        assert_eq!(FONT.read(&local), Some(1));
+        assert_eq!(ZOOM.read(&local), Some(4));
+        let decoded_settings = SETTINGS.read(&local).unwrap();
         assert_eq!(decoded_settings.keywords, "deploy, urgent");
         assert!(!decoded_settings.enter_sends);
         assert_eq!(bridge.settings().unwrap().keywords, "deploy, urgent");
-        assert_eq!(CoreBridge::parse_drafts(&local), Some(drafts.clone()));
-        assert_eq!(bridge.drafts(), Some(drafts));
+        assert_eq!(DRAFTS.read(&local), Some(drafts.clone()));
+        assert_eq!(bridge.read_local(&DRAFTS), Some(drafts));
         assert_eq!(
-            CoreBridge::parse_frequent_emoji(&local),
+            FREQUENT_EMOJI.read(&local),
             Some(vec!["fire".into(), "100".into()])
         );
-        assert_eq!(CoreBridge::parse_emoji_tone(&local), Some(5));
+        assert_eq!(EMOJI_TONE.read(&local), Some(5));
         assert_eq!(
             bridge.workspace_order(),
             Some(vec!["T2".into(), "T1".into()])
         );
         assert_eq!(bridge.section_prefs(), Some(section_prefs));
-        assert_eq!(CoreBridge::parse_channel_counts(&local), (members, apps));
+        assert_eq!(CHANNEL_COUNTS_CACHE.read(&local), Some((members, apps)));
     }
 }

@@ -520,7 +520,7 @@ impl App {
                                                     );
                                                 });
                                                 if let Some(write) =
-                                                    app.bridge.remember_settings(&settings)
+                                                    app.bridge.remember(&SETTINGS, &settings)
                                                 {
                                                     cx.background_executor().spawn(write).detach();
                                                 }

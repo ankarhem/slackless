@@ -167,7 +167,7 @@ impl App {
         let order: Vec<String> = (self.rail.iter())
             .map(|&ix| self.slots[ix].team.id.as_str().to_owned())
             .collect();
-        if let Some(write) = self.bridge.remember_workspace_order(&order) {
+        if let Some(write) = self.bridge.remember(&WORKSPACE_ORDER, order.as_slice()) {
             cx.background_executor().spawn(write).detach();
         }
         self.sync_rail(cx);
@@ -518,7 +518,7 @@ impl App {
             self.search_menu
                 .update(cx, |menu, cx| menu.record_search(&query, cx));
             let history = self.search_menu.read(cx).history().to_vec();
-            if let Some(write) = self.bridge.remember_search_history(&history) {
+            if let Some(write) = self.bridge.remember(&SEARCH_HISTORY, history.as_slice()) {
                 cx.background_executor().spawn(write).detach();
             }
         }
@@ -619,7 +619,7 @@ impl App {
         // Scrub `recent` after navigating away so `show_conversation` does not re-record the
         // channel we just left at the top of the history list.
         self.recent.retain(|c| *c != channel);
-        if let Some(write) = self.bridge.remember_recent_places(&self.recent) {
+        if let Some(write) = self.bridge.remember(&RECENT_PLACES, self.recent.as_slice()) {
             cx.background_executor().spawn(write).detach();
         }
         self.update_menus(cx);
@@ -632,7 +632,7 @@ impl App {
             return;
         }
         self.close_hover_card(cx);
-        if let Some(write) = self.bridge.remember_conversation(channel.clone()) {
+        if let Some(write) = self.bridge.remember(&LAST_CONVERSATION, &channel) {
             cx.background_executor().spawn(write).detach();
         }
         /// Recent conversations kept for the history menu.
@@ -642,7 +642,7 @@ impl App {
         self.recent.insert(0, left);
         self.recent.truncate(RECENT_MAX);
         *self.ws.visits.entry(channel.clone()).or_default() += 1;
-        if let Some(write) = self.bridge.remember_recent_places(&self.recent) {
+        if let Some(write) = self.bridge.remember(&RECENT_PLACES, self.recent.as_slice()) {
             cx.background_executor().spawn(write).detach();
         }
         self.save_draft(cx);
@@ -863,17 +863,18 @@ impl App {
             None => {
                 // Live: the workspace paints at once from a placeholder while its snapshot is
                 // read off the UI thread, as the incoming state's pending reload.
+                let local = self.bridge.all_local();
                 let (fixtures, channel, archive, chosen, reload) =
                     if let Some(mut snap) = self.bridge.placeholder(&state.counts) {
                         snap.workspaces = self.rail_teams();
                         // The conversation last open here opens at once; the snapshot confirms
                         // it when it lands, else the first conversation opens instead.
-                        let restored = self.bridge.last_conversation();
+                        let restored = LAST_CONVERSATION.read(&local);
                         let chosen = restored.is_some();
                         let channel = restored.unwrap_or_default();
                         let archive = self.bridge.read_store_clone();
                         // Restore persisted drafts for this workspace on first visit.
-                        if let Some(saved_drafts) = self.bridge.drafts() {
+                        if let Some(saved_drafts) = DRAFTS.read(&local) {
                             let entries: Vec<Entry> = saved_drafts
                                 .into_iter()
                                 .map(|d| Entry {
@@ -903,7 +904,7 @@ impl App {
                     window,
                     cx,
                 );
-                if let Some(prefs) = self.bridge.section_prefs() {
+                if let Some(prefs) = SECTION_PREFS.read(&local) {
                     views
                         .sidebar
                         .update(cx, |sidebar, cx| sidebar.restore_section_prefs(prefs, cx));

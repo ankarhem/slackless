@@ -89,7 +89,8 @@ use gpui_kit::open_window;
 use slackless_platform::{self as platform, IconSetter as _};
 
 use crate::app::App;
-use crate::bridge::CoreBridge;
+use crate::bridge::{COLOR_MODE, CoreBridge, FONT, SETTINGS, WINDOW_STATE, ZOOM};
+use crate::preferences::AppearanceMode;
 
 fn main() {
     slackless_core::huddle::install_default_crypto_provider();
@@ -177,15 +178,18 @@ fn main() {
         // Live: the Font and Slack's Color Mode (both remembered locally; Lato and `System`
         // until chosen) over the color theme it stores for the workspace, installed before the
         // first frame (all read from the single batched `local` map).
-        if let Some(font) = CoreBridge::parse_font(&local) {
+        if let Some(font) = FONT.read(&local) {
             theme::set_font(font, cx);
         }
         // The remembered zoom, before the first frame lays out.
-        if let Some(level) = CoreBridge::parse_zoom(&local) {
+        if let Some(level) = ZOOM.read(&local) {
             zoom::set_level(level, cx);
         }
-        if let Some(mode) = bridge.parse_color_mode(&local) {
-            let saved = CoreBridge::parse_settings(&local);
+        if let Some(mode) = bridge
+            .store()
+            .map(|_| COLOR_MODE.read(&local).unwrap_or(AppearanceMode::System))
+        {
+            let saved = SETTINGS.read(&local);
             let palette = saved
                 .as_ref()
                 .map(|s| s.palette)
@@ -207,7 +211,7 @@ fn main() {
         // frame it was left in (`App` saves it as it changes). A saved frame is restored onto a
         // plain window: restoring onto a zoomed one lets AppKit's zoom state skew the frame.
         // The traffic lights sit inside the 40px top bar, vertically centred, as in Slack's.
-        let saved_frame = CoreBridge::parse_window_state(&local);
+        let saved_frame = WINDOW_STATE.read(&local);
         let default_bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         let window_options = WindowOptions {
             window_bounds: Some(if saved_frame.is_some() {

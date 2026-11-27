@@ -64,7 +64,7 @@ pub(super) fn subscribe_workspace(
                 }
                 SidebarEvent::SectionPrefsChanged => {
                     let prefs = this.sidebar.read(cx).export_section_prefs();
-                    if let Some(write) = this.bridge.remember_section_prefs(&prefs) {
+                    if let Some(write) = this.bridge.remember(&SECTION_PREFS, &prefs) {
                         cx.background_executor().spawn(write).detach();
                     }
                 }
