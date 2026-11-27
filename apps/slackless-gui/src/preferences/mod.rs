@@ -44,12 +44,10 @@ pub use window::open_preferences_window;
 pub enum PreferencesEvent {
     /// Some setting changed; read [`Preferences::settings`].
     Changed,
-    /// User asked to reset the local SQLite & media cache in Preferences -> Advanced.
-    ResetCache,
     /// User asked to compact/VACUUM the active workspace's local SQLite store.
     CompactStorage,
-    /// User asked to prune cached media/temp files on disk.
-    PruneMediaCache,
+    /// User asked to clear the re-fetchable media, audio and avatar/emoji caches on disk.
+    ClearMediaCache,
     /// User asked to export captured HTTP net-log JSON (`F-SHELL-158`).
     ExportNetLog,
     /// User clicked "Test speaker" in Preferences -> Audio & video (`F-COLLAB-040`).

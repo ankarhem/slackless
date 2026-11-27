@@ -232,27 +232,6 @@ impl App {
         });
     }
 
-    /// Confirm clearing the re-fetchable caches (`Preferences -> Advanced -> Clear local cache`):
-    /// the media, audio and avatar/emoji caches, never the workspace archives.
-    pub(in crate::app) fn confirm_reset_cache(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let this = cx.weak_entity();
-        crate::ui::ConfirmDialog::new(
-            "Clear local cache?",
-            "Removes the downloaded media, audio and avatar/emoji caches from disk; anything still needed is downloaded again. Your message history, search index and signed-in sessions stay intact.",
-            "Clear cache",
-        )
-        .danger()
-        .open(window, cx, move |window, cx| {
-            let _ = this.update(cx, |app, cx| {
-                app.clear_media_caches("Cache cleared", window, cx);
-            });
-        });
-    }
-
     /// Gather SQLite & media cache metrics for the active workspace off the UI thread and push
     /// them into `Preferences -> Advanced -> Local storage & maintenance`.
     pub(in crate::app) fn refresh_storage_stats(&self, cx: &mut Context<Self>) {
@@ -1707,7 +1686,6 @@ impl App {
             let this_resume = this.clone();
             let this_compact = this.clone();
             let this_prune = this.clone();
-            let this_reset = this.clone();
             let this_sem_dl = this.clone();
             let this_sem_idx = this.clone();
             let this_verify = this.clone();
@@ -2122,14 +2100,13 @@ impl App {
                             preferences::form_button(
                                 Button::new("storage-dlg-prune")
                                     .outline()
-                                    .label("Prune media cache"),
+                                    .label("Clear media cache"),
                                 cx,
                             )
                             .on_click(move |_, window, cx| {
-                                let _ = this_prune
-                                    .update(cx, |app, cx| {
-                                        app.clear_media_caches("Media cache pruned", window, cx);
-                                    });
+                                let _ = this_prune.update(cx, |app, cx| {
+                                    app.clear_media_caches("Media cache cleared", window, cx);
+                                });
                             }),
                         )
                         .child(
@@ -2164,19 +2141,6 @@ impl App {
                                     .update(cx, |app, cx| app.backup_archive(window, cx));
                             }),
                         ),
-                )
-                .child(
-                    preferences::form_button(
-                        Button::new("storage-dlg-reset")
-                            .danger()
-                            .label("Clear local cache"),
-                        cx,
-                    )
-                    .on_click(move |_, window, cx| {
-                        window.close_dialog(cx);
-                        let _ = this_reset
-                            .update(cx, |app, cx| app.confirm_reset_cache(window, cx));
-                    }),
                 );
 
             let sem_model = slackless_core::embeddings::EmbeddingModel::default();

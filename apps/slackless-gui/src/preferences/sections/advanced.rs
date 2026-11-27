@@ -137,20 +137,13 @@ impl Preferences {
                     .label("Compact database"),
             )
             .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::CompactStorage)));
-        let prune_media = self
+        let clear_media_cache = self
             .btn(
                 Button::new("adv-prune-media")
                     .outline()
-                    .label("Prune media cache"),
+                    .label("Clear media cache"),
             )
-            .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::PruneMediaCache)));
-        let reset_cache = self
-            .btn(
-                Button::new("adv-reset-cache")
-                    .danger()
-                    .label("Clear local cache & reload"),
-            )
-            .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::ResetCache)));
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::ClearMediaCache)));
         let storage_summary = {
             let theme = cx.theme();
             let fg = theme.foreground;
@@ -222,9 +215,8 @@ impl Preferences {
                                 .child(open_storage_dialog)
                                 .child(backfill_btn)
                                 .child(compact_db)
-                                .child(prune_media),
-                        )
-                        .child(reset_cache),
+                                .child(clear_media_cache),
+                        ),
                 )
         };
         let dl_label = if self.settings.download_dir.is_empty() {

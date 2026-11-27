@@ -498,10 +498,9 @@ fn wire_feature_view_subscriptions(
             window,
             |this: &mut App, _, event: &PreferencesEvent, window, cx| match event {
                 PreferencesEvent::Changed => this.apply_preferences(window, cx),
-                PreferencesEvent::ResetCache => this.confirm_reset_cache(window, cx),
                 PreferencesEvent::CompactStorage => this.compact_storage(window, cx),
-                PreferencesEvent::PruneMediaCache => {
-                    this.clear_media_caches("Media cache pruned", window, cx);
+                PreferencesEvent::ClearMediaCache => {
+                    this.clear_media_caches("Media cache cleared", window, cx);
                 }
                 PreferencesEvent::ExportNetLog => {
                     let json = slackless_core::api::net_log_export_json();
