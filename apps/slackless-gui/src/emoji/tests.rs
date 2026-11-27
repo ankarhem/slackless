@@ -1,4 +1,4 @@
-use super::catalog::{FREQUENT_MAX, PEOPLE, WORK, lookup};
+use super::catalog::{ALIASES, CATALOG, FREQUENT_MAX, PEOPLE, WORK, lookup, unicode_emoji};
 use super::gifs::filter_gif_presets;
 use super::resolve::{
     base_name, normalize_emoji_query, record_frequent, search_emoji_choices, tone_of, toned,
@@ -83,6 +83,37 @@ fn slack_circle_square_and_alias_shortcodes_resolve() {
         assert!(
             display_glyph(code).is_some(),
             "expected Slack shortcode :{code}: to resolve"
+        );
+    }
+}
+
+#[test]
+fn crate_resolves_every_catalog_shortcode_to_its_hand_kept_glyph() {
+    // The catalog's glyphs and skin-tone flags are hand-kept; the crate resolution behind every
+    // other shortcode (`unicode_emoji`) must agree with it for each one, so the table can go.
+    for (_, title, list) in CATALOG {
+        for emoji in list {
+            let Some(resolved) = unicode_emoji(emoji.name) else {
+                panic!(
+                    "{title}: :{}: does not resolve through the crate",
+                    emoji.name
+                );
+            };
+            assert_eq!(resolved.as_str(), emoji.glyph, "{title} :{}:", emoji.name);
+            assert_eq!(
+                resolved.skin_tone().is_some(),
+                emoji.skin,
+                "{title} :{}: skin-tone support",
+                emoji.name
+            );
+        }
+    }
+    for &(alias, target) in ALIASES {
+        let expected = lookup(target).unwrap();
+        assert_eq!(
+            unicode_emoji(alias).map(|emoji| emoji.as_str()),
+            Some(expected.glyph),
+            ":{alias}:"
         );
     }
 }

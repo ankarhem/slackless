@@ -120,7 +120,7 @@ pub(super) const PEOPLE: &[Emoji] = &[
     s("raised_hands", "🙌"),
     s("pray", "🙏"),
     s("muscle", "💪"),
-    e("handshake", "🤝"),
+    s("handshake", "🤝"),
     e("eyes", "👀"),
     e("brain", "🧠"),
     s("face_palm", "🤦"),
@@ -482,8 +482,18 @@ fn unicode_index() -> &'static HashMap<String, &'static emojis::Emoji> {
     })
 }
 
-fn lookup_unicode_map(key: &str) -> Option<&'static emojis::Emoji> {
+/// A GitHub shortcode or a normalized Unicode CLDR name.
+fn crate_emoji(key: &str) -> Option<&'static emojis::Emoji> {
     emojis::get_by_shortcode(key).or_else(|| unicode_index().get(key).copied())
+}
+
+/// A Slack (`iamcal/emoji-data`) name the crate knows: a Slack alias for the crate's own name
+/// first (GitHub gives `train` to the tram car), else a GitHub shortcode, else a normalized
+/// Unicode CLDR name.
+fn lookup_unicode_map(key: &str) -> Option<&'static emojis::Emoji> {
+    slack_alias(key)
+        .and_then(crate_emoji)
+        .or_else(|| crate_emoji(key))
 }
 
 /// Slack-specific (`iamcal/emoji-data`) shortcode names that differ from both GitHub and CLDR.
@@ -493,6 +503,17 @@ fn slack_alias(name: &str) -> Option<&'static str> {
         "thumbsup" | "thumbsup_all" => "+1",
         "thumbsdown" => "-1",
         "sleuth_or_spy" => "detective",
+        "train" => "train2",
+        "face_palm" => "facepalm",
+        "unicorn_face" => "unicorn",
+        "medal" => "medal_sports",
+        "beach_with_umbrella" => "beach_umbrella",
+        "face_with_raised_eyebrow" => "raised_eyebrow",
+        "face_with_rolling_eyes" => "roll_eyes",
+        "large_green_circle" => "green_circle",
+        "waving_black_flag" => "black_flag",
+        "waving_white_flag" => "white_flag",
+        "rainbow-flag" => "rainbow_flag",
         "man_in_business_suit_levitating" => "business_suit_levitating",
         "speaking_head_in_silhouette" => "speaking_head",
         "female-doctor" | "female_doctor" => "woman_health_worker",
@@ -621,21 +642,11 @@ pub(super) fn unicode_emoji(name: &str) -> Option<&'static emojis::Emoji> {
     if let Some(emoji) = lookup_unicode_map(name) {
         return Some(emoji);
     }
-    if let Some(alias) = slack_alias(name)
-        && let Some(emoji) = lookup_unicode_map(alias)
+    let underscored = name.replace('-', "_");
+    if underscored != name
+        && let Some(emoji) = lookup_unicode_map(&underscored)
     {
         return Some(emoji);
-    }
-    let underscored = name.replace('-', "_");
-    if underscored != name {
-        if let Some(emoji) = lookup_unicode_map(&underscored) {
-            return Some(emoji);
-        }
-        if let Some(alias) = slack_alias(&underscored)
-            && let Some(emoji) = lookup_unicode_map(alias)
-        {
-            return Some(emoji);
-        }
     }
     if let Some(code) = underscored.strip_prefix("flag_")
         && let Some(emoji) = regional_flag(code)
