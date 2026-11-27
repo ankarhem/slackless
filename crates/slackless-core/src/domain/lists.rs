@@ -47,7 +47,7 @@ pub fn build_list_share_request(
                 .to_owned(),
         );
     }
-    if access_level == ListAccessLevel::Owner && !channel_ids.is_empty() && user_ids.is_empty() {
+    if access_level == ListAccessLevel::Owner && !channel_ids.is_empty() {
         return Err(
             "Owner access can only be granted to individual users (U…), not channels.".to_owned(),
         );
@@ -566,10 +566,14 @@ mod tests {
         .unwrap();
         assert!(silent.post_permalink.is_none());
 
-        // Owner access cannot be assigned to channels.
+        // Owner access cannot be assigned to channels (alone or mixed with users).
         let err = build_list_share_request("C01ENG", ListAccessLevel::Owner, true, None, None)
             .unwrap_err();
         assert!(err.contains("Owner"));
+        let err_mixed =
+            build_list_share_request("C01ENG, U01ALICE", ListAccessLevel::Owner, true, None, None)
+                .unwrap_err();
+        assert!(err_mixed.contains("Owner"));
 
         // Empty targets rejected.
         assert!(build_list_share_request("   ", ListAccessLevel::Read, true, None, None).is_err());

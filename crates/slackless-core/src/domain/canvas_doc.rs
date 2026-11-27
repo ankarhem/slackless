@@ -1197,15 +1197,31 @@ fn is_block_boundary(tag: &str) -> bool {
 }
 
 /// Whether an `<li>` is a done checklist item (`data-checked="true"`, `class="checked"` or a
-/// checked `<input>`).
+/// checked `<input>`). Stops at nested `<ul>`/`<ol>` boundaries so a checked sub-item never
+/// marks its unchecked parent done.
 fn list_item_checked(li: &Handle) -> bool {
     let has_checked_class = |node: &Handle| {
         attr(node, "class").is_some_and(|class| class.split_whitespace().any(|c| c == "checked"))
     };
+    fn has_checked_descendant(parent: &Handle) -> bool {
+        for child in &*parent.children.borrow() {
+            if let NodeData::Element { name, .. } = &child.data
+                && matches!(&*name.local, "ul" | "ol")
+            {
+                continue;
+            }
+            let checked_class = attr(child, "class")
+                .is_some_and(|class| class.split_whitespace().any(|c| c == "checked"));
+            if has_attr(child, "checked") || checked_class || has_checked_descendant(child) {
+                return true;
+            }
+        }
+        false
+    }
     attr(li, "data-checked").is_some_and(|v| v.eq_ignore_ascii_case("true"))
         || has_attr(li, "checked")
         || has_checked_class(li)
-        || descendants(li).any(|n| has_attr(&n, "checked") || has_checked_class(&n))
+        || has_checked_descendant(li)
 }
 
 /// A comment node that is really a preserved mrkdwn token (`<!subteam^S01DES|@design>` is
@@ -1302,8 +1318,8 @@ impl<'a> HtmlParser<'a> {
                     }
                 }
                 "control" => {
-                    self.flush_text();
                     if let Some(card) = self.control_profile_card(node) {
+                        self.flush_text();
                         self.push(card, node);
                     } else {
                         let mut text = std::mem::take(&mut self.text);
@@ -2055,6 +2071,9 @@ pub fn parse_canvas_markdown(markdown: &str) -> Vec<CanvasBlock> {
             let mut items = Vec::new();
             while i < lines.len() {
                 let t = lines[i].trim();
+                if t.starts_with("- [ ] ") || t.starts_with("- [x] ") || t.starts_with("- [X] ") {
+                    break;
+                }
                 if let Some(rest) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")) {
                     items.push(rest.trim().to_owned());
                     i += 1;
@@ -2767,11 +2786,38 @@ mod tests {
                 )],
                 vec![None],
             ),
+            // Body-level inline `<control>` stays inside the surrounding paragraph instead of splitting it.
+            (
+                r#"Check <control><a href="https://acme.slack.com/archives/C01ENG">#eng</a></control> now"#,
+                vec![Paragraph("Check <#C01ENG|eng> now".into())],
+                vec![None],
+            ),
+            // Nested checked sub-item must NOT mark its unchecked parent checklist item done.
+            (
+                r#"<ul data-type="checklist"><li data-checked="false">Parent<ul><li data-checked="true">Child</li></ul></li></ul>"#,
+                vec![CanvasBlock::Checklist(vec![
+                    (false, "Parent".into()),
+                    (true, "Child".into()),
+                ])],
+                vec![None],
+            ),
         ];
         for (html, blocks, ids) in cases {
             let (got_blocks, got_ids) = parse_canvas_html_with_ids(html);
             assert_eq!(&got_blocks, blocks, "{html}");
             assert_eq!(&got_ids, ids, "{html}");
         }
+
+        // Markdown checklist immediately after a bullet list starts a Checklist block.
+        let md_blocks = parse_canvas_markdown("- bullet one\n- [ ] task one\n- [x] task two");
+        assert_eq!(
+            md_blocks,
+            vec![
+                Bullets(vec!["bullet one".into()]),
+                CanvasBlock::Checklist(
+                    vec![(false, "task one".into()), (true, "task two".into()),]
+                ),
+            ]
+        );
     }
 }

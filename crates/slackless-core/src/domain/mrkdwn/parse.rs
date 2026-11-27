@@ -557,6 +557,7 @@ fn parse_underline(text: &str, range: Range<usize>, atoms: &[Placed]) -> Option<
 fn parse_link(text: &str, range: Range<usize>, atoms: &[Placed]) -> Option<InlineConstruct> {
     let start = range.start;
     let mut at = start + 1;
+    let mut bracket_depth = 0u32;
     let mut label_end = None;
     while at + 1 < range.end {
         if let Some(atom) = atom_covering(atoms, at) {
@@ -564,7 +565,14 @@ fn parse_link(text: &str, range: Range<usize>, atoms: &[Placed]) -> Option<Inlin
             continue;
         }
         match text.as_bytes()[at] {
-            b'[' => return None,
+            b'[' => {
+                bracket_depth += 1;
+                at += 1;
+            }
+            b']' if bracket_depth > 0 => {
+                bracket_depth -= 1;
+                at += 1;
+            }
             b']' if text.as_bytes()[at + 1] == b'(' && !overlaps_atom(atoms, at..at + 2) => {
                 if at == start + 1 {
                     return None;

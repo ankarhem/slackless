@@ -154,15 +154,20 @@ fn parse_comparable_version(raw: &str) -> Option<ComparableVersion> {
         });
     }
     let s = raw.trim().trim_start_matches('v');
-    let (lhs, pre) = s.rsplit_once('-')?;
-    let (pre_stage, pre_num) = parse_prerelease_tag(pre)?;
-    let base = parse_version(lhs)?;
-    Some(ComparableVersion {
-        base,
-        is_stable: false,
-        pre_stage,
-        pre_num,
-    })
+    for (idx, _) in s.match_indices('-') {
+        let (lhs, pre) = (&s[..idx], &s[idx + 1..]);
+        if let (Some(base), Some((pre_stage, pre_num))) =
+            (parse_version(lhs), parse_prerelease_tag(pre))
+        {
+            return Some(ComparableVersion {
+                base,
+                is_stable: false,
+                pre_stage,
+                pre_num,
+            });
+        }
+    }
+    None
 }
 
 /// Returns `true` if `latest` is strictly newer than `current` (supporting both stable and
@@ -1633,5 +1638,19 @@ mod tests {
                 .expect("valid")
                 .expect("release");
         assert_eq!(chosen_after.version, "2026.11.26-01");
+
+        // Hyphenated pre-release tags (`v1.2.3-beta-2`, `2026.11.25-01-rc-1`) compare properly.
+        assert!(is_newer_version("v1.2.3-beta-2", "v1.2.3-beta-1"));
+        assert!(!is_newer_version("v1.2.3-beta-1", "v1.2.3-beta-2"));
+        assert!(is_newer_version("v1.2.3", "v1.2.3-beta-2"));
+        assert!(!is_newer_version("v1.2.3-beta-2", "v1.2.3"));
+        assert!(is_newer_version(
+            "2026.11.25-01-rc-2",
+            "2026.11.25-01-beta-9"
+        ));
+        assert!(!is_newer_version(
+            "2026.11.25-01-beta-9",
+            "2026.11.25-01-rc-2"
+        ));
     }
 }

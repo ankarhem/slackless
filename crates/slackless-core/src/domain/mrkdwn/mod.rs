@@ -185,4 +185,64 @@ mod tests {
         assert_eq!(doc.to_draft(), "hello <u>world</u>");
         assert_eq!(doc.to_mrkdwn(), "hello world");
     }
+
+    #[test]
+    fn wrapped_styles_skip_markers_in_code_and_links_and_roundtrip_edge_cases() {
+        // Markers inside inline code and `<...>` links must not prematurely close outer styles.
+        let spans = parse_mrkdwn_spans("*bold with `a*b` inside*");
+        assert_eq!(
+            spans,
+            vec![
+                MrkdwnSpan::Text {
+                    text: "bold with ".into(),
+                    style: Style::BOLD,
+                },
+                MrkdwnSpan::Text {
+                    text: "a*b".into(),
+                    style: Style::BOLD.with(Style::CODE),
+                },
+                MrkdwnSpan::Text {
+                    text: " inside".into(),
+                    style: Style::BOLD,
+                },
+            ]
+        );
+        let italic_link = parse_mrkdwn_spans("_see <https://ex.com/a_b> now_");
+        assert_eq!(
+            italic_link,
+            vec![
+                MrkdwnSpan::Text {
+                    text: "see ".into(),
+                    style: Style::ITALIC,
+                },
+                MrkdwnSpan::Link {
+                    url: "https://ex.com/a_b".into(),
+                    label: None,
+                    style: Style::ITALIC,
+                },
+                MrkdwnSpan::Text {
+                    text: " now".into(),
+                    style: Style::ITALIC,
+                },
+            ]
+        );
+
+        // `from_mrkdwn` preserves `*bold `a*b` end*`, empty link labels `<url|>`, and `[` in link labels.
+        let doc_code = from_mrkdwn("*bold `a*b` end*", &TestDir);
+        assert_eq!(doc_code.to_mrkdwn(), "*bold `a*b` end*");
+
+        let doc_empty_label = from_mrkdwn("<https://example.com|>", &TestDir);
+        assert_eq!(doc_empty_label.to_mrkdwn(), "<https://example.com>");
+
+        let doc_brackets = from_mrkdwn("<https://example.com|[BUG] fix>", &TestDir);
+        assert_eq!(doc_brackets.to_mrkdwn(), "<https://example.com|[BUG] fix>");
+
+        // `linkified` handles short `www.` URLs and strips unmatched trailing `>` / `]`.
+        let rt = mrkdwn_to_rich_text("visit <www.x.io> and [http://a.co]", &TestDir);
+        let json = serde_json::to_string(&rt).unwrap();
+        assert!(json.contains("\"url\":\"http://www.x.io\""), "{json}");
+        assert!(json.contains("\"url\":\"http://a.co\""), "{json}");
+        assert!(!json.contains("www.x.io>"), "{json}");
+        assert!(!json.contains("a.co]"), "{json}");
+    }
 }

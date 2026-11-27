@@ -415,6 +415,46 @@ fn parse_span_code(rest: &str, active: Style, out: &mut Vec<MrkdwnSpan>) -> Opti
     Some(close + 1)
 }
 
+/// Find the closing inline formatting `marker` in `line[inner_start..end]`, skipping markers
+/// embedded inside `` `...` `` inline code spans or `<...>` Slack references/links.
+fn find_closing_marker(line: &str, inner_start: usize, end: usize, marker: char) -> Option<usize> {
+    let is_word = |ch: Option<char>| ch.is_some_and(char::is_alphanumeric);
+    let bytes = line.as_bytes();
+    let mut i = inner_start;
+    while i < end {
+        match bytes[i] {
+            b'`' => {
+                if let Some(rel) = line[i + 1..end].find('`')
+                    && rel > 0
+                {
+                    i = i + 1 + rel + 1;
+                    continue;
+                }
+            }
+            b'<' => {
+                if let Some(rel) = line[i + 1..end].find('>') {
+                    i = i + 1 + rel + 1;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        let ch = line[i..end].chars().next()?;
+        let next = i + ch.len_utf8();
+        if ch == marker
+            && line[inner_start..i]
+                .chars()
+                .next_back()
+                .is_some_and(|before| !before.is_whitespace())
+            && !is_word(line[next..end].chars().next())
+        {
+            return Some(i);
+        }
+        i = next;
+    }
+    None
+}
+
 fn parse_span_wrapped(
     line: &str,
     range: Range<usize>,
@@ -434,16 +474,7 @@ fn parse_span_wrapped(
     if !opens {
         return None;
     }
-    let close = line[inner_start..range.end]
-        .match_indices(marker)
-        .map(|(ix, _)| inner_start + ix)
-        .find(|&at| {
-            line[inner_start..at]
-                .chars()
-                .next_back()
-                .is_some_and(|before| !before.is_whitespace())
-                && !is_word(line[at + 1..range.end].chars().next())
-        })?;
+    let close = find_closing_marker(line, inner_start, range.end, marker)?;
     parse_spans_range(line, inner_start..close, active.with(style), out);
     Some(close + 1 - range.start)
 }
@@ -849,7 +880,7 @@ impl Reader<'_> {
                 .append_atom(Atom::Broadcast(range), &format!("@{name}"));
         } else if target.contains("://") || target.starts_with("mailto:") {
             let url = unescape_mrkdwn(target);
-            match label {
+            match label.filter(|r| !r.is_empty()) {
                 Some(label_range) => {
                     self.doc.append("[");
                     self.inline(line, label_range, active);
@@ -909,16 +940,7 @@ impl Reader<'_> {
         if !opens {
             return None;
         }
-        let close = line[inner_start..range.end]
-            .match_indices(marker)
-            .map(|(ix, _)| inner_start + ix)
-            .find(|&at| {
-                line[inner_start..at]
-                    .chars()
-                    .next_back()
-                    .is_some_and(|before| !before.is_whitespace())
-                    && !is_word(line[at + 1..range.end].chars().next())
-            })?;
+        let close = find_closing_marker(line, inner_start, range.end, marker)?;
         let mut buf = [0u8; 4];
         let m = marker.encode_utf8(&mut buf);
         self.doc.append(m);

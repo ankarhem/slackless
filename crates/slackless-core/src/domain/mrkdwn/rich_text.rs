@@ -556,14 +556,23 @@ fn linkified(run: &str, style: Option<TextStyle>) -> Vec<RichTextElement> {
             .map_or(rest.len(), |len| start + len);
         while let Some(last) = rest[start..end].chars().last() {
             let url = &rest[start..end];
-            let unmatched = last == ')' && url.matches('(').count() < url.matches(')').count();
+            let unmatched = (last == ')' && url.matches('(').count() < url.matches(')').count())
+                || (last == ']' && url.matches('[').count() < url.matches(']').count())
+                || (last == '>' && url.matches('<').count() < url.matches('>').count());
             if !(".,;:!?'\"".contains(last) || unmatched) {
                 break;
             }
             end -= last.len_utf8();
         }
         let url = &rest[start..end];
-        if url.len() <= "https://".len() {
+        let min_len = if url.starts_with("https://") {
+            "https://".len()
+        } else if url.starts_with("http://") {
+            "http://".len()
+        } else {
+            "www.".len()
+        };
+        if url.len() <= min_len {
             push(&mut elements, text(&rest[..end], style));
             rest = &rest[end..];
             continue;
