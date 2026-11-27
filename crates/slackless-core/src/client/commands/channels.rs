@@ -55,7 +55,12 @@ impl<B: Backend> Core<B> {
                 });
                 continue;
             }
-            if !self.bots_asked.insert(bot.clone()) {
+            if !self
+                .bots_asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(bot.clone())
+            {
                 continue;
             }
             self.spawn_fetch_bot_profile(bot, None);
@@ -71,8 +76,20 @@ impl<B: Backend> Core<B> {
     ) {
         let ctx = self.ctx();
         let bots = Arc::clone(&self.bots);
+        let bots_asked = Arc::clone(&self.bots_asked);
         self.spawn("bots.info", async move {
-            let profile = ctx.backend.bot_info(bot.clone()).await?;
+            let profile = match ctx.backend.bot_info(bot.clone()).await {
+                Ok(profile) => profile,
+                Err(e) => {
+                    if crate::outbox::is_transient_send_error(&e) || e.is_auth_expired() {
+                        bots_asked
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .remove(&bot);
+                    }
+                    return Err(e.into());
+                }
+            };
             bots.lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(bot.clone(), profile.clone());
@@ -157,7 +174,7 @@ impl<B: Backend> Core<B> {
             let mut joined = ctx.backend.join_conversation(channel.clone()).await?;
             joined.is_member = true;
             let ws = ctx.workspace.clone();
-            with_store(&ctx.store, move |s| s.upsert_conversation(&ws, &joined)).await?;
+            with_store(&ctx.store, move |s| s.merge_conversation(&ws, &joined)).await?;
             ctx.events.emit(Event::Conversations(vec![channel]));
             Ok(())
         });
@@ -200,7 +217,7 @@ impl<B: Backend> Core<B> {
             let dm = ctx.backend.open_dm(users).await?;
             let channel = dm.id.clone();
             let ws = ctx.workspace.clone();
-            with_store(&ctx.store, move |s| s.upsert_conversation(&ws, &dm)).await?;
+            with_store(&ctx.store, move |s| s.merge_conversation(&ws, &dm)).await?;
             ctx.events.emit(Event::Conversations(vec![channel.clone()]));
             ctx.events.emit(Event::ConversationOpened(channel));
             Ok(())

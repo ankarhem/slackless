@@ -200,6 +200,33 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Returns `true` if `workspace` has an actively draining (`sending`) or freshly queued
+    /// (`pending` with no prior attempt error) message/reply outbox entry targeting
+    /// `(channel, thread_ts)`, so new sends queue behind it to preserve FIFO order.
+    pub fn has_active_outbox_for_target(
+        &self,
+        workspace: &TeamId,
+        channel: &ChannelId,
+        thread_ts: Option<&Ts>,
+    ) -> Result<bool> {
+        let thread_ts = thread_ts
+            .filter(|ts| !ts.as_str().is_empty())
+            .map(Ts::as_str);
+        let exists: i64 = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM outbox
+                 WHERE workspace_id = ?1
+                   AND channel_id = ?2
+                   AND ((?3 IS NULL AND thread_ts IS NULL) OR thread_ts = ?3)
+                   AND kind IN ('message', 'reply')
+                   AND (status = 'sending' OR (status = 'pending' AND last_error IS NULL))
+             )",
+            params![workspace.as_str(), channel.as_str(), thread_ts],
+            |r| r.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
     /// List outbox items for a specific channel (or specific thread when `thread_ts` is `Some`),
     /// ordered FIFO (`id ASC`); tests only.
     #[cfg(any(test, feature = "test-support"))]

@@ -384,6 +384,46 @@ impl Store {
         Ok(())
     }
 
+    /// Batch version of [`Self::merge_conversation`]: overlays each conversation in `conversations`
+    /// onto its stored row (preserving richer fields like `last_read`, `unread_count_display`,
+    /// `num_members`, and `properties`) inside a single `IMMEDIATE` transaction.
+    pub fn merge_conversations(
+        &mut self,
+        workspace: &TeamId,
+        conversations: &[Conversation],
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        if conversations.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ts = now_epoch_secs();
+        for fresh in conversations {
+            let merged = match load_conversation(&tx, workspace, &fresh.id) {
+                Ok(Some(mut stored)) => {
+                    stored.merge(fresh);
+                    stored
+                }
+                Ok(None) => fresh.clone(),
+                Err(StoreError::Json(error)) => {
+                    tracing::warn!(
+                        %error,
+                        channel = %fresh.id,
+                        "overwriting corrupt stored conversation during batch merge"
+                    );
+                    fresh.clone()
+                }
+                Err(e) => return Err(e),
+            };
+            upsert_conversation_in_tx(&tx, workspace, &merged, ts)?;
+        }
+        tx.commit()?;
+        self.bump_message_revision();
+        Ok(())
+    }
+
     /// Every stored conversation of `workspace`, by name, as last upserted. A row whose JSON no
     /// longer decodes is logged and skipped, so one stale row cannot fail the whole list.
     pub fn conversations(&self, workspace: &TeamId) -> Result<Vec<Conversation>> {

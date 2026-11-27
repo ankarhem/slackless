@@ -141,11 +141,19 @@ impl<B: Backend> Unfurls<B> {
                 Ok(mut conversation) => {
                     conversation.is_member = false;
                     let (ws, conversation) = (self.workspace.clone(), conversation);
-                    with_store(&self.store, move |s| {
-                        s.upsert_conversation(&ws, &conversation)
+                    let inserted = with_store(&self.store, move |s| {
+                        // Re-check under the store lock so a concurrent `JoinConversation` or
+                        // `client.userBoot` is never overwritten with `is_member = false`.
+                        if s.conversation(&ws, &conversation.id)?.is_some() {
+                            return Ok(false);
+                        }
+                        s.upsert_conversation(&ws, &conversation)?;
+                        Ok(true)
                     })
                     .await?;
-                    self.events.emit(Event::Conversations(vec![id]));
+                    if inserted {
+                        self.events.emit(Event::Conversations(vec![id]));
+                    }
                     guard.completed = n + 1;
                 }
                 Err(ApiError::Slack(_)) => {

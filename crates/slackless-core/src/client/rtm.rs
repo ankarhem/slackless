@@ -36,14 +36,46 @@ impl<B: Backend> Core<B> {
                                 let counts = ctx.backend.counts().await?;
                                 let targets = select_prefetch_targets(&counts);
                                 ctx.events.emit(Event::Counts(Box::new(counts)));
-                                prefetch_targets(ctx, targets).await
+                                prefetch_targets(ctx, targets, true).await
                             });
                         }
+                        let mut drained_ids: HashSet<i64> = HashSet::new();
                         if !self.offline_queue.is_empty() {
                             let queued: Vec<(i64, QueuedMutation)> =
                                 self.offline_queue.drain(..).collect();
+                            drained_ids.extend(queued.iter().map(|(id, _)| *id));
                             self.events.emit(Event::OfflineQueueChanged(0));
                             self.flush_queued_mutations_sequentially(queued);
+                        } else {
+                            // Recover any persisted `offline_queue` rows left behind by an earlier
+                            // failed/AuthExpired flush without yielding before `Event::Connection`.
+                            let ctx = self.ctx();
+                            let stealth_mode = Arc::clone(&self.stealth_mode);
+                            let tasks = self.tasks.clone();
+                            self.tasks.spawn(async move {
+                                let ws = ctx.workspace.clone();
+                                let Ok(rows) =
+                                    with_store(&ctx.store, move |s| s.list_offline(&ws)).await
+                                else {
+                                    return;
+                                };
+                                let queued: Vec<(i64, QueuedMutation)> = rows
+                                    .into_iter()
+                                    .filter(|(id, _)| !drained_ids.contains(id))
+                                    .filter_map(|(id, payload)| {
+                                        serde_json::from_str::<QueuedMutation>(&payload)
+                                            .ok()
+                                            .map(|m| (id, m))
+                                    })
+                                    .collect();
+                                if !queued.is_empty() {
+                                    ctx.events.emit(Event::OfflineQueueChanged(0));
+                                    tasks.spawn(async move {
+                                        Self::run_queued_mutations_batch(ctx, stealth_mode, queued)
+                                            .await;
+                                    });
+                                }
+                            });
                         }
                         self.outbox_retry.reset();
                         self.flush_outbox();
@@ -57,6 +89,19 @@ impl<B: Backend> Core<B> {
             }
             RtmEvent::Event(mut event) => {
                 match &event {
+                    SlackEvent::ManualPresenceChange(m) => {
+                        if let Some(me) = self
+                            .self_user_id
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .clone()
+                        {
+                            self.events.emit(Event::Presence {
+                                users: vec![me],
+                                presence: m.presence.clone(),
+                            });
+                        }
+                    }
                     SlackEvent::DndUpdated(ev) => {
                         self.events
                             .emit(Event::SelfDndUpdated(ev.dnd_status.clone()));
@@ -219,6 +264,9 @@ impl<B: Backend> Core<B> {
             SlackEvent::Message(MessageEvent::Changed(changed)) => {
                 (changed.channel.clone(), changed.message.as_mut())
             }
+            SlackEvent::Message(MessageEvent::Replied(replied)) => {
+                (replied.channel.clone(), replied.message.as_deref_mut()?)
+            }
             _ => return None,
         };
         let bot = message
@@ -235,7 +283,12 @@ impl<B: Backend> Core<B> {
             message.bot_profile = Some(profile);
             return None;
         }
-        if !self.bots_asked.insert(bot.clone()) {
+        if !self
+            .bots_asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(bot.clone())
+        {
             return None;
         }
         let msg_ref = channel.map(|ch| (ch, message.ts.clone()));
@@ -368,16 +421,22 @@ impl<B: Backend> Core<B> {
     }
 
     /// `users.info` for people `users.list` leaves out (members of other organizations in
-    /// shared channels and DMs), each id asked once per session.
+    /// shared channels and DMs), each id asked once per session (re-tried after transient errors).
     pub(super) fn resolve_users(&mut self, ids: Vec<UserId>) {
-        let ids: Vec<UserId> = ids
-            .into_iter()
-            .filter(|id| self.users_asked.insert(id.clone()))
-            .collect();
+        let ids: Vec<UserId> = {
+            let mut asked = self
+                .users_asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            ids.into_iter()
+                .filter(|id| asked.insert(id.clone()))
+                .collect()
+        };
         if ids.is_empty() {
             return;
         }
         let ctx = self.ctx();
+        let users_asked = Arc::clone(&self.users_asked);
         let teams_asked = Arc::clone(&self.teams_asked);
         self.spawn("users.info", async move {
             // Check only the requested ids via PK lookup instead of scanning every stored user.
@@ -406,10 +465,28 @@ impl<B: Backend> Core<B> {
                 return Ok(());
             }
             let mut users = Vec::new();
-            for id in ids {
-                match ctx.backend.user_info(id).await {
+            let mut remaining = ids.into_iter();
+            while let Some(id) = remaining.next() {
+                match ctx.backend.user_info(id.clone()).await {
                     Ok(user) => users.push(user),
-                    Err(e) => ctx.events.report("users.info", e.into()),
+                    Err(e) if e.is_auth_expired() => {
+                        let mut asked = users_asked.lock().unwrap_or_else(PoisonError::into_inner);
+                        asked.remove(&id);
+                        for rest in remaining {
+                            asked.remove(&rest);
+                        }
+                        ctx.events.report("users.info", e.into());
+                        break;
+                    }
+                    Err(e) => {
+                        if crate::outbox::is_transient_send_error(&e) {
+                            users_asked
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .remove(&id);
+                        }
+                        ctx.events.report("users.info", e.into());
+                    }
                 }
             }
             if users.is_empty() {
@@ -527,11 +604,11 @@ pub(super) fn posted_message(event: &SlackEvent) -> Option<(ChannelId, Box<Messa
 }
 
 /// Conversation events without a conversation object; the store needs a fresh copy.
+/// (`ChannelLeft` is reduced directly in `reducer.rs` because calling `conversations.info`
+/// after leaving a private channel fails with `channel_not_found`.)
 pub(super) fn refresh_target(event: &SlackEvent) -> Option<ChannelId> {
     match event {
-        SlackEvent::ChannelArchive(e)
-        | SlackEvent::ChannelUnarchive(e)
-        | SlackEvent::ChannelLeft(e) => Some(e.channel.clone()),
+        SlackEvent::ChannelArchive(e) | SlackEvent::ChannelUnarchive(e) => Some(e.channel.clone()),
         _ => None,
     }
 }

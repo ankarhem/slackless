@@ -2,12 +2,12 @@
 //! scheduled messages, pins, bookmarks, and saved/Later command handlers.
 
 use super::super::*;
-use super::offline::park_transient_send;
+use super::offline::{enqueue_and_flush_outbox, park_transient_send};
 use crate::api::{
     ActionContainer, ActivityEntry, DraftHandle, MessageContent, SavedMark, new_client_msg_id,
 };
 use crate::outbox::{OutboxPayload, is_transient_send_error};
-use crate::reducer::update_conversation_last_read;
+use crate::reducer::update_conversation_last_read_monotonic;
 
 /// Prune idle `draft_locks` entries once the per-channel lock map exceeds this threshold.
 const DRAFT_LOCKS_PRUNE_THRESHOLD: usize = 64;
@@ -33,6 +33,32 @@ impl<B: Backend> Core<B> {
         let client_msg_id = new_client_msg_id();
         let flush = self.outbox_flush();
         self.spawn("chat.postMessage", async move {
+            // Preserve strict FIFO ordering per conversation/thread: if an earlier send to the
+            // same target is still pending/sending in the durable outbox, queue behind it instead
+            // of racing ahead over HTTP.
+            let (ws_chk, ch_chk, th_chk) =
+                (ctx.workspace.clone(), channel.clone(), thread_ts.clone());
+            let has_queued = with_store(&ctx.store, move |s| {
+                s.has_active_outbox_for_target(&ws_chk, &ch_chk, th_chk.as_ref())
+            })
+            .await
+            .unwrap_or(false);
+            if has_queued {
+                let payload = if thread_ts.is_some() {
+                    OutboxPayload::Reply {
+                        content,
+                        broadcast,
+                        client_msg_id: Some(client_msg_id),
+                    }
+                } else {
+                    OutboxPayload::Message {
+                        content,
+                        client_msg_id: Some(client_msg_id),
+                    }
+                };
+                enqueue_and_flush_outbox(&flush, channel, thread_ts, payload).await?;
+                return Ok(());
+            }
             let outcome = post_message_and_store(
                 &ctx,
                 channel.clone(),
@@ -432,13 +458,23 @@ impl<B: Backend> Core<B> {
     pub(super) fn fetch_cloud_drafts(&self) {
         let ctx = self.ctx();
         let cloud_drafts = Arc::clone(&self.cloud_drafts);
+        let draft_sync_seq = Arc::clone(&self.draft_sync_seq);
+        let draft_dirty_seq = Arc::clone(&self.draft_dirty_seq);
         self.spawn("drafts.list", async move {
+            let start_seq = draft_sync_seq.load(Ordering::Acquire);
             let drafts = ctx.backend.drafts_list().await?;
             {
+                let dirty = draft_dirty_seq
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
                 let mut guard = cloud_drafts.lock().unwrap_or_else(PoisonError::into_inner);
-                guard.clear();
+                // Keep any channel modified by a concurrent `sync_draft` while `drafts.list` was
+                // in flight so we never wipe a freshly created/updated DraftHandle.
+                guard.retain(|ch, _| dirty.get(ch).copied().unwrap_or(0) > start_seq);
                 for d in &drafts {
-                    guard.insert(d.channel.clone(), d.handle());
+                    if dirty.get(&d.channel).copied().unwrap_or(0) <= start_seq {
+                        guard.insert(d.channel.clone(), d.handle());
+                    }
                 }
             }
             ctx.events.emit(Event::CloudDrafts(drafts));
@@ -449,6 +485,8 @@ impl<B: Backend> Core<B> {
     pub(super) fn sync_draft(&self, channel: ChannelId, text: String) {
         let ctx = self.ctx();
         let cloud_drafts = Arc::clone(&self.cloud_drafts);
+        let draft_sync_seq = Arc::clone(&self.draft_sync_seq);
+        let draft_dirty_seq = Arc::clone(&self.draft_dirty_seq);
         let draft_locks = Arc::clone(&self.draft_locks);
         let channel_lock = {
             let mut locks = self
@@ -467,6 +505,13 @@ impl<B: Backend> Core<B> {
         self.spawn("drafts.sync", async move {
             let _permit = channel_lock.lock().await;
             let drafts = || cloud_drafts.lock().unwrap_or_else(PoisonError::into_inner);
+            let mark_dirty = |ch: &ChannelId| {
+                let seq = draft_sync_seq.fetch_add(1, Ordering::AcqRel) + 1;
+                draft_dirty_seq
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(ch.clone(), seq);
+            };
             // After a failed write the token may be stale (another device wrote the draft): the
             // next write looks the current one up instead.
             let forget_token = |channel: &ChannelId| {
@@ -479,6 +524,7 @@ impl<B: Backend> Core<B> {
                 if let Some(draft) = existing {
                     match ctx.backend.drafts_delete(draft).await {
                         Ok(()) => {
+                            mark_dirty(&channel);
                             drafts().remove(&channel);
                             Ok(())
                         }
@@ -499,6 +545,7 @@ impl<B: Backend> Core<B> {
                     .await
                 {
                     Ok(updated) => {
+                        mark_dirty(&channel);
                         drafts().insert(channel.clone(), updated);
                         Ok(())
                     }
@@ -512,6 +559,7 @@ impl<B: Backend> Core<B> {
             } else {
                 match ctx.backend.drafts_create(channel.clone(), text).await {
                     Ok(Some(created)) => {
+                        mark_dirty(&channel);
                         drafts().insert(channel.clone(), created);
                         Ok(())
                     }
@@ -649,7 +697,7 @@ pub(super) async fn mark_read_and_store<B: Backend>(
     ctx.backend.mark_read(channel.clone(), ts.clone()).await?;
     let ws = ctx.workspace.clone();
     if let Err(err) = with_store(&ctx.store, move |s| {
-        update_conversation_last_read(s, &ws, &channel, ts, None)
+        update_conversation_last_read_monotonic(s, &ws, &channel, ts)
     })
     .await
     {

@@ -58,7 +58,24 @@ impl OutboxRetry {
     /// pending timer.
     fn schedule<B: Backend>(&self, flush: OutboxFlush<B>) {
         let mut state = self.lock();
+        self.schedule_locked(&mut state, flush);
+    }
+
+    /// Ensures a re-flush timer is armed without replacing an already-pending timer or doubling
+    /// its backoff before the first retry fires (e.g. when several sends fail concurrently).
+    fn ensure_scheduled<B: Backend>(&self, flush: OutboxFlush<B>) {
+        let mut state = self.lock();
+        if state.pending.is_some() {
+            // Still bump generation so an in-flight `Flush::Proceed` does not cancel this timer.
+            state.generation = state.generation.wrapping_add(1);
+            return;
+        }
+        self.schedule_locked(&mut state, flush);
+    }
+
+    fn schedule_locked<B: Backend>(&self, state: &mut RetryState, flush: OutboxFlush<B>) {
         state.generation = state.generation.wrapping_add(1);
+        let my_gen = state.generation;
         let delay = state.delay;
         state.delay = next_outbox_retry_delay(delay);
         state.abort_pending();
@@ -66,9 +83,15 @@ impl OutboxRetry {
         let tasks = flush.tasks.clone();
         state.pending = tasks.spawn(async move {
             tokio::time::sleep(delay).await;
-            // This timer has fired: take it out (without aborting) so the pass's own outcome
-            // never aborts the task running it.
-            retry.lock().pending = None;
+            // Verify this timer was not superseded or reset while waking; otherwise a stale
+            // wakeup could clear a newer timer's handle or run a duplicate flush pass.
+            {
+                let mut st = retry.lock();
+                if st.generation != my_gen {
+                    return;
+                }
+                st.pending = None;
+            }
             flush.run().await;
         });
     }
@@ -77,6 +100,7 @@ impl OutboxRetry {
     /// which flushes at once).
     pub(in crate::client) fn reset(&self) {
         let mut state = self.lock();
+        state.generation = state.generation.wrapping_add(1);
         state.delay = OUTBOX_RETRY_INITIAL;
         state.abort_pending();
     }
@@ -86,6 +110,7 @@ impl OutboxRetry {
     fn reset_if_unchanged(&self, expected_generation: u64) {
         let mut state = self.lock();
         if state.generation == expected_generation {
+            state.generation = state.generation.wrapping_add(1);
             state.delay = OUTBOX_RETRY_INITIAL;
             state.abort_pending();
         }
@@ -180,7 +205,7 @@ impl<B: Backend> OutboxFlush<B> {
 }
 
 /// Park a send or reaction that failed transiently while online: enqueue it in the outbox and
-/// arm the automatic re-flush, since no reconnect will come to flush it.
+/// arm the automatic re-flush (if not already armed), since no reconnect will come to flush it.
 pub(super) async fn park_transient_send<B: Backend>(
     flush: &OutboxFlush<B>,
     channel: ChannelId,
@@ -196,8 +221,21 @@ pub(super) async fn park_transient_send<B: Backend>(
         Some(err.to_string()),
     )
     .await?;
-    flush.retry.schedule(flush.clone());
+    flush.retry.ensure_scheduled(flush.clone());
     Ok(item)
+}
+
+/// Queue a send behind existing active outbox items for the same `(channel, thread_ts)` and run
+/// the serialized FIFO flush so newer messages never overtake older queued ones.
+pub(super) async fn enqueue_and_flush_outbox<B: Backend>(
+    flush: &OutboxFlush<B>,
+    channel: ChannelId,
+    thread_ts: Option<Ts>,
+    payload: OutboxPayload,
+) -> Result<(), CoreError> {
+    enqueue_outbox_with_ctx(&flush.ctx, channel, thread_ts, payload, None).await?;
+    flush.run().await;
+    Ok(())
 }
 
 /// Read marker persisted in SQLite `offline_queue` until flushed on reconnect (sends and
@@ -756,36 +794,62 @@ impl<B: Backend> Core<B> {
         let ctx = self.ctx();
         let stealth_mode = Arc::clone(&self.stealth_mode);
         self.tasks.spawn(async move {
-            for (id, mutation) in queued {
-                let summary = mutation.summary();
-                let outcome = Self::execute_queued_mutation(&ctx, &stealth_mode, mutation).await;
-                match outcome {
-                    Ok(()) => {
-                        if id > 0 {
-                            let ws = ctx.workspace.clone();
-                            if let Err(err) =
-                                with_store(&ctx.store, move |s| s.delete_offline(&ws, id)).await
-                            {
-                                tracing::warn!(id, %err, "failed to delete flushed offline mutation");
-                            }
+            Self::run_queued_mutations_batch(ctx, stealth_mode, queued).await;
+        });
+    }
+
+    pub(in crate::client) async fn run_queued_mutations_batch(
+        ctx: TaskCtx<B>,
+        stealth_mode: Arc<AtomicBool>,
+        queued: Vec<(i64, QueuedMutation)>,
+    ) {
+        let mut stopped_or_failed = false;
+        for (id, mutation) in queued {
+            let summary = mutation.summary();
+            let outcome = Self::execute_queued_mutation(&ctx, &stealth_mode, mutation).await;
+            match outcome {
+                Ok(()) => {
+                    if id > 0 {
+                        let ws = ctx.workspace.clone();
+                        if let Err(err) =
+                            with_store(&ctx.store, move |s| s.delete_offline(&ws, id)).await
+                        {
+                            tracing::warn!(id, %err, "failed to delete flushed offline mutation");
                         }
                     }
-                    Err(CoreError::Api(ApiError::AuthExpired(code))) => {
-                        ctx.events.emit(Event::AuthExpired(code));
-                        break;
-                    }
-                    Err(CoreError::Cancelled) => break,
-                    Err(err) => {
-                        ctx.events
-                            .emit(Event::OfflineMutationFailed(FailedMutation {
-                                id,
-                                summary,
-                                error: err.to_string(),
-                            }));
-                    }
+                }
+                Err(CoreError::Api(ApiError::AuthExpired(code))) => {
+                    stopped_or_failed = true;
+                    ctx.events.emit(Event::AuthExpired(code));
+                    break;
+                }
+                Err(CoreError::Cancelled) => {
+                    stopped_or_failed = true;
+                    break;
+                }
+                Err(err) => {
+                    stopped_or_failed = true;
+                    ctx.events
+                        .emit(Event::OfflineMutationFailed(FailedMutation {
+                            id,
+                            summary,
+                            error: err.to_string(),
+                        }));
                 }
             }
-        });
+        }
+        if stopped_or_failed {
+            let ws = ctx.workspace.clone();
+            if let Ok(rows) = with_store(&ctx.store, move |s| s.list_offline(&ws)).await {
+                let remaining = rows
+                    .into_iter()
+                    .filter(|(_, payload)| serde_json::from_str::<QueuedMutation>(payload).is_ok())
+                    .count();
+                if remaining > 0 {
+                    ctx.events.emit(Event::OfflineQueueChanged(remaining));
+                }
+            }
+        }
     }
 
     /// Execute one persisted offline mutation via [`Self::flush_queued_mutations_sequentially`].

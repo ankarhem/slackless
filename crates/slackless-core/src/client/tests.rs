@@ -8941,3 +8941,190 @@ async fn front_end_read_in_flight_does_not_block_the_writer() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn manual_presence_change_and_channel_left_behave_without_extra_info_call() {
+    let fake = FakeBackend::default();
+    let (store, events, mut rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+    store
+        .lock()
+        .unwrap()
+        .upsert_conversation(
+            &ws,
+            &Conversation {
+                id: c1(),
+                name: Some("private-room".into()),
+                is_private: true,
+                is_member: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+    *core.self_user_id.lock().unwrap() = Some(UserId::from("U_ME"));
+
+    let away: SlackEvent =
+        serde_json::from_str(r#"{"type":"manual_presence_change","presence":"away"}"#).unwrap();
+    core.on_rtm(RtmEvent::Event(away)).await;
+    assert_eq!(
+        next(&mut rx).await,
+        Event::Presence {
+            users: vec![UserId::from("U_ME")],
+            presence: crate::types::Presence::Away,
+        }
+    );
+
+    let left: SlackEvent =
+        serde_json::from_str(r#"{"type":"channel_left","channel":"C1"}"#).unwrap();
+    core.on_rtm(RtmEvent::Event(left)).await;
+    assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
+    let conv = store
+        .lock()
+        .unwrap()
+        .conversation(&ws, &c1())
+        .unwrap()
+        .unwrap();
+    assert!(!conv.is_member);
+    assert!(
+        fake.state.lock().unwrap().info_calls.is_empty(),
+        "channel_left must not invoke conversations.info (fails on private channels)"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconnect_prefetch_fetches_missed_messages_even_when_live_rtm_arrived_first() {
+    let fake = FakeBackend::default();
+    let missed = Message {
+        ts: Ts::from("1700000002.000000"),
+        text: "missed while offline".into(),
+        ..Default::default()
+    };
+    let live = Message {
+        ts: Ts::from("1700000003.000000"),
+        text: "arrived live right after reconnect".into(),
+        ..Default::default()
+    };
+    fake.state.lock().unwrap().history = vec![live.clone(), missed.clone()];
+    let (store, events, mut rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+    // Simulate a live RTM message (ts=3.0) already stored before reconnect counts (latest=2.0) runs.
+    store
+        .lock()
+        .unwrap()
+        .upsert_message(&ws, &c1(), &live)
+        .unwrap();
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    // Initial hydrate (force_recent = false) skips when local_newest >= latest_ts.
+    prefetch_targets(
+        core.ctx(),
+        vec![(c1(), Some(Ts::from("1700000002.000000")))],
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .message(&ws, &c1(), &missed.ts)
+            .unwrap()
+            .is_none(),
+        "initial hydrate should still skip when local_newest >= latest"
+    );
+
+    // Reconnect (force_recent = true) fetches recent history to close any offline gap.
+    prefetch_targets(
+        core.ctx(),
+        vec![(c1(), Some(Ts::from("1700000002.000000")))],
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
+    let recovered = store
+        .lock()
+        .unwrap()
+        .message(&ws, &c1(), &missed.ts)
+        .unwrap()
+        .expect("missed message recovered on reconnect");
+    assert_eq!(recovered.message.text, "missed while offline");
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_message_queues_behind_active_outbox_item_preserving_fifo() {
+    let fake = FakeBackend::default();
+    let (store, events, mut rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+    // Seed a pending message already in the durable outbox for C1.
+    let first_payload = serde_json::to_string(&crate::outbox::OutboxPayload::Message {
+        content: MessageContent::plain("first queued"),
+        client_msg_id: Some("cid-1".into()),
+    })
+    .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .enqueue_outbox(
+            &ws,
+            &crate::store::NewOutboxItem {
+                channel_id: &c1(),
+                thread_ts: None,
+                kind: crate::store::OutboxKind::Message,
+                payload_json: &first_payload,
+                last_error: None,
+            },
+        )
+        .unwrap();
+
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+    // Drain startup OutboxUpdated.
+    assert!(matches!(next(&mut rx).await, Event::OutboxUpdated(_)));
+
+    // Sending a second message online to the same channel must queue behind the pending one.
+    core.handle(Command::Messaging(MessagingCommand::SendMessage {
+        channel: c1(),
+        content: MessageContent::plain("second online"),
+        thread_ts: None,
+        broadcast: false,
+    }))
+    .await;
+
+    wait_until("both messages posted in FIFO order", || {
+        fake.state.lock().unwrap().posted_messages.len() == 2
+    })
+    .await;
+    let posted = fake.state.lock().unwrap().posted_messages.clone();
+    assert_eq!(
+        posted,
+        vec![
+            (c1(), "first queued".to_owned()),
+            (c1(), "second online".to_owned()),
+        ]
+    );
+    core.shutdown().await;
+}

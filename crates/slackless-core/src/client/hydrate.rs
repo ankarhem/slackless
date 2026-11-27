@@ -115,7 +115,7 @@ async fn run_hydrate<B: Backend>(
                 for conversation in &mut convs {
                     conversation.is_member |= member.contains(&conversation.id);
                 }
-                store.upsert_conversations(&ws, &convs)?;
+                store.merge_conversations(&ws, &convs)?;
                 if let Some(me) = &boot.self_user {
                     store.upsert_user(&ws, me)?;
                 }
@@ -339,7 +339,7 @@ fn spawn_prefetch_unreads<B: Backend>(
     }
     let events = ctx.events.clone();
     spawn_tracked(tasks, &events, "unread prefetch", async move {
-        prefetch_targets(ctx, targets).await
+        prefetch_targets(ctx, targets, false).await
     });
 }
 
@@ -365,7 +365,14 @@ fn spawn_fetch_dm_previews<B: Backend>(tasks: &TaskTracker, ctx: TaskCtx<B>) {
                 tokio::time::sleep(PAGE_DELAY).await;
             }
             let message =
-                wait_out_rate_limits(|| ctx.backend.latest_message(channel.clone())).await?;
+                match wait_out_rate_limits(|| ctx.backend.latest_message(channel.clone())).await {
+                    Ok(msg) => msg,
+                    Err(e) if e.is_auth_expired() => return Err(e.into()),
+                    Err(e) => {
+                        tracing::debug!(%channel, %e, "dm preview skipped channel");
+                        continue;
+                    }
+                };
             let Some(message) = message else {
                 continue;
             };
@@ -427,26 +434,39 @@ pub(super) fn select_prefetch_targets(
 }
 
 /// Prefetch recent history for unread `targets` whose local SQLite archive is behind `latest`.
+/// When `force_recent` is `true` (e.g. after a websocket reconnect), only skip a channel if
+/// `latest` itself is already stored locally (rather than trusting `local_newest >= latest`,
+/// which a single live RTM message arriving right after reconnect can satisfy while leaving an
+/// offline gap underneath).
 pub(super) async fn prefetch_targets<B: Backend>(
     ctx: TaskCtx<B>,
     targets: Vec<(ChannelId, Option<Ts>)>,
+    force_recent: bool,
 ) -> Result<(), CoreError> {
     let mut fetched = 0usize;
     for (channel, latest) in targets {
-        // Skip channels whose local archive already contains `latest`.
         if let Some(ref latest_ts) = latest
             && !latest_ts.as_str().is_empty()
         {
             let (ws_check, ch_check) = (ctx.workspace.clone(), channel.clone());
-            let local_newest = with_store(&ctx.store, move |s| {
-                s.channel_history(&ws_check, &ch_check, None, 1)
-                    .map(|rows| rows.into_iter().last().map(|r| r.message.ts))
-            })
-            .await?;
-            if local_newest
-                .as_ref()
-                .is_some_and(|local| local >= latest_ts)
-            {
+            let already_present = if force_recent {
+                let target_ts = latest_ts.clone();
+                with_store(&ctx.store, move |s| {
+                    s.message(&ws_check, &ch_check, &target_ts)
+                        .map(|m| m.is_some())
+                })
+                .await?
+            } else {
+                let local_newest = with_store(&ctx.store, move |s| {
+                    s.channel_history(&ws_check, &ch_check, None, 1)
+                        .map(|rows| rows.into_iter().last().map(|r| r.message.ts))
+                })
+                .await?;
+                local_newest
+                    .as_ref()
+                    .is_some_and(|local| local >= latest_ts)
+            };
+            if already_present {
                 continue;
             }
         }
@@ -618,9 +638,19 @@ pub(super) async fn resolve_teams<B: Backend>(
         return;
     }
     let mut teams = Vec::new();
-    for id in fresh {
+    let mut remaining = fresh.into_iter();
+    while let Some(id) = remaining.next() {
         match ctx.backend.team_info(id.clone()).await {
             Ok(team) => teams.push(team),
+            Err(e) if e.is_auth_expired() => {
+                let mut guard = asked.lock().unwrap_or_else(PoisonError::into_inner);
+                guard.remove(&id);
+                for rest in remaining {
+                    guard.remove(&rest);
+                }
+                ctx.events.report("team.info", e.into());
+                break;
+            }
             Err(e) => {
                 if crate::outbox::is_transient_send_error(&e) {
                     asked

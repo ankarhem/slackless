@@ -2,12 +2,12 @@
 
 use crate::Event;
 use crate::store::{self, Store};
-use crate::types::event::{MessageEvent, ReactionEvent};
-use crate::types::{ChannelId, Reaction, SlackEvent, TeamId, Ts, UserId};
+use crate::types::event::{MessageEvent, PinEvent, ReactionEvent};
+use crate::types::{ChannelId, Message, Reaction, SlackEvent, TeamId, Ts, UserId};
 
 /// Update a stored conversation's `last_read` (and optionally `unread_count_display`) without
-/// clobbering other metadata. Shared across RTM read-marker events, online `mark_read`, and
-/// offline queue flush.
+/// clobbering other metadata. Used by authoritative RTM read-marker events (which may move
+/// `last_read` backward when the user marks a message unread).
 pub(crate) fn update_conversation_last_read(
     store: &mut Store,
     ws: &TeamId,
@@ -20,6 +20,23 @@ pub(crate) fn update_conversation_last_read(
         if let Some(unread) = unread_count {
             conv.unread_count_display = Some(unread);
         }
+        store.upsert_conversation(ws, &conv)?;
+    }
+    Ok(())
+}
+
+/// Monotonically advance a stored conversation's `last_read` after an outbound `conversations.mark`
+/// completes, so an older in-flight response finishing out of order never rewinds a newer marker.
+pub(crate) fn update_conversation_last_read_monotonic(
+    store: &mut Store,
+    ws: &TeamId,
+    channel: &ChannelId,
+    ts: Ts,
+) -> store::Result<()> {
+    if let Some(mut conv) = store.conversation(ws, channel)?
+        && conv.last_read.as_ref().is_none_or(|cur| ts > *cur)
+    {
+        conv.last_read = Some(ts);
         store.upsert_conversation(ws, &conv)?;
     }
     Ok(())
@@ -39,12 +56,33 @@ fn apply(store: &mut Store, ws: &TeamId, event: SlackEvent) -> store::Result<Opt
         SlackEvent::Message(ev) => apply_message(store, ws, ev)?,
         SlackEvent::ReactionAdded(r) => apply_reaction(store, ws, &r, true)?,
         SlackEvent::ReactionRemoved(r) => apply_reaction(store, ws, &r, false)?,
+        SlackEvent::PinAdded(p) => apply_pin(store, ws, &p, true)?,
+        SlackEvent::PinRemoved(p) => apply_pin(store, ws, &p, false)?,
         SlackEvent::ChannelCreated(e)
         | SlackEvent::ChannelJoined(e)
         | SlackEvent::ChannelRename(e)
         | SlackEvent::GroupRename(e) => {
             store.merge_conversation(ws, &e.channel)?;
             Some(Event::Conversations(vec![e.channel.id.clone()]))
+        }
+        SlackEvent::ChannelLeft(e) => {
+            if let Some(mut conv) = store.conversation(ws, &e.channel)? {
+                conv.is_member = false;
+                store.upsert_conversation(ws, &conv)?;
+                Some(Event::Conversations(vec![e.channel]))
+            } else {
+                None
+            }
+        }
+        SlackEvent::ChannelDeleted(e) => {
+            if let Some(mut conv) = store.conversation(ws, &e.channel)? {
+                conv.is_archived = true;
+                conv.is_member = false;
+                store.upsert_conversation(ws, &conv)?;
+                Some(Event::Conversations(vec![e.channel]))
+            } else {
+                None
+            }
         }
         SlackEvent::UserChange(e)
         | SlackEvent::UserProfileChanged(e)
@@ -89,7 +127,10 @@ fn apply_message(store: &mut Store, ws: &TeamId, ev: MessageEvent) -> store::Res
     };
     match ev {
         MessageEvent::Message(m) => store.upsert_message(ws, &channel, &m)?,
-        MessageEvent::Changed(c) => store.upsert_message(ws, &channel, &c.message)?,
+        MessageEvent::Changed(mut c) => {
+            preserve_stored_message_metadata(store, ws, &channel, &mut c.message)?;
+            store.upsert_message(ws, &channel, &c.message)?;
+        }
         MessageEvent::Deleted(d) => store.record_deletion(
             ws,
             &channel,
@@ -98,10 +139,80 @@ fn apply_message(store: &mut Store, ws: &TeamId, ev: MessageEvent) -> store::Res
             d.previous_message.as_deref(),
         )?,
         MessageEvent::Replied(r) => match r.message {
-            Some(root) => store.upsert_message(ws, &channel, &root)?,
+            Some(mut root) => {
+                preserve_stored_message_metadata(store, ws, &channel, &mut root)?;
+                store.upsert_message(ws, &channel, &root)?;
+            }
             None => return Ok(None),
         },
     }
+    Ok(Some(Event::StoreChanged { channel }))
+}
+
+/// Slack's `message_changed` and `message_replied` RTM envelopes frequently omit `reactions`,
+/// `pinned_to`, and `bot_profile` even when the stored message already carries them. Preserve
+/// those fields when absent on the incoming partial payload.
+fn preserve_stored_message_metadata(
+    store: &Store,
+    ws: &TeamId,
+    channel: &ChannelId,
+    incoming: &mut Message,
+) -> store::Result<()> {
+    let Some(existing) = store
+        .message(ws, channel, &incoming.ts)?
+        .filter(|m| !m.deleted)
+    else {
+        return Ok(());
+    };
+    if incoming.reactions.is_empty() && !existing.message.reactions.is_empty() {
+        incoming.reactions = existing.message.reactions;
+    }
+    if incoming.pinned_to.is_empty() && !existing.message.pinned_to.is_empty() {
+        incoming.pinned_to = existing.message.pinned_to;
+    }
+    if incoming.bot_profile.is_none() {
+        incoming.bot_profile = existing.message.bot_profile;
+    }
+    Ok(())
+}
+
+/// Pins live on the stored message's `pinned_to` list. Pins for files or messages not yet in the
+/// store are ignored; the next history fetch carries them.
+fn apply_pin(
+    store: &mut Store,
+    ws: &TeamId,
+    ev: &PinEvent,
+    added: bool,
+) -> store::Result<Option<Event>> {
+    let channel = ev.channel_id.clone().or_else(|| {
+        ev.item
+            .get("channel")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ChannelId::from)
+    });
+    let ts = ev
+        .item
+        .get("message")
+        .and_then(|m| m.get("ts"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(Ts::from);
+    let (Some(channel), Some(ts)) = (channel, ts) else {
+        return Ok(None);
+    };
+    let Some(current) = store.message(ws, &channel, &ts)?.filter(|m| !m.deleted) else {
+        return Ok(None);
+    };
+    let mut message = current.message;
+    if added {
+        if !message.pinned_to.contains(&channel) {
+            message.pinned_to.push(channel.clone());
+        }
+    } else {
+        message.pinned_to.retain(|c| c != &channel);
+    }
+    store.upsert_message(ws, &channel, &message)?;
     Ok(Some(Event::StoreChanged { channel }))
 }
 
@@ -649,5 +760,228 @@ mod tests {
                 .map(|id| id.as_str()),
             Some("FCANV")
         );
+    }
+
+    #[test]
+    fn message_changed_and_replied_preserve_reactions_pins_and_bot_profile() {
+        let mut store = Store::open_in_memory().unwrap();
+        let initial = event(
+            r#"{
+                "type": "message",
+                "channel": "C1",
+                "ts": "1700000000.000100",
+                "text": "deploy started",
+                "bot_id": "B1",
+                "bot_profile": {"id": "B1", "name": "DeployBot"},
+                "reactions": [{"name": "rocket", "count": 1, "users": ["U1"]}],
+                "pinned_to": ["C1"]
+            }"#,
+        );
+        assert_eq!(
+            apply_event(&mut store, &ws(), initial),
+            Some(Event::StoreChanged { channel: c1() })
+        );
+
+        // Partial `message_changed` omits `reactions`, `pinned_to`, and `bot_profile`.
+        let changed = event(
+            r#"{
+                "type": "message",
+                "subtype": "message_changed",
+                "channel": "C1",
+                "message": {
+                    "ts": "1700000000.000100",
+                    "text": "deploy succeeded",
+                    "bot_id": "B1"
+                }
+            }"#,
+        );
+        assert_eq!(
+            apply_event(&mut store, &ws(), changed),
+            Some(Event::StoreChanged { channel: c1() })
+        );
+        let after_edit = store
+            .message(&ws(), &c1(), &Ts::from("1700000000.000100"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_edit.message.text, "deploy succeeded");
+        assert_eq!(after_edit.message.reactions.len(), 1);
+        assert_eq!(after_edit.message.reactions[0].name, "rocket");
+        assert_eq!(after_edit.message.pinned_to, vec![c1()]);
+        assert_eq!(
+            after_edit
+                .message
+                .bot_profile
+                .as_ref()
+                .map(|p| p.name.as_str()),
+            Some("DeployBot")
+        );
+
+        // Partial `message_replied` also omits `reactions`, `pinned_to`, and `bot_profile`.
+        let replied = event(
+            r#"{
+                "type": "message",
+                "subtype": "message_replied",
+                "channel": "C1",
+                "message": {
+                    "ts": "1700000000.000100",
+                    "text": "deploy succeeded",
+                    "bot_id": "B1",
+                    "reply_count": 1
+                }
+            }"#,
+        );
+        assert_eq!(
+            apply_event(&mut store, &ws(), replied),
+            Some(Event::StoreChanged { channel: c1() })
+        );
+        let after_reply = store
+            .message(&ws(), &c1(), &Ts::from("1700000000.000100"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_reply.message.reply_count, Some(1));
+        assert_eq!(after_reply.message.reactions.len(), 1);
+        assert_eq!(after_reply.message.pinned_to, vec![c1()]);
+        assert_eq!(
+            after_reply
+                .message
+                .bot_profile
+                .as_ref()
+                .map(|p| p.name.as_str()),
+            Some("DeployBot")
+        );
+    }
+
+    #[test]
+    fn channel_left_channel_deleted_and_pin_events_update_store() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .upsert_conversation(
+                &ws(),
+                &crate::types::Conversation {
+                    id: c1(),
+                    name: Some("secret-ops".into()),
+                    is_private: true,
+                    is_member: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        apply_event(&mut store, &ws(), event(HELLO));
+
+        // Pin added then removed updates `pinned_to`.
+        let pin_add = event(
+            r#"{
+                "type": "pin_added",
+                "channel_id": "C1",
+                "item": {"type": "message", "channel": "C1", "message": {"ts": "1700000000.000100"}}
+            }"#,
+        );
+        assert_eq!(
+            apply_event(&mut store, &ws(), pin_add),
+            Some(Event::StoreChanged { channel: c1() })
+        );
+        let pinned = store
+            .message(&ws(), &c1(), &Ts::from("1700000000.000100"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.message.pinned_to, vec![c1()]);
+
+        let pin_rm = event(
+            r#"{
+                "type": "pin_removed",
+                "channel_id": "C1",
+                "item": {"type": "message", "channel": "C1", "message": {"ts": "1700000000.000100"}}
+            }"#,
+        );
+        assert_eq!(
+            apply_event(&mut store, &ws(), pin_rm),
+            Some(Event::StoreChanged { channel: c1() })
+        );
+        let unpinned = store
+            .message(&ws(), &c1(), &Ts::from("1700000000.000100"))
+            .unwrap()
+            .unwrap();
+        assert!(unpinned.message.pinned_to.is_empty());
+
+        // `channel_left` clears `is_member` directly without dropping metadata.
+        assert_eq!(
+            apply_event(
+                &mut store,
+                &ws(),
+                event(r#"{"type":"channel_left","channel":"C1"}"#)
+            ),
+            Some(Event::Conversations(vec![c1()]))
+        );
+        let after_left = store.conversation(&ws(), &c1()).unwrap().unwrap();
+        assert!(!after_left.is_member);
+        assert!(!after_left.is_archived);
+        assert_eq!(after_left.name.as_deref(), Some("secret-ops"));
+
+        // `channel_deleted` marks archived and non-member.
+        assert_eq!(
+            apply_event(
+                &mut store,
+                &ws(),
+                event(r#"{"type":"channel_deleted","channel":"C1"}"#)
+            ),
+            Some(Event::Conversations(vec![c1()]))
+        );
+        let after_del = store.conversation(&ws(), &c1()).unwrap().unwrap();
+        assert!(!after_del.is_member);
+        assert!(after_del.is_archived);
+    }
+
+    #[test]
+    fn update_conversation_last_read_monotonic_never_rewinds() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .upsert_conversation(
+                &ws(),
+                &crate::types::Conversation {
+                    id: c1(),
+                    last_read: Some(Ts::from("1700000010.000000")),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Older outbound `conversations.mark` completion must not rewind `last_read`.
+        update_conversation_last_read_monotonic(
+            &mut store,
+            &ws(),
+            &c1(),
+            Ts::from("1700000005.000000"),
+        )
+        .unwrap();
+        assert_eq!(
+            store.conversation(&ws(), &c1()).unwrap().unwrap().last_read,
+            Some(Ts::from("1700000010.000000"))
+        );
+
+        // Newer `ts` advances normally.
+        update_conversation_last_read_monotonic(
+            &mut store,
+            &ws(),
+            &c1(),
+            Ts::from("1700000020.000000"),
+        )
+        .unwrap();
+        assert_eq!(
+            store.conversation(&ws(), &c1()).unwrap().unwrap().last_read,
+            Some(Ts::from("1700000020.000000"))
+        );
+
+        // Authoritative RTM `channel_marked` (mark unread) may still move `last_read` backward.
+        update_conversation_last_read(
+            &mut store,
+            &ws(),
+            &c1(),
+            Ts::from("1700000005.000000"),
+            Some(3),
+        )
+        .unwrap();
+        let conv = store.conversation(&ws(), &c1()).unwrap().unwrap();
+        assert_eq!(conv.last_read, Some(Ts::from("1700000005.000000")));
+        assert_eq!(conv.unread_count_display, Some(3));
     }
 }

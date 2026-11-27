@@ -506,21 +506,28 @@ pub(crate) struct Core<B: Backend> {
     /// and subscribed on the websocket. Every `presence_sub` frame replaces the whole
     /// subscription, so the accumulated set is resent as it grows.
     presence_peers: Arc<Mutex<Vec<UserId>>>,
-    /// Ids already sent to `users.info` this session (found or not): each is asked once.
-    users_asked: HashSet<UserId>,
+    /// Ids already sent to `users.info` this session (found or permanently absent); transient
+    /// transport/rate-limit failures release their id so a later view retries.
+    users_asked: Arc<Mutex<HashSet<UserId>>>,
     /// Team ids already sent to `team.info` this session (found or not): each is asked
     /// once. Shared with spawned tasks, which compute the ids off the `&self` borrow.
     teams_asked: Arc<Mutex<HashSet<TeamId>>>,
     /// Bot profiles read through `bots.info` or SQLite cache this session (shared between
     /// `attach_bot_profile` and `Command::ResolveBots`).
     bots: Arc<Mutex<HashMap<BotId, BotProfile>>>,
-    /// Bot ids already requested via `bots.info` this session (found or not): each is asked once.
-    bots_asked: HashSet<BotId>,
+    /// Bot ids already requested via `bots.info` this session (found or permanently absent);
+    /// transient transport/rate-limit failures release their id so a later message retries.
+    bots_asked: Arc<Mutex<HashSet<BotId>>>,
     /// Signed-in user id learned from `client.userBoot` (used to mirror self profile/presence).
     self_user_id: Arc<Mutex<Option<UserId>>>,
     /// Cloud-synced draft per channel with its conflict token (`drafts.list` / `drafts.create` /
     /// `drafts.update` / `drafts.delete`).
     cloud_drafts: Arc<Mutex<HashMap<ChannelId, crate::api::DraftHandle>>>,
+    /// Monotonic sequence bumped on every local `sync_draft` write so an in-flight `drafts.list`
+    /// never overwrites or wipes a channel whose draft changed while the list was in flight.
+    draft_sync_seq: Arc<AtomicU64>,
+    /// Per-channel latest `draft_sync_seq` written by `sync_draft`.
+    draft_dirty_seq: Arc<Mutex<HashMap<ChannelId, u64>>>,
     /// Per-channel async mutexes serializing `SyncDraft` so concurrent edits never double-create.
     draft_locks: Arc<Mutex<HashMap<ChannelId, Arc<tokio::sync::Mutex<()>>>>>,
     /// Whether the RTM websocket is currently disconnected or reconnecting.
@@ -632,12 +639,14 @@ impl<B: Backend> Core<B> {
             tasks,
             rtm: None,
             presence_peers: Arc::new(Mutex::new(Vec::new())),
-            users_asked: HashSet::new(),
+            users_asked: Arc::new(Mutex::new(HashSet::new())),
             teams_asked: Arc::new(Mutex::new(HashSet::new())),
             bots: Arc::new(Mutex::new(cached_bots)),
-            bots_asked: HashSet::new(),
+            bots_asked: Arc::new(Mutex::new(HashSet::new())),
             self_user_id: Arc::new(Mutex::new(None)),
             cloud_drafts: Arc::new(Mutex::new(HashMap::new())),
+            draft_sync_seq: Arc::new(AtomicU64::new(0)),
+            draft_dirty_seq: Arc::new(Mutex::new(HashMap::new())),
             draft_locks: Arc::new(Mutex::new(HashMap::new())),
             is_offline: false,
             has_connected_once: false,
