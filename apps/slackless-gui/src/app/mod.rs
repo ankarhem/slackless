@@ -403,6 +403,10 @@ pub(super) struct WorkspaceState {
     pub(super) active_list: Option<String>,
     /// Live mode: per app DM channel, its App Home metadata and Block Kit view (`F-COLLAB-480`).
     pub(super) app_homes: DocCache<ChannelId, Result<slackless_core::api::AppHomeResponse, String>>,
+    /// Cached last generated AI summary per target (channel, thread, catch-up, or transcript) so
+    /// reopening the summary dialog shows the previous generation until the user clicks Regenerate.
+    pub(in crate::app) summary_cache:
+        DocCache<dialogs::summary::SummaryCacheKey, slackless_core::summarize::SummaryResult>,
     /// Deduplicates `subscriptions.thread.mark` calls: last cursor sent per `(channel, thread_ts)`.
     pub(super) marked_threads: HashMap<(ChannelId, Ts), Ts>,
     /// Live archive backfill progress snapshot for this workspace (`Event::BackfillProgress`).

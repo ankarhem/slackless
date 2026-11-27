@@ -1720,6 +1720,31 @@ fn wired_summary_dialog_states_generation_guard_and_live_targets(cx: &mut gpui::
         let _ = window.draw(cx);
         window.close_dialog(cx);
         theme::activate(SlackTheme::Dark, cx);
+
+        // 3. Cached summary for a channel is reused on reopen without requiring a fresh request.
+        let cached = SummaryResult {
+            title: "#engineering".into(),
+            summary: "Cached overview\n\n- Reopened immediately".into(),
+            provider: AiProvider::Custom,
+            endpoint: "http://localhost:11434/v1".into(),
+            model: "glm-5.3-flash".into(),
+            target_kind: "channel".into(),
+            source_items: 4,
+            truncated: false,
+            prompt_tokens: Some(200),
+            completion_tokens: Some(80),
+            total_tokens: Some(280),
+            elapsed_ms: 1_450,
+        };
+        app.update(cx, |app, cx| {
+            app.ws.summary_cache.insert(
+                super::dialogs::summary::SummaryCacheKey::Channel(ChannelId::from("C0ENG")),
+                cached.clone(),
+            );
+            app.open_summary_for_channel(window, cx);
+        });
+        let _ = window.draw(cx);
+        window.close_dialog(cx);
     });
     drop(root);
 }

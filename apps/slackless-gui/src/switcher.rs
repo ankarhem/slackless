@@ -12,8 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, TextareaState};
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, FontWeight,
@@ -591,7 +593,25 @@ impl Render for QuickSwitcher {
             .w_full()
             .gap_2()
             .capture_key_down(cx.listener(Self::on_key))
-            .child(crate::preferences::search_input_box(&self.input, cx))
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        crate::preferences::search_input_box(&self.input, cx)
+                            .flex_1()
+                            .min_w_0(),
+                    )
+                    .child(
+                        Button::new("switcher-close")
+                            .ghost()
+                            .with_size(Size::Small)
+                            .icon(IconName::X)
+                            .tooltip("Close (Esc)")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+            )
             .child(v_flex().gap_0p5().children(rows).children(empty))
             .child(div().pt_1().text_xs().text_color(muted).child(
                 "\u{2191}\u{2193} to navigate \u{b7} \u{21B5} to open \u{b7} esc to dismiss",

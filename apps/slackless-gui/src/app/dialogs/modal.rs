@@ -213,6 +213,7 @@ impl AppModalStack {
             let stack_close = stack_on_close.clone();
             dialog
                 .w(px(560.))
+                .close_button(false)
                 .overlay_closable(true)
                 .on_close(move |_, _, cx| {
                     let _ = stack_close.update(cx, |s, cx| s.on_dialog_dismissed(cx));

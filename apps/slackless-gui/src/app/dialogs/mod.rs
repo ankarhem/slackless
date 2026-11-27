@@ -617,7 +617,11 @@ impl App {
             .update(cx, |switcher, cx| switcher.set_frecency(recent, visits, cx));
         let switcher = self.switcher.clone();
         window.open_dialog(cx, move |dialog, _, _| {
-            dialog.w(px(560.)).child(switcher.clone())
+            dialog
+                .w(px(560.))
+                .close_button(false)
+                .overlay_closable(true)
+                .child(switcher.clone())
         });
         let switcher = self.switcher.clone();
         window.defer(cx, move |window, cx| {

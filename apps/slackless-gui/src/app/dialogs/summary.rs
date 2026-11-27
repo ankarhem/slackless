@@ -42,12 +42,14 @@ pub(in crate::app) enum SummaryDialogState {
 }
 
 /// Reactive GPUI dialog card presenting an AI summary with selectable text, Copy button,
-/// provider/model pill, and a "Configure in Preferences" CTA when unconfigured or errored.
+/// provider/model pill, inline close button, and a "Configure in Preferences" CTA when
+/// unconfigured or errored.
 pub(in crate::app) struct SummaryDialogView {
     app: WeakEntity<App>,
     request: SummaryRequest,
     state: SummaryDialogState,
     generation: u64,
+    from_cache: bool,
     copied: bool,
 }
 
@@ -59,11 +61,23 @@ impl SummaryDialogView {
         generation: u64,
         cx: &mut gpui::App,
     ) -> Entity<Self> {
+        Self::new_with_cached(app, request, state, generation, false, cx)
+    }
+
+    pub(in crate::app) fn new_with_cached(
+        app: WeakEntity<App>,
+        request: SummaryRequest,
+        state: SummaryDialogState,
+        generation: u64,
+        from_cache: bool,
+        cx: &mut gpui::App,
+    ) -> Entity<Self> {
         cx.new(|_| Self {
             app,
             request,
             state,
             generation,
+            from_cache,
             copied: false,
         })
     }
@@ -80,6 +94,7 @@ impl SummaryDialogView {
             return;
         }
         self.copied = false;
+        self.from_cache = false;
         self.state = match result {
             Ok(res) => SummaryDialogState::Ready(res),
             Err(message) => SummaryDialogState::Error {
@@ -96,18 +111,102 @@ impl SummaryDialogView {
     pub(in crate::app) fn state(&self) -> &SummaryDialogState {
         &self.state
     }
+
+    #[cfg(test)]
+    pub(in crate::app) fn is_from_cache(&self) -> bool {
+        self.from_cache
+    }
 }
 
-impl Render for SummaryDialogView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+/// Format integer counts with comma thousands separators (`1734` -> `"1,734"`).
+fn format_thousands(n: u32) -> String {
+    let digits = n.to_string();
+    let len = digits.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Human-friendly metadata line shown beneath a completed AI summary.
+fn format_summary_meta(res: &SummaryResult, from_cache: bool) -> String {
+    let mut parts = Vec::with_capacity(5);
+    if from_cache {
+        parts.push("Last generated".to_owned());
+    }
+    parts.push(if res.source_items == 1 {
+        "1 item".to_owned()
+    } else {
+        format!("{} items", res.source_items)
+    });
+    if let Some(tokens) = res.total_tokens {
+        parts.push(format!("{} tokens", format_thousands(tokens)));
+    }
+    if res.elapsed_ms >= 1_000 {
+        parts.push(format!("{:.1} s", res.elapsed_ms as f64 / 1_000.0));
+    } else {
+        parts.push(format!("{} ms", res.elapsed_ms));
+    }
+    if res.truncated {
+        parts.push("input truncated to fit budget".to_owned());
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// Render summary text as cleanly spaced, selectable paragraphs so multi-line markdown summaries
+/// read comfortably while keeping drag-select and `Cmd+C` working across every block.
+fn render_summary_body(summary: &str, fg: gpui::Hsla, cx: &gpui::App) -> AnyElement {
+    let blocks: Vec<String> = summary
+        .replace("\r\n", "\n")
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if blocks.is_empty() {
+        return crate::messages::selectable_text(
+            "summary-dialog-text",
+            0,
+            summary.to_owned(),
+            Some(fg),
+            SUMMARY_DIALOG_ORDER,
+            cx,
+        );
+    }
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_2p5()
+        .children(blocks.into_iter().enumerate().map(|(ix, block)| {
+            div()
+                .w_full()
+                .min_w_0()
+                .child(crate::messages::selectable_text(
+                    "summary-dialog-text",
+                    ix,
+                    block,
+                    Some(fg),
+                    SUMMARY_DIALOG_ORDER + ix as u64,
+                    cx,
+                ))
+        }))
+        .into_any_element()
+}
+
+impl SummaryDialogView {
+    #[inline(never)]
+    fn render_header(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let (fg, muted, border, secondary, primary, danger) = (
+        let (fg, muted, border, secondary, primary) = (
             theme.foreground,
             theme.muted_foreground,
             theme.border,
             theme.secondary,
             theme.primary,
-            theme.danger,
         );
 
         let (title, pill): (String, Option<String>) = match &self.state {
@@ -136,13 +235,13 @@ impl Render for SummaryDialogView {
             ),
         };
 
-        let header = h_flex()
+        h_flex()
             .w_full()
             .min_w_0()
             .items_center()
             .justify_between()
             .gap_3()
-            .pb_2p5()
+            .pb_3()
             .border_b_1()
             .border_color(border)
             .child(
@@ -150,10 +249,10 @@ impl Render for SummaryDialogView {
                     .flex_1()
                     .min_w_0()
                     .items_center()
-                    .gap_2()
+                    .gap_2p5()
                     .child(
                         div()
-                            .size(px(28.))
+                            .size(px(30.))
                             .flex_none()
                             .rounded_md()
                             .bg(primary.opacity(0.14))
@@ -170,6 +269,7 @@ impl Render for SummaryDialogView {
                         v_flex()
                             .flex_1()
                             .min_w_0()
+                            .gap_0p5()
                             .child(
                                 div()
                                     .text_sm()
@@ -186,74 +286,255 @@ impl Render for SummaryDialogView {
                             ),
                     ),
             )
-            .when_some(pill, |row, pill_text| {
-                row.child(
-                    div()
-                        .id("summary-provider-pill")
-                        .flex_none()
-                        .max_w(px(220.))
-                        .truncate()
-                        .px_2()
-                        .py(px(3.))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(border)
-                        .bg(secondary.opacity(0.6))
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(fg)
-                        .child(pill_text),
-                )
-            });
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1p5()
+                    .when_some(pill, |row, pill_text| {
+                        row.child(
+                            div()
+                                .id("summary-provider-pill")
+                                .flex_none()
+                                .max_w(px(210.))
+                                .truncate()
+                                .px_2p5()
+                                .py(px(3.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(border)
+                                .bg(secondary.opacity(0.55))
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(fg)
+                                .child(pill_text),
+                        )
+                    })
+                    .child(
+                        Button::new("summary-header-close")
+                            .ghost()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::X)
+                            .tooltip("Close (Esc)")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+            )
+            .into_any_element()
+    }
 
+    #[inline(never)]
+    fn render_not_configured(&self, reason: &str, cx: &Context<Self>) -> (AnyElement, AnyElement) {
+        let theme = cx.theme();
+        let (fg, muted, border, secondary) = (
+            theme.foreground,
+            theme.muted_foreground,
+            theme.border,
+            theme.secondary,
+        );
+        let app_prefs = self.app.clone();
+        let body = v_flex()
+            .gap_2p5()
+            .py_3()
+            .px_3p5()
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(secondary.opacity(0.35))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(fg)
+                    .child("AI summaries are not configured yet"),
+            )
+            .child(div().text_sm().text_color(muted).child(reason.to_owned()))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Point Slackless at local Ollama (http://localhost:11434/v1), LM Studio, OpenAI, or any OpenAI-compatible server in Preferences -> Advanced."),
+            )
+            .into_any_element();
+
+        let footer = h_flex()
+            .items_center()
+            .justify_end()
+            .gap_2()
+            .pt_2()
+            .child(
+                Button::new("summary-close-unconfigured")
+                    .ghost()
+                    .with_size(Size::Small)
+                    .label("Close")
+                    .on_click(|_, window, cx| window.close_dialog(cx)),
+            )
+            .child(
+                Button::new("summary-open-prefs")
+                    .primary()
+                    .with_size(Size::Small)
+                    .icon(IconName::SlidersHorizontal)
+                    .label("Configure in Preferences")
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        let _ = app_prefs.update(cx, |app, cx| {
+                            app.open_preferences(Some(Section::Advanced), window, cx);
+                        });
+                    }),
+            )
+            .into_any_element();
+        (body, footer)
+    }
+
+    #[inline(never)]
+    fn render_loading(
+        provider: AiProvider,
+        model: &str,
+        source_items: usize,
+        cx: &Context<Self>,
+    ) -> (AnyElement, AnyElement) {
+        let theme = cx.theme();
+        let (fg, muted, primary) = (theme.foreground, theme.muted_foreground, theme.primary);
+        let item_note = if source_items > 0 {
+            format!(
+                "Summarizing {source_items} item(s) with {} ({model})\u{2026}",
+                provider.short_label()
+            )
+        } else {
+            format!(
+                "Generating summary with {} ({model})\u{2026}",
+                provider.short_label()
+            )
+        };
+        let body =
+            v_flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .py_8()
+                .px_4()
+                .child(
+                    Icon::new(IconName::Sparkles)
+                        .size(px(22.))
+                        .text_color(primary),
+                )
+                .child(div().text_sm().text_color(fg).child(item_note))
+                .child(div().text_xs().text_color(muted).child(
+                    "Running off the UI thread — you can keep browsing or close this dialog.",
+                ))
+                .into_any_element();
+
+        let footer = h_flex()
+            .items_center()
+            .justify_end()
+            .gap_2()
+            .pt_2()
+            .child(
+                Button::new("summary-cancel-loading")
+                    .outline()
+                    .with_size(Size::Small)
+                    .label("Close")
+                    .on_click(|_, window, cx| window.close_dialog(cx)),
+            )
+            .into_any_element();
+        (body, footer)
+    }
+
+    #[inline(never)]
+    fn render_ready(
+        &self,
+        res: &SummaryResult,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, AnyElement) {
+        let theme = cx.theme();
+        let (fg, muted, border, secondary) = (
+            theme.foreground,
+            theme.muted_foreground,
+            theme.border,
+            theme.secondary,
+        );
         let app_prefs = self.app.clone();
         let app_retry = self.app.clone();
         let retry_request = self.request.clone();
+        let copy_text = res.summary.clone();
+        let copied = self.copied;
+        let meta_line = format_summary_meta(res, self.from_cache);
 
-        let (body, footer): (AnyElement, AnyElement) = match &self.state {
-            SummaryDialogState::NotConfigured { reason, .. } => {
-                let body = v_flex()
-                    .gap_2p5()
-                    .py_3()
-                    .px_3p5()
-                    .rounded_md()
+        let body = v_flex()
+            .gap_2()
+            .child(
+                div()
+                    .id("summary-body-scroll")
+                    .w_full()
+                    .max_h(px(440.))
+                    .overflow_y_scroll()
+                    .px_4()
+                    .py_3p5()
+                    .rounded_lg()
                     .border_1()
                     .border_color(border)
-                    .bg(secondary.opacity(0.35))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(fg)
-                            .child("AI summaries are not configured yet"),
-                    )
-                    .child(div().text_sm().text_color(muted).child(reason.clone()))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child("Point Slackless at local Ollama (http://localhost:11434/v1), LM Studio, OpenAI, or any OpenAI-compatible server in Preferences -> Advanced."),
-                    )
-                    .into_any_element();
+                    .bg(secondary.opacity(0.24))
+                    .text_sm()
+                    .line_height(px(22.))
+                    .text_color(fg)
+                    .child(render_summary_body(&res.summary, fg, cx)),
+            )
+            .child(div().text_xs().text_color(muted).child(meta_line))
+            .into_any_element();
 
-                let footer = h_flex()
+        let footer = h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .pt_2()
+            .child(
+                h_flex()
                     .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .pt_2()
+                    .gap_1p5()
                     .child(
-                        Button::new("summary-close-unconfigured")
+                        Button::new("summary-copy")
+                            .outline()
+                            .with_size(Size::Small)
+                            .icon(if copied {
+                                IconName::Check
+                            } else {
+                                IconName::Copy
+                            })
+                            .label(if copied { "Copied" } else { "Copy" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                                this.copied = true;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("summary-regenerate")
                             .ghost()
                             .with_size(Size::Small)
-                            .label("Close")
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    )
+                            .icon(IconName::RefreshCw)
+                            .label("Regenerate")
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                let _ = app_retry.update(cx, |app, cx| {
+                                    app.run_summary_request_with_options(
+                                        retry_request.clone(),
+                                        true,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1p5()
                     .child(
-                        Button::new("summary-open-prefs")
-                            .primary()
+                        Button::new("summary-prefs-link")
+                            .ghost()
                             .with_size(Size::Small)
-                            .icon(IconName::SlidersHorizontal)
-                            .label("Configure in Preferences")
+                            .label("Preferences")
                             .on_click(move |_, window, cx| {
                                 window.close_dialog(cx);
                                 let _ = app_prefs.update(cx, |app, cx| {
@@ -261,267 +542,131 @@ impl Render for SummaryDialogView {
                                 });
                             }),
                     )
-                    .into_any_element();
-                (body, footer)
+                    .child(
+                        Button::new("summary-close-ready")
+                            .primary()
+                            .with_size(Size::Small)
+                            .label("Done")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+            )
+            .into_any_element();
+        (body, footer)
+    }
+
+    #[inline(never)]
+    fn render_error(&self, message: &str, cx: &Context<Self>) -> (AnyElement, AnyElement) {
+        let theme = cx.theme();
+        let (fg, danger) = (theme.foreground, theme.danger);
+        let app_prefs = self.app.clone();
+        let app_retry = self.app.clone();
+        let retry_request = self.request.clone();
+        let body = v_flex()
+            .gap_2()
+            .py_3()
+            .px_3p5()
+            .rounded_md()
+            .border_1()
+            .border_color(danger.opacity(0.45))
+            .bg(danger.opacity(0.08))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::TriangleAlert)
+                            .size(px(15.))
+                            .text_color(danger),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(danger)
+                            .child("Could not generate summary"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("summary-error-scroll")
+                    .w_full()
+                    .max_h(px(220.))
+                    .overflow_y_scroll()
+                    .text_sm()
+                    .text_color(fg)
+                    .child(message.to_owned()),
+            )
+            .into_any_element();
+
+        let footer = h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .pt_2()
+            .child(
+                Button::new("summary-error-prefs")
+                    .outline()
+                    .with_size(Size::Small)
+                    .icon(IconName::SlidersHorizontal)
+                    .label("Configure in Preferences")
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        let _ = app_prefs.update(cx, |app, cx| {
+                            app.open_preferences(Some(Section::Advanced), window, cx);
+                        });
+                    }),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        Button::new("summary-error-retry")
+                            .primary()
+                            .with_size(Size::Small)
+                            .icon(IconName::RefreshCw)
+                            .label("Retry")
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                let _ = app_retry.update(cx, |app, cx| {
+                                    app.run_summary_request_with_options(
+                                        retry_request.clone(),
+                                        true,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("summary-error-close")
+                            .ghost()
+                            .with_size(Size::Small)
+                            .label("Close")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+            )
+            .into_any_element();
+        (body, footer)
+    }
+}
+
+impl Render for SummaryDialogView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let header = self.render_header(cx);
+        let (body, footer) = match &self.state {
+            SummaryDialogState::NotConfigured { reason, .. } => {
+                self.render_not_configured(reason, cx)
             }
             SummaryDialogState::Loading {
                 provider,
                 model,
                 source_items,
                 ..
-            } => {
-                let item_note = if *source_items > 0 {
-                    format!(
-                        "Summarizing {source_items} item(s) with {} ({model})\u{2026}",
-                        provider.short_label()
-                    )
-                } else {
-                    format!(
-                        "Generating summary with {} ({model})\u{2026}",
-                        provider.short_label()
-                    )
-                };
-                let body = v_flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .py_8()
-                    .px_4()
-                    .child(
-                        Icon::new(IconName::Sparkles)
-                            .size(px(22.))
-                            .text_color(primary),
-                    )
-                    .child(div().text_sm().text_color(fg).child(item_note))
-                    .child(div().text_xs().text_color(muted).child(
-                        "Running off the UI thread — you can keep browsing or close this dialog.",
-                    ))
-                    .into_any_element();
-
-                let footer = h_flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        Button::new("summary-cancel-loading")
-                            .outline()
-                            .with_size(Size::Small)
-                            .label("Close")
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    )
-                    .into_any_element();
-                (body, footer)
-            }
-            SummaryDialogState::Ready(res) => {
-                let summary_text = res.summary.clone();
-                let copy_text = res.summary.clone();
-                let copied = self.copied;
-                let mut meta_parts = vec![format!("{} item(s)", res.source_items)];
-                if let Some(tokens) = res.total_tokens {
-                    meta_parts.push(format!("{tokens} tokens"));
-                }
-                meta_parts.push(format!("{} ms", res.elapsed_ms));
-                if res.truncated {
-                    meta_parts.push("input truncated to fit budget".to_owned());
-                }
-                let meta_line = meta_parts.join(" · ");
-
-                let body = v_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("summary-body-scroll")
-                            .w_full()
-                            .max_h(px(380.))
-                            .overflow_y_scroll()
-                            .px_3p5()
-                            .py_3()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(border)
-                            .bg(secondary.opacity(0.28))
-                            .text_sm()
-                            .line_height(px(21.))
-                            .text_color(fg)
-                            .child(crate::messages::selectable_text(
-                                "summary-dialog-text",
-                                0,
-                                summary_text,
-                                Some(fg),
-                                SUMMARY_DIALOG_ORDER,
-                                cx,
-                            )),
-                    )
-                    .child(div().text_xs().text_color(muted).child(meta_line))
-                    .into_any_element();
-
-                let footer = h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                Button::new("summary-copy")
-                                    .outline()
-                                    .with_size(Size::Small)
-                                    .icon(if copied {
-                                        IconName::Check
-                                    } else {
-                                        IconName::Copy
-                                    })
-                                    .label(if copied { "Copied" } else { "Copy" })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            copy_text.clone(),
-                                        ));
-                                        this.copied = true;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("summary-regenerate")
-                                    .ghost()
-                                    .with_size(Size::Small)
-                                    .icon(IconName::RefreshCw)
-                                    .label("Regenerate")
-                                    .on_click(move |_, window, cx| {
-                                        window.close_dialog(cx);
-                                        let _ = app_retry.update(cx, |app, cx| {
-                                            app.run_summary_request(
-                                                retry_request.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                    }),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                Button::new("summary-prefs-link")
-                                    .ghost()
-                                    .with_size(Size::Small)
-                                    .label("Preferences")
-                                    .on_click(move |_, window, cx| {
-                                        window.close_dialog(cx);
-                                        let _ = app_prefs.update(cx, |app, cx| {
-                                            app.open_preferences(
-                                                Some(Section::Advanced),
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                    }),
-                            )
-                            .child(
-                                Button::new("summary-close-ready")
-                                    .primary()
-                                    .with_size(Size::Small)
-                                    .label("Done")
-                                    .on_click(|_, window, cx| window.close_dialog(cx)),
-                            ),
-                    )
-                    .into_any_element();
-                (body, footer)
-            }
-            SummaryDialogState::Error { message, .. } => {
-                let body = v_flex()
-                    .gap_2()
-                    .py_3()
-                    .px_3p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(danger.opacity(0.45))
-                    .bg(danger.opacity(0.08))
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Icon::new(IconName::TriangleAlert)
-                                    .size(px(15.))
-                                    .text_color(danger),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(danger)
-                                    .child("Could not generate summary"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("summary-error-scroll")
-                            .w_full()
-                            .max_h(px(220.))
-                            .overflow_y_scroll()
-                            .text_sm()
-                            .text_color(fg)
-                            .child(message.clone()),
-                    )
-                    .into_any_element();
-
-                let footer = h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        Button::new("summary-error-prefs")
-                            .outline()
-                            .with_size(Size::Small)
-                            .icon(IconName::SlidersHorizontal)
-                            .label("Configure in Preferences")
-                            .on_click(move |_, window, cx| {
-                                window.close_dialog(cx);
-                                let _ = app_prefs.update(cx, |app, cx| {
-                                    app.open_preferences(Some(Section::Advanced), window, cx);
-                                });
-                            }),
-                    )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                Button::new("summary-error-retry")
-                                    .primary()
-                                    .with_size(Size::Small)
-                                    .icon(IconName::RefreshCw)
-                                    .label("Retry")
-                                    .on_click(move |_, window, cx| {
-                                        window.close_dialog(cx);
-                                        let _ = app_retry.update(cx, |app, cx| {
-                                            app.run_summary_request(
-                                                retry_request.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                    }),
-                            )
-                            .child(
-                                Button::new("summary-error-close")
-                                    .ghost()
-                                    .with_size(Size::Small)
-                                    .label("Close")
-                                    .on_click(|_, window, cx| window.close_dialog(cx)),
-                            ),
-                    )
-                    .into_any_element();
-                (body, footer)
-            }
+            } => Self::render_loading(*provider, model, *source_items, cx),
+            SummaryDialogState::Ready(res) => self.render_ready(res, cx),
+            SummaryDialogState::Error { message, .. } => self.render_error(message, cx),
         };
 
         v_flex()
@@ -570,6 +715,15 @@ fn fixture_message_to_summary(
     })
 }
 
+/// Stable per-workspace cache key for the most recently generated AI summary of a target.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(in crate::app) enum SummaryCacheKey {
+    Channel(ChannelId),
+    Thread(ChannelId, Ts),
+    CatchUp,
+    Transcript(String),
+}
+
 /// Specification of what to summarize: either an already-materialized [`SummaryTarget`] or a
 /// lazy live SQLite store loader run off the UI thread so channel/thread reads never block frames.
 #[derive(Clone)]
@@ -591,6 +745,30 @@ pub(in crate::app) enum SummaryRequest {
 }
 
 impl SummaryRequest {
+    pub(in crate::app) fn cache_key(&self) -> SummaryCacheKey {
+        match self {
+            Self::LiveChannel { channel, .. } => SummaryCacheKey::Channel(channel.clone()),
+            Self::LiveThread {
+                channel, thread_ts, ..
+            } => SummaryCacheKey::Thread(channel.clone(), thread_ts.clone()),
+            Self::Direct(SummaryTarget::Channel { channel_label, .. }) => {
+                SummaryCacheKey::Channel(ChannelId::from(channel_label.as_str()))
+            }
+            Self::Direct(SummaryTarget::Thread {
+                channel_label,
+                thread_ts,
+                ..
+            }) => SummaryCacheKey::Thread(
+                ChannelId::from(channel_label.as_str()),
+                Ts::from(thread_ts.as_deref().unwrap_or("")),
+            ),
+            Self::Direct(SummaryTarget::CatchUp { .. }) => SummaryCacheKey::CatchUp,
+            Self::Direct(SummaryTarget::Transcript { file_id, title, .. }) => {
+                SummaryCacheKey::Transcript(file_id.clone().unwrap_or_else(|| title.clone()))
+            }
+        }
+    }
+
     fn display_title(&self) -> String {
         match self {
             Self::Direct(target) => target.display_title(),
@@ -830,17 +1008,65 @@ impl App {
         );
     }
 
-    /// Core dialog launcher shared by all 4 summary entry points.
+    /// Store a completed AI summary into `ws_slot`'s cache (whether active or parked).
+    fn store_cached_summary(
+        &mut self,
+        ws_slot: usize,
+        key: SummaryCacheKey,
+        result: SummaryResult,
+    ) {
+        if ws_slot == self.workspace {
+            self.ws.summary_cache.insert(key, result);
+        } else if let Some(slot) = self.slots.get_mut(ws_slot) {
+            slot.state.summary_cache.insert(key, result);
+        }
+    }
+
+    /// Core dialog launcher shared by all 4 summary entry points; shows the last generated
+    /// summary for the target when cached unless `force_refresh` is requested.
     pub(in crate::app) fn run_summary_request(
         &mut self,
         request: SummaryRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ai_settings = self.preferences.read(cx).settings().ai_summary.clone();
-        let target_title = request.display_title();
+        self.run_summary_request_with_options(request, false, window, cx);
+    }
+
+    /// Same as [`Self::run_summary_request`], with explicit cache bypass for `Regenerate`/`Retry`.
+    pub(in crate::app) fn run_summary_request_with_options(
+        &mut self,
+        request: SummaryRequest,
+        force_refresh: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cache_key = request.cache_key();
+        let origin_ws = self.workspace;
         let generation = SUMMARY_GEN.fetch_add(1, Ordering::Relaxed);
         let app_weak = cx.weak_entity();
+
+        if !force_refresh && let Some(cached) = self.ws.summary_cache.get(&cache_key).cloned() {
+            let view = SummaryDialogView::new_with_cached(
+                app_weak,
+                request,
+                SummaryDialogState::Ready(cached),
+                generation,
+                true,
+                cx,
+            );
+            window.open_dialog(cx, move |dialog, _, _| {
+                dialog
+                    .w(px(620.))
+                    .close_button(false)
+                    .overlay_closable(true)
+                    .child(view.clone())
+            });
+            return;
+        }
+
+        let ai_settings = self.preferences.read(cx).settings().ai_summary.clone();
+        let target_title = request.display_title();
 
         if !ai_settings.enabled {
             let view = SummaryDialogView::new(
@@ -856,6 +1082,7 @@ impl App {
             window.open_dialog(cx, move |dialog, _, _| {
                 dialog
                     .w(px(580.))
+                    .close_button(false)
                     .overlay_closable(true)
                     .child(view.clone())
             });
@@ -878,6 +1105,7 @@ impl App {
             window.open_dialog(cx, move |dialog, _, _| {
                 dialog
                     .w(px(580.))
+                    .close_button(false)
                     .overlay_closable(true)
                     .child(view.clone())
             });
@@ -887,7 +1115,7 @@ impl App {
         let source_items = request.known_item_count();
         let provider = ai_settings.provider;
         let view = SummaryDialogView::new(
-            app_weak,
+            app_weak.clone(),
             request.clone(),
             SummaryDialogState::Loading {
                 target_title,
@@ -902,6 +1130,7 @@ impl App {
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
                 .w(px(620.))
+                .close_button(false)
                 .overlay_closable(true)
                 .child(view.clone())
         });
@@ -924,6 +1153,15 @@ impl App {
                         .map_err(|err| err.to_string())
                 })
                 .await;
+
+            // Cache successful summaries even if the user closed the dialog while generating so
+            // reopening shows the completed result immediately.
+            if let Ok(ref res) = result {
+                let res_for_cache = res.clone();
+                let _ = app_weak.update(cx, |app, _| {
+                    app.store_cached_summary(origin_ws, cache_key, res_for_cache);
+                });
+            }
 
             let _ = view_weak.update(cx, |dlg, cx| {
                 dlg.apply_result(generation, result, provider, eff_model, cx);
@@ -1058,5 +1296,122 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         });
+    }
+
+    #[test]
+    fn summary_meta_and_cache_keys_format_cleanly() {
+        let res = SummaryResult {
+            summary: "Overview:\n- Done".to_owned(),
+            provider: AiProvider::Custom,
+            endpoint: "http://localhost:11434/v1".to_owned(),
+            model: "glm-5.3-flash".to_owned(),
+            target_kind: "thread".to_owned(),
+            title: "Thread in #eng".to_owned(),
+            source_items: 16,
+            truncated: false,
+            prompt_tokens: Some(1200),
+            completion_tokens: Some(534),
+            total_tokens: Some(1734),
+            elapsed_ms: 17_554,
+        };
+        assert_eq!(
+            format_summary_meta(&res, false),
+            "16 items \u{b7} 1,734 tokens \u{b7} 17.6 s"
+        );
+        assert_eq!(
+            format_summary_meta(&res, true),
+            "Last generated \u{b7} 16 items \u{b7} 1,734 tokens \u{b7} 17.6 s"
+        );
+        let single = SummaryResult {
+            source_items: 1,
+            total_tokens: None,
+            elapsed_ms: 420,
+            truncated: true,
+            ..res
+        };
+        assert_eq!(
+            format_summary_meta(&single, false),
+            "1 item \u{b7} 420 ms \u{b7} input truncated to fit budget"
+        );
+
+        let ch_req = SummaryRequest::Direct(SummaryTarget::Channel {
+            channel_label: "#eng".into(),
+            topic: None,
+            messages: Vec::new(),
+        });
+        let th_req = SummaryRequest::Direct(SummaryTarget::Thread {
+            channel_label: "#eng".into(),
+            thread_ts: Some("1700.1".into()),
+            messages: Vec::new(),
+        });
+        let catchup_req = SummaryRequest::Direct(SummaryTarget::CatchUp {
+            briefing: slackless_core::CatchUpBriefing {
+                generated_at_secs: 0,
+                window: slackless_core::CatchUpWindow::Last24h,
+                cutoff_secs: 0,
+                workspaces: Vec::new(),
+                mentions: Vec::new(),
+                unread_channels: Vec::new(),
+                active_threads: Vec::new(),
+                transcripts: Vec::new(),
+            },
+        });
+        let tr_req = SummaryRequest::Direct(SummaryTarget::Transcript {
+            title: "clip.mp4".into(),
+            file_id: Some("F99".into()),
+            text: "hi".into(),
+            cues: Vec::new(),
+        });
+        assert_eq!(
+            ch_req.cache_key(),
+            SummaryCacheKey::Channel(ChannelId::from("#eng"))
+        );
+        assert_eq!(
+            th_req.cache_key(),
+            SummaryCacheKey::Thread(ChannelId::from("#eng"), Ts::from("1700.1"))
+        );
+        assert_eq!(catchup_req.cache_key(), SummaryCacheKey::CatchUp);
+        assert_eq!(
+            tr_req.cache_key(),
+            SummaryCacheKey::Transcript("F99".into())
+        );
+    }
+
+    #[gpui_kit::gpui::test]
+    fn summary_dialog_cached_flag_clears_when_fresh_result_arrives(cx: &mut TestAppContext) {
+        let ready = SummaryResult {
+            summary: "First paragraph\n\nSecond paragraph".to_owned(),
+            provider: AiProvider::Ollama,
+            endpoint: "http://localhost:11434/v1".to_owned(),
+            model: "llama3.2".to_owned(),
+            target_kind: "channel".to_owned(),
+            title: "#eng".to_owned(),
+            source_items: 3,
+            truncated: false,
+            prompt_tokens: Some(100),
+            completion_tokens: Some(40),
+            total_tokens: Some(140),
+            elapsed_ms: 250,
+        };
+        let req = SummaryRequest::Direct(SummaryTarget::Channel {
+            channel_label: "#eng".into(),
+            topic: None,
+            messages: Vec::new(),
+        });
+        let view = cx.update(|cx| {
+            SummaryDialogView::new_with_cached(
+                WeakEntity::new_invalid(),
+                req,
+                SummaryDialogState::Ready(ready.clone()),
+                12,
+                true,
+                cx,
+            )
+        });
+        view.read_with(cx, |dlg, _| assert!(dlg.is_from_cache()));
+        view.update(cx, |dlg, cx| {
+            dlg.apply_result(12, Ok(ready), AiProvider::Ollama, "llama3.2".into(), cx);
+        });
+        view.read_with(cx, |dlg, _| assert!(!dlg.is_from_cache()));
     }
 }
