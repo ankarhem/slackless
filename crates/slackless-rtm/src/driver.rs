@@ -83,32 +83,30 @@ impl Driver {
         let mut attempt: u32 = 0;
         loop {
             if *self.close.borrow_and_update() {
-                self.emit(RtmEvent::State(ConnectionState::Disconnected {
-                    reason: "closed by client".into(),
-                }))
-                .await;
+                self.emit_terminal("closed by client".into()).await;
                 return;
             }
             if !self
                 .emit(RtmEvent::State(ConnectionState::Connecting))
                 .await
             {
+                if *self.close.borrow_and_update() {
+                    self.emit_terminal("closed by client".into()).await;
+                }
                 return;
             }
-            let started = Instant::now();
-            let reason = match self.dial().await {
+            let (reason, healthy) = match self.dial().await {
                 Ok(socket) => self.session(socket).await,
-                Err(end) => end,
+                Err(end) => (end, false),
             };
             let reason = match reason {
                 End::Lost(reason) => reason,
                 End::Stop(reason) => {
-                    self.emit(RtmEvent::State(ConnectionState::Disconnected { reason }))
-                        .await;
+                    self.emit_terminal(reason).await;
                     return;
                 }
             };
-            if started.elapsed() >= self.config.healthy_after {
+            if healthy {
                 attempt = 0;
             }
             let delay = self.config.backoff.delay(attempt, &mut rand::rng());
@@ -119,11 +117,13 @@ impl Driver {
                 reason,
             };
             if !self.emit(RtmEvent::State(state)).await {
+                if *self.close.borrow_and_update() {
+                    self.emit_terminal("closed by client".into()).await;
+                }
                 return;
             }
             if let Err(End::Stop(reason)) = self.wait(delay).await {
-                self.emit(RtmEvent::State(ConnectionState::Disconnected { reason }))
-                    .await;
+                self.emit_terminal(reason).await;
                 return;
             }
         }
@@ -149,25 +149,33 @@ impl Driver {
 
     async fn dial(&mut self) -> Result<Socket, End> {
         // A server-provided reconnect URL is tried once; a failure or untrusted host falls back to a fresh URL.
-        let url = match self.reconnect_url.take() {
-            Some(url) if is_trusted_cookie_host(&self.config.base_url, &url) => url,
+        let (url, used_reconnect_url) = match self.reconnect_url.take() {
+            Some(url) if is_trusted_cookie_host(&self.config.base_url, &url) => (url, true),
             Some(url) => {
                 let redacted = slackless_types::net::redact_url(&url);
                 tracing::warn!(
                     url = %redacted,
                     "rejecting untrusted reconnect_url; falling back to base_url"
                 );
-                connect_url_on(&self.config.base_url, &self.config.params)
+                let fresh: String = connect_url_on(&self.config.base_url, &self.config.params)
                     .map_err(|e| End::Stop(format!("invalid connect url: {e}")))?
-                    .into()
+                    .into();
+                (fresh, false)
             }
-            None => connect_url_on(&self.config.base_url, &self.config.params)
-                .map_err(|e| End::Stop(format!("invalid connect url: {e}")))?
-                .into(),
+            None => {
+                let fresh: String = connect_url_on(&self.config.base_url, &self.config.params)
+                    .map_err(|e| End::Stop(format!("invalid connect url: {e}")))?
+                    .into();
+                (fresh, false)
+            }
         };
-        let request = self
-            .request(&url)
-            .map_err(|e| End::Stop(format!("invalid handshake request: {e}")))?;
+        let request = match self.request(&url) {
+            Ok(req) => req,
+            Err(e) if used_reconnect_url => {
+                return Err(End::Lost(format!("invalid reconnect_url request: {e}")));
+            }
+            Err(e) => return Err(End::Stop(format!("invalid handshake request: {e}"))),
+        };
         let mut dial_fut = Box::pin(tokio::time::timeout(
             Duration::from_secs(20),
             tokio_tungstenite::connect_async_tls_with_config(
@@ -203,12 +211,21 @@ impl Driver {
                     StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
                 ) =>
             {
-                Err(End::Stop(format!(
-                    "handshake rejected: {}",
-                    response.status()
-                )))
+                let msg = format!("handshake rejected: {}", response.status());
+                if used_reconnect_url {
+                    // Single-use reconnect_url expired (e.g. after laptop sleep): fall back to base_url.
+                    Err(End::Lost(msg))
+                } else {
+                    Err(End::Stop(msg))
+                }
             }
-            Err(e @ tungstenite::Error::Url(_)) => Err(End::Stop(e.to_string())),
+            Err(e @ tungstenite::Error::Url(_)) => {
+                if used_reconnect_url {
+                    Err(End::Lost(e.to_string()))
+                } else {
+                    Err(End::Stop(e.to_string()))
+                }
+            }
             Err(e) => Err(End::Lost(e.to_string())),
         }
     }
@@ -232,12 +249,26 @@ impl Driver {
         Ok(request)
     }
 
-    async fn session(&mut self, socket: Socket) -> End {
+    async fn session(&mut self, socket: Socket) -> (End, bool) {
         let (mut sink, mut stream) = socket.split();
         let period = self.config.ping_interval;
         let mut ping = tokio::time::interval_at(Instant::now() + period, period);
         ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut unanswered: u32 = 0;
+        let mut hello_at: Option<Instant> = None;
+        let mut last_rx: Option<Instant> = None;
+
+        let is_healthy = |hello_at: Option<Instant>, last_rx: Option<Instant>, unanswered: u32| {
+            hello_at.is_some_and(|h| {
+                // Exclude dead-air missed-pong waits so blackholed sockets cannot reset backoff.
+                let active_end = if unanswered > 0 {
+                    last_rx.unwrap_or(h)
+                } else {
+                    Instant::now()
+                };
+                active_end.saturating_duration_since(h) >= self.config.healthy_after
+            })
+        };
 
         loop {
             let outgoing = tokio::select! {
@@ -247,14 +278,18 @@ impl Driver {
                 // `max_missed_pongs` pings gets the socket reconnected.
                 frame = stream.next(), if self.pending.is_empty() => {
                     let text = match frame {
-                        None => return End::Lost("socket closed".into()),
-                        Some(Err(e)) => return End::Lost(e.to_string()),
-                        Some(Ok(Message::Text(text))) => text,
+                        None => return (End::Lost("socket closed".into()), is_healthy(hello_at, last_rx, unanswered)),
+                        Some(Err(e)) => return (End::Lost(e.to_string()), is_healthy(hello_at, last_rx, unanswered)),
+                        Some(Ok(Message::Text(text))) => {
+                            last_rx = Some(Instant::now());
+                            text
+                        }
                         Some(Ok(Message::Close(close))) => {
-                            return End::Lost(match close {
+                            let msg = match close {
                                 Some(c) => format!("closed by server: {} {}", c.code, c.reason),
                                 None => "closed by server".into(),
-                            });
+                            };
+                            return (End::Lost(msg), is_healthy(hello_at, last_rx, unanswered));
                         }
                         // Websocket-level pings are answered by tungstenite itself while reading.
                         Some(Ok(_)) => continue,
@@ -270,6 +305,7 @@ impl Driver {
                     let mut resubscribe = None;
                     match &event {
                         SlackEvent::Hello(hello) => {
+                            hello_at = Some(Instant::now());
                             let state = ConnectionState::Connected { fast_reconnect: hello.fast_reconnect };
                             self.pending.push_back(RtmEvent::State(state));
                             resubscribe = self.presence_sub.clone().map(Outgoing::PresenceSub);
@@ -298,7 +334,7 @@ impl Driver {
                     }
                     self.pending.push_back(RtmEvent::Event(event));
                     if let Some(end) = end {
-                        return end;
+                        return (end, is_healthy(hello_at, last_rx, unanswered));
                     }
                     match resubscribe {
                         Some(frame) => frame,
@@ -307,14 +343,17 @@ impl Driver {
                 }
                 reserved = self.events.reserve(), if !self.pending.is_empty() => {
                     let (Ok(permit), Some(event)) = (reserved, self.pending.pop_front()) else {
-                        return End::Stop("event receiver dropped".into());
+                        return (End::Stop("event receiver dropped".into()), false);
                     };
                     permit.send(event);
                     continue;
                 }
                 _ = ping.tick() => {
                     if unanswered >= self.config.max_missed_pongs {
-                        return End::Lost(format!("{unanswered} pings unanswered"));
+                        return (
+                            End::Lost(format!("{unanswered} pings unanswered")),
+                            is_healthy(hello_at, last_rx, unanswered),
+                        );
                     }
                     unanswered += 1;
                     Outgoing::Ping
@@ -322,13 +361,13 @@ impl Driver {
                 () = wait_for_close(&mut self.close) => {
                     let close_timeout = self.config.write_timeout.min(Duration::from_secs(2));
                     let _ = tokio::time::timeout(close_timeout, sink.send(Message::Close(None))).await;
-                    return End::Stop("closed by client".into());
+                    return (End::Stop("closed by client".into()), false);
                 }
                 cmd = self.commands.recv() => match cmd {
                     None => {
                         let close_timeout = self.config.write_timeout.min(Duration::from_secs(2));
                         let _ = tokio::time::timeout(close_timeout, sink.send(Message::Close(None))).await;
-                        return End::Stop("closed by client".into());
+                        return (End::Stop("closed by client".into()), false);
                     }
                     Some(Command::Send(frame)) => {
                         remember(&mut self.presence_sub, &frame);
@@ -345,21 +384,56 @@ impl Driver {
             .await
             {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => return End::Lost(e.to_string()),
-                Err(_) => return End::Lost("websocket write timed out".into()),
+                Ok(Err(e)) => {
+                    return (
+                        End::Lost(e.to_string()),
+                        is_healthy(hello_at, last_rx, unanswered),
+                    );
+                }
+                Err(_) => {
+                    return (
+                        End::Lost("websocket write timed out".into()),
+                        is_healthy(hello_at, last_rx, unanswered),
+                    );
+                }
             }
         }
     }
 
     /// Forwards `event` to the caller after the events the last session left pending; `false`
-    /// when the receiver is gone.
+    /// when the receiver is gone or the client closed while blocked on a full channel.
     async fn emit(&mut self, event: RtmEvent) -> bool {
         while let Some(pending) = self.pending.pop_front() {
-            if self.events.send(pending).await.is_err() {
-                return false;
+            tokio::select! {
+                res = self.events.send(pending) => {
+                    if res.is_err() {
+                        return false;
+                    }
+                }
+                () = wait_for_close(&mut self.close) => return false,
             }
         }
-        self.events.send(event).await.is_ok()
+        tokio::select! {
+            res = self.events.send(event) => res.is_ok(),
+            () = wait_for_close(&mut self.close) => false,
+        }
+    }
+
+    /// Bounded terminal `Disconnected` emit: delivers pending events + `Disconnected` when the
+    /// caller drains `rx`, without ever deadlocking shutdown if `rx` is permanently stalled.
+    async fn emit_terminal(&mut self, reason: String) {
+        let _ = tokio::time::timeout(Duration::from_millis(200), async {
+            while let Some(pending) = self.pending.pop_front() {
+                if self.events.send(pending).await.is_err() {
+                    return;
+                }
+            }
+            let _ = self
+                .events
+                .send(RtmEvent::State(ConnectionState::Disconnected { reason }))
+                .await;
+        })
+        .await;
     }
 }
 

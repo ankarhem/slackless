@@ -1099,3 +1099,147 @@ async fn bounded_command_channel_returns_queue_full_and_close_still_succeeds() {
         .expect("driver should exit promptly on close")
         .unwrap();
 }
+
+#[tokio::test]
+async fn blackholed_socket_missed_pongs_do_not_reset_backoff() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Accept two WS upgrades without ever answering pings (or even sending hello).
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (s, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
+            while ws.next().await.is_some() {}
+        }
+    });
+
+    let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-blackhole"));
+    cfg.base_url = format!("ws://{addr}/link/");
+    // Default ratio: healthy_after == ping_interval * (max_missed_pongs + 1) so wall time alone
+    // would exceed healthy_after unless dead-air missed-pong waits are excluded.
+    cfg.ping_interval = Duration::from_millis(20);
+    cfg.max_missed_pongs = 2;
+    cfg.healthy_after = Duration::from_millis(50);
+    cfg.backoff = Backoff {
+        initial: Duration::from_millis(10),
+        max: Duration::from_millis(40),
+    };
+    let (client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+    let drv = tokio::spawn(driver);
+
+    let mut attempts = Vec::new();
+    while attempts.len() < 2 {
+        if let RtmEvent::State(ConnectionState::Reconnecting { attempt, .. }) =
+            next_event(&mut rx).await
+        {
+            attempts.push(attempt);
+        }
+    }
+    assert_eq!(
+        attempts,
+        vec![1, 2],
+        "backoff attempt counter must increment instead of resetting to 1 on blackholed sockets"
+    );
+
+    client.close();
+    let _ = tokio::time::timeout(Duration::from_secs(2), drv).await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn expired_reconnect_url_401_falls_back_to_base_url() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        // 1. Initial connection delivers a reconnect_url on the same trusted host, then closes.
+        let (s1, _) = listener.accept().await.unwrap();
+        let mut ws1 = tokio_tungstenite::accept_async(s1).await.unwrap();
+        ws1.send(Message::text(r#"{"type":"hello"}"#))
+            .await
+            .unwrap();
+        ws1.send(Message::text(format!(
+            r#"{{"type":"reconnect_url","url":"ws://{addr}/expired"}}"#
+        )))
+        .await
+        .unwrap();
+        ws1.send(Message::text(r#"{"type":"goodbye"}"#))
+            .await
+            .unwrap();
+        drop(ws1);
+
+        // 2. Dial to /expired gets HTTP 401 Unauthorized (expired single-use token).
+        let (mut s2, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let n = s2.read(&mut buf).await.unwrap();
+        let req_line = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            req_line.contains("/expired"),
+            "expected reconnect_url dial, got: {req_line}"
+        );
+        s2.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = s2.shutdown().await;
+
+        // 3. Driver must fall back to base_url (/link/) and connect cleanly!
+        let (s3, _) = listener.accept().await.unwrap();
+        let mut ws3 = tokio_tungstenite::accept_async(s3).await.unwrap();
+        ws3.send(Message::text(r#"{"type":"hello"}"#))
+            .await
+            .unwrap();
+        let _ = ws3.next().await;
+    });
+
+    let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-reconn"));
+    cfg.base_url = format!("ws://{addr}/link/");
+    cfg.backoff = Backoff {
+        initial: Duration::from_millis(10),
+        max: Duration::from_millis(20),
+    };
+    let (client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+    let drv = tokio::spawn(driver);
+
+    let mut connected = 0;
+    for _ in 0..20 {
+        match next_event(&mut rx).await {
+            RtmEvent::State(ConnectionState::Connected { .. }) => {
+                connected += 1;
+                if connected == 2 {
+                    break;
+                }
+            }
+            RtmEvent::State(ConnectionState::Disconnected { reason }) => {
+                panic!("expired reconnect_url must fall back to base_url, not stop: {reason}");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(connected, 2);
+
+    client.close();
+    let _ = tokio::time::timeout(Duration::from_secs(2), drv).await;
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn close_unblocks_driver_when_event_channel_is_full_during_emit() {
+    let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-full"));
+    cfg.event_buffer = 1;
+    // Unreachable port so after Connecting fills the 1-slot channel, Reconnecting blocks in emit().
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    cfg.base_url = format!("ws://{addr}/link/");
+    let (client, _rx, driver) = RtmClient::new(cfg).unwrap();
+    let drv = tokio::spawn(driver);
+
+    // Give the driver a moment to push `Connecting` (filling buffer=1) and block on `Reconnecting`.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.close();
+    tokio::time::timeout(Duration::from_secs(2), drv)
+        .await
+        .expect("close() must unblock Driver::emit even when event_rx is full and not dropped")
+        .unwrap();
+}
