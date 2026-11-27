@@ -301,7 +301,7 @@ pub(in crate::client) fn migrate_legacy_offline_sends(
                 last_error: None,
             },
         )?;
-        store.delete_offline(id)?;
+        store.delete_offline(workspace, id)?;
         moved += 1;
     }
     Ok(moved)
@@ -739,7 +739,8 @@ impl<B: Backend> Core<B> {
 
     pub(super) async fn discard_offline_mutation(&mut self, id: i64) {
         self.offline_queue.retain(|(row_id, _)| *row_id != id);
-        if let Err(err) = with_store(&self.store, move |s| s.delete_offline(id)).await {
+        let ws = self.workspace.clone();
+        if let Err(err) = with_store(&self.store, move |s| s.delete_offline(&ws, id)).await {
             tracing::warn!(id, %err, "failed to delete discarded offline mutation");
         }
         self.events
@@ -760,11 +761,13 @@ impl<B: Backend> Core<B> {
                 let outcome = Self::execute_queued_mutation(&ctx, &stealth_mode, mutation).await;
                 match outcome {
                     Ok(()) => {
-                        if id > 0
-                            && let Err(err) =
-                                with_store(&ctx.store, move |s| s.delete_offline(id)).await
-                        {
-                            tracing::warn!(id, %err, "failed to delete flushed offline mutation");
+                        if id > 0 {
+                            let ws = ctx.workspace.clone();
+                            if let Err(err) =
+                                with_store(&ctx.store, move |s| s.delete_offline(&ws, id)).await
+                            {
+                                tracing::warn!(id, %err, "failed to delete flushed offline mutation");
+                            }
                         }
                     }
                     Err(CoreError::Api(ApiError::AuthExpired(code))) => {

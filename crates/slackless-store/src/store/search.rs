@@ -177,8 +177,9 @@ impl Store {
             });
         }
         if let Some(user) = &f.includes_user {
-            sql.push_str(" AND instr(m.text, ?) > 0");
+            sql.push_str(" AND (instr(m.text, ?) > 0 OR instr(m.text, ?) > 0)");
             args.push(SqlValue::Text(format!("<@{user}>")));
+            args.push(SqlValue::Text(format!("<@{user}|")));
         }
         if f.threads_only {
             sql.push_str(" AND m.thread_ts IS NOT NULL");

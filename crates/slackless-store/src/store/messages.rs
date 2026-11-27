@@ -134,6 +134,7 @@ impl Store {
         let n = self.conn.execute(
             "DELETE FROM message_current
              WHERE workspace_id = ?1 AND typeof(json) = 'text'
+               AND json_valid(json) = 1
                AND json_extract(json, '$.is_ephemeral') = 1",
             params![workspace.as_str()],
         )?;
@@ -478,7 +479,9 @@ fn tombstone_absent_from_page(
     page: &[Message],
     fetched_at: i64,
 ) -> Result<usize> {
-    let mut keys = page.iter().map(|m| ts_key(&m.ts));
+    // Only compute the reconciliation span from valid timestamps; an empty or malformed `ts`
+    // must never collapse `oldest` to 0 and mass-tombstone older channel history.
+    let mut keys = page.iter().filter_map(|m| parse_ts_key(&m.ts));
     let Some(first) = keys.next() else {
         return Ok(0);
     };
@@ -489,7 +492,7 @@ fn tombstone_absent_from_page(
             "SELECT ts FROM message_current
              WHERE workspace_id = ?1 AND channel_id = ?2 AND deleted = 0
                AND ts_key BETWEEN ?3 AND ?4
-               AND (thread_ts IS NULL OR thread_ts = ts)
+               AND (thread_ts IS NULL OR thread_ts = ts OR subtype = 'thread_broadcast')
                AND updated_at < ?5",
         )?;
         let rows = stmt.query_map(

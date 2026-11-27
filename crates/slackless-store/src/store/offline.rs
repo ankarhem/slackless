@@ -28,13 +28,13 @@ impl Store {
         Ok(out)
     }
 
-    /// Remove one persisted offline mutation by row id (after flush or user discard).
-    pub fn delete_offline(&mut self, id: i64) -> Result<()> {
+    /// Remove one persisted offline mutation owned by `workspace` (after flush or user discard).
+    pub fn delete_offline(&mut self, workspace: &TeamId, id: i64) -> Result<()> {
         self.ensure_writable()?;
         let mut stmt = self
             .conn
-            .prepare_cached("DELETE FROM offline_queue WHERE id = ?1")?;
-        stmt.execute(params![id])?;
+            .prepare_cached("DELETE FROM offline_queue WHERE workspace_id = ?1 AND id = ?2")?;
+        stmt.execute(params![workspace.as_str(), id])?;
         Ok(())
     }
 

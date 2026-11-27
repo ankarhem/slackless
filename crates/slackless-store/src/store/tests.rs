@@ -859,7 +859,7 @@ fn stats_vacuum_and_offline_queue_round_trip() {
         store.list_offline(&ws()).unwrap(),
         vec![(id1, "{\"a\":1}".to_owned()), (id2, "{\"b\":2}".to_owned())]
     );
-    store.delete_offline(id1).unwrap();
+    store.delete_offline(&ws(), id1).unwrap();
     assert_eq!(
         store.list_offline(&ws()).unwrap(),
         vec![(id2, "{\"b\":2}".to_owned())]
@@ -4757,4 +4757,115 @@ fn file_transcript_ids_in_channel_returns_only_matching_channel_files() {
     assert_eq!(in_c1.len(), 1);
     assert!(in_c1.contains(&FileId::from("F1")));
     assert!(!in_c1.contains(&FileId::from("F2")));
+}
+
+#[test]
+fn vacuum_and_drop_ephemeral_tolerate_corrupt_json_and_delete_offline_is_workspace_scoped() {
+    let mut store = Store::open_in_memory().unwrap();
+    let ws1 = TeamId::from("T1");
+    let ws2 = TeamId::from("T2");
+    let ch = ChannelId::from("C1");
+
+    let valid = msg("1700000010.000100", "U1", &"compressible text ".repeat(20));
+    store.upsert_message(&ws1, &ch, &valid).unwrap();
+    let corrupt = msg("1700000020.000100", "U1", "to be corrupted");
+    store.upsert_message(&ws1, &ch, &corrupt).unwrap();
+    // Corrupt one row's JSON column directly into malformed TEXT.
+    store
+        .conn
+        .execute(
+            "UPDATE message_current SET json = '{malformed json'
+             WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = '1700000020.000100'",
+            params![ws1.as_str(), ch.as_str()],
+        )
+        .unwrap();
+
+    // Neither drop_ephemeral nor vacuum may abort with SQLITE_ERROR on malformed JSON.
+    assert_eq!(store.drop_ephemeral(&ws1).unwrap(), 0);
+    store.vacuum().unwrap();
+    assert_eq!(
+        store
+            .message(&ws1, &ch, &Ts::from("1700000010.000100"))
+            .unwrap()
+            .unwrap()
+            .message
+            .text,
+        valid.text
+    );
+
+    // Offline deletion is strictly scoped to workspace_id.
+    let id1 = store.enqueue_offline(&ws1, "{\"op\":\"ws1\"}").unwrap();
+    let id2 = store.enqueue_offline(&ws2, "{\"op\":\"ws2\"}").unwrap();
+    store.delete_offline(&ws1, id2).unwrap();
+    assert_eq!(
+        store.list_offline(&ws2).unwrap().len(),
+        1,
+        "ws1 must not be able to delete ws2's offline_queue row"
+    );
+    store.delete_offline(&ws1, id1).unwrap();
+    assert!(store.list_offline(&ws1).unwrap().is_empty());
+}
+
+#[test]
+fn history_reconciliation_ignores_malformed_ts_tombstones_thread_broadcast_and_search_matches_labeled_mentions()
+ {
+    let mut store = Store::open_in_memory().unwrap();
+    let ws = TeamId::from("T1");
+    let ch = ChannelId::from("C1");
+
+    // Seed old message (t=100), root (t=200), thread_broadcast (t=210), and newer message (t=300).
+    let old = msg("1700000100.000100", "U1", "ancient history");
+    let root = msg("1700000200.000100", "U1", "ping <@U9|alice> about launch");
+    let mut broadcast = msg("1700000210.000100", "U2", "broadcast reply");
+    broadcast.thread_ts = Some(Ts::from("1700000200.000100"));
+    broadcast.subtype = Some(MessageSubtype::ThreadBroadcast);
+    let newer = msg("1700000300.000100", "U1", "latest message");
+    store
+        .upsert_messages(&ws, &ch, &[old, root.clone(), broadcast, newer.clone()])
+        .unwrap();
+
+    // Reconcile a page covering [200..300] that omits the deleted thread_broadcast (210) AND
+    // contains a malformed empty-ts item: ancient history (100) must NOT be tombstoned, while
+    // the deleted thread_broadcast (210) MUST be tombstoned.
+    let malformed = msg("", "U1", "bad ts row");
+    let tombstoned = store
+        .upsert_history_page(&ws, &ch, &[root, newer, malformed], i64::MAX)
+        .unwrap();
+    assert_eq!(tombstoned, 1);
+
+    let history = store.channel_history(&ws, &ch, None, 20).unwrap();
+    let ancient = history
+        .iter()
+        .find(|m| m.message.ts.as_str() == "1700000100.000100")
+        .expect("ancient message must stay present");
+    assert!(
+        !ancient.deleted,
+        "malformed ts must not collapse span oldest=0 and tombstone older history"
+    );
+    let bcast = history
+        .iter()
+        .find(|m| m.message.ts.as_str() == "1700000210.000100")
+        .expect("thread_broadcast row present");
+    assert!(
+        bcast.deleted,
+        "omitted thread_broadcast inside page span must be tombstoned"
+    );
+
+    // Search `includes_user` must match `<@U9|alice>` as well as `<@U9>`.
+    let hits = store
+        .search(
+            &ws,
+            &SearchQuery {
+                terms: vec!["launch".into()],
+                filters: SearchFilters {
+                    includes_user: Some("U9".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].message.ts.as_str(), "1700000200.000100");
 }

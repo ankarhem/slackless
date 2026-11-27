@@ -321,11 +321,12 @@ impl Store {
         const BATCH: usize = 5_000;
         let mut last_id: i64 = 0;
         loop {
-            let mut batch: Vec<(i64, Vec<u8>)> = Vec::with_capacity(BATCH);
+            let mut batch: Vec<(i64, String, Vec<u8>)> = Vec::with_capacity(BATCH);
             {
                 let mut stmt = self.conn.prepare_cached(
                     "SELECT id, json FROM message_current
                      WHERE id > ?1 AND typeof(json) = 'text' AND length(json) >= 160
+                       AND json_valid(json) = 1
                        AND COALESCE(json_extract(json, '$.is_ephemeral'), 0) = 0
                      ORDER BY id ASC LIMIT ?2",
                 )?;
@@ -338,7 +339,7 @@ impl Store {
                     last_id = id;
                     seen += 1;
                     if let SqlValue::Blob(blob) = encode_json_value(&text, false) {
-                        batch.push((id, blob));
+                        batch.push((id, text, blob));
                     }
                 }
                 if seen == 0 {
@@ -350,10 +351,14 @@ impl Store {
                     .conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 {
-                    let mut upd =
-                        tx.prepare_cached("UPDATE message_current SET json = ?1 WHERE id = ?2")?;
-                    for (id, blob) in &batch {
-                        upd.execute(params![blob, id])?;
+                    // Optimistic CAS predicate: only replace if no concurrent writer modified
+                    // `json` between our SELECT and this UPDATE.
+                    let mut upd = tx.prepare_cached(
+                        "UPDATE message_current SET json = ?1
+                         WHERE id = ?2 AND typeof(json) = 'text' AND json = ?3",
+                    )?;
+                    for (id, orig_text, blob) in &batch {
+                        upd.execute(params![blob, id, orig_text])?;
                     }
                 }
                 tx.commit()?;
