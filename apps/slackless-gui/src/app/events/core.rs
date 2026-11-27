@@ -97,17 +97,17 @@ impl App {
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
                     .insert(bot_id.clone(), profile.clone());
-                window.refresh();
+                self.notify_people_views(cx);
             }
             Event::Presence { users, presence } => {
-                // Every snapshot shares this map: update it in place and repaint, with no
-                // store reload however often presence changes.
+                // Every snapshot shares this map: update it in place and repaint the views that
+                // draw people, with no store reload however often presence changes.
                 self.ws
                     .presence
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
                     .extend(users.iter().map(|user| (user.clone(), presence.clone())));
-                window.refresh();
+                self.notify_people_views(cx);
             }
             Event::DndPaused { user, paused } => {
                 self.ws.peer_dnd_paused.insert(user.clone(), *paused);
@@ -514,6 +514,31 @@ impl App {
             },
             _ => {}
         }
+    }
+
+    /// Repaint the views that draw people (presence dots, bot badges) after `ws.presence` or
+    /// `ws.bots` changed in place; every other cached pane stays as it is, where a window
+    /// refresh would re-render all of them.
+    fn notify_people_views(&mut self, cx: &mut Context<Self>) {
+        macro_rules! notify {
+            ($($view:expr),* $(,)?) => {$(
+                $view.update(cx, |_, cx| cx.notify());
+            )*};
+        }
+        notify!(
+            self.sidebar,
+            self.messages,
+            self.thread,
+            self.threads,
+            self.unreads,
+            self.activity,
+            self.profile,
+            self.directory,
+            self.details,
+            self.tools_page,
+            self.huddles,
+            self.results,
+        );
     }
 
     fn on_counts_event(
