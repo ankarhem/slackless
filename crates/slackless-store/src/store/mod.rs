@@ -34,6 +34,7 @@ pub(crate) use messages::decode_json_value;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
 use std::path::Path;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -118,8 +119,8 @@ impl Drop for Store {
 }
 
 /// Monotonic revision bumped whenever message, transcript, or conversation rows are mutated in
-/// any [`Store`] instance. Lets secondary windows skip idle SQLite polling with a single atomic
-/// load.
+/// any [`Store`] instance; the test probe behind [`Store::message_revision`].
+#[cfg(test)]
 static MESSAGE_REVISION: AtomicU64 = AtomicU64::new(1);
 
 /// Durable local-first message store; the rendering source of truth.
@@ -132,7 +133,9 @@ pub struct Store {
 }
 
 impl Store {
-    /// Current monotonic mutation revision (O(1) atomic read, zero SQLite I/O).
+    /// Current global monotonic mutation revision (O(1) atomic read, zero SQLite I/O); a
+    /// test probe, since nothing outside the store's tests reads it.
+    #[cfg(test)]
     pub fn message_revision() -> u64 {
         MESSAGE_REVISION.load(Ordering::Acquire)
     }
@@ -147,8 +150,10 @@ impl Store {
     #[inline]
     pub(super) fn bump_message_revision(&self) {
         #[cfg(test)]
-        self.local_revision.fetch_add(1, Ordering::Release);
-        MESSAGE_REVISION.fetch_add(1, Ordering::Release);
+        {
+            self.local_revision.fetch_add(1, Ordering::Release);
+            MESSAGE_REVISION.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Rejects mutations on handles opened via [`Store::open_read_only`].
