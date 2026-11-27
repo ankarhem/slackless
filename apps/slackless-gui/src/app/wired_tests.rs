@@ -678,6 +678,28 @@ fn wired_multi_workspace_event_isolation_and_switching(cx: &mut gpui::TestAppCon
         );
     });
 
+    // A popped-out window of T0ONE jumps back into T0ONE, whichever workspace is shown.
+    let jump =
+        cx.update(|window, cx| app.update(cx, |app, cx| app.popout_jump_handler(0, window, cx)));
+    // From outside the main window's update, as a popout's click is.
+    cx.cx
+        .update(|cx| jump(ChannelId::from("C0ONE"), None, false, cx));
+    cx.executor().advance_clock(RELOAD_DEBOUNCE);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(
+            app.read(cx).workspace,
+            0,
+            "a jump shows the popout's workspace"
+        );
+        assert_eq!(app.read(cx).channel, ChannelId::from("C0ONE"));
+    });
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.switch_workspace(1, window, cx));
+    });
+    cx.executor().advance_clock(RELOAD_DEBOUNCE);
+    cx.run_until_parked();
+
     // Back on T0ONE a draft is typed, then T0TWO's tile is moved to the top of the rail.
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {

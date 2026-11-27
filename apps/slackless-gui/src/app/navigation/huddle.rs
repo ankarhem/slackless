@@ -554,7 +554,7 @@ impl App {
         let label = (fixtures.conversation(&ch))
             .map_or_else(|| ch.to_string(), |c| fixtures.conversation_label(c));
         let title = format!("Huddle — {label}");
-        let on_jump = self.popout_jump_handler(window, cx);
+        let on_jump = self.popout_jump_handler(owner, window, cx);
         let this = cx.weak_entity();
         let main_window = window.window_handle();
         let on_open_canvas: crate::popout::CanvasOpenHandler = Rc::new(move |fid, cx| {
