@@ -7,7 +7,7 @@ use gpui_kit::gpui::{
 };
 use slackless_core::domain::mrkdwn::replace_shortcodes_with;
 
-use super::catalog::{CATALOG, Emoji, FREQUENT_MAX, lookup, skin_tone_swatch, unicode_emoji};
+use super::catalog::{CATALOG, FREQUENT_MAX, lookup, skin_tone_swatch, unicode_emoji};
 use super::picker::EmojiChoice;
 use crate::blockkit::{Json, serde_json};
 use crate::fixtures::Fixtures;
@@ -28,31 +28,17 @@ pub(super) fn tone_of(shortcode: &str) -> u8 {
         .unwrap_or(1)
 }
 
-/// `emoji`'s glyph with skin `tone` applied (the modifier follows the base code point; a
-/// trailing variation selector is dropped, as the modifier implies emoji presentation).
-pub(super) fn toned(emoji: &Emoji, tone: u8) -> String {
-    if !emoji.skin || tone < 2 {
-        return emoji.glyph.to_owned();
-    }
-    let mut chars = emoji.glyph.chars();
-    let mut glyph = String::new();
-    glyph.extend(chars.next());
-    glyph.extend(char::from_u32(0x1F3FB + u32::from(tone - 2)));
-    glyph.extend(chars.filter(|c| *c != '\u{FE0F}'));
-    glyph
-}
-
-/// `name` with Slack's skin-tone suffix when `tone` is not the default.
-pub(super) fn toned_name(name: &str, tone: u8) -> String {
-    if tone < 2 {
-        name.to_owned()
-    } else {
-        format!("{name}::skin-tone-{tone}")
-    }
+/// `emoji` under Slack skin `tone` (2..=6) when it takes one; its default glyph otherwise
+/// (`with_skin_tone` drops the variation selector, as the modifier implies emoji presentation).
+pub(super) fn toned(emoji: &'static emojis::Emoji, tone: u8) -> &'static str {
+    skin_tone(tone)
+        .and_then(|skin| emoji.with_skin_tone(skin))
+        .unwrap_or(emoji)
+        .as_str()
 }
 
 /// The `emojis` crate's skin tone for Slack tone `tone` (2..=6); `None` for the default.
-pub(super) fn skin_tone(tone: u8) -> Option<emojis::SkinTone> {
+fn skin_tone(tone: u8) -> Option<emojis::SkinTone> {
     match tone {
         2 => Some(emojis::SkinTone::Light),
         3 => Some(emojis::SkinTone::MediumLight),
@@ -67,27 +53,16 @@ pub(super) fn skin_tone(tone: u8) -> Option<emojis::SkinTone> {
 /// ignored), if it is a standard emoji.
 pub(crate) fn glyph(shortcode: &str) -> Option<&'static str> {
     let name = base_name(shortcode);
-    lookup(name)
-        .map(|emoji| emoji.glyph)
-        .or_else(|| skin_tone_swatch(name))
-        .or_else(|| unicode_emoji(name).map(emojis::Emoji::as_str))
+    skin_tone_swatch(name).or_else(|| unicode_emoji(name).map(emojis::Emoji::as_str))
 }
 
 /// The glyph a shortcode displays as, with its `::skin-tone-N` suffix applied.
 pub(crate) fn display_glyph(shortcode: &str) -> Option<String> {
     let name = base_name(shortcode);
     let tone = tone_of(shortcode);
-    if let Some(emoji) = lookup(name) {
-        return Some(toned(emoji, tone));
-    }
-    if let Some(swatch) = skin_tone_swatch(name) {
-        return Some(swatch.to_owned());
-    }
-    let emoji = unicode_emoji(name)?;
-    let emoji = skin_tone(tone)
-        .and_then(|skin| emoji.with_skin_tone(skin))
-        .unwrap_or(emoji);
-    Some(emoji.as_str().to_owned())
+    skin_tone_swatch(name)
+        .or_else(|| unicode_emoji(name).map(|emoji| toned(emoji, tone)))
+        .map(str::to_owned)
 }
 
 /// One emoji at `size`: the unicode glyph, the workspace custom image, or a literal `:name:`.
@@ -204,12 +179,16 @@ pub(super) fn normalize_emoji_query(raw: &str) -> String {
     raw.trim().to_lowercase().replace(' ', "_")
 }
 
-/// Build an [`EmojiChoice`] for a catalog [`Emoji`] under skin `tone`.
-pub(super) fn catalog_choice(emoji: &Emoji, tone: u8) -> EmojiChoice {
-    let tone = if emoji.skin { tone } else { 1 };
+/// Shortcode `name` drawn as `emoji` under skin `tone`: Slack's `::skin-tone-N` name and the
+/// Fitzpatrick glyph when the emoji takes a tone, else both as they are.
+pub(super) fn toned_choice(name: &str, emoji: &'static emojis::Emoji, tone: u8) -> EmojiChoice {
+    let toned = skin_tone(tone).and_then(|skin| emoji.with_skin_tone(skin));
     EmojiChoice {
-        name: toned_name(emoji.name, tone),
-        glyph: Some(toned(emoji, tone)),
+        name: match toned {
+            Some(_) => format!("{name}::skin-tone-{tone}"),
+            None => name.to_owned(),
+        },
+        glyph: Some(toned.unwrap_or(emoji).as_str().to_owned()),
     }
 }
 
@@ -222,8 +201,9 @@ pub(super) fn search_emoji_choices<'a>(
     CATALOG
         .iter()
         .flat_map(|(_, _, list)| list.iter())
+        .filter_map(|name| lookup(name))
         .filter(|emoji| emoji.name.contains(query))
-        .map(|emoji| catalog_choice(emoji, tone))
+        .map(|emoji| toned_choice(emoji.name, emoji.emoji, tone))
         .chain(
             custom_names
                 .filter(|name| name.contains(query))

@@ -18,8 +18,8 @@ use slackless_core::api::GifItem;
 use super::catalog::{CATALOG, Category, FREQUENT_SEED, TABS, WORK, lookup, unicode_emoji};
 use super::gifs::{GIF_PRESETS, evict_gif_asset};
 use super::resolve::{
-    catalog_choice, emoji_element, normalize_emoji_query, record_frequent, search_emoji_choices,
-    skin_tone, toned, toned_name,
+    emoji_element, normalize_emoji_query, record_frequent, search_emoji_choices, toned,
+    toned_choice,
 };
 use crate::fixtures::Fixtures;
 
@@ -315,7 +315,8 @@ impl EmojiPicker {
         for (category, title, list) in CATALOG {
             let cells = list
                 .iter()
-                .map(|emoji| catalog_choice(emoji, self.tone))
+                .filter_map(|name| lookup(name))
+                .map(|emoji| toned_choice(emoji.name, emoji.emoji, self.tone))
                 .collect();
             self.push_section(category, title, cells);
         }
@@ -344,17 +345,10 @@ impl EmojiPicker {
     /// a workspace custom emoji; `None` when it is neither (say, a deleted custom emoji).
     fn choice(&self, name: &str) -> Option<EmojiChoice> {
         if let Some(emoji) = lookup(name) {
-            return Some(catalog_choice(emoji, self.tone));
+            return Some(toned_choice(emoji.name, emoji.emoji, self.tone));
         }
         if let Some(emoji) = unicode_emoji(name) {
-            let toned = skin_tone(self.tone).and_then(|skin| emoji.with_skin_tone(skin));
-            return Some(EmojiChoice {
-                name: match toned {
-                    Some(_) => toned_name(name, self.tone),
-                    None => name.to_owned(),
-                },
-                glyph: Some(toned.unwrap_or(emoji).as_str().to_owned()),
-            });
+            return Some(toned_choice(name, emoji, self.tone));
         }
         self.fixtures.custom_emoji(name).map(|_| EmojiChoice {
             name: name.to_owned(),
@@ -737,7 +731,7 @@ impl Render for EmojiPicker {
                             .child(format!(":{}:", choice.name)),
                     )
             });
-        let hand = lookup("raised_hand");
+        let hand = unicode_emoji("raised_hand");
         let skin = if self.tones_open {
             h_flex()
                 .gap_0p5()

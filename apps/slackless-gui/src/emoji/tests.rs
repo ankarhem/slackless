@@ -1,8 +1,8 @@
-use super::catalog::{ALIASES, CATALOG, FREQUENT_MAX, PEOPLE, WORK, lookup, unicode_emoji};
+use super::catalog::{CATALOG, FREQUENT_MAX, WORK, lookup};
 use super::gifs::filter_gif_presets;
 use super::resolve::{
     base_name, normalize_emoji_query, record_frequent, search_emoji_choices, tone_of, toned,
-    toned_name,
+    toned_choice,
 };
 use super::*;
 use crate::blockkit::Json;
@@ -26,9 +26,10 @@ fn frequent_emoji_follow_the_emoji_use_counts() {
         frequent_from_prefs(&prefs, |name| name == "shipit"),
         ["thumbsup", "joy", "tada", "partying_face", "shipit"]
     );
-    let many: serde_json::Map<String, Json> = PEOPLE
+    let many: serde_json::Map<String, Json> = CATALOG[0]
+        .2
         .iter()
-        .map(|emoji| (emoji.name.to_owned(), json!(1)))
+        .map(|name| ((*name).to_owned(), json!(1)))
         .collect();
     let prefs = json!({ "emoji_use": many });
     assert_eq!(frequent_from_prefs(&prefs, |_| false).len(), FREQUENT_MAX);
@@ -88,34 +89,64 @@ fn slack_circle_square_and_alias_shortcodes_resolve() {
 }
 
 #[test]
-fn crate_resolves_every_catalog_shortcode_to_its_hand_kept_glyph() {
-    // The catalog's glyphs and skin-tone flags are hand-kept; the crate resolution behind every
-    // other shortcode (`unicode_emoji`) must agree with it for each one, so the table can go.
-    for (_, title, list) in CATALOG {
-        for emoji in list {
-            let Some(resolved) = unicode_emoji(emoji.name) else {
-                panic!(
-                    "{title}: :{}: does not resolve through the crate",
-                    emoji.name
-                );
-            };
-            assert_eq!(resolved.as_str(), emoji.glyph, "{title} :{}:", emoji.name);
-            assert_eq!(
-                resolved.skin_tone().is_some(),
-                emoji.skin,
-                "{title} :{}: skin-tone support",
-                emoji.name
-            );
-        }
-    }
-    for &(alias, target) in ALIASES {
-        let expected = lookup(target).unwrap();
+fn crate_built_catalog_keeps_slack_names_and_glyphs() {
+    // The catalog is built from the crate. Slack spells these shortcodes differently from it (an
+    // alias entry or a `flag-XX` code); each keeps the glyph the hand-kept catalog drew it as.
+    for (name, glyph) in [
+        ("rolling_on_the_floor_laughing", "🤣"),
+        ("star-struck", "🤩"),
+        ("thinking_face", "🤔"),
+        ("face_with_raised_eyebrow", "🤨"),
+        ("face_with_rolling_eyes", "🙄"),
+        ("robot_face", "🤖"),
+        ("face_palm", "🤦"),
+        ("unicorn_face", "🦄"),
+        ("medal", "🏅"),
+        ("beach_with_umbrella", "🏖️"),
+        ("train", "🚆"),
+        ("spiral_calendar_pad", "🗓️"),
+        ("large_green_circle", "🟢"),
+        ("waving_black_flag", "🏴"),
+        ("waving_white_flag", "🏳️"),
+        ("rainbow-flag", "🏳️‍🌈"),
+        ("flag-se", "🇸🇪"),
+        ("flag-eu", "🇪🇺"),
+        ("flag-za", "🇿🇦"),
+    ] {
         assert_eq!(
-            unicode_emoji(alias).map(|emoji| emoji.as_str()),
-            Some(expected.glyph),
+            lookup(name).map(|emoji| emoji.emoji.as_str()),
+            Some(glyph),
+            ":{name}:"
+        );
+    }
+    // Other names for a catalog emoji resolve to the catalog's own name.
+    for (alias, canonical) in [
+        ("+1", "thumbsup"),
+        ("-1", "thumbsdown"),
+        ("hand", "raised_hand"),
+        ("facepalm", "face_palm"),
+        ("simple_smile", "slightly_smiling_face"),
+    ] {
+        assert_eq!(
+            lookup(alias).map(|emoji| emoji.name),
+            Some(canonical),
             ":{alias}:"
         );
     }
+    // Every catalog shortcode is its own catalog entry (a typo, or two names for one emoji, would
+    // drop it from the picker), and no section shrinks below the hand-kept catalog's size.
+    let lost: Vec<&str> = CATALOG
+        .iter()
+        .flat_map(|(_, _, list)| list.iter().copied())
+        .filter(|&name| lookup(name).map(|emoji| emoji.name) != Some(name))
+        .collect();
+    assert!(lost.is_empty(), "{lost:?}");
+    let sizes = CATALOG.map(|(_, _, list)| list.len());
+    let minimums = [65, 30, 20, 16, 18, 25, 26, 40];
+    assert!(
+        sizes.iter().zip(minimums).all(|(size, min)| *size >= min),
+        "{sizes:?}"
+    );
 }
 
 #[test]
@@ -140,23 +171,29 @@ fn catalog_aliases_and_skin_tone_modifiers_work() {
     assert_eq!(tone_of("wave::skin-tone-7"), 1);
     assert_eq!(tone_of("wave::other"), 1);
 
-    assert_eq!(toned_name("wave", 1), "wave");
-    assert_eq!(toned_name("wave", 4), "wave::skin-tone-4");
+    assert_eq!(
+        toned_choice("wave", lookup("wave").unwrap().emoji, 1).name,
+        "wave"
+    );
+    assert_eq!(
+        toned_choice("wave", lookup("wave").unwrap().emoji, 4).name,
+        "wave::skin-tone-4"
+    );
 
-    // Skin-capable catalog emoji applies Fitzpatrick modifier & strips variation selector.
+    // A skin-tone capable emoji gets the Fitzpatrick modifier, which replaces the variation
+    // selector; a non-skin emoji ignores the tone.
     let wave = lookup("wave").unwrap();
-    assert_eq!(toned(wave, 1), "👋");
-    assert_eq!(toned(wave, 2), "👋\u{1F3FB}");
-    assert_eq!(toned(wave, 6), "👋\u{1F3FF}");
+    assert_eq!(toned(wave.emoji, 1), "👋");
+    assert_eq!(toned(wave.emoji, 2), "👋\u{1F3FB}");
+    assert_eq!(toned(wave.emoji, 6), "👋\u{1F3FF}");
 
     let victory = lookup("v").unwrap();
-    let toned_v = toned(victory, 3);
+    let toned_v = toned(victory.emoji, 3);
     assert!(!toned_v.contains('\u{FE0F}'));
     assert!(toned_v.contains('\u{1F3FC}'));
 
-    // Non-skin emoji ignores tone.
     let rocket = lookup("rocket").unwrap();
-    assert_eq!(toned(rocket, 5), "🚀");
+    assert_eq!(toned(rocket.emoji, 5), "🚀");
 
     // `glyph` ignores skin-tone suffix; `display_glyph` applies it (including unicode fallback).
     assert_eq!(glyph("wave::skin-tone-4"), Some("👋"));

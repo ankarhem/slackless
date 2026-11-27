@@ -1,32 +1,15 @@
-//! Static Slack emoji catalog, category tabs, aliases, and fallback Unicode lookup.
+//! The picker's emoji catalog and tabs, and Slack shortcode lookup through the `emojis` crate.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use gpui_kit::assets::IconName;
 
-/// One catalog emoji: Slack shortcode, default glyph, and whether it takes a skin tone.
+/// One emoji in the picker's catalog: the Slack shortcode it is named and picked by, and the
+/// `emojis` crate entry it draws as (glyph, CLDR name, skin tones).
 pub(super) struct Emoji {
     pub(super) name: &'static str,
-    pub(super) glyph: &'static str,
-    pub(super) skin: bool,
-}
-
-const fn e(name: &'static str, glyph: &'static str) -> Emoji {
-    Emoji {
-        name,
-        glyph,
-        skin: false,
-    }
-}
-
-/// A skin-tone capable emoji.
-const fn s(name: &'static str, glyph: &'static str) -> Emoji {
-    Emoji {
-        name,
-        glyph,
-        skin: true,
-    }
+    pub(super) emoji: &'static emojis::Emoji,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,281 +42,65 @@ pub(super) const TABS: [(Category, IconName); 10] = [
     (Category::Custom, IconName::Hash),
 ];
 
-pub(super) const PEOPLE: &[Emoji] = &[
-    e("grinning", "😀"),
-    e("smiley", "😃"),
-    e("smile", "😄"),
-    e("grin", "😁"),
-    e("laughing", "😆"),
-    e("sweat_smile", "😅"),
-    e("joy", "😂"),
-    e("rolling_on_the_floor_laughing", "🤣"),
-    e("slightly_smiling_face", "🙂"),
-    e("upside_down_face", "🙃"),
-    e("wink", "😉"),
-    e("blush", "😊"),
-    e("innocent", "😇"),
-    e("heart_eyes", "😍"),
-    e("star-struck", "🤩"),
-    e("kissing_heart", "😘"),
-    e("yum", "😋"),
-    e("stuck_out_tongue", "😛"),
-    e("thinking_face", "🤔"),
-    e("face_with_raised_eyebrow", "🤨"),
-    e("neutral_face", "😐"),
-    e("expressionless", "😑"),
-    e("no_mouth", "😶"),
-    e("smirk", "😏"),
-    e("unamused", "😒"),
-    e("face_with_rolling_eyes", "🙄"),
-    e("grimacing", "😬"),
-    e("relieved", "😌"),
-    e("pensive", "😔"),
-    e("sleepy", "😪"),
-    e("sleeping", "😴"),
-    e("mask", "😷"),
-    e("face_with_thermometer", "🤒"),
-    e("nerd_face", "🤓"),
-    e("sunglasses", "😎"),
-    e("confused", "😕"),
-    e("worried", "😟"),
-    e("open_mouth", "😮"),
-    e("astonished", "😲"),
-    e("flushed", "😳"),
-    e("cry", "😢"),
-    e("sob", "😭"),
-    e("scream", "😱"),
-    e("rage", "😡"),
-    e("skull", "💀"),
-    e("clown_face", "🤡"),
-    e("ghost", "👻"),
-    e("robot_face", "🤖"),
-    s("wave", "👋"),
-    s("raised_hand", "✋"),
-    s("ok_hand", "👌"),
-    s("v", "✌️"),
-    s("crossed_fingers", "🤞"),
-    s("point_up", "☝️"),
-    s("thumbsup", "👍"),
-    s("thumbsdown", "👎"),
-    s("clap", "👏"),
-    s("raised_hands", "🙌"),
-    s("pray", "🙏"),
-    s("muscle", "💪"),
-    s("handshake", "🤝"),
-    e("eyes", "👀"),
-    e("brain", "🧠"),
-    s("face_palm", "🤦"),
-    s("shrug", "🤷"),
-];
-
-pub(super) const NATURE: &[Emoji] = &[
-    e("dog", "🐶"),
-    e("cat", "🐱"),
-    e("fox_face", "🦊"),
-    e("bear", "🐻"),
-    e("panda_face", "🐼"),
-    e("unicorn_face", "🦄"),
-    e("bee", "🐝"),
-    e("bug", "🐛"),
-    e("butterfly", "🦋"),
-    e("turtle", "🐢"),
-    e("octopus", "🐙"),
-    e("whale", "🐳"),
-    e("sunflower", "🌻"),
-    e("rose", "🌹"),
-    e("seedling", "🌱"),
-    e("evergreen_tree", "🌲"),
-    e("palm_tree", "🌴"),
-    e("cactus", "🌵"),
-    e("fallen_leaf", "🍂"),
-    e("sunny", "☀️"),
-    e("cloud", "☁️"),
-    e("rainbow", "🌈"),
-    e("snowflake", "❄️"),
-    e("zap", "⚡"),
-    e("fire", "🔥"),
-    e("droplet", "💧"),
-    e("ocean", "🌊"),
-    e("star", "⭐"),
-    e("sparkles", "✨"),
-    e("crescent_moon", "🌙"),
-];
-
-pub(super) const FOOD: &[Emoji] = &[
-    e("coffee", "☕"),
-    e("tea", "🍵"),
-    e("beer", "🍺"),
-    e("wine_glass", "🍷"),
-    e("pizza", "🍕"),
-    e("hamburger", "🍔"),
-    e("fries", "🍟"),
-    e("taco", "🌮"),
-    e("sushi", "🍣"),
-    e("ramen", "🍜"),
-    e("sandwich", "🥪"),
-    e("cake", "🍰"),
-    e("birthday", "🎂"),
-    e("doughnut", "🍩"),
-    e("cookie", "🍪"),
-    e("apple", "🍎"),
-    e("banana", "🍌"),
-    e("avocado", "🥑"),
-    e("popcorn", "🍿"),
-    e("ice_cream", "🍨"),
-];
-
-pub(super) const ACTIVITY: &[Emoji] = &[
-    e("tada", "🎉"),
-    e("confetti_ball", "🎊"),
-    e("balloon", "🎈"),
-    e("gift", "🎁"),
-    e("trophy", "🏆"),
-    e("medal", "🏅"),
-    e("soccer", "⚽"),
-    e("basketball", "🏀"),
-    e("tennis", "🎾"),
-    e("video_game", "🎮"),
-    e("dart", "🎯"),
-    e("game_die", "🎲"),
-    e("art", "🎨"),
-    e("guitar", "🎸"),
-    e("headphones", "🎧"),
-    e("microphone", "🎤"),
-    s("runner", "🏃"),
-    s("bicyclist", "🚴"),
-];
-
-pub(super) const TRAVEL: &[Emoji] = &[
-    e("rocket", "🚀"),
-    e("airplane", "✈️"),
-    e("car", "🚗"),
-    e("bus", "🚌"),
-    e("train", "🚆"),
-    e("bike", "🚲"),
-    e("ship", "🚢"),
-    e("house", "🏠"),
-    e("house_with_garden", "🏡"),
-    e("office", "🏢"),
-    e("earth_africa", "🌍"),
-    e("mountain", "⛰️"),
-    e("beach_with_umbrella", "🏖️"),
-    e("world_map", "🗺️"),
-    e("tent", "⛺"),
-    e("construction", "🚧"),
-];
-
-pub(super) const OBJECTS: &[Emoji] = &[
-    e("computer", "💻"),
-    e("keyboard", "⌨️"),
-    e("iphone", "📱"),
-    e("bulb", "💡"),
-    e("calendar", "📆"),
-    e("spiral_calendar_pad", "🗓️"),
-    e("memo", "📝"),
-    e("pencil2", "✏️"),
-    e("books", "📚"),
-    e("package", "📦"),
-    e("lock", "🔒"),
-    e("key", "🔑"),
-    e("hammer_and_wrench", "🛠️"),
-    e("gear", "⚙️"),
-    e("mag", "🔍"),
-    e("link", "🔗"),
-    e("paperclip", "📎"),
-    e("pushpin", "📌"),
-    e("chart_with_upwards_trend", "📈"),
-    e("bell", "🔔"),
-    e("hourglass", "⌛"),
-    e("alarm_clock", "⏰"),
-    e("money_with_wings", "💸"),
-    e("speech_balloon", "💬"),
-    e("email", "📧"),
-];
-
-pub(super) const SYMBOLS: &[Emoji] = &[
-    e("heart", "❤️"),
-    e("orange_heart", "🧡"),
-    e("yellow_heart", "💛"),
-    e("green_heart", "💚"),
-    e("blue_heart", "💙"),
-    e("purple_heart", "💜"),
-    e("broken_heart", "💔"),
-    e("100", "💯"),
-    e("white_check_mark", "✅"),
-    e("heavy_check_mark", "✔️"),
-    e("x", "❌"),
-    e("warning", "⚠️"),
-    e("no_entry", "⛔"),
-    e("question", "❓"),
-    e("exclamation", "❗"),
-    e("bangbang", "‼️"),
-    e("recycle", "♻️"),
-    e("zzz", "💤"),
-    e("red_circle", "🔴"),
-    e("large_green_circle", "🟢"),
-    e("large_blue_circle", "🔵"),
-    e("arrow_up", "⬆️"),
-    e("arrow_down", "⬇️"),
-    e("repeat", "🔁"),
-    e("new", "🆕"),
-    e("sos", "🆘"),
-];
-
-/// Flags in Slack's order and naming (`flag-se`, the ten oldest by bare code).
-pub(super) const FLAGS: &[Emoji] = &[
-    e("checkered_flag", "🏁"),
-    e("triangular_flag_on_post", "🚩"),
-    e("crossed_flags", "🎌"),
-    e("waving_black_flag", "🏴"),
-    e("waving_white_flag", "🏳️"),
-    e("rainbow-flag", "🏳️‍🌈"),
-    e("transgender_flag", "🏳️‍⚧️"),
-    e("pirate_flag", "🏴‍☠️"),
-    e("flag-ar", "🇦🇷"),
-    e("flag-at", "🇦🇹"),
-    e("flag-au", "🇦🇺"),
-    e("flag-be", "🇧🇪"),
-    e("flag-br", "🇧🇷"),
-    e("flag-ca", "🇨🇦"),
-    e("flag-ch", "🇨🇭"),
-    e("cn", "🇨🇳"),
-    e("de", "🇩🇪"),
-    e("flag-dk", "🇩🇰"),
-    e("flag-ee", "🇪🇪"),
-    e("es", "🇪🇸"),
-    e("flag-eu", "🇪🇺"),
-    e("flag-fi", "🇫🇮"),
-    e("fr", "🇫🇷"),
-    e("gb", "🇬🇧"),
-    e("flag-ie", "🇮🇪"),
-    e("flag-in", "🇮🇳"),
-    e("flag-is", "🇮🇸"),
-    e("it", "🇮🇹"),
-    e("jp", "🇯🇵"),
-    e("kr", "🇰🇷"),
-    e("flag-mx", "🇲🇽"),
-    e("flag-nl", "🇳🇱"),
-    e("flag-no", "🇳🇴"),
-    e("flag-nz", "🇳🇿"),
-    e("flag-pl", "🇵🇱"),
-    e("flag-pt", "🇵🇹"),
-    e("flag-se", "🇸🇪"),
-    e("flag-ua", "🇺🇦"),
-    e("us", "🇺🇸"),
-    e("flag-za", "🇿🇦"),
-];
-
-/// The picker's categories in Slack's order, under Slack's section titles.
-pub(super) const CATALOG: [(Category, &str, &[Emoji]); 8] = [
-    (Category::People, "Smileys & People", PEOPLE),
-    (Category::Nature, "Animals & Nature", NATURE),
-    (Category::Food, "Food & Drink", FOOD),
-    (Category::Travel, "Travel & Places", TRAVEL),
-    (Category::Activity, "Activities", ACTIVITY),
-    (Category::Objects, "Objects", OBJECTS),
-    (Category::Symbols, "Symbols", SYMBOLS),
-    (Category::Flags, "Flags", FLAGS),
+/// The picker's categories in Slack's order, under Slack's section titles: the Slack shortcodes
+/// of every emoji in the section, in Slack's order. Glyphs, skin tones and names to search come
+/// from the `emojis` crate through [`lookup`]; the flags follow Slack's naming (`flag-se`, the
+/// bare code for the ten oldest).
+#[rustfmt::skip]
+pub(super) const CATALOG: [(Category, &str, &[&str]); 8] = [
+    (Category::People, "Smileys & People", &[
+        "grinning", "smiley", "smile", "grin", "laughing", "sweat_smile", "joy",
+        "rolling_on_the_floor_laughing", "slightly_smiling_face", "upside_down_face", "wink",
+        "blush", "innocent", "heart_eyes", "star-struck", "kissing_heart", "yum",
+        "stuck_out_tongue", "thinking_face", "face_with_raised_eyebrow", "neutral_face",
+        "expressionless", "no_mouth", "smirk", "unamused", "face_with_rolling_eyes", "grimacing",
+        "relieved", "pensive", "sleepy", "sleeping", "mask", "face_with_thermometer", "nerd_face",
+        "sunglasses", "confused", "worried", "open_mouth", "astonished", "flushed", "cry", "sob",
+        "scream", "rage", "skull", "clown_face", "ghost", "robot_face", "wave", "raised_hand",
+        "ok_hand", "v", "crossed_fingers", "point_up", "thumbsup", "thumbsdown", "clap",
+        "raised_hands", "pray", "muscle", "handshake", "eyes", "brain", "face_palm", "shrug",
+    ]),
+    (Category::Nature, "Animals & Nature", &[
+        "dog", "cat", "fox_face", "bear", "panda_face", "unicorn_face", "bee", "bug", "butterfly",
+        "turtle", "octopus", "whale", "sunflower", "rose", "seedling", "evergreen_tree",
+        "palm_tree", "cactus", "fallen_leaf", "sunny", "cloud", "rainbow", "snowflake", "zap",
+        "fire", "droplet", "ocean", "star", "sparkles", "crescent_moon",
+    ]),
+    (Category::Food, "Food & Drink", &[
+        "coffee", "tea", "beer", "wine_glass", "pizza", "hamburger", "fries", "taco", "sushi",
+        "ramen", "sandwich", "cake", "birthday", "doughnut", "cookie", "apple", "banana", "avocado",
+        "popcorn", "ice_cream",
+    ]),
+    (Category::Travel, "Travel & Places", &[
+        "rocket", "airplane", "car", "bus", "train", "bike", "ship", "house", "house_with_garden",
+        "office", "earth_africa", "mountain", "beach_with_umbrella", "world_map", "tent",
+        "construction",
+    ]),
+    (Category::Activity, "Activities", &[
+        "tada", "confetti_ball", "balloon", "gift", "trophy", "medal", "soccer", "basketball",
+        "tennis", "video_game", "dart", "game_die", "art", "guitar", "headphones", "microphone",
+        "runner", "bicyclist",
+    ]),
+    (Category::Objects, "Objects", &[
+        "computer", "keyboard", "iphone", "bulb", "calendar", "spiral_calendar_pad", "memo",
+        "pencil2", "books", "package", "lock", "key", "hammer_and_wrench", "gear", "mag", "link",
+        "paperclip", "pushpin", "chart_with_upwards_trend", "bell", "hourglass", "alarm_clock",
+        "money_with_wings", "speech_balloon", "email",
+    ]),
+    (Category::Symbols, "Symbols", &[
+        "heart", "orange_heart", "yellow_heart", "green_heart", "blue_heart", "purple_heart",
+        "broken_heart", "100", "white_check_mark", "heavy_check_mark", "x", "warning", "no_entry",
+        "question", "exclamation", "bangbang", "recycle", "zzz", "red_circle", "large_green_circle",
+        "large_blue_circle", "arrow_up", "arrow_down", "repeat", "new", "sos",
+    ]),
+    (Category::Flags, "Flags", &[
+        "checkered_flag", "triangular_flag_on_post", "crossed_flags", "waving_black_flag",
+        "waving_white_flag", "rainbow-flag", "transgender_flag", "pirate_flag", "flag-ar",
+        "flag-at", "flag-au", "flag-be", "flag-br", "flag-ca", "flag-ch", "cn", "de", "flag-dk",
+        "flag-ee", "es", "flag-eu", "flag-fi", "fr", "gb", "flag-ie", "flag-in", "flag-is", "it",
+        "jp", "kr", "flag-mx", "flag-nl", "flag-no", "flag-nz", "flag-pl", "flag-pt", "flag-se",
+        "flag-ua", "us", "flag-za",
+    ]),
 ];
 
 /// Slack's "Getting Work Done" section, under Frequently Used and without a tab of its own.
@@ -366,15 +133,6 @@ pub(super) const WORK: [&str; 26] = [
     "100",
 ];
 
-/// Alternate shortcodes Slack accepts for catalog emoji.
-pub(super) const ALIASES: &[(&str, &str)] = &[
-    ("+1", "thumbsup"),
-    ("-1", "thumbsdown"),
-    ("simple_smile", "slightly_smiling_face"),
-    ("hand", "raised_hand"),
-    ("facepalm", "face_palm"),
-];
-
 /// Frequently Used when the user's prefs carry no `emoji_use` (the sample workspace).
 pub(super) const FREQUENT_SEED: &[&str] = &[
     "thumbsup",
@@ -394,23 +152,22 @@ pub(super) const FREQUENT_SEED: &[&str] = &[
 /// Slack's cap on Frequently Used: four rows.
 pub(super) const FREQUENT_MAX: usize = 36;
 
+/// The catalog entry a Slack shortcode denotes, under the catalog's own name: `thumbsup` itself,
+/// or another name for the same emoji (`+1`, `satisfied` for `laughing`).
 pub(super) fn lookup(name: &str) -> Option<&'static Emoji> {
-    static INDEX: OnceLock<HashMap<&'static str, &'static Emoji>> = OnceLock::new();
-    let map = INDEX.get_or_init(|| {
-        let mut map = HashMap::new();
+    static INDEX: OnceLock<HashMap<&'static emojis::Emoji, Emoji>> = OnceLock::new();
+    let index = INDEX.get_or_init(|| {
+        let mut index = HashMap::new();
         for (_, _, list) in CATALOG {
-            for emoji in list.iter() {
-                map.insert(emoji.name, emoji);
+            for &name in list {
+                if let Some(emoji) = unicode_emoji(name) {
+                    index.insert(emoji, Emoji { name, emoji });
+                }
             }
         }
-        for &(alias, target) in ALIASES {
-            if let Some(&emoji) = map.get(target) {
-                map.insert(alias, emoji);
-            }
-        }
-        map
+        index
     });
-    map.get(name).copied()
+    unicode_emoji(name).and_then(|emoji| index.get(emoji))
 }
 
 /// Standalone Fitzpatrick skin-tone swatch shortcodes (`:skin-tone-2:`..`:skin-tone-6:`).
@@ -634,22 +391,24 @@ fn regional_flag(code: &str) -> Option<&'static emojis::Emoji> {
     emojis::get(&flag)
 }
 
-/// Every standard emoji beyond the picker's [`CATALOG`], resolved through GitHub shortcodes,
-/// normalized Unicode CLDR names, Slack `iamcal/emoji-data` aliases, `flag-XX` regional
-/// indicators, and Slack's gender/prefix conventions (`male_X`, `female_X`, `large_X`,
+/// Every standard emoji Slack names, the catalog's included, resolved through Slack
+/// `iamcal/emoji-data` aliases, GitHub shortcodes, normalized Unicode CLDR names, `flag-XX`
+/// regional indicators, and Slack's gender/prefix conventions (`male_X`, `female_X`, `large_X`,
 /// `family_X`).
 pub(super) fn unicode_emoji(name: &str) -> Option<&'static emojis::Emoji> {
+    if let Some(code) = name
+        .strip_prefix("flag-")
+        .or_else(|| name.strip_prefix("flag_"))
+        && let Some(emoji) = regional_flag(code)
+    {
+        return Some(emoji);
+    }
     if let Some(emoji) = lookup_unicode_map(name) {
         return Some(emoji);
     }
     let underscored = name.replace('-', "_");
     if underscored != name
         && let Some(emoji) = lookup_unicode_map(&underscored)
-    {
-        return Some(emoji);
-    }
-    if let Some(code) = underscored.strip_prefix("flag_")
-        && let Some(emoji) = regional_flag(code)
     {
         return Some(emoji);
     }
