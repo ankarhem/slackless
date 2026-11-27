@@ -48,7 +48,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|s| s.channel == channel);
             if !active_here {
-                let settings = self.preferences.read(cx).settings().clone();
+                let settings = self.preferences.read(cx).settings();
                 let huddle_link =
                     crate::huddle_video::huddle_browser_url(&self.fixtures, &channel, None);
                 let snap = slackless_core::huddle::HuddleSessionSnapshot {
@@ -58,8 +58,8 @@ impl App {
                     muted: settings.huddle_join_muted,
                     started_at_secs: crate::drafts::now_secs(),
                     huddle_link: Some(huddle_link),
-                    input_device: settings.huddle_input_device,
-                    output_device: settings.huddle_output_device,
+                    input_device: settings.huddle_input_device.clone(),
+                    output_device: settings.huddle_output_device.clone(),
                     aec: settings.huddle_aec,
                     ns: settings.huddle_ns,
                     agc: settings.huddle_agc,
@@ -173,17 +173,23 @@ impl App {
         {
             self.send_huddle(HuddleCommand::Leave);
         }
-        let settings = self.preferences.read(cx).settings().clone();
-        let audio = slackless_core::huddle::HuddleAudioConfig {
-            muted: settings.huddle_join_muted,
-            input_device: settings.huddle_input_device.clone(),
-            output_device: settings.huddle_output_device.clone(),
-            camera_device: settings.huddle_camera_device,
-            blur_background: settings.huddle_blur_background,
-            aec: settings.huddle_aec,
-            ns: settings.huddle_ns,
-            agc: settings.huddle_agc,
-            transcription_provider: settings.transcription_provider(),
+        let (audio, captions_enabled, auto_open_window) = {
+            let settings = self.preferences.read(cx).settings();
+            (
+                slackless_core::huddle::HuddleAudioConfig {
+                    muted: settings.huddle_join_muted,
+                    input_device: settings.huddle_input_device.clone(),
+                    output_device: settings.huddle_output_device.clone(),
+                    camera_device: settings.huddle_camera_device,
+                    blur_background: settings.huddle_blur_background,
+                    aec: settings.huddle_aec,
+                    ns: settings.huddle_ns,
+                    agc: settings.huddle_agc,
+                    transcription_provider: settings.transcription_provider(),
+                },
+                settings.huddle_auto_captions,
+                settings.huddle_auto_open_window,
+            )
         };
         let initial = slackless_core::huddle::HuddleSessionSnapshot {
             phase: if self.fixtures.sample {
@@ -194,7 +200,7 @@ impl App {
             channel: channel.clone(),
             muted: audio.muted,
             blur_background: audio.blur_background,
-            captions_enabled: settings.huddle_auto_captions,
+            captions_enabled,
             started_at_secs: crate::drafts::now_secs(),
             input_device: audio.input_device.clone(),
             output_device: audio.output_device.clone(),
@@ -212,7 +218,7 @@ impl App {
                 audio,
             });
         }
-        if settings.huddle_auto_open_window {
+        if auto_open_window {
             self.pop_out_huddle(window, cx);
         }
         cx.notify();
@@ -471,21 +477,27 @@ impl App {
     }
 
     pub(in crate::app) fn toggle_huddle_camera(&mut self, cx: &mut Context<Self>) {
-        let settings = self.preferences.read(cx).settings().clone();
+        let (blur_background, camera_device) = {
+            let settings = self.preferences.read(cx).settings();
+            (
+                settings.huddle_blur_background,
+                settings.huddle_camera_device,
+            )
+        };
         let Some(snap) = self.huddle_session.as_mut() else {
             return;
         };
         let next = !snap.video;
         snap.video = next;
-        snap.blur_background = settings.huddle_blur_background;
+        snap.blur_background = blur_background;
         if let Some(state) = &self.huddle_state {
             state.update(cx, |s, cx| s.set_camera_local(next, cx));
         }
         if !self.fixtures.sample {
             self.send_huddle(HuddleControlCommand::SetCamera {
                 enabled: next,
-                device_index: settings.huddle_camera_device,
-                blur: settings.huddle_blur_background,
+                device_index: camera_device,
+                blur: blur_background,
             });
         }
         cx.notify();

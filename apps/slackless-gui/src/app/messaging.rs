@@ -359,9 +359,11 @@ impl App {
         if !self.transcript_visible(cx) {
             return;
         }
-        let settings = self.preferences.read(cx).settings().clone();
-        let allow_mark =
-            settings.mark_read != 2 && (!settings.no_bg_mark_read || self.window_active);
+        let (mark_read, no_bg_mark_read) = {
+            let settings = self.preferences.read(cx).settings();
+            (settings.mark_read, settings.no_bg_mark_read)
+        };
+        let allow_mark = mark_read != 2 && (!no_bg_mark_read || self.window_active);
         if !allow_mark {
             return;
         }

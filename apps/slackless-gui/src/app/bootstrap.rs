@@ -164,12 +164,14 @@ fn restore_initial_preferences(
         );
         preferences.update(cx, |prefs, cx| prefs.load_settings(settings, window, cx));
     } else {
-        let s = preferences.read(cx).settings().clone();
-        crate::composer::set_outgoing_guard_prefs(
-            s.strip_tracking_params,
-            s.warn_before_sending_secrets,
-            cx,
-        );
+        {
+            let s = preferences.read(cx).settings();
+            crate::composer::set_outgoing_guard_prefs(
+                s.strip_tracking_params,
+                s.warn_before_sending_secrets,
+                cx,
+            );
+        }
     }
     // `open_url`'s link policy holds from the first click, not from the first Preferences change.
     let settings = preferences.read(cx).settings();
@@ -238,8 +240,11 @@ fn wire_window_and_input_subscriptions(
         cx.observe_window_activation(window, |this, window, cx| {
             this.window_active = window.is_window_active();
             if this.window_active {
-                let settings = this.preferences.read(cx).settings().clone();
-                if settings.no_bg_mark_read && settings.mark_read != 2 {
+                let (no_bg_mark_read, mark_read) = {
+                    let settings = this.preferences.read(cx).settings();
+                    (settings.no_bg_mark_read, settings.mark_read)
+                };
+                if no_bg_mark_read && mark_read != 2 {
                     if this.page == MainPage::Threads {
                         this.auto_mark_threads_view_read(cx);
                     } else {
@@ -1529,8 +1534,10 @@ fn hydrate_initial_channel(app: &Entity<App>, window: &mut Window, cx: &mut gpui
         if !initial_history.is_empty() {
             app.resolve_named_users(&initial_history);
             let newest = initial_history.last().map(|m| m.ts.clone());
-            let settings = app.preferences.read(cx).settings().clone();
-            let mark_read_mode = settings.mark_read;
+            let (mark_read_mode, no_bg_mark_read) = {
+                let settings = app.preferences.read(cx).settings();
+                (settings.mark_read, settings.no_bg_mark_read)
+            };
             app.messages.update(cx, |list, cx| {
                 list.set_conversation(channel.clone(), cx);
                 list.set_history(channel.clone(), initial_history, cx);
@@ -1538,8 +1545,7 @@ fn hydrate_initial_channel(app: &Entity<App>, window: &mut Window, cx: &mut gpui
                     list.scroll_to_unread_once(cx);
                 }
             });
-            let allow_mark =
-                mark_read_mode != 2 && (!settings.no_bg_mark_read || app.window_active);
+            let allow_mark = mark_read_mode != 2 && (!no_bg_mark_read || app.window_active);
             if allow_mark && let Some(newest) = newest {
                 app.mark_read(&channel, newest, cx);
             }
