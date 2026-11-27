@@ -172,6 +172,16 @@ impl Composer {
         cx.notify();
     }
 
+    /// Stage `files` again after a canceled send put them back.
+    pub(crate) fn restore_attachments(
+        &mut self,
+        files: Vec<PendingAttachment>,
+        cx: &mut Context<Self>,
+    ) {
+        self.attachments = files;
+        cx.notify();
+    }
+
     pub(super) fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.attachments.len() {
             self.attachments.remove(index);

@@ -1338,17 +1338,7 @@ impl App {
         if composer::outgoing_guard_prefs(cx).warn_before_sending_secrets {
             let matches = slackless_core::detect_secrets(&msg.content.text);
             if !matches.is_empty() {
-                let restore = (msg.thread_ts.is_none()).then(|| msg.channel.clone());
-                self.confirm_secret_send(
-                    matches,
-                    msg.content.text.clone(),
-                    restore,
-                    move |app, window, cx| {
-                        app.guard_broadcast(msg.clone(), window, cx);
-                    },
-                    window,
-                    cx,
-                );
+                self.confirm_secret_send(matches, msg, window, cx);
                 return false;
             }
         }
@@ -1371,22 +1361,29 @@ impl App {
             return true;
         };
         let (this_send, this_cancel) = (cx.weak_entity(), cx.weak_entity());
-        let cancel_text = msg.content.text.clone();
-        let restore = (msg.thread_ts.is_none()).then(|| msg.channel.clone());
-        // Taken once on Send, so staged files go out without a copy.
-        let pending = Cell::new(Some(msg));
+        // Taken once on Send or Cancel, so staged files are neither copied nor dropped.
+        let pending = Rc::new(Cell::new(Some(msg)));
         confirm_broadcast(
             guard,
-            move |_, cx| {
-                if let Some(msg) = pending.take() {
-                    let _ = this_send.update(cx, |app, cx| app.dispatch(msg, cx));
+            {
+                let pending = Rc::clone(&pending);
+                move |_, cx| {
+                    if let Some(msg) = pending.take() {
+                        let _ = this_send.update(cx, |app, cx| app.dispatch(msg, cx));
+                    }
                 }
             },
-            move |_, cx| {
-                if let Some(channel) = &restore {
-                    let _ = this_cancel.update(cx, |app, cx| {
-                        app.restore_composer_text(channel, &cancel_text, cx);
-                    });
+            {
+                let pending = Rc::clone(&pending);
+                move |_, cx| {
+                    // Only a top-level send came out of the main composer.
+                    if let Some(msg) = pending.take()
+                        && msg.thread_ts.is_none()
+                    {
+                        let _ = this_cancel.update(cx, |app, cx| {
+                            app.restore_composer(&msg.channel, &msg.content.text, msg.files, cx);
+                        });
+                    }
                 }
             },
             window,
@@ -1396,101 +1393,63 @@ impl App {
     }
 
     /// Show a confirmation dialog when outgoing text matches known API keys, tokens, or private
-    /// keys. Canceling restores `cancel_text` into the main composer of `restore` (when the text
-    /// came from there); "Send anyway" invokes `proceed`.
+    /// keys. `msg` waits in it: "Send anyway" continues through [`Self::guard_broadcast`]; Cancel
+    /// puts its text and staged files back into the main composer when it came from there.
     pub(super) fn confirm_secret_send(
         &self,
         matches: Vec<slackless_core::SecretMatch>,
-        cancel_text: String,
-        restore: Option<ChannelId>,
-        proceed: impl Fn(&mut App, &mut Window, &mut Context<App>) + Clone + 'static,
+        msg: OutgoingMessage,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let pending = Rc::new(Cell::new(Some(msg)));
         let summary_lines: Vec<String> = matches
             .iter()
             .map(|m| format!("\u{2022} {}: {}", m.kind, m.preview))
             .collect();
-        let this = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        let (this_send, this_cancel) = (cx.weak_entity(), cx.weak_entity());
+        crate::ui::ConfirmDialog::new(
+            "Possible secret detected",
+            "This message looks like it contains credentials or a private key. Are you sure you want to send it?",
+            "Send anyway",
+        )
+        .danger()
+        .width(px(480.))
+        .extra(move |cx| {
             let theme = cx.theme();
-            let (muted, danger, border, card_bg, mono) = (
-                theme.muted_foreground,
-                theme.danger,
-                theme.border,
-                theme.secondary.opacity(0.35),
-                theme.mono_font_family.clone(),
-            );
-            let this_cancel = this.clone();
-            let this_send = this.clone();
-            let cancel_text = cancel_text.clone();
-            let restore_cancel = restore.clone();
-            let proceed = proceed.clone();
-            let items: Vec<_> = summary_lines
-                .iter()
-                .map(|line| {
+            v_flex()
+                .gap_1()
+                .p_2p5()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.secondary.opacity(0.35))
+                .children(summary_lines.iter().map(|line| {
                     div()
-                        .font_family(mono.clone())
+                        .font_family(theme.mono_font_family.clone())
                         .text_xs()
-                        .text_color(danger)
+                        .text_color(theme.danger)
                         .child(line.clone())
-                })
-                .collect();
-            dialog
-                .title("Possible secret detected")
-                .w(px(480.))
-                .child(
-                    v_flex()
-                        .gap_3()
-                        .child(div().text_sm().text_color(muted).child(
-                            "This message looks like it contains credentials or a private key. Are you sure you want to send it?",
-                        ))
-                        .child(
-                            v_flex()
-                                .gap_1()
-                                .p_2p5()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(border)
-                                .bg(card_bg)
-                                .children(items),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .justify_end()
-                                .child(
-                                    preferences::form_button(
-                                        Button::new("secret-guard-cancel")
-                                            .outline()
-                                            .label("Cancel"),
-                                        cx,
-                                    )
-                                    .on_click(move |_, window, cx| {
-                                        window.close_dialog(cx);
-                                        let _ = this_cancel.update(cx, |app, cx| {
-                                            if let Some(channel) = restore_cancel.clone() {
-                                                app.restore_composer_text(&channel, &cancel_text, cx);
-                                            }
-                                        });
-                                    }),
-                                )
-                                .child(
-                                    preferences::form_button(
-                                        Button::new("secret-guard-send")
-                                            .danger()
-                                            .label("Send anyway"),
-                                        cx,
-                                    )
-                                    .on_click(move |_, window, cx| {
-                                            window.close_dialog(cx);
-                                            let _ = this_send.update(cx, |app, cx| {
-                                                proceed(app, window, cx);
-                                            });
-                                        }),
-                                ),
-                        ),
-                )
+                }))
+                .into_any_element()
+        })
+        .on_cancel({
+            let pending = Rc::clone(&pending);
+            move |_, cx| {
+                // Only a top-level send came out of the main composer.
+                if let Some(msg) = pending.take()
+                    && msg.thread_ts.is_none()
+                {
+                    let _ = this_cancel.update(cx, |app, cx| {
+                        app.restore_composer(&msg.channel, &msg.content.text, msg.files, cx);
+                    });
+                }
+            }
+        })
+        .open(window, cx, move |window, cx| {
+            if let Some(msg) = pending.take() {
+                let _ = this_send.update(cx, |app, cx| app.guard_broadcast(msg, window, cx));
+            }
         });
     }
 
@@ -1680,14 +1639,25 @@ impl App {
         self.sync_thread_sidebar_counts(cx);
     }
 
-    /// Put a canceled send's `text` back into the main composer of `channel`, showing `channel`
-    /// again when the user has moved on meanwhile.
-    fn restore_composer_text(&mut self, channel: &ChannelId, text: &str, cx: &mut Context<Self>) {
+    /// Put a canceled send back into the main composer of `channel`: its `text` and staged
+    /// `files`, showing `channel` again when the user has moved on meanwhile.
+    fn restore_composer(
+        &mut self,
+        channel: &ChannelId,
+        text: &str,
+        files: Option<Rc<Vec<composer::PendingAttachment>>>,
+        cx: &mut Context<Self>,
+    ) {
         if self.channel != *channel {
             self.select(channel.clone(), cx);
         }
-        self.composer
-            .update(cx, |composer, cx| composer.load_draft(text, cx));
+        let files = files.map_or_else(Vec::new, |files| {
+            Rc::try_unwrap(files).unwrap_or_else(|shared| (*shared).clone())
+        });
+        self.composer.update(cx, |composer, cx| {
+            composer.load_draft(text, cx);
+            composer.restore_attachments(files, cx);
+        });
     }
 
     fn send_to_conversation(

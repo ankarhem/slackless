@@ -62,6 +62,11 @@ impl ConfirmDialog {
         self
     }
 
+    pub fn on_cancel(mut self, on_cancel: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_cancel = Some(Rc::new(on_cancel));
+        self
+    }
+
     /// Open the dialog over `window`; `on_confirm` runs when the action button is clicked.
     pub fn open(
         self,

@@ -473,15 +473,18 @@ fn wired_confirmed_send_stays_on_the_channel_it_was_submitted_to(cx: &mut gpui::
         "nothing may reach the channel that was open at confirm time: {cmds:?}"
     );
 
-    // 3. Canceling after the same switch puts the text back where it was typed.
+    // 3. Canceling after the same switch puts the text and its staged file back where they
+    // were typed.
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
             app.select(big.clone(), cx);
-            app.send(
-                crate::composer::content_of("<!channel> again", &app.fixtures),
-                window,
-                cx,
-            );
+            let content = crate::composer::content_of("<!channel> again", &app.fixtures);
+            let file = crate::composer::PendingAttachment {
+                filename: "notes.txt".into(),
+                bytes: b"notes".to_vec(),
+                preview: None,
+            };
+            app.upload_files(big.clone(), None, Some(content), vec![file], window, cx);
             app.select(small.clone(), cx);
         });
         let _ = window.draw(cx);
@@ -497,7 +500,18 @@ fn wired_confirmed_send_stays_on_the_channel_it_was_submitted_to(cx: &mut gpui::
             app.channel, big,
             "cancel returns to the conversation the text belongs to"
         );
-        assert_eq!(app.composer.read(cx).text(), "<!channel> again");
+        let composer = app.composer.read(cx);
+        assert_eq!(composer.text(), "<!channel> again");
+        let restored: Vec<_> = composer
+            .attachments()
+            .iter()
+            .map(|file| file.filename.as_str())
+            .collect();
+        assert_eq!(
+            restored,
+            ["notes.txt"],
+            "cancel must stage the upload's file again, not only its text"
+        );
     });
     assert!(
         !sent_to(&core.drain_commands(), &big),

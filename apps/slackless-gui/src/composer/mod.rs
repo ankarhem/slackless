@@ -728,6 +728,12 @@ impl Composer {
         self.editor.doc().to_draft()
     }
 
+    /// The files staged for the next send, in strip order.
+    #[cfg(test)]
+    pub fn attachments(&self) -> &[PendingAttachment] {
+        &self.attachments
+    }
+
     /// Replace the draft with `draft` (a saved per-conversation draft as mrkdwn, or empty).
     pub fn load_draft(&mut self, draft: &str, cx: &mut Context<Self>) {
         self.editor.load(from_mrkdwn(draft, &*self.fixtures));
