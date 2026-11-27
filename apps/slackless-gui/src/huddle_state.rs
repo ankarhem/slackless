@@ -64,25 +64,50 @@ fn now_ms() -> u64 {
     slackless_core::types::time::now_epoch_ms()
 }
 
+/// One line of live huddle captions: its speaker, the text so far, whether more words are
+/// coming, and the detected language.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptionLine {
+    pub user: UserId,
+    pub text: String,
+    pub partial: bool,
+    pub lang: Option<String>,
+}
+
+/// The effect reaction (confetti, applause, ...) a peer just sent, shown for a few seconds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveEffect {
+    pub user: UserId,
+    pub emoji: String,
+    pub at_ms: u64,
+}
+
+/// Whether a sticky emoji or reaction is the raised hand, however a client spells it.
+pub fn is_hand(emoji: Option<&str>) -> bool {
+    matches!(emoji, Some("raised_hand" | "\u{270B}"))
+}
+
 /// Snapshot consumed by `PopoutKind::Huddle` and `HuddleFloatingPanel` so secondary windows stay
 /// in lock-step with [`HuddleState`]; shared, so a popped-out window's render reuses the copy its
-/// observer took on the last change. Live video frames live in a separate [`HuddleVideoStore`]
-/// entity so high-frequency video updates never repaint the main window.
+/// observer took on the last change. The collections are shared with [`HuddleState`] (copied on
+/// write there), so a copy of this is shallow whatever their size. Live video frames live in a
+/// separate [`HuddleVideoStore`] entity so high-frequency video updates never repaint the main
+/// window.
 #[derive(Clone)]
 pub struct HuddleViewState {
     pub session: HuddleSessionSnapshot,
-    pub participants: Vec<UserId>,
-    pub levels: HuddleAudioLevels,
+    pub participants: Rc<Vec<UserId>>,
+    pub levels: Rc<HuddleAudioLevels>,
     pub elapsed_secs: u64,
-    pub raised_hands: HashSet<UserId>,
-    pub sticky_emojis: HashMap<UserId, String>,
-    pub reactions: Vec<ReactionEntry>,
-    pub active_effect: Option<(UserId, String, u64)>,
-    pub draw_strokes: Vec<DrawStrokeEntry>,
-    pub draw_cursors: HashMap<UserId, DrawCursorEntry>,
+    pub raised_hands: Rc<HashSet<UserId>>,
+    pub sticky_emojis: Rc<HashMap<UserId, String>>,
+    pub reactions: Rc<Vec<ReactionEntry>>,
+    pub active_effect: Option<ActiveEffect>,
+    pub draw_strokes: Rc<Vec<DrawStrokeEntry>>,
+    pub draw_cursors: Rc<HashMap<UserId, DrawCursorEntry>>,
     pub draw_mode: bool,
     pub draw_hue: i32,
-    pub captions: Vec<(UserId, String, bool, Option<String>)>,
+    pub captions: Rc<Vec<CaptionLine>>,
 }
 
 /// App-level actions emitted by [`HuddleState`] (floating panel lifecycle, desktop pen draw
@@ -122,20 +147,20 @@ pub struct HuddleState {
     session: HuddleSessionSnapshot,
     /// The room fields of the core's last snapshot (see [`HuddleState::update_session`]).
     core_room_meta: RoomMeta,
-    participants: Vec<UserId>,
-    levels: HuddleAudioLevels,
+    participants: Rc<Vec<UserId>>,
+    levels: Rc<HuddleAudioLevels>,
     elapsed_secs: u64,
     video_store: Entity<HuddleVideoStore>,
-    raised_hands: HashSet<UserId>,
-    sticky_emojis: HashMap<UserId, String>,
-    reactions: Vec<ReactionEntry>,
-    active_effect: Option<(UserId, String, u64)>,
-    draw_strokes: Vec<DrawStrokeEntry>,
-    draw_cursors: HashMap<UserId, DrawCursorEntry>,
+    raised_hands: Rc<HashSet<UserId>>,
+    sticky_emojis: Rc<HashMap<UserId, String>>,
+    reactions: Rc<Vec<ReactionEntry>>,
+    active_effect: Option<ActiveEffect>,
+    draw_strokes: Rc<Vec<DrawStrokeEntry>>,
+    draw_cursors: Rc<HashMap<UserId, DrawCursorEntry>>,
     draw_mode: bool,
     draw_hue: i32,
     user_hues: HashMap<UserId, i32>,
-    captions: Vec<(UserId, String, bool, Option<String>)>,
+    captions: Rc<Vec<CaptionLine>>,
     #[cfg(target_os = "macos")]
     overlay_visible: bool,
     #[cfg(target_os = "macos")]
@@ -205,14 +230,14 @@ impl HuddleState {
                             let now = now_ms();
                             let react_cutoff = now.saturating_sub(4_500);
                             let before = state.reactions.len();
-                            state.reactions.retain(|r| r.at_ms >= react_cutoff);
+                            Rc::make_mut(&mut state.reactions).retain(|r| r.at_ms >= react_cutoff);
                             if state.reactions.len() != before {
                                 dirty = true;
                             }
                             if state
                                 .active_effect
                                 .as_ref()
-                                .is_some_and(|(_, _, at)| *at < now.saturating_sub(3_500))
+                                .is_some_and(|effect| effect.at_ms < now.saturating_sub(3_500))
                             {
                                 state.active_effect = None;
                                 dirty = true;
@@ -220,7 +245,7 @@ impl HuddleState {
                             let ended_cutoff = now.saturating_sub(5_800);
                             let stale_cutoff = now.saturating_sub(15_000);
                             let strokes_before = state.draw_strokes.len();
-                            state.draw_strokes.retain(|s| {
+                            Rc::make_mut(&mut state.draw_strokes).retain(|s| {
                                 if let Some(ended_at) = s.ended_at_ms {
                                     ended_at >= ended_cutoff
                                 } else {
@@ -229,8 +254,7 @@ impl HuddleState {
                             });
                             let cursor_cutoff = now.saturating_sub(3_000);
                             let cursors_before = state.draw_cursors.len();
-                            state
-                                .draw_cursors
+                            Rc::make_mut(&mut state.draw_cursors)
                                 .retain(|_, c| c.updated_at_ms >= cursor_cutoff);
                             if state.draw_strokes.len() != strokes_before
                                 || state.draw_cursors.len() != cursors_before
@@ -255,24 +279,24 @@ impl HuddleState {
                 fixtures,
                 core_room_meta: RoomMeta::of(&session),
                 session,
-                participants,
-                levels: HuddleAudioLevels::default(),
+                participants: Rc::new(participants),
+                levels: Rc::new(HuddleAudioLevels::default()),
                 elapsed_secs: if started > 0 {
                     now_secs().saturating_sub(started)
                 } else {
                     0
                 },
                 video_store,
-                raised_hands: HashSet::new(),
-                sticky_emojis: HashMap::new(),
-                reactions: Vec::new(),
+                raised_hands: Rc::default(),
+                sticky_emojis: Rc::default(),
+                reactions: Rc::default(),
                 active_effect: None,
-                draw_strokes: Vec::new(),
-                draw_cursors: HashMap::new(),
+                draw_strokes: Rc::default(),
+                draw_cursors: Rc::default(),
                 draw_mode: false,
                 draw_hue: 210,
                 user_hues: HashMap::new(),
-                captions: Vec::new(),
+                captions: Rc::default(),
                 #[cfg(target_os = "macos")]
                 overlay_visible: false,
                 #[cfg(target_os = "macos")]
@@ -589,7 +613,7 @@ impl HuddleState {
 
         let now = now_ms();
         let mut segs = Vec::new();
-        for stroke in &self.draw_strokes {
+        for stroke in self.draw_strokes.iter() {
             let (alpha, width_scale) = overlay_stroke_fade(stroke.ended_at_ms, now);
             if alpha <= 0.01 {
                 continue;
@@ -707,9 +731,9 @@ impl HuddleState {
             self.elapsed_secs = now_secs().saturating_sub(session.started_at_secs);
         }
         if session.hand_raised {
-            self.raised_hands.insert(self.fixtures.self_user.clone());
+            Rc::make_mut(&mut self.raised_hands).insert(self.fixtures.self_user.clone());
         } else {
-            self.raised_hands.remove(&self.fixtures.self_user);
+            Rc::make_mut(&mut self.raised_hands).remove(&self.fixtures.self_user);
         }
         let was_sharing = self.session.sharing;
         let share_changed = self.session.sharing != session.sharing
@@ -731,8 +755,8 @@ impl HuddleState {
     }
 
     pub fn set_participants(&mut self, participants: Vec<UserId>, cx: &mut Context<Self>) {
-        if self.participants != participants {
-            self.participants = participants;
+        if *self.participants != participants {
+            self.participants = Rc::new(participants);
             cx.notify();
         }
     }
@@ -744,7 +768,7 @@ impl HuddleState {
         {
             return;
         }
-        self.levels = levels;
+        self.levels = Rc::new(levels);
         cx.notify();
     }
 
@@ -847,39 +871,39 @@ impl HuddleState {
             } => {
                 let ts = if *at_ms == 0 { now_ms() } else { *at_ms };
                 if *kind == HuddleReactionKind::Effect {
-                    self.active_effect = Some((user.clone(), emoji.clone(), ts));
+                    self.active_effect = Some(ActiveEffect {
+                        user: user.clone(),
+                        emoji: emoji.clone(),
+                        at_ms: ts,
+                    });
                 }
-                self.reactions.push(ReactionEntry {
+                let reactions = Rc::make_mut(&mut self.reactions);
+                reactions.push(ReactionEntry {
                     user: user.clone(),
                     emoji: emoji.clone(),
                     at_ms: ts,
                 });
-                if self.reactions.len() > 24 {
-                    let excess = self.reactions.len() - 24;
-                    self.reactions.drain(0..excess);
+                if reactions.len() > 24 {
+                    let excess = reactions.len() - 24;
+                    reactions.drain(0..excess);
                 }
             }
             HuddleDataEvent::HandRaise { user, raised } => {
                 if *raised {
-                    self.raised_hands.insert(user.clone());
+                    Rc::make_mut(&mut self.raised_hands).insert(user.clone());
                 } else {
-                    self.raised_hands.remove(user);
+                    Rc::make_mut(&mut self.raised_hands).remove(user);
                     if self
                         .sticky_emojis
                         .get(user)
-                        .is_some_and(|em| em == "raised_hand" || em == "✋")
+                        .is_some_and(|em| is_hand(Some(em)))
                     {
-                        self.sticky_emojis.remove(user);
+                        Rc::make_mut(&mut self.sticky_emojis).remove(user);
                     }
                 }
                 if *user == self.fixtures.self_user {
                     self.session.hand_raised = *raised;
-                    if !*raised
-                        && matches!(
-                            self.session.sticky_emoji.as_deref(),
-                            Some("raised_hand") | Some("✋")
-                        )
-                    {
+                    if !*raised && is_hand(self.session.sticky_emoji.as_deref()) {
                         self.session.sticky_emoji = None;
                     }
                 }
@@ -888,25 +912,24 @@ impl HuddleState {
                 let prev_was_hand = self
                     .sticky_emojis
                     .get(user)
-                    .is_some_and(|em| em == "raised_hand" || em == "✋");
+                    .is_some_and(|em| is_hand(Some(em)));
                 match emoji {
                     Some(em) if !em.is_empty() => {
-                        if em == "raised_hand" || em == "✋" {
-                            self.raised_hands.insert(user.clone());
+                        if is_hand(Some(em)) {
+                            Rc::make_mut(&mut self.raised_hands).insert(user.clone());
                         } else if prev_was_hand {
-                            self.raised_hands.remove(user);
+                            Rc::make_mut(&mut self.raised_hands).remove(user);
                         }
-                        self.sticky_emojis.insert(user.clone(), em.clone());
+                        Rc::make_mut(&mut self.sticky_emojis).insert(user.clone(), em.clone());
                     }
                     _ => {
-                        self.sticky_emojis.remove(user);
-                        self.raised_hands.remove(user);
+                        Rc::make_mut(&mut self.sticky_emojis).remove(user);
+                        Rc::make_mut(&mut self.raised_hands).remove(user);
                     }
                 }
                 if *user == self.fixtures.self_user {
                     self.session.sticky_emoji = emoji.clone();
-                    self.session.hand_raised =
-                        matches!(emoji.as_deref(), Some("raised_hand") | Some("✋"));
+                    self.session.hand_raised = is_hand(emoji.as_deref());
                 }
             }
             HuddleDataEvent::Topic { topic, .. } => {
@@ -920,23 +943,28 @@ impl HuddleState {
                 ..
             } => {
                 if !text.trim().is_empty() {
-                    if let Some(last) = self.captions.last_mut()
-                        && last.0 == *user
-                        && last.2
+                    let captions = Rc::make_mut(&mut self.captions);
+                    if let Some(last) = captions.last_mut()
+                        && last.user == *user
+                        && last.partial
                     {
-                        last.1 = text.clone();
-                        last.2 = *is_partial;
+                        last.text = text.clone();
+                        last.partial = *is_partial;
                         if lang.is_some() {
-                            last.3 = lang.clone();
+                            last.lang = lang.clone();
                         }
                         cx.notify();
                         return;
                     }
-                    self.captions
-                        .push((user.clone(), text.clone(), *is_partial, lang.clone()));
-                    if self.captions.len() > 4 {
-                        let excess = self.captions.len() - 4;
-                        self.captions.drain(0..excess);
+                    captions.push(CaptionLine {
+                        user: user.clone(),
+                        text: text.clone(),
+                        partial: *is_partial,
+                        lang: lang.clone(),
+                    });
+                    if captions.len() > 4 {
+                        let excess = captions.len() - 4;
+                        captions.drain(0..excess);
                     }
                 }
             }
@@ -948,7 +976,8 @@ impl HuddleState {
                     }
                     HuddleDrawMessage::New { item_id, segment } => {
                         let hue = *self.user_hues.get(user).unwrap_or(&210);
-                        if let Some(open) = self.draw_strokes.iter_mut().rev().find(|s| {
+                        let strokes = Rc::make_mut(&mut self.draw_strokes);
+                        if let Some(open) = strokes.iter_mut().rev().find(|s| {
                             !s.ended
                                 && s.user == *user
                                 && s.item_id == *item_id
@@ -958,7 +987,7 @@ impl HuddleState {
                             open.segments.push(*segment);
                             open.updated_at_ms = ts;
                         } else {
-                            self.draw_strokes.push(DrawStrokeEntry {
+                            strokes.push(DrawStrokeEntry {
                                 user: user.clone(),
                                 item_id: item_id.clone(),
                                 hue,
@@ -967,15 +996,11 @@ impl HuddleState {
                                 ended: false,
                                 ended_at_ms: None,
                             });
-                            if self.draw_strokes.len() > 64 {
-                                let excess = self.draw_strokes.len() - 64;
-                                self.draw_strokes.drain(0..excess);
-                            }
+                            strokes.drain(..strokes.len().saturating_sub(64));
                         }
                     }
                     HuddleDrawMessage::Edit { item_id, segment } => {
-                        if let Some(stroke) = self
-                            .draw_strokes
+                        if let Some(stroke) = Rc::make_mut(&mut self.draw_strokes)
                             .iter_mut()
                             .rev()
                             .find(|s| !s.ended && s.user == *user && s.item_id == *item_id)
@@ -989,8 +1014,7 @@ impl HuddleState {
                         }
                     }
                     HuddleDrawMessage::End { item_id } => {
-                        if let Some(stroke) = self
-                            .draw_strokes
+                        if let Some(stroke) = Rc::make_mut(&mut self.draw_strokes)
                             .iter_mut()
                             .rev()
                             .find(|s| !s.ended && s.user == *user && s.item_id == *item_id)
@@ -1002,7 +1026,7 @@ impl HuddleState {
                     }
                     HuddleDrawMessage::Position { item_id, x, y } => {
                         let hue = *self.user_hues.get(user).unwrap_or(&210);
-                        self.draw_cursors.insert(
+                        Rc::make_mut(&mut self.draw_cursors).insert(
                             user.clone(),
                             DrawCursorEntry {
                                 item_id: item_id.clone(),
@@ -1080,7 +1104,8 @@ impl HuddleState {
             return;
         }
         let ts = now_ms();
-        self.draw_strokes.push(DrawStrokeEntry {
+        let strokes = Rc::make_mut(&mut self.draw_strokes);
+        strokes.push(DrawStrokeEntry {
             user: self.fixtures.self_user.clone(),
             item_id,
             hue,
@@ -1089,10 +1114,7 @@ impl HuddleState {
             ended: true,
             ended_at_ms: Some(ts),
         });
-        if self.draw_strokes.len() > 64 {
-            let excess = self.draw_strokes.len() - 64;
-            self.draw_strokes.drain(0..excess);
-        }
+        strokes.drain(..strokes.len().saturating_sub(64));
         self.sync_desktop_draw_overlay(cx);
         cx.notify();
     }
@@ -1222,7 +1244,10 @@ mod tests {
                 }
                 assert_eq!(s.view_state().reactions.len(), 24);
                 assert_eq!(
-                    s.view_state().active_effect.as_ref().map(|e| e.1.as_str()),
+                    s.view_state()
+                        .active_effect
+                        .as_ref()
+                        .map(|e| e.emoji.as_str()),
                     Some("e29")
                 );
 
@@ -1299,8 +1324,8 @@ mod tests {
                     cx,
                 );
                 assert_eq!(s.view_state().captions.len(), 1);
-                assert_eq!(s.view_state().captions[0].1, "Hello world");
-                assert_eq!(s.view_state().captions[0].3.as_deref(), Some("en"));
+                assert_eq!(s.view_state().captions[0].text, "Hello world");
+                assert_eq!(s.view_state().captions[0].lang.as_deref(), Some("en"));
                 for i in 0..6 {
                     s.apply_data_event(
                         &HuddleDataEvent::Caption {

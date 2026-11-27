@@ -1008,7 +1008,7 @@ impl PopoutWindow {
             return None;
         }
         let mut stacked: Vec<(String, usize, Vec<String>)> = Vec::new();
-        for entry in &state.reactions {
+        for entry in state.reactions.iter() {
             let who = self.fixtures.user_name(&entry.user).to_owned();
             if let Some(slot) = stacked.iter_mut().find(|(em, _, _)| *em == entry.emoji) {
                 slot.1 += 1;
@@ -1064,7 +1064,7 @@ impl PopoutWindow {
             .captions
             .iter()
             .rev()
-            .find_map(|(_, _, _, lang)| lang.as_deref())
+            .find_map(|line| line.lang.as_deref())
             .map(|l| l.to_ascii_uppercase());
 
         let header = h_flex()
@@ -1135,7 +1135,16 @@ impl PopoutWindow {
             }
             let total = state.captions.len();
             let mut groups: Vec<CaptionTurn<'_>> = Vec::new();
-            for (idx, (uid, text, is_partial, _lang)) in state.captions.iter().enumerate() {
+            for (
+                idx,
+                CaptionLine {
+                    user: uid,
+                    text,
+                    partial: is_partial,
+                    ..
+                },
+            ) in state.captions.iter().enumerate()
+            {
                 if let Some(prev) = groups.last_mut()
                     && prev.uid == uid
                 {

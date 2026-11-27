@@ -15,6 +15,7 @@ use gpui_kit::gpui::{
 use slackless_core::{CollabCommand, HuddleCommand, HuddleControlCommand};
 
 use crate::actions::{self, ActionHandler};
+use crate::huddle_state::{ActiveEffect, CaptionLine};
 use crate::messages::{message_row_linked, same_group};
 
 use super::*;
@@ -322,7 +323,7 @@ impl PopoutWindow {
 
         let snap = state.session.clone();
         let channel = snap.channel.clone();
-        let mut people = state.participants.clone();
+        let mut people = state.participants.as_ref().clone();
         if !people.contains(&self.fixtures.self_user) {
             people.push(self.fixtures.self_user.clone());
         }
@@ -501,7 +502,12 @@ impl PopoutWindow {
         }
 
         // Floating effect burst banner (top-center, never shifts stage layout)
-        if let Some((uid, effect_name, _)) = &state.active_effect {
+        if let Some(ActiveEffect {
+            user: uid,
+            emoji: effect_name,
+            ..
+        }) = &state.active_effect
+        {
             let who = self.fixtures.user_name(uid).to_owned();
             let (glyph, label) = effect_label(effect_name);
             stage = stage.child(

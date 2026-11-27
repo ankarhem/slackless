@@ -1179,8 +1179,8 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
             assert_eq!(vs.session.topic.as_deref(), Some("Release readiness"));
             // Partial caption updated in-place by final caption -> 1 row!
             assert_eq!(vs.captions.len(), 1);
-            assert_eq!(vs.captions[0].1, "Shipping full parity today!");
-            assert!(!vs.captions[0].2);
+            assert_eq!(vs.captions[0].text, "Shipping full parity today!");
+            assert!(!vs.captions[0].partial);
             app.on_huddle_media_event(
                 &HuddleMediaEvent::VideoTileClosed(
                     slackless_core::huddle::VideoTileKey::LocalCamera,
