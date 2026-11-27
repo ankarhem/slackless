@@ -1336,8 +1336,7 @@ fn qa_image_viewer_keyboard_zoom_step_and_zero_subscription_leak(cx: &mut gpui::
             user: None,
             taken_at: None,
             download: None,
-            video: None,
-            pdf: None,
+            media: crate::image_viewer::ViewerMedia::Image,
         };
         std::rc::Rc::new(vec![img("one.png"), img("two.png")])
     };
@@ -1410,7 +1409,7 @@ fn qa_image_viewer_keyboard_zoom_step_and_zero_subscription_leak(cx: &mut gpui::
         user: None,
         taken_at: None,
         download: None,
-        video: Some(crate::image_viewer::ViewerVideo {
+        media: crate::image_viewer::ViewerMedia::Video(crate::image_viewer::ViewerVideo {
             file_id: "F_KEY_VID".into(),
             url: "https://files.slack.com/pri/clip.mp4".into(),
             ext: "mp4".into(),
@@ -1418,7 +1417,6 @@ fn qa_image_viewer_keyboard_zoom_step_and_zero_subscription_leak(cx: &mut gpui::
             inline_transcript: Some("Sample spoken words.".into()),
             vtt_url: None,
         }),
-        pdf: None,
     }]);
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
@@ -3370,8 +3368,7 @@ fn qa_wave1_modal_stale_submit_workspace_switch_and_viewer_shortcut_guards(
                 user: None,
                 taken_at: None,
                 download: None,
-                video: None,
-                pdf: None,
+                media: crate::image_viewer::ViewerMedia::Image,
             }]);
             app.open_image_viewer(app.channel.clone(), items, 0, window, cx);
             assert!(app.image_viewer.is_some());

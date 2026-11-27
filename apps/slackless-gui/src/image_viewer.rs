@@ -81,14 +81,23 @@ pub struct ViewerVideo {
     pub vtt_url: Option<String>,
 }
 
-/// Metadata for a PDF document displayed page-by-page inside [`ImageViewer`].
+/// Metadata for a PDF document displayed page-by-page inside [`ImageViewer`]. The page count is
+/// the document's own, learned when its first page renders and kept by the media cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewerPdf {
     pub file_id: String,
     pub url: String,
     /// Optional local file path (used by tests or already-local PDFs without network fetch).
     pub local_path: Option<PathBuf>,
-    pub page_count: Option<u32>,
+}
+
+/// What a viewer item shows beyond its still rendition (a video's poster, a PDF's thumbnail):
+/// exactly one of a still image, a playable video or a paged document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewerMedia {
+    Image,
+    Video(ViewerVideo),
+    Pdf(ViewerPdf),
 }
 
 /// One image, video, or PDF the viewer can show: the rendition (fixture pixels or a live url the
@@ -103,10 +112,8 @@ pub struct ViewerImage {
     pub taken_at: Option<i64>,
     /// What Download saves into ~/Downloads: the url and the file name.
     pub download: Option<(String, String)>,
-    /// Present when this viewer item is a playable video rather than a static/animated image.
-    pub video: Option<ViewerVideo>,
-    /// Present when this viewer item is a multi-page PDF document rendered natively.
-    pub pdf: Option<ViewerPdf>,
+    /// What it shows: a still image, a video or a PDF.
+    pub media: ViewerMedia,
 }
 
 impl ViewerImage {
@@ -130,7 +137,7 @@ impl ViewerImage {
             user: meta.user.clone(),
             taken_at: meta.taken_at,
             download: meta.download.clone(),
-            video: Some(ViewerVideo {
+            media: ViewerMedia::Video(ViewerVideo {
                 file_id: meta.file_id.clone(),
                 url: meta.url.clone(),
                 ext: meta.ext.clone(),
@@ -138,7 +145,6 @@ impl ViewerImage {
                 inline_transcript: meta.inline_transcript.clone(),
                 vtt_url: meta.vtt_url.clone(),
             }),
-            pdf: None,
         }
     }
 }
@@ -211,7 +217,7 @@ pub fn message_images(fixtures: &Fixtures, message: &Message) -> Vec<ImageEntry>
                     name,
                     user: file.user.clone().or_else(|| author.clone()),
                     taken_at: file.timestamp.or(taken_at),
-                    video: Some(ViewerVideo {
+                    media: ViewerMedia::Video(ViewerVideo {
                         file_id: file.id.to_string(),
                         url: video_url,
                         ext: crate::files::file_ext(file, "mp4"),
@@ -219,7 +225,6 @@ pub fn message_images(fixtures: &Fixtures, message: &Message) -> Vec<ImageEntry>
                         inline_transcript: crate::files::inline_clip_transcript(file),
                         vtt_url: crate::files::clip_vtt_url(file),
                     }),
-                    pdf: None,
                 },
             });
             continue;
@@ -243,12 +248,10 @@ pub fn message_images(fixtures: &Fixtures, message: &Message) -> Vec<ImageEntry>
                     name,
                     user: file.user.clone().or_else(|| author.clone()),
                     taken_at: file.timestamp.or(taken_at),
-                    video: None,
-                    pdf: Some(ViewerPdf {
+                    media: ViewerMedia::Pdf(ViewerPdf {
                         file_id: file.id.to_string(),
                         url: pdf_url,
                         local_path: None,
-                        page_count: None,
                     }),
                 },
             });
@@ -292,8 +295,7 @@ pub fn message_images(fixtures: &Fixtures, message: &Message) -> Vec<ImageEntry>
                 name,
                 user: file.user.clone().or_else(|| author.clone()),
                 taken_at: file.timestamp.or(taken_at),
-                video: None,
-                pdf: None,
+                media: ViewerMedia::Image,
             },
         });
     }
@@ -370,8 +372,7 @@ fn url_image(
         user,
         taken_at,
         download: Some((url.to_owned(), url_tail(url))),
-        video: None,
-        pdf: None,
+        media: ViewerMedia::Image,
     })
 }
 
@@ -478,21 +479,35 @@ const VIEWER_SETTLE_TICKS: u32 = 15;
 const VIEWER_PDF_MAX_W: u32 = 1600;
 const VIEWER_PDF_MAX_H: u32 = 2200;
 
-struct ViewerVideoPlayback {
-    generation: u64,
+/// The shown item's live playback, when it has any.
+enum Playback {
+    Video(VideoPlayback),
+    Pdf(PdfPlayback),
+}
+
+/// A video's native player, its latest frame and the tasks that drive it.
+struct VideoPlayback {
     loading: bool,
     player: Option<NativeVideoPlayer>,
     last_frame: Option<Arc<crate::media::VideoSurface>>,
     error: Option<String>,
+    /// The duration the transport shows until the player reports its own.
     fallback_duration_secs: f64,
+    /// The fetch-and-open task, held so dropping the playback cancels it.
+    _load_task: Option<Task<()>>,
+    /// The frame tick; restarting it (play, seek) cancels the previous one.
+    tick_task: Option<Task<()>>,
 }
 
-struct ViewerPdfPlayback {
+/// A PDF's rendered page and the task rendering the next one.
+struct PdfPlayback {
     loading: bool,
     page_index: u32,
     page_count: Option<u32>,
     rendered_page: Option<Arc<Image>>,
     error: Option<String>,
+    /// The page render, held so dropping the playback cancels it.
+    _load_task: Option<Task<()>>,
 }
 
 /// The viewer overlay: an entity so the root can mount it like the other overlays and
@@ -508,13 +523,12 @@ pub struct ImageViewer {
     zoom_ix: usize,
     slider: Entity<SliderState>,
     _subscription: Subscription,
-    video_gen: u64,
-    video_playback: Option<ViewerVideoPlayback>,
-    video_load_task: Option<Task<()>>,
-    video_tick_task: Option<Task<()>>,
-    pdf_gen: u64,
-    pdf_playback: Option<ViewerPdfPlayback>,
-    pdf_load_task: Option<Task<()>>,
+    /// Counts every playback start and stop, so a load or tick task captured under an older
+    /// generation lands nowhere.
+    media_gen: u64,
+    /// The shown item's live playback: a video's player or a PDF's page, nothing for a still image.
+    playback: Option<Playback>,
+    /// Whether the transcript drawer is open for the shown video (kept across items).
     show_transcript: bool,
     /// The shown video's transcript drawer while it is open.
     transcript: Option<(Entity<ViewerTranscript>, Subscription)>,
@@ -522,8 +536,7 @@ pub struct ImageViewer {
 
 impl Drop for ImageViewer {
     fn drop(&mut self) {
-        self.stop_video();
-        self.stop_pdf();
+        self.stop_playback();
     }
 }
 
@@ -545,15 +558,15 @@ impl ImageViewer {
     /// window & asset caches and immediately stop any active video playback or PDF render tasks.
     pub fn evict_assets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_video();
-        let active_pdf_page = self
-            .pdf_playback
-            .as_ref()
-            .and_then(|pb| pb.rendered_page.clone());
+        let active_pdf_page = self.pdf_playback().and_then(|pb| pb.rendered_page.clone());
         self.stop_pdf();
         let pdf_ids: Vec<String> = self
             .images
             .iter()
-            .filter_map(|entry| entry.pdf.as_ref().map(|p| p.file_id.clone()))
+            .filter_map(|entry| match &entry.media {
+                ViewerMedia::Pdf(pdf) => Some(pdf.file_id.clone()),
+                ViewerMedia::Image | ViewerMedia::Video(_) => None,
+            })
             .collect();
         if !pdf_ids.is_empty() {
             crate::media::evict_viewer_pdf_pages(&pdf_ids, window, cx);
@@ -739,13 +752,8 @@ impl ImageViewer {
                 zoom_ix: FIT_INDEX,
                 slider,
                 _subscription,
-                video_gen: 0,
-                video_playback: None,
-                video_load_task: None,
-                video_tick_task: None,
-                pdf_gen: 0,
-                pdf_playback: None,
-                pdf_load_task: None,
+                media_gen: 0,
+                playback: None,
                 show_transcript: false,
                 transcript: None,
             }
@@ -779,25 +787,38 @@ impl ImageViewer {
 
     /// Whether the currently shown item is a playable video.
     pub fn is_video(&self) -> bool {
-        self.current().video.is_some()
+        matches!(self.current().media, ViewerMedia::Video(_))
     }
 
     /// Whether the currently shown item is a multi-page PDF document.
     pub fn is_pdf(&self) -> bool {
-        self.current().pdf.is_some()
+        matches!(self.current().media, ViewerMedia::Pdf(_))
+    }
+
+    /// The shown video's playback, if a video is shown.
+    fn video_playback(&self) -> Option<&VideoPlayback> {
+        match &self.playback {
+            Some(Playback::Video(pb)) => Some(pb),
+            Some(Playback::Pdf(_)) | None => None,
+        }
+    }
+
+    /// The shown PDF's playback, if a PDF is shown.
+    fn pdf_playback(&self) -> Option<&PdfPlayback> {
+        match &self.playback {
+            Some(Playback::Pdf(pb)) => Some(pb),
+            Some(Playback::Video(_)) | None => None,
+        }
     }
 
     /// Current zero-based page index when viewing a PDF document.
     pub fn pdf_page(&self) -> u32 {
-        self.pdf_playback.as_ref().map_or(0, |p| p.page_index)
+        self.pdf_playback().map_or(0, |p| p.page_index)
     }
 
     /// Known total page count for the currently shown PDF document.
     pub fn pdf_page_count(&self) -> Option<u32> {
-        self.pdf_playback
-            .as_ref()
-            .and_then(|p| p.page_count)
-            .or_else(|| self.current().pdf.as_ref().and_then(|p| p.page_count))
+        self.pdf_playback().and_then(|p| p.page_count)
     }
 
     /// Step previous (`-1`) or next (`+1`) page inside the currently displayed PDF document.
@@ -828,27 +849,24 @@ impl ImageViewer {
 
     /// Stop and drop any active PDF render task and page state immediately.
     pub fn stop_pdf(&mut self) {
-        self.pdf_gen = self.pdf_gen.wrapping_add(1);
-        self.pdf_load_task = None;
-        self.pdf_playback = None;
+        if matches!(self.playback, Some(Playback::Pdf(_))) {
+            self.stop_playback();
+        }
     }
 
+    /// Show `page_index` of the shown PDF: the media cache answers synchronously, else the page
+    /// renders in the background while the previous one stays under the rendering overlay.
     fn load_pdf_page(&mut self, page_index: u32, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pdf) = self.current().pdf.clone() else {
+        let ViewerMedia::Pdf(pdf) = self.current().media.clone() else {
             return;
         };
-        self.pdf_gen = self.pdf_gen.wrapping_add(1);
-        let generation = self.pdf_gen;
-        let prev_count = self
-            .pdf_playback
-            .as_ref()
-            .and_then(|p| p.page_count)
-            .or(pdf.page_count)
-            .or_else(|| crate::media::cached_pdf_page_count(&pdf.file_id, cx));
-        let prev_page = self
-            .pdf_playback
-            .as_ref()
-            .and_then(|p| p.rendered_page.clone());
+        self.media_gen = self.media_gen.wrapping_add(1);
+        let generation = self.media_gen;
+        let (prev_count, prev_page) = self
+            .pdf_playback()
+            .map_or((None, None), |pb| (pb.page_count, pb.rendered_page.clone()));
+        let prev_count =
+            prev_count.or_else(|| crate::media::cached_pdf_page_count(&pdf.file_id, cx));
 
         if let Some(cached) = crate::media::cached_pdf_page(
             &pdf.file_id,
@@ -857,49 +875,41 @@ impl ImageViewer {
             VIEWER_PDF_MAX_H,
             cx,
         ) {
-            self.pdf_load_task = None;
-            self.pdf_playback = Some(ViewerPdfPlayback {
+            self.playback = Some(Playback::Pdf(PdfPlayback {
                 loading: false,
                 page_index,
                 page_count: prev_count.or(Some(page_index + 1)),
                 rendered_page: Some(cached.image),
                 error: None,
-            });
+                _load_task: None,
+            }));
             cx.notify();
             return;
         }
 
+        // A local file renders without a workspace; a url needs the signed-in fetcher.
         let fetcher = if pdf.local_path.is_some() {
             None
         } else {
             let Some(fetcher) = crate::media::active_fetcher(cx) else {
-                self.pdf_load_task = None;
-                self.pdf_playback = Some(ViewerPdfPlayback {
+                self.playback = Some(Playback::Pdf(PdfPlayback {
                     loading: false,
                     page_index,
                     page_count: prev_count,
                     rendered_page: prev_page,
                     error: Some("PDF preview requires a signed-in workspace.".to_owned()),
-                });
+                    _load_task: None,
+                }));
                 cx.notify();
                 return;
             };
             Some(fetcher)
         };
 
-        self.pdf_playback = Some(ViewerPdfPlayback {
-            loading: true,
-            page_index,
-            page_count: prev_count,
-            rendered_page: prev_page,
-            error: None,
-        });
-        cx.notify();
-
         let file_id = pdf.file_id;
         let url = pdf.url;
         let local_path = pdf.local_path;
-        self.pdf_load_task = Some(cx.spawn_in(window, async move |weak, cx| {
+        let load_task = cx.spawn_in(window, async move |weak, cx| {
             let bg = cx.background_executor().clone();
             let res = crate::media::fetch_and_render_pdf_page(
                 fetcher,
@@ -912,32 +922,30 @@ impl ImageViewer {
             )
             .await;
             let _ = weak.update_in(cx, |viewer, window, cx| {
-                if viewer.pdf_gen != generation {
+                if viewer.media_gen != generation {
                     return;
                 }
-                match res {
-                    Ok((page_count, rendered)) => {
-                        let clamped = page_index.min(page_count.saturating_sub(1));
-                        crate::media::store_cached_pdf_page(
-                            file_id,
-                            clamped,
-                            VIEWER_PDF_MAX_W,
-                            VIEWER_PDF_MAX_H,
-                            page_count,
-                            rendered.clone(),
-                            Some(window),
-                            cx,
-                        );
-                        viewer.pdf_playback = Some(ViewerPdfPlayback {
-                            loading: false,
-                            page_index: clamped,
-                            page_count: Some(page_count),
-                            rendered_page: Some(rendered.image),
-                            error: None,
-                        });
-                    }
-                    Err(err) => {
-                        if let Some(pb) = viewer.pdf_playback.as_mut() {
+                if let Some(Playback::Pdf(pb)) = viewer.playback.as_mut() {
+                    match res {
+                        Ok((page_count, rendered)) => {
+                            let clamped = page_index.min(page_count.saturating_sub(1));
+                            crate::media::store_cached_pdf_page(
+                                file_id,
+                                clamped,
+                                VIEWER_PDF_MAX_W,
+                                VIEWER_PDF_MAX_H,
+                                page_count,
+                                rendered.clone(),
+                                Some(window),
+                                cx,
+                            );
+                            pb.loading = false;
+                            pb.page_index = clamped;
+                            pb.page_count = Some(page_count);
+                            pb.rendered_page = Some(rendered.image);
+                            pb.error = None;
+                        }
+                        Err(err) => {
                             pb.loading = false;
                             pb.error = Some(err);
                         }
@@ -945,7 +953,16 @@ impl ImageViewer {
                 }
                 cx.notify();
             });
+        });
+        self.playback = Some(Playback::Pdf(PdfPlayback {
+            loading: true,
+            page_index,
+            page_count: prev_count,
+            rendered_page: prev_page,
+            error: None,
+            _load_task: Some(load_task),
         }));
+        cx.notify();
     }
 
     /// Toggle visibility of the right-side video transcript drawer; lazily fetches WebVTT when
@@ -965,11 +982,11 @@ impl ImageViewer {
     /// Mount the transcript drawer for the shown video while it is open (a fresh one per
     /// video), and drop it otherwise.
     fn sync_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(video) = self
-            .show_transcript
-            .then(|| self.current().video.clone())
-            .flatten()
-        else {
+        let video = match &self.current().media {
+            ViewerMedia::Video(video) if self.show_transcript => Some(video.clone()),
+            ViewerMedia::Video(_) | ViewerMedia::Image | ViewerMedia::Pdf(_) => None,
+        };
+        let Some(video) = video else {
             self.transcript = None;
             return;
         };
@@ -1011,7 +1028,7 @@ impl ImageViewer {
     }
 
     fn ensure_transcript_loaded(&self, window: &mut Window, cx: &mut App) {
-        let Some(video) = self.current().video.as_ref() else {
+        let ViewerMedia::Video(video) = &self.current().media else {
             return;
         };
         let fid = FileId::from(video.file_id.clone());
@@ -1028,25 +1045,32 @@ impl ImageViewer {
 
     /// Stop and drop any active video player and background tasks immediately.
     pub fn stop_video(&mut self) {
-        self.video_gen = self.video_gen.wrapping_add(1);
-        self.video_load_task = None;
-        self.video_tick_task = None;
-        self.video_playback = None;
+        if matches!(self.playback, Some(Playback::Video(_))) {
+            self.stop_playback();
+        }
     }
 
-    /// Sync video or PDF playback to `self.current()`: stops any previous video/PDF, and starts
-    /// loading the current item if it is a video or PDF.
+    /// Drop the playback and its tasks; a load still in flight lands on a newer generation.
+    fn stop_playback(&mut self) {
+        self.media_gen = self.media_gen.wrapping_add(1);
+        self.playback = None;
+    }
+
+    /// Sync playback to the shown item: stop whatever played before, then load page 0 of a PDF
+    /// or open the video.
     fn sync_current_media(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.stop_video();
-        self.stop_pdf();
-        if self.current().pdf.is_some() {
-            self.load_pdf_page(0, window, cx);
-            return;
+        self.stop_playback();
+        match self.current().media.clone() {
+            ViewerMedia::Image => {}
+            ViewerMedia::Pdf(_) => self.load_pdf_page(0, window, cx),
+            ViewerMedia::Video(video) => self.start_video(video, window, cx),
         }
-        let Some(video) = self.current().video.clone() else {
-            return;
-        };
-        let generation = self.video_gen;
+    }
+
+    /// Open `video`: an inline player expanding into the viewer hands over its position and
+    /// rate; the player loads in the background under the loading overlay.
+    fn start_video(&mut self, video: ViewerVideo, window: &mut Window, cx: &mut Context<Self>) {
+        let generation = self.media_gen;
         let carry = crate::media::take_inline_handoff_for_viewer(&video.file_id, window, cx);
         let fallback_duration_secs = video.duration_ms.map_or(0.0, |ms| ms as f64 / 1000.0);
         let hls = crate::media::is_hls_url(&video.url);
@@ -1055,29 +1079,20 @@ impl ImageViewer {
             crate::media::active_fetcher(cx)
         } else {
             let Some(fetcher) = crate::media::active_fetcher(cx) else {
-                self.video_playback = Some(ViewerVideoPlayback {
-                    generation,
+                self.playback = Some(Playback::Video(VideoPlayback {
                     loading: false,
                     player: None,
                     last_frame: None,
                     error: Some("Playback needs a signed-in workspace.".to_owned()),
                     fallback_duration_secs,
-                });
+                    _load_task: None,
+                    tick_task: None,
+                }));
                 cx.notify();
                 return;
             };
             Some(fetcher)
         };
-
-        self.video_playback = Some(ViewerVideoPlayback {
-            generation,
-            loading: true,
-            player: None,
-            last_frame: None,
-            error: None,
-            fallback_duration_secs,
-        });
-        cx.notify();
 
         let file_id = video.file_id;
         let url = video.url;
@@ -1085,7 +1100,7 @@ impl ImageViewer {
         let fetch_url = url.clone();
         let fetch_ext = ext.clone();
         let cache_id = file_id.clone();
-        self.video_load_task = Some(cx.spawn_in(window, async move |weak, cx| {
+        let load_task = cx.spawn_in(window, async move |weak, cx| {
             let bg = cx.background_executor().clone();
             let open_res = if hls {
                 bg.spawn(async move { NativeVideoPlayer::open_url(&fetch_url, None) })
@@ -1110,7 +1125,7 @@ impl ImageViewer {
                 }
             };
             let _ = weak.update_in(cx, |viewer, window, cx| {
-                if viewer.video_gen != generation {
+                if viewer.media_gen != generation {
                     drop(open_res);
                     return;
                 }
@@ -1126,7 +1141,7 @@ impl ImageViewer {
                         }
                         player.play();
                         let initial_frame = crate::media::copy_player_surface(&player);
-                        if let Some(pb) = viewer.video_playback.as_mut() {
+                        if let Some(Playback::Video(pb)) = viewer.playback.as_mut() {
                             pb.loading = false;
                             pb.error = None;
                             pb.last_frame = initial_frame;
@@ -1142,11 +1157,11 @@ impl ImageViewer {
                                 cx,
                             );
                         }
-                        viewer.spawn_video_tick_loop(generation, window, cx);
+                        viewer.spawn_video_tick_loop(window, cx);
                         cx.notify();
                     }
                     Err(err) => {
-                        if let Some(pb) = viewer.video_playback.as_mut() {
+                        if let Some(Playback::Video(pb)) = viewer.playback.as_mut() {
                             pb.loading = false;
                             pb.error = Some(err);
                         }
@@ -1154,16 +1169,24 @@ impl ImageViewer {
                     }
                 }
             });
+        });
+        self.playback = Some(Playback::Video(VideoPlayback {
+            loading: true,
+            player: None,
+            last_frame: None,
+            error: None,
+            fallback_duration_secs,
+            _load_task: Some(load_task),
+            tick_task: None,
         }));
+        cx.notify();
     }
 
-    fn spawn_video_tick_loop(
-        &mut self,
-        generation: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.video_tick_task = Some(cx.spawn_in(window, async move |weak, cx| {
+    /// Tick the player every frame while it plays (and a few ticks after a pause or a seek),
+    /// copying its surface into the stage and its playhead into the transcript drawer.
+    fn spawn_video_tick_loop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let generation = self.media_gen;
+        let tick_task = cx.spawn_in(window, async move |weak, cx| {
             let mut idle_ticks = 0u32;
             loop {
                 cx.background_executor()
@@ -1171,14 +1194,10 @@ impl ImageViewer {
                     .await;
                 let keep_going = weak
                     .update(cx, |viewer, cx| {
-                        if viewer.video_gen != generation {
+                        if viewer.media_gen != generation {
                             return false;
                         }
-                        let Some(pb) = viewer
-                            .video_playback
-                            .as_mut()
-                            .filter(|pb| pb.generation == generation)
-                        else {
+                        let Some(Playback::Video(pb)) = viewer.playback.as_mut() else {
                             return false;
                         };
                         let Some(player) = pb.player.as_ref() else {
@@ -1216,12 +1235,15 @@ impl ImageViewer {
                     break;
                 }
             }
-        }));
+        });
+        if let Some(Playback::Video(pb)) = self.playback.as_mut() {
+            pb.tick_task = Some(tick_task);
+        }
     }
 
     /// Toggle play/pause on the viewer's currently open video.
     pub fn toggle_video_play(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pb) = self.video_playback.as_mut() else {
+        let Some(Playback::Video(pb)) = self.playback.as_mut() else {
             return;
         };
         let Some(player) = pb.player.as_ref() else {
@@ -1231,18 +1253,13 @@ impl ImageViewer {
         if let Some(frame) = crate::media::copy_player_surface(player) {
             pb.last_frame = Some(frame);
         }
-        let gen_id = pb.generation;
-        self.spawn_video_tick_loop(gen_id, window, cx);
+        self.spawn_video_tick_loop(window, cx);
         cx.notify();
     }
 
     /// Toggle mute/unmute on the viewer's currently open video.
     pub fn toggle_video_mute(&mut self, cx: &mut Context<Self>) {
-        let Some(player) = self
-            .video_playback
-            .as_ref()
-            .and_then(|pb| pb.player.as_ref())
-        else {
+        let Some(player) = self.video_playback().and_then(|pb| pb.player.as_ref()) else {
             return;
         };
         let muted = !player.state().muted;
@@ -1252,11 +1269,7 @@ impl ImageViewer {
 
     /// Adjust playback volume by `delta` (`-1.0..=1.0`, e.g. `±0.1`) on the viewer's open video.
     pub fn adjust_video_volume(&mut self, delta: f32, cx: &mut Context<Self>) {
-        let Some(player) = self
-            .video_playback
-            .as_ref()
-            .and_then(|pb| pb.player.as_ref())
-        else {
+        let Some(player) = self.video_playback().and_then(|pb| pb.player.as_ref()) else {
             return;
         };
         player.adjust_volume(delta);
@@ -1265,11 +1278,7 @@ impl ImageViewer {
 
     /// Cycle playback speed (`1x -> 1.5x -> 2x -> 1x`) on the viewer's currently open video.
     pub fn cycle_video_rate(&mut self, cx: &mut Context<Self>) {
-        let Some(player) = self
-            .video_playback
-            .as_ref()
-            .and_then(|pb| pb.player.as_ref())
-        else {
+        let Some(player) = self.video_playback().and_then(|pb| pb.player.as_ref()) else {
             return;
         };
         player.cycle_rate();
@@ -1284,8 +1293,7 @@ impl ImageViewer {
         cx: &mut Context<Self>,
     ) {
         let Some(cur) = self
-            .video_playback
-            .as_ref()
+            .video_playback()
             .and_then(|pb| pb.player.as_ref())
             .map(|p| crate::media::sanitize_secs(p.state().position_secs))
         else {
@@ -1296,7 +1304,7 @@ impl ImageViewer {
 
     /// Seek the viewer's currently open video to `secs`.
     pub fn seek_video(&mut self, secs: f64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pb) = self.video_playback.as_mut() else {
+        let Some(Playback::Video(pb)) = self.playback.as_mut() else {
             return;
         };
         let Some(player) = pb.player.as_ref() else {
@@ -1312,8 +1320,7 @@ impl ImageViewer {
         if let Some(frame) = crate::media::copy_player_surface(player) {
             pb.last_frame = Some(frame);
         }
-        let gen_id = pb.generation;
-        self.spawn_video_tick_loop(gen_id, window, cx);
+        self.spawn_video_tick_loop(window, cx);
         cx.notify();
     }
 
@@ -1506,8 +1513,8 @@ impl Render for ImageViewer {
                     ),
             );
 
-        let is_video = image.video.is_some();
-        let is_pdf = image.pdf.is_some();
+        let is_video = self.is_video();
+        let is_pdf = self.is_pdf();
         let (
             vid_loading,
             vid_playing,
@@ -1520,7 +1527,7 @@ impl Render for ImageViewer {
             vid_surface,
             vid_err,
         ) = if is_video {
-            if let Some(pb) = self.video_playback.as_ref() {
+            if let Some(pb) = self.video_playback() {
                 if let Some(player) = pb.player.as_ref() {
                     let st = player.state();
                     let surface = pb.last_frame.clone();
@@ -1661,7 +1668,7 @@ impl Render for ImageViewer {
                 .into_any_element()
         } else if is_pdf {
             let fg = theme::media_overlay_foreground();
-            let (pdf_loading, pdf_page_img, pdf_err) = match self.pdf_playback.as_ref() {
+            let (pdf_loading, pdf_page_img, pdf_err) = match self.pdf_playback() {
                 Some(pb) => (pb.loading, pb.rendered_page.clone(), pb.error.clone()),
                 None => (false, None, None),
             };
@@ -2781,7 +2788,7 @@ mod tests {
         assert_eq!(entries.len(), 3, "video without playback URL is skipped");
 
         assert_eq!(entries[0].origin, ImageOrigin::File(0));
-        assert!(entries[0].image.video.is_none());
+        assert_eq!(entries[0].image.media, ViewerMedia::Image);
         assert_eq!(entries[0].image.name, "shot.png");
 
         assert_eq!(entries[1].origin, ImageOrigin::File(1));
@@ -2797,8 +2804,8 @@ mod tests {
         );
         assert!(poster_source_if_present(&entries[1].image.source).is_some());
         assert_eq!(
-            entries[1].image.video,
-            Some(ViewerVideo {
+            entries[1].image.media,
+            ViewerMedia::Video(ViewerVideo {
                 file_id: "F_VID1".to_owned(),
                 url: "https://files.slack.com/stream/demo.mp4".to_owned(),
                 ext: "mp4".to_owned(),
@@ -2814,8 +2821,8 @@ mod tests {
             "video with only .mp4 thumb_video uses empty placeholder"
         );
         assert_eq!(
-            entries[2].image.video,
-            Some(ViewerVideo {
+            entries[2].image.media,
+            ViewerMedia::Video(ViewerVideo {
                 file_id: "F_VID2".to_owned(),
                 url: "https://files.slack.com/pri/clip.mov".to_owned(),
                 ext: "mov".to_owned(),
@@ -2835,7 +2842,10 @@ mod tests {
         .expect("clicked video must be found");
         assert_eq!(all.len(), 3);
         assert_eq!(ix, 1);
-        assert_eq!(all[ix].video.as_ref().unwrap().file_id, "F_VID1");
+        let ViewerMedia::Video(video) = &all[ix].media else {
+            panic!("the clicked item must be a video");
+        };
+        assert_eq!(video.file_id, "F_VID1");
     }
 
     #[gpui::test]
@@ -2851,8 +2861,7 @@ mod tests {
                 user: None,
                 taken_at: None,
                 download: None,
-                video: None,
-                pdf: None,
+                media: ViewerMedia::Image,
             },
             ViewerImage {
                 source: empty_placeholder_source(),
@@ -2863,7 +2872,7 @@ mod tests {
                     "https://files.slack.com/dl/demo.mp4".into(),
                     "demo.mp4".into(),
                 )),
-                video: Some(ViewerVideo {
+                media: ViewerMedia::Video(ViewerVideo {
                     file_id: "F_DEMO".into(),
                     url: "https://files.slack.com/pri/demo.mp4".into(),
                     ext: "mp4".into(),
@@ -2871,7 +2880,6 @@ mod tests {
                     inline_transcript: Some("Welcome to the walkthrough clip.".into()),
                     vtt_url: None,
                 }),
-                pdf: None,
             },
         ]);
         let (viewer, cx) = cx.add_window_view(|window, cx| {
@@ -2902,7 +2910,7 @@ mod tests {
             assert!(!iv.read(cx).is_video());
             iv.update(cx, |v, cx| v.step(1, window, cx));
             assert!(iv.read(cx).is_video());
-            assert!(iv.read(cx).video_playback.is_some());
+            assert!(iv.read(cx).video_playback().is_some());
             assert!(!iv.read(cx).showing_transcript());
             iv.update(cx, |v, cx| v.toggle_transcript(window, cx));
             assert!(iv.read(cx).showing_transcript());
@@ -2911,14 +2919,14 @@ mod tests {
             iv.update(cx, |v, cx| v.step(-1, window, cx));
             assert!(!iv.read(cx).is_video());
             assert!(!iv.read(cx).showing_transcript());
-            assert!(iv.read(cx).video_playback.is_none());
+            assert!(iv.read(cx).video_playback().is_none());
             // Stepping onto video then closing via `evict_assets` stops playback immediately.
             iv.update(cx, |v, cx| v.step(1, window, cx));
-            assert!(iv.read(cx).video_playback.is_some());
+            assert!(iv.read(cx).video_playback().is_some());
             iv.update(cx, |v, cx| v.toggle_transcript(window, cx));
             assert!(!iv.read(cx).showing_transcript());
             iv.update(cx, |v, cx| v.evict_assets(window, cx));
-            assert!(iv.read(cx).video_playback.is_none());
+            assert!(iv.read(cx).video_playback().is_none());
         });
         cx.run_until_parked();
     }
@@ -2946,14 +2954,12 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].origin, ImageOrigin::File(0));
         assert_eq!(entries[0].image.name, "architecture.pdf");
-        assert!(entries[0].image.video.is_none());
         assert_eq!(
-            entries[0].image.pdf,
-            Some(ViewerPdf {
+            entries[0].image.media,
+            ViewerMedia::Pdf(ViewerPdf {
                 file_id: "F_PDF1".into(),
                 url: "https://files.slack.com/dl/architecture.pdf".into(),
                 local_path: None,
-                page_count: None,
             })
         );
     }
@@ -2987,7 +2993,7 @@ mod tests {
             user: None,
             taken_at: None,
             download: None,
-            video: Some(ViewerVideo {
+            media: ViewerMedia::Video(ViewerVideo {
                 file_id: "F_TIMED".into(),
                 url: "https://files.slack.com/pri/walkthrough.mp4".into(),
                 ext: "mp4".into(),
@@ -2995,7 +3001,6 @@ mod tests {
                 inline_transcript: None,
                 vtt_url: None,
             }),
-            pdf: None,
         }]);
         let (host, cx) = cx.add_window_view(|window, cx| {
             let entity = ImageViewer::new(fixtures, "#eng".into(), items, 0, window, cx);
@@ -3113,12 +3118,10 @@ mod tests {
             user: None,
             taken_at: None,
             download: None,
-            video: None,
-            pdf: Some(ViewerPdf {
+            media: ViewerMedia::Pdf(ViewerPdf {
                 file_id: "F_LOCAL_PDF".into(),
                 url: String::new(),
                 local_path: Some(path.clone()),
-                page_count: None,
             }),
         }]);
         let (host, cx) = cx.add_window_view(|window, cx| {
@@ -3157,7 +3160,7 @@ mod tests {
             assert!(iv.update(cx, |v, cx| v.step_pdf_page(-1, window, cx)));
             assert_eq!(iv.read(cx).pdf_page(), 0);
             iv.update(cx, |v, cx| v.evict_assets(window, cx));
-            assert!(iv.read(cx).pdf_playback.is_none());
+            assert!(iv.read(cx).pdf_playback().is_none());
             assert!(
                 crate::media::cached_pdf_page(
                     "F_LOCAL_PDF",
@@ -3188,8 +3191,7 @@ mod tests {
                 user: None,
                 taken_at: None,
                 download: None,
-                video: None,
-                pdf: None,
+                media: ViewerMedia::Image,
             },
             ViewerImage {
                 source: empty_placeholder_source(),
@@ -3197,7 +3199,7 @@ mod tests {
                 user: None,
                 taken_at: None,
                 download: None,
-                video: Some(ViewerVideo {
+                media: ViewerMedia::Video(ViewerVideo {
                     file_id: "F_VID_KEYS".into(),
                     url: String::new(),
                     ext: "mp4".into(),
@@ -3205,7 +3207,6 @@ mod tests {
                     vtt_url: None,
                     inline_transcript: Some("hello world".into()),
                 }),
-                pdf: None,
             },
             ViewerImage {
                 source: empty_placeholder_source(),
@@ -3213,12 +3214,10 @@ mod tests {
                 user: None,
                 taken_at: None,
                 download: None,
-                video: None,
-                pdf: Some(ViewerPdf {
+                media: ViewerMedia::Pdf(ViewerPdf {
                     file_id: "F_PDF_KEYS".into(),
                     url: String::new(),
                     local_path: None,
-                    page_count: Some(2),
                 }),
             },
         ]);
