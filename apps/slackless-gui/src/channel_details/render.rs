@@ -1011,9 +1011,8 @@ impl ChannelDetails {
             // The topic is mrkdwn, as in the conversation header.
             div()
                 .text_sm()
-                .child(crate::messages::mrkdwn_preview(
-                    &value,
-                    &self.fixtures,
+                .child(crate::messages::render_preview(
+                    &crate::messages::memoized_preview(&value, &self.fixtures, cx),
                     muted_foreground,
                     "details-topic".into(),
                     cx,

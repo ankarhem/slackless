@@ -37,7 +37,7 @@ use slackless_core::types::{ChannelId, Message, Ts, UserId};
 use crate::avatars::author_avatar;
 use crate::emoji;
 use crate::fixtures::Fixtures;
-use crate::messages::{day_label, list_stamp, mrkdwn_preview};
+use crate::messages::{day_label, list_stamp, memoized_preview, render_preview};
 use crate::sidebar::mentions_user;
 
 /// Rows kept beyond Slack's page are dropped (bounded memory; a page holds ~50 and the
@@ -404,8 +404,7 @@ impl ActivityFeed {
             .message
             .as_ref()
             .filter(|message| !message.text.is_empty())
-            .map(|message| message.text.clone())
-            .unwrap_or_else(|| item.text.clone());
+            .map_or(item.text.as_str(), |message| message.text.as_str());
         let group = SharedString::from(format!("activity-group-{ix}"));
         let ring = cx.theme().ring;
         h_flex()
@@ -465,9 +464,8 @@ impl ActivityFeed {
                             // Inline link chips split the paragraph, so cap the height as well.
                             .max_h(px(40.))
                             .overflow_hidden()
-                            .child(mrkdwn_preview(
-                                &body,
-                                &self.fixtures,
+                            .child(render_preview(
+                                &memoized_preview(body, &self.fixtures, cx),
                                 fg,
                                 format!("activity-{ix}"),
                                 cx,

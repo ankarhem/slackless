@@ -1,8 +1,11 @@
 //! Inline text themes and the elements built from a paragraph's segments
 //! ([`super::model`]); shortcode and color helpers.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex};
 use gpui_kit::gpui::{
@@ -403,23 +406,55 @@ pub(crate) fn plain_text(text: &str, names: &dyn Directory) -> String {
     replace_shortcodes_with(&mrkdwn_to_plain_with(text, names), &emoji::display_glyph)
 }
 
-/// A one-paragraph mrkdwn preview (the DM list, the Activity feed, headers): formatting, links
-/// and emoji as the transcript renders them, plain runs in `color`, line breaks flattened.
-/// Preview text is not selectable; links open as URLs.
-pub(crate) fn mrkdwn_preview(
-    text: &str,
-    fixtures: &Fixtures,
-    color: Hsla,
-    key: String,
-    cx: &App,
-) -> Div {
-    let emoji_text = crate::preferences::display_prefs(cx).emoji_text_mode;
-    render_preview(&preview_model(text, fixtures, emoji_text), color, key, cx)
+/// A [`mrkdwn_preview`]'s model: one paragraph with its line breaks flattened. A list that
+/// keeps it (the DM previews, the Activity feed, the header topic) renders it each frame
+/// without parsing again.
+pub(crate) struct Preview(Vec<Segment>);
+
+thread_local! {
+    /// The previews built this session, by text, against the workspace data and emoji
+    /// preference the memo holds; a full memo starts over.
+    static PREVIEWS: RefCell<Option<PreviewMemo>> = const { RefCell::new(None) };
 }
 
-/// A [`mrkdwn_preview`]'s model: one paragraph with its line breaks flattened. A list that
-/// keeps it ([`crate::sidebar`]'s DM previews) renders it each frame without parsing again.
-pub(crate) struct Preview(Vec<Segment>);
+struct PreviewMemo {
+    fixtures: Arc<Fixtures>,
+    emoji_text: bool,
+    previews: HashMap<String, Rc<Preview>>,
+}
+
+const PREVIEW_MEMO_CAP: usize = 1024;
+
+/// [`preview_model`] of `text`, built once per text while the workspace data and the emoji
+/// preference hold; for text a view re-renders every frame.
+pub(crate) fn memoized_preview(text: &str, fixtures: &Arc<Fixtures>, cx: &App) -> Rc<Preview> {
+    let emoji_text = crate::preferences::display_prefs(cx).emoji_text_mode;
+    PREVIEWS.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        let stale = memo.as_ref().is_none_or(|known| {
+            !known.fixtures.shares_data(fixtures) || known.emoji_text != emoji_text
+        });
+        if stale {
+            *memo = Some(PreviewMemo {
+                fixtures: fixtures.clone(),
+                emoji_text,
+                previews: HashMap::new(),
+            });
+        }
+        let Some(known) = memo.as_mut() else {
+            unreachable!("set above");
+        };
+        if let Some(preview) = known.previews.get(text) {
+            return preview.clone();
+        }
+        let preview = Rc::new(preview_model(text, fixtures, emoji_text));
+        if known.previews.len() >= PREVIEW_MEMO_CAP {
+            known.previews.clear();
+        }
+        known.previews.insert(text.to_owned(), preview.clone());
+        preview
+    })
+}
 
 pub(crate) fn preview_model(text: &str, fixtures: &Fixtures, emoji_text: bool) -> Preview {
     Preview(line_segments(

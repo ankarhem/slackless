@@ -34,9 +34,7 @@ pub(crate) use cards::format_huddle_duration;
 #[cfg(test)]
 pub(super) use inline::jumbomoji_elements;
 pub(super) use inline::{DEFAULT_FLAGS, RunFlags, RunTheme, paragraph_id, text_hash};
-pub(crate) use inline::{
-    Preview, hex_color, mrkdwn_preview, plain_text, preview_model, render_preview,
-};
+pub(crate) use inline::{Preview, hex_color, memoized_preview, plain_text, render_preview};
 #[cfg(test)]
 pub(super) use model::{
     RunStyle, Segment, TextOpts, Tone, line_segments, mrkdwn_fences, strip_quote_prefix,

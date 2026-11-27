@@ -366,9 +366,8 @@ impl App {
                         .truncate()
                         .text_sm()
                         .text_color(muted_foreground)
-                        .child(crate::messages::mrkdwn_preview(
-                            topic,
-                            &self.fixtures,
+                        .child(crate::messages::render_preview(
+                            &crate::messages::memoized_preview(topic, &self.fixtures, cx),
                             muted_foreground,
                             format!("topic-{title}"),
                             cx,

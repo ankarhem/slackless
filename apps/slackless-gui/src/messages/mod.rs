@@ -63,8 +63,8 @@ use render::{
 };
 pub(crate) use render::{
     Preview, clock, day_and_time, day_label, file_day, hex_color, iso_date, list_stamp,
-    local_offset_now, mrkdwn, mrkdwn_preview, mrkdwn_with_verbatim, now_secs, plain_text,
-    preview_model, render_block, render_preview, selectable_code, selectable_text, short_date,
+    local_offset_now, memoized_preview, mrkdwn, mrkdwn_with_verbatim, now_secs, plain_text,
+    render_block, render_preview, selectable_code, selectable_text, short_date,
 };
 use rows::transcript_row;
 #[cfg(test)]
