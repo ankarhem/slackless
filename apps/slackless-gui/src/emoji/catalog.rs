@@ -12,6 +12,16 @@ pub(super) struct Emoji {
     pub(super) emoji: &'static emojis::Emoji,
 }
 
+impl Emoji {
+    /// Whether search `query` (lowercase, `_` between words) is part of one of the emoji's names:
+    /// its Slack shortcode, a GitHub shortcode, or its CLDR name (`party` for `tada`).
+    pub(super) fn matches(&self, query: &str) -> bool {
+        self.name.contains(query)
+            || self.emoji.shortcodes().any(|code| code.contains(query))
+            || normalize_cldr_name(self.emoji.name(), false).contains(query)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Category {
     Frequent,

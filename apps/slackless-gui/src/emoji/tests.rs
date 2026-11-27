@@ -261,6 +261,18 @@ fn search_ranking_query_normalization_and_frequent_tracking() {
 
     assert!(search_emoji_choices("zzz_no_match_zzz", 1, custom.iter().copied()).is_empty());
 
+    // The crate's other names for an emoji find it too, after every shortcode match: its CLDR
+    // name (`party popper`) or a GitHub shortcode (`facepalm`).
+    let names = |query: &str| -> Vec<String> {
+        search_emoji_choices(query, 1, std::iter::empty())
+            .into_iter()
+            .map(|choice| choice.name)
+            .collect()
+    };
+    assert_eq!(names("party"), ["tada"]);
+    assert_eq!(names("facepalm"), ["face_palm"]);
+    assert_eq!(names("face")[0], "slightly_smiling_face");
+
     // `record_frequent` deduplicates toned names by base, moves to front, and caps at FREQUENT_MAX.
     let mut freq: Vec<String> = (0..FREQUENT_MAX).map(|i| format!("e{i}")).collect();
     record_frequent(&mut freq, "e5::skin-tone-3");

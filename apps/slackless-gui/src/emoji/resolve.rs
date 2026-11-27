@@ -192,17 +192,23 @@ pub(super) fn toned_choice(name: &str, emoji: &'static emojis::Emoji, tone: u8) 
     }
 }
 
-/// Search catalog emoji, then custom emoji names, whose shortcode contains `query`.
+/// Search catalog emoji whose shortcode contains `query`, then those another of whose names does
+/// (a GitHub shortcode or the CLDR name: `party` finds `tada`), then custom emoji names.
 pub(super) fn search_emoji_choices<'a>(
     query: &str,
     tone: u8,
     custom_names: impl Iterator<Item = &'a str>,
 ) -> Vec<EmojiChoice> {
-    CATALOG
+    let mut found: Vec<_> = CATALOG
         .iter()
         .flat_map(|(_, _, list)| list.iter())
         .filter_map(|name| lookup(name))
-        .filter(|emoji| emoji.name.contains(query))
+        .filter(|emoji| emoji.matches(query))
+        .collect();
+    // Shortcode matches first: the stable sort keeps both groups in catalog order.
+    found.sort_by_key(|emoji| !emoji.name.contains(query));
+    found
+        .into_iter()
         .map(|emoji| toned_choice(emoji.name, emoji.emoji, tone))
         .chain(
             custom_names
