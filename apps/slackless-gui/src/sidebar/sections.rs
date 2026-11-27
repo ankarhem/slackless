@@ -1,11 +1,9 @@
 //! Custom channel sections, starring, notification levels, section filters/sorts, and dialogs.
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::PopupMenu;
-use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
 use gpui_kit::gpui::{
-    Context, DismissEvent, Div, Focusable as _, ParentElement as _, SharedString, Styled as _,
-    Window, div, px,
+    Context, DismissEvent, Div, Focusable as _, ParentElement as _, SharedString, Window, px,
 };
 use slackless_core::NotifyLevel;
 use slackless_core::types::{
@@ -635,49 +633,19 @@ impl Sidebar {
         let this = cx.entity().downgrade();
         let id = section.id.clone();
         let name = section.name.clone();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let muted = cx.theme().muted_foreground;
-            let (this, section_id) = (this.clone(), id.clone());
-            dialog
-                .title(format!("Delete {name}?"))
-                .w(px(440.))
-                .child(
-                    v_flex()
-                        .gap_4()
-                        .child(div().text_color(muted).child(format!(
-                            "Any channels in {name} will move back to their default sections."
-                        )))
-                        .child(
-                            h_flex().gap_2().justify_end().child(
-                                crate::preferences::form_button(
-                                    Button::new("section-delete-cancel")
-                                        .outline()
-                                        .label("Cancel"),
-                                    cx,
-                                )
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                            ),
-                        ),
-                )
-                // The confirm rides as the dialog's footer action so it reads as one.
-                .child(
-                    h_flex().justify_end().child(
-                        crate::preferences::form_button(
-                            Button::new("section-delete-confirm")
-                                .danger()
-                                .label("Delete section"),
-                            cx,
-                        )
-                        .on_click(move |_, window, cx| {
-                            window.close_dialog(cx);
-                            let _ = this.update(cx, |_, cx| {
-                                cx.emit(SidebarEvent::DeleteSection {
-                                    section: section_id.clone(),
-                                })
-                            });
-                        }),
-                    ),
-                )
+        crate::ui::ConfirmDialog::new(
+            format!("Delete {name}?"),
+            format!("Any channels in {name} will move back to their default sections."),
+            "Delete section",
+        )
+        .danger()
+        .width(px(440.))
+        .open(window, cx, move |_, cx| {
+            let _ = this.update(cx, |_, cx| {
+                cx.emit(SidebarEvent::DeleteSection {
+                    section: id.clone(),
+                })
+            });
         });
     }
 }

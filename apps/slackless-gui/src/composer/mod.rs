@@ -330,83 +330,41 @@ pub(crate) fn confirm_secret_send_dialog(
     cx: &mut App,
     on_send: impl Fn(&mut Window, &mut App) + 'static,
 ) {
-    use gpui_kit::component::WindowExt as _;
-    use gpui_kit::component::button::{Button, ButtonVariants as _};
-    use gpui_kit::gpui::FontWeight;
+    use gpui_kit::gpui::{FontWeight, IntoElement as _};
 
-    let on_send = Rc::new(on_send);
-    window.open_dialog(cx, move |dialog, _, cx| {
+    let matches = Rc::new(matches);
+    crate::ui::ConfirmDialog::new(
+        "Possible secret detected",
+        "This message appears to contain sensitive credentials. Sending it to Slack cannot be undone.",
+        "Send anyway",
+    )
+    .danger()
+    .width(px(460.))
+    .extra(move |cx| {
         let theme = cx.theme();
-        let (muted, danger, border, bg) = (
-            theme.muted_foreground,
-            theme.danger,
-            theme.border,
-            theme.secondary.opacity(0.45),
-        );
-        let on_send = on_send.clone();
-        dialog
-            .title("Possible secret detected")
-            .w(px(460.))
-            .child(
-                v_flex()
-                    .gap_3()
+        v_flex()
+            .gap_1p5()
+            .p_2p5()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.secondary.opacity(0.45))
+            .children(matches.iter().map(|m| {
+                h_flex()
+                    .justify_between()
+                    .gap_2()
+                    .text_xs()
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(muted)
-                            .child("This message appears to contain sensitive credentials. Sending it to Slack cannot be undone."),
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.danger)
+                            .child(m.kind),
                     )
-                    .child(
-                        v_flex()
-                            .gap_1p5()
-                            .p_2p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(border)
-                            .bg(bg)
-                            .children(matches.iter().map(|m| {
-                                h_flex()
-                                    .justify_between()
-                                    .gap_2()
-                                    .text_xs()
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(danger)
-                                            .child(m.kind),
-                                    )
-                                    .child(div().text_color(muted).child(m.preview.clone()))
-                            })),
-                    )
-                    .child(
-                        h_flex()
-                            .justify_end()
-                            .gap_2()
-                            .pt_1()
-                            .child(
-                                crate::preferences::form_button(
-                                    Button::new("popout-secret-cancel")
-                                        .outline()
-                                        .label("Cancel"),
-                                    cx,
-                                )
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                            )
-                            .child(
-                                crate::preferences::form_button(
-                                    Button::new("popout-secret-send")
-                                        .danger()
-                                        .label("Send anyway"),
-                                    cx,
-                                )
-                                .on_click(move |_, window, cx| {
-                                    window.close_dialog(cx);
-                                    on_send(window, cx);
-                                }),
-                            ),
-                    ),
-            )
-    });
+                    .child(div().text_color(theme.muted_foreground).child(m.preview.clone()))
+            }))
+            .into_any_element()
+    })
+    .open(window, cx, on_send);
 }
 
 /// Builds the strip Slack draws inside the composer's frame above the formatting bar, its

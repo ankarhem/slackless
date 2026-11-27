@@ -893,46 +893,13 @@ impl App {
             return self.mark_all_read(cx);
         }
         let this = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let muted = cx.theme().muted_foreground;
-            let this = this.clone();
-            dialog
-                .title("Mark all messages as read?")
-                .w(px(440.))
-                .child(
-                    v_flex()
-                        .gap_4()
-                        .child(div().text_color(muted).child(
-                            "Every channel, direct message and thread will be marked as read.",
-                        ))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .justify_end()
-                                .child(
-                                    preferences::form_button(
-                                        Button::new("mark-all-cancel").outline().label("Cancel"),
-                                        cx,
-                                    )
-                                    .on_click(|_, window, cx| window.close_dialog(cx)),
-                                )
-                                .child(
-                                    preferences::form_button(
-                                        Button::new("mark-all-confirm")
-                                            .primary()
-                                            .label("Mark all as read"),
-                                        cx,
-                                    )
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            window.close_dialog(cx);
-                                            let _ =
-                                                this.update(cx, |app, cx| app.mark_all_read(cx));
-                                        },
-                                    ),
-                                ),
-                        ),
-                )
+        crate::ui::ConfirmDialog::new(
+            "Mark all messages as read?",
+            "Every channel, direct message and thread will be marked as read.",
+            "Mark all as read",
+        )
+        .open(window, cx, move |_, cx| {
+            let _ = this.update(cx, |app, cx| app.mark_all_read(cx));
         });
     }
 

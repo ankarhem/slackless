@@ -549,50 +549,18 @@ impl App {
                 let this = cx.weak_entity();
                 let ch = channel.clone();
                 let label = self.label(&ch);
-                window.open_dialog(cx, move |dialog, _, cx| {
-                    let muted = cx.theme().muted_foreground;
-                    let (this, ch) = (this.clone(), ch.clone());
-                    dialog.title(format!("Archive {label}?")).w(px(420.)).child(
-                        v_flex()
-                            .gap_3()
-                            .p_4()
-                            .child(div().text_sm().text_color(muted).child(
-                                "Archiving stops new messages from being posted. Message history remains searchable and the channel can be unarchived later.",
-                            ))
-                            .child(
-                                h_flex()
-                                    .justify_end()
-                                    .gap_2()
-                                    .child(
-                                        preferences::form_button(
-                                            Button::new("archive-cancel").outline().label("Cancel"),
-                                            cx,
-                                        )
-                                        .on_click(|_, window, cx| window.close_dialog(cx)),
-                                    )
-                                    .child(
-                                        preferences::form_button(
-                                            Button::new("archive-confirm")
-                                                .danger()
-                                                .label("Archive channel"),
-                                            cx,
-                                        )
-                                        .on_click(move |_, window, cx| {
-                                                window.close_dialog(cx);
-                                                let _ = this.update(cx, |app, cx| {
-                                                    app.bridge
-                                                        .send(ChannelCommand::ArchiveChannel(ch.clone()));
-                                                    actions::notify(
-                                                        "Channel archived",
-                                                        app.label(&ch),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                });
-                                            }),
-                                    ),
-                            ),
-                    )
+                crate::ui::ConfirmDialog::new(
+                    format!("Archive {label}?"),
+                    "Archiving stops new messages from being posted. Message history remains searchable and the channel can be unarchived later.",
+                    "Archive channel",
+                )
+                .danger()
+                .open(window, cx, move |window, cx| {
+                    let _ = this.update(cx, |app, cx| {
+                        app.bridge
+                            .send(ChannelCommand::ArchiveChannel(ch.clone()));
+                        actions::notify("Channel archived", app.label(&ch), window, cx);
+                    });
                 });
             }
             ChannelDetailsEvent::Unarchive(channel) => {
@@ -636,58 +604,19 @@ impl App {
                 let this = cx.weak_entity();
                 let ch = channel.clone();
                 let label = self.label(&ch);
-                window.open_dialog(cx, move |dialog, _, cx| {
-                    let muted = cx.theme().muted_foreground;
-                    let (this, ch) = (this.clone(), ch.clone());
-                    dialog
-                        .title(format!("Delete {label}?"))
-                        .w(px(420.))
-                        .child(
-                            v_flex()
-                                .gap_3()
-                                .p_4()
-                                .child(div().text_sm().text_color(muted).child(
-                                    "Deleting permanently removes this channel and its message history for everyone in the workspace. Requires workspace admin permissions.",
-                                ))
-                                .child(
-                                    h_flex()
-                                        .justify_end()
-                                        .gap_2()
-                                        .child(
-                                            preferences::form_button(
-                                                Button::new("delete-ch-cancel")
-                                                    .outline()
-                                                    .label("Cancel"),
-                                                cx,
-                                            )
-                                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                                        )
-                                        .child(
-                                            preferences::form_button(
-                                                Button::new("delete-ch-confirm")
-                                                    .danger()
-                                                    .label("Delete permanently"),
-                                                cx,
-                                            )
-                                            .on_click(move |_, window, cx| {
-                                                    window.close_dialog(cx);
-                                                    let _ = this.update(cx, |app, cx| {
-                                                        if !app.fixtures.sample {
-                                                            app.bridge.send(
-                                                                ChannelCommand::DeleteChannel(ch.clone()),
-                                                            );
-                                                        }
-                                                        actions::notify(
-                                                            "Delete requested",
-                                                            app.label(&ch),
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    });
-                                                }),
-                                        ),
-                                ),
-                        )
+                crate::ui::ConfirmDialog::new(
+                    format!("Delete {label}?"),
+                    "Deleting permanently removes this channel and its message history for everyone in the workspace. Requires workspace admin permissions.",
+                    "Delete permanently",
+                )
+                .danger()
+                .open(window, cx, move |window, cx| {
+                    let _ = this.update(cx, |app, cx| {
+                        if !app.fixtures.sample {
+                            app.bridge.send(ChannelCommand::DeleteChannel(ch.clone()));
+                        }
+                        actions::notify("Delete requested", app.label(&ch), window, cx);
+                    });
                 });
             }
             ChannelDetailsEvent::ConvertToPrivate(channel) => {
@@ -695,60 +624,19 @@ impl App {
                 let this = cx.weak_entity();
                 let ch = channel.clone();
                 let label = self.label(&ch);
-                window.open_dialog(cx, move |dialog, _, cx| {
-                    let muted = cx.theme().muted_foreground;
-                    let (this, ch) = (this.clone(), ch.clone());
-                    dialog
-                        .title(format!("Convert {label} to private?"))
-                        .w(px(420.))
-                        .child(
-                            v_flex()
-                                .gap_3()
-                                .p_4()
-                                .child(div().text_sm().text_color(muted).child(
-                                    "Members stay in the conversation, and only invited people will be able to find or view it going forward.",
-                                ))
-                                .child(
-                                    h_flex()
-                                        .justify_end()
-                                        .gap_2()
-                                        .child(
-                                            preferences::form_button(
-                                                Button::new("convert-priv-cancel")
-                                                    .outline()
-                                                    .label("Cancel"),
-                                                cx,
-                                            )
-                                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                                        )
-                                        .child(
-                                            preferences::form_button(
-                                                Button::new("convert-priv-confirm")
-                                                    .primary()
-                                                    .label("Convert to private"),
-                                                cx,
-                                            )
-                                            .on_click(move |_, window, cx| {
-                                                    window.close_dialog(cx);
-                                                    let _ = this.update(cx, |app, cx| {
-                                                        if !app.fixtures.sample {
-                                                            app.bridge.send(
-                                                                ChannelCommand::ConvertChannelToPrivate(
-                                                                    ch.clone(),
-                                                                ),
-                                                            );
-                                                        }
-                                                        actions::notify(
-                                                            "Converted to private",
-                                                            app.label(&ch),
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    });
-                                                }),
-                                        ),
-                                ),
-                        )
+                crate::ui::ConfirmDialog::new(
+                    format!("Convert {label} to private?"),
+                    "Members stay in the conversation, and only invited people will be able to find or view it going forward.",
+                    "Convert to private",
+                )
+                .open(window, cx, move |window, cx| {
+                    let _ = this.update(cx, |app, cx| {
+                        if !app.fixtures.sample {
+                            app.bridge
+                                .send(ChannelCommand::ConvertChannelToPrivate(ch.clone()));
+                        }
+                        actions::notify("Converted to private", app.label(&ch), window, cx);
+                    });
                 });
             }
             ChannelDetailsEvent::AddPeople(channel) => {

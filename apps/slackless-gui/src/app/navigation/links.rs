@@ -92,45 +92,21 @@ impl App {
         } else {
             "This link uses an unencrypted or unusual address. Verify the destination before opening it:"
         };
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let muted = cx.theme().muted_foreground;
-            let open_target = target.clone();
-            dialog.title("Open external link?").w(px(460.)).child(
-                v_flex()
-                    .gap_3()
-                    .child(div().text_sm().text_color(muted).child(prompt_msg))
-                    .child(
-                        div()
-                            .p_2()
-                            .rounded_md()
-                            .bg(cx.theme().secondary)
-                            .text_xs()
-                            .child(target.clone()),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .justify_end()
-                            .child(
-                                preferences::form_button(
-                                    Button::new("ext-url-cancel").outline().label("Cancel"),
-                                    cx,
-                                )
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                            )
-                            .child(
-                                preferences::form_button(
-                                    Button::new("ext-url-open").primary().label("Open link"),
-                                    cx,
-                                )
-                                .on_click(move |_, window, cx| {
-                                    window.close_dialog(cx);
-                                    launch_external_url(&open_target, browser_choice, cx);
-                                }),
-                            ),
-                    ),
-            )
-        });
+        let shown = target.clone();
+        crate::ui::ConfirmDialog::new("Open external link?", prompt_msg, "Open link")
+            .width(px(460.))
+            .extra(move |cx| {
+                div()
+                    .p_2()
+                    .rounded_md()
+                    .bg(cx.theme().secondary)
+                    .text_xs()
+                    .child(shown.clone())
+                    .into_any_element()
+            })
+            .open(window, cx, move |_, cx| {
+                launch_external_url(&target, browser_choice, cx);
+            });
     }
 
     /// Route a `slack://`, `https://app.slack.com/client/...`, or `https://*.slack.com/archives/...`

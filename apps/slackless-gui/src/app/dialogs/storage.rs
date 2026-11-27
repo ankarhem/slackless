@@ -217,43 +217,18 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         let this = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let muted = cx.theme().muted_foreground;
-            let this = this.clone();
-            let file_id = file_id.clone();
-            dialog.title("Delete file?").w(px(420.)).child(
-                v_flex()
-                    .gap_4()
-                    .child(div().text_color(muted).child(format!(
-                        "Permanently delete \"{name}\"? This cannot be undone."
-                    )))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .justify_end()
-                            .child(
-                                preferences::form_button(
-                                    Button::new("delete-file-cancel").outline().label("Cancel"),
-                                    cx,
-                                )
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                            )
-                            .child(
-                                preferences::form_button(
-                                    Button::new("delete-file-confirm").danger().label("Delete"),
-                                    cx,
-                                )
-                                .on_click(move |_, window, cx| {
-                                    window.close_dialog(cx);
-                                    let _ = this.update(cx, |app, _| {
-                                        app.bridge.send(CollabCommand::DeleteFile {
-                                            file_id: file_id.clone(),
-                                        });
-                                    });
-                                }),
-                            ),
-                    ),
-            )
+        crate::ui::ConfirmDialog::new(
+            "Delete file?",
+            format!("Permanently delete \"{name}\"? This cannot be undone."),
+            "Delete",
+        )
+        .danger()
+        .open(window, cx, move |_, cx| {
+            let _ = this.update(cx, |app, _| {
+                app.bridge.send(CollabCommand::DeleteFile {
+                    file_id: file_id.clone(),
+                });
+            });
         });
     }
 
@@ -265,47 +240,16 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         let this = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let muted = cx.theme().muted_foreground;
-            let this_clear = this.clone();
-            dialog
-                .title("Clear local cache?")
-                .w(px(420.))
-                .child(
-                    v_flex()
-                        .gap_4()
-                        .child(div().text_color(muted).child(
-                            "Removes the downloaded media, audio and avatar/emoji caches from disk; anything still needed is downloaded again. Your message history, search index and signed-in sessions stay intact.",
-                        ))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .justify_end()
-                                .child(
-                                    preferences::form_button(
-                                        Button::new("reset-cache-cancel")
-                                            .outline()
-                                            .label("Cancel"),
-                                        cx,
-                                    )
-                                    .on_click(|_, window, cx| window.close_dialog(cx)),
-                                )
-                                .child(
-                                    preferences::form_button(
-                                        Button::new("reset-cache-confirm")
-                                            .danger()
-                                            .label("Clear cache"),
-                                        cx,
-                                    )
-                                    .on_click(move |_, window, cx| {
-                                        window.close_dialog(cx);
-                                        let _ = this_clear.update(cx, |app, cx| {
-                                            app.clear_media_caches("Cache cleared", window, cx);
-                                        });
-                                    }),
-                                ),
-                        ),
-                )
+        crate::ui::ConfirmDialog::new(
+            "Clear local cache?",
+            "Removes the downloaded media, audio and avatar/emoji caches from disk; anything still needed is downloaded again. Your message history, search index and signed-in sessions stay intact.",
+            "Clear cache",
+        )
+        .danger()
+        .open(window, cx, move |window, cx| {
+            let _ = this.update(cx, |app, cx| {
+                app.clear_media_caches("Cache cleared", window, cx);
+            });
         });
     }
 

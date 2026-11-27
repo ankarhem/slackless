@@ -101,48 +101,18 @@ impl App {
         if is_channel && member_count >= 150 {
             let label = self.label(&channel);
             let this = cx.weak_entity();
-            window.open_dialog(cx, move |dialog, _, cx| {
-                let muted = cx.theme().muted_foreground;
-                let this = this.clone();
-                let ch = channel.clone();
-                dialog
-                    .title(format!("Start a huddle in {label}?"))
-                    .w(px(440.))
-                    .child(
-                        v_flex()
-                            .gap_4()
-                            .child(div().text_color(muted).child(format!(
-                                "This channel has {member_count} members. Starting a huddle may notify everyone in {label}."
-                            )))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .justify_end()
-                                    .child(
-                                        preferences::form_button(
-                                            Button::new("huddle-warn-cancel")
-                                                .outline()
-                                                .label("Cancel"),
-                                            cx,
-                                        )
-                                        .on_click(|_, window, cx| window.close_dialog(cx)),
-                                    )
-                                    .child(
-                                        preferences::form_button(
-                                            Button::new("huddle-warn-go")
-                                                .primary()
-                                                .label("Start huddle"),
-                                            cx,
-                                        )
-                                        .on_click(move |_, window, cx| {
-                                            window.close_dialog(cx);
-                                            let _ = this.update(cx, |app, cx| {
-                                                app.join_huddle_in(ch.clone(), window, cx);
-                                            });
-                                        }),
-                                    ),
-                            ),
-                    )
+            crate::ui::ConfirmDialog::new(
+                format!("Start a huddle in {label}?"),
+                format!(
+                    "This channel has {member_count} members. Starting a huddle may notify everyone in {label}."
+                ),
+                "Start huddle",
+            )
+            .width(px(440.))
+            .open(window, cx, move |window, cx| {
+                let _ = this.update(cx, |app, cx| {
+                    app.join_huddle_in(channel.clone(), window, cx);
+                });
             });
         } else {
             self.join_huddle_in(channel, window, cx);
@@ -174,50 +144,16 @@ impl App {
             "on"
         };
         let this = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let muted = cx.theme().muted_foreground;
-            let this = this.clone();
-            let ch = channel.clone();
-            dialog
-                .title(format!("Join huddle in {label}?"))
-                .w(px(440.))
-                .child(
-                    v_flex()
-                        .gap_4()
-                        .child(
-                            div()
-                                .text_color(muted)
-                                .child(format!("You'll join with your microphone {mic}.")),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .justify_end()
-                                .child(
-                                    preferences::form_button(
-                                        Button::new("huddle-link-cancel").outline().label("Cancel"),
-                                        cx,
-                                    )
-                                    .on_click(|_, window, cx| window.close_dialog(cx)),
-                                )
-                                .child(
-                                    preferences::form_button(
-                                        Button::new("huddle-link-join")
-                                            .primary()
-                                            .label("Join huddle"),
-                                        cx,
-                                    )
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            window.close_dialog(cx);
-                                            let _ = this.update(cx, |app, cx| {
-                                                app.start_huddle_in(ch.clone(), window, cx);
-                                            });
-                                        },
-                                    ),
-                                ),
-                        ),
-                )
+        crate::ui::ConfirmDialog::new(
+            format!("Join huddle in {label}?"),
+            format!("You'll join with your microphone {mic}."),
+            "Join huddle",
+        )
+        .width(px(440.))
+        .open(window, cx, move |window, cx| {
+            let _ = this.update(cx, |app, cx| {
+                app.start_huddle_in(channel.clone(), window, cx);
+            });
         });
     }
 
