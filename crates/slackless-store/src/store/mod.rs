@@ -186,6 +186,9 @@ impl Store {
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(path, flags)?;
+        // Configure busy_timeout BEFORE any PRAGMA that requires a database lock (such as
+        // `journal_mode = WAL`) so concurrent CLI/GUI opens wait instead of failing with SQLITE_BUSY.
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
         let _ = conn.execute_batch(
             "PRAGMA synchronous = NORMAL;
@@ -197,13 +200,14 @@ impl Store {
     }
 
     /// Opens an existing archive for reading: read-only when possible, falling back to read-write
-    /// only on SQLite open errors (e.g. a WAL database whose `-shm` file is missing). Structural
-    /// errors like [`StoreError::FutureSchema`] are never bypassed by opening read-write.
+    /// when an existing database needs schema migration or WAL `-shm` recovery. Never creates a
+    /// new database file on missing paths and never bypasses [`StoreError::FutureSchema`].
     pub fn open_for_reading(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         match Self::open_read_only(path) {
             Ok(store) => Ok(store),
-            Err(StoreError::Sqlite(_)) => Self::open(path),
+            Err(StoreError::OutdatedSchema { .. }) => Self::open(path),
+            Err(StoreError::Sqlite(_)) if path.exists() => Self::open(path),
             Err(err) => Err(err),
         }
     }
@@ -221,12 +225,18 @@ impl Store {
              PRAGMA mmap_size = 8388608;",
         );
         // Probe header/schema readability eagerly so WAL-without-shm databases fail here instead
-        // of returning a broken handle, and refuse databases written by a newer schema version.
+        // of returning a broken handle, and refuse databases whose schema version mismatches.
         let found = schema::schema_version(&conn)?;
         if found > schema::SCHEMA_VERSION {
             return Err(StoreError::FutureSchema {
                 found,
                 supported: schema::SCHEMA_VERSION,
+            });
+        }
+        if found < schema::SCHEMA_VERSION {
+            return Err(StoreError::OutdatedSchema {
+                found,
+                required: schema::SCHEMA_VERSION,
             });
         }
         Ok(Self {

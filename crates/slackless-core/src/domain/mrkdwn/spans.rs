@@ -288,7 +288,7 @@ fn parse_span_reference(
     let close = line[range.clone()].find('>')?;
     let body = &line[range.start + 1..range.start + close];
     let (target, label) = match body.split_once('|') {
-        Some((t, l)) => (t, Some(l)),
+        Some((t, l)) => (t, (!l.is_empty()).then_some(l)),
         None => (body, None),
     };
     if let Some(id) = target.strip_prefix('@') {
@@ -331,8 +331,7 @@ fn parse_span_reference(
             style: active,
         });
     } else if target.contains("://") || target.starts_with("mailto:") {
-        let (label, style) =
-            styled_link_label(label.map(|l| unescape_mrkdwn(l).into_owned()), active);
+        let (label, style) = styled_link_label(label, active);
         out.push(MrkdwnSpan::Link {
             url: unescape_mrkdwn(target).into_owned(),
             label,
@@ -346,13 +345,13 @@ fn parse_span_reference(
 
 /// A link label wrapped whole in `*` / `_` / `~` markers (`<url|*TypeError*>`) loses them and
 /// lends its style to the link, as Slack draws a bold link; a label styled any other way (or
-/// not at all) stays as written.
-fn styled_link_label(label: Option<String>, active: Style) -> (Option<String>, Style) {
+/// not at all) stays as written (unescaped exactly once).
+fn styled_link_label(label: Option<&str>, active: Style) -> (Option<String>, Style) {
     const WRAPPED: Style = Style::BOLD.with(Style::ITALIC).with(Style::STRIKE);
     let Some(raw) = label else {
         return (None, active);
     };
-    let spans = parse_mrkdwn_spans(&raw);
+    let spans = parse_mrkdwn_spans(raw);
     let mut style = Style::NONE;
     let mut text = String::with_capacity(raw.len());
     for span in &spans {
@@ -373,10 +372,11 @@ fn styled_link_label(label: Option<String>, active: Style) -> (Option<String>, S
                 text.push_str(shortcode);
                 text.push(':');
             }
-            _ => return (Some(raw), active),
+            _ => return (Some(unescape_mrkdwn(raw).into_owned()), active),
         }
     }
     let whole = !spans.is_empty()
+        && !style.is_plain()
         && WRAPPED.contains(style)
         && spans.iter().all(|span| match span {
             MrkdwnSpan::Text { style: own, .. } | MrkdwnSpan::Emoji { style: own, .. } => {
@@ -387,7 +387,7 @@ fn styled_link_label(label: Option<String>, active: Style) -> (Option<String>, S
     if whole {
         (Some(text), active.with(style))
     } else {
-        (Some(raw), active)
+        (Some(unescape_mrkdwn(raw).into_owned()), active)
     }
 }
 
@@ -859,11 +859,11 @@ impl Reader<'_> {
             self.doc.append_atom(Atom::Channel(id), &format!("#{name}"));
         } else if let Some(rest) = target.strip_prefix("!subteam^") {
             let id = UsergroupId::from(rest);
-            let shown = match label {
+            let shown = match label.filter(|r| !r.is_empty()) {
                 Some(label_range) => {
-                    let text = &line[label_range];
+                    let text = unescape_mrkdwn(&line[label_range]);
                     if text.starts_with('@') {
-                        text.to_owned()
+                        text.into_owned()
                     } else {
                         format!("@{text}")
                     }

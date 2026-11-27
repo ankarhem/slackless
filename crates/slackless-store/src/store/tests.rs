@@ -4869,3 +4869,163 @@ fn history_reconciliation_ignores_malformed_ts_tombstones_thread_broadcast_and_s
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].message.ts.as_str(), "1700000200.000100");
 }
+
+#[test]
+fn open_for_reading_migrates_outdated_schema_and_never_creates_missing_file() {
+    let dir = MaintTempDir::new("outdated-and-missing-ro");
+    let missing = dir.0.join("does-not-exist.sqlite");
+    assert!(Store::open_for_reading(&missing).is_err());
+    assert!(
+        !missing.exists(),
+        "open_for_reading must never create a database file on a missing path"
+    );
+
+    let legacy = dir.0.join("legacy-v10.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&legacy).unwrap();
+        crate::schema::apply_up_to_for_test(&conn, 10);
+    }
+    let ro_err = Store::open_read_only(&legacy)
+        .err()
+        .expect("open_read_only must reject outdated V10 schema");
+    assert!(
+        matches!(ro_err, StoreError::OutdatedSchema { found: 10, .. }),
+        "expected OutdatedSchema(10), got {ro_err:?}"
+    );
+
+    let store = Store::open_for_reading(&legacy).expect("open_for_reading migrates V10 -> current");
+    let ws = TeamId::from("T1");
+    // V13/V14 tables (`outbox`, `file_transcript`) must exist and be queryable after migration.
+    assert!(store.list_outbox(&ws).unwrap().is_empty());
+    assert!(
+        store
+            .search(&ws, &SearchQuery::parse("anything"), 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn store_open_and_upsert_messages_tolerate_concurrent_wal_writer() {
+    let dir = MaintTempDir::new("wal-contention");
+    let path = dir.0.join("shared.sqlite");
+    let ws = TeamId::from("T1");
+    let ch = ChannelId::from("C1");
+    {
+        let mut s = Store::open(&path).unwrap();
+        s.upsert_message(&ws, &ch, &msg("1700000001.000100", "U1", "seed"))
+            .unwrap();
+    }
+
+    // Hold an IMMEDIATE write lock on connection A for 80ms while thread B calls `Store::open`
+    // (which runs `PRAGMA journal_mode = WAL`) and then `upsert_messages`.
+    let mut conn_a = rusqlite::Connection::open(&path).unwrap();
+    let tx = conn_a
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let path_b = path.clone();
+    let ws_b = ws.clone();
+    let ch_b = ch.clone();
+    let worker = std::thread::spawn(move || {
+        let mut store_b = Store::open(&path_b).expect("Store::open waits for busy_timeout");
+        store_b
+            .upsert_messages(
+                &ws_b,
+                &ch_b,
+                &[msg("1700000002.000100", "U1", "from writer B")],
+            )
+            .expect("IMMEDIATE upsert_messages waits cleanly instead of SQLITE_BUSY_SNAPSHOT");
+    });
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    tx.commit().unwrap();
+    worker.join().unwrap();
+
+    let verify = Store::open_read_only(&path).unwrap();
+    assert_eq!(verify.channel_history(&ws, &ch, None, 10).unwrap().len(), 2);
+}
+
+#[test]
+fn merge_conversations_batch_preserves_richer_fields_and_heals_corrupt_rows() {
+    let mut store = Store::open_in_memory().unwrap();
+    let ws = TeamId::from("T1");
+    let rev_before = store.local_message_revision();
+    store.merge_conversations(&ws, &[]).unwrap();
+    assert_eq!(store.local_message_revision(), rev_before);
+
+    // Seed C1 with richer fields and C2 with corrupt JSON.
+    let rich_c1 = Conversation {
+        id: ChannelId::from("C1"),
+        name: Some("general".into()),
+        is_channel: true,
+        last_read: Some(Ts::from("1700000500.000100")),
+        num_members: Some(42),
+        ..Default::default()
+    };
+    let c2 = Conversation {
+        id: ChannelId::from("C2"),
+        name: Some("corrupt".into()),
+        is_channel: true,
+        ..Default::default()
+    };
+    store.upsert_conversation(&ws, &rich_c1).unwrap();
+    store.upsert_conversation(&ws, &c2).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE conversation SET json = '{not-json' WHERE workspace_id = ?1 AND id = 'C2'",
+            params![ws.as_str()],
+        )
+        .unwrap();
+
+    let sparse_c1 = Conversation {
+        id: ChannelId::from("C1"),
+        name: Some("general-renamed".into()),
+        is_channel: true,
+        ..Default::default()
+    };
+    let healed_c2 = Conversation {
+        id: ChannelId::from("C2"),
+        name: Some("healed".into()),
+        is_channel: true,
+        ..Default::default()
+    };
+    let brand_new_c3 = Conversation {
+        id: ChannelId::from("C3"),
+        name: Some("brand-new".into()),
+        is_channel: true,
+        ..Default::default()
+    };
+    store
+        .merge_conversations(&ws, &[sparse_c1, healed_c2, brand_new_c3])
+        .unwrap();
+
+    let got_c1 = store
+        .conversation(&ws, &ChannelId::from("C1"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(got_c1.name.as_deref(), Some("general-renamed"));
+    assert_eq!(
+        got_c1.last_read,
+        Some(Ts::from("1700000500.000100")),
+        "richer stored last_read preserved"
+    );
+    assert_eq!(got_c1.num_members, Some(42));
+    assert_eq!(
+        store
+            .conversation(&ws, &ChannelId::from("C2"))
+            .unwrap()
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("healed")
+    );
+    assert_eq!(
+        store
+            .conversation(&ws, &ChannelId::from("C3"))
+            .unwrap()
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("brand-new")
+    );
+}

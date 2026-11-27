@@ -245,4 +245,81 @@ mod tests {
         assert!(!json.contains("www.x.io>"), "{json}");
         assert!(!json.contains("a.co]"), "{json}");
     }
+
+    #[test]
+    fn mrkdwn_link_entities_empty_labels_subteams_and_shortcodes() {
+        // 1. Plain and bold link labels must unescape entities exactly once (no double-unescape).
+        assert_eq!(
+            parse_mrkdwn_spans("<https://x.dev|&amp;lt;script&amp;gt;>"),
+            vec![MrkdwnSpan::Link {
+                url: "https://x.dev".into(),
+                label: Some("&lt;script&gt;".into()),
+                style: Style::NONE,
+            }]
+        );
+        assert_eq!(
+            parse_mrkdwn_spans("<https://x.dev|*a &amp;lt; b*>"),
+            vec![MrkdwnSpan::Link {
+                url: "https://x.dev".into(),
+                label: Some("a &lt; b".into()),
+                style: Style::BOLD,
+            }]
+        );
+        assert_eq!(
+            parse_mrkdwn_spans("<https://x.dev|*see &lt;https://b.dev&gt;*>"),
+            vec![MrkdwnSpan::Link {
+                url: "https://x.dev".into(),
+                label: Some("see <https://b.dev>".into()),
+                style: Style::BOLD,
+            }]
+        );
+
+        // 2. Empty labels after `|` normalize to `None` so URLs and channel fallbacks aren't lost.
+        assert_eq!(
+            parse_mrkdwn_spans("<https://x.dev|>"),
+            vec![MrkdwnSpan::Link {
+                url: "https://x.dev".into(),
+                label: None,
+                style: Style::NONE,
+            }]
+        );
+        assert_eq!(mrkdwn_to_plain("<https://x.dev|>"), "https://x.dev");
+        assert_eq!(
+            parse_mrkdwn_spans("<#C1|>"),
+            vec![MrkdwnSpan::ChannelMention {
+                id: ChannelId::from("C1"),
+                name: None,
+                style: Style::NONE,
+            }]
+        );
+
+        // 3. `from_mrkdwn` subteam references fall back on empty label and unescape entities.
+        let sub_empty = from_mrkdwn("<!subteam^S1|>", &TestDir);
+        assert_eq!(sub_empty.text, "@eng");
+        let sub_entity = from_mrkdwn("<!subteam^S1|@r&amp;d>", &TestDir);
+        assert_eq!(sub_entity.text, "@r&d");
+
+        // 4. `replace_shortcodes_with` boundary cases (adjacent colons, 40-char vs 41-char,
+        //    multibyte after skin-tone).
+        let lookup = |name: &str| match name {
+            "rocket" => Some("🚀".to_owned()),
+            "wave::skin-tone-3" => Some("👋🏽".to_owned()),
+            s if s.len() == 40 => Some("OK40".to_owned()),
+            _ => None,
+        };
+        assert_eq!(
+            replace_shortcodes_with(":unknown:rocket:", &lookup),
+            ":unknown🚀"
+        );
+        let name40 = "a".repeat(40);
+        let name41 = "a".repeat(41);
+        assert_eq!(
+            replace_shortcodes_with(&format!(":{name40}: :{name41}:"), &lookup),
+            format!("OK40 :{name41}:")
+        );
+        assert_eq!(
+            replace_shortcodes_with(":wave::skin-tone-3: :wave::skin-tone-é:", &lookup),
+            "👋🏽 :wave::skin-tone-é:"
+        );
+    }
 }

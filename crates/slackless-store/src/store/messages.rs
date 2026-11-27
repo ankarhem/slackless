@@ -45,7 +45,11 @@ impl Store {
         if messages.is_empty() {
             return Ok(());
         }
-        let tx = self.conn.transaction()?;
+        // Acquire the write lock up front (`IMMEDIATE`) so reading `message_current` before
+        // upserting cannot fail with `SQLITE_BUSY_SNAPSHOT` under concurrent WAL writers.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for message in messages {
             upsert_message_in_tx(&tx, workspace, channel, message, SameRevision::Replace)?;
         }
@@ -157,7 +161,11 @@ impl Store {
         previous: Option<&Message>,
     ) -> Result<()> {
         self.ensure_writable()?;
-        let tx = self.conn.transaction()?;
+        // Acquire the write lock up front (`IMMEDIATE`) so reading `message_current` before
+        // upserting cannot fail with `SQLITE_BUSY_SNAPSHOT` under concurrent WAL writers.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         record_deletion_in_tx(&tx, workspace, channel, deleted_ts, event_ts, previous)?;
         tx.commit()?;
         self.bump_message_revision();
@@ -302,39 +310,41 @@ impl Store {
         channel: &ChannelId,
         ts: &Ts,
     ) -> Result<Vec<Revision>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT edit_ts, deleted, json FROM message_revision
-             WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3
-             ORDER BY recorded_at, edit_ts",
-        )?;
-        let rows = stmt.query_map(
-            params![workspace.as_str(), channel.as_str(), ts.as_str()],
-            raw_revision_row,
-        )?;
-        let mut out = Vec::new();
-        for row in rows {
-            if let Some(rev) = decode_revision_or_skip(row?) {
-                out.push(rev);
-            }
-        }
-        if out.is_empty() {
-            let mut cur_stmt = self.conn.prepare_cached(
-                "SELECT edit_ts, deleted, json FROM message_current
-                 WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3",
+        self.with_read_tx(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT edit_ts, deleted, json FROM message_revision
+                 WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3
+                 ORDER BY recorded_at, edit_ts",
             )?;
-            let current = cur_stmt
-                .query_row(
-                    params![workspace.as_str(), channel.as_str(), ts.as_str()],
-                    raw_revision_row,
-                )
-                .optional()?;
-            if let Some(raw) = current
-                && let Some(rev) = decode_revision_or_skip(raw)
-            {
-                out.push(rev);
+            let rows = stmt.query_map(
+                params![workspace.as_str(), channel.as_str(), ts.as_str()],
+                raw_revision_row,
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                if let Some(rev) = decode_revision_or_skip(row?) {
+                    out.push(rev);
+                }
             }
-        }
-        Ok(out)
+            if out.is_empty() {
+                let mut cur_stmt = conn.prepare_cached(
+                    "SELECT edit_ts, deleted, json FROM message_current
+                     WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3",
+                )?;
+                let current = cur_stmt
+                    .query_row(
+                        params![workspace.as_str(), channel.as_str(), ts.as_str()],
+                        raw_revision_row,
+                    )
+                    .optional()?;
+                if let Some(raw) = current
+                    && let Some(rev) = decode_revision_or_skip(raw)
+                {
+                    out.push(rev);
+                }
+            }
+            Ok(out)
+        })
     }
 
     /// Archived thread roots (`reply_count > 0`, undeleted), newest first, optionally scoped

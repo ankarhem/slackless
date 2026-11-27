@@ -50,6 +50,10 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("database schema version {found} is newer than this build supports ({supported})")]
     FutureSchema { found: u32, supported: u32 },
+    #[error(
+        "database schema version {found} is older than required ({required}); open read-write to migrate"
+    )]
+    OutdatedSchema { found: u32, required: u32 },
     #[error("store was opened read-only")]
     ReadOnly,
     #[error("invalid backup destination: {0}")]
