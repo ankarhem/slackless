@@ -5,11 +5,29 @@ use super::{action_base, dispatch_action};
 
 /// Validate a Block Kit text input element's current value (`F-COLLAB-747`, `776`, `778`, `791`).
 pub(in crate::blockkit) fn validate_text_input(element: &Json, value: &str) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+    let kind = element["type"].as_str().unwrap_or_default();
+    if kind == "plain_text_input" {
+        let len = value.chars().count();
+        if let Some(min) = element["min_length"].as_u64()
+            && (len as u64) < min
+        {
+            return Some(format!("Must be at least {min} characters."));
+        }
+        if let Some(max) = element["max_length"].as_u64()
+            && (len as u64) > max
+        {
+            return Some(format!("Must be at most {max} characters."));
+        }
+        return None;
+    }
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
     }
-    match element["type"].as_str().unwrap_or_default() {
+    match kind {
         "email_text_input" => {
             let valid = trimmed.split_once('@').is_some_and(|(local, domain)| {
                 !local.is_empty()
@@ -33,7 +51,7 @@ pub(in crate::blockkit) fn validate_text_input(element: &Json, value: &str) -> O
         "number_input" => {
             let decimal_ok = element["is_decimal_allowed"].as_bool().unwrap_or(false);
             let parsed = if decimal_ok {
-                trimmed.parse::<f64>().ok()
+                trimmed.parse::<f64>().ok().filter(|n| n.is_finite())
             } else {
                 trimmed.parse::<i64>().ok().map(|n| n as f64)
             };
@@ -59,20 +77,6 @@ pub(in crate::blockkit) fn validate_text_input(element: &Json, value: &str) -> O
                 && num > max
             {
                 return Some(format!("Must be at most {max}."));
-            }
-            None
-        }
-        "plain_text_input" => {
-            let len = value.chars().count();
-            if let Some(min) = element["min_length"].as_u64()
-                && (len as u64) < min
-            {
-                return Some(format!("Must be at least {min} characters."));
-            }
-            if let Some(max) = element["max_length"].as_u64()
-                && (len as u64) > max
-            {
-                return Some(format!("Must be at most {max} characters."));
             }
             None
         }
@@ -217,6 +221,7 @@ pub(in crate::blockkit) fn text_input(
             let on_action = kcx.on_action.clone();
             let attachment = kcx.attachment;
             let key_c = key.to_owned();
+            let element_c = element.clone();
             crate::preferences::form_button(
                 Button::new(SharedString::from(format!("bk-dispatch-{key}")))
                     .outline()
@@ -225,6 +230,9 @@ pub(in crate::blockkit) fn text_input(
             )
             .on_click(move |_, window, cx| {
                 let val = input_c.read(cx).value().to_string();
+                if validate_text_input(&element_c, &val).is_some() {
+                    return;
+                }
                 let mut payload = base.clone();
                 if kind == "rich_text_input" {
                     payload["rich_text_value"] = rich_text_input_value(&val);

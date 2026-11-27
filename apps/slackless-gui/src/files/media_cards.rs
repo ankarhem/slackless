@@ -211,11 +211,6 @@ fn clip_transcript_section(
                         .text_color(theme.muted_foreground)
                         .child("Loading transcript\u{2026}")
                         .into_any_element()
-                } else if let Some(err) = state.error {
-                    div()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("Could not load transcript: {err}"))
-                        .into_any_element()
                 } else if let Some(text) = body_text {
                     crate::messages::selectable_text(
                         &format!("clip-transcript-{}", file.id),
@@ -225,6 +220,11 @@ fn clip_transcript_section(
                         order_base,
                         cx,
                     )
+                } else if let Some(err) = state.error {
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("Could not load transcript: {err}"))
+                        .into_any_element()
                 } else {
                     div()
                         .text_color(theme.muted_foreground)
@@ -255,8 +255,13 @@ fn transcribe_pill_button(
     ext: String,
     cx: &App,
 ) -> Option<gpui_kit::gpui::Stateful<Div>> {
-    let has_transcript =
-        fixtures.file_transcript(&file.id).is_some() || inline_clip_transcript(file).is_some();
+    let has_cached_vtt = cx
+        .try_global::<ClipTranscriptStore>()
+        .and_then(|store| store.entries.get(&file.id))
+        .is_some_and(|entry| entry.text.is_some());
+    let has_transcript = fixtures.file_transcript(&file.id).is_some()
+        || inline_clip_transcript(file).is_some()
+        || has_cached_vtt;
     if has_transcript {
         return None;
     }
@@ -644,16 +649,31 @@ fn loaded_image_dims(
     window: &mut Window,
     cx: &mut App,
 ) -> Option<(i64, i64)> {
-    let data = match source {
-        ImageSource::Resource(resource) => window
-            .use_asset::<ImgResourceLoader>(resource, cx)
-            .and_then(Result::ok)?,
-        ImageSource::Render(data) => data.clone(),
-        _ => return None,
-    };
-    let sz = data.size(0);
-    let (w, h) = (i64::from(sz.width.0), i64::from(sz.height.0));
-    (w > 0 && h > 0).then_some((w, h))
+    match source {
+        ImageSource::Resource(resource) => {
+            let data = window
+                .use_asset::<ImgResourceLoader>(resource, cx)
+                .and_then(Result::ok)?;
+            let sz = data.size(0);
+            let (w, h) = (i64::from(sz.width.0), i64::from(sz.height.0));
+            (w > 0 && h > 0).then_some((w, h))
+        }
+        ImageSource::Render(data) => {
+            let sz = data.size(0);
+            let (w, h) = (i64::from(sz.width.0), i64::from(sz.height.0));
+            (w > 0 && h > 0).then_some((w, h))
+        }
+        ImageSource::Image(img) if img.format == gpui_kit::gpui::ImageFormat::Png => {
+            let (w, h) = image::ImageReader::with_format(
+                std::io::Cursor::new(&img.bytes),
+                image::ImageFormat::Png,
+            )
+            .into_dimensions()
+            .ok()?;
+            (w > 0 && h > 0).then_some((i64::from(w), i64::from(h)))
+        }
+        _ => None,
+    }
 }
 
 /// Top-right overlay icon button (matching [`download_button`]) used in active inline video frames.

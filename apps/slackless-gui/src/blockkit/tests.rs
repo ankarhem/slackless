@@ -780,3 +780,100 @@ fn external_select_inline_errors_workflow_and_hydrated_call_blocks_render(
         );
     });
 }
+
+#[test]
+fn validate_text_input_rejects_non_finite_numbers_and_whitespace_length_violations() {
+    let dec = json!({
+        "type": "number_input",
+        "is_decimal_allowed": true,
+        "min_value": "0",
+        "max_value": "100"
+    });
+    assert!(validate_text_input(&dec, "NaN").is_some());
+    assert!(validate_text_input(&dec, "inf").is_some());
+    assert!(validate_text_input(&dec, "-inf").is_some());
+    assert!(validate_text_input(&dec, "42.5").is_none());
+    assert!(validate_text_input(&dec, "101").is_some());
+
+    let plain = json!({
+        "type": "plain_text_input",
+        "min_length": 5,
+        "max_length": 10
+    });
+    assert!(validate_text_input(&plain, "").is_none());
+    assert!(
+        validate_text_input(&plain, "   ").is_some(),
+        "whitespace-only string below min_length must fail validation"
+    );
+    assert!(
+        validate_text_input(&plain, "            ").is_some(),
+        "whitespace-only string above max_length must fail validation"
+    );
+    assert!(validate_text_input(&plain, "hello").is_none());
+}
+
+#[gpui::test]
+fn context_actions_feedback_buttons_have_distinct_ids_and_icon_button_uses_label(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::init(cx);
+    });
+    let fixtures = Arc::new(crate::fixtures::load());
+    let kit = cx.new(|_| BlockKitState::default());
+    let blocks = vec![json!({
+        "type": "context_actions",
+        "block_id": "ctx_fb_1",
+        "elements": [
+            {
+                "type": "feedback_buttons",
+                "action_id": "shared_fb",
+                "positive_button": {
+                    "text": { "type": "plain_text", "text": "Good" },
+                    "value": "pos"
+                },
+                "negative_button": {
+                    "text": { "type": "plain_text", "text": "Bad" },
+                    "value": "neg"
+                }
+            },
+            {
+                "type": "icon_button",
+                "action_id": "trash_act",
+                "icon": "trash",
+                "accessibility_label": "Delete item"
+            }
+        ]
+    })];
+
+    struct CtxHost {
+        fixtures: Arc<crate::fixtures::Fixtures>,
+        kit: Entity<BlockKitState>,
+        blocks: Vec<Json>,
+    }
+    impl gpui::Render for CtxHost {
+        fn render(
+            &mut self,
+            window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let ts = Ts::from("1700000500.000100");
+            prepare_raw_inputs(&self.kit, &ts, &self.blocks, window, cx);
+            let kcx = KitCx::new(&self.fixtures, Some(&self.kit), &ts);
+            div().child(render_raw_blocks(&self.blocks, &kcx, cx))
+        }
+    }
+
+    let (_view, cx) = cx.add_window_view(|_, _| CtxHost {
+        fixtures,
+        kit,
+        blocks,
+    });
+    // Drawing twice verifies GPUI does not panic or collide on duplicate ElementIds for
+    // positive_button / negative_button sharing `block_id` + `action_id`.
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        let _ = window.draw(cx);
+    });
+}

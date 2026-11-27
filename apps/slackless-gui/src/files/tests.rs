@@ -687,3 +687,46 @@ fn pdf_attachment_card_renders_with_click_to_preview(cx: &mut gpui::TestAppConte
     assert!(!opened.get());
     cx.run_until_parked();
 }
+
+#[gpui::test]
+fn clip_transcript_prefers_completed_local_transcript_over_stale_vtt_error(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::init(cx);
+    });
+    let file_id = FileId::from("F_CLIP_ERR");
+    let mut file = File {
+        id: file_id.clone(),
+        name: Some("clip.mp4".into()),
+        mimetype: Some("video/mp4".into()),
+        filetype: Some("mp4".into()),
+        url_private: Some("https://files.slack.com/pri/clip.mp4".into()),
+        ..Default::default()
+    };
+    file.extra
+        .insert("vtt".into(), json!("https://files.slack.com/pri/clip.vtt"));
+    let fixtures = crate::fixtures::load()
+        .with_file_transcript(file_id.clone(), "Completed local transcript".into());
+
+    let msg = slackless_core::types::Message {
+        ts: slackless_core::types::Ts::from("1700000200.000100"),
+        files: vec![file],
+        ..Default::default()
+    };
+    struct ClipHost {
+        fixtures: crate::fixtures::Fixtures,
+        msg: slackless_core::types::Message,
+    }
+    impl Render for ClipHost {
+        fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+            gpui::div().children(super::attachments(&self.fixtures, &self.msg, None, cx))
+        }
+    }
+    let (_view, cx) = cx.add_window_view(|_, _| ClipHost { fixtures, msg });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+}

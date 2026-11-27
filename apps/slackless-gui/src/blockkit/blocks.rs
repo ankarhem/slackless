@@ -98,6 +98,7 @@ pub(super) fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
             let id_rate = vid_id.clone();
             let id_mute = vid_id.clone();
             let id_close = vid_id.clone();
+            let id_play = vid_id.clone();
             let poster = Some(ImageSource::from(SharedString::from(thumb)));
             card = card.child(
                 div()
@@ -142,13 +143,27 @@ pub(super) fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                                     .items_center()
                                     .gap_2()
                                     .child(
-                                        Icon::new(if snap.playing {
-                                            IconName::Pause
-                                        } else {
-                                            IconName::Play
-                                        })
-                                        .size(px(14.))
-                                        .text_color(fg),
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "bk-video-play-{}-{ix}",
+                                                kcx.ts.as_str()
+                                            )))
+                                            .cursor_pointer()
+                                            .on_click(move |_, window, cx| {
+                                                cx.stop_propagation();
+                                                crate::media::toggle_inline_video_pause(
+                                                    &id_play, window, cx,
+                                                );
+                                            })
+                                            .child(
+                                                Icon::new(if snap.playing {
+                                                    IconName::Pause
+                                                } else {
+                                                    IconName::Play
+                                                })
+                                                .size(px(14.))
+                                                .text_color(fg),
+                                            ),
                                     )
                                     .child(div().text_size(px(10.)).text_color(fg).child(format!(
                                         "{} / {}",
@@ -262,13 +277,25 @@ pub(super) fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                         ),
                 );
             if let Some(href) = direct_video_url.clone().or(url) {
-                let is_direct_media = {
-                    let lower = href.to_ascii_lowercase();
-                    lower.ends_with(".mp4")
-                        || lower.ends_with(".mov")
-                        || lower.ends_with(".webm")
+                let (is_direct_media, media_ext) = {
+                    let path_part = href
+                        .split(['?', '#'])
+                        .next()
+                        .unwrap_or(&href)
+                        .to_ascii_lowercase();
+                    let ext = if path_part.ends_with(".mov") {
+                        "mov"
+                    } else if path_part.ends_with(".webm") {
+                        "webm"
+                    } else {
+                        "mp4"
+                    };
+                    let direct = path_part.ends_with(".mp4")
+                        || path_part.ends_with(".mov")
+                        || path_part.ends_with(".webm")
                         || crate::media::is_hls_url(&href)
-                        || lower.contains("files.slack.com")
+                        || href.to_ascii_lowercase().contains("files.slack.com");
+                    (direct, ext.to_owned())
                 };
                 let target = LinkTarget::Url(href.clone().into());
                 let links = kcx.links.clone();
@@ -284,7 +311,7 @@ pub(super) fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                                 crate::media::play_inline_video(
                                     vid_id.clone(),
                                     href.clone(),
-                                    "mp4".to_owned(),
+                                    media_ext.clone(),
                                     None,
                                     window,
                                     cx,
@@ -809,16 +836,17 @@ pub(super) fn context_actions_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App
                             if synthetic["action_id"].is_null() {
                                 synthetic["action_id"] = element["action_id"].clone();
                             }
-                            let key = control_key(kcx.ts, raw, ix * 17 + sub_ix, &synthetic, n);
+                            let key = format!(
+                                "{}-fb{sub_ix}",
+                                control_key(kcx.ts, raw, ix, &synthetic, n)
+                            );
                             row = row.child(block_element(&synthetic, raw, key, kcx, cx));
                         }
                     }
                 }
                 "icon_button" => {
-                    let mut synthetic = element.clone();
-                    synthetic["type"] = "button".into();
-                    let key = control_key(kcx.ts, raw, ix, &synthetic, n);
-                    row = row.child(block_element(&synthetic, raw, key, kcx, cx));
+                    let key = control_key(kcx.ts, raw, ix, element, n);
+                    row = row.child(block_element(element, raw, key, kcx, cx));
                 }
                 _ => {
                     let key = control_key(kcx.ts, raw, ix, element, n);
