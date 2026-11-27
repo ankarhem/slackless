@@ -200,8 +200,8 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Returns `true` if `workspace` has an actively draining (`sending`) or freshly queued
-    /// (`pending` with no prior attempt error) message/reply outbox entry targeting
+    /// Returns `true` if `workspace` has an actively draining (`sending`) or queued (`pending`,
+    /// including transiently parked retries awaiting backoff) message/reply outbox entry targeting
     /// `(channel, thread_ts)`, so new sends queue behind it to preserve FIFO order.
     pub fn has_active_outbox_for_target(
         &self,
@@ -219,7 +219,7 @@ impl Store {
                    AND channel_id = ?2
                    AND ((?3 IS NULL AND thread_ts IS NULL) OR thread_ts = ?3)
                    AND kind IN ('message', 'reply')
-                   AND (status = 'sending' OR (status = 'pending' AND last_error IS NULL))
+                   AND status IN ('sending', 'pending')
              )",
             params![workspace.as_str(), channel.as_str(), thread_ts],
             |r| r.get(0),

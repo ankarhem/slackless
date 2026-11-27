@@ -7846,8 +7846,8 @@ async fn outbox_enqueues_on_transient_errors_and_rejects_permanent_slack_and_aut
     assert!(items.iter().all(|i| i.status == OutboxStatus::Pending));
     assert!(items.iter().all(|i| i.last_error.is_some()));
 
-    // 2. Permanent Slack errors (`channel_not_found`, `not_in_channel`, `invalid_auth`) MUST NOT
-    //    enqueue into outbox.
+    // 2. Permanent Slack errors (`channel_not_found`, `not_in_channel`, `invalid_auth`) on a fresh
+    //    channel (no prior pending FIFO outbox item ahead of it) MUST NOT enqueue into outbox.
     for perm_err in [
         FakeSendError::Slack("channel_not_found"),
         FakeSendError::Slack("not_in_channel"),
@@ -7856,7 +7856,7 @@ async fn outbox_enqueues_on_transient_errors_and_rejects_permanent_slack_and_aut
         let expect_auth = matches!(perm_err, FakeSendError::AuthExpired(_));
         fake.state.lock().unwrap().post_message_error = Some(perm_err);
         core.handle(Command::Messaging(MessagingCommand::SendMessage {
-            channel: c1(),
+            channel: ChannelId::from("C2"),
             content: MessageContent::plain("should never queue"),
             thread_ts: None,
             broadcast: false,
@@ -9125,6 +9125,316 @@ async fn send_message_queues_behind_active_outbox_item_preserving_fifo() {
             (c1(), "first queued".to_owned()),
             (c1(), "second online".to_owned()),
         ]
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbox_retry_does_not_deadlock_on_second_transient_failure() {
+    let fake = FakeBackend::default();
+    fake.state.lock().unwrap().post_message_error = Some(FakeSendError::Status(503, "upstream"));
+    let (store, events, mut rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    // Two back-to-back transient failures while online arm `OutboxRetry::ensure_scheduled` twice
+    // inside the initial 5s backoff window. Before the timer_gen split, the second call bumped
+    // `generation` without replacing the timer, causing the timer to self-abort without clearing
+    // `pending` and deadlocking automatic retries forever.
+    for text in ["first transient", "second transient"] {
+        core.handle(Command::Messaging(MessagingCommand::SendMessage {
+            channel: c1(),
+            content: MessageContent::plain(text),
+            thread_ts: None,
+            broadcast: false,
+        }))
+        .await;
+    }
+
+    wait_until("both sends parked in outbox", || {
+        store.lock().unwrap().list_outbox(&ws).unwrap().len() == 2
+    })
+    .await;
+    // Drain initial OutboxUpdated events.
+    while rx.try_recv().is_ok() {}
+
+    // Backend recovers; advance mocked clock past the initial 5s retry delay.
+    fake.state.lock().unwrap().post_message_error = None;
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+
+    wait_until("automatic retry flushes both parked messages", || {
+        fake.state.lock().unwrap().posted_messages.len() == 2
+    })
+    .await;
+    let posted = fake.state.lock().unwrap().posted_messages.clone();
+    assert_eq!(
+        posted,
+        vec![
+            (c1(), "first transient".to_owned()),
+            (c1(), "second transient".to_owned()),
+        ]
+    );
+    assert!(store.lock().unwrap().list_outbox(&ws).unwrap().is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn parked_transient_send_preserves_fifo_when_later_message_sent_online() {
+    let fake = FakeBackend::default();
+    fake.state.lock().unwrap().post_message_error = Some(FakeSendError::Status(503, "blip"));
+    let (store, events, _rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    // 1. First message fails transiently and parks in outbox with `status='pending'` and
+    //    `last_error = Some(...)`.
+    core.handle(Command::Messaging(MessagingCommand::SendMessage {
+        channel: c1(),
+        content: MessageContent::plain("M1 parked"),
+        thread_ts: None,
+        broadcast: false,
+    }))
+    .await;
+    wait_until("M1 parked with last_error", || {
+        let items = store.lock().unwrap().list_outbox(&ws).unwrap();
+        items.len() == 1 && items[0].last_error.is_some()
+    })
+    .await;
+
+    // 2. Backend recovers and user sends M2 online to the same channel before the 5s retry timer.
+    //    `has_active_outbox_for_target` must include parked pending rows so M2 queues behind M1.
+    fake.state.lock().unwrap().post_message_error = None;
+    core.handle(Command::Messaging(MessagingCommand::SendMessage {
+        channel: c1(),
+        content: MessageContent::plain("M2 online"),
+        thread_ts: None,
+        broadcast: false,
+    }))
+    .await;
+
+    wait_until("both messages deliver strictly in FIFO order", || {
+        fake.state.lock().unwrap().posted_messages.len() == 2
+    })
+    .await;
+    let posted = fake.state.lock().unwrap().posted_messages.clone();
+    assert_eq!(
+        posted,
+        vec![
+            (c1(), "M1 parked".to_owned()),
+            (c1(), "M2 online".to_owned()),
+        ]
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn offline_mutation_auth_halt_discard_and_online_retry_reconcile_queue_count() {
+    let fake = FakeBackend::default();
+    // mark_read_ok defaults to false (returns AuthExpired).
+    let (store, events, mut rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    // 1. Go offline and queue two MarkRead mutations.
+    core.on_rtm(RtmEvent::State(ConnectionState::Disconnected {
+        reason: "net".into(),
+    }))
+    .await;
+    let ts1 = Ts::from("1700000100.000100");
+    let ts2 = Ts::from("1700000200.000200");
+    core.handle(Command::Messaging(MessagingCommand::MarkRead {
+        channel: c1(),
+        ts: ts1.clone(),
+    }))
+    .await;
+    core.handle(Command::Messaging(MessagingCommand::MarkRead {
+        channel: ChannelId::from("C2"),
+        ts: ts2.clone(),
+    }))
+    .await;
+    let persisted = store.lock().unwrap().list_offline(&ws).unwrap();
+    assert_eq!(persisted.len(), 2);
+    let (id1, id2) = (persisted[0].0, persisted[1].0);
+    while rx.try_recv().is_ok() {}
+
+    // 2. Reconnect while mark_read fails with AuthExpired: batch stops after item 1 (never calling
+    //    item 2) and reports OfflineQueueChanged(2).
+    core.on_rtm(RtmEvent::State(ConnectionState::Connected {
+        fast_reconnect: false,
+    }))
+    .await;
+    wait_until("auth expired stops after first mark_read", || {
+        fake.state.lock().unwrap().mark_calls.len() == 1
+    })
+    .await;
+    let mut saw_auth = false;
+    let mut saw_remaining_two = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && !(saw_auth && saw_remaining_two) {
+        if let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            match ev {
+                Event::AuthExpired(_) => saw_auth = true,
+                Event::OfflineQueueChanged(2) => saw_remaining_two = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_auth, "expected Event::AuthExpired on failing mark_read");
+    assert!(
+        saw_remaining_two,
+        "expected Event::OfflineQueueChanged(2) while 2 SQLite rows remain"
+    );
+    assert_eq!(
+        fake.state.lock().unwrap().mark_calls.len(),
+        1,
+        "AuthExpired on item 1 must halt batch before attempting item 2"
+    );
+
+    // 3. Discard item 1 while online: must emit OfflineQueueChanged(1), NOT 0.
+    while rx.try_recv().is_ok() {}
+    core.handle(Command::Messaging(
+        MessagingCommand::DiscardOfflineMutation(id1),
+    ))
+    .await;
+    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
+
+    // 4. Retry item 2 online after backend recovers: must delete row AND emit OfflineQueueChanged(0).
+    fake.state.lock().unwrap().mark_read_ok = true;
+    core.handle(Command::Messaging(MessagingCommand::RetryOfflineMutation(
+        id2,
+    )))
+    .await;
+    let mut saw_zero = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && !saw_zero {
+        if let Ok(Ok(Event::OfflineQueueChanged(0))) =
+            tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+        {
+            saw_zero = true;
+        }
+    }
+    assert!(
+        saw_zero,
+        "successful online retry of last offline mutation must emit OfflineQueueChanged(0)"
+    );
+    assert!(store.lock().unwrap().list_offline(&ws).unwrap().is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn create_channel_with_purpose_merges_fields_and_update_profile_syncs_real_name() {
+    let fake = FakeBackend::default();
+    fake.state.lock().unwrap().profile_update_response = Some(crate::types::Profile {
+        real_name: Some("Alice Updated".to_owned()),
+        display_name: Some("alice".to_owned()),
+        ..Default::default()
+    });
+    let (store, events, mut rx) = fake_core_parts();
+    let ws = TeamId::from("T1");
+    let me = UserId::from("U1");
+    store
+        .lock()
+        .unwrap()
+        .upsert_user(
+            &ws,
+            &User {
+                id: me.clone(),
+                name: "alice".to_owned(),
+                real_name: Some("Alice Old".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        ws.clone(),
+        events,
+        test_media_tx(),
+    )
+    .await;
+    *core.self_user_id.lock().unwrap() = Some(me.clone());
+
+    // 1. CreateChannel with non-empty purpose: FakeBackend::set_purpose returns a partial
+    //    Conversation (only id + purpose); stored row must retain name, is_private, and is_member.
+    core.handle(Command::Channel(ChannelCommand::CreateChannel {
+        name: "secret-ops".to_owned(),
+        is_private: true,
+        purpose: Some("Ops coordination".to_owned()),
+    }))
+    .await;
+    let created_id = loop {
+        if let Event::ConversationOpened(id) = next(&mut rx).await {
+            break id;
+        }
+    };
+    let stored = store
+        .lock()
+        .unwrap()
+        .conversation(&ws, &created_id)
+        .unwrap()
+        .expect("created channel persisted");
+    assert_eq!(stored.name.as_deref(), Some("secret-ops"));
+    assert!(stored.is_private);
+    assert!(stored.is_member);
+    assert_eq!(
+        stored.purpose.as_ref().map(|p| p.value.as_str()),
+        Some("Ops coordination")
+    );
+
+    // 2. UpdateProfile changing real_name must sync top-level `user.real_name` in SQLite.
+    core.handle(Command::Workspace(WorkspaceCommand::UpdateProfile {
+        update: api::ProfileUpdate {
+            real_name: Some("Alice Updated".to_owned()),
+            ..Default::default()
+        },
+    }))
+    .await;
+    loop {
+        if matches!(next(&mut rx).await, Event::UsersChanged(ids) if ids.contains(&me)) {
+            break;
+        }
+    }
+    let stored_user = store
+        .lock()
+        .unwrap()
+        .user(&ws, &me)
+        .unwrap()
+        .expect("updated user persisted");
+    assert_eq!(
+        stored_user.profile.real_name.as_deref(),
+        Some("Alice Updated")
+    );
+    assert_eq!(
+        stored_user.real_name.as_deref(),
+        Some("Alice Updated"),
+        "top-level user.real_name must stay in sync with profile.real_name"
     );
     core.shutdown().await;
 }

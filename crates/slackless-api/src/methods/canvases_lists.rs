@@ -123,30 +123,39 @@ impl SlackApi {
                 }
                 columns = cols;
             }
+            let fallback_meta = parse_list_meta(list_obj);
             if meta.permalink.is_none() {
-                let fallback_meta = parse_list_meta(list_obj);
                 meta.permalink = fallback_meta.permalink;
-                if meta.access.is_none() {
-                    meta.access = fallback_meta.access;
-                }
-                if meta.org_or_workspace_access.is_none() {
-                    meta.org_or_workspace_access = fallback_meta.org_or_workspace_access;
-                }
-                if meta.owner_id.is_none() {
-                    meta.owner_id = fallback_meta.owner_id;
-                }
-                if meta.editors.is_empty() {
-                    meta.editors = fallback_meta.editors;
-                }
-                if meta.shared_channels.is_empty() {
-                    meta.shared_channels = fallback_meta.shared_channels;
-                }
-                if meta.row_count.is_none() {
-                    meta.row_count = fallback_meta.row_count;
-                }
-                if meta.row_count_limit.is_none() {
-                    meta.row_count_limit = fallback_meta.row_count_limit;
-                }
+            }
+            if !meta.editable && fallback_meta.editable {
+                meta.editable = true;
+            }
+            if meta.access.is_none() {
+                meta.access = fallback_meta.access;
+            }
+            if meta.org_or_workspace_access.is_none() {
+                meta.org_or_workspace_access = fallback_meta.org_or_workspace_access;
+            }
+            if meta.owner_id.is_none() {
+                meta.owner_id = fallback_meta.owner_id;
+            }
+            if meta.editors.is_empty() {
+                meta.editors = fallback_meta.editors;
+            }
+            if meta.shared_channels.is_empty() {
+                meta.shared_channels = fallback_meta.shared_channels;
+            }
+            if meta.row_count.is_none() {
+                meta.row_count = fallback_meta.row_count;
+            }
+            if meta.row_count_limit.is_none() {
+                meta.row_count_limit = fallback_meta.row_count_limit;
+            }
+            if meta.archived_row_count.is_none() {
+                meta.archived_row_count = fallback_meta.archived_row_count;
+            }
+            if !meta.over_row_maximum && fallback_meta.over_row_maximum {
+                meta.over_row_maximum = true;
             }
         }
 
@@ -669,11 +678,8 @@ impl SlackApi {
 
     /// `lists.records.archive`: archive one list item (`F-COLLAB-255`).
     pub async fn lists_records_archive(&self, list_id: &str, row_id: &str) -> Result<()> {
-        let params = vec![
-            ("list_id", list_id.to_owned()),
-            ("record_id", row_id.to_owned()),
-            ("id", row_id.to_owned()),
-        ];
+        let ids_json = serde_json::to_string(&[row_id])?;
+        let params = vec![("list_id", list_id.to_owned()), ("ids", ids_json)];
         self.call_ok(method::LISTS_RECORDS_ARCHIVE, params).await
     }
 

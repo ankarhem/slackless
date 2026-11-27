@@ -32,10 +32,15 @@ struct RetryState {
     delay: Duration,
     /// The pending timer task, if any.
     pending: Option<AbortHandle>,
-    /// Monotonic counter bumped on every [`OutboxRetry::schedule`], so a flushing pass that
+    /// Monotonic activity counter bumped on every [`OutboxRetry::schedule`],
+    /// [`OutboxRetry::ensure_scheduled`], or [`OutboxRetry::reset`], so a flushing pass that
     /// finishes with `Flush::Proceed` does not cancel a retry armed concurrently by
     /// [`park_transient_send`].
     generation: u64,
+    /// Monotonic timer identity bumped only when `pending` is replaced or aborted, so calling
+    /// [`OutboxRetry::ensure_scheduled`] while a timer is already sleeping does NOT cause that
+    /// timer to self-abort on wakeup and leave `pending` permanently stuck as `Some(...)`.
+    timer_gen: u64,
 }
 
 impl Default for RetryState {
@@ -44,6 +49,7 @@ impl Default for RetryState {
             delay: OUTBOX_RETRY_INITIAL,
             pending: None,
             generation: 0,
+            timer_gen: 0,
         }
     }
 }
@@ -66,7 +72,8 @@ impl OutboxRetry {
     fn ensure_scheduled<B: Backend>(&self, flush: OutboxFlush<B>) {
         let mut state = self.lock();
         if state.pending.is_some() {
-            // Still bump generation so an in-flight `Flush::Proceed` does not cancel this timer.
+            // Bump activity generation so an in-flight `Flush::Proceed` does not cancel this timer,
+            // while keeping `timer_gen` unchanged so the armed timer still runs when it wakes.
             state.generation = state.generation.wrapping_add(1);
             return;
         }
@@ -75,7 +82,8 @@ impl OutboxRetry {
 
     fn schedule_locked<B: Backend>(&self, state: &mut RetryState, flush: OutboxFlush<B>) {
         state.generation = state.generation.wrapping_add(1);
-        let my_gen = state.generation;
+        state.timer_gen = state.timer_gen.wrapping_add(1);
+        let my_timer_gen = state.timer_gen;
         let delay = state.delay;
         state.delay = next_outbox_retry_delay(delay);
         state.abort_pending();
@@ -87,7 +95,7 @@ impl OutboxRetry {
             // wakeup could clear a newer timer's handle or run a duplicate flush pass.
             {
                 let mut st = retry.lock();
-                if st.generation != my_gen {
+                if st.timer_gen != my_timer_gen {
                     return;
                 }
                 st.pending = None;
@@ -101,6 +109,7 @@ impl OutboxRetry {
     pub(in crate::client) fn reset(&self) {
         let mut state = self.lock();
         state.generation = state.generation.wrapping_add(1);
+        state.timer_gen = state.timer_gen.wrapping_add(1);
         state.delay = OUTBOX_RETRY_INITIAL;
         state.abort_pending();
     }
@@ -111,6 +120,7 @@ impl OutboxRetry {
         let mut state = self.lock();
         if state.generation == expected_generation {
             state.generation = state.generation.wrapping_add(1);
+            state.timer_gen = state.timer_gen.wrapping_add(1);
             state.delay = OUTBOX_RETRY_INITIAL;
             state.abort_pending();
         }
@@ -778,11 +788,23 @@ impl<B: Backend> Core<B> {
     pub(super) async fn discard_offline_mutation(&mut self, id: i64) {
         self.offline_queue.retain(|(row_id, _)| *row_id != id);
         let ws = self.workspace.clone();
-        if let Err(err) = with_store(&self.store, move |s| s.delete_offline(&ws, id)).await {
-            tracing::warn!(id, %err, "failed to delete discarded offline mutation");
-        }
-        self.events
-            .emit(Event::OfflineQueueChanged(self.offline_queue.len()));
+        let remaining = match with_store(&self.store, move |s| {
+            s.delete_offline(&ws, id)?;
+            let rows = s.list_offline(&ws)?;
+            Ok(rows
+                .into_iter()
+                .filter(|(_, payload)| serde_json::from_str::<QueuedMutation>(payload).is_ok())
+                .count())
+        })
+        .await
+        {
+            Ok(count) => count.max(self.offline_queue.len()),
+            Err(err) => {
+                tracing::warn!(id, %err, "failed to delete discarded offline mutation");
+                self.offline_queue.len()
+            }
+        };
+        self.events.emit(Event::OfflineQueueChanged(remaining));
     }
 
     /// Execute a batch of persisted offline mutations strictly sequentially (FIFO), deleting each
@@ -791,10 +813,18 @@ impl<B: Backend> Core<B> {
         &self,
         queued: Vec<(i64, QueuedMutation)>,
     ) {
+        self.spawn_queued_mutations_batch(queued, false);
+    }
+
+    fn spawn_queued_mutations_batch(
+        &self,
+        queued: Vec<(i64, QueuedMutation)>,
+        emit_zero_on_empty: bool,
+    ) {
         let ctx = self.ctx();
         let stealth_mode = Arc::clone(&self.stealth_mode);
         self.tasks.spawn(async move {
-            Self::run_queued_mutations_batch(ctx, stealth_mode, queued).await;
+            Self::run_queued_mutations_batch(ctx, stealth_mode, queued, emit_zero_on_empty).await;
         });
     }
 
@@ -802,6 +832,7 @@ impl<B: Backend> Core<B> {
         ctx: TaskCtx<B>,
         stealth_mode: Arc<AtomicBool>,
         queued: Vec<(i64, QueuedMutation)>,
+        emit_zero_on_empty: bool,
     ) {
         let mut stopped_or_failed = false;
         for (id, mutation) in queued {
@@ -838,23 +869,24 @@ impl<B: Backend> Core<B> {
                 }
             }
         }
-        if stopped_or_failed {
+        if stopped_or_failed || emit_zero_on_empty {
             let ws = ctx.workspace.clone();
             if let Ok(rows) = with_store(&ctx.store, move |s| s.list_offline(&ws)).await {
                 let remaining = rows
                     .into_iter()
                     .filter(|(_, payload)| serde_json::from_str::<QueuedMutation>(payload).is_ok())
                     .count();
-                if remaining > 0 {
+                if remaining > 0 || emit_zero_on_empty {
                     ctx.events.emit(Event::OfflineQueueChanged(remaining));
                 }
             }
         }
     }
 
-    /// Execute one persisted offline mutation via [`Self::flush_queued_mutations_sequentially`].
+    /// Execute one persisted offline mutation via [`Self::spawn_queued_mutations_batch`], always
+    /// reconciling the UI badge count (including `0`) after completion.
     pub(in crate::client) fn flush_queued_mutation(&self, id: i64, mutation: QueuedMutation) {
-        self.flush_queued_mutations_sequentially(vec![(id, mutation)]);
+        self.spawn_queued_mutations_batch(vec![(id, mutation)], true);
     }
 
     pub(in crate::client) async fn execute_queued_mutation(

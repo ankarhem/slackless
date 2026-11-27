@@ -104,11 +104,12 @@ impl SlackApi {
             match &mut merged {
                 None => merged = Some(resp.data),
                 Some(first) => {
-                    if let (Some(dest), Some(more)) = (
-                        first.get_mut("drafts").and_then(Value::as_array_mut),
-                        resp.data.get("drafts").and_then(Value::as_array),
-                    ) {
-                        dest.extend(more.iter().cloned());
+                    if let Some(more) = resp.data.get("drafts").and_then(Value::as_array) {
+                        if let Some(dest) = first.get_mut("drafts").and_then(Value::as_array_mut) {
+                            dest.extend(more.iter().cloned());
+                        } else if let Some(obj) = first.as_object_mut() {
+                            obj.insert("drafts".to_owned(), Value::Array(more.clone()));
+                        }
                     }
                 }
             }
@@ -586,8 +587,12 @@ impl SlackApi {
         let html = if let Some(url) = file
             .url_private
             .as_deref()
-            .or(file.url_private_download.as_deref())
-        {
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                file.url_private_download
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+            }) {
             self.download_html_file(url).await?
         } else {
             match self.canvases_get_content(file_id, Some("html")).await {

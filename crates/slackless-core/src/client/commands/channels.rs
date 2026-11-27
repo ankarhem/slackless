@@ -311,10 +311,14 @@ impl<B: Backend> Core<B> {
         self.spawn("conversations.create", async move {
             let mut created = ctx.backend.create_channel(name, is_private).await?;
             let id = created.id.clone();
-            if let Some(purpose) = purpose.filter(|p| !p.trim().is_empty())
-                && let Ok(updated) = ctx.backend.set_purpose(id.clone(), purpose).await
-            {
-                created = updated;
+            if let Some(purpose) = purpose.filter(|p| !p.trim().is_empty()) {
+                match ctx.backend.set_purpose(id.clone(), purpose).await {
+                    Ok(updated) => created.merge(&updated),
+                    Err(err) if err.is_auth_expired() => return Err(err.into()),
+                    Err(err) => {
+                        tracing::warn!(%err, channel = %id, "conversations.setPurpose after create failed");
+                    }
+                }
             }
             created.is_member = true;
             let for_store = created.clone();
@@ -493,6 +497,10 @@ impl<B: Backend> Core<B> {
                 let ws = ctx.workspace.clone();
                 if let Err(err) = with_store(&ctx.store, move |s| {
                     if let Some(mut user) = s.user(&ws, &me_for_store)? {
+                        if let Some(real_name) = profile.real_name.clone().filter(|s| !s.is_empty())
+                        {
+                            user.real_name = Some(real_name);
+                        }
                         user.profile = profile;
                         s.upsert_user(&ws, &user)?;
                     }

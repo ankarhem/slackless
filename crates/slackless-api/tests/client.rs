@@ -3439,3 +3439,171 @@ async fn drafts_writes_carry_the_token_of_the_previous_write() {
     let draft = api.drafts_update(&draft, &channel, "second").await.unwrap();
     api.drafts_delete(&draft).await.unwrap();
 }
+
+#[tokio::test]
+async fn lists_records_archive_sends_ids_json_and_fetch_list_with_meta_merges_partial_fields() {
+    // 1. lists.records.archive must send `list_id` and JSON array `ids`, not `record_id`/`id`.
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/lists.records.archive"))
+            .and(body_string_contains("list_id=F0LIST1"))
+            .and(body_string_contains("ids=%5B%22Rec99%22%5D"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        api.lists_records_archive("F0LIST1", "Rec99").await.unwrap();
+    }
+
+    // 2. fetch_list_with_meta merges access/editors/limits from `slackLists.items.list`'s `list`
+    //    object even when `files.info` already returned a `permalink`.
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/files.info"))
+            .and(body_string_contains("file=F0PARTIAL"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "file": {
+                    "id": "F0PARTIAL",
+                    "title": "Partial Meta List",
+                    "permalink": "https://acme.slack.com/lists/T1/F0PARTIAL"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/lists.records.list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"ok": false, "error": "unknown_method"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/slackLists.items.list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "list": {
+                    "id": "F0PARTIAL",
+                    "title": "Partial Meta List",
+                    "editable": true,
+                    "access": "write",
+                    "org_or_workspace_access": "read",
+                    "user": "U0OWNER",
+                    "editors": ["U0ED1"],
+                    "channels": ["C0SH1"],
+                    "list_limits": {
+                        "row_count": 7,
+                        "row_count_limit": 5000,
+                        "archived_row_count": 2,
+                        "over_row_maximum": false
+                    },
+                    "list_metadata": {
+                        "schema": [
+                            { "id": "col_name", "key": "name", "name": "Name", "type": "text", "is_primary_column": true }
+                        ]
+                    }
+                },
+                "items": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_data, meta) = api.fetch_list_with_meta("F0PARTIAL").await.unwrap();
+        assert_eq!(
+            meta.permalink.as_deref(),
+            Some("https://acme.slack.com/lists/T1/F0PARTIAL")
+        );
+        assert!(meta.editable);
+        assert_eq!(meta.access.as_deref(), Some("write"));
+        assert_eq!(meta.org_or_workspace_access.as_deref(), Some("read"));
+        assert_eq!(meta.owner_id, Some(UserId::from("U0OWNER")));
+        assert_eq!(meta.editors, vec![UserId::from("U0ED1")]);
+        assert_eq!(meta.shared_channels, vec![ChannelId::from("C0SH1")]);
+        assert_eq!(meta.row_count, Some(7));
+        assert_eq!(meta.row_count_limit, Some(5000));
+        assert_eq!(meta.archived_row_count, Some(2));
+    }
+}
+
+#[tokio::test]
+async fn fetch_canvas_with_meta_falls_back_on_empty_url_and_drafts_list_merges_late_pages() {
+    // 1. Empty string `url_private: ""` must fall back to `canvases.getContent`.
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/files.info"))
+            .and(body_string_contains("file=FEMPTYURL"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "file": {
+                    "id": "FEMPTYURL",
+                    "title": "Empty URL Canvas",
+                    "url_private": "",
+                    "url_private_download": ""
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/canvases.getContent"))
+            .and(body_string_contains("canvas_id=FEMPTYURL"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "content": "<p>Fallback HTML</p>"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (meta, html) = api.fetch_canvas_with_meta("FEMPTYURL").await.unwrap();
+        assert_eq!(meta.title, "Empty URL Canvas");
+        assert_eq!(html, "<p>Fallback HTML</p>");
+    }
+
+    // 2. `drafts.list` page 1 omitting `"drafts"` must still keep drafts from page 2.
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/drafts.list"))
+            .and(wiremock::matchers::body_string_contains("cursor=p2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "drafts": [{
+                    "id": "DrPage2",
+                    "destinations": [{ "channel_id": "C1" }],
+                    "blocks": [{
+                        "type": "rich_text",
+                        "elements": [{
+                            "type": "rich_text_section",
+                            "elements": [{ "type": "text", "text": "from page 2" }]
+                        }]
+                    }]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/drafts.list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "response_metadata": { "next_cursor": "p2" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let drafts = api.drafts_list().await.unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].id, "DrPage2");
+        assert_eq!(drafts[0].text, "from page 2");
+    }
+}

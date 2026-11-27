@@ -71,8 +71,13 @@ impl<B: Backend> Core<B> {
                                 if !queued.is_empty() {
                                     ctx.events.emit(Event::OfflineQueueChanged(0));
                                     tasks.spawn(async move {
-                                        Self::run_queued_mutations_batch(ctx, stealth_mode, queued)
-                                            .await;
+                                        Self::run_queued_mutations_batch(
+                                            ctx,
+                                            stealth_mode,
+                                            queued,
+                                            false,
+                                        )
+                                        .await;
                                     });
                                 }
                             });
