@@ -116,11 +116,10 @@ impl PopoutWindow {
                         }),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        (send_mute)(HuddleControlCommand::SetMuted(next_muted).into());
-                        if this.fixtures.sample
-                            && let Some(state) = this.huddle_state_entity()
-                        {
-                            state.update(cx, |s, cx| s.set_muted_local(next_muted, cx));
+                        if let Some(state) = this.huddle_state_entity() {
+                            state.update(cx, |s, cx| s.request_toggle_mute(cx));
+                        } else {
+                            (send_mute)(HuddleControlCommand::SetMuted(next_muted).into());
                         }
                     })),
             )
@@ -196,18 +195,24 @@ impl PopoutWindow {
                         }),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        (send_cam)(
-                            HuddleControlCommand::SetCamera {
-                                enabled: next_cam,
-                                device_index: selected_cam_idx,
-                                blur: blur_now,
-                            }
-                            .into(),
-                        );
-                        if this.fixtures.sample
+                        if selected_cam_idx.is_none()
                             && let Some(state) = this.huddle_state_entity()
                         {
-                            state.update(cx, |s, cx| s.set_camera_local(next_cam, cx));
+                            state.update(cx, |s, cx| s.request_toggle_camera(cx));
+                        } else {
+                            (send_cam)(
+                                HuddleControlCommand::SetCamera {
+                                    enabled: next_cam,
+                                    device_index: selected_cam_idx,
+                                    blur: blur_now,
+                                }
+                                .into(),
+                            );
+                            if this.fixtures.sample
+                                && let Some(state) = this.huddle_state_entity()
+                            {
+                                state.update(cx, |s, cx| s.set_camera_local(next_cam, cx));
+                            }
                         }
                     })),
             )

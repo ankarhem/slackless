@@ -168,7 +168,9 @@ impl HuddlesView {
                 *counts.entry(h.channel.clone()).or_default() += 1;
             }
         }
-        let (ch, freq) = counts.into_iter().max_by_key(|(_, n)| *n)?;
+        let (ch, freq) = counts.into_iter().max_by(|(ch_a, n_a), (ch_b, n_b)| {
+            n_a.cmp(n_b).then_with(|| ch_b.as_str().cmp(ch_a.as_str()))
+        })?;
         let conv = self.fixtures.conversation(&ch)?;
         let peer = conv.user.clone().or_else(|| {
             self.fixtures

@@ -58,6 +58,7 @@ impl PopoutWindow {
         let send_music = self.send.clone();
         let send_copy = self.send.clone();
         let copy_ch = channel.clone();
+        let copy_url = browser_url.clone();
 
         let item = |id: &'static str, icon: IconName, label: String, active: bool| {
             h_flex()
@@ -192,13 +193,20 @@ impl PopoutWindow {
                     "Copy huddle link".to_owned(),
                     false,
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    (send_copy)(
-                        HuddleCommand::GetLink {
-                            channel: copy_ch.clone(),
-                        }
-                        .into(),
-                    );
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.fixtures.sample {
+                        cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(
+                            copy_url.clone(),
+                        ));
+                        actions::notify("Huddle link copied", String::new(), window, cx);
+                    } else {
+                        (send_copy)(
+                            HuddleCommand::GetLink {
+                                channel: copy_ch.clone(),
+                            }
+                            .into(),
+                        );
+                    }
                     this.close_huddle_popovers();
                     cx.notify();
                 })),
@@ -459,7 +467,14 @@ impl PopoutWindow {
                     let frame_layout = Arc::clone(&frame);
                     canvas(
                         move |bounds, _, _| {
-                            ObjectFit::Contain.get_bounds(bounds, frame_layout.size(0))
+                            if frame_layout.frame_count() == 0 {
+                                return Bounds::default();
+                            }
+                            let sz = frame_layout.size(0);
+                            if sz.width.0 <= 0 || sz.height.0 <= 0 {
+                                return Bounds::default();
+                            }
+                            ObjectFit::Contain.get_bounds(bounds, sz)
                         },
                         move |bounds, img_bounds, window, _| {
                             if frame.frame_count() > 0 {
@@ -1428,7 +1443,7 @@ impl PopoutWindow {
                                 } else {
                                     d.name.clone()
                                 })
-                                .on_click(move |_, _, _| {
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     (send)(
                                         HuddleControlCommand::SetAudioDevices {
                                             input: Some(name.clone()),
@@ -1436,7 +1451,9 @@ impl PopoutWindow {
                                         }
                                         .into(),
                                     );
-                                })
+                                    this.close_huddle_popovers();
+                                    cx.notify();
+                                }))
                         }),
                 ),
             )
@@ -1477,7 +1494,7 @@ impl PopoutWindow {
                                 } else {
                                     d.name.clone()
                                 })
-                                .on_click(move |_, _, _| {
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     (send)(
                                         HuddleControlCommand::SetAudioDevices {
                                             input: inp.clone(),
@@ -1485,7 +1502,9 @@ impl PopoutWindow {
                                         }
                                         .into(),
                                     );
-                                })
+                                    this.close_huddle_popovers();
+                                    cx.notify();
+                                }))
                         }),
                 ),
             )
