@@ -2556,3 +2556,221 @@ fn wired_wave9_usergroups_later_todos_and_vip_sound_guards(cx: &mut gpui::TestAp
 
     drop(root);
 }
+
+#[gpui::test]
+fn wired_huddle_leave_race_and_multi_workspace_isolation(cx: &mut gpui::TestAppContext) {
+    let people = [user("U0ME", "me"), user("U0PEER", "peer")];
+    let ((b1, c1), (b2, c2)) = cx.update(|cx| {
+        (
+            make_wired_workspace("T0ONE", "One", &[("C0ONE", "one")], &people, cx),
+            make_wired_workspace("T0TWO", "Two", &[("C0TWO", "two")], &people, cx),
+        )
+    });
+    let mut fx = b1.snapshot(&HashMap::new()).expect("ws1 snapshot");
+    fx.set_rail_workspaces(vec![b1.team_summary().unwrap(), b2.team_summary().unwrap()]);
+    let (root, app, cx) = mount_wired(fx, vec![b1, b2], cx);
+    let one = ChannelId::from("C0ONE");
+    let two = ChannelId::from("C0TWO");
+
+    // 1. Join huddle in workspace 0 and transition to Connected.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.join_huddle_in(one.clone(), window, cx));
+        c1.emit(
+            Event::Huddle(HuddleEvent::SessionChanged(Box::new(
+                HuddleSessionSnapshot {
+                    phase: HuddlePhase::Connected,
+                    channel: one.clone(),
+                    call_id: "R0ONE".into(),
+                    ..Default::default()
+                },
+            ))),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let app_ref = app.read(cx);
+        assert_eq!(app_ref.huddle_owner, Some(0));
+        assert!(app_ref.huddle_dock.is_some());
+    });
+
+    // 2. High-frequency HuddleMediaEvent from non-owning workspace 1 must be ignored.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.on_huddle_media_event(
+                1,
+                &HuddleMediaEvent::AudioLevels(slackless_core::huddle::HuddleAudioLevels {
+                    local_rms: 0.99,
+                    active_speakers: vec![(UserId::from("U0PEER"), 0.88)],
+                    muted_peers: Vec::new(),
+                }),
+                window,
+                cx,
+            );
+            let levels = app.huddle_state.as_ref().unwrap().read(cx).levels();
+            assert_eq!(
+                levels.local_rms, 0.0,
+                "WS 1 media events must not bleed into WS 0's huddle state"
+            );
+        });
+    });
+
+    // 3. InviteCancelled from WS 1 must NOT dismiss an active invite belonging to WS 0.
+    cx.update(|_, cx| {
+        c1.emit(
+            Event::Huddle(HuddleEvent::Invite {
+                channel: one.clone(),
+                inviter: UserId::from("U0PEER"),
+                call_id: "R0INV".into(),
+            }),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert!(app.read(cx).huddle_invite.is_some());
+        assert_eq!(app.read(cx).huddle_invite_owner, Some(0));
+        c2.emit(
+            Event::Huddle(HuddleEvent::InviteCancelled {
+                channel: None,
+                call_id: None,
+            }),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert!(
+            app.read(cx).huddle_invite.is_some(),
+            "WS 1 InviteCancelled must not dismiss WS 0's invite banner"
+        );
+        c1.emit(
+            Event::Huddle(HuddleEvent::InviteCancelled {
+                channel: Some(one.clone()),
+                call_id: Some("R0INV".into()),
+            }),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert!(app.read(cx).huddle_invite.is_none());
+    });
+
+    // 4. HuddleEvent::Updated arriving for unvisited WS 1 must populate WS 1's sidebar on first visit.
+    cx.update(|_, cx| {
+        c2.emit(
+            Event::Huddle(HuddleEvent::Updated {
+                channel: two.clone(),
+                participants: vec![UserId::from("U0PEER")],
+                ended: false,
+                topic: None,
+                background_id: None,
+                thread_root_ts: None,
+            }),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.switch_workspace(1, window, cx));
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let app_ref = app.read(cx);
+        assert_eq!(app_ref.workspace, 1);
+        assert!(
+            app_ref.ws.active_huddles.contains_key(&two),
+            "WS 1 active_huddles must survive into first visit"
+        );
+    });
+
+    // 5. Clicking Leave clears the dock; stale queued Connected/Leaving snapshots for the leaving
+    //    call must NOT resurrect the dock, and Idle clears `huddle_leaving_call`.
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| app.leave_huddle(cx));
+    });
+    cx.update(|_, cx| {
+        let app_ref = app.read(cx);
+        assert!(app_ref.huddle_dock.is_none());
+        assert_eq!(app_ref.huddle_leaving_call, Some((0, "R0ONE".to_owned())));
+        c1.emit(
+            Event::Huddle(HuddleEvent::SessionChanged(Box::new(
+                HuddleSessionSnapshot {
+                    phase: HuddlePhase::Connected,
+                    channel: one.clone(),
+                    call_id: "R0ONE".into(),
+                    ..Default::default()
+                },
+            ))),
+            cx,
+        );
+        c1.emit(
+            Event::Huddle(HuddleEvent::SessionChanged(Box::new(
+                HuddleSessionSnapshot {
+                    phase: HuddlePhase::Leaving,
+                    channel: one.clone(),
+                    call_id: "R0ONE".into(),
+                    ..Default::default()
+                },
+            ))),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert!(
+            app.read(cx).huddle_dock.is_none(),
+            "stale Connected/Leaving snapshots after Leave must never resurrect the huddle dock"
+        );
+        c1.emit(
+            Event::Huddle(HuddleEvent::SessionChanged(Box::new(
+                HuddleSessionSnapshot {
+                    phase: HuddlePhase::Idle,
+                    channel: one.clone(),
+                    call_id: "R0ONE".into(),
+                    ..Default::default()
+                },
+            ))),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert!(app.read(cx).huddle_leaving_call.is_none());
+    });
+
+    // 6. Toggling `huddle_save_transcripts` forwards `SetSaveHuddleTranscripts` to ALL workspaces.
+    let _ = c1.drain_commands();
+    let _ = c2.drain_commands();
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            let prefs = app.preferences.clone();
+            prefs.update(cx, |p, cx| {
+                let mut s = p.settings().clone();
+                s.huddle_save_transcripts = !s.huddle_save_transcripts;
+                p.load_settings(s, window, cx);
+            });
+            app.apply_preferences(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let has_save_cmd = |core: &TestCoreHandle| {
+        core.drain_commands().iter().any(|c| {
+            matches!(
+                c,
+                Command::Workspace(WorkspaceCommand::SetSaveHuddleTranscripts(_))
+            )
+        })
+    };
+    assert!(
+        has_save_cmd(&c1),
+        "WS 0 must receive SetSaveHuddleTranscripts"
+    );
+    assert!(
+        has_save_cmd(&c2),
+        "WS 1 must receive SetSaveHuddleTranscripts"
+    );
+
+    drop(root);
+}

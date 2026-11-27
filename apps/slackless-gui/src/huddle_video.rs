@@ -515,6 +515,33 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn video_store_rejects_zero_dimension_frames_and_tracks_active_popout_count(
+        cx: &mut TestAppContext,
+    ) {
+        let store = cx.update(HuddleVideoStore::new);
+        let tile = VideoTileKey::LocalCamera;
+
+        assert_eq!(store.read_with(cx, |s, _| s.active_popout_count()), 0);
+        let g1 = store.read_with(cx, |s, _| s.register_popout());
+        assert_eq!(store.read_with(cx, |s, _| s.active_popout_count()), 1);
+        let g2 = store.read_with(cx, |s, _| s.register_popout());
+        assert_eq!(store.read_with(cx, |s, _| s.active_popout_count()), 2);
+
+        // 0x0, 0xH, Wx0 frames must be rejected without panicking or populating `frames()`.
+        for (w, h) in [(0, 0), (0, 8), (8, 0)] {
+            let empty = VideoFrame::from_bgra(w, h, Vec::new());
+            store.update(cx, |s, cx| s.update_frame(tile.clone(), &empty, cx));
+        }
+        cx.run_until_parked();
+        assert!(store.read_with(cx, |s, _| s.frames().is_empty()));
+
+        drop(g2);
+        assert_eq!(store.read_with(cx, |s, _| s.active_popout_count()), 1);
+        drop(g1);
+        assert_eq!(store.read_with(cx, |s, _| s.active_popout_count()), 0);
+    }
+
     #[test]
     fn format_elapsed_renders_mm_ss_and_h_mm_ss() {
         assert_eq!(format_elapsed(0), "00:00");

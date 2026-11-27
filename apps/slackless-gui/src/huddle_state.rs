@@ -1560,4 +1560,38 @@ mod tests {
         assert!(log.contains(&"send_draw".to_owned()));
         assert!(log.contains(&"audio_settings".to_owned()));
     }
+
+    #[gpui::test]
+    fn set_draw_mode_while_sharing_opens_floating_panel_and_request_leave_emits_leave(
+        cx: &mut TestAppContext,
+    ) {
+        let (state, events) = make_state(cx);
+        cx.update(|cx| {
+            state.update(cx, |s, cx| {
+                // Start sharing, then clear logged events before toggling draw mode on.
+                let mut sharing_snap = s.session().clone();
+                sharing_snap.sharing = true;
+                sharing_snap.share_source_id = Some("monitor:1".into());
+                s.update_session(sharing_snap, cx);
+            });
+        });
+        events.borrow_mut().clear();
+
+        cx.update(|cx| {
+            state.update(cx, |s, cx| {
+                s.set_draw_mode(true, cx);
+                assert!(s.draw_mode());
+                s.request_leave(cx);
+            });
+        });
+        let log = events.borrow();
+        assert!(
+            log.contains(&"open_floating".to_owned()),
+            "enabling draw_mode while sharing must reopen the floating control bar: {log:?}"
+        );
+        assert!(
+            log.contains(&"leave".to_owned()),
+            "request_leave must emit HuddleStateEvent::Leave: {log:?}"
+        );
+    }
 }
