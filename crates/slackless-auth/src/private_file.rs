@@ -8,6 +8,37 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Monotonic per-process counter for unique sibling temp filenames during atomic saves.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Acquires an exclusive advisory OS lock on a sibling `<target>.lock` file so concurrent
+/// GUI/CLI read-modify-write sequences cannot clobber each other's updates. Drop the returned
+/// file handle to release the lock.
+pub(crate) fn lock_private_file(target: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = lock_file_path(target);
+    let file = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        opts.open(&lock_path)?
+    };
+    file.lock()?;
+    Ok(file)
+}
+
+fn lock_file_path(target: &Path) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| std::ffi::OsString::from("secrets"));
+    name.push(".lock");
+    target.with_file_name(name)
+}
+
 /// Replaces the file at `target` with `bytes`: writes a uniquely named sibling temp file
 /// (owner-only `0600` on Unix), syncs it, then renames it over `target`. On failure the temp
 /// file is removed and `target` is left as it was.

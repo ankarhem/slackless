@@ -67,6 +67,7 @@ impl SecretStore {
                 &encode_envelope(trimmed).expect("one string always serializes"),
             )
         } else {
+            let _lock = crate::private_file::lock_private_file(&self.path)?;
             let mut map = self.read_file_map()?;
             map.insert(account.to_owned(), trimmed.to_owned());
             self.write_file_map(&map)
@@ -97,6 +98,7 @@ impl SecretStore {
             self.keychain.delete(account)?;
         }
         if self.path.exists() {
+            let _lock = crate::private_file::lock_private_file(&self.path)?;
             let mut map = self.read_file_map()?;
             if map.remove(account).is_some() {
                 self.write_file_map(&map)?;

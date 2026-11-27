@@ -2173,3 +2173,95 @@ fn skill_has_a_heading_for_every_command() {
         "commands without a `#### <command>` heading in SKILL.md: {missing:?}"
     );
 }
+
+#[test]
+fn parse_canvas_share_target_resolves_comma_separated_channel_names_without_corruption() {
+    use crate::live::{CanvasShareTarget, parse_canvas_share_target};
+    use slackless_core::types::ChannelId;
+
+    let target = parse_canvas_share_target(
+        &["#general, #engineering; C01OPS".to_owned()],
+        &[],
+        |name| match name {
+            "#general" => ChannelId::from("C01GEN"),
+            "#engineering" => ChannelId::from("C01ENG"),
+            other => ChannelId::from(other),
+        },
+    )
+    .expect("resolve mixed comma-separated channel names and IDs");
+    assert_eq!(
+        target,
+        CanvasShareTarget::Channels(vec![
+            ChannelId::from("C01GEN"),
+            ChannelId::from("C01ENG"),
+            ChannelId::from("C01OPS"),
+        ])
+    );
+}
+
+#[test]
+fn json_flag_with_out_file_preserves_requested_markdown_export_format() {
+    use crate::archive::Archive;
+    use crate::commands::messages::{ExportCmdOpts, cmd_export_in_archive};
+    use slackless_core::store::Store;
+    use slackless_core::types::{ChannelId, Conversation, Message, TeamId, Ts};
+    use std::process::ExitCode;
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("slackless-cli-export-md-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let db = tmp_dir.join("T1.sqlite");
+    let ws = TeamId::from("T1");
+    {
+        let mut store = Store::open(&db).unwrap();
+        store
+            .upsert_conversation(
+                &ws,
+                &Conversation {
+                    id: ChannelId::from("C1"),
+                    name: Some("general".into()),
+                    is_channel: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .upsert_message(
+                &ws,
+                &ChannelId::from("C1"),
+                &Message {
+                    ts: Ts::from("1700000001.000000"),
+                    text: "hello markdown export".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let archive = Archive::open_path(&db).unwrap().unwrap();
+    let out_md = tmp_dir.join("out.md");
+    let code = cmd_export_in_archive(
+        &crate::Ctx::new(true, None),
+        &ws,
+        Some(&archive),
+        ExportCmdOpts {
+            channel: Some("#general"),
+            thread_ts: None,
+            transcript_file_id: None,
+            huddle_call_id: None,
+            include_threads: false,
+            include_deleted: false,
+            format: ExportFormat::Md,
+            limit: 50,
+            out: Some(&out_md),
+        },
+    )
+    .unwrap();
+    assert_eq!(code, ExitCode::SUCCESS);
+    let written = std::fs::read_to_string(&out_md).unwrap();
+    assert!(
+        written.contains("# #general") && written.contains("hello markdown export"),
+        "expected Markdown export even when global --json is set with --out, got: {written}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

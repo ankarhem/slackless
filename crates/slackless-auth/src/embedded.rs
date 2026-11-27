@@ -46,8 +46,13 @@ pub struct SignInRequest {
 impl SignInRequest {
     /// The page the sign-in window opens on.
     pub fn url(&self) -> String {
-        match self.workspace_domain.as_deref().filter(|d| !d.is_empty()) {
-            Some(domain) => domain_url(domain),
+        match self
+            .workspace_domain
+            .as_deref()
+            .and_then(domain_url)
+            .filter(|url| is_slack_https_url(url))
+        {
+            Some(url) => url,
             None => format!("{WEB_ORIGIN}/signin"),
         }
     }
@@ -128,7 +133,7 @@ fn team_workspace_url(team: &Value) -> Option<String> {
             team.get("domain")
                 .and_then(Value::as_str)
                 .filter(|d| !d.is_empty())?,
-        ),
+        )?,
     };
     is_slack_https_url(&url).then_some(url)
 }
@@ -137,17 +142,48 @@ fn team_workspace_url(team: &Value) -> Option<String> {
 /// `localConfig_v2`, and the only workspace URLs a captured session's credentials may go to.
 fn is_slack_https_url(raw: &str) -> bool {
     Url::parse(raw).is_ok_and(|url| {
-        url.scheme() == "https" && url.host_str().is_some_and(is_trusted_slack_host)
+        url.scheme() == "https"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.host_str().is_some_and(is_trusted_slack_host)
     })
 }
 
 /// `acme` -> `https://acme.slack.com/`; Grid `acme.enterprise` -> `https://acme.enterprise.slack.com/`;
-/// a full `*.slack.com` host (`acme.enterprise.slack.com`) is kept.
-fn domain_url(domain: &str) -> String {
-    if domain.ends_with(".slack.com") {
-        format!("https://{domain}/")
+/// a full `*.slack.com` host or `https://*.slack.com/...` URL is normalized cleanly; untrusted
+/// hosts, userinfo (`@`), or malformed domain tokens return `None`.
+fn domain_url(domain: &str) -> Option<String> {
+    let trimmed = domain.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("https://")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("HTTPS://")
+        || trimmed.starts_with("HTTP://")
+    {
+        let parsed = Url::parse(trimmed).ok()?;
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return None;
+        }
+        let host = parsed.host_str()?;
+        return is_trusted_slack_host(host).then(|| format!("https://{host}/"));
+    }
+    // Bare workspace subdomain or `*.slack.com` host: reject paths, userinfo, ports, or whitespace.
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'))
+        || trimmed.starts_with('.')
+        || trimmed.ends_with('.')
+        || trimmed.contains("..")
+    {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "slack.com" || lower.ends_with(".slack.com") {
+        Some(format!("https://{trimmed}/"))
     } else {
-        format!("https://{domain}.slack.com/")
+        Some(format!("https://{trimmed}.slack.com/"))
     }
 }
 
@@ -467,6 +503,23 @@ mod tests {
         assert!(!is_slack_cookie_domain("evilslack.com"));
         assert!(!is_slack_cookie_domain("slack.com.evil.example"));
         assert!(!is_slack_cookie_domain("example.com"));
+    }
+
+    #[test]
+    fn sign_in_request_url_normalizes_full_urls_and_rejects_untrusted_domains() {
+        let req = |d: &str| {
+            SignInRequest {
+                workspace_domain: Some(d.to_owned()),
+            }
+            .url()
+        };
+        assert_eq!(req("acme"), "https://acme.slack.com/");
+        assert_eq!(req("https://acme.slack.com/"), "https://acme.slack.com/");
+        assert_eq!(
+            req("https://acme.enterprise.slack.com/client/T1"),
+            "https://acme.enterprise.slack.com/"
+        );
+        assert_eq!(req("evil.com@attacker.org"), "https://app.slack.com/signin");
     }
 
     #[test]

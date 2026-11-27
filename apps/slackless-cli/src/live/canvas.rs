@@ -266,21 +266,15 @@ pub(crate) fn parse_canvas_share_target(
         let mut seen = HashSet::new();
         let mut resolved = Vec::with_capacity(channels.len());
         for raw in channels {
-            let trimmed = raw.trim();
-            if trimmed.contains([',', ';']) {
-                let (parsed_chs, _) = domain_canvas::parse_share_targets(trimmed);
-                if !parsed_chs.is_empty() {
-                    for id in parsed_chs {
-                        if seen.insert(id.clone()) {
-                            resolved.push(id);
-                        }
-                    }
-                    continue;
+            for token in raw
+                .split([',', ';'])
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                let id = resolve_ch(token);
+                if seen.insert(id.clone()) {
+                    resolved.push(id);
                 }
-            }
-            let id = resolve_ch(trimmed);
-            if seen.insert(id.clone()) {
-                resolved.push(id);
             }
         }
         Ok(CanvasShareTarget::Channels(resolved))
@@ -288,18 +282,23 @@ pub(crate) fn parse_canvas_share_target(
         let mut seen = HashSet::new();
         let mut resolved = Vec::with_capacity(users.len());
         for raw in users {
-            let trimmed = raw.trim();
-            let (_, parsed_users) = domain_canvas::parse_share_targets(trimmed);
-            if !parsed_users.is_empty() {
-                for id in parsed_users {
+            for token in raw
+                .split([',', ';'])
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                let (_, parsed_users) = domain_canvas::parse_share_targets(token);
+                if !parsed_users.is_empty() {
+                    for id in parsed_users {
+                        if seen.insert(id.clone()) {
+                            resolved.push(id);
+                        }
+                    }
+                } else {
+                    let id = UserId::from(token.trim_start_matches('@').to_owned());
                     if seen.insert(id.clone()) {
                         resolved.push(id);
                     }
-                }
-            } else {
-                let id = UserId::from(trimmed.trim_start_matches('@').to_owned());
-                if seen.insert(id.clone()) {
-                    resolved.push(id);
                 }
             }
         }

@@ -34,7 +34,8 @@ pub async fn run_watch(
     let mut archive = Archive::open_rw_or_report(&session.team_id);
     let filter_ch =
         channel_arg.map(|ch| resolve_channel_with(archive.as_ref(), &session.team_id, ch).0);
-    let mut cfg = RtmConfig::new(ConnectParams::new(session.xoxc_token.clone()));
+    let mut cfg =
+        RtmConfig::new(ConnectParams::new(session.xoxc_token.clone()).with_team(&session.team_id));
     cfg.d_cookie = Some(session.d_cookie.clone());
     let (_rtm, mut rx, driver) = match RtmClient::new(cfg) {
         Ok(parts) => parts,

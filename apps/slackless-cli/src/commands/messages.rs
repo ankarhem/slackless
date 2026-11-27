@@ -253,10 +253,12 @@ fn export_search_if_asked(
     if format.is_none() && out.is_none() {
         return Ok(false);
     }
-    let effective = if ctx.json {
-        ExportFormat::Json
-    } else {
-        format.unwrap_or(ExportFormat::Md)
+    let effective = match format {
+        Some(explicit) if out.is_some() => explicit,
+        Some(_) if ctx.json => ExportFormat::Json,
+        Some(explicit) => explicit,
+        None if ctx.json && out.is_none() => ExportFormat::Json,
+        None => ExportFormat::Md,
     };
     let rendered = match effective {
         ExportFormat::Json => serde_json::to_string_pretty(json)?,
@@ -987,7 +989,7 @@ pub(crate) fn cmd_export_in_archive(
     archive: Option<&Archive>,
     opts: ExportCmdOpts<'_>,
 ) -> Result<ExitCode> {
-    let effective = if ctx.json {
+    let effective = if ctx.json && opts.out.is_none() {
         CoreExportFormat::Json
     } else {
         match opts.format {

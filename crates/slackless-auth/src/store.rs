@@ -13,7 +13,7 @@ use slackless_types::TeamId;
 
 use crate::error::{AuthError, Result};
 use crate::keychain::{KeychainBackend, SecurityKeychain};
-use crate::private_file::replace_private_file;
+use crate::private_file::{lock_private_file, replace_private_file};
 use crate::session::Session;
 
 /// Durable store for one-or-more [`Session`]s.
@@ -102,6 +102,7 @@ impl SessionStore {
     /// the Keychain (skipping workspaces whose Keychain entry is already identical) and are
     /// blanked on disk.
     pub fn save(&self, sessions: &[Session]) -> Result<()> {
+        let _lock = lock_private_file(&self.path)?;
         if self.use_keychain {
             for s in sessions {
                 if !s.has_secrets() {
@@ -147,7 +148,25 @@ impl SessionStore {
     /// Inserts or replaces the session for its `team_id` without rewriting unrelated workspaces'
     /// Keychain items.
     pub fn upsert(&self, session: Session) -> Result<()> {
+        let _lock = lock_private_file(&self.path)?;
         let mut sessions = self.read_file()?;
+        // If Keychain mirroring is enabled and an unrelated session still carries plaintext
+        // secrets on disk (e.g. from a file-only migration), preserve them in Keychain before
+        // `write_sessions_file` blanks on-disk secrets.
+        if self.use_keychain {
+            for other in &sessions {
+                if other.team_id != session.team_id && other.has_secrets() {
+                    let encoded = encode_secret(other);
+                    let unchanged = self
+                        .keychain
+                        .get(other.team_id.as_str())?
+                        .is_some_and(|blob| blob == encoded);
+                    if !unchanged {
+                        self.keychain.set(other.team_id.as_str(), &encoded)?;
+                    }
+                }
+            }
+        }
         let secrets_changed = match sessions.iter_mut().find(|s| s.team_id == session.team_id) {
             Some(existing) => {
                 let changed = if self.use_keychain {
@@ -187,6 +206,7 @@ impl SessionStore {
 
     /// Removes the session for `team_id`. Returns whether one was present.
     pub fn remove(&self, team_id: &TeamId) -> Result<bool> {
+        let _lock = lock_private_file(&self.path)?;
         let mut sessions = self.read_file()?;
         let before = sessions.len();
         sessions.retain(|s| &s.team_id != team_id);
@@ -476,9 +496,9 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(
-            entries,
-            vec!["sessions.json".to_owned()],
+        assert!(
+            entries.iter().any(|e| e == "sessions.json")
+                && !entries.iter().any(|e| e.ends_with(".tmp")),
             "no leftover .tmp files expected, found: {entries:?}"
         );
 
@@ -514,5 +534,55 @@ mod tests {
             leftover_tmps.is_empty(),
             "temp file must be cleaned up on failure, found: {leftover_tmps:?}"
         );
+    }
+
+    #[test]
+    fn concurrent_upserts_preserve_all_workspaces_and_migrate_plaintext_secrets_to_keychain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+
+        // 1. Concurrent upserts of distinct workspaces must not lose updates under file locking.
+        let store = SessionStore::with_path(&path);
+        std::thread::scope(|scope| {
+            for i in 0..8usize {
+                let store = store.clone();
+                scope.spawn(move || {
+                    store
+                        .upsert(Session::new(
+                            format!("https://team-{i}.slack.com/"),
+                            format!("T{i}"),
+                            format!("xoxc-{i}"),
+                            format!("xoxd-{i}"),
+                            format!("U{i}"),
+                        ))
+                        .expect("locked upsert succeeds");
+                });
+            }
+        });
+        let loaded = store.load().expect("load after concurrent upserts");
+        assert_eq!(loaded.len(), 8, "all 8 concurrent upserts must survive");
+
+        // 2. Switching to Keychain mode and upserting T9 must migrate T0..T7 secrets to Keychain
+        //    before blanking them on disk.
+        let kc = Arc::new(MockKeychain::default());
+        let kc_store = SessionStore::with_keychain(&path, kc);
+        kc_store
+            .upsert(Session::new(
+                "https://team-9.slack.com/",
+                "T9",
+                "xoxc-9",
+                "xoxd-9",
+                "U9",
+            ))
+            .expect("keychain upsert succeeds");
+        let hydrated = kc_store.load().expect("load hydrated");
+        assert_eq!(hydrated.len(), 9);
+        for s in &hydrated {
+            assert!(
+                s.has_secrets(),
+                "migrated session {} must retain secrets in Keychain",
+                s.team_id
+            );
+        }
     }
 }

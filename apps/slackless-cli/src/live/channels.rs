@@ -404,6 +404,7 @@ pub async fn run_backfill(
         include_threads,
         max_pages,
     };
+    let multi_target = targets.len() > 1;
     let mut summaries = Vec::with_capacity(targets.len());
     for (channel, label) in targets {
         let prior = spans.get(&channel).cloned();
@@ -417,6 +418,17 @@ pub async fn run_backfill(
         };
         let stats = match walk_history(prior, walk, &mut sink).await {
             Ok(stats) => stats,
+            Err(CoreError::Api(err))
+                if multi_target
+                    && !err.is_auth_expired()
+                    && matches!(err, slackless_core::api::ApiError::Slack(_)) =>
+            {
+                eprintln!(
+                    "slackless: skipping {}: {err}",
+                    display_channel(&channel, label.as_deref())
+                );
+                continue;
+            }
             Err(CoreError::Api(err)) => return Ok(api_fail(ctx, &err)),
             Err(CoreError::Store(err)) => {
                 return Err(anyhow::Error::new(err).context("storing the backfilled history"));

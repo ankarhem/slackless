@@ -112,18 +112,50 @@ fn keychain_get(account: &str) -> Result<Option<String>> {
         .arg("-w")
         .output()?;
     match output.status.code() {
-        Some(0) => Ok(Some(
-            std::str::from_utf8(&output.stdout)
+        Some(0) => {
+            let raw = std::str::from_utf8(&output.stdout)
                 .map_err(|_| AuthError::Keychain("keychain item is not UTF-8".to_owned()))?
-                .trim_ascii_end()
-                .to_owned(),
-        )),
+                .trim_ascii_end();
+            Ok(Some(decode_keychain_stdout(raw)))
+        }
         // Not found is not an error: the caller falls back to whatever is on disk.
         Some(ITEM_NOT_FOUND) => Ok(None),
         _ => Err(AuthError::Keychain(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         )),
     }
+}
+
+/// macOS `security find-generic-password -w` prints hex bytes instead of raw text whenever the
+/// stored secret contains non-ASCII UTF-8 bytes or control characters. Decode even-length hex
+/// payloads back to UTF-8 JSON when they decode cleanly to a JSON object.
+#[cfg(any(test, target_os = "macos"))]
+fn decode_keychain_stdout(raw: &str) -> String {
+    if !raw.starts_with('{')
+        && !raw.is_empty()
+        && raw.len().is_multiple_of(2)
+        && raw.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        let mut bytes = Vec::with_capacity(raw.len() / 2);
+        let mut valid = true;
+        for pair in raw.as_bytes().as_chunks::<2>().0 {
+            if let Ok(s) = std::str::from_utf8(pair)
+                && let Ok(byte) = u8::from_str_radix(s, 16)
+            {
+                bytes.push(byte);
+            } else {
+                valid = false;
+                break;
+            }
+        }
+        if valid
+            && let Ok(decoded) = String::from_utf8(bytes)
+            && decoded.starts_with('{')
+        {
+            return decoded;
+        }
+    }
+    raw.to_owned()
 }
 
 #[cfg(target_os = "macos")]
@@ -315,5 +347,18 @@ mod tests {
             classify_delete_status(None, b""),
             Err(AuthError::Keychain(msg)) if msg.contains("None")
         ));
+    }
+
+    #[test]
+    fn decode_keychain_stdout_decodes_hex_non_ascii_json_and_preserves_plain_json() {
+        let plain = r#"{"xoxc":"xoxc-1","d":"xoxd-2"}"#;
+        assert_eq!(decode_keychain_stdout(plain), plain);
+
+        let non_ascii = r#"{"value":"sk-héllo-日本語"}"#;
+        let hex: String = non_ascii.bytes().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(decode_keychain_stdout(&hex), non_ascii);
+
+        // Plain non-JSON hex-looking secret is left untouched.
+        assert_eq!(decode_keychain_stdout("deadbeef"), "deadbeef");
     }
 }

@@ -380,7 +380,7 @@ fn parse_web_client(url: &Url, raw: &str) -> Result<DeepLink> {
     {
         let workspace_domain = host
             .strip_suffix(".slack.com")
-            .filter(|sub| !sub.is_empty() && !sub.contains('.'))
+            .filter(|sub| !sub.is_empty())
             .map(str::to_owned);
         let team_id = query_param_ci(url, "team").and_then(|v| sanitize_id(&v));
         let cid_query = query_param_ci(url, "cid").and_then(|v| sanitize_id(&v));
@@ -897,6 +897,21 @@ mod tests {
                 parse_deep_link(link).is_err(),
                 "expected cleartext http link to be rejected: {link}"
             );
+        }
+    }
+
+    #[test]
+    fn enterprise_grid_archive_permalink_preserves_workspace_domain() {
+        let link =
+            parse_deep_link("https://acme.enterprise.slack.com/archives/C01ENG/p1700000001234567")
+                .expect("parse grid archive link");
+        match link {
+            DeepLink::WebClient(web) => {
+                assert_eq!(web.workspace_domain.as_deref(), Some("acme.enterprise"));
+                assert_eq!(web.channel_id.as_deref(), Some("C01ENG"));
+                assert_eq!(web.message_ts.as_deref(), Some("1700000001.234567"));
+            }
+            other => panic!("expected WebClient link, got {other:?}"),
         }
     }
 }

@@ -63,6 +63,27 @@ fn quit_running_app_and_wait() -> Result<()> {
     Ok(())
 }
 
+/// Sanitize a release version string before embedding it in a staging directory name so untrusted
+/// characters or path traversal segments (`../`, `/`) can never escape the staging root.
+#[cfg(any(test, target_os = "macos"))]
+fn sanitize_stage_component(version: &str) -> String {
+    let cleaned: String = version
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned.contains("..") || cleaned.starts_with('.') {
+        "release".to_owned()
+    } else {
+        cleaned
+    }
+}
+
 #[cfg(target_os = "macos")]
 async fn download_and_install(
     release: &ReleaseInfo,
@@ -76,10 +97,14 @@ async fn download_and_install(
             .with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    let stage_dir = std::env::temp_dir().join(format!(
-        "slackless-cli-update-{}-{}",
+    let stage_root = target_app
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let safe_version = sanitize_stage_component(&release.version);
+    let stage_dir = stage_root.join(format!(
+        ".slackless-cli-update-{}-{safe_version}",
         std::process::id(),
-        release.version
     ));
     if stage_dir.exists() {
         std::fs::remove_dir_all(&stage_dir)
@@ -399,5 +424,14 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitize_stage_component_rejects_traversal_and_special_chars() {
+        assert_eq!(sanitize_stage_component("2026.11.27-01"), "2026.11.27-01");
+        assert_eq!(sanitize_stage_component("../../etc/passwd"), "release");
+        assert_eq!(sanitize_stage_component(".hidden"), "release");
+        assert_eq!(sanitize_stage_component(""), "release");
+        assert_eq!(sanitize_stage_component("v1.0/bad name"), "v1.0_bad_name");
     }
 }

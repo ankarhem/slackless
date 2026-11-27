@@ -732,14 +732,22 @@ pub(crate) async fn cmd_archive_index_semantic(
         ));
     }
 
-    let mut index = open_default_semantic_index().map_err(|e| anyhow::anyhow!("{e}"))?;
-    if args.rebuild {
-        index
-            .clear()
-            .context("clearing semantic_index.sqlite before rebuild")?;
-    }
     let embedder = OnnxEmbedder::load_from_dir(model, &setup.model_path)
         .map_err(|e| anyhow::anyhow!("loading ONNX embedding model: {e}"))?;
+    let mut index = open_default_semantic_index().map_err(|e| anyhow::anyhow!("{e}"))?;
+    if args.rebuild {
+        if args.single_workspace {
+            for (ws, _) in &archives {
+                index.delete_workspace(ws).with_context(|| {
+                    format!("clearing semantic vectors for {ws} before rebuild")
+                })?;
+            }
+        } else {
+            index
+                .clear()
+                .context("clearing semantic_index.sqlite before rebuild")?;
+        }
+    }
     let report = index_semantic_archives_with_embedder(ctx, &archives, &mut index, &embedder)?;
     emit_semantic_index_report(ctx, &report, &index)?;
     Ok(ExitCode::SUCCESS)
