@@ -236,14 +236,9 @@ impl PopoutWindow {
                 in_thread: !is_conversation
                     && matches!(&self.kind, PopoutKind::Thread { thread_ts, .. } if msg.ts != *thread_ts),
             };
-            let mut display = msg.clone();
-            let reactions = std::mem::take(&mut display.reactions);
-            let chips =
-                actions::reaction_chips(&key, &reactions, &self.fixtures, Some(&handler), cx)
-                    .map(|c| c.pl(px(48.)));
             let row_body = message_row_linked(
                 &self.fixtures,
-                &display,
+                msg,
                 Some(&handler),
                 Some(links),
                 grouped,
@@ -285,7 +280,6 @@ impl PopoutWindow {
                     })
                     .when(!is_saved && revealed, |row| row.bg(hover_bg))
                     .child(row_body)
-                    .children(chips)
                     .children(reply_bar_el)
                     .when(revealed, |row| {
                         row.child(

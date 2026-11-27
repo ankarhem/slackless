@@ -284,15 +284,9 @@ impl PopoutWindow {
                     this.handle_message_action(ch, m, action, window, cx);
                 });
             });
-            let mut display = msg.clone();
-            let reactions = std::mem::take(&mut display.reactions);
-            let key = format!("huddle-thread-row-{}", msg.ts.as_str());
-            let chips =
-                actions::reaction_chips(&key, &reactions, &self.fixtures, Some(&handler), cx)
-                    .map(|c| c.pl(px(48.)));
             let row_body = message_row_linked(
                 &self.fixtures,
-                &display,
+                msg,
                 Some(&handler),
                 Some(&links),
                 grouped,
@@ -300,12 +294,14 @@ impl PopoutWindow {
             );
             rows.push(
                 v_flex()
-                    .id(SharedString::from(key))
+                    .id(SharedString::from(format!(
+                        "huddle-thread-row-{}",
+                        msg.ts.as_str()
+                    )))
                     .group(msg_group)
                     .px_3()
                     .py_0p5()
                     .child(row_body)
-                    .children(chips)
                     .into_any_element(),
             );
             prev_msg = Some(msg);
