@@ -41,7 +41,9 @@ use crate::composer::{
 use crate::emoji::EmojiChoice;
 use crate::fixtures::Fixtures;
 use crate::later::SaveRequest;
-use crate::messages::{LinkHandler, LinkTarget, editing_avatar, message_row_linked, same_group};
+use crate::messages::{
+    DeletedRow, LinkHandler, LinkTarget, editing_avatar, message_row_linked, same_group,
+};
 use crate::slash::{Invocation, SlashKind};
 
 pub enum ThreadPanelEvent {
@@ -1014,72 +1016,35 @@ impl ThreadPanel {
         let deleted_ghost = crate::messages::is_deleted_ghost(message);
         let deleted_expanded =
             !deleted_ghost || (prefs.show_deleted_messages ^ self.toggled_deleted.contains(&ts));
-        if deleted_ghost && !deleted_expanded {
-            let (muted, fg, hover_bg) = (
-                cx.theme().muted_foreground,
-                cx.theme().foreground,
-                cx.theme().secondary.opacity(0.38),
-            );
-            let author = message
-                .user
-                .as_ref()
-                .map(|u| self.fixtures.user_name(u).to_owned())
-                .unwrap_or_else(|| "Unknown".to_owned());
-            let stamp = crate::messages::list_stamp(&ts);
+        // "Show" and "Hide" on a deleted message toggle whether it stands expanded.
+        let deleted_toggle = deleted_ghost.then(|| {
+            let panel = cx.entity().downgrade();
             let toggle_ts = ts.clone();
-            return h_flex()
-                .id(SharedString::from(format!(
-                    "thread-deleted-collapsed-{}",
-                    ts.as_str()
-                )))
-                .group("thread-deleted-row")
-                .w_full()
-                .min_w_0()
-                .items_center()
-                .gap_3()
-                .px_2()
-                .py_1()
-                .cursor_pointer()
-                .hover(move |el| el.bg(hover_bg))
-                .child(
-                    div()
-                        .w(px(36.))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            Icon::new(IconName::Trash)
-                                .size(px(12.))
-                                .text_color(muted.opacity(0.55)),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .items_center()
-                        .gap_2()
-                        .text_xs()
-                        .child(
-                            div()
-                                .italic()
-                                .text_color(muted.opacity(0.8))
-                                .child(format!("Deleted message \u{b7} {author} \u{b7} {stamp}")),
-                        )
-                        .child(
-                            div()
-                                .text_color(muted)
-                                .group_hover("thread-deleted-row", move |el| {
-                                    el.text_color(fg).underline()
-                                })
-                                .child("Show"),
-                        ),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_deleted(&toggle_ts, cx);
-                }))
-                .into_any_element();
+            Rc::new(move |_: &mut Window, cx: &mut App| {
+                let _ = panel.update(cx, |panel, cx| panel.toggle_deleted(&toggle_ts, cx));
+            })
+        });
+
+        // Minimal clickable placeholder row when a deleted message is collapsed (either because
+        // "Expand deleted messages by default" is off, or because the user clicked Hide on it).
+        if let Some(on_toggle) = deleted_toggle.clone().filter(|_| !deleted_expanded) {
+            return crate::messages::deleted_row(
+                DeletedRow {
+                    key: format!("thread-deleted-collapsed-{}", ts.as_str()),
+                    author: crate::messages::author_name_with(
+                        message,
+                        &self.fixtures,
+                        prefs.display_names_only,
+                    ),
+                    stamp: crate::messages::format_clock_with(&ts, prefs.clock_24h),
+                    gutter: crate::messages::message_avatar_size(prefs.compact),
+                    on_toggle,
+                },
+                cx,
+            )
+            .w_full()
+            .px_2()
+            .into_any_element();
         }
 
         let handler: ActionHandler = {
@@ -1121,38 +1086,29 @@ impl ThreadPanel {
             cx,
         );
         let text_inset = if prefs.compact { 36. } else { TEXT_INSET };
-        let card = if deleted_ghost {
-            let (muted, fg) = (cx.theme().muted_foreground, cx.theme().foreground);
-            let toggle_ts = ts.clone();
-            v_flex()
-                .min_w_0()
-                .child(div().opacity(0.65).child(card))
-                .child(
-                    h_flex()
-                        .pl(px(text_inset))
-                        .pt_0p5()
-                        .items_center()
-                        .gap_1p5()
-                        .text_xs()
-                        .child(div().italic().text_color(muted).child("deleted"))
-                        .child(div().text_color(muted).child("\u{b7}"))
-                        .child(
-                            div()
-                                .id(SharedString::from(format!(
-                                    "thread-deleted-hide-{}",
-                                    ts.as_str()
-                                )))
-                                .text_color(muted)
-                                .cursor_pointer()
-                                .hover(move |el| el.text_color(fg).underline())
-                                .child("Hide")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.toggle_deleted(&toggle_ts, cx);
-                                })),
-                        ),
-                )
-        } else {
-            card
+        let card = match &deleted_toggle {
+            Some(on_toggle) => {
+                let muted = cx.theme().muted_foreground;
+                v_flex()
+                    .min_w_0()
+                    .child(div().opacity(0.65).child(card))
+                    .child(
+                        h_flex()
+                            .pl(px(text_inset))
+                            .pt_0p5()
+                            .items_center()
+                            .gap_1p5()
+                            .text_xs()
+                            .child(div().italic().text_color(muted).child("deleted"))
+                            .child(div().text_color(muted).child("\u{b7}"))
+                            .child(crate::messages::deleted_hide(
+                                format!("thread-deleted-hide-{}", ts.as_str()),
+                                on_toggle.clone(),
+                                cx,
+                            )),
+                    )
+            }
+            None => card,
         };
         // Straddling the row's top edge would cut the root's bar off at the panel's top, so
         // Slack keeps it inside the row, 3pt down.
@@ -1346,7 +1302,12 @@ impl Render for ThreadPanel {
         match self.root.as_ref() {
             Some(root) => {
                 if self.unread_after.as_ref() == Some(&root.ts) {
-                    rows.push(new_messages_divider(cx).into_any_element());
+                    rows.push(
+                        div()
+                            .px_2()
+                            .child(crate::messages::new_messages_divider(cx))
+                            .into_any_element(),
+                    );
                 }
                 if self.reveal.as_ref() == Some(&root.ts) {
                     revealed = Some(rows.len());
@@ -1396,7 +1357,12 @@ impl Render for ThreadPanel {
                 for message in &self.replies {
                     let divider = self.unread_after.as_ref() == Some(&message.ts);
                     if divider {
-                        rows.push(new_messages_divider(cx).into_any_element());
+                        rows.push(
+                            div()
+                                .px_2()
+                                .child(crate::messages::new_messages_divider(cx))
+                                .into_any_element(),
+                        );
                     }
                     let grouped =
                         !divider && previous.is_some_and(|prev| same_group(prev, message));
@@ -1495,25 +1461,6 @@ impl Render for ThreadPanel {
             .child(body)
             .child(composer_area)
     }
-}
-
-/// The fixture-mode unread divider, styled like the transcript's in `messages.rs`.
-fn new_messages_divider(cx: &App) -> Div {
-    let danger = cx.theme().danger;
-    h_flex()
-        .items_center()
-        .gap_2()
-        .px_2()
-        .py_1()
-        .child(div().flex_1().h(px(1.)).bg(danger))
-        .child(
-            div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(danger)
-                .child("New"),
-        )
-        .child(div().flex_1().h(px(1.)).bg(danger))
 }
 
 #[cfg(test)]

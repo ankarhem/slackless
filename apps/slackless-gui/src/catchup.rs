@@ -8,7 +8,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use slackless_core::catchup::{
@@ -163,17 +163,106 @@ impl CatchUpView {
                         .child(title.to_uppercase()),
                 )
                 .child(
-                    div()
-                        .px_1p5()
-                        .py(px(1.))
-                        .rounded_full()
+                    Self::chip(count.to_string())
                         .bg(theme.secondary)
-                        .text_xs()
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.foreground)
-                        .child(count.to_string()),
+                        .text_color(theme.foreground),
                 ),
         )
+    }
+
+    /// The briefing's card: a hairline-bordered rounded row that highlights on hover. Its
+    /// rows sit 4px apart (an unread channel's 6px).
+    fn card(id: SharedString, cx: &App) -> Stateful<Div> {
+        let theme = cx.theme();
+        v_flex()
+            .id(id)
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(theme.border.opacity(0.7))
+            .bg(theme.background)
+            .cursor_pointer()
+            .hover(move |el| el.bg(theme.secondary.opacity(0.65)))
+    }
+
+    /// A card's header line: `lead` (the title group) at its left, `tail` (the chips and
+    /// the relative time) at its right end.
+    fn card_header(lead: Div, tail: Div) -> Div {
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(lead)
+            .child(tail)
+    }
+
+    /// The left of a card's header: the title, then its "in #channel" and workspace chips.
+    fn card_lead() -> Div {
+        h_flex().flex_1().min_w_0().items_center().gap_1p5()
+    }
+
+    /// The right of a card's header: the chips, then the relative time.
+    fn card_tail() -> Div {
+        h_flex().flex_none().items_center().gap_2()
+    }
+
+    /// A card's semibold truncated title: an author, a channel, a transcript's name.
+    fn card_title(text: String, cx: &App) -> Div {
+        div()
+            .min_w_0()
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(cx.theme().foreground)
+            .truncate()
+            .child(text)
+    }
+
+    /// The muted "in #channel" after a mention's author or a transcript's title.
+    fn card_place(label: &str, cx: &App) -> Div {
+        div()
+            .min_w_0()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .truncate()
+            .child(format!("in {label}"))
+    }
+
+    /// The workspace chip a card carries when the briefing spans several workspaces.
+    fn workspace_badge(label: String, cx: &App) -> Div {
+        div()
+            .flex_none()
+            .px_1p5()
+            .py(px(1.))
+            .rounded(px(4.))
+            .bg(cx.theme().secondary)
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(label)
+    }
+
+    /// A rounded chip (a count, a kind); the caller colors and weights it.
+    fn chip(text: String) -> Div {
+        div()
+            .px_1p5()
+            .py(px(1.))
+            .rounded_full()
+            .text_xs()
+            .child(text)
+    }
+
+    /// The relative time at a card's right end.
+    fn card_stamp(ts_secs: i64, now_secs: i64, cx: &App) -> Div {
+        div()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(Self::format_relative(ts_secs, now_secs))
     }
 
     fn render_mention_row(
@@ -184,38 +273,17 @@ impl CatchUpView {
         now_secs: i64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.theme();
-        let fg = theme.foreground;
-        let muted = theme.muted_foreground;
-        let border = theme.border;
-        let hover_bg = theme.secondary.opacity(0.65);
         let badge_color = match m.kind {
-            MentionKind::DirectMention => theme.danger,
-            MentionKind::DirectMessage => theme.primary,
-            MentionKind::Broadcast => theme.warning,
+            MentionKind::DirectMention => cx.theme().danger,
+            MentionKind::DirectMessage => cx.theme().primary,
+            MentionKind::Broadcast => cx.theme().warning,
         };
         let ws = m.workspace.clone();
         let ch = m.channel.clone();
         let ts = m.ts.clone();
         let thread_ts = m.thread_ts.clone();
-        let ws_label = m
-            .workspace_name
-            .clone()
-            .unwrap_or_else(|| m.workspace.as_str().to_owned());
 
-        v_flex()
-            .id(SharedString::from(format!("catchup-mention-{ix}")))
-            .w_full()
-            .min_w_0()
-            .gap_1()
-            .px_3()
-            .py_2()
-            .rounded(px(8.))
-            .border_1()
-            .border_color(border.opacity(0.7))
-            .bg(theme.background)
-            .cursor_pointer()
-            .hover(move |el| el.bg(hover_bg))
+        Self::card(SharedString::from(format!("catchup-mention-{ix}")), cx)
             .on_click(cx.listener(move |_, _, _, cx| {
                 if let Some(root_ts) = thread_ts.clone() {
                     cx.emit(CatchUpEvent::OpenThread {
@@ -231,80 +299,31 @@ impl CatchUpView {
                     });
                 }
             }))
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
+            .child(Self::card_header(
+                Self::card_lead()
+                    .child(Self::card_title(m.author_name.clone(), cx))
+                    .child(Self::card_place(&m.channel_label, cx))
+                    .when(show_workspace, |row| {
+                        row.child(Self::workspace_badge(
+                            workspace_label(&m.workspace_name, &m.workspace),
+                            cx,
+                        ))
+                    }),
+                Self::card_tail()
                     .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(fg)
-                                    .truncate()
-                                    .child(m.author_name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .truncate()
-                                    .child(format!("in {}", m.channel_label)),
-                            )
-                            .when(show_workspace, |row| {
-                                row.child(
-                                    div()
-                                        .flex_none()
-                                        .px_1p5()
-                                        .py(px(1.))
-                                        .rounded(px(4.))
-                                        .bg(theme.secondary)
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(ws_label),
-                                )
-                            }),
+                        Self::chip(m.kind.label().to_owned())
+                            .bg(badge_color.opacity(0.16))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(badge_color),
                     )
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .px_1p5()
-                                    .py(px(1.))
-                                    .rounded_full()
-                                    .bg(badge_color.opacity(0.16))
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(badge_color)
-                                    .child(m.kind.label()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(Self::format_relative(m.created_at, now_secs)),
-                            ),
-                    ),
-            )
+                    .child(Self::card_stamp(m.created_at, now_secs, cx)),
+            ))
             .child(
                 div()
                     .w_full()
                     .min_w_0()
                     .text_sm()
-                    .text_color(fg.opacity(0.9))
+                    .text_color(cx.theme().foreground.opacity(0.9))
                     .truncate()
                     .child(m.excerpt.clone()),
             )
@@ -320,31 +339,10 @@ impl CatchUpView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let fg = theme.foreground;
-        let muted = theme.muted_foreground;
-        let border = theme.border;
-        let hover_bg = theme.secondary.opacity(0.65);
-        let ws = u.workspace.clone();
-        let ch = u.channel.clone();
-        let latest_ts = u.latest_ts.clone();
-        let ws_label = u
-            .workspace_name
-            .clone()
-            .unwrap_or_else(|| u.workspace.as_str().to_owned());
+        let (ws, ch, latest_ts) = (u.workspace.clone(), u.channel.clone(), u.latest_ts.clone());
 
-        v_flex()
-            .id(SharedString::from(format!("catchup-unread-{ix}")))
-            .w_full()
-            .min_w_0()
+        Self::card(SharedString::from(format!("catchup-unread-{ix}")), cx)
             .gap_1p5()
-            .px_3()
-            .py_2()
-            .rounded(px(8.))
-            .border_1()
-            .border_color(border.opacity(0.7))
-            .bg(theme.background)
-            .cursor_pointer()
-            .hover(move |el| el.bg(hover_bg))
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(CatchUpEvent::OpenChannel {
                     workspace: ws.clone(),
@@ -352,93 +350,47 @@ impl CatchUpView {
                     ts: Some(latest_ts.clone()),
                 });
             }))
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
+            .child(Self::card_header(
+                Self::card_lead()
                     .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                Icon::new(if u.is_dm {
-                                    IconName::User
-                                } else {
-                                    IconName::Hash
-                                })
-                                .flex_none()
-                                .size(px(13.))
-                                .text_color(muted),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(fg)
-                                    .truncate()
-                                    .child(u.channel_label.clone()),
-                            )
-                            .when(show_workspace, |row| {
-                                row.child(
-                                    div()
-                                        .flex_none()
-                                        .px_1p5()
-                                        .py(px(1.))
-                                        .rounded(px(4.))
-                                        .bg(theme.secondary)
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(ws_label),
-                                )
-                            }),
+                        Icon::new(if u.is_dm {
+                            IconName::User
+                        } else {
+                            IconName::Hash
+                        })
+                        .flex_none()
+                        .size(px(13.))
+                        .text_color(theme.muted_foreground),
                     )
+                    .child(Self::card_title(u.channel_label.clone(), cx))
+                    .when(show_workspace, |row| {
+                        row.child(Self::workspace_badge(
+                            workspace_label(&u.workspace_name, &u.workspace),
+                            cx,
+                        ))
+                    }),
+                Self::card_tail()
+                    .gap_1p5()
+                    .when(u.mention_count > 0, |row| {
+                        row.child(
+                            Self::chip(format!("@{}", u.mention_count))
+                                .bg(theme.danger)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.danger_foreground),
+                        )
+                    })
                     .child(
-                        h_flex()
-                            .flex_none()
-                            .items_center()
-                            .gap_1p5()
-                            .when(u.mention_count > 0, |row| {
-                                row.child(
-                                    div()
-                                        .px_1p5()
-                                        .py(px(1.))
-                                        .rounded_full()
-                                        .bg(theme.danger)
-                                        .text_xs()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme.danger_foreground)
-                                        .child(format!("@{}", u.mention_count)),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .px_1p5()
-                                    .py(px(1.))
-                                    .rounded_full()
-                                    .bg(theme.secondary)
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(fg)
-                                    .child(format!(
-                                        "{} {}",
-                                        u.message_count,
-                                        if u.message_count == 1 { "msg" } else { "msgs" }
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(Self::format_relative(u.latest_at, now_secs)),
-                            ),
-                    ),
-            )
+                        Self::chip(format!(
+                            "{} {}",
+                            u.message_count,
+                            if u.message_count == 1 { "msg" } else { "msgs" }
+                        ))
+                        .bg(theme.secondary)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.foreground),
+                    )
+                    .child(Self::card_stamp(u.latest_at, now_secs, cx)),
+            ))
             .children(u.excerpts.iter().map(|ex| {
                 h_flex()
                     .w_full()
@@ -450,7 +402,7 @@ impl CatchUpView {
                             .flex_none()
                             .text_xs()
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(muted)
+                            .text_color(theme.muted_foreground)
                             .child(format!("{}:", ex.author_name)),
                     )
                     .child(
@@ -458,7 +410,7 @@ impl CatchUpView {
                             .flex_1()
                             .min_w_0()
                             .text_xs()
-                            .text_color(fg.opacity(0.88))
+                            .text_color(theme.foreground.opacity(0.88))
                             .truncate()
                             .child(ex.text.clone()),
                     )
@@ -475,31 +427,9 @@ impl CatchUpView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let fg = theme.foreground;
-        let muted = theme.muted_foreground;
-        let border = theme.border;
-        let hover_bg = theme.secondary.opacity(0.65);
-        let ws = t.workspace.clone();
-        let ch = t.channel.clone();
-        let thread_ts = t.thread_ts.clone();
-        let ws_label = t
-            .workspace_name
-            .clone()
-            .unwrap_or_else(|| t.workspace.as_str().to_owned());
+        let (ws, ch, thread_ts) = (t.workspace.clone(), t.channel.clone(), t.thread_ts.clone());
 
-        v_flex()
-            .id(SharedString::from(format!("catchup-thread-{ix}")))
-            .w_full()
-            .min_w_0()
-            .gap_1()
-            .px_3()
-            .py_2()
-            .rounded(px(8.))
-            .border_1()
-            .border_color(border.opacity(0.7))
-            .bg(theme.background)
-            .cursor_pointer()
-            .hover(move |el| el.bg(hover_bg))
+        Self::card(SharedString::from(format!("catchup-thread-{ix}")), cx)
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(CatchUpEvent::OpenThread {
                     workspace: ws.clone(),
@@ -507,75 +437,33 @@ impl CatchUpView {
                     thread_ts: thread_ts.clone(),
                 });
             }))
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
+            .child(Self::card_header(
+                Self::card_lead()
+                    .child(Self::card_title(t.channel_label.clone(), cx))
+                    .when(show_workspace, |row| {
+                        row.child(Self::workspace_badge(
+                            workspace_label(&t.workspace_name, &t.workspace),
+                            cx,
+                        ))
+                    }),
+                Self::card_tail()
                     .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(fg)
-                                    .truncate()
-                                    .child(t.channel_label.clone()),
-                            )
-                            .when(show_workspace, |row| {
-                                row.child(
-                                    div()
-                                        .flex_none()
-                                        .px_1p5()
-                                        .py(px(1.))
-                                        .rounded(px(4.))
-                                        .bg(theme.secondary)
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(ws_label),
-                                )
-                            }),
+                        Self::chip(format!(
+                            "+{} new ({} total)",
+                            t.new_reply_count, t.total_reply_count
+                        ))
+                        .bg(theme.primary.opacity(0.16))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.primary),
                     )
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .px_1p5()
-                                    .py(px(1.))
-                                    .rounded_full()
-                                    .bg(theme.primary.opacity(0.16))
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.primary)
-                                    .child(format!(
-                                        "+{} new ({} total)",
-                                        t.new_reply_count, t.total_reply_count
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(Self::format_relative(t.latest_reply_at, now_secs)),
-                            ),
-                    ),
-            )
+                    .child(Self::card_stamp(t.latest_reply_at, now_secs, cx)),
+            ))
             .child(
                 div()
                     .w_full()
                     .min_w_0()
                     .text_xs()
-                    .text_color(muted)
+                    .text_color(theme.muted_foreground)
                     .truncate()
                     .child(format!("{}: {}", t.root_author, t.root_excerpt)),
             )
@@ -584,7 +472,7 @@ impl CatchUpView {
                     .w_full()
                     .min_w_0()
                     .text_sm()
-                    .text_color(fg.opacity(0.92))
+                    .text_color(theme.foreground.opacity(0.92))
                     .truncate()
                     .child(format!(
                         "Latest \u{2014} {}: {}",
@@ -603,37 +491,19 @@ impl CatchUpView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let fg = theme.foreground;
-        let muted = theme.muted_foreground;
-        let border = theme.border;
-        let hover_bg = theme.secondary.opacity(0.65);
         let icon = match tr.kind {
             TranscriptKind::FileClip => IconName::Video,
             TranscriptKind::Huddle => IconName::Headphones,
         };
-        let ws = tr.workspace.clone();
-        let ch = tr.channel.clone();
-        let ts = tr.message_ts.clone();
-        let call_id = tr.call_id.clone();
-        let kind = tr.kind;
-        let ws_label = tr
-            .workspace_name
-            .clone()
-            .unwrap_or_else(|| tr.workspace.as_str().to_owned());
+        let (ws, ch, ts, call_id, kind) = (
+            tr.workspace.clone(),
+            tr.channel.clone(),
+            tr.message_ts.clone(),
+            tr.call_id.clone(),
+            tr.kind,
+        );
 
-        v_flex()
-            .id(SharedString::from(format!("catchup-transcript-{ix}")))
-            .w_full()
-            .min_w_0()
-            .gap_1()
-            .px_3()
-            .py_2()
-            .rounded(px(8.))
-            .border_1()
-            .border_color(border.opacity(0.7))
-            .bg(theme.background)
-            .cursor_pointer()
-            .hover(move |el| el.bg(hover_bg))
+        Self::card(SharedString::from(format!("catchup-transcript-{ix}")), cx)
             .on_click(cx.listener(move |_, _, _, cx| match kind {
                 TranscriptKind::Huddle => {
                     if let Some(cid) = call_id.clone() {
@@ -660,92 +530,49 @@ impl CatchUpView {
                     }
                 }
             }))
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
+            .child(Self::card_header(
+                Self::card_lead()
                     .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                Icon::new(icon)
-                                    .flex_none()
-                                    .size(px(14.))
-                                    .text_color(theme.primary),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(fg)
-                                    .truncate()
-                                    .child(tr.title.clone()),
-                            )
-                            .when_some(tr.channel_label.clone(), |row, label| {
-                                row.child(
-                                    div()
-                                        .min_w_0()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .truncate()
-                                        .child(format!("in {label}")),
-                                )
-                            })
-                            .when(show_workspace, |row| {
-                                row.child(
-                                    div()
-                                        .flex_none()
-                                        .px_1p5()
-                                        .py(px(1.))
-                                        .rounded(px(4.))
-                                        .bg(theme.secondary)
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(ws_label),
-                                )
-                            }),
-                    )
-                    .child(
-                        h_flex()
+                        Icon::new(icon)
                             .flex_none()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .px_1p5()
-                                    .py(px(1.))
-                                    .rounded_full()
-                                    .bg(theme.secondary)
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(format!("{} \u{00B7} {}", tr.kind.label(), tr.source)),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(Self::format_relative(tr.updated_at, now_secs)),
-                            ),
-                    ),
-            )
+                            .size(px(14.))
+                            .text_color(theme.primary),
+                    )
+                    .child(Self::card_title(tr.title.clone(), cx))
+                    .when_some(tr.channel_label.clone(), |row, label| {
+                        row.child(Self::card_place(&label, cx))
+                    })
+                    .when(show_workspace, |row| {
+                        row.child(Self::workspace_badge(
+                            workspace_label(&tr.workspace_name, &tr.workspace),
+                            cx,
+                        ))
+                    }),
+                Self::card_tail()
+                    .child(
+                        Self::chip(format!("{} \u{00B7} {}", tr.kind.label(), tr.source))
+                            .bg(theme.secondary)
+                            .text_color(theme.muted_foreground),
+                    )
+                    .child(Self::card_stamp(tr.updated_at, now_secs, cx)),
+            ))
             .child(
                 div()
                     .w_full()
                     .min_w_0()
                     .text_sm()
-                    .text_color(fg.opacity(0.9))
+                    .text_color(theme.foreground.opacity(0.9))
                     .truncate()
                     .child(tr.excerpt.clone()),
             )
             .into_any_element()
     }
+}
+
+/// The name a card shows for a workspace: its own, else its id.
+fn workspace_label(name: &Option<String>, workspace: &TeamId) -> String {
+    name.clone()
+        .unwrap_or_else(|| workspace.as_str().to_owned())
 }
 
 impl Render for CatchUpView {

@@ -1,5 +1,6 @@
-//! Message row rendering: transcript rows, cards, reply bars, headers, date/unread dividers,
-//! and compact membership lines.
+//! Message row rendering: transcript rows, cards, reply bars, headers, and compact
+//! membership lines; the day / unread dividers and the deleted-message placeholder live in
+//! [`super::shell`].
 
 use super::render::is_deleted_ghost;
 use super::*;
@@ -57,7 +58,7 @@ pub(super) fn transcript_row(
         row = row.child(date_divider(
             label,
             format!("day-{}", message.ts.as_str()),
-            this.downgrade(),
+            Some(this.downgrade()),
             cx,
         ));
     } else if new_break {
@@ -95,70 +96,35 @@ pub(super) fn transcript_row(
     let deleted_ghost = is_deleted_ghost(message);
     let deleted_expanded = !deleted_ghost
         || (prefs.show_deleted_messages ^ store.toggled_deleted.contains(&message.ts));
+    // "Show" and "Hide" on a deleted message toggle whether it stands expanded.
+    let deleted_toggle = deleted_ghost.then(|| {
+        let (list, ts) = (this.clone(), message.ts.clone());
+        Rc::new(move |_: &mut Window, cx: &mut App| {
+            list.update(cx, |list, cx| list.toggle_deleted(&ts, cx))
+        })
+    });
 
     // Minimal clickable placeholder row when a deleted message is collapsed (either because
     // "Expand deleted messages by default" is off, or because the user clicked Hide on it).
-    if deleted_ghost && !deleted_expanded && !editing {
-        let theme = cx.theme();
-        let (muted, fg, hover_bg) = (
-            theme.muted_foreground,
-            theme.foreground,
-            theme.secondary.opacity(0.38),
-        );
-        let toggle_list = this.clone();
-        let toggle_ts = message.ts.clone();
-        let collapsed = h_flex()
-            .id(SharedString::from(format!(
-                "deleted-collapsed-{}",
-                message.ts.as_str()
-            )))
-            .group("deleted-row")
-            .min_w_0()
-            .items_center()
-            .gap(row_gap_x)
+    if let Some(on_toggle) = deleted_toggle
+        .clone()
+        .filter(|_| !deleted_expanded && !editing)
+    {
+        return row.child(
+            deleted_row(
+                DeletedRow {
+                    key: format!("deleted-collapsed-{}", message.ts.as_str()),
+                    author,
+                    stamp,
+                    gutter: avatar_size,
+                    on_toggle,
+                },
+                cx,
+            )
             .ml(px(-GUTTER))
             .mr(px(-GUTTER))
-            .px(px(GUTTER))
-            .py(px(if prefs.compact { 2. } else { 4. }))
-            .cursor_pointer()
-            .hover(move |el| el.bg(hover_bg))
-            .child(
-                div()
-                    .w(px(avatar_size))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        Icon::new(IconName::Trash)
-                            .size(px(12.))
-                            .text_color(muted.opacity(0.55)),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .text_xs()
-                    .child(
-                        div()
-                            .italic()
-                            .text_color(muted.opacity(0.8))
-                            .child(format!("Deleted message \u{b7} {author} \u{b7} {stamp}")),
-                    )
-                    .child(
-                        div()
-                            .text_color(muted)
-                            .group_hover("deleted-row", move |el| el.text_color(fg).underline())
-                            .child("Show"),
-                    ),
-            )
-            .on_click(move |_, _window, cx| {
-                toggle_list.update(cx, |list, cx| list.toggle_deleted(&toggle_ts, cx));
-            });
-        return row.child(collapsed);
+            .px(px(GUTTER)),
+        );
     }
 
     let mut body = v_flex()
@@ -175,10 +141,8 @@ pub(super) fn transcript_row(
             Some(&handler),
             cx,
         );
-        if deleted_ghost {
-            let (muted, fg) = (cx.theme().muted_foreground, cx.theme().foreground);
-            let toggle_list = this.clone();
-            let toggle_ts = message.ts.clone();
+        if let Some(on_toggle) = &deleted_toggle {
+            let muted = cx.theme().muted_foreground;
             header = header
                 .child(
                     div()
@@ -187,21 +151,11 @@ pub(super) fn transcript_row(
                         .text_color(muted)
                         .child("\u{b7} deleted"),
                 )
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "deleted-hide-{}",
-                            message.ts.as_str()
-                        )))
-                        .text_xs()
-                        .text_color(muted)
-                        .cursor_pointer()
-                        .hover(move |el| el.text_color(fg).underline())
-                        .child("Hide")
-                        .on_click(move |_, _window, cx| {
-                            toggle_list.update(cx, |list, cx| list.toggle_deleted(&toggle_ts, cx));
-                        }),
-                );
+                .child(deleted_hide(
+                    format!("deleted-hide-{}", message.ts.as_str()),
+                    on_toggle.clone(),
+                    cx,
+                ));
         }
         body = body.child(header);
     }
@@ -670,7 +624,12 @@ pub(super) fn author_name(message: &Message, fixtures: &Fixtures) -> String {
     author_name_with(message, fixtures, false)
 }
 
-fn author_name_with(message: &Message, fixtures: &Fixtures, display_only: bool) -> String {
+/// The author's name as a row shows it: the display name when the preference asks for it.
+pub(crate) fn author_name_with(
+    message: &Message,
+    fixtures: &Fixtures,
+    display_only: bool,
+) -> String {
     message
         .user
         .as_ref()
@@ -1137,79 +1096,6 @@ fn message_header(
         .child(div().text_xs().text_color(muted).child(stamp))
 }
 
-/// Slack's day divider: a full-width rule with the day's pill (label, then a chevron) on it.
-/// The date divider's "Jump to…" targets.
-#[derive(Clone, Copy)]
-pub enum Jump {
-    Recent,
-    Yesterday,
-    LastWeek,
-    LastMonth,
-    Beginning,
-}
-
-fn date_divider(label: String, key: String, list: WeakEntity<MessageList>, cx: &App) -> Div {
-    let theme = cx.theme();
-    let (border, background, fg) = (theme.border, theme.background, theme.foreground);
-    // Slack's pill: 28px high, 13px bold, 16px before the label and 8px after its small
-    // chevron, a 13% foreground ring and a faint drop shadow.
-    let pill = Button::new(SharedString::from(key))
-        .outline()
-        .with_size(Size::XSmall)
-        .rounded(ButtonRounded::Size(px(999.)))
-        .h(px(28.))
-        .pl(px(16.))
-        .pr(px(8.))
-        .bg(background)
-        .border_color(fg.opacity(0.13))
-        .child(
-            div()
-                .text_size(px(13.))
-                .font_weight(FontWeight::BOLD)
-                .text_color(fg)
-                .child(label),
-        )
-        .child(
-            Icon::new(IconName::ChevronDown)
-                .size(px(10.))
-                .text_color(fg),
-        );
-    // `Button::shadow` toggles the kit's own shadow; this is the element's.
-    let pill = gpui_kit::gpui::Styled::shadow(
-        pill,
-        vec![gpui_kit::gpui::BoxShadow {
-            color: Hsla::black().opacity(0.08),
-            offset: gpui_kit::gpui::point(px(0.), px(1.)),
-            blur_radius: px(3.),
-            spread_radius: px(0.),
-            inset: false,
-        }],
-    );
-    h_flex()
-        .items_center()
-        .py_1()
-        .child(div().flex_1().h(px(1.)).bg(border))
-        .child(
-            pill.dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
-                menu = menu.label("Jump to…");
-                for (jump, text) in [
-                    (Jump::Recent, "Most recent"),
-                    (Jump::Yesterday, "Yesterday"),
-                    (Jump::LastWeek, "Last week"),
-                    (Jump::LastMonth, "Last month"),
-                    (Jump::Beginning, "The very beginning"),
-                ] {
-                    let list = list.clone();
-                    menu = menu.item(PopupMenuItem::new(text).on_click(move |_, _, cx| {
-                        let _ = list.update(cx, |list, cx| list.jump(jump, cx));
-                    }));
-                }
-                menu
-            }),
-        )
-        .child(div().flex_1().h(px(1.)).bg(border))
-}
-
 fn is_membership(message: &Message) -> bool {
     matches!(
         message.subtype,
@@ -1334,24 +1220,6 @@ fn membership_link(
         .hover(|el| el.underline())
         .on_click(move |_, window, cx| links.clone()(target.clone(), window, cx))
         .child(label)
-}
-
-/// Slack's unread marker: a danger-colored line with the "New" label at its right end.
-fn new_messages_divider(cx: &App) -> Div {
-    let danger = cx.theme().danger;
-    h_flex()
-        .items_center()
-        .gap_2()
-        .py_1()
-        .child(div().flex_1().h(px(1.)).bg(danger))
-        .child(
-            div()
-                .flex_none()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(danger)
-                .child("New"),
-        )
 }
 
 // ---------------------------------------------------------------------------

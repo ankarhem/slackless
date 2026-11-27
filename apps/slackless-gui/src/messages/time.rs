@@ -73,7 +73,7 @@ pub(super) fn format_clock(ts: &Ts) -> String {
     format_clock_with(ts, false)
 }
 
-pub(super) fn format_clock_with(ts: &Ts, clock_24h: bool) -> String {
+pub(crate) fn format_clock_with(ts: &Ts, clock_24h: bool) -> String {
     match ts.secs() {
         Some(secs) => format_clock_civil(&CivilTime::from_unix(secs), clock_24h),
         None => ts.as_str().to_owned(),

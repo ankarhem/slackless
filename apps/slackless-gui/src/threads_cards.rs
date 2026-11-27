@@ -62,7 +62,7 @@ pub struct ThreadCard {
     pub replies: Vec<Message>,
     pub reply_total: u32,
     pub unread: u32,
-    /// Pre-mark read cursor used to draw a subtle `"New"` divider above unread replies.
+    /// Pre-mark read cursor: the `"New"` divider is drawn above the first reply after it.
     pub last_read: Option<Ts>,
     /// Present when this thread belongs to a Slack List item (`lists.getThreadsForRecord`).
     pub list_item: Option<ListItemThreadMeta>,
@@ -723,20 +723,9 @@ pub(super) fn card_view(
             drew_new_divider = true;
             prev_reply = None;
             reply_rows.push(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap_2()
+                div()
                     .px_4()
-                    .py_0p5()
-                    .child(div().flex_1().h(px(1.)).bg(danger.opacity(0.6)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(danger)
-                            .child("New"),
-                    )
+                    .child(crate::messages::new_messages_divider(cx))
                     .into_any_element(),
             );
         }

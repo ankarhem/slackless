@@ -28,16 +28,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonRounded};
-use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    Anchor, AnyElement, App, AppContext as _, Bounds, Context, Div, Entity, EventEmitter,
-    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point,
-    Render, SharedString, Stateful, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
-    Subscription, WeakEntity, Window, div, px, size,
+    AnyElement, App, AppContext as _, Bounds, Context, Div, Entity, EventEmitter, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render, SharedString,
+    Stateful, StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window,
+    div, px, size,
 };
 use slackless_core::api::MessageContent;
 use slackless_core::types::{Block, ChannelId, Message, MessageSubtype, Ts, UserId};
@@ -55,22 +54,25 @@ mod code_block;
 mod render;
 mod rows;
 mod selectable;
+mod shell;
 mod time;
 pub(crate) use render::is_deleted_ghost;
 use render::{
-    BodyCache, CivilTime, card_stamp, date_label, day_index, format_clock, format_clock_with,
-    message_body, message_body_cached,
+    BodyCache, CivilTime, card_stamp, date_label, day_index, format_clock, message_body,
+    message_body_cached,
 };
 pub(crate) use render::{
-    Preview, clock, day_and_time, day_label, file_day, hex_color, iso_date, list_stamp,
-    local_offset_now, memoized_preview, mrkdwn, mrkdwn_with_verbatim, now_secs, plain_text,
-    render_block, render_preview, selectable_code, selectable_text, short_date,
+    Preview, clock, day_and_time, day_label, file_day, format_clock_with, hex_color, iso_date,
+    list_stamp, local_offset_now, memoized_preview, mrkdwn, mrkdwn_with_verbatim, now_secs,
+    plain_text, render_block, render_preview, selectable_code, selectable_text, short_date,
 };
 use rows::transcript_row;
 #[cfg(test)]
 pub(crate) use rows::{AuthorBadge, classify_author_badge, external_file_sharing_label};
-pub use rows::{Jump, message_row, message_row_linked};
-pub(crate) use rows::{editing_avatar, reply_bar, same_group};
+pub(crate) use rows::{author_name_with, editing_avatar, reply_bar, same_group};
+pub use rows::{message_row, message_row_linked};
+pub use shell::Jump;
+pub(crate) use shell::{DeletedRow, date_divider, deleted_hide, deleted_row, new_messages_divider};
 pub use time::set_timezone_override;
 pub(crate) use time::{
     day_and_time_with, default_custom_datetime, local_utc_offset, parse_local_schedule,

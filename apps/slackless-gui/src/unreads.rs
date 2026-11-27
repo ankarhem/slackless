@@ -1039,7 +1039,13 @@ fn card_view(args: UnreadCardArgs<'_>, cx: &mut Context<UnreadsView>) -> AnyElem
             };
             if date_break {
                 rows.push(
-                    unreads_date_divider(day.clone(), border, background, cx).into_any_element(),
+                    crate::messages::date_divider(
+                        day.clone(),
+                        format!("unreads-{ix}-day-{m_ix}"),
+                        None,
+                        cx,
+                    )
+                    .into_any_element(),
                 );
             }
             let msg_group = SharedString::from(format!("unreads-{ix}-msg-{m_ix}"));
@@ -1203,35 +1209,6 @@ fn card_view(args: UnreadCardArgs<'_>, cx: &mut Context<UnreadsView>) -> AnyElem
         .children(body)
         .children(reply_box)
         .into_any_element()
-}
-
-/// Centered date pill on a full-width hairline, matching Slack's Unreads view ("Yesterday").
-fn unreads_date_divider(
-    label: String,
-    border: Hsla,
-    background: Hsla,
-    cx: &App,
-) -> gpui_kit::gpui::Div {
-    let fg = cx.theme().foreground;
-    h_flex()
-        .w_full()
-        .items_center()
-        .py_1p5()
-        .child(div().flex_1().h(px(1.)).bg(border))
-        .child(
-            div()
-                .px_3()
-                .py_1()
-                .rounded_full()
-                .bg(background)
-                .border_1()
-                .border_color(fg.opacity(0.14))
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(fg)
-                .child(label),
-        )
-        .child(div().flex_1().h(px(1.)).bg(border))
 }
 
 #[cfg(test)]

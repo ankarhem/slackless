@@ -6,8 +6,8 @@ use std::cell::RefCell;
 
 use gpui_kit::base::TextSelection;
 use gpui_kit::gpui::{
-    Entity, Font, Modifiers, MouseButton, Render, TestAppContext, VisualTestContext, Window, point,
-    px,
+    Entity, Font, Hsla, Modifiers, MouseButton, Render, TestAppContext, VisualTestContext, Window,
+    point, px,
 };
 
 use super::*;
