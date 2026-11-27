@@ -330,6 +330,18 @@ fn cldr_gendered_zwj_flags_and_skin_toned_slack_shortcodes_resolve() {
     );
     assert_eq!(display_glyph("skin-tone-4").as_deref(), Some("\u{1F3FD}"));
 
+    // Older Slack names GitHub or CLDR spell the same way need no alias entry of their own.
+    for (name, glyph) in [
+        ("poop", "💩"),
+        ("female_sign", "♀️"),
+        ("sign_of_the_horns", "🤘"),
+        ("eye-in-speech-bubble", "👁️‍🗨️"),
+        ("male-detective", "🕵️‍♂️"),
+        ("face_with_hand_over_mouth", "🤭"),
+    ] {
+        assert_eq!(display_glyph(name).as_deref(), Some(glyph), ":{name}:");
+    }
+
     // Inline parsing & shortcode replacement end-to-end.
     assert_eq!(
         parse_shortcode(":male_mage::skin-tone-4:"),
