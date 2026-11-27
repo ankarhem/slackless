@@ -19,10 +19,11 @@ pub(crate) use downloads::active_fetcher;
 #[cfg(target_os = "macos")]
 pub use downloads::save_download;
 pub use downloads::{
-    DownloadStatus, clear_finished_downloads, download, download_as, downloads, enable_downloads,
-    fetch, open_local_file, reveal_in_finder, set_ask_download_location, set_download_dir,
+    DownloadStatus, clear_finished_downloads, disable_downloads, download, download_as, downloads,
+    enable_downloads, fetch, open_local_file, reveal_in_finder, set_ask_download_location,
+    set_download_dir,
 };
-pub use http::CoreHttp;
+pub use http::{CoreHttp, OfflineHttp};
 pub use pdf::{
     cached_pdf_inline_thumb, cached_pdf_page, cached_pdf_page_count, clear_pdf_cache,
     evict_viewer_pdf_pages, pdf_cache_usage, request_pdf_inline_thumb, store_cached_pdf_page,
@@ -36,8 +37,9 @@ pub use video_player::{
     format_playback_rate, format_video_time, inline_video_begin_paint, inline_video_finish_paint,
     inline_video_snapshot, inline_video_visibility_probe, install_transcription_dispatcher,
     is_hls_url, is_transcribing, pip_stage_dimensions, play_inline_video,
-    play_inline_video_with_meta, progress_fraction, render_video_surface, sanitize_secs,
-    seek_inline_video, stop_active_inline_video, stop_inline_video, stop_inline_video_for_expand,
+    play_inline_video_with_meta, progress_fraction, render_video_surface,
+    reset_transcriptions_for_workspace_switch, sanitize_secs, seek_inline_video,
+    stop_active_inline_video, stop_inline_video, stop_inline_video_for_expand,
     toggle_inline_video_mute, toggle_inline_video_pause, transcribe_media, video_scrub_bar,
 };
 pub(crate) use video_player::{

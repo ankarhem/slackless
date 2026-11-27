@@ -128,7 +128,10 @@ impl ImageViewer {
         let load_task = cx.spawn_in(window, async move |weak, cx| {
             let bg = cx.background_executor().clone();
             let open_res = if hls {
-                bg.spawn(async move { NativeVideoPlayer::open_url(&fetch_url, None) })
+                let cookie = fetcher
+                    .as_ref()
+                    .and_then(|f| f.file_cookie_header(&fetch_url));
+                bg.spawn(async move { NativeVideoPlayer::open_url(&fetch_url, cookie.as_deref()) })
                     .await
                     .map_err(|e| e.to_string())
             } else {

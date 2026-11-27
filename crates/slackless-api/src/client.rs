@@ -394,6 +394,16 @@ impl SlackApi {
         stream_to_path(resp, dest, MAX_FILE_BYTES, |_, _| {}).await
     }
 
+    /// Returns the `d=...` `Cookie` header value if and only if `url` is a trusted Slack file
+    /// host (for native players such as AVFoundation streaming private Slack HLS `.m3u8` URLs).
+    pub fn file_cookie_header(&self, url: &str) -> Option<String> {
+        let parsed = Url::parse(url).ok()?;
+        if !self.is_trusted_file_url(&parsed) {
+            return None;
+        }
+        self.cookie.to_str().ok().map(str::to_owned)
+    }
+
     /// The 2xx answer for a Slack-hosted file, before its body is read.
     async fn file_response(&self, url_private: &str) -> Result<Response> {
         let resp = self.fetch_trusted_file(url_private).await?;
@@ -786,6 +796,24 @@ mod tests {
         assert_eq!(
             parse_retry_after(Some(&HeaderValue::from_static("999999"))),
             MAX_RETRY_AFTER
+        );
+    }
+
+    #[test]
+    fn file_cookie_header_only_authorizes_trusted_slack_file_hosts() {
+        let api = SlackApi::for_workspace("acme", "xoxc-tok", "xoxd-cookie+val").unwrap();
+        assert_eq!(
+            api.file_cookie_header("https://files.slack.com/files-pri/T1-F1/clip.m3u8")
+                .as_deref(),
+            Some("d=xoxd-cookie%2Bval")
+        );
+        assert!(
+            api.file_cookie_header("https://evil.example.com/files-pri/T1-F1/clip.m3u8")
+                .is_none()
+        );
+        assert!(
+            api.file_cookie_header("http://files.slack.com/files-pri/T1-F1/clip.m3u8")
+                .is_none()
         );
     }
 }

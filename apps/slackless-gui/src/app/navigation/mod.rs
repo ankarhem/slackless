@@ -845,10 +845,12 @@ impl App {
         if index == self.workspace || index >= self.slots.len() {
             return;
         }
-        // Stop any active inline video / PiP dock, full-screen viewer, PDF render cache, or
-        // open app modal / workflow details dialog from the outgoing workspace before swapping
-        // bridges, auth cookies, and fixtures.
+        // Stop any active inline video / PiP dock, inline audio, full-screen viewer, PDF render
+        // cache, pending media transcriptions, or open app modal / workflow details dialog from
+        // the outgoing workspace before swapping bridges, auth cookies, and fixtures.
         crate::media::stop_active_inline_video(window, cx);
+        crate::media::stop_audio(window, cx);
+        crate::media::reset_transcriptions_for_workspace_switch(cx);
         self.close_image_viewer(window, cx);
         crate::media::clear_pdf_cache(window, cx);
         window.close_dialog(cx);
@@ -858,11 +860,15 @@ impl App {
         self.save_draft(cx);
         self.bridge
             .send(ChannelCommand::CloseConversation(self.channel.clone()));
-        // Swap live bridges when target workspace has its own `CoreBridge`.
+        // Swap live bridges when target workspace has its own `CoreBridge`; otherwise clear
+        // global authenticated fetchers so outgoing cookies never leak into an offline/sample slot.
         if let Some(incoming_bridge) = self.slots[index].bridge.take() {
             let outgoing_bridge = mem::replace(&mut self.bridge, incoming_bridge);
             self.slots[self.workspace].bridge = Some(outgoing_bridge);
             self.bridge.activate_media(cx);
+        } else {
+            cx.set_http_client(Arc::new(crate::media::OfflineHttp));
+            crate::media::disable_downloads(cx);
         }
         // The state kept while in the background (counts, presence, connection, ...) carries on.
         let mut state = mem::take(&mut self.slots[index].state);

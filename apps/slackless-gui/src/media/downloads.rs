@@ -21,6 +21,14 @@ pub fn enable_downloads(fetcher: Fetcher, cx: &mut App) {
     cx.set_global(Downloader(fetcher));
 }
 
+/// Remove the active authenticated [`Fetcher`] (e.g. when switching to an offline/sample workspace)
+/// so outgoing Slack session cookies are never retained globally.
+pub fn disable_downloads(cx: &mut App) {
+    if cx.has_global::<Downloader>() {
+        cx.remove_global::<Downloader>();
+    }
+}
+
 /// Clone the active authenticated [`Fetcher`] if signed in.
 pub(crate) fn active_fetcher(cx: &App) -> Option<Fetcher> {
     cx.try_global::<Downloader>().map(|d| d.0.clone())

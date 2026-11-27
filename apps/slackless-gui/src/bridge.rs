@@ -598,6 +598,9 @@ impl CoreBridge {
         if let Some(fetcher) = &self.fetcher {
             cx.set_http_client(Arc::new(CoreHttp(fetcher.clone())));
             crate::media::enable_downloads(fetcher.clone(), cx);
+        } else {
+            cx.set_http_client(Arc::new(crate::media::OfflineHttp));
+            crate::media::disable_downloads(cx);
         }
     }
 

@@ -260,6 +260,12 @@ impl Fetcher {
         disk_cache_dir()
     }
 
+    /// Returns the authenticated `Cookie` header value when `url` points to a trusted Slack file
+    /// host (used by native HLS video playback for private Slack `.m3u8` streams).
+    pub fn file_cookie_header(&self, url: &str) -> Option<String> {
+        self.files.as_ref()?.file_cookie_header(url)
+    }
+
     /// The bytes at `url`. Slack-hosted files (thumbnails under `https://files.slack.com/`)
     /// download through the signed-in client, which sends the session cookie to Slack file
     /// hosts only; everything else is a public asset (served from the persistent disk cache on

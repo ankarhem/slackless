@@ -10,6 +10,27 @@ use slackless_core::Fetcher;
 
 pub struct CoreHttp(pub Fetcher);
 
+/// Unauthenticated fallback [`HttpClient`] installed when switching to a workspace with no live
+/// session so outgoing Slack cookies are never reused across workspaces.
+pub struct OfflineHttp;
+
+impl HttpClient for OfflineHttp {
+    fn user_agent(&self) -> Option<&HeaderValue> {
+        None
+    }
+
+    fn proxy(&self) -> Option<&Url> {
+        None
+    }
+
+    fn send(
+        &self,
+        _request: Request<AsyncBody>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Response<AsyncBody>>> + Send>> {
+        Box::pin(async { Err(anyhow::anyhow!("no signed-in workspace")) })
+    }
+}
+
 impl HttpClient for CoreHttp {
     fn user_agent(&self) -> Option<&HeaderValue> {
         None

@@ -54,6 +54,7 @@ pub(crate) fn decoded_bgra_bytes(width: u32, height: u32) -> u64 {
 
 #[derive(Default)]
 struct PdfRenderCache {
+    generation: u64,
     pages: HashMap<PdfPageKey, CachedPdfPage>,
     order: VecDeque<PdfPageKey>,
     /// Sum of `decoded_bytes` across `pages`.
@@ -131,6 +132,7 @@ impl PdfRenderCache {
     }
 
     fn take_all(&mut self) -> Vec<CachedPdfPage> {
+        self.generation = self.generation.wrapping_add(1);
         self.order.clear();
         self.total_bytes = 0;
         self.page_counts.clear();
@@ -274,7 +276,7 @@ pub fn request_pdf_inline_thumb(file_id: String, url: String, window: &mut Windo
         max_w: INLINE_PDF_THUMB_W,
         max_h: INLINE_PDF_THUMB_H,
     };
-    {
+    let gen_id = {
         let cache = cx.default_global::<PdfRenderCache>();
         if cache.pages.contains_key(&key)
             || cache.thumb_in_flight.contains(&file_id)
@@ -283,7 +285,8 @@ pub fn request_pdf_inline_thumb(file_id: String, url: String, window: &mut Windo
             return;
         }
         cache.thumb_in_flight.insert(file_id.clone());
-    }
+        cache.generation
+    };
     let Some(fetcher) = active_fetcher(cx) else {
         cx.default_global::<PdfRenderCache>()
             .thumb_in_flight
@@ -312,6 +315,9 @@ pub fn request_pdf_inline_thumb(file_id: String, url: String, window: &mut Windo
         cx.update(|cx| {
             let evicted = {
                 let cache = cx.default_global::<PdfRenderCache>();
+                if cache.generation != gen_id {
+                    return;
+                }
                 cache.thumb_in_flight.remove(&fid);
                 match rendered {
                     Ok((count, page)) => {
@@ -541,7 +547,13 @@ mod tests {
                 "inline thumbnail must stay cached after viewer close"
             );
 
+            let gen_before = cx.default_global::<PdfRenderCache>().generation;
             clear_pdf_cache(window, cx);
+            assert_eq!(
+                cx.default_global::<PdfRenderCache>().generation,
+                gen_before.wrapping_add(1),
+                "clear_pdf_cache must bump generation so in-flight thumbs cannot repopulate"
+            );
             assert!(
                 cached_pdf_page("F_EVICT", 0, INLINE_PDF_THUMB_W, INLINE_PDF_THUMB_H, cx).is_none()
             );

@@ -285,7 +285,7 @@ pub(super) fn poster_source_if_present(source: &ImageSource) -> Option<ImageSour
 }
 
 fn url_tail(url: &str) -> String {
-    url.rsplit('?')
+    url.split(['?', '#'])
         .next()
         .unwrap_or(url)
         .rsplit('/')
@@ -415,5 +415,20 @@ fn plural(count: i64, unit: &str) -> String {
         format!("1 {unit} ago")
     } else {
         format!("{count} {unit}s ago")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::url_tail;
+
+    #[test]
+    fn url_tail_strips_query_and_fragment_instead_of_returning_query_string() {
+        assert_eq!(
+            url_tail("https://cdn.example.com/a/photo.png?token=secret&sig=123#preview"),
+            "photo.png"
+        );
+        assert_eq!(url_tail("https://cdn.example.com/clip.mp4#t=5"), "clip.mp4");
+        assert_eq!(url_tail("https://cdn.example.com/plain.jpg"), "plain.jpg");
     }
 }

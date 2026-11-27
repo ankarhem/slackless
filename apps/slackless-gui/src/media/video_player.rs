@@ -544,7 +544,10 @@ pub fn play_inline_video_with_meta(
         .spawn(cx, async move |cx| {
             let bg = cx.background_executor().clone();
             let open_res = if hls {
-                bg.spawn(async move { NativeVideoPlayer::open_url(&fetch_url, None) })
+                let cookie = fetcher
+                    .as_ref()
+                    .and_then(|f| f.file_cookie_header(&fetch_url));
+                bg.spawn(async move { NativeVideoPlayer::open_url(&fetch_url, cookie.as_deref()) })
                     .await
                     .map_err(|e| e.to_string())
             } else {
@@ -759,11 +762,23 @@ pub struct TranscriptionDispatcher {
     dispatch: Option<DispatchTranscribeFn>,
     preferred_provider: Option<PreferredProviderFn>,
     has_transcript: Option<HasTranscriptFn>,
+    generation: u64,
     in_progress: HashSet<FileId>,
     manual_requests: HashSet<FileId>,
 }
 
 impl Global for TranscriptionDispatcher {}
+
+/// Invalidate any in-flight media fetches for transcription when switching workspaces so a file
+/// fetched from the outgoing workspace can never dispatch onto the incoming workspace's bridge.
+pub fn reset_transcriptions_for_workspace_switch(cx: &mut App) {
+    if cx.has_global::<TranscriptionDispatcher>() {
+        let state = cx.global_mut::<TranscriptionDispatcher>();
+        state.generation = state.generation.wrapping_add(1);
+        state.in_progress.clear();
+        state.manual_requests.clear();
+    }
+}
 
 /// Install the active workspace transcription dispatch hooks (called once from `app/bootstrap.rs`).
 pub fn install_transcription_dispatcher(
@@ -868,34 +883,46 @@ pub fn transcribe_media(
         return;
     };
 
-    {
+    let gen_id = {
         let state = cx.default_global::<TranscriptionDispatcher>();
         state.in_progress.insert(file_id.clone());
         if !auto {
             state.manual_requests.insert(file_id.clone());
         }
-    }
+        state.generation
+    };
     window.refresh();
 
+    let win = window.window_handle();
     let cache_id = file_id.to_string();
-    window
-        .spawn(cx, async move |cx| {
-            let bg = cx.background_executor().clone();
-            let fetched = fetch_cached_media(fetcher, cache_id, url, ext, bg).await;
-            let _ = cx.update(|window, cx| match fetched {
+    cx.spawn(async move |cx| {
+        let bg = cx.background_executor().clone();
+        let fetched = fetch_cached_media(fetcher, cache_id, url, ext, bg).await;
+        cx.update(|cx| {
+            // Drop stale fetches if the user switched workspaces while downloading.
+            let same_workspace = cx
+                .try_global::<TranscriptionDispatcher>()
+                .is_some_and(|s| s.generation == gen_id);
+            if !same_workspace {
+                return;
+            }
+            match fetched {
                 Ok(local_path) => {
                     dispatch_fn(file_id, local_path, provider, cx);
                 }
                 Err(err) => {
                     let was_manual = finish_transcription(&file_id, cx);
-                    if was_manual {
-                        crate::actions::notify("Transcription failed", err, window, cx);
-                    }
-                    window.refresh();
+                    let _ = win.update(cx, |_, window, cx| {
+                        if was_manual {
+                            crate::actions::notify("Transcription failed", err, window, cx);
+                        }
+                        window.refresh();
+                    });
                 }
-            });
-        })
-        .detach();
+            }
+        });
+    })
+    .detach();
 }
 
 fn spawn_inline_refresh_loop(generation: u64, tick_gen: u64, window: &mut Window, cx: &mut App) {

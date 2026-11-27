@@ -307,10 +307,18 @@ fn media_cache_dir() -> PathBuf {
 
 fn media_cache_path(dir: &Path, file_id: &str, ext: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let safe_id: String = file_id
+    let mut safe_id: String = file_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
         .collect();
+    if safe_id.is_empty() {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in file_id.as_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        safe_id = format!("id_{h:016x}");
+    }
     let safe_ext: String = ext.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     let filename = if safe_ext.is_empty() {
         safe_id
@@ -701,5 +709,25 @@ mod tests {
         mgr.stop_all();
         assert!(mgr.snapshot("F_WAV").is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn media_cache_path_hashes_empty_and_non_ascii_file_ids_without_collisions() {
+        let dir =
+            std::env::temp_dir().join(format!("slackless-media-path-test-{}", std::process::id()));
+        let p_empty = media_cache_path(&dir, "", "").unwrap();
+        let p_a = media_cache_path(&dir, "日本語", "mp4").unwrap();
+        let p_b = media_cache_path(&dir, "한국어", "mp4").unwrap();
+        assert_ne!(p_empty, dir, "empty file_id must not return cache dir");
+        assert_ne!(p_a, p_b, "distinct non-ASCII IDs must not collide");
+        assert!(
+            p_a.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("id_")
+        );
+        assert!(p_a.file_name().unwrap().to_str().unwrap().ends_with(".mp4"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
