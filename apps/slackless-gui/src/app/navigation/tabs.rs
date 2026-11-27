@@ -254,11 +254,7 @@ impl App {
         let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
             crate::popout::PopoutRequest {
-                kind: crate::popout::PopoutKind::Conversation {
-                    channel,
-                    source: self.messages.downgrade(),
-                    on_jump,
-                },
+                kind: crate::popout::PopoutKind::Conversation { channel, on_jump },
                 title,
                 fixtures: self.fixtures.clone(),
                 store: self.bridge.read_store_clone(),
@@ -287,7 +283,6 @@ impl App {
                 kind: crate::popout::PopoutKind::Thread {
                     channel,
                     thread_ts,
-                    source: self.messages.downgrade(),
                     on_jump,
                 },
                 title,

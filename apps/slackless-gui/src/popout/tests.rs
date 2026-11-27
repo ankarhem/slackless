@@ -5,6 +5,7 @@ use slackless_core::MessagingCommand;
 
 use crate::actions::MessageAction;
 use crate::emoji::EmojiChoice;
+use crate::messages::MessageList;
 
 use super::*;
 
@@ -43,13 +44,11 @@ fn popout_message_actions_mutate_state_and_forward_commands(cx: &mut TestAppCont
     let later = cx.update(LaterView::new);
     let mut popout_slot: Option<Entity<PopoutWindow>> = None;
     let vcx = cx.add_window(|window, cx| {
-        let list = MessageList::new(fixtures.clone(), channel.clone(), window, cx);
         let win = cx.new(|cx| {
             PopoutWindow::new(
                 PopoutRequest {
                     kind: PopoutKind::Conversation {
                         channel: channel.clone(),
-                        source: list.downgrade(),
                         on_jump,
                     },
                     title: "# general".to_owned(),
@@ -201,13 +200,11 @@ fn popout_emoji_picker_occludes_scroll_wheel_from_messages(cx: &mut TestAppConte
     cx.update(gpui_kit::init);
     let mut popout_slot: Option<Entity<PopoutWindow>> = None;
     let vcx = cx.add_window(|window, cx| {
-        let list = MessageList::new(fixtures.clone(), channel.clone(), window, cx);
         let win = cx.new(|cx| {
             let mut w = PopoutWindow::new(
                 PopoutRequest {
                     kind: PopoutKind::Conversation {
                         channel: channel.clone(),
-                        source: list.downgrade(),
                         on_jump,
                     },
                     title: "# general".to_owned(),
@@ -541,7 +538,7 @@ fn huddle_popout_thread_drawer_skips_store_queries_on_unrelated_huddle_notifies(
 }
 
 #[gpui::test]
-fn popout_reloads_when_its_own_conversation_changes(cx: &mut TestAppContext) {
+fn popout_reloads_only_when_its_own_conversation_changes(cx: &mut TestAppContext) {
     let fixtures = Arc::new(crate::fixtures::load());
     let (team, general) = (TeamId::from("T1"), ChannelId::from("C0GENERAL"));
     let store: SharedStore = Arc::new(Mutex::new(
@@ -551,6 +548,7 @@ fn popout_reloads_when_its_own_conversation_changes(cx: &mut TestAppContext) {
     let on_jump: JumpHandler = Rc::new(|_, _, _, _| {});
     cx.update(gpui_kit::init);
     let mut popout_slot: Option<Entity<PopoutWindow>> = None;
+    let mut list_slot: Option<Entity<MessageList>> = None;
     let win_handle = cx.add_window(|window, cx| {
         let list = MessageList::new(fixtures.clone(), general.clone(), window, cx);
         let win = cx.new(|cx| {
@@ -558,7 +556,6 @@ fn popout_reloads_when_its_own_conversation_changes(cx: &mut TestAppContext) {
                 PopoutRequest {
                     kind: PopoutKind::Conversation {
                         channel: general.clone(),
-                        source: list.downgrade(),
                         on_jump,
                     },
                     title: "# general".to_owned(),
@@ -574,11 +571,24 @@ fn popout_reloads_when_its_own_conversation_changes(cx: &mut TestAppContext) {
             )
         });
         popout_slot = Some(win.clone());
+        list_slot = Some(list);
         gpui_kit::component::Root::new(win, window, cx)
     });
-    let popout = popout_slot.unwrap();
+    let (popout, list) = (popout_slot.unwrap(), list_slot.unwrap());
     let mut vcx = gpui_kit::VisualTestContext::from_window(win_handle.into(), cx);
     vcx.run_until_parked();
+
+    // The main window's message list notifies on every scroll, hover and selection: none of
+    // that is a store change, so it must not re-read the conversation.
+    let queries = vcx.read(|cx| popout.read(cx).reload_gen);
+    vcx.update(|_, cx| list.update(cx, |_, cx| cx.notify()));
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.read(|cx| popout.read(cx).reload_gen),
+        queries,
+        "a main-list notify alone must not re-query the store"
+    );
+
     let fresh = Message {
         ts: Ts::from("1700000001.000100"),
         text: "fresh".to_owned(),
@@ -631,14 +641,12 @@ fn popout_mark_unread_edit_mrkdwn_refresh_edits_and_readonly_skips_composer(
     let mut readonly_slot: Option<Entity<PopoutWindow>> = None;
     let mut thread_slot: Option<Entity<PopoutWindow>> = None;
     let vcx = cx.add_window(|window, cx| {
-        let list = MessageList::new(fixtures.clone(), channel.clone(), window, cx);
         thread_slot = Some(cx.new(|cx| {
             PopoutWindow::new(
                 PopoutRequest {
                     kind: PopoutKind::Thread {
                         channel: channel.clone(),
                         thread_ts: Ts::from("1700000000.000100"),
-                        source: list.downgrade(),
                         on_jump: on_jump.clone(),
                     },
                     title: "Thread".to_owned(),
@@ -658,7 +666,6 @@ fn popout_mark_unread_edit_mrkdwn_refresh_edits_and_readonly_skips_composer(
                 PopoutRequest {
                     kind: PopoutKind::Conversation {
                         channel: channel.clone(),
-                        source: list.downgrade(),
                         on_jump: on_jump.clone(),
                     },
                     title: "# general".to_owned(),

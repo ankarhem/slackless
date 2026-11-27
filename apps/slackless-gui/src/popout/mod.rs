@@ -29,7 +29,7 @@ use crate::fixtures::Fixtures;
 use crate::huddle_state::{HuddlePopoutGuard, HuddleState, HuddleVideoStore};
 use crate::image_viewer::ImageViewer;
 use crate::later::{LaterItem, LaterView};
-use crate::messages::{LinkHandler, LinkTarget, MessageList};
+use crate::messages::{LinkHandler, LinkTarget};
 
 mod actions;
 pub mod floating_controls;
@@ -64,13 +64,11 @@ pub type CanvasOpenHandler = Rc<dyn Fn(String, &mut App)>;
 pub enum PopoutKind {
     Conversation {
         channel: ChannelId,
-        source: WeakEntity<MessageList>,
         on_jump: JumpHandler,
     },
     Thread {
         channel: ChannelId,
         thread_ts: Ts,
-        source: WeakEntity<MessageList>,
         on_jump: JumpHandler,
     },
     Activity {
@@ -417,13 +415,7 @@ impl PopoutWindow {
         let mut huddle_video = None;
         let mut huddle_popout_guard = None;
         match &kind {
-            PopoutKind::Conversation { source, .. } | PopoutKind::Thread { source, .. } => {
-                if let Some(list) = source.upgrade() {
-                    subscriptions.push(cx.observe(&list, |this, _, cx| {
-                        this.reload_from_store(cx);
-                    }));
-                }
-            }
+            PopoutKind::Conversation { .. } | PopoutKind::Thread { .. } => {}
             PopoutKind::Activity { source, .. } => {
                 if let Some(feed) = source.upgrade() {
                     activity_rows = feed.read(cx).snapshot_for_popout();
