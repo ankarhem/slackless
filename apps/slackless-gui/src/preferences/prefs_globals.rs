@@ -122,3 +122,24 @@ pub fn set_display_prefs(settings: &Settings, cx: &mut App) {
         cx.refresh_windows();
     }
 }
+
+#[cfg(test)]
+struct AppliedNetLog(bool);
+
+#[cfg(test)]
+impl Global for AppliedNetLog {}
+
+/// Apply the effective HTTP net-log toggle (`net_log_enabled || debug_logging`) to `slackless_api`.
+/// Under `#[cfg(test)]`, mirrors the value into a per-`TestAppContext` GPUI global so parallel
+/// tests do not race on the process-wide `NET_LOG_ENABLED` atomic.
+pub fn sync_net_log_enabled(settings: &Settings, _cx: &mut App) {
+    let enabled = settings.net_log_enabled || settings.debug_logging;
+    slackless_core::api::set_net_log_enabled(enabled);
+    #[cfg(test)]
+    _cx.set_global(AppliedNetLog(enabled));
+}
+
+#[cfg(test)]
+pub fn applied_net_log_enabled(cx: &App) -> bool {
+    cx.try_global::<AppliedNetLog>().is_some_and(|v| v.0)
+}

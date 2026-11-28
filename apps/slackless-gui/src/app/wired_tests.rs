@@ -2126,6 +2126,7 @@ fn wired_background_workspace_applies_same_thread_reply_and_vip_notification_rul
             app.preferences.update(cx, |prefs, cx| {
                 let mut s = prefs.settings().clone();
                 s.desktop_notifications = true;
+                s.schedule_enabled = false;
                 s.notify_level = 0; // Everything
                 s.thread_replies = true;
                 prefs.load_settings(s, window, cx);
@@ -3290,10 +3291,12 @@ fn wired_cold_launch_stealth_mode_huddle_transcript_and_palette_hydration(
         )),
         "cold launch must propagate SetSaveHuddleTranscripts(false) to background WS 1: {cmds2:?}"
     );
-    assert!(
-        slackless_core::api::net_log_enabled(),
-        "debug_logging=true must keep net_log_enabled active after load_settings"
-    );
+    vcx.update(|_, cx| {
+        assert!(
+            crate::preferences::applied_net_log_enabled(cx),
+            "debug_logging=true must keep net_log_enabled active after load_settings"
+        );
+    });
     drop(root);
 }
 

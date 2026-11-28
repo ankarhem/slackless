@@ -49,12 +49,14 @@ pub(super) struct Menu {
 
 impl Menu {
     /// The menu for what is being typed at the caret, when anything matches it.
+    #[cfg(test)]
     pub fn at_caret(editor: &Editor, fixtures: &Fixtures) -> Option<Menu> {
         Self::at_caret_with_slash(editor, fixtures, true)
     }
 
-    /// Like [`Self::at_caret`], with slash-command completion suppressed when `allow_slash` is
-    /// `false` (e.g. inline message editing, where Enter should save rather than run `/commands`).
+    /// The menu for what is being typed at the caret, with slash-command completion suppressed
+    /// when `allow_slash` is `false` (e.g. inline message editing, where Enter should save rather
+    /// than run `/commands`).
     pub fn at_caret_with_slash(
         editor: &Editor,
         fixtures: &Fixtures,

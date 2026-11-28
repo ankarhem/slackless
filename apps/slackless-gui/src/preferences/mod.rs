@@ -29,8 +29,11 @@ pub use crate::ui::forms::{
     ControlMetrics, control_metrics, form_button, search_input_box, text_input_box, text_input_mono,
 };
 pub(crate) use crate::ui::forms::{form_button_for, text_input_box_for};
+#[cfg(test)]
+pub use prefs_globals::applied_net_log_enabled;
 pub use prefs_globals::{
     active_quick_reactions, display_prefs, matches_highlight_keyword, set_display_prefs,
+    sync_net_log_enabled,
 };
 #[cfg(test)]
 pub(crate) use settings::AiSummarySettings;
@@ -846,9 +849,7 @@ impl Preferences {
         let ai_model = settings.ai_summary.model.clone();
         let quick_emojis = settings.quick_reaction_emojis.clone();
         slackless_core::api::set_proxy_url(Some(proxy.clone()));
-        slackless_core::api::set_net_log_enabled(
-            settings.net_log_enabled || settings.debug_logging,
-        );
+        sync_net_log_enabled(&settings, cx);
         let rgb_pair = settings.palette.rgb_pair();
         self.settings = settings;
         self.keywords

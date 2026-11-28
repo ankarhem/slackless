@@ -142,9 +142,7 @@ impl App {
         } else {
             gpui::WindowBackgroundAppearance::Opaque
         });
-        slackless_core::api::set_net_log_enabled(
-            settings.net_log_enabled || settings.debug_logging,
-        );
+        crate::preferences::sync_net_log_enabled(&settings, cx);
         crate::messages::set_timezone_override(settings.timezone());
         crate::media::set_download_dir(
             (!settings.download_dir.is_empty())
@@ -393,9 +391,6 @@ impl App {
             }
             if prev.proxy_url != settings.proxy_url {
                 slackless_core::api::set_proxy_url(Some(settings.proxy_url.clone()));
-            }
-            if prev.net_log_enabled != settings.net_log_enabled {
-                slackless_core::api::set_net_log_enabled(settings.net_log_enabled);
             }
             let reload_deleted = prev.show_deleted_messages != settings.show_deleted_messages;
             if self.huddle_session.is_some() {
