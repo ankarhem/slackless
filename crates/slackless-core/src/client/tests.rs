@@ -9148,16 +9148,28 @@ async fn outbox_retry_does_not_deadlock_on_second_transient_failure() {
     // Two back-to-back transient failures while online arm `OutboxRetry::ensure_scheduled` twice
     // inside the initial 5s backoff window. Before the timer_gen split, the second call bumped
     // `generation` without replacing the timer, causing the timer to self-abort without clearing
-    // `pending` and deadlocking automatic retries forever.
-    for text in ["first transient", "second transient"] {
-        core.handle(Command::Messaging(MessagingCommand::SendMessage {
-            channel: c1(),
-            content: MessageContent::plain(text),
-            thread_ts: None,
-            broadcast: false,
-        }))
-        .await;
-    }
+    // `pending` and deadlocking automatic retries forever. Use distinct channels and wait for the
+    // first send to park so both deterministically take `park_transient_send` (not the same-channel
+    // `has_queued` fast-path) and enqueue in deterministic FIFO order.
+    let c2 = ChannelId::from("C2");
+    core.handle(Command::Messaging(MessagingCommand::SendMessage {
+        channel: c1(),
+        content: MessageContent::plain("first transient"),
+        thread_ts: None,
+        broadcast: false,
+    }))
+    .await;
+    wait_until("first send parked in outbox", || {
+        store.lock().unwrap().list_outbox(&ws).unwrap().len() == 1
+    })
+    .await;
+    core.handle(Command::Messaging(MessagingCommand::SendMessage {
+        channel: c2.clone(),
+        content: MessageContent::plain("second transient"),
+        thread_ts: None,
+        broadcast: false,
+    }))
+    .await;
 
     wait_until("both sends parked in outbox", || {
         store.lock().unwrap().list_outbox(&ws).unwrap().len() == 2
@@ -9180,7 +9192,7 @@ async fn outbox_retry_does_not_deadlock_on_second_transient_failure() {
         posted,
         vec![
             (c1(), "first transient".to_owned()),
-            (c1(), "second transient".to_owned()),
+            (c2, "second transient".to_owned()),
         ]
     );
     assert!(store.lock().unwrap().list_outbox(&ws).unwrap().is_empty());
